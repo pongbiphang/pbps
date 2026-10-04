@@ -529,6 +529,14 @@ fn managed_schemas(project: &Project) -> Vec<String> {
         .map(|t| t.schema.clone())
         .collect();
     out.extend(loaded.schema.modules.keys().map(|m| m.schema().to_owned()));
+    // A history table is created in its own schema, which may be another
+    // (#1176): the same `CREATE TABLE` needs it to exist, and the rights there.
+    out.extend(loaded.schema.tables.values().filter_map(|t| {
+        t.system_time
+            .as_ref()
+            .and_then(|st| st.versioning.as_ref())
+            .map(|v| v.history.schema.clone())
+    }));
     out.into_iter().collect()
 }
 

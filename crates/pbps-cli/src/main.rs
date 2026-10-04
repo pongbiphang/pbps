@@ -1653,6 +1653,15 @@ pub(crate) fn declaration_problems(
     for problem in pbps_dialect::check_module_names(schema, dialect) {
         out.push(("schema.name-collision", problem));
     }
+    // And a history table, which no declaration lists as a table but which
+    // takes a name in the same namespace (#1176).
+    for problem in pbps_dialect::check_history_names(schema, dialect) {
+        out.push(("schema.name-collision", problem));
+    }
+    // And a trigger the engine refuses on a system-versioned table (#1176).
+    for problem in pbps_dialect::check_system_time_triggers(schema, dialect) {
+        out.push(("dialect.rejected", problem));
+    }
     // And a third whole-schema question, on the same engines-differ shape: an
     // index (or the index behind a named primary key or unique constraint)
     // shares a schema's relation namespace with tables and views on

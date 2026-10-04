@@ -210,6 +210,22 @@ impl Dialect for Mssql {
         // creation over the table that is there: refused here instead, as the
         // PostgreSQL dialect does. Same-named tables in another schema are the
         // project's.
+        // A history takes a table's name in the database too (#1176).
+        if let Some(history) = table
+            .system_time
+            .as_ref()
+            .and_then(|st| st.versioning.as_ref())
+            .map(|v| &v.history)
+            .filter(|h| catalog::is_ours(h))
+        {
+            found.push(DialectError::Invalid {
+                dialect: types::DIALECT,
+                message: format!(
+                    "table `{name}` names `{history}` as its history table, which is one of the \
+                     ledger tables this tool owns (SPEC §8.1); name another table"
+                ),
+            });
+        }
         if catalog::is_ours(name) {
             found.push(DialectError::Invalid {
                 dialect: types::DIALECT,
@@ -343,6 +359,98 @@ mod tests {
             "dbo.__pbps_customers",
         ] {
             assert!(!refused(theirs), "{theirs}");
+        }
+    }
+
+    /// A history named after a generated default's fallback name is not
+    /// refused offline (#1501 review): `CREATE TABLE` names the default by its
+    /// first choice, and only a later rename uses the fallback. A default
+    /// parked there, or one at the first choice, is the connected walk's,
+    /// where the plan's own creation fails safely in its transaction.
+    #[test]
+    fn a_history_named_like_a_generated_default_is_not_refused_offline() {
+        let name: pbps_model::TableName = "dbo.t".parse().unwrap();
+        let mut t = Table::default();
+        t.columns.insert(
+            "c".into(),
+            pbps_model::Column {
+                default: Some("0".into()),
+                ..pbps_model::Column::new("int".parse().unwrap())
+            },
+        );
+        for history in [
+            emit::fallback_default_constraint_name(&name, "c"),
+            emit::default_constraint_name(&name, "c"),
+        ] {
+            let versioned = Table {
+                system_time: Some(pbps_model::SystemTime {
+                    start: "vf".into(),
+                    end: "vt".into(),
+                    hidden: false,
+                    versioning: Some(pbps_model::SystemVersioning {
+                        history: pbps_model::TableName::new("dbo", &history),
+                        retention: None,
+                    }),
+                }),
+                ..Default::default()
+            };
+            let mut schema = pbps_model::Schema::default();
+            schema.tables.insert(name.clone(), t.clone());
+            schema.tables.insert("dbo.v".parse().unwrap(), versioned);
+            let problems = pbps_dialect::check_history_names(&schema, &Mssql);
+            assert!(problems.is_empty(), "{history}: {problems:?}");
+        }
+    }
+
+    /// A history named after one of the ledger's tables is refused like a
+    /// table of that name, for the same reason; the same names elsewhere stay
+    /// the project's (#1176).
+    #[test]
+    fn a_history_named_after_a_ledger_table_is_refused() {
+        let with_history = |history: &str| {
+            let mut table = Table::default();
+            for c in ["id", "vf", "vt"] {
+                let ty = if c == "id" { "int" } else { "datetime2" };
+                table.columns.insert(
+                    c.into(),
+                    pbps_model::Column::new(ty.parse().unwrap()).not_null(),
+                );
+            }
+            table.primary_key = Some(pbps_model::PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            });
+            table.system_time = Some(pbps_model::SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: false,
+                versioning: Some(pbps_model::SystemVersioning {
+                    history: history.parse().unwrap(),
+                    retention: None,
+                }),
+            });
+            Mssql
+                .validate_table(&"dbo.t".parse().unwrap(), &table)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        for ours in ["dbo.__pbps_state", "dbo.__pbps_lock"] {
+            let refused = with_history(ours);
+            assert!(
+                refused
+                    .iter()
+                    .any(|m| m.contains("as its history table, which is one of the ledger")),
+                "{ours}: {refused:?}"
+            );
+        }
+        for theirs in ["app.__pbps_state", "dbo.__pbps_statements", "dbo.t_history"] {
+            assert!(
+                with_history(theirs).is_empty(),
+                "{theirs}: {:?}",
+                with_history(theirs)
+            );
         }
     }
 

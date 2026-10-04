@@ -106,6 +106,19 @@ pub enum DiffError {
         target: TableName,
     },
 
+    /// A change to a table with `system_time`, on either side, other than
+    /// creating it (#1176, DEC-1176.1). The engine refuses some (dropping
+    /// the table, 13552; altering the period, 13599) and does others with
+    /// history side effects nobody declared: DROP COLUMN deletes that
+    /// column's history, and ADD NOT NULL with a default writes the default
+    /// into every history row (measured on 17.0).
+    #[error(
+        "{table} has `system_time`, and pbps can create such a table but not change it yet: \
+         some changes are refused by SQL Server and others rewrite or delete its history. \
+         Declare {table} as it is recorded, and make the change by hand."
+    )]
+    TemporalTableChange { table: TableName },
+
     /// A `data:` table whose primary key moved to a different column. The row
     /// keys on each side are values of that side's key column, so the two sets
     /// have nothing in common and matching them by text would update and
@@ -455,6 +468,7 @@ fn diff_partial_rebuilding(
         &mut changes,
     );
     refuse_computed_dependencies(base.schema, declared.schema, dialect, &changes, &mut errs);
+    refuse_temporal_changes(base, declared, &changes, &mut errs);
     // A module declaration can stay byte-for-byte identical while a new
     // overload or shadow changes what it should bind to. Ask the dialect
     // before sorting, rather than appending unreviewed SQL at apply time.
@@ -1836,6 +1850,92 @@ fn input_change<'a>(change: &'a Change, table: &TableName) -> Option<(&'a str, &
 /// "May" by [`Dialect::may_name`], which over-approximates. A computed column
 /// this plan drops, or changes and so drops and re-adds, is out of the way
 /// before any of these and is not standing.
+fn refuse_temporal_changes(
+    base: Side<'_>,
+    declared: Side<'_>,
+    changes: &[Change],
+    errs: &mut Vec<DiffError>,
+) {
+    let temporal = |schema: &Schema, name: &TableName| {
+        schema
+            .tables
+            .get(name)
+            .is_some_and(|t| t.system_time.is_some())
+    };
+    let mut refused = BTreeSet::new();
+    // A difference in `system_time` itself, which no change carries: without
+    // this it would plan nothing and record the declaration as applied.
+    for (uid, declared_name) in &declared.ids.tables {
+        let Some(base_name) = base.ids.tables.get(uid) else {
+            continue;
+        };
+        if let (Some(b), Some(d)) = (
+            base.schema.tables.get(base_name),
+            declared.schema.tables.get(declared_name),
+        ) && b.system_time != d.system_time
+        {
+            refused.insert(declared_name.clone());
+        }
+    }
+    // A table this plan creates is created with every change it splits out
+    // of the `CREATE` (its foreign keys, #1501 review): those are the
+    // creation, not a change to a table that stands. By the change, not by
+    // the base: a new table may take the name of one the plan renames or
+    // drops. Whatever drops or renames a table at that name is still asked
+    // about below, so a temporal table dropped and recreated under its own
+    // name is still refused.
+    let created: BTreeSet<&TableName> = changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::CreateTable { name, .. } = c {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    // A grant or a trigger on the table is not a change to the pair, and
+    // `table()` names neither; a rename is reached by both of its names.
+    for change in changes {
+        let ends_a_table = matches!(
+            change,
+            Change::DropTable { .. } | Change::RenameTable { .. }
+        );
+        if matches!(change, Change::CreateTable { .. })
+            || (!ends_a_table && change.table().is_some_and(|t| created.contains(t)))
+        {
+            continue;
+        }
+        // A drop or a rename acts on the table the base has at that name, and
+        // a rename brings it to the declared one: asked of those sides, so the
+        // ordinary table a new temporal one replaces may still go.
+        let asked: Vec<&TableName> = if let Change::DropTable { name, .. } = change {
+            vec![name]
+                .into_iter()
+                .filter(|n| temporal(base.schema, n))
+                .collect()
+        } else if let Change::RenameTable { from, to, .. } = change {
+            [(from, base.schema), (to, declared.schema)]
+                .into_iter()
+                .filter(|(n, side)| temporal(side, n))
+                .map(|(n, _)| n)
+                .collect()
+        } else {
+            change
+                .table()
+                .into_iter()
+                .filter(|n| temporal(base.schema, n) || temporal(declared.schema, n))
+                .collect()
+        };
+        refused.extend(asked.into_iter().cloned());
+    }
+    errs.extend(
+        refused
+            .into_iter()
+            .map(|table| DiffError::TemporalTableChange { table }),
+    );
+}
+
 fn refuse_computed_dependencies(
     base: &Schema,
     declared: &Schema,
@@ -4473,6 +4573,254 @@ mod tests {
         assert!(
             errors.iter().any(|e| matches!(e, DiffError::PermanentReferencesUnlogged { key, .. } if key == "ch_pa")),
             "{errors:?}"
+        );
+    }
+
+    /// A table with `system_time` is created whole, and every change to it
+    /// is refused by name until #1177: a column added, its period or history
+    /// changed (which no change would carry, and would otherwise plan nothing
+    /// and record the declaration as applied), the table dropped or renamed.
+    /// A change to another table, even one referencing it, is not refused.
+    #[test]
+    fn a_table_with_system_time_is_created_but_never_changed() {
+        let versioned = |retention: Option<&str>| {
+            let mut t = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("vf", Column::new(ty("datetime2")).not_null()),
+                ("vt", Column::new(ty("datetime2")).not_null()),
+            ]);
+            t.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            });
+            t.system_time = Some(pbps_model::SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: false,
+                versioning: Some(pbps_model::SystemVersioning {
+                    history: "app.t_history".parse().unwrap(),
+                    retention: retention.map(|r| r.parse().unwrap()),
+                }),
+            });
+            t
+        };
+        let outcome = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+        };
+        let refused = |base: &Schema, declared: &Schema, intents: &[Intent]| -> Vec<String> {
+            match outcome(base, declared, intents) {
+                Ok(cs) => panic!("planned {:?}", kinds(&cs)),
+                Err(errors) => errors
+                    .iter()
+                    .filter(|e| matches!(e, DiffError::TemporalTableChange { .. }))
+                    .map(ToString::to_string)
+                    .collect(),
+            }
+        };
+        let base = schema_of("app.t", versioned(None));
+
+        // Created whole, in one change.
+        let created = outcome(&Schema::default(), &base, &[]).expect("a create is planned");
+        assert_eq!(kinds(&created), ["CreateTable"]);
+        // With the foreign keys the differ splits out of its `CREATE`, which
+        // are the creation too (#1501 review).
+        let mut keyed = base.clone();
+        keyed.tables.insert(
+            "app.parent".parse().unwrap(),
+            table(&[("id", Column::new(ty("int")).not_null())]),
+        );
+        keyed
+            .tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .foreign_keys
+            .insert(
+                "fk_t_parent".into(),
+                pbps_model::ForeignKey {
+                    columns: vec!["id".into()],
+                    references_table: "app.parent".parse().unwrap(),
+                    references_columns: vec!["id".into()],
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+        let created = outcome(&Schema::default(), &keyed, &[]).expect("a keyed create is planned");
+        assert!(
+            kinds(&created).contains(&"AddForeignKey".to_owned()),
+            "{:?}",
+            kinds(&created)
+        );
+        // And under the name of an ordinary table an earlier revision of the
+        // same plan dropped: the new table has a uid of its own.
+        let mut ordinary = keyed.clone();
+        ordinary.tables.insert(
+            "app.t".parse().unwrap(),
+            table(&[("id", Column::new(ty("int")).not_null())]),
+        );
+        let mut vacated = keyed.clone();
+        vacated
+            .tables
+            .remove(&"app.t".parse::<TableName>().unwrap());
+        let base_ids = crate::resolve(&ordinary, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let between = crate::resolve(
+            &vacated,
+            &base_ids,
+            &[Intent::DropTable {
+                table: "app.t".parse().unwrap(),
+                reason: "replaced".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let reused_ids = crate::resolve(&keyed, &between, &[], &ctx()).unwrap().ids;
+        let reused = diff(
+            Side {
+                schema: &ordinary,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &keyed,
+                ids: &reused_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .expect("a create under a name an earlier revision dropped is planned");
+        assert!(
+            kinds(&reused).contains(&"DropTable".to_owned())
+                && kinds(&reused).contains(&"AddForeignKey".to_owned()),
+            "{:?}",
+            kinds(&reused)
+        );
+        // Negative: a temporal table dropped and created again under its own
+        // name is still a drop of a temporal table.
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let between = crate::resolve(
+            &Schema::default(),
+            &base_ids,
+            &[Intent::DropTable {
+                table: "app.t".parse().unwrap(),
+                reason: "replaced".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let again_ids = crate::resolve(&base, &between, &[], &ctx()).unwrap().ids;
+        let errors = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &base,
+                ids: &again_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .expect_err("a temporal table dropped and recreated is refused");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, DiffError::TemporalTableChange { .. })),
+            "{errors:?}"
+        );
+        // Unchanged, nothing to plan.
+        assert!(outcome(&base, &base, &[]).unwrap().changes.is_empty());
+
+        let mut added = base.clone();
+        added
+            .tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .columns
+            .insert("note".into(), Column::new(ty("int")));
+        let retained = schema_of("app.t", versioned(Some("6 months")));
+        let mut renamed_history = base.clone();
+        renamed_history
+            .tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .system_time
+            .as_mut()
+            .unwrap()
+            .versioning
+            .as_mut()
+            .unwrap()
+            .history = "app.t_audit".parse().unwrap();
+        let renamed = schema_of("app.u", versioned(None));
+        for (what, declared, intents) in [
+            ("a column added", &added, vec![]),
+            ("its retention", &retained, vec![]),
+            ("its history renamed", &renamed_history, vec![]),
+            (
+                "the table dropped",
+                &Schema::default(),
+                vec![Intent::DropTable {
+                    table: "app.t".parse().unwrap(),
+                    reason: "retired".into(),
+                }],
+            ),
+            (
+                "the table renamed",
+                &renamed,
+                vec![Intent::RenameTable {
+                    from: "app.t".parse().unwrap(),
+                    to: "app.u".parse().unwrap(),
+                }],
+            ),
+        ] {
+            let errors = refused(&base, declared, &intents);
+            assert!(
+                !errors.is_empty() && errors.iter().all(|e| e.contains("has `system_time`")),
+                "{what}: {errors:?}"
+            );
+        }
+        // Negative: an ordinary table referencing it changes freely.
+        let mut referencing = base.clone();
+        let mut other = table(&[("t_id", Column::new(ty("int")))]);
+        other.foreign_keys.insert(
+            "fk_other_t".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["t_id".into()],
+                references_table: "app.t".parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        referencing
+            .tables
+            .insert("app.other".parse().unwrap(), other);
+        let cs = outcome(&base, &referencing, &[]).expect("another table is not refused");
+        assert!(
+            kinds(&cs).contains(&"CreateTable".to_owned()),
+            "{:?}",
+            kinds(&cs)
         );
     }
 

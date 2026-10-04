@@ -330,7 +330,8 @@ impl Table {
     }
 
     /// The columns a declared row can hold a value in: every one but the
-    /// column its key lives in and the engine's own `IDENTITY`s.
+    /// column its key lives in, the engine's own `IDENTITY`s and a period's
+    /// columns.
     ///
     /// The key is the map key of the row, not a cell in it, and a non-key
     /// `IDENTITY` is the engine's — never written by a row and never read back
@@ -351,6 +352,13 @@ impl Table {
         self.columns
             .iter()
             .filter(move |(c, spec)| c.as_str() != key_column && !spec.engine_assigned())
+            // The engine writes a period's columns on every change (#1176).
+            .filter(move |(c, _)| {
+                !self
+                    .system_time
+                    .as_ref()
+                    .is_some_and(|p| p.is_period_column(c))
+            })
     }
 }
 
@@ -438,6 +446,12 @@ pub struct Table {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unlogged: bool,
 
+    /// SQL Server's `PERIOD FOR SYSTEM_TIME` and system versioning (#1176,
+    /// DEC-1176.1). `None` is an ordinary table, which every table an older
+    /// reader recorded was: it left a temporal one out as a limitation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_time: Option<SystemTime>,
+
     /// Declared reference data (ADR-0004).
     ///
     /// `None` — the overwhelmingly common case — is the opt-in switch being
@@ -449,6 +463,124 @@ pub struct Table {
     /// existed describes a table that declares no rows, not a broken file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<TableData>,
+}
+
+/// A SQL Server table's `PERIOD FOR SYSTEM_TIME`, and its system versioning
+/// where that is on (#1176, DEC-1176.1).
+///
+/// The period's two columns stay in [`Table::columns`], which holds their
+/// type, nullability and place; this names them. The engine writes both on
+/// every change to a row, so neither is a column a declared row can write.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemTime {
+    /// `GENERATED ALWAYS AS ROW START`.
+    pub start: String,
+    /// `GENERATED ALWAYS AS ROW END`.
+    pub end: String,
+    /// Both period columns `HIDDEN`: left out of `SELECT *`. One flag for the
+    /// pair; a table with one hidden and one visible is read as a limitation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+    /// `None` is the period alone: a table with versioning off, which is also
+    /// what `SET (SYSTEM_VERSIONING = OFF)` leaves behind (measured on 17.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versioning: Option<SystemVersioning>,
+}
+
+impl SystemTime {
+    /// Whether `column` is one of the period's two columns.
+    pub fn is_period_column(&self, column: &str) -> bool {
+        self.start == column || self.end == column
+    }
+}
+
+/// `SYSTEM_VERSIONING = ON`: the engine keeps every replaced row in a history
+/// table. The history is part of its table, with no identity of its own: its
+/// columns follow the table's, and the engine builds its layout (DEC-1176.1).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemVersioning {
+    /// Always a name, even where the engine chose one: a table recreated
+    /// without it gets a history of another name (DEC-1176.1).
+    pub history: TableName,
+    /// `HISTORY_RETENTION_PERIOD`; `None` is `INFINITE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<Retention>,
+}
+
+/// A finite `HISTORY_RETENTION_PERIOD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Retention {
+    /// Positive: the engine refuses zero.
+    pub count: u32,
+    pub unit: RetentionUnit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionUnit {
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+impl RetentionUnit {
+    /// The engine's keyword, singular.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            RetentionUnit::Day => "DAY",
+            RetentionUnit::Week => "WEEK",
+            RetentionUnit::Month => "MONTH",
+            RetentionUnit::Year => "YEAR",
+        }
+    }
+}
+
+/// As a declaration writes it: `6 months`, `1 day`.
+impl std::fmt::Display for Retention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let unit = self.unit.keyword().to_lowercase();
+        if self.count == 1 {
+            write!(f, "1 {unit}")
+        } else {
+            write!(f, "{} {unit}s", self.count)
+        }
+    }
+}
+
+impl std::str::FromStr for Retention {
+    type Err = String;
+
+    /// `<count> <unit>`, the unit singular or plural, in any case.
+    fn from_str(text: &str) -> Result<Self, String> {
+        let wrong = || {
+            format!(
+                "`{text}` is not a retention period: write a positive count and a unit, such as \
+                 `6 months` or `1 year`, or leave `retention` out for INFINITE"
+            )
+        };
+        let mut words = text.split_whitespace();
+        let (Some(count), Some(unit), None) = (words.next(), words.next(), words.next()) else {
+            return Err(wrong());
+        };
+        let count: u32 = count.parse().map_err(|_| wrong())?;
+        if count == 0 {
+            return Err(wrong());
+        }
+        // Singular or plural, and nothing else: one `s` at most.
+        let lower = unit.to_ascii_lowercase();
+        let unit = match lower.strip_suffix('s').unwrap_or(&lower) {
+            "day" => RetentionUnit::Day,
+            "week" => RetentionUnit::Week,
+            "month" => RetentionUnit::Month,
+            "year" => RetentionUnit::Year,
+            _ => return Err(wrong()),
+        };
+        Ok(Retention { count, unit })
+    }
 }
 
 /// A table layout other than the default (see [`Table::clustered`]).
@@ -1058,6 +1190,64 @@ mod tests {
                 storage_parameters: Default::default(),
             }),
             ..Default::default()
+        }
+    }
+
+    /// A period's columns are the engine's to write on every change to a
+    /// row, so no declared row writes them (#1176).
+    #[test]
+    fn a_period_column_is_not_a_row_column() {
+        let mut t = sample();
+        for c in ["valid_from", "valid_to"] {
+            t.columns
+                .insert(c.into(), Column::new(ty("datetime2(7)")).not_null());
+        }
+        let row_columns = |t: &Table| -> Vec<String> {
+            t.row_columns("customer_id")
+                .map(|(c, _)| c.clone())
+                .collect()
+        };
+        // Negative first: without a period they are ordinary columns.
+        assert_eq!(row_columns(&t), ["email", "valid_from", "valid_to"]);
+        t.system_time = Some(SystemTime {
+            start: "valid_from".into(),
+            end: "valid_to".into(),
+            hidden: false,
+            versioning: None,
+        });
+        assert_eq!(row_columns(&t), ["email"]);
+    }
+
+    /// A retention period reads in either number and any case, is written
+    /// back singular for one and plural otherwise, and anything the engine
+    /// would refuse, zero included, is refused here (#1176).
+    #[test]
+    fn a_retention_period_reads_both_numbers_and_refuses_what_the_engine_does() {
+        for (text, count, unit, written) in [
+            ("6 months", 6, RetentionUnit::Month, "6 months"),
+            ("1 MONTH", 1, RetentionUnit::Month, "1 month"),
+            ("1 days", 1, RetentionUnit::Day, "1 day"),
+            ("  3   Weeks ", 3, RetentionUnit::Week, "3 weeks"),
+            ("10 year", 10, RetentionUnit::Year, "10 years"),
+        ] {
+            let r: Retention = text.parse().unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(r, Retention { count, unit }, "{text}");
+            assert_eq!(r.to_string(), written, "{text}");
+            assert_eq!(written.parse::<Retention>(), Ok(r), "{text}");
+        }
+        for text in [
+            "0 days",
+            "-1 days",
+            "months",
+            "6",
+            "six months",
+            "6 fortnights",
+            "6 months ago",
+            "6 monthss",
+            "1 dayss",
+            "",
+        ] {
+            assert!(text.parse::<Retention>().is_err(), "{text:?}");
         }
     }
 

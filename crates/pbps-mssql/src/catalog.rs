@@ -56,7 +56,8 @@ pub(crate) fn is_ours(name: &pbps_model::TableName) -> bool {
 const TABLES: &str = "\
 SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type,
        CONVERT(bit, CASE WHEN p.object_id IS NULL THEN 0 ELSE 1 END) AS has_period,
-       t.ledger_type, t.is_dropped_ledger_table, t.ledger_view_id
+       t.ledger_type, t.is_dropped_ledger_table, t.ledger_view_id,
+       {temporal}
   FROM sys.tables t
   JOIN sys.schemas s ON s.schema_id = t.schema_id
   LEFT JOIN sys.periods p ON p.object_id = t.object_id
@@ -74,7 +75,8 @@ const PRE_LEDGER_TABLES: &str = "\
 SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type,
        CONVERT(bit, CASE WHEN p.object_id IS NULL THEN 0 ELSE 1 END) AS has_period,
        CONVERT(tinyint, 0) AS ledger_type, CONVERT(bit, 0) AS is_dropped_ledger_table,
-       CONVERT(int, NULL) AS ledger_view_id
+       CONVERT(int, NULL) AS ledger_view_id,
+       {temporal}
   FROM sys.tables t
   JOIN sys.schemas s ON s.schema_id = t.schema_id
   LEFT JOIN sys.periods p ON p.object_id = t.object_id
@@ -91,7 +93,11 @@ const LEGACY_TABLES: &str = "\
 SELECT t.object_id, s.name AS schema_name, t.name AS table_name,
        CONVERT(tinyint, 0) AS temporal_type, CONVERT(bit, 0) AS has_period,
        CONVERT(tinyint, 0) AS ledger_type, CONVERT(bit, 0) AS is_dropped_ledger_table,
-       CONVERT(int, NULL) AS ledger_view_id
+       CONVERT(int, NULL) AS ledger_view_id,
+       CONVERT(int, NULL) AS history_table_id,
+       CONVERT(int, NULL) AS retention_period, CONVERT(int, NULL) AS retention_unit,
+       CONVERT(sysname, NULL) AS period_start, CONVERT(sysname, NULL) AS period_end,
+       CONVERT(tinyint, NULL) AS min_compression, CONVERT(tinyint, NULL) AS max_compression
   FROM sys.tables t
   JOIN sys.schemas s ON s.schema_id = t.schema_id
  WHERE t.is_ms_shipped = 0
@@ -100,23 +106,71 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name,
                 IN (N'__pbps_state|', N'__pbps_lock|'))
  ORDER BY s.name, t.name;";
 
+/// What a system-versioned table needs read beside it (#1176): its history,
+/// retention, period columns, and its rows' compression, which a history
+/// table is held to (DEC-1176.1). `{retention}` is the two retention columns,
+/// which SQL Server added in 2017: a 2016 server is asked for neither, and
+/// keeps every history row, which is what INFINITE (-1) says.
+const TEMPORAL_COLUMNS: &str = "\
+t.history_table_id,
+       {retention},
+       COL_NAME(p.object_id, p.start_column_id) AS period_start,
+       COL_NAME(p.object_id, p.end_column_id) AS period_end,
+       (SELECT MIN(pa.data_compression) FROM sys.partitions pa
+         WHERE pa.object_id = t.object_id AND pa.index_id IN (0, 1)) AS min_compression,
+       (SELECT MAX(pa.data_compression) FROM sys.partitions pa
+         WHERE pa.object_id = t.object_id AND pa.index_id IN (0, 1)) AS max_compression";
+
 /// `has_ledger` is the server's own answer to whether `sys.tables` carries
 /// the ledger columns, not a guess from the banner: Azure SQL Edge says
 /// "Azure" on a 15.x engine without them, and Azure SQL Database says 12.x on
-/// one with them.
-fn tables_query(product_version: &str, edition: &str, has_ledger: bool) -> String {
+/// one with them. `has_retention` is the same answer for the history
+/// retention columns (2017).
+fn tables_query(
+    product_version: &str,
+    edition: &str,
+    has_ledger: bool,
+    has_retention: bool,
+) -> String {
+    let retention = if has_retention {
+        "t.history_retention_period AS retention_period, \
+         t.history_retention_period_unit AS retention_unit"
+    } else {
+        "CONVERT(int, -1) AS retention_period, CONVERT(int, -1) AS retention_unit"
+    };
+    let temporal = TEMPORAL_COLUMNS.replace("{retention}", retention);
     if has_ledger {
-        return TABLES.to_owned();
+        return TABLES.replace("{temporal}", &temporal);
     }
+    if has_temporal(product_version, edition) {
+        PRE_LEDGER_TABLES.replace("{temporal}", &temporal)
+    } else {
+        LEGACY_TABLES.to_owned()
+    }
+}
+
+/// Whether the server has `sys.periods`, `sys.tables.temporal_type` and the
+/// temporal columns of `sys.columns`: SQL Server 2016 (13.x) and later, and
+/// every Azure SQL, whatever its banner says.
+fn has_temporal(product_version: &str, edition: &str) -> bool {
     let major = product_version
         .split('.')
         .next()
         .and_then(|v| v.parse::<u32>().ok());
-    if !edition.to_ascii_lowercase().contains("azure") && major.is_some_and(|v| v < 13) {
-        LEGACY_TABLES.to_owned()
-    } else {
-        PRE_LEDGER_TABLES.to_owned()
-    }
+    edition.to_ascii_lowercase().contains("azure") || !major.is_some_and(|v| v < 13)
+}
+
+/// [`COLUMNS`], with the temporal columns of `sys.columns` where the server
+/// has them (2016 and later); an older one has no period to read.
+fn columns_query(temporal: bool) -> String {
+    COLUMNS.replace(
+        "{generated}",
+        if temporal {
+            "c.generated_always_type, c.is_hidden"
+        } else {
+            "CONVERT(tinyint, 0) AS generated_always_type, CONVERT(bit, 0) AS is_hidden"
+        },
+    )
 }
 
 const COLUMNS: &str = "\
@@ -134,7 +188,9 @@ SELECT c.object_id, c.name, ty.name AS type_name,
        -- A computed column's expression and whether it is stored (#1174).
        -- The definition is NULL where the reader may not see it.
        cc.definition AS computed_definition,
-       CONVERT(bit, ISNULL(cc.is_persisted, 0)) AS computed_persisted
+       CONVERT(bit, ISNULL(cc.is_persisted, 0)) AS computed_persisted,
+       -- A period's columns, and anything else the engine writes (#1176).
+       {generated}
   FROM sys.columns c
   JOIN sys.types ty ON ty.user_type_id = c.user_type_id
   LEFT JOIN sys.computed_columns cc
@@ -341,7 +397,9 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
                 CONVERT(nvarchar(128), SERVERPROPERTY('Edition')) AS edition,
                 CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')) AS db_collation,
                 CONVERT(bit, CASE WHEN COL_LENGTH('sys.tables', 'ledger_type') IS NULL
-                                  THEN 0 ELSE 1 END) AS has_ledger;",
+                                  THEN 0 ELSE 1 END) AS has_ledger,
+                CONVERT(bit, CASE WHEN COL_LENGTH('sys.tables', 'history_retention_period')
+                                       IS NULL THEN 0 ELSE 1 END) AS has_retention;",
         )
         .await?;
     let version = versions
@@ -351,7 +409,12 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
         get(version, "version")?,
         get(version, "edition")?,
         get(version, "has_ledger")?,
+        get(version, "has_retention")?,
     );
+    let columns = columns_query(has_temporal(
+        get(version, "version")?,
+        get(version, "edition")?,
+    ));
     raw.database_collation = get::<&str>(version, "db_collation")?.to_owned();
     for row in conn.query(&tables).await? {
         raw.tables.push(RawTable {
@@ -363,10 +426,18 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             ledger_type: get(&row, "ledger_type")?,
             is_dropped_ledger_table: get(&row, "is_dropped_ledger_table")?,
             ledger_view_id: opt(&row, "ledger_view_id")?,
+            history_table_id: opt(&row, "history_table_id")?,
+            retention: opt::<i32>(&row, "retention_period")?
+                .zip(opt::<i32>(&row, "retention_unit")?),
+            period: opt::<&str>(&row, "period_start")?
+                .map(str::to_owned)
+                .zip(opt::<&str>(&row, "period_end")?.map(str::to_owned)),
+            compression: opt::<u8>(&row, "min_compression")?
+                .zip(opt::<u8>(&row, "max_compression")?),
         });
     }
 
-    for row in conn.query(COLUMNS).await? {
+    for row in conn.query(&columns).await? {
         let seed: Option<i64> = opt(&row, "seed")?;
         let increment: Option<i64> = opt(&row, "increment")?;
         raw.columns.push(RawColumn {
@@ -386,6 +457,8 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             collation: opt::<&str>(&row, "collation_name")?.map(str::to_owned),
             computed_definition: opt::<&str>(&row, "computed_definition")?.map(str::to_owned),
             computed_persisted: get(&row, "computed_persisted")?,
+            generated_always_type: get(&row, "generated_always_type")?,
+            is_hidden: get(&row, "is_hidden")?,
         });
     }
 
@@ -1515,11 +1588,18 @@ mod tests {
     #[test]
     fn old_servers_are_not_asked_for_a_temporal_catalog_column() {
         for version in ["10.50.6000.34", "11.0.7001.0", "12.0.6024.0"] {
-            let query = tables_query(version, "Developer Edition", false);
+            let query = tables_query(version, "Developer Edition", false, false);
             assert!(!query.contains("t.temporal_type"), "{query}");
             assert!(!query.contains("sys.periods"), "{query}");
             assert!(query.contains("CONVERT(tinyint, 0) AS temporal_type"));
             assert!(query.contains("CONVERT(bit, 0) AS has_period"));
+            // Nor for any column the history and period reads add (#1176).
+            for column in ["history_table_id", "start_column_id", "is_hidden"] {
+                assert!(!query.contains(&format!("t.{column}")), "{query}");
+            }
+            let columns = columns_query(has_temporal(version, "Developer Edition"));
+            assert!(!columns.contains("c.generated_always_type"), "{columns}");
+            assert!(!columns.contains("c.is_hidden"), "{columns}");
         }
         for (version, edition) in [
             ("13.0.1601.5", "Developer Edition"),
@@ -1528,10 +1608,35 @@ mod tests {
             ("unknown", "Developer Edition"),
         ] {
             for has_ledger in [false, true] {
-                let query = tables_query(version, edition, has_ledger);
+                let query = tables_query(version, edition, has_ledger, has_ledger);
                 assert!(query.contains("t.temporal_type"));
                 assert!(query.contains("sys.periods"));
+                assert!(query.contains("t.history_table_id"));
             }
+            let columns = columns_query(has_temporal(version, edition));
+            assert!(columns.contains("c.generated_always_type"), "{columns}");
+            assert!(columns.contains("c.is_hidden"), "{columns}");
+        }
+    }
+
+    /// Retention arrived in 2017: a 2016 server is not asked for it, and
+    /// reads as INFINITE, which is what it keeps (#1176).
+    #[test]
+    fn only_a_server_with_history_retention_is_asked_for_it() {
+        let query = tables_query("13.0.1601.5", "Developer Edition", false, false);
+        assert!(!query.contains("t.history_retention_period"), "{query}");
+        assert!(
+            query.contains("CONVERT(int, -1) AS retention_period"),
+            "{query}"
+        );
+        for has_ledger in [false, true] {
+            let query = tables_query("14.0.1000.169", "Developer Edition", has_ledger, true);
+            assert!(query.contains("t.history_retention_period AS"), "{query}");
+            assert!(
+                query.contains("t.history_retention_period_unit AS"),
+                "{query}"
+            );
+            assert!(!query.contains("{"), "an unfilled placeholder: {query}");
         }
     }
 
@@ -1547,7 +1652,7 @@ mod tests {
             ("12.0.2000.8", "SQL Azure"),
             ("unknown", "Developer Edition"),
         ] {
-            let query = tables_query(version, edition, false);
+            let query = tables_query(version, edition, false, false);
             for column in [
                 "t.ledger_type",
                 "t.is_dropped_ledger_table",
@@ -1562,7 +1667,7 @@ mod tests {
             ("17.0.4075.5", "Enterprise Developer Edition (64-bit)"),
             ("12.0.2000.8", "SQL Azure"),
         ] {
-            let query = tables_query(version, edition, true);
+            let query = tables_query(version, edition, true, true);
             assert!(query.contains("t.ledger_type"), "{version}");
             assert!(query.contains("t.is_dropped_ledger_table"), "{version}");
             assert!(query.contains("t.ledger_view_id"), "{version}");

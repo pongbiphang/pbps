@@ -16,7 +16,7 @@ use pbps_model::{
 
 use crate::dto::{
     ClusteredDto, DataDto, ModuleDto, PrimaryKeyDto, ReplicaIdentityDto, RoleDto, StorageValueDto,
-    TableDto, UniqueDto, ValueDto,
+    SystemTimeDto, TableDto, UniqueDto, ValueDto,
 };
 use crate::error::{LoadError, SourceFile, to_span};
 
@@ -418,6 +418,57 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
         &mut errs,
     );
 
+    let system_time = dto.system_time.and_then(|st| {
+        let SystemTimeDto {
+            period: [start, end],
+            hidden,
+            versioning,
+        } = *st;
+        let versioning = match versioning {
+            None => None,
+            Some(v) => {
+                let history = TableName::from_str(v.history.value.trim()).map_err(|e| {
+                    LoadError::semantic(
+                        src,
+                        to_span(&v.history.defined),
+                        format!("invalid history table: {e}"),
+                        "not a `schema.table` name",
+                    )
+                });
+                let retention = v
+                    .retention
+                    .as_ref()
+                    .map(|r| {
+                        r.value.parse::<pbps_model::Retention>().map_err(|e| {
+                            LoadError::semantic(
+                                src,
+                                to_span(&r.defined),
+                                e.clone(),
+                                "not a retention period",
+                            )
+                        })
+                    })
+                    .transpose();
+                match (history, retention) {
+                    (Ok(history), Ok(retention)) => {
+                        Some(pbps_model::SystemVersioning { history, retention })
+                    }
+                    (history, retention) => {
+                        errs.extend(history.err());
+                        errs.extend(retention.err());
+                        return None;
+                    }
+                }
+            }
+        };
+        Some(pbps_model::SystemTime {
+            start,
+            end,
+            hidden,
+            versioning,
+        })
+    });
+
     match (name, errs.is_empty()) {
         (Some(name), true) => Ok(LoadedTable {
             name,
@@ -458,6 +509,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                 }),
                 storage_parameters,
                 unlogged: dto.unlogged,
+                system_time,
             },
             intents,
             strategy: dto.strategy.map(|s| Strategy { online: s.online }),

@@ -1867,7 +1867,9 @@ fn pull_reports_system_versioning_without_declaring_either_temporal_table() {
              valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
              valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
              PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
-         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));",
+         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));
+         -- A history layout of its own leaves the pair out (#1176).
+         CREATE INDEX ix_extra ON dbo.versioned_history (id);",
     );
     let d = Demo::new("temporal-pull");
     for table in ["versioned", "plain"] {
@@ -1883,7 +1885,7 @@ fn pull_reports_system_versioning_without_declaring_either_temporal_table() {
         assert!(
             warnings
                 .lines()
-                .any(|line| line.contains(name) && line.contains("system versioning")),
+                .any(|line| line.contains(name) && line.contains("history table")),
             "{warnings}"
         );
         assert!(!d.dir.join("schema").join(format!("{name}.yml")).exists());
@@ -2447,6 +2449,299 @@ fn computed_columns_round_trip_and_change_through_the_cli() {
         stderr(&o).contains("computed column dbo.t.doubled may read `a`"),
         "{}",
         stderr(&o)
+    );
+}
+
+/// A system-versioned table goes the whole way through the CLI (#1176).
+/// `pull` declares its period and its history, with no file for the history;
+/// the next connected plan is empty; a bootstrap onto a database where the
+/// history's name is taken is refused by name; `bootstrap` onto an empty one
+/// rebuilds the pair, whose history then keeps a replaced row, and a second
+/// `pull` writes the same file. A change to the table is refused by name,
+/// offline, before anything runs.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_system_versioned_table_round_trips_through_the_cli() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let source = OwnDatabase::new(&server, "temporal1176_src");
+    let target = OwnDatabase::new(&server, "temporal1176_dst");
+    let taken = OwnDatabase::new(&server, "temporal1176_taken");
+    on_server(
+        source.connection(),
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, v int NULL,
+             vf datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (vf, vt))
+         WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.t_history,
+                                       HISTORY_RETENTION_PERIOD = 3 DAYS));
+         INSERT dbo.t (id, v) VALUES (1, 5);
+         UPDATE dbo.t SET v = 6 WHERE id = 1;",
+    );
+    // Columns the history's would match, and the clustered index a finite
+    // retention needs: the engine would adopt it, rows and all.
+    on_server(
+        taken.connection(),
+        "CREATE TABLE dbo.t_history (id int NOT NULL, v int NULL,
+             vf datetime2 NOT NULL, vt datetime2 NOT NULL);
+         CREATE CLUSTERED INDEX ix_t_history ON dbo.t_history (vt, vf);",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let file = |d: &Demo| std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
+
+    let d = Demo::new("temporal1176");
+    ok(&d.run(&["pull", "--db", source.connection()]));
+    let pulled = file(&d);
+    assert!(
+        pulled.contains(
+            "\nsystem_time:\n  period: [vf, vt]\n  versioning:\n    history: dbo.t_history\n    retention: 3 days\n"
+        ),
+        "{pulled}"
+    );
+    assert!(!d.dir.join("schema/dbo.t_history.yml").exists());
+    d.commit();
+    ok(&d.run(&["baseline", "--db", source.connection(), "--reason", "adopt"]));
+    let o = d.run(&["plan", "--db", source.connection()]);
+    ok(&o);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+
+    let refused = d.run(&["bootstrap", "--db", taken.connection()]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("dbo.t names dbo.t_history as its history table"),
+        "{}",
+        stderr(&refused)
+    );
+    on_server(
+        taken.connection(),
+        "IF OBJECT_ID('dbo.t') IS NOT NULL THROW 50000, 'bootstrap ran', 1;",
+    );
+
+    ok(&d.run(&["bootstrap", "--db", target.connection()]));
+    on_server(
+        target.connection(),
+        "INSERT dbo.t (id, v) VALUES (1, 5);
+         UPDATE dbo.t SET v = 6 WHERE id = 1;
+         IF (SELECT COUNT(*) FROM dbo.t_history WHERE v = 5) <> 1
+             THROW 50000, 'no history kept', 1;
+         IF (SELECT history_retention_period FROM sys.tables WHERE name = 't') <> 3
+             THROW 50000, 'retention not kept', 1;",
+    );
+    let again = Demo::new("temporal1176-again");
+    ok(&again.run(&["pull", "--db", target.connection()]));
+    assert_eq!(file(&again), file(&d));
+
+    // Negative: a column added to it is refused by name before anything
+    // connects, rather than planned with history side effects.
+    let path = d.dir.join("schema/dbo.t.yml");
+    let added = pulled.replacen("  vf:\n", "  note:\n    type: int\n  vf:\n", 1);
+    assert_ne!(added, pulled, "{pulled}");
+    std::fs::write(&path, added).unwrap();
+    let o = d.run(&["plan"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("dbo.t has `system_time`"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// A table made at a history's name after `plan --db` and before `apply` is
+/// refused under the lock, before anything runs, by a transactional apply and
+/// a staged one alike: SQL Server would take it as the history, rows and all,
+/// and the closing read would fold it into the pair (#1501 review).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_history_name_taken_after_the_plan_is_refused_at_apply() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "temporal1176_late");
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.base (id int NOT NULL CONSTRAINT pk_base PRIMARY KEY);",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("temporal1176-late");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    std::fs::write(
+        d.dir.join("schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  vf: {type: datetime2(7), nullable: false}\n  vt: {type: datetime2(7), nullable: false}\n\nprimary_key: [id]\n\nsystem_time:\n  period: [vf, vt]\n  versioning:\n    history: dbo.t_history\n",
+    )
+    .unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = |name: &str, staged: bool| {
+        let path = d.dir.join(name);
+        let mut args = vec![
+            "plan",
+            "--db",
+            own.connection(),
+            "--out",
+            path.to_str().unwrap(),
+        ];
+        if staged {
+            args.push("--staged");
+        }
+        ok(&d.run(&args));
+        path
+    };
+    let transactional = plan("plan.json", false);
+    let staged = plan("staged.json", true);
+    // Now, and adoptable: matching columns, and a clustered index.
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.t_history (id int NOT NULL, vf datetime2 NOT NULL, vt datetime2 NOT NULL);
+         CREATE CLUSTERED INDEX ix_t_history ON dbo.t_history (vt, vf);
+         INSERT dbo.t_history VALUES (7, '2000-01-01', '2001-01-01');",
+    );
+    for (path, extra) in [(&transactional, None), (&staged, Some("--staged"))] {
+        let checksum = plan_checksum(path);
+        let mut args = vec![
+            "apply",
+            "--db",
+            own.connection(),
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        args.extend(extra);
+        let refused = d.run(&args);
+        assert_ne!(code(&refused), 0, "{extra:?}: {}", stdout(&refused));
+        assert!(
+            stderr(&refused).contains("dbo.t names dbo.t_history as its history table"),
+            "{extra:?}: {}",
+            stderr(&refused)
+        );
+        on_server(
+            own.connection(),
+            "IF OBJECT_ID('dbo.t') IS NOT NULL THROW 50000, 'the table was created', 1;
+             IF (SELECT temporal_type FROM sys.tables WHERE name = 't_history') <> 0
+                 THROW 50000, 'the table was adopted', 1;",
+        );
+    }
+}
+
+/// A table that appears at a history's name after every check before the
+/// statements, and before the history is renamed to it, is never taken as
+/// the history: the history is created under the engine's own name and
+/// renamed, and the rename onto a taken name fails, taking the `CREATE` back
+/// with it, in a transactional apply and in a staged one, whose statements
+/// commit one by one (#1501 review). A database DDL trigger stands in for the
+/// other session: it fires inside the statement's own transaction when the
+/// engine creates `dbo.t`, ahead of the renames.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_history_taken_over_mid_apply_rolls_the_plan_back() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "temporal1176_race");
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.base (id int NOT NULL CONSTRAINT pk_base PRIMARY KEY);",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("temporal1176-race");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    std::fs::write(
+        d.dir.join("schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  vf: {type: datetime2(7), nullable: false}\n  vt: {type: datetime2(7), nullable: false}\n\nprimary_key: [id]\n\nsystem_time:\n  period: [vf, vt]\n  versioning:\n    history: dbo.t_history\n",
+    )
+    .unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    // A transactional apply, and a staged one, whose statements commit one
+    // by one: the history's renames must not leave the `CREATE` behind.
+    for staged in [false, true] {
+        let path = d.dir.join(if staged { "staged.json" } else { "plan.json" });
+        let mut args = vec![
+            "plan",
+            "--db",
+            own.connection(),
+            "--out",
+            path.to_str().unwrap(),
+        ];
+        if staged {
+            args.push("--staged");
+        }
+        ok(&d.run(&args));
+        on_server(
+            own.connection(),
+            "CREATE TRIGGER tr_sneak ON DATABASE FOR CREATE_TABLE AS
+             IF EVENTDATA().value('(/EVENT_INSTANCE/ObjectName)[1]', 'sysname') = N't'
+             BEGIN
+                 CREATE TABLE dbo.t_history (id int NOT NULL, vf datetime2 NOT NULL,
+                                             vt datetime2 NOT NULL);
+                 -- The layout the engine would build, so the read-back alone
+                 -- cannot tell it from the statement's own.
+                 CREATE CLUSTERED INDEX ix_t_history ON dbo.t_history (vt, vf)
+                     WITH (DATA_COMPRESSION = PAGE);
+                 INSERT dbo.t_history VALUES (7, '2000-01-01', '2001-01-01');
+             END;",
+        );
+        let checksum = plan_checksum(&path);
+        let mut args = vec![
+            "apply",
+            "--db",
+            own.connection(),
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        if staged {
+            args.push("--staged");
+        }
+        let refused = d.run(&args);
+        on_server(own.connection(), "DROP TRIGGER tr_sneak ON DATABASE;");
+        assert_ne!(code(&refused), 0, "staged {staged}: {}", stdout(&refused));
+        assert!(
+            stderr(&refused).contains("'t_history' is already in use"),
+            "staged {staged}: {}",
+            stderr(&refused)
+        );
+        // Nothing is left: not the table, not an engine-named history, and
+        // not the trigger's table, which ran in the statement's transaction.
+        on_server(
+            own.connection(),
+            "IF OBJECT_ID('dbo.t') IS NOT NULL OR OBJECT_ID('dbo.t_history') IS NOT NULL
+                 OR EXISTS (SELECT 1 FROM sys.tables WHERE name LIKE 'MSSQL_TemporalHistoryFor%')
+                 THROW 50000, 'the CREATE was left behind', 1;",
+        );
+    }
+}
+
+/// A history's schema is held to the database's spelling before bootstrap
+/// runs, like a table's (#1501 review). Without that, the history was created
+/// in `Hist`, read back so, and the recorded state already differed from the
+/// declaration.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_history_schema_the_database_spells_otherwise_is_refused() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "temporal1176_spelt");
+    on_server(own.connection(), "CREATE SCHEMA Hist;");
+    let d = Demo::new("temporal1176-spelt");
+    std::fs::write(
+        d.dir.join("schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  vf: {type: datetime2(7), nullable: false}\n  vt: {type: datetime2(7), nullable: false}\n\nprimary_key: [id]\n\nsystem_time:\n  period: [vf, vt]\n  versioning:\n    history: hist.t_history\n",
+    )
+    .unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+    let refused = d.run(&["bootstrap", "--db", own.connection()]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused)
+            .contains("`hist` (the schema of `dbo.t`'s history table) is written `Hist`"),
+        "{}",
+        stderr(&refused)
+    );
+    on_server(
+        own.connection(),
+        "IF OBJECT_ID('dbo.t') IS NOT NULL THROW 50000, 'bootstrap ran', 1;",
     );
 }
 

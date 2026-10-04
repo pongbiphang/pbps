@@ -1621,7 +1621,9 @@ async fn omitted_character_columns_do_not_request_a_bootstrap_collation() {
                  valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
                  valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
                  PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
-             ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));",
+             ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));
+             -- A history layout of its own leaves the pair out (#1176).
+             CREATE INDEX ix_extra ON dbo.versioned_history (id);",
         )
         .await
         .expect("create character columns only in omitted temporal/history tables");
@@ -1679,7 +1681,7 @@ async fn omitted_character_columns_do_not_request_a_bootstrap_collation() {
         for name in ["versioned", "versioned_history"] {
             assert!(pulled.limitations.iter().any(|limitation| {
                 limitation.target.object_name() == TableName::new("dbo", name)
-                    && limitation.detail.contains("system versioning")
+                    && limitation.detail.contains("history table")
             }));
         }
         assert_eq!(pulled.warnings.len(), pulled.limitations.len());
@@ -1968,6 +1970,253 @@ async fn index_types(conn: &mut Conn, table: &str) -> std::collections::BTreeMap
         )
     })
     .collect()
+}
+
+/// A system-versioned table and its history are read as one table and
+/// rebuilt in an empty database from the declaration alone, with versioning
+/// on, its retention, and the history layout the engine builds; a row
+/// updated on the rebuild lands in its history (#1176). A pair whose history
+/// has a layout of its own, and anything bound to a history, stay out by
+/// name.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn system_versioned_tables_round_trip_through_an_empty_database() {
+    let mut db = TestDb::create("temporal1176").await;
+    for statement in [
+        "CREATE SCHEMA hist;",
+        "CREATE TABLE dbo.parent (id int NOT NULL CONSTRAINT pk_parent PRIMARY KEY);",
+        "CREATE TABLE dbo.named (
+             id int NOT NULL CONSTRAINT pk_named PRIMARY KEY,
+             v nvarchar(20) NULL,
+             -- A key the plan creates beside the table (#1501 review).
+             parent_id int NULL CONSTRAINT fk_named_parent REFERENCES dbo.parent (id),
+             vf datetime2 GENERATED ALWAYS AS ROW START
+                 CONSTRAINT df_named_vf DEFAULT SYSUTCDATETIME() NOT NULL,
+             vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (vf, vt)
+         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = hist.named_history,
+                                         HISTORY_RETENTION_PERIOD = 6 MONTHS));",
+        "CREATE TABLE dbo.anon (
+             id int NOT NULL CONSTRAINT pk_anon PRIMARY KEY,
+             vf datetime2(3) GENERATED ALWAYS AS ROW START HIDDEN NOT NULL,
+             vt datetime2(3) GENERATED ALWAYS AS ROW END HIDDEN NOT NULL,
+             PERIOD FOR SYSTEM_TIME (vf, vt)
+         ) WITH (SYSTEM_VERSIONING = ON);",
+        "CREATE TABLE dbo.period_only (
+             id int NOT NULL CONSTRAINT pk_period_only PRIMARY KEY,
+             vf datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (vf, vt)
+         );",
+        // Two pairs whose history is not the engine's own layout.
+        "CREATE TABLE dbo.indexed (
+             id int NOT NULL CONSTRAINT pk_indexed PRIMARY KEY,
+             vf datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (vf, vt)
+         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.indexed_history));",
+        "CREATE INDEX ix_extra ON dbo.indexed_history (id);",
+        "CREATE TABLE dbo.heap_history (id int NOT NULL, vf datetime2 NOT NULL,
+                                        vt datetime2 NOT NULL);",
+        "CREATE TABLE dbo.heaped (
+             id int NOT NULL CONSTRAINT pk_heaped PRIMARY KEY,
+             vf datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (vf, vt)
+         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.heap_history));",
+        "CREATE VIEW dbo.v_named AS SELECT id, v FROM dbo.named;",
+        "CREATE VIEW dbo.v_named_history AS SELECT id, v FROM hist.named_history;",
+    ] {
+        db.conn.execute(statement).await.expect(statement);
+    }
+    let engine_named: String = db
+        .conn
+        .query("SELECT OBJECT_NAME(history_table_id) AS h FROM sys.tables WHERE name = 'anon';")
+        .await
+        .expect("read the engine-named history")[0]
+        .try_get::<&str>("h")
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    assert!(
+        engine_named.starts_with("MSSQL_TemporalHistoryFor_"),
+        "{engine_named}"
+    );
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect temporal tables");
+    db.drop().await;
+
+    let table = |name: &str| &pulled.schema.tables[&TableName::new("dbo", name)];
+    let st = |name: &str| table(name).system_time.clone().expect(name);
+    assert_eq!(
+        st("named"),
+        pbps_model::SystemTime {
+            start: "vf".into(),
+            end: "vt".into(),
+            hidden: false,
+            versioning: Some(pbps_model::SystemVersioning {
+                history: TableName::new("hist", "named_history"),
+                retention: Some("6 months".parse().unwrap()),
+            }),
+        }
+    );
+    assert!(table("named").columns["vf"].default.is_some());
+    assert!(!table("named").columns["vf"].nullable);
+    assert!(st("anon").hidden);
+    assert_eq!(
+        st("anon").versioning.map(|v| (v.history, v.retention)),
+        Some((TableName::new("dbo", &engine_named), None))
+    );
+    assert!(
+        pulled
+            .onboarding_notices
+            .iter()
+            .any(|n| n.contains(&engine_named) && n.contains("explicitly")),
+        "{:?}",
+        pulled.onboarding_notices
+    );
+    assert_eq!(st("period_only").versioning, None);
+    // A history is never a table of its own.
+    for history in [
+        TableName::new("hist", "named_history"),
+        TableName::new("dbo", &engine_named),
+    ] {
+        assert!(!pulled.schema.tables.contains_key(&history), "{history}");
+    }
+    // A history of its own layout keeps its pair out, both named.
+    for (name, says) in [
+        ("indexed", "has an index other than `ix_indexed_history`"),
+        ("indexed_history", "the history table of dbo.indexed"),
+        ("heaped", "has no clustered index"),
+        ("heap_history", "the history table of dbo.heaped"),
+    ] {
+        assert!(
+            !pulled
+                .schema
+                .tables
+                .contains_key(&TableName::new("dbo", name))
+        );
+        assert!(
+            pulled.limitations.iter().any(|l| {
+                l.target.object_name() == TableName::new("dbo", name) && l.detail.contains(says)
+            }),
+            "{name}: {:?}",
+            pulled.limitations
+        );
+    }
+    assert_eq!(pulled.limitations.len(), 4, "{:?}", pulled.limitations);
+    // A view of the table is the table's; a view of its history is not.
+    let views: Vec<String> = pulled
+        .schema
+        .modules
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(views, ["dbo.v_named"]);
+    assert!(
+        pulled.unmanaged_modules.iter().any(|m| {
+            m.target.object_name() == TableName::new("dbo", "v_named_history")
+                && m.why.contains("temporal")
+        }),
+        "{:?}",
+        pulled.unmanaged_modules
+    );
+
+    // Rebuilt in an empty database from the declaration alone.
+    let mut schema = pulled.schema.clone();
+    schema.modules.clear();
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+    let bootstrap = plan(&Schema::default(), &IdsFile::default(), &schema, &ids);
+    let mut target = TestDb::create("temporal1176_target").await;
+    // pbps creates no schema: the history's is the operator's, like a
+    // table's, and `doctor` asks for it.
+    target
+        .conn
+        .execute("CREATE SCHEMA hist;")
+        .await
+        .expect("create the history's schema");
+    try_apply(&mut target.conn, &bootstrap)
+        .await
+        .unwrap_or_else(|e| panic!("bootstrap refused: {e}"));
+    let again = pbps_mssql::catalog::introspect(&mut target.conn)
+        .await
+        .expect("introspect the rebuild");
+    let replan = plan(&again.schema, &ids, &schema, &ids);
+    // The engine's own reading of the rebuild, not only the reader's.
+    let catalog: Vec<(String, u8, String, i32, String)> = target
+        .conn
+        .query(
+            "SELECT t.name, t.temporal_type, ISNULL(OBJECT_SCHEMA_NAME(t.history_table_id) + '.'
+                    + OBJECT_NAME(t.history_table_id), N'-') AS h,
+                    ISNULL(t.history_retention_period, 0) AS rp,
+                    ISNULL((SELECT TOP 1 i.name FROM sys.indexes i
+                             WHERE i.object_id = t.history_table_id), N'-') AS ix
+               FROM sys.tables t WHERE t.temporal_type <> 1 ORDER BY t.name;",
+        )
+        .await
+        .expect("read the rebuilt pairs")
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<&str>("name").unwrap().unwrap().to_owned(),
+                row.try_get::<u8>("temporal_type").unwrap().unwrap(),
+                row.try_get::<&str>("h").unwrap().unwrap().to_owned(),
+                row.try_get::<i32>("rp").unwrap().unwrap(),
+                row.try_get::<&str>("ix").unwrap().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    // A replaced row lands in the history, under the engine's period.
+    for statement in [
+        "INSERT INTO dbo.named (id, v) VALUES (1, N'one');",
+        "UPDATE dbo.named SET v = N'uno' WHERE id = 1;",
+    ] {
+        target.conn.execute(statement).await.expect(statement);
+    }
+    // Counted in the history itself: an insert and an update within one
+    // tick of the clock leave a history row of zero length, which `FOR
+    // SYSTEM_TIME ALL` does not return.
+    let versions = target
+        .conn
+        .query(
+            "SELECT (SELECT COUNT(*) FROM hist.named_history WHERE v = N'one') AS kept,
+                    (SELECT COUNT(*) FROM dbo.named WHERE v = N'uno') AS now;",
+        )
+        .await
+        .expect("read the versions");
+    let counts = (
+        versions[0].try_get::<i32>("kept").unwrap().unwrap(),
+        versions[0].try_get::<i32>("now").unwrap().unwrap(),
+    );
+    target.drop().await;
+
+    assert!(again.limitations.is_empty(), "{:?}", again.limitations);
+    assert_eq!(again.schema, schema);
+    assert!(replan.changes.is_empty(), "{replan:?}");
+    let pair = |name: &str| catalog.iter().find(|c| c.0 == name).cloned().unwrap();
+    assert_eq!(
+        pair("named"),
+        (
+            "named".into(),
+            2,
+            "hist.named_history".into(),
+            6,
+            "ix_named_history".into()
+        )
+    );
+    assert_eq!(
+        pair("anon"),
+        (
+            "anon".into(),
+            2,
+            format!("dbo.{engine_named}"),
+            -1,
+            format!("ix_{engine_named}")
+        )
+    );
+    assert_eq!(pair("period_only").1, 0);
+    assert_eq!(counts, (1, 1));
 }
 
 /// #1186 found a key's backing index layout was never read, so bootstrap
@@ -3168,6 +3417,9 @@ async fn the_clustered_index_moves_between_objects_and_keeps_the_rows() {
     );
 }
 
+/// A versioned pair the reader cannot hold stays out, its history with it,
+/// and so does everything bound to either; a period with versioning off is
+/// held, and its old history is an ordinary table (#1176).
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
@@ -3184,6 +3436,8 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
              valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
              PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
          ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));
+         -- A history layout of its own leaves the pair out (#1176).
+         CREATE INDEX ix_extra ON dbo.versioned_history (id);
          CREATE TABLE dbo.disabled (
              id int NOT NULL PRIMARY KEY,
              valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
@@ -3248,7 +3502,16 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
         .expect("introspect temporal catalog");
     db.drop().await;
 
-    assert_eq!(pulled.schema.tables.len(), 2);
+    // A period with versioning off is held since #1176; its old history is
+    // an ordinary table.
+    assert_eq!(pulled.schema.tables.len(), 3);
+    assert_eq!(
+        pulled.schema.tables[&TableName::new("dbo", "disabled")]
+            .system_time
+            .as_ref()
+            .map(|st| st.versioning.is_none()),
+        Some(true)
+    );
     assert!(
         pulled
             .schema
@@ -3270,21 +3533,19 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
         matches!(&history.clustered, Some(Clustered::Index(n)) if history.indexes.contains_key(n)),
         "{history:?}"
     );
-    assert_eq!(pulled.limitations.len(), 6, "{:?}", pulled.limitations);
-    assert_eq!(pulled.schema.modules.len(), 1);
-    assert!(
-        pulled
-            .schema
-            .modules
-            .contains_key(&"dbo.plain.tr_plain".parse().unwrap())
-    );
-    assert_eq!(pulled.unmanaged_modules.len(), 7);
-    for trigger in ["tr_disabled", "tr_versioned"] {
-        assert!(pulled.unmanaged_modules.iter().any(|module| {
-            module.target.object_name() == TableName::new("dbo", trigger)
-                && module.why.contains("system versioning")
-        }));
-    }
+    assert_eq!(pulled.limitations.len(), 5, "{:?}", pulled.limitations);
+    let modules: Vec<String> = pulled
+        .schema
+        .modules
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(modules, ["dbo.disabled.tr_disabled", "dbo.plain.tr_plain"]);
+    assert_eq!(pulled.unmanaged_modules.len(), 6);
+    assert!(pulled.unmanaged_modules.iter().any(|module| {
+        module.target.object_name() == TableName::new("dbo", "tr_versioned")
+            && module.why.contains("system versioning")
+    }));
     for view in ["v_versioned", "v_versioned_chain"] {
         assert!(pulled.unmanaged_modules.iter().any(|module| {
             module.target.object_name() == TableName::new("dbo", view)
@@ -3301,20 +3562,16 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
                 && module.why.contains("create-time-bound dependency")
         }));
     }
-    for name in ["disabled", "versioned", "versioned_history"] {
+    for name in ["versioned", "versioned_history"] {
         assert!(
             pulled.limitations.iter().any(|l| {
                 l.target.object_name() == TableName::new("dbo", name)
-                    && l.detail.contains("system versioning")
+                    && l.detail.contains("history table")
             }),
             "{:?}",
             pulled.limitations
         );
     }
-    assert!(pulled.limitations.iter().any(|limitation| {
-        limitation.target.object_name() == TableName::new("dbo", "disabled")
-            && limitation.detail.contains("PERIOD FOR SYSTEM_TIME")
-    }));
     assert!(pulled.limitations.iter().any(|limitation| {
         limitation.target.object_name() == TableName::new("dbo", "plain")
             && limitation.detail.contains("fk_plain_versioned")

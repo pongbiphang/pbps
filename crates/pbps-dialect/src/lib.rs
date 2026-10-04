@@ -2633,6 +2633,107 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
     problems
 }
 
+/// Whether a system-versioned table's history (#1176) takes a name something
+/// else in the declaration holds: another table's history, or any object the
+/// engine keeps beside tables. That is a table, a module of a kind that shares
+/// the namespace, and, where constraints share it too, a named constraint.
+/// The history is a table in the database, in the schema's one namespace,
+/// though no declaration lists it as one, so its creation would meet the other
+/// object mid-apply.
+///
+/// Not a generated default's names (#1501 review): of the two
+/// [`Dialect::generated_constraint_names`] gives, `CREATE TABLE` takes the
+/// first and only a later rename the fallback, so reserving both refuses a
+/// valid plan. A default already parked at either is the connected walk's.
+pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+    // Every name the declaration puts in that namespace, with what holds it.
+    let mut held: BTreeMap<TableName, String> = BTreeMap::new();
+    for name in schema.tables.keys() {
+        held.insert(name.clone(), "a table".to_owned());
+    }
+    for (id, module) in &schema.modules {
+        if dialect.shares_namespace_with_tables(module.kind) {
+            held.insert(id.object_name(), format!("a {}", module.kind));
+        }
+    }
+    if dialect.constraints_share_namespace_with_tables() {
+        for (table_name, table) in &schema.tables {
+            let named = table
+                .primary_key
+                .iter()
+                .filter_map(|pk| pk.name.clone())
+                .chain(table.unique.keys().cloned())
+                .chain(table.foreign_keys.keys().cloned())
+                .chain(table.checks.keys().cloned());
+            for name in named {
+                held.insert(
+                    TableName::new(table_name.schema.clone(), name),
+                    format!("a constraint of `{table_name}`"),
+                );
+            }
+        }
+    }
+    let mut problems = Vec::new();
+    let mut histories: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+    for (table, versioning) in schema.tables.iter().filter_map(|(name, t)| {
+        t.system_time
+            .as_ref()
+            .and_then(|st| st.versioning.as_ref())
+            .map(|v| (name, v))
+    }) {
+        let history = &versioning.history;
+        if let Some(what) = held.get(history) {
+            problems.push(format!(
+                "`{table}` names `{history}` as its history table, which is also declared as \
+                 {what}; {} keeps them in one namespace per schema, and the history is created \
+                 with `{table}`, so name it something else",
+                dialect.name()
+            ));
+        }
+        if let Some(first) = histories.insert(history, table) {
+            problems.push(format!(
+                "`{first}` and `{table}` both name `{history}` as their history table; each \
+                 system-versioned table needs its own"
+            ));
+        }
+    }
+    problems
+}
+
+/// An `INSTEAD OF` trigger declared on a system-versioned table (#1176):
+/// SQL Server refuses one there (13569), and takes an `AFTER` trigger, or
+/// either kind on a table with a period alone (measured on 17.0). The
+/// trigger's timing is the first of `FOR`, `AFTER` or `INSTEAD` in its code,
+/// which is where a definition starts after any `WITH` options.
+pub fn check_system_time_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (id, module) in &schema.modules {
+        let ModuleId::Trigger { on, name } = id else {
+            continue;
+        };
+        let versioned = schema
+            .tables
+            .get(on)
+            .and_then(|t| t.system_time.as_ref())
+            .is_some_and(|st| st.versioning.is_some());
+        if !versioned {
+            continue;
+        }
+        let code = dialect.code_only(&module.definition).to_ascii_uppercase();
+        let timing = code
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .find(|word| matches!(*word, "FOR" | "AFTER" | "INSTEAD"));
+        if timing == Some("INSTEAD") {
+            problems.push(format!(
+                "trigger `{name}` on `{on}` is INSTEAD OF, which {} refuses on a \
+                 system-versioned table; make it AFTER, or leave `versioning` out",
+                dialect.name()
+            ));
+        }
+    }
+    problems
+}
+
 /// The whole-schema question of whether a declared index, or the index behind
 /// a named primary key or unique constraint, collides with another relation
 /// in its schema — a third case of the namespace-sharing rule 201 moved to
@@ -3744,6 +3845,128 @@ mod tests {
             schema.modules.insert(id.parse().unwrap(), module(*kind));
         }
         schema
+    }
+
+    /// A history table takes a name in the schema's namespace although no
+    /// declaration lists it as a table: a declared table, another table's
+    /// history, or a module sharing that namespace under the same name is
+    /// refused, and a history named apart from all of them is not (#1176).
+    #[test]
+    fn a_history_name_something_else_holds_is_refused() {
+        let versioned = |history: &str| Table {
+            system_time: Some(pbps_model::SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: false,
+                versioning: Some(pbps_model::SystemVersioning {
+                    history: history.parse().unwrap(),
+                    retention: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut schema = schema_with(&[("app.v", ModuleKind::View)], &["app.other"]);
+        schema
+            .tables
+            .insert("app.a".parse().unwrap(), versioned("hist.a_history"));
+        assert!(
+            check_history_names(&schema, &MinimalDialect).is_empty(),
+            "{:?}",
+            check_history_names(&schema, &MinimalDialect)
+        );
+        // A period alone has no history to collide.
+        let mut period_only = versioned("app.other");
+        period_only.system_time.as_mut().unwrap().versioning = None;
+        schema.tables.insert("app.p".parse().unwrap(), period_only);
+        assert!(check_history_names(&schema, &MinimalDialect).is_empty());
+        // A named constraint takes a name there too, where the engine says so.
+        schema
+            .tables
+            .get_mut(&"app.other".parse().unwrap())
+            .unwrap()
+            .checks
+            .insert(
+                "ck_other".into(),
+                pbps_model::CheckConstraint {
+                    expression: "1 = 1".into(),
+                },
+            );
+        assert!(check_history_names(&schema, &MinimalDialect).is_empty());
+        for (history, says) in [
+            ("app.other", "also declared as a table"),
+            ("hist.a_history", "both name `hist.a_history`"),
+            ("app.v", "also declared as a view"),
+            (
+                "app.ck_other",
+                "also declared as a constraint of `app.other`",
+            ),
+        ] {
+            let mut clash = schema.clone();
+            clash
+                .tables
+                .insert("app.b".parse().unwrap(), versioned(history));
+            let problems = check_history_names(&clash, &MinimalDialect);
+            assert!(
+                problems.len() == 1 && problems[0].contains(says),
+                "{history}: {problems:?}"
+            );
+        }
+    }
+
+    /// An INSTEAD OF trigger is refused on a versioned table, by its timing
+    /// in code and not by a word in a comment, and an AFTER trigger, or one on
+    /// a table with a period alone, is not (#1176).
+    #[test]
+    fn an_instead_of_trigger_is_refused_only_on_a_versioned_table() {
+        let table = |versioned: bool| Table {
+            system_time: Some(pbps_model::SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: false,
+                versioning: versioned.then(|| pbps_model::SystemVersioning {
+                    history: "app.t_history".parse().unwrap(),
+                    retention: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        let with_trigger = |versioned: bool, definition: &str| {
+            let mut schema = Schema::default();
+            schema
+                .tables
+                .insert("app.t".parse().unwrap(), table(versioned));
+            schema.modules.insert(
+                ModuleId::Trigger {
+                    on: "app.t".parse().unwrap(),
+                    name: "tr".into(),
+                },
+                Module {
+                    definition: definition.into(),
+                    ..module(ModuleKind::Trigger)
+                },
+            );
+            check_system_time_triggers(&schema, &MinimalDialect)
+        };
+        for definition in [
+            "INSTEAD OF INSERT AS SELECT 1",
+            "instead  of delete as select 1",
+            "WITH EXECUTE AS OWNER INSTEAD OF UPDATE AS SELECT 1",
+        ] {
+            let problems = with_trigger(true, definition);
+            assert!(
+                problems.len() == 1 && problems[0].contains("is INSTEAD OF"),
+                "{definition}: {problems:?}"
+            );
+            assert!(with_trigger(false, definition).is_empty(), "{definition}");
+        }
+        for definition in [
+            "AFTER INSERT AS SELECT 1",
+            "FOR UPDATE AS SELECT 1 -- not INSTEAD OF",
+            "AFTER DELETE AS SELECT 'INSTEAD OF'",
+            "/* INSTEAD OF */ AFTER INSERT AS SELECT 1",
+        ] {
+            assert!(with_trigger(true, definition).is_empty(), "{definition}");
+        }
     }
 
     /// Whether a module competes with a table for its name is the engine's

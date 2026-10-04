@@ -1152,3 +1152,13 @@ table, which is what every table an older reader recorded was: it left an
 unlogged one out as a limitation, and no recorder accepts a managed table
 carrying one. An older build reading a version 21 plan would create the
 table permanent.
+
+<a id="dec-1176-2"></a>
+
+**DEC-1176.2. State version 18 adds a table's `system_time` and still reads 6
+to 17; plan version 23 turns 22 away.** An absent `system_time` is an ordinary
+table. Every table an older reader recorded was one, because that reader left
+a table with a period or system versioning out as a limitation. An older build
+reading a version 23 plan would create an ordinary table, without its period
+or history.
+

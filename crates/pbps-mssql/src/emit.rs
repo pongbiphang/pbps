@@ -1524,6 +1524,17 @@ fn column_definition(
     name: &str,
     column: &Column,
 ) -> Result<String, DialectError> {
+    generated_column_definition(table, name, column, None)
+}
+
+/// [`column_definition`], with a `GENERATED ALWAYS AS …` clause where the
+/// column is a period's (#1176): after the type, before the nullability.
+fn generated_column_definition(
+    table: &TableName,
+    name: &str,
+    column: &Column,
+    generated: Option<&str>,
+) -> Result<String, DialectError> {
     let mut s = format!(
         "{} {}{}",
         quote(name)?,
@@ -1532,6 +1543,10 @@ fn column_definition(
     );
     if let Some(id) = column.identity {
         s.push_str(&format!(" IDENTITY({},{})", id.seed, id.increment));
+    }
+    if let Some(generated) = generated {
+        s.push(' ');
+        s.push_str(generated);
     }
     s.push(' ');
     s.push_str(null_clause(column.nullable));
@@ -1715,6 +1730,48 @@ fn computed_definition(
     ))
 }
 
+/// The history named as declared, in the batch that created it under the
+/// engine's own name (#1176, #1501 review).
+///
+/// Not `HISTORY_TABLE = <name>`: given an existing table whose columns match,
+/// that takes it as the history, rows and all, and no check before the
+/// statement closes the window another session has until it runs. The name
+/// the engine chooses, `MSSQL_TemporalHistoryFor_<object_id>`, is the new
+/// table's own and cannot be taken; it is moved to the declared schema, then
+/// renamed, with its index, to the declared names. A name that is taken there
+/// fails the rename (15335), and the plan with it. Measured on 17.0: the
+/// history and its `ix_` index take both renames and the transfer while
+/// versioning is on, in one transaction.
+fn history_rename(table: &TableName, history: &TableName) -> Result<String, DialectError> {
+    let mut sql = format!(
+        "\nDECLARE @pbps_history sysname = (SELECT OBJECT_NAME(history_table_id) \
+         FROM sys.tables WHERE object_id = OBJECT_ID({}));\nDECLARE @pbps_object nvarchar(max);",
+        literal(&qualified(table)?)
+    );
+    if history.schema != table.schema {
+        sql.push_str(&format!(
+            "\nSET @pbps_object = {} + QUOTENAME(@pbps_history) + N';';\n\
+             EXEC sys.sp_executesql @pbps_object;",
+            literal(&format!(
+                "ALTER SCHEMA {} TRANSFER {}.",
+                quote(&history.schema)?,
+                quote(&table.schema)?
+            ))
+        ));
+    }
+    sql.push_str(&format!(
+        "\nSET @pbps_object = {} + QUOTENAME(@pbps_history);\n\
+         EXEC sys.sp_rename @pbps_object, {}, N'OBJECT';\n\
+         SET @pbps_object = {} + QUOTENAME(N'ix_' + @pbps_history);\n\
+         EXEC sys.sp_rename @pbps_object, {}, N'INDEX';",
+        literal(&format!("{}.", quote(&history.schema)?)),
+        literal(&history.name),
+        literal(&format!("{}.", qualified(history)?)),
+        literal(&format!("ix_{}", history.name)),
+    ));
+    Ok(sql)
+}
+
 fn create_table(name: &TableName, table: &Table) -> Sql {
     if table.columns.is_empty() {
         return Err(DialectError::Invalid {
@@ -1726,7 +1783,25 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
 
     let mut body: Vec<String> = Vec::new();
     for (col_name, column) in &table.columns {
-        body.push(column_definition(name, col_name, column)?);
+        let generated = table.system_time.as_ref().and_then(|st| {
+            let edge = if *col_name == st.start {
+                "START"
+            } else if *col_name == st.end {
+                "END"
+            } else {
+                return None;
+            };
+            Some(format!(
+                "GENERATED ALWAYS AS ROW {edge}{}",
+                if st.hidden { " HIDDEN" } else { "" }
+            ))
+        });
+        body.push(generated_column_definition(
+            name,
+            col_name,
+            column,
+            generated.as_deref(),
+        )?);
     }
     // After the columns they read, and where an `ADD` would put them: at the
     // end, so a table created here and one changed in place agree on where a
@@ -1740,11 +1815,45 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
     if let Some(pk) = &table.primary_key {
         body.push(primary_key_clause(pk, table.primary_key_is_clustered())?);
     }
+    // In the same statement as the history: the engine builds the history's
+    // layout itself, and that layout is the only one the model holds
+    // (#1176, DEC-1176.1).
+    let mut with = String::new();
+    let mut rename = String::new();
+    if let Some(st) = &table.system_time {
+        body.push(format!(
+            "PERIOD FOR SYSTEM_TIME ({}, {})",
+            quote(&st.start)?,
+            quote(&st.end)?
+        ));
+        if let Some(v) = &st.versioning {
+            let retention = match &v.retention {
+                None => String::new(),
+                Some(r) => format!(
+                    " (HISTORY_RETENTION_PERIOD = {} {})",
+                    r.count,
+                    r.unit.keyword()
+                ),
+            };
+            with = format!(" WITH (SYSTEM_VERSIONING = ON{retention})");
+            rename = history_rename(name, &v.history)?;
+        }
+    }
 
-    let mut out = vec![Statement::new(format!(
-        "CREATE TABLE {qualified_name} (\n    {}\n);",
+    let create = format!(
+        "CREATE TABLE {qualified_name} (\n    {}\n){with};",
         body.join(",\n    ")
-    ))];
+    );
+    // The renames and the `CREATE` stand or fall together: a staged apply
+    // runs each statement outside a transaction, and a rename that failed
+    // there would leave the table and its engine-named history committed
+    // with no checkpoint for them (#1501 review). Its own batch, for its
+    // variables.
+    let mut out = vec![if rename.is_empty() {
+        Statement::new(create)
+    } else {
+        Statement::new(atomically(&format!("{create}{rename}"))).own_batch()
+    }];
 
     // The clustered constraint or index first, if another object is the
     // clustered one: the table is empty, so the order costs nothing today,
@@ -2101,6 +2210,98 @@ mod tests {
             computed: stored,
         });
         assert_eq!(dropped, ["ALTER TABLE [dbo].[t] DROP COLUMN [c];"]);
+    }
+
+    /// A table with `system_time` is created in one statement with its
+    /// period columns `GENERATED ALWAYS`, its period, and its versioning and
+    /// retention, so the engine builds the history's layout itself; a period
+    /// alone has no `WITH`, and an ordinary table neither (#1176).
+    #[test]
+    fn a_system_versioned_table_is_created_in_one_statement() {
+        let mut t = Table::default();
+        t.columns
+            .insert("id".into(), Column::new(ty("int")).not_null());
+        for c in ["vf", "vt"] {
+            t.columns
+                .insert(c.into(), Column::new(ty("datetime2(3)")).not_null());
+        }
+        t.columns.get_mut("vf").unwrap().default = Some("SYSUTCDATETIME()".into());
+        let create = |t: &Table| {
+            sql_of(&Change::CreateTable {
+                uid: uid("t_k7x2mq"),
+                name: tname("dbo.t"),
+                table: Box::new(t.clone()),
+            })
+        };
+        // Negative first: an ordinary table says none of it.
+        let plain = create(&t);
+        assert!(
+            !plain[0].contains("GENERATED")
+                && !plain[0].contains("PERIOD")
+                && !plain[0].contains("WITH"),
+            "{}",
+            plain[0]
+        );
+        t.system_time = Some(pbps_model::SystemTime {
+            start: "vf".into(),
+            end: "vt".into(),
+            hidden: true,
+            versioning: Some(pbps_model::SystemVersioning {
+                history: tname("hist.t_history"),
+                retention: Some("6 months".parse().unwrap()),
+            }),
+        });
+        let sql = create(&t);
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        // One transaction of its own, which a staged apply needs (#1501).
+        assert!(
+            sql[0].starts_with("BEGIN TRANSACTION;\nBEGIN TRY\nCREATE TABLE")
+                && sql[0].contains("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;"),
+            "{}",
+            sql[0]
+        );
+        for part in [
+            "[vf] datetime2(3) GENERATED ALWAYS AS ROW START HIDDEN NOT NULL CONSTRAINT",
+            "[vt] datetime2(3) GENERATED ALWAYS AS ROW END HIDDEN NOT NULL",
+            "PERIOD FOR SYSTEM_TIME ([vf], [vt])",
+            ") WITH (SYSTEM_VERSIONING = ON (HISTORY_RETENTION_PERIOD = 6 MONTH));",
+            // Created under the engine's name, which nothing can hold, then
+            // moved and renamed: never adopted (#1501 review).
+            "OBJECT_ID(N'[dbo].[t]')",
+            "SET @pbps_object = N'ALTER SCHEMA [hist] TRANSFER [dbo].' + QUOTENAME(@pbps_history) + N';';",
+            "SET @pbps_object = N'[hist].' + QUOTENAME(@pbps_history);",
+            "EXEC sys.sp_rename @pbps_object, N't_history', N'OBJECT';",
+            "SET @pbps_object = N'[hist].[t_history].' + QUOTENAME(N'ix_' + @pbps_history);",
+            "EXEC sys.sp_rename @pbps_object, N'ix_t_history', N'INDEX';",
+        ] {
+            assert!(sql[0].contains(part), "{part}: {}", sql[0]);
+        }
+        assert!(!sql[0].contains("HISTORY_TABLE"), "{}", sql[0]);
+        assert!(!sql[0].contains("[id] int GENERATED"), "{}", sql[0]);
+        // INFINITE is the engine's default, and not spelled.
+        // A history in the table's own schema is renamed and not moved.
+        let st = t.system_time.as_mut().unwrap();
+        st.hidden = false;
+        let v = st.versioning.as_mut().unwrap();
+        v.retention = None;
+        v.history = tname("dbo.t_history");
+        let sql = create(&t);
+        assert!(
+            sql[0].contains("GENERATED ALWAYS AS ROW START NOT NULL")
+                && sql[0].contains(") WITH (SYSTEM_VERSIONING = ON);")
+                && sql[0].contains("N't_history', N'OBJECT'")
+                && !sql[0].contains("ALTER SCHEMA"),
+            "{}",
+            sql[0]
+        );
+        // The period alone: no versioning, no `WITH`.
+        t.system_time.as_mut().unwrap().versioning = None;
+        let sql = create(&t);
+        assert!(
+            sql[0].contains("PERIOD FOR SYSTEM_TIME") && !sql[0].contains("WITH"),
+            "{}",
+            sql[0]
+        );
     }
 
     /// A key's layout is always spelled, because a bare `PRIMARY KEY` beside

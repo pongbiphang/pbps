@@ -513,6 +513,9 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
             errs.push(e);
         }
     }
+    if let Some(st) = &table.system_time {
+        errs.extend(system_time(name, table, st));
+    }
 
     let mut identity_columns = Vec::new();
     for (col_name, col) in &table.columns {
@@ -935,6 +938,122 @@ enum Computed {
 }
 
 /// The checks shared by every construct that builds a key out of columns.
+/// What the engine takes for `PERIOD FOR SYSTEM_TIME` and its history
+/// (#1176, measured on 17.0): two distinct `datetime2` columns, not nullable,
+/// the engine's to write. A default is accepted, and kept.
+fn system_time(name: &TableName, table: &Table, st: &pbps_model::SystemTime) -> Vec<DialectError> {
+    let mut errs = Vec::new();
+    if st.start == st.end {
+        errs.push(invalid(format!(
+            "`system_time` names `{}` as both the start and the end of its period; name two \
+             columns",
+            st.start
+        )));
+    }
+    for (role, column) in [("start", &st.start), ("end", &st.end)] {
+        let Some(col) = table.columns.get(column) else {
+            errs.push(invalid(format!(
+                "`system_time` names `{column}` as its period's {role}, but no column of that \
+                 name is declared; declare it under `columns:` as `datetime2`, not nullable"
+            )));
+            continue;
+        };
+        // The engine refuses any other type, `datetime` too (Msg 13501).
+        if col.ty.base != "datetime2" {
+            errs.push(invalid(format!(
+                "column `{column}` is the period's {role}, which SQL Server requires to be \
+                 `datetime2`, not `{}`",
+                col.ty
+            )));
+        }
+        if col.nullable {
+            errs.push(invalid(format!(
+                "column `{column}` is the period's {role}, which is never NULL; declare it \
+                 `nullable: false`"
+            )));
+        }
+        if col.identity.is_some() {
+            errs.push(invalid(format!(
+                "column `{column}` is the period's {role}, which the engine writes, so it \
+                 cannot also be an identity"
+            )));
+        }
+    }
+    // One precision for both: the engine refuses two (13513), and reads an
+    // omitted one as 7 (measured on 17.0).
+    let precision = |column: &str| {
+        table.columns.get(column).map(|c| match c.ty.args.first() {
+            Some(pbps_model::TypeArg::Int(p)) => *p,
+            _ => 7,
+        })
+    };
+    if let (Some(start), Some(end)) = (precision(&st.start), precision(&st.end))
+        && start != end
+    {
+        errs.push(invalid(format!(
+            "the period's columns `{}` and `{}` are `datetime2({start})` and `datetime2({end})`, \
+             and SQL Server requires one precision for both",
+            st.start, st.end
+        )));
+    }
+    // Every write to a row writes history, and the period's columns are the
+    // engine's: rows are not this slice's to manage (#1177).
+    if table.data.is_some() {
+        errs.push(invalid(
+            "a table with `system_time` cannot declare `data:` rows yet: every row written \
+             also writes its period and its history",
+        ));
+    }
+    if let Some(v) = &st.versioning {
+        // A period alone needs none (measured on 17.0).
+        if table.primary_key.is_none() {
+            errs.push(invalid(
+                "a system-versioned table must have a primary key (SQL Server refuses it \
+                 otherwise, 13553); declare one, or leave `versioning` out for the period alone",
+            ));
+        }
+        for part in [&v.history.schema, &v.history.name] {
+            if let Err(e) = ident::quote(part) {
+                errs.push(e);
+            }
+        }
+        if &v.history == name {
+            errs.push(invalid(format!(
+                "`system_time` names `{name}` itself as its history table; name another table"
+            )));
+        }
+        // Its index is `ix_` and the name, which the engine cuts at 127
+        // characters (measured on 17.0): a longer name has no index name it
+        // could read back as the engine's own. Counted as `sysname` counts,
+        // in UTF-16 units, as `ident::quote` does: an emoji is two.
+        if v.history.name.encode_utf16().count() > 124 {
+            errs.push(invalid(format!(
+                "history table `{}` has a name longer than 124 characters (UTF-16 units, as \
+                 SQL Server counts them), which leaves its index, `ix_` and the name, no room in \
+                 SQL Server's 128; name it shorter",
+                v.history
+            )));
+        }
+        // The engine keeps history for at most 1000 years, in any unit
+        // (13749 beyond, measured on 17.0 by bisection).
+        if let Some(r) = &v.retention {
+            let most = match r.unit {
+                pbps_model::RetentionUnit::Day => 365_242,
+                pbps_model::RetentionUnit::Week => 52_177,
+                pbps_model::RetentionUnit::Month => 12_000,
+                pbps_model::RetentionUnit::Year => 1_000,
+            };
+            if r.count > most {
+                errs.push(invalid(format!(
+                    "a history retention of {r} is longer than SQL Server keeps: at most 1000 \
+                     years, which is {most} in this unit"
+                )));
+            }
+        }
+    }
+    errs
+}
+
 fn key_columns(
     what: &str,
     columns: &[String],
@@ -1205,6 +1324,163 @@ mod tests {
             refused.iter().any(|m| m.contains("`unlogged`")),
             "{refused:?}"
         );
+    }
+
+    /// A period and its history are validated as the engine would take them
+    /// (#1176, measured on 17.0): two distinct declared `datetime2` columns,
+    /// not nullable, no identity; no `data:` rows; a history other than the
+    /// table itself. Each is refused by name, and a valid one is clean.
+    #[test]
+    fn a_period_is_held_to_what_sql_server_takes() {
+        use pbps_model::{SystemTime, SystemVersioning};
+        let valid = || {
+            let mut table = Table::default();
+            table
+                .columns
+                .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+            for c in ["vf", "vt"] {
+                table.columns.insert(
+                    c.into(),
+                    Column::new("datetime2(7)".parse().unwrap()).not_null(),
+                );
+            }
+            table.primary_key = Some(pbps_model::PrimaryKey {
+                name: Some("pk_t".into()),
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            });
+            // A default on a period column is accepted by the engine, and kept.
+            table.columns.get_mut("vf").unwrap().default = Some("SYSUTCDATETIME()".into());
+            table.system_time = Some(SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: true,
+                versioning: Some(SystemVersioning {
+                    history: "hist.t_history".parse().unwrap(),
+                    retention: Some("6 months".parse().unwrap()),
+                }),
+            });
+            table
+        };
+        let found = |t: &Table| {
+            super::table(&"dbo.t".parse().unwrap(), t)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        fn st(t: &mut Table) -> &mut SystemTime {
+            t.system_time.as_mut().unwrap()
+        }
+        assert!(found(&valid()).is_empty(), "{:?}", found(&valid()));
+        // An omitted precision is 7, the same as a declared one.
+        let mut bare = valid();
+        bare.columns.get_mut("vf").unwrap().ty = "datetime2".parse().unwrap();
+        assert!(found(&bare).is_empty(), "{:?}", found(&bare));
+        // A name of 124 UTF-16 units leaves `ix_` room, in emoji too.
+        let mut paired = valid();
+        st(&mut paired).versioning.as_mut().unwrap().history =
+            TableName::new("hist", "\u{1F600}".repeat(62));
+        assert!(found(&paired).is_empty(), "{:?}", found(&paired));
+        // A name of 124 characters leaves `ix_` room.
+        let mut longest = valid();
+        st(&mut longest).versioning.as_mut().unwrap().history =
+            TableName::new("hist", "h".repeat(124));
+        assert!(found(&longest).is_empty(), "{:?}", found(&longest));
+        // A period alone needs no key.
+        let mut period_only = valid();
+        period_only.primary_key = None;
+        st(&mut period_only).versioning = None;
+        assert!(found(&period_only).is_empty(), "{:?}", found(&period_only));
+        // The longest retention the engine takes, in each unit, is valid.
+        for longest in ["365242 days", "52177 weeks", "12000 months", "1000 years"] {
+            let mut t = valid();
+            st(&mut t).versioning.as_mut().unwrap().retention = Some(longest.parse().unwrap());
+            assert!(found(&t).is_empty(), "{longest}: {:?}", found(&t));
+        }
+        type Break = fn(&mut Table);
+        let cases: [(Break, &str); 14] = [
+            (|t| st(t).end = "vf".into(), "as both the start and the end"),
+            (|t| st(t).end = "missing".into(), "no column of that name"),
+            (
+                |t| t.columns.get_mut("vt").unwrap().ty = "datetime".parse().unwrap(),
+                "`datetime2`, not `datetime`",
+            ),
+            (
+                |t| t.columns.get_mut("vf").unwrap().nullable = true,
+                "declare it `nullable: false`",
+            ),
+            (
+                |t| {
+                    t.columns.get_mut("vf").unwrap().identity = Some(pbps_model::Identity {
+                        seed: 1,
+                        increment: 1,
+                    })
+                },
+                "cannot also be an identity",
+            ),
+            (
+                |t| {
+                    t.data = Some(pbps_model::TableData {
+                        mode: pbps_model::DataMode::Exact,
+                        rows: Default::default(),
+                    })
+                },
+                "cannot declare `data:` rows",
+            ),
+            (
+                |t| st(t).versioning.as_mut().unwrap().history = "dbo.t".parse().unwrap(),
+                "itself as its history table",
+            ),
+            (
+                |t| {
+                    st(t).versioning.as_mut().unwrap().retention =
+                        Some("365243 days".parse().unwrap())
+                },
+                "longer than SQL Server keeps",
+            ),
+            (|t| t.primary_key = None, "must have a primary key"),
+            (
+                |t| {
+                    st(t).versioning.as_mut().unwrap().history =
+                        TableName::new("hist", "h".repeat(125))
+                },
+                "longer than 124 characters",
+            ),
+            (
+                |t| {
+                    st(t).versioning.as_mut().unwrap().history =
+                        TableName::new("hist", "\u{1F600}".repeat(63))
+                },
+                "longer than 124 characters",
+            ),
+            (
+                |t| t.columns.get_mut("vt").unwrap().ty = "datetime2(3)".parse().unwrap(),
+                "requires one precision for both",
+            ),
+            (
+                |t| {
+                    st(t).versioning.as_mut().unwrap().retention =
+                        Some("2147483648 days".parse().unwrap())
+                },
+                "which is 365242 in this unit",
+            ),
+            (
+                |t| {
+                    st(t).versioning.as_mut().unwrap().history =
+                        TableName::new("hist", "a]b".repeat(60))
+                },
+                "",
+            ),
+        ];
+        for (break_it, says) in cases {
+            let mut t = valid();
+            break_it(&mut t);
+            let refused = found(&t);
+            assert!(
+                !refused.is_empty() && refused.iter().any(|m| m.contains(says)),
+                "{says}: {refused:?}"
+            );
+        }
     }
 
     /// A GIN method or an operator class is PostgreSQL's, and is refused on

@@ -543,10 +543,11 @@ pub(crate) fn transferred_tables(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
         .collect()
 }
 
-/// The `sys.objects` names this plan creates on SQL Server: its tables, and
-/// the modules it creates that it does not also drop. A module dropped and
-/// created in one plan is a rebuild, and its name is already its own. A
-/// trigger's object is in its table's schema.
+/// The `sys.objects` names this plan creates on SQL Server: its tables, a
+/// system-versioned table's history (#1176), and the modules it creates that
+/// it does not also drop. A module dropped and created in one plan is a
+/// rebuild, and its name is already its own. A trigger's object is in its
+/// table's schema.
 // The complement is every change that creates no object name.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn created_object_names(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
@@ -561,10 +562,17 @@ pub(crate) fn created_object_names(cs: &pbps_model::ChangeSet) -> Vec<TableName>
         .collect();
     cs.changes
         .iter()
-        .filter_map(|p| match &p.change {
-            Change::CreateTable { name, .. } => Some(name.clone()),
-            Change::CreateModule { id, .. } if !dropped.contains(id) => Some(module_object(id)),
-            _ => None,
+        .flat_map(|p| match &p.change {
+            Change::CreateTable { name, table, .. } => {
+                let history = table
+                    .system_time
+                    .as_ref()
+                    .and_then(|st| st.versioning.as_ref())
+                    .map(|v| v.history.clone());
+                std::iter::once(name.clone()).chain(history).collect()
+            }
+            Change::CreateModule { id, .. } if !dropped.contains(id) => vec![module_object(id)],
+            _ => Vec::new(),
         })
         .collect()
 }
@@ -1240,6 +1248,14 @@ impl<'f> Walk<'f> {
             }
             Change::CreateTable { name, table, .. } => {
                 self.claim(step, object(name, "user table"));
+                // The history is created by the same statement (#1176).
+                if let Some(v) = table
+                    .system_time
+                    .as_ref()
+                    .and_then(|st| st.versioning.as_ref())
+                {
+                    self.claim(step, object(&v.history, "user table"));
+                }
                 // Its own constraints and generated defaults take their names
                 // with it, for whatever the plan creates after.
                 for (column, spec) in &table.columns {
@@ -1700,6 +1716,96 @@ fn pinned_scopes(recorded: &DataScopes, planned: &DataScopes) -> DataScopes {
     out
 }
 
+/// The history names a plan's `CREATE TABLE`s take that something in the
+/// database still holds when that `CREATE` runs (#1176): each table, its
+/// history, and the occupant. Ordered as the `sys.objects` walk orders the
+/// plan, so an object the plan drops or renames away first frees the name, as
+/// it does at plan time (#1501 review).
+fn blocking_history_occupants<'a>(
+    cs: &pbps_model::ChangeSet,
+    held: &'a [pbps_mssql::catalog::NameOccupant],
+) -> Vec<(TableName, TableName, &'a pbps_mssql::catalog::NameOccupant)> {
+    let histories: BTreeMap<&TableName, &TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::CreateTable { name, table, .. } = &p.change {
+                let v = table.system_time.as_ref()?.versioning.as_ref()?;
+                Some((&v.history, name))
+            } else {
+                None
+            }
+        })
+        .collect();
+    held.iter()
+        .filter_map(|o| {
+            let table = histories.get(&o.wanted)?;
+            let facts = NameFacts::new(std::slice::from_ref(o), &[]);
+            let mut walk = Walk::new(&facts);
+            walk.run(&cs.changes);
+            (!walk.is_clear()).then(|| ((*table).clone(), o.wanted.clone(), o))
+        })
+        .collect()
+}
+
+/// Refuses a plan whose `CREATE TABLE` names, as a system-versioned table's
+/// history, a name the database still holds when it runs (#1176). Not left
+/// to the engine: given an existing table whose columns match, SQL Server
+/// takes it as the history, rows, layout and all, where any other `CREATE`
+/// would be refused (measured on 17.0).
+async fn refuse_taken_history_names(
+    conn: &mut Conn,
+    cs: &pbps_model::ChangeSet,
+    label: &str,
+) -> anyhow::Result<()> {
+    if conn.driver() != pbps_db::Driver::Mssql {
+        return Ok(());
+    }
+    let names: Vec<TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::CreateTable { table, .. } = &p.change {
+                Some(
+                    table
+                        .system_time
+                        .as_ref()?
+                        .versioning
+                        .as_ref()?
+                        .history
+                        .clone(),
+                )
+            } else {
+                None
+            }
+        })
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    let held = pbps_mssql::catalog::object_name_occupants(conn, &names, &[]).await?;
+    let taken: Vec<String> = blocking_history_occupants(cs, &held)
+        .into_iter()
+        .map(|(table, history, o)| {
+            format!(
+                "{table} names {history} as its history table, and the database already has {} \
+                 `{}`",
+                o.kind, o.name
+            )
+        })
+        .collect();
+    if taken.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "`{label}` already holds {} history table name(s) this plan would create:\n  {}\n\
+         SQL Server would take an existing table whose columns match as the history, with its \
+         rows, rather than refuse. Drop or rename that object, or name another history table.",
+        taken.len(),
+        taken.join("\n  ")
+    );
+}
+
 /// Refuses, before anything runs, a role name another database principal
 /// holds: users, roles and application roles share one namespace, and a
 /// `CREATE ROLE` or `ALTER ROLE ... WITH NAME` onto a taken name fails
@@ -1923,6 +2029,18 @@ fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
     for id in schema.modules.keys() {
         out.entry(id.schema().to_owned())
             .or_insert_with(|| format!("the schema of `{id}`"));
+    }
+    // A history is created in its own schema, spelled as declared, and read
+    // back as the database spells it (#1176, #1501 review).
+    for (name, table) in &schema.tables {
+        if let Some(v) = table
+            .system_time
+            .as_ref()
+            .and_then(|st| st.versioning.as_ref())
+        {
+            out.entry(v.history.schema.clone())
+                .or_insert_with(|| format!("the schema of `{name}`'s history table"));
+        }
     }
     out
 }
@@ -3569,6 +3687,15 @@ fn refuse_unplanned_movement(
                     }
                 ));
             }
+            // In the `CREATE` itself, period and versioning, so held from the
+            // first read that finds the table (#1176): another session's
+            // retention or versioning change after it is not the plan's.
+            if declared.system_time != now.system_time {
+                moved.push(format!(
+                    "{now_name} period or system versioning is not what this plan's `CREATE \
+                     TABLE` declares"
+                ));
+            }
             // In the `CREATE` itself (`WITH`), so held from the first read
             // that finds the table (#1441).
             if declared.storage_parameters != now.storage_parameters {
@@ -3839,6 +3966,14 @@ fn refuse_unplanned_movement(
                 moved.push(format!(
                     "{now_name} is {} and this plan does not leave it so",
                     if now.unlogged { "unlogged" } else { "logged" }
+                ));
+            }
+            // No change of a plan sets it on a table that exists (#1176), so
+            // it is held to the before-read throughout.
+            if was.system_time != now.system_time {
+                moved.push(format!(
+                    "{now_name} period or system versioning changed, and this plan does not \
+                     change it"
                 ));
             }
             // An index whose parameters the plan sets in place, held once
@@ -5258,6 +5393,10 @@ pub fn cmd_bootstrap(
             // is outside this database's ownership (DECISIONS 211).
             let (wanted, vacated) = role_name_expectations(&cs, dialect.as_ref(), 0)?;
             refuse_taken_role_names(&mut conn, &wanted, &vacated).await?;
+            // A history name already taken: SQL Server takes an existing
+            // table whose columns match as the history, with its rows,
+            // instead of refusing (measured on 17.0, #1176).
+            refuse_taken_history_names(&mut conn, &cs, &target.label).await?;
 
             // A cluster role with no managed grants is not an object this
             // bootstrap creates. Existing managed grants still make the
@@ -6601,6 +6740,9 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         );
     };
     refuse_mid_deployment(&entry, &target.label)?;
+    // Under the lock, before anything runs: a table made at a history's name
+    // since the plan was computed would be adopted, not refused (#1176).
+    refuse_taken_history_names(conn, &plan.changes, &target.label).await?;
     let original_ids = entry.snapshot.ids.clone();
     let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids)
         .await?
@@ -6927,6 +7069,11 @@ async fn apply_staged_under_lock(
     // statement to start at, and the state the checkpoints are measured
     // against. Returned together so there is no way to reach the loop with a
     // baseline from some other read (DECISIONS 174).
+    // A fresh run asks what a transactional one does; a resumed one created
+    // the history itself, before its checkpoint (DEC-1176.1).
+    if !resume {
+        refuse_taken_history_names(conn, &plan.changes, &target.label).await?;
+    }
     let (start, mut previous) = if resume {
         let progress = match (&entry.snapshot.staged, entry.snapshot.kind) {
             (Some(p), StateKind::Staged | StateKind::Failed) => p.clone(),
@@ -8289,6 +8436,75 @@ mod tests {
             .expect("two names where the database reads them as two");
     }
 
+    /// A history name the database holds blocks the `CREATE` only if it is
+    /// still held when that runs: a table the plan drops or renames away
+    /// first frees it, as the plan-time walk agrees (#1501 review). A name no
+    /// history takes is not this check's.
+    #[test]
+    fn a_history_occupant_blocks_unless_the_plan_frees_it_first() {
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        use pbps_mssql::catalog::NameOccupant;
+        let history = TableName::new("dbo", "old_history");
+        let uid = |n: &str| pbps_model::Uid::derived(pbps_model::UidKind::Table, n, 0);
+        let create = PlannedChange::new(Change::CreateTable {
+            uid: uid("dbo.t"),
+            name: TableName::new("dbo", "t"),
+            table: Box::new(pbps_model::Table {
+                system_time: Some(pbps_model::SystemTime {
+                    start: "vf".into(),
+                    end: "vt".into(),
+                    hidden: false,
+                    versioning: Some(pbps_model::SystemVersioning {
+                        history: history.clone(),
+                        retention: None,
+                    }),
+                }),
+                ..Default::default()
+            }),
+        });
+        let at = |name: &TableName| NameOccupant {
+            wanted: name.clone(),
+            name: name.clone(),
+            kind: "user table".into(),
+            parent: None,
+            parent_column: None,
+        };
+        let held = [at(&history)];
+        let blocking = |changes: Vec<PlannedChange>| {
+            blocking_history_occupants(&ChangeSet { changes }, &held)
+                .into_iter()
+                .map(|(t, h, _)| (t.to_string(), h.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            blocking(vec![create.clone()]),
+            [("dbo.t".to_owned(), "dbo.old_history".to_owned())]
+        );
+        let dropped = PlannedChange::new(Change::DropTable {
+            uid: uid("dbo.old_history"),
+            name: history.clone(),
+        });
+        assert!(blocking(vec![dropped, create.clone()]).is_empty());
+        let renamed = PlannedChange::new(Change::RenameTable {
+            uid: uid("dbo.old_history"),
+            from: history.clone(),
+            to: TableName::new("dbo", "archived"),
+            defaults: Vec::new(),
+        });
+        assert!(blocking(vec![renamed, create.clone()]).is_empty());
+        // Negative: an occupant of a name no history takes.
+        let other = [at(&TableName::new("dbo", "elsewhere"))];
+        assert!(
+            blocking_history_occupants(
+                &ChangeSet {
+                    changes: vec![create]
+                },
+                &other
+            )
+            .is_empty()
+        );
+    }
+
     #[test]
     fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
         use pbps_model::{Change, ChangeSet, Module, ModuleKind, PlannedChange};
@@ -9126,6 +9342,51 @@ mod tests {
             created_object_names(&trigger),
             [TableName::new("sales", "tr")]
         );
+
+        // A system-versioned table's history takes a `sys.objects` name with
+        // it, read and refused like the table's own (#1176).
+        let history = TableName::new("hist", "x_history");
+        let temporal = |versioned: bool| {
+            let table = pbps_model::Table {
+                system_time: Some(pbps_model::SystemTime {
+                    start: "vf".into(),
+                    end: "vt".into(),
+                    hidden: false,
+                    versioning: versioned.then(|| pbps_model::SystemVersioning {
+                        history: history.clone(),
+                        retention: None,
+                    }),
+                }),
+                ..Default::default()
+            };
+            plan(vec![PlannedChange::new(Change::CreateTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.x", 0),
+                name: x.clone(),
+                table: Box::new(table),
+            })])
+        };
+        assert_eq!(
+            created_object_names(&temporal(true)),
+            [x.clone(), history.clone()]
+        );
+        let at_history = NameOccupant {
+            wanted: history.clone(),
+            name: history.clone(),
+            kind: "user table".into(),
+            parent: None,
+            parent_column: None,
+        };
+        let e = refuse_occupied_objects(&temporal(true), std::slice::from_ref(&at_history), "prod")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("already has user table `hist.x_history`"), "{e}");
+        // Negative: a period alone creates no history, and takes no name.
+        assert_eq!(
+            created_object_names(&temporal(false)),
+            std::slice::from_ref(&x)
+        );
+        refuse_occupied_objects(&temporal(false), &[at_history], "prod")
+            .expect("no history to collide");
     }
 
     /// An index the plan creates takes a relation name too (#1355): one at
@@ -12494,6 +12755,112 @@ mod tests {
         let e =
             check(&creating, &empty, &schema(false), Settled::SoFar).expect_err("not as created");
         assert!(format!("{e:#}").contains("unlogged"), "{e:#}");
+    }
+
+    /// A history's schema is a declared schema, whose spelling bootstrap
+    /// holds to the database's like any other (#1501 review); a period alone
+    /// has no history and adds none.
+    #[test]
+    fn a_history_schema_is_a_declared_schema() {
+        let mut schema = Schema::default();
+        let mut table = pbps_model::Table {
+            system_time: Some(pbps_model::SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: false,
+                versioning: Some(pbps_model::SystemVersioning {
+                    history: TableName::new("hist", "t_history"),
+                    retention: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        schema
+            .tables
+            .insert(TableName::new("dbo", "t"), table.clone());
+        let declared = schemas_declared(&schema);
+        assert_eq!(declared.keys().collect::<Vec<_>>(), ["dbo", "hist"]);
+        assert!(declared["hist"].contains("history table"), "{declared:?}");
+        table.system_time.as_mut().unwrap().versioning = None;
+        schema.tables.insert(TableName::new("dbo", "t"), table);
+        assert_eq!(
+            schemas_declared(&schema).keys().collect::<Vec<_>>(),
+            ["dbo"]
+        );
+    }
+
+    /// A table's period and versioning are held across an apply (#1176): a
+    /// change by another session to an untouched or touched table is
+    /// movement, and a created table is held to its `CREATE` from the first
+    /// read, so a retention changed after it commits is not recorded as the
+    /// plan's (#1501 review).
+    #[test]
+    fn a_system_time_change_by_someone_else_is_movement() {
+        use pbps_model::{Change, Column, PlannedChange, Table};
+        let name = TableName::new("dbo", "t");
+        let schema = |retention: Option<&str>| {
+            let mut t = Table::default();
+            t.columns
+                .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+            t.system_time = Some(pbps_model::SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: false,
+                versioning: Some(pbps_model::SystemVersioning {
+                    history: TableName::new("dbo", "t_history"),
+                    retention: retention.map(|r| r.parse().unwrap()),
+                }),
+            });
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let check = |plan: &pbps_model::ChangeSet, before: &Schema, after: &Schema, settled| {
+            refuse_unplanned_movement(&pbps_mssql::Mssql, plan, before, after, "test", settled)
+        };
+        let plan = |changes: Vec<Change>| pbps_model::ChangeSet {
+            changes: changes.into_iter().map(PlannedChange::new).collect(),
+        };
+        let nothing = plan(Vec::new());
+        check(&nothing, &schema(None), &schema(None), Settled::Whole).expect("unchanged");
+        let e = check(
+            &nothing,
+            &schema(None),
+            &schema(Some("1 day")),
+            Settled::SoFar,
+        )
+        .expect_err("changed by another, untouched");
+        assert!(format!("{e:#}").contains("dbo.t"), "{e:#}");
+        // Touched by the plan, which never sets it on a table that exists.
+        let mut grown = schema(Some("1 day"));
+        grown
+            .tables
+            .get_mut(&name)
+            .unwrap()
+            .columns
+            .insert("note".into(), Column::new("int".parse().unwrap()));
+        let adding = plan(vec![Change::AddColumn {
+            table: name.clone(),
+            name: "note".into(),
+            column: Box::new(Column::new("int".parse().unwrap())),
+            uid: "c_000000".parse().unwrap(),
+        }]);
+        let e = check(&adding, &schema(None), &grown, Settled::Whole)
+            .expect_err("changed by another, touched");
+        assert!(format!("{e:#}").contains("system versioning"), "{e:#}");
+        // Created: held to the `CREATE` from the first read.
+        let declared = schema(Some("6 months")).tables.remove(&name).unwrap();
+        let creating = plan(vec![Change::CreateTable {
+            uid: "t_000000".parse().unwrap(),
+            name: name.clone(),
+            table: Box::new(declared),
+        }]);
+        let empty = Schema::default();
+        check(&creating, &empty, &schema(Some("6 months")), Settled::SoFar).expect("as created");
+        let e = check(&creating, &empty, &schema(Some("1 day")), Settled::SoFar)
+            .expect_err("not as created");
+        assert!(format!("{e:#}").contains("system versioning"), "{e:#}");
     }
 
     /// Storage parameters are held across an apply (#1441): another

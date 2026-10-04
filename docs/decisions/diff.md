@@ -2050,3 +2050,146 @@ Tests: `an_unlogged_table_round_trips_and_permanence_writes_nothing`
 `a_persistence_switch_by_someone_else_is_movement` (`crates/pbps-cli`); the
 live `unlogged_tables_round_trip_and_switch_in_foreign_key_order` (on 16 and
 18) and `an_unlogged_table_switches_through_the_cli_behind_its_risk`.
+
+<a id="dec-1176-1"></a>
+
+**DEC-1176.1. A SQL Server system-versioned table and its history are one
+table of the model, declared under `system_time:`. Only the history layout
+the engine builds is read, and until #1177 every change to such a table is
+refused (#1176).**
+
+Measured on 17.0.4075.5, Developer and Express editions:
+
+- `CREATE TABLE … WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = h))` builds
+  `h` with one clustered, non-unique index `ix_<h>` on `(end, start)`. It is
+  compressed PAGE on Developer and NONE on Express, which does take PAGE when
+  asked.
+- Without `HISTORY_TABLE`, the engine names the history
+  `MSSQL_TemporalHistoryFor_<object_id>`, a name a recreated table does not
+  get.
+- `SET (SYSTEM_VERSIONING = OFF)` keeps the period, and the history becomes an
+  ordinary table.
+- Given an existing table whose columns match, `HISTORY_TABLE` adopts it as
+  the history, with its rows and its layout, instead of refusing.
+- A history table takes a default constraint and further indexes. It refuses
+  a CHECK constraint (13564) and a trigger (13569).
+- A period column must be `datetime2` (13501). It may have a default.
+- A system-versioned table must have a primary key (13553); a period alone
+  needs none.
+
+**The engine's temporal limitations, audited once against 17.0** (#1501
+review):
+
+| Limitation | On 17.0 | pbps |
+|---|---|---|
+| No primary key on a versioned table | refused (13553) | validation refuses it |
+| Period columns of two precisions (an omitted one is 7) | refused (13513) | validation refuses it |
+| A history name over 124 characters | its `ix_` index name is cut at 127 | validation refuses it |
+| An INSTEAD OF trigger on a versioned table | refused (13569) | validation refuses it |
+| An AFTER trigger on it, or either kind with a period alone | accepted | held |
+| A cascading foreign key from or to a versioned table | accepted | held; the restriction was 2016's (#1502) |
+| A computed, identity, `xml`, `(max)` or `ntext` column | accepted | held as for any table |
+| A sparse or FILESTREAM column | refused (11418) | outside the model |
+| A history table's constraints, triggers or own layout | see above | the pair is left out |
+| TRUNCATE, DROP, and changes to the period or the history | refused or rewrites history | every change refused until #1177 |
+- History is kept for at most 1000 years in any unit (365242 days, 52177
+  weeks, 12000 months, 1000 years; 13749 beyond, found by bisection), so
+  validation refuses a longer retention.
+
+**The model.** Leon chose all three design points on the issue.
+
+- `Table::system_time` holds `start` and `end`, each naming a column in
+  `columns:`, which keeps its type, nullability and place. `hidden` covers both
+  period columns. `versioning: {history, retention}` is absent for a period
+  alone, which is a state the engine has, so a pair read with versioning off
+  shows as a difference rather than as a missing table.
+- The history has no uid. It is a property of its table. Its name is always
+  written out, the engine's own choice included (with an onboarding notice),
+  so a rebuild keeps it.
+- No row writes a period column, so `data:` on such a table is refused.
+- PostgreSQL refuses `system_time`.
+
+**The reader holds the engine's history layout only.** It compares the same
+fields it reads for an ordinary index:
+
+- exactly one index, named `ix_<history>`;
+- clustered, non-unique, unfiltered, enabled and unpartitioned;
+- keys `(end ASC, start ASC)` and nothing included;
+- no key, check or foreign-key constraint, and no default, identity or
+  computed column;
+- columns that mirror the table's, in order.
+
+Anything else leaves the pair out, both tables named. Compression is not held,
+and PAGE and NONE both count as the default. The edition decides between them,
+and an ordinary table's compression is not read either. ROW, columnstore, or
+a mix across partitions stays a limitation.
+
+**The reader fails closed.** Each of these is a limitation, never an ordinary
+table or a default:
+
+- a history it cannot see;
+- a retention it cannot read;
+- a `generated_always_type` other than a period's 1 and 2;
+- a hidden column outside the period;
+- one period column hidden and the other not.
+
+A module bound to the history stays out with it, and a grant on the history
+is reported as one on an object outside the model.
+
+**The history's name** takes a place in the schema's namespace although no
+declaration lists it:
+
+- validation refuses another history or any object the declaration puts in
+  that namespace: a table, a module, or a named constraint. A generated
+  default's names are not reserved, because `CREATE TABLE` takes only the first
+  and only a later rename the fallback. A default already at either is the
+  connected walk's, and the plan's own creation fails safely in its
+  transaction;
+- `plan --db` reads it and refuses an occupant, through the `sys.objects`
+  walk;
+- `bootstrap` refuses an occupant before anything runs, since the engine
+  would adopt a matching one;
+- `apply` asks the same under the lock, before anything runs, for a table made
+  there since the plan was computed. A staged run asks when it starts, not on
+  a resume, whose own earlier statement created the history;
+- validation refuses the ledger's own table names for it, as for a table;
+- `doctor` asks for its schema, and bootstrap holds that schema's spelling to
+  the database's, as it does a table's.
+
+Every place that lists what a declaration puts in the database was audited
+for the history once (#1501 review). The places above are the ones that need
+it. The ids file, the managed scope and declared grants do not: the history
+has no identity, and pbps declares no grant on it.
+
+**Creation never adopts.** `HISTORY_TABLE = <name>` would take an existing
+table that matches. No check before the statement can close the window in
+which another session makes one, and the creation timestamps cannot tell the
+two apart: in a tight loop, 169 of 200 fresh histories had their table's
+`create_date`, which is a `datetime`. So pbps does not use `HISTORY_TABLE`.
+It creates the table with versioning on and lets the engine name the history
+`MSSQL_TemporalHistoryFor_<object_id>`, a name that belongs to the new table
+and that nothing can hold. In the same batch it then moves the history to
+the declared schema and renames it and its `ix_` index. The engine accepts
+both renames and the transfer while versioning is on, in one transaction. A
+declared name that is taken fails the rename (15335), and the plan rolls back
+with it. The `CREATE` and the renames are one transaction of their own, which
+nests in a transactional apply, so a staged apply, whose statements commit one
+by one, cannot leave the table behind without its checkpoint. The checks before the statements still give a taken name a refusal
+that names it. The engine cuts the index name at 127 characters, so a history
+name longer than 124 characters is refused.
+
+**Changes.** Creating the table is one statement, so the engine builds the
+history. Every other change to a table with `system_time` on either side is
+refused by name until #1177. This covers:
+
+- a difference in `system_time` itself, which no change carries and which
+  would otherwise plan nothing;
+- dropping the table, which the engine refuses (13552);
+- renaming it;
+- every column, constraint and index change. Some succeed with history side
+  effects: DROP COLUMN deletes the column's history, and ADD NOT NULL with a
+  default writes into every history row.
+
+A grant or a trigger on the table, and a change to another table referencing
+it, are not changes to the pair.
+
