@@ -329,6 +329,144 @@ async fn cancelled_creation_is_cleaned_without_starting_the_engine() {
     );
 }
 
+/// The control launch shares its caller's deadline (#645). A create still in
+/// flight when it passes is abandoned: the attempt reports a startup failure
+/// naming the resource whose removal it has not seen, the supervisor removes
+/// it, and the engine is never started. With time to spare the same launch
+/// succeeds.
+#[tokio::test]
+async fn a_launch_past_its_deadline_is_abandoned_named_and_removed() {
+    let fixture = Fixture::new(Observations {
+        delay_create: true,
+        ..Default::default()
+    });
+    let token = format!("{:032x}", rand::random::<u128>());
+    let launch = Launch::new(&candidate(), Driver::Postgres, &token).unwrap();
+    let failure = CandidateRun::start_launch_by(
+        Instant::now() + Duration::from_millis(50),
+        fixture.api().await,
+        candidate(),
+        token.clone(),
+        launch,
+        LIFETIME_SECS,
+    )
+    .await
+    .err()
+    .expect("a create delayed past the deadline must not yield a run");
+    assert!(matches!(failure.cause, Error::Start), "{:?}", failure.cause);
+    assert_eq!(failure.recovery_names, [format!("pbps-resolver-{token}")]);
+    fixture.removed().await;
+    let requests = fixture.seen.lock().unwrap().requests.clone();
+    assert!(
+        !requests.iter().any(|r| r.contains("/start ")),
+        "{requests:#?}"
+    );
+    // The create reply arrives after the deadline: the launch's own ownership
+    // inspect must not follow it. The one read before the removal is
+    // cleanup's (review on #1496).
+    let removal = requests
+        .iter()
+        .position(|r| r.starts_with("DELETE "))
+        .expect("a removal");
+    let reads = requests[..removal]
+        .iter()
+        .filter(|r| r.starts_with("GET ") && r.contains("/json "))
+        .count();
+    assert_eq!(reads, 1, "{requests:#?}");
+
+    let fixture = Fixture::new(Observations {
+        delay_create: true,
+        ..Default::default()
+    });
+    let token = format!("{:032x}", rand::random::<u128>());
+    let launch = Launch::new(&candidate(), Driver::Postgres, &token).unwrap();
+    let run = CandidateRun::start_launch_by(
+        Instant::now() + Duration::from_secs(30),
+        fixture.api().await,
+        candidate(),
+        token,
+        launch,
+        LIFETIME_SECS,
+    )
+    .await
+    .expect("the same launch inside its deadline starts");
+    run.close().await.unwrap();
+}
+
+/// A launch that completes as its deadline passes is not accepted (review on
+/// #1496): `timeout_at` hands back a run whose last reply won the race with
+/// its timer, so the run is checked against the deadline once more, closed,
+/// and its confirmed removal leaves nothing to recover. Inside the deadline
+/// the same run is kept.
+#[tokio::test]
+async fn a_run_that_came_up_after_its_deadline_is_closed_not_accepted() {
+    let fixture = Fixture::new(Observations::default());
+    let run = CandidateRun::start(fixture.api().await, candidate(), Driver::Postgres)
+        .await
+        .unwrap();
+    let kept = run
+        .refuse_after(Instant::now() + Duration::from_secs(30))
+        .await
+        .expect("a run inside its deadline is kept");
+    let failure = kept
+        .refuse_after(Instant::now())
+        .await
+        .err()
+        .expect("a run at its deadline must not be accepted");
+    assert!(matches!(failure.cause, Error::Start), "{:?}", failure.cause);
+    assert!(
+        failure.recovery_names.is_empty(),
+        "{:?}",
+        failure.recovery_names
+    );
+    fixture.removed().await;
+}
+
+/// The supervisor stops on its own clock, not only when the caller lets go
+/// (review on #1496). With `ready` still open, a deadline already passed
+/// stops `create_start` before its first request, and one that passes while
+/// the post-create inspect is delayed stops it before `start`.
+#[tokio::test]
+async fn the_supervisor_stops_launching_at_its_deadline_with_ready_still_open() {
+    for (already, expected) in [(true, 0), (false, 2)] {
+        let fixture = Fixture::new(Observations {
+            delay_inspect: true,
+            ..Default::default()
+        });
+        let token = format!("{:032x}", rand::random::<u128>());
+        let launch = Launch::new(&candidate(), Driver::Postgres, &token).unwrap();
+        let mut owner = Owner {
+            name: resource_name(&token),
+            token,
+            image: candidate().identity.image_id.clone(),
+            creation: Creation::NotRequested,
+        };
+        let (ready, _held) = oneshot::channel();
+        let handoff = Handoff {
+            ready,
+            abandon_at: Some(if already {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_millis(100)
+            }),
+        };
+        let mut api = fixture.api().await;
+        let cause = create_start(&mut api, &mut owner, &launch, &handoff)
+            .await
+            .err()
+            .expect("a launch past its deadline must stop");
+        assert!(matches!(cause, Error::Start), "{cause:?}");
+        let requests = fixture.seen.lock().unwrap().requests.clone();
+        assert!(
+            !requests.iter().any(|r| r.contains("/start ")),
+            "{requests:#?}"
+        );
+        // Nothing at all before an elapsed deadline; the create and its
+        // inspect, and nothing after, when it passes during that inspect.
+        assert_eq!(requests.len(), expected, "{requests:#?}");
+    }
+}
+
 #[tokio::test]
 async fn failed_startup_is_cleaned_and_does_not_echo_the_server_error() {
     let fixture = Fixture::new(Observations {
