@@ -523,9 +523,20 @@ fn an_index_replica_identity_is_set_after_its_index() {
 /// `app.b` calls the earlier function and another of its generated columns
 /// names `app.a` in an OID-alias literal, resolved as the table is created
 /// (measured on 18), while `app.a` waits for the later function. Placing
-/// `app.b` after its own function alone would create it before `app.a`.
+/// `app.b` after its own function alone would create it before `app.a`. Its
+/// array type is a name too, though scratch reads its spelling back only
+/// once the table exists.
 #[test]
 fn a_held_table_naming_another_held_table_follows_it() {
+    for naming in [
+        "'app.a'::regclass::oid::bigint",
+        "'app._a'::regtype::oid::bigint",
+    ] {
+        held_table_follows_the_held_table_it_names(naming);
+    }
+}
+
+fn held_table_follows_the_held_table_it_names(naming: &str) {
     use pbps_model::{Column, Generated, Module, Schema};
     let generated = |expression: &str| {
         let mut column = Column::new("integer".parse().unwrap());
@@ -543,7 +554,7 @@ fn a_held_table_naming_another_held_table_follows_it() {
     b.columns
         .insert("id".into(), Column::new("integer".parse().unwrap()));
     b.columns.insert("g".into(), generated("app.f1(id)"));
-    let mut r = generated("'app.a'::regclass::oid::bigint");
+    let mut r = generated(naming);
     r.ty = "bigint".parse().unwrap();
     b.columns.insert("r".into(), r);
     let mut schema = Schema::default();

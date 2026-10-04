@@ -117,9 +117,50 @@ pub fn may_call(expression: &str, name: &str) -> bool {
             .any(|contents| crate::impact::mentions_in_literal(contents, name))
 }
 
+/// Every spelling the engine may give a relation's array type before it
+/// exists: `_name`, or more underscores while that is taken, each clipped to
+/// the identifier limit at a character boundary (`makeUniqueTypeName`).
+pub fn array_spellings(name: &str) -> impl Iterator<Item = String> + '_ {
+    const LIMIT: usize = 63;
+    (1..LIMIT).map(move |underscores| {
+        let mut spelling = "_".repeat(underscores);
+        for c in name.chars() {
+            if spelling.len() + c.len_utf8() > LIMIT {
+                break;
+            }
+            spelling.push(c);
+        }
+        spelling
+    })
+}
+
+/// Whether text may name the relation `name` before it exists: the
+/// relation and its row type, read as [`may_call`] reads a function, or its
+/// array type by any spelling the engine may give it (`'app._a'::regtype`
+/// is resolved as a generated column is created, measured on 18).
+#[must_use]
+pub fn may_name_relation(text: &str, name: &str) -> bool {
+    may_call(text, name) || array_spellings(name).any(|array| may_call(text, &array))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{may_call, may_name, may_read};
+    use super::{array_spellings, may_call, may_name, may_name_relation, may_read};
+
+    /// A relation's array type is a name of it before it exists, by any
+    /// spelling the engine may choose; an unrelated underscored name is not.
+    #[test]
+    fn a_relation_may_be_named_by_its_array_type() {
+        assert!(may_name_relation("'app._a'::regtype::oid::bigint", "a"));
+        assert!(may_name_relation("'app.__a'::regtype", "a"));
+        assert!(may_name_relation("'app.a'::regclass", "a"));
+        assert!(!may_name_relation("'app._ab'::regtype", "a"));
+        assert!(!may_name_relation("'app.b_a'::regtype", "a"));
+        let long = "x".repeat(63);
+        let clipped = format!("_{}", "x".repeat(62));
+        assert!(array_spellings(&long).any(|spelling| spelling == clipped));
+        assert!(array_spellings(&long).all(|spelling| spelling.len() == 63));
+    }
 
     /// A function an OID-alias literal names is a call to the engine, so a
     /// name inside a literal counts; a longer name still does not

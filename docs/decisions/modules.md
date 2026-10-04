@@ -1633,9 +1633,13 @@ generation expression reads columns the same `CREATE TABLE` makes.
 Whether a later change names such a table is read as `may_call` reads a
 function: the name as code or inside a string literal, since an OID-alias
 literal such as `'app.a'::regclass` names the table to the engine as a default
-or view is created (measured on 16 and 18). A new table names an earlier one
-only that way, through a column of its row type or through a foreign key;
-otherwise two new tables stay independent.
+or view is created (measured on 16 and 18). Its array type is a name of it too,
+by every spelling the engine may give it (`_a`, more underscores while that is
+taken, clipped to the identifier limit), since scratch reads the spelling back
+only once the table exists. A new table names an earlier one only that way,
+through a column of its row type or through a foreign key; otherwise two new
+tables stay independent. Two held tables keep the order between them that such
+a name requires, whichever function each waits for.
 
 Pinned by `a_new_table_generating_from_a_new_function_follows_it_whole`
 (`crates/pbps-cli/src/dependents.rs`),

@@ -640,12 +640,23 @@ fn after_their_functions(
         return Ok(steps);
     }
     // A literal counts: an OID-alias literal such as `'app.n'::regclass`
-    // names the table to the engine as the step compiles (DEC-1364.1).
-    let names = |at: usize, name: &str| {
+    // names the table to the engine as the step compiles (DEC-1364.1). A
+    // relation's array type is named before compiling reads its spelling
+    // back, so a relation counts by every spelling the engine may give it.
+    let names = |at: usize, (kind, name): &(Nameable, String)| {
+        steps[at].statements.iter().any(|sql| {
+            if *kind == Nameable::Relation {
+                crate::generated::may_name_relation(sql, name)
+            } else {
+                crate::generated::may_call(sql, name)
+            }
+        })
+    };
+    let made = |at: usize| {
         steps[at]
-            .statements
+            .names
             .iter()
-            .any(|sql| crate::generated::may_call(sql, name))
+            .map(|(kind, _, name)| (*kind, name.clone()))
     };
     let early = |at: usize| matches!(steps[at].phase, Phase::Tables | Phase::Keys);
     // A foreign key naming a late table waits for the end of the modules:
@@ -653,7 +664,10 @@ fn after_their_functions(
     let keys: Vec<usize> = foreign
         .iter()
         .copied()
-        .filter(|&at| late.iter().any(|(table, _)| names(at, &table.table.name)))
+        .filter(|&at| {
+            late.iter()
+                .any(|(table, _)| names(at, &(Nameable::Relation, table.table.name.clone())))
+        })
         .collect();
     let mut modules: Vec<usize> = (0..steps.len())
         .filter(|&at| steps[at].phase == Phase::Modules)
@@ -673,14 +687,11 @@ fn after_their_functions(
             .rposition(|at| {
                 called.contains(at)
                     || (delayed.contains(at)
-                        && steps[*at]
-                            .names
-                            .iter()
-                            .any(|(_, _, name)| group.iter().any(|&own| names(own, name))))
+                        && made(*at).any(|name| group.iter().any(|&own| names(own, &name))))
             })
             .map_or(0, |position| position + 1);
         delayed.extend(group.iter().copied());
-        let mut held = BTreeSet::from([table.table.name.clone()]);
+        let mut held = BTreeSet::from([(Nameable::Relation, table.table.name.clone())]);
         let mut kept = Vec::new();
         let mut moved = Vec::new();
         for &at in &modules[..point] {
@@ -688,7 +699,7 @@ fn after_their_functions(
                 if called.contains(&at) {
                     return Err(ReconstructError::Cycle(format!("table {}", table.table)));
                 }
-                held.extend(steps[at].names.iter().map(|(_, _, name)| name.clone()));
+                held.extend(made(at));
                 moved.push(at);
             } else {
                 kept.push(at);
