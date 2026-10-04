@@ -2276,6 +2276,37 @@ mod tests {
         assert!(created < table_at("app.n"), "{order:?}");
         assert!(table_at("app.n") < table_at("app.child"), "{order:?}");
         assert!(table_at("app.n") < table_at("app.literal"), "{order:?}");
+
+        // Two tables held behind different functions keep their own order:
+        // app.b waits for the earlier function but names app.a, which waits
+        // for the later one.
+        let mut cs = plan(vec![
+            new_table("app.a", &[("id", None), ("g", Some("app.f2(id)"))], None),
+            new_table(
+                "app.b",
+                &[
+                    ("id", None),
+                    ("g", Some("app.f1(id)")),
+                    ("r", Some("'app.a'::regclass::oid::integer")),
+                ],
+                None,
+            ),
+            routine("app.f1(integer)", "SELECT 1"),
+            routine("app.f2(integer)", "SELECT 2"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 2);
+        let order = names(&cs);
+        let position = |name: &str| {
+            cs.changes
+                .iter()
+                .position(|p| {
+                    matches!(&p.change, Change::CreateTable { name: n, .. } if n.to_string() == name)
+                        || matches!(&p.change, Change::CreateModule { id, .. } if id.to_string() == name)
+                })
+                .unwrap_or_else(|| panic!("{name} missing from {order:?}"))
+        };
+        assert!(position("app.f2(integer)") < position("app.a"), "{order:?}");
+        assert!(position("app.a") < position("app.b"), "{order:?}");
     }
 
     /// DEC-1364.1: a literal an OID-alias type reads names the function to

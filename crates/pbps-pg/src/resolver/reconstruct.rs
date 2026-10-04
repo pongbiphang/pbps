@@ -658,6 +658,10 @@ fn after_their_functions(
     let mut modules: Vec<usize> = (0..steps.len())
         .filter(|&at| steps[at].phase == Phase::Modules)
         .collect();
+    // Steps already moved for an earlier table. A table that names one of
+    // them, such as by an OID-alias literal in its generated column, follows
+    // it as it follows its own functions.
+    let mut delayed: BTreeSet<usize> = BTreeSet::new();
     for (table, called) in &late {
         let group: Vec<usize> = table
             .steps
@@ -666,8 +670,16 @@ fn after_their_functions(
             .collect();
         let point = modules
             .iter()
-            .rposition(|at| called.contains(at))
+            .rposition(|at| {
+                called.contains(at)
+                    || (delayed.contains(at)
+                        && steps[*at]
+                            .names
+                            .iter()
+                            .any(|(_, _, name)| group.iter().any(|&own| names(own, name))))
+            })
             .map_or(0, |position| position + 1);
+        delayed.extend(group.iter().copied());
         let mut held = BTreeSet::from([table.table.name.clone()]);
         let mut kept = Vec::new();
         let mut moved = Vec::new();

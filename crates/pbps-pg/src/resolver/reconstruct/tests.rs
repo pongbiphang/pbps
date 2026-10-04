@@ -518,3 +518,95 @@ fn an_index_replica_identity_is_set_after_its_index() {
     let last = reconstruction.steps[2].statements.join("\n");
     assert!(last.contains("REPLICA IDENTITY USING INDEX"), "{last}");
 }
+
+/// Two tables held behind different functions keep the order between them:
+/// `app.b` calls the earlier function and another of its generated columns
+/// names `app.a` in an OID-alias literal, resolved as the table is created
+/// (measured on 18), while `app.a` waits for the later function. Placing
+/// `app.b` after its own function alone would create it before `app.a`.
+#[test]
+fn a_held_table_naming_another_held_table_follows_it() {
+    use pbps_model::{Column, Generated, Module, Schema};
+    let generated = |expression: &str| {
+        let mut column = Column::new("integer".parse().unwrap());
+        column.generated = Some(Generated {
+            expression: expression.into(),
+            stored: true,
+        });
+        column
+    };
+    let mut a = Table::default();
+    a.columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    a.columns.insert("g".into(), generated("app.f2(id)"));
+    let mut b = Table::default();
+    b.columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    b.columns.insert("g".into(), generated("app.f1(id)"));
+    let mut r = generated("'app.a'::regclass::oid::bigint");
+    r.ty = "bigint".parse().unwrap();
+    b.columns.insert("r".into(), r);
+    let mut schema = Schema::default();
+    schema.tables.insert(TableName::new("app", "a"), a);
+    schema.tables.insert(TableName::new("app", "b"), b);
+    for name in ["app.f1(integer)", "app.f2(integer)"] {
+        schema.modules.insert(
+            name.parse().unwrap(),
+            Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+            },
+        );
+    }
+    let ids = pbps_diff::resolve(
+        &schema,
+        &pbps_model::IdsFile::default(),
+        &[],
+        &pbps_diff::Context {
+            operator: "1274-test".into(),
+            today: "2026-10-04".into(),
+        },
+    )
+    .unwrap()
+    .ids;
+    let empty = Schema::default();
+    let changes: Vec<_> = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &empty,
+            ids: &pbps_model::IdsFile::default(),
+        },
+        pbps_diff::Side {
+            schema: &schema,
+            ids: &ids,
+        },
+        &crate::Postgres::new(),
+        &pbps_model::Hints::default(),
+    )
+    .unwrap()
+    .changes
+    .into_iter()
+    .map(|planned| planned.change)
+    .collect();
+    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &changes).unwrap();
+    let order: Vec<_> = reconstruction
+        .steps
+        .iter()
+        .map(|step| step.declaration.as_str())
+        .collect();
+    let at = |declaration: &str| {
+        order
+            .iter()
+            .position(|d| *d == declaration)
+            .unwrap_or_else(|| panic!("{declaration} missing from {order:?}"))
+    };
+    assert!(
+        at("function app.f1(integer)") < at("table app.b"),
+        "{order:?}"
+    );
+    assert!(
+        at("function app.f2(integer)") < at("table app.a"),
+        "{order:?}"
+    );
+    assert!(at("table app.a") < at("table app.b"), "{order:?}");
+}
