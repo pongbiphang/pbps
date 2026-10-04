@@ -2078,6 +2078,18 @@ fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
         out.entry(id.schema().to_owned())
             .or_insert_with(|| format!("the schema of `{id}`"));
     }
+    // A history is created in its own schema, spelled as declared, and read
+    // back as the database spells it (#1176, #1501 review).
+    for (name, table) in &schema.tables {
+        if let Some(v) = table
+            .system_time
+            .as_ref()
+            .and_then(|st| st.versioning.as_ref())
+        {
+            out.entry(v.history.schema.clone())
+                .or_insert_with(|| format!("the schema of `{name}`'s history table"));
+        }
+    }
     out
 }
 
@@ -12797,6 +12809,38 @@ mod tests {
         let e =
             check(&creating, &empty, &schema(false), Settled::SoFar).expect_err("not as created");
         assert!(format!("{e:#}").contains("unlogged"), "{e:#}");
+    }
+
+    /// A history's schema is a declared schema, whose spelling bootstrap
+    /// holds to the database's like any other (#1501 review); a period alone
+    /// has no history and adds none.
+    #[test]
+    fn a_history_schema_is_a_declared_schema() {
+        let mut schema = Schema::default();
+        let mut table = pbps_model::Table {
+            system_time: Some(pbps_model::SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: false,
+                versioning: Some(pbps_model::SystemVersioning {
+                    history: TableName::new("hist", "t_history"),
+                    retention: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        schema
+            .tables
+            .insert(TableName::new("dbo", "t"), table.clone());
+        let declared = schemas_declared(&schema);
+        assert_eq!(declared.keys().collect::<Vec<_>>(), ["dbo", "hist"]);
+        assert!(declared["hist"].contains("history table"), "{declared:?}");
+        table.system_time.as_mut().unwrap().versioning = None;
+        schema.tables.insert(TableName::new("dbo", "t"), table);
+        assert_eq!(
+            schemas_declared(&schema).keys().collect::<Vec<_>>(),
+            ["dbo"]
+        );
     }
 
     /// A table's period and versioning are held across an apply (#1176): a

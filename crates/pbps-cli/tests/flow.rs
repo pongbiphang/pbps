@@ -2701,6 +2701,39 @@ fn a_history_taken_over_mid_apply_rolls_the_plan_back() {
     );
 }
 
+/// A history's schema is held to the database's spelling before bootstrap
+/// runs, like a table's (#1501 review). Without that, the history was created
+/// in `Hist`, read back so, and the recorded state already differed from the
+/// declaration.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_history_schema_the_database_spells_otherwise_is_refused() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "temporal1176_spelt");
+    on_server(own.connection(), "CREATE SCHEMA Hist;");
+    let d = Demo::new("temporal1176-spelt");
+    std::fs::write(
+        d.dir.join("schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  vf: {type: datetime2(7), nullable: false}\n  vt: {type: datetime2(7), nullable: false}\n\nprimary_key: [id]\n\nsystem_time:\n  period: [vf, vt]\n  versioning:\n    history: hist.t_history\n",
+    )
+    .unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+    let refused = d.run(&["bootstrap", "--db", own.connection()]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused)
+            .contains("`hist` (the schema of `dbo.t`'s history table) is written `Hist`"),
+        "{}",
+        stderr(&refused)
+    );
+    on_server(
+        own.connection(),
+        "IF OBJECT_ID('dbo.t') IS NOT NULL THROW 50000, 'bootstrap ran', 1;",
+    );
+}
+
 /// Every file under `dir`, at any depth.
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();

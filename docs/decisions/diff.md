@@ -2155,7 +2155,13 @@ declaration lists it:
   predates the statement. In a transaction the plan rolls back. A staged run
   asks at its closing read, by age alone, and does not close (SPEC §7.6);
 - validation refuses the ledger's own table names for it, as for a table;
-- `doctor` asks for its schema.
+- `doctor` asks for its schema, and bootstrap holds that schema's spelling to
+  the database's, as it does a table's.
+
+Every place that lists what a declaration puts in the database was audited
+for the history once (#1501 review). The places above are the ones that need
+it. The ids file, the managed scope and declared grants do not: the history
+has no identity, and pbps declares no grant on it.
 
 **Changes.** Creating the table is one statement, so the engine builds the
 history. Every other change to a table with `system_time` on either side is
