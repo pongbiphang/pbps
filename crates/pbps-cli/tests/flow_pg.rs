@@ -388,13 +388,14 @@ fn psql_script(db: &OwnDatabase, script: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("script regression needs psql or PBPS_TEST_PG_CONTAINER");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    child.wait_with_output().unwrap()
+    // Fed from a thread while `wait_with_output` reads: psql can fill its
+    // output pipe before it has read the whole script (#1485).
+    let mut stdin = child.stdin.take().unwrap();
+    let script = script.to_owned();
+    let feeder = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
+    let output = child.wait_with_output().unwrap();
+    fed(feeder.join().unwrap());
+    output
 }
 
 #[test]
@@ -8150,13 +8151,13 @@ fn a_plan_saved_before_a_grammar_upgrade_is_refused_after_the_transfer() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    restore
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(&dump.stdout)
-        .unwrap();
+    // Fed from a thread while `wait_with_output` reads, so psql's own output
+    // cannot fill a pipe nobody is reading yet (#1485).
+    let mut stdin = restore.stdin.take().unwrap();
+    let dumped = dump.stdout.clone();
+    let feeder = std::thread::spawn(move || stdin.write_all(&dumped));
     let restored = restore.wait_with_output().unwrap();
+    fed(feeder.join().unwrap());
     assert!(
         restored.status.success(),
         "{}",
@@ -15067,32 +15068,117 @@ fn a_routine_replaced_while_the_statements_run_rolls_the_apply_back() {
     );
 }
 
+/// The result of feeding a child's stdin from a thread. With
+/// `ON_ERROR_STOP` psql stops at the first error and closes stdin, so a
+/// script longer than the pipe meets `BrokenPipe` on the way: that is the
+/// child having finished early, and its output carries the verdict. Any other
+/// write error is the fixture's own failure.
+fn fed(result: std::io::Result<()>) {
+    match result {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("feeding the child's stdin failed: {error}"),
+    }
+}
+
+/// A child that stops reading stdin early still reports its own exit code,
+/// and the unread input is not a fixture failure (review on #1504). Needs no
+/// server, so it runs with the ordinary tests.
+#[cfg(unix)]
+#[test]
+fn a_child_that_closes_stdin_early_keeps_its_own_verdict() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("sh")
+        .args(["-c", "head -c 1 >/dev/null; exit 3"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let feeder = std::thread::spawn(move || stdin.write_all(&vec![b'x'; 1 << 22]));
+    let output = child.wait_with_output().unwrap();
+    let result = feeder.join().unwrap();
+    assert!(
+        matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe),
+        "{result:?}"
+    );
+    fed(result);
+    assert_eq!(output.status.code(), Some(3));
+}
+
+/// A spawned `pbps` whose stdout and stderr are read as it writes them.
+///
+/// A test that waits on the database while the child runs must not leave its
+/// output in a pipe nobody reads: once the pipe is full the child blocks in
+/// `write` before reaching what the test waits for. A pipe can be one page
+/// rather than 64 KiB when the user's pipe pages pass `pipe-user-pages-soft`,
+/// so a few kilobytes of pre-flight output were enough to stall the apply
+/// about one run in thirty-five, idle after a catalog `COMMIT` (#1485).
+struct Drained {
+    child: std::process::Child,
+    stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+}
+
+impl Drained {
+    fn spawn(command: &mut Command) -> Self {
+        use std::io::Read;
+        use std::process::Stdio;
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes).unwrap();
+                bytes
+            })
+        }
+        let stdout = child.stdout.take().map(drain);
+        let stderr = child.stderr.take().map(drain);
+        Self {
+            child,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn output(&mut self, status: std::process::ExitStatus) -> Output {
+        let read = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
+            handle.map(|h| h.join().unwrap()).unwrap_or_default()
+        };
+        Output {
+            status,
+            stdout: read(self.stdout.take()),
+            stderr: read(self.stderr.take()),
+        }
+    }
+
+    fn wait_with_output(mut self) -> Output {
+        let status = self.child.wait().unwrap();
+        self.output(status)
+    }
+}
+
 /// Polls until `reached` holds while the spawned `apply` runs. A child that
 /// exits first fails at once with its own output: it will never get there,
 /// and its stderr says why. The bound only caps how long a stuck run takes to
 /// fail, so it is generous: a loaded host spent more than the old 60 s in the
 /// apply's pre-flight alone (#1040).
-fn wait_for_the_apply(
-    what: &str,
-    child: &mut std::process::Child,
-    mut reached: impl FnMut() -> bool,
-) {
-    use std::io::Read;
+fn wait_for_the_apply(what: &str, child: &mut Drained, mut reached: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     while !reached() {
-        if let Some(status) = child.try_wait().unwrap() {
-            let mut out = String::new();
-            for pipe in [
-                child.stdout.take().map(|p| Box::new(p) as Box<dyn Read>),
-                child.stderr.take().map(|p| Box::new(p) as Box<dyn Read>),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                let mut pipe = pipe;
-                pipe.read_to_string(&mut out).unwrap();
-            }
-            panic!("{what}: the apply exited ({status}) before getting there:\n{out}");
+        if let Some(status) = child.child.try_wait().unwrap() {
+            let output = child.output(status);
+            panic!(
+                "{what}: the apply exited ({status}) before getting there:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -15140,24 +15226,22 @@ fn a_concurrent_replacement_is_seen_under_a_repeatable_read_default() {
         c
     });
     let checksum = plan_checksum(&plan);
-    let mut child = Command::new(BIN)
-        .arg("--project")
-        .arg(&h.demo.dir)
-        .args([
-            "apply",
-            "--env",
-            "dev",
-            "--plan",
-            plan.to_str().unwrap(),
-            "--checksum",
-            &checksum,
-        ])
-        .env(PinnedHelper::URL, h.db.connection())
-        .env(PinnedHelper::KEY, &key)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = Drained::spawn(
+        Command::new(BIN)
+            .arg("--project")
+            .arg(&h.demo.dir)
+            .args([
+                "apply",
+                "--env",
+                "dev",
+                "--plan",
+                plan.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+            ])
+            .env(PinnedHelper::URL, h.db.connection())
+            .env(PinnedHelper::KEY, &key),
+    );
     wait_for_the_apply(
         "the apply's ALTER TABLE queued behind the lock",
         &mut child,
@@ -15171,7 +15255,7 @@ fn a_concurrent_replacement_is_seen_under_a_repeatable_read_default() {
     );
     h.replace_helper();
     rt.block_on(async { holder.execute("COMMIT").await.unwrap() });
-    let refused = child.wait_with_output().unwrap();
+    let refused = child.wait_with_output();
     assert_ne!(code(&refused), 0, "{}", stdout(&refused));
     assert!(
         stderr(&refused).contains("after the statements, before recording"),
@@ -15657,16 +15741,14 @@ fn a_trigger_function_replaced_between_the_check_and_the_row_write_is_rolled_bac
         if staged {
             args.push("--staged");
         }
-        let mut child = Command::new(BIN)
-            .arg("--project")
-            .arg(&d.dir)
-            .args(&args)
-            .env(KEYED_URL, &deployment)
-            .env(KEYED_KEY, fingerprint_key(9))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = Drained::spawn(
+            Command::new(BIN)
+                .arg("--project")
+                .arg(&d.dir)
+                .args(&args)
+                .env(KEYED_URL, &deployment)
+                .env(KEYED_KEY, fingerprint_key(9)),
+        );
         // A child that exits first reports its own cause instead of a timeout
         // that only said "never reached" (#1320).
         wait_for_the_apply(&format!("{slug}: the row write"), &mut child, || {
@@ -15696,7 +15778,7 @@ fn a_trigger_function_replaced_between_the_check_and_the_row_write_is_rolled_bac
                 .await
                 .unwrap()
         });
-        let refused = child.wait_with_output().unwrap();
+        let refused = child.wait_with_output();
         assert_ne!(code(&refused), 0, "{slug}: {}", stdout(&refused));
         assert!(
             stderr(&refused).contains("pinned routines changed in `hook`"),
