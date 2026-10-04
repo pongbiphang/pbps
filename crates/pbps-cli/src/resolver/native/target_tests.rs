@@ -18,11 +18,25 @@ async fn a_target_without_verified_tls_is_refused_before_connecting() {
         .err()
         .expect("an unverified connection is refused");
         assert!(
-            matches!(refused, TargetConnectError::Connect(_)),
+            matches!(refused, TargetConnectError::Unverified(_)),
             "{mode}: {refused:?}"
         );
         assert!(refused.to_string().contains("sslmode=require"), "{refused}");
     }
+    // A verified string that reaches no server keeps its own diagnosis, with
+    // no TLS remedy that would send the operator to the wrong fix.
+    let refused = NativeTarget::connect(
+        Driver::Postgres,
+        "host=127.0.0.1 port=1 user=u dbname=d sslmode=require connect_timeout=1",
+    )
+    .await
+    .err()
+    .expect("nothing listens on port 1");
+    assert!(
+        matches!(refused, TargetConnectError::Connect(_)),
+        "{refused:?}"
+    );
+    assert!(!refused.to_string().contains("sslmode"), "{refused}");
 }
 
 #[tokio::test]

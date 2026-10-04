@@ -598,7 +598,7 @@ async fn the_production_run_connects_with_the_callers_driver() {
     assert!(
         matches!(
             refused,
-            ProduceError::Target(crate::resolver::native::TargetConnectError::Connect(
+            ProduceError::Target(crate::resolver::native::TargetConnectError::Unverified(
                 pbps_db::DbError::Refused(_)
             ))
         ),

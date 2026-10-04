@@ -57,13 +57,18 @@ pub enum NativeTargetError {
 /// Why a target connection did not become a native target binding (#1514).
 #[derive(Debug, thiserror::Error)]
 pub enum TargetConnectError {
-    /// Either engine's verified connection: the remedy names both, since
+    /// The connection's own options refused verification before any socket.
+    /// Only this failure carries the TLS remedy, naming both engines since
     /// the caller chose the driver (#1514 review).
     #[error(
         "the target connection must verify its server's certificate and name (PostgreSQL: \
          `sslmode=require` or no `sslmode`; SQL Server: `Encrypt=true` with certificate \
          validation): {0}"
     )]
+    Unverified(pbps_db::DbError),
+    /// Any other failure to connect keeps its own diagnosis: a refused port,
+    /// a timeout or a password says nothing about TLS settings.
+    #[error("the target connection failed: {0}")]
     Connect(pbps_db::DbError),
     #[error(transparent)]
     Discovery(#[from] super::ServiceDiscovery),
@@ -165,7 +170,20 @@ impl NativeTarget {
     ) -> Result<Self, TargetConnectError> {
         let connection = PeerVerifiedConn::connect(driver, connection_string)
             .await
-            .map_err(TargetConnectError::Connect)?;
+            .map_err(|error| {
+                // Named rather than wildcarded: a new variant has to be decided
+                // on, since one about the options would need the TLS remedy.
+                match error {
+                    pbps_db::DbError::Refused(_) => TargetConnectError::Unverified(error),
+                    pbps_db::DbError::BadConnectionString(_)
+                    | pbps_db::DbError::Connect { .. }
+                    | pbps_db::DbError::ConnectTimeout { .. }
+                    | pbps_db::DbError::Driver { .. }
+                    | pbps_db::DbError::Context { .. }
+                    | pbps_db::DbError::WrongSession { .. }
+                    | pbps_db::DbError::BadRow(_) => TargetConnectError::Connect(error),
+                }
+            })?;
         let service = super::discover_service(&connection)?;
         Ok(Self::establish(connection, service).await?)
     }
