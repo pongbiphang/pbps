@@ -281,6 +281,38 @@ pub struct ModuleDto {
     pub public_execute: Option<Spanned<bool>>,
 }
 
+/// `system_time:` on a SQL Server table (#1176).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SystemTimeDto {
+    /// The period's start and end columns, in that order, each declared
+    /// under `columns:` as `datetime2(p)`, not nullable.
+    pub period: [String; 2],
+
+    /// Both period columns `HIDDEN`, left out of `SELECT *`.
+    #[serde(default)]
+    pub hidden: bool,
+
+    /// `SYSTEM_VERSIONING = ON`. Absent is the period alone.
+    #[serde(default)]
+    pub versioning: Option<VersioningDto>,
+}
+
+/// `versioning:` under `system_time:`.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VersioningDto {
+    /// The history table, `schema.name`.
+    #[schemars(with = "String")]
+    pub history: Spanned<String>,
+
+    /// `HISTORY_RETENTION_PERIOD`, as `6 months` or `1 year`. Absent is
+    /// INFINITE.
+    #[serde(default)]
+    #[schemars(with = "Option<String>")]
+    pub retention: Option<Spanned<String>>,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TableDto {
@@ -351,6 +383,13 @@ pub struct TableDto {
     /// crash empties it. Absent, or `false`, is a permanent table.
     #[serde(default)]
     pub unlogged: bool,
+
+    /// SQL Server `PERIOD FOR SYSTEM_TIME` and system versioning:
+    /// `{period: [valid_from, valid_to], hidden: true, versioning: {history:
+    /// dbo.orders_history, retention: 6 months}}`. Absent is an ordinary
+    /// table.
+    #[serde(default)]
+    pub system_time: Option<Box<SystemTimeDto>>,
 
     /// Declared reference data (ADR-0004). Absent on almost every table: it is
     /// the opt-in that lets the tool touch rows at all.

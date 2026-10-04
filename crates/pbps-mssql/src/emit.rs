@@ -1524,6 +1524,17 @@ fn column_definition(
     name: &str,
     column: &Column,
 ) -> Result<String, DialectError> {
+    generated_column_definition(table, name, column, None)
+}
+
+/// [`column_definition`], with a `GENERATED ALWAYS AS …` clause where the
+/// column is a period's (#1176): after the type, before the nullability.
+fn generated_column_definition(
+    table: &TableName,
+    name: &str,
+    column: &Column,
+    generated: Option<&str>,
+) -> Result<String, DialectError> {
     let mut s = format!(
         "{} {}{}",
         quote(name)?,
@@ -1532,6 +1543,10 @@ fn column_definition(
     );
     if let Some(id) = column.identity {
         s.push_str(&format!(" IDENTITY({},{})", id.seed, id.increment));
+    }
+    if let Some(generated) = generated {
+        s.push(' ');
+        s.push_str(generated);
     }
     s.push(' ');
     s.push_str(null_clause(column.nullable));
@@ -1726,7 +1741,25 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
 
     let mut body: Vec<String> = Vec::new();
     for (col_name, column) in &table.columns {
-        body.push(column_definition(name, col_name, column)?);
+        let generated = table.system_time.as_ref().and_then(|st| {
+            let edge = if *col_name == st.start {
+                "START"
+            } else if *col_name == st.end {
+                "END"
+            } else {
+                return None;
+            };
+            Some(format!(
+                "GENERATED ALWAYS AS ROW {edge}{}",
+                if st.hidden { " HIDDEN" } else { "" }
+            ))
+        });
+        body.push(generated_column_definition(
+            name,
+            col_name,
+            column,
+            generated.as_deref(),
+        )?);
     }
     // After the columns they read, and where an `ADD` would put them: at the
     // end, so a table created here and one changed in place agree on where a
@@ -1740,9 +1773,34 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
     if let Some(pk) = &table.primary_key {
         body.push(primary_key_clause(pk, table.primary_key_is_clustered())?);
     }
+    // In the same statement as the history: the engine builds the history's
+    // layout itself, and that layout is the only one the model holds
+    // (#1176, DEC-1176.1).
+    let mut with = String::new();
+    if let Some(st) = &table.system_time {
+        body.push(format!(
+            "PERIOD FOR SYSTEM_TIME ({}, {})",
+            quote(&st.start)?,
+            quote(&st.end)?
+        ));
+        if let Some(v) = &st.versioning {
+            let retention = match &v.retention {
+                None => String::new(),
+                Some(r) => format!(
+                    ", HISTORY_RETENTION_PERIOD = {} {}",
+                    r.count,
+                    r.unit.keyword()
+                ),
+            };
+            with = format!(
+                " WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = {}{retention}))",
+                qualified(&v.history)?
+            );
+        }
+    }
 
     let mut out = vec![Statement::new(format!(
-        "CREATE TABLE {qualified_name} (\n    {}\n);",
+        "CREATE TABLE {qualified_name} (\n    {}\n){with};",
         body.join(",\n    ")
     ))];
 
@@ -2101,6 +2159,78 @@ mod tests {
             computed: stored,
         });
         assert_eq!(dropped, ["ALTER TABLE [dbo].[t] DROP COLUMN [c];"]);
+    }
+
+    /// A table with `system_time` is created in one statement with its
+    /// period columns `GENERATED ALWAYS`, its period, and its versioning and
+    /// retention, so the engine builds the history's layout itself; a period
+    /// alone has no `WITH`, and an ordinary table neither (#1176).
+    #[test]
+    fn a_system_versioned_table_is_created_in_one_statement() {
+        let mut t = Table::default();
+        t.columns
+            .insert("id".into(), Column::new(ty("int")).not_null());
+        for c in ["vf", "vt"] {
+            t.columns
+                .insert(c.into(), Column::new(ty("datetime2(3)")).not_null());
+        }
+        t.columns.get_mut("vf").unwrap().default = Some("SYSUTCDATETIME()".into());
+        let create = |t: &Table| {
+            sql_of(&Change::CreateTable {
+                uid: uid("t_k7x2mq"),
+                name: tname("dbo.t"),
+                table: Box::new(t.clone()),
+            })
+        };
+        // Negative first: an ordinary table says none of it.
+        let plain = create(&t);
+        assert!(
+            !plain[0].contains("GENERATED")
+                && !plain[0].contains("PERIOD")
+                && !plain[0].contains("WITH"),
+            "{}",
+            plain[0]
+        );
+        t.system_time = Some(pbps_model::SystemTime {
+            start: "vf".into(),
+            end: "vt".into(),
+            hidden: true,
+            versioning: Some(pbps_model::SystemVersioning {
+                history: tname("hist.t_history"),
+                retention: Some("6 months".parse().unwrap()),
+            }),
+        });
+        let sql = create(&t);
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        for part in [
+            "[vf] datetime2(3) GENERATED ALWAYS AS ROW START HIDDEN NOT NULL CONSTRAINT",
+            "[vt] datetime2(3) GENERATED ALWAYS AS ROW END HIDDEN NOT NULL",
+            "PERIOD FOR SYSTEM_TIME ([vf], [vt])",
+            ") WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = [hist].[t_history], \
+             HISTORY_RETENTION_PERIOD = 6 MONTH));",
+        ] {
+            assert!(sql[0].contains(part), "{part}: {}", sql[0]);
+        }
+        assert!(!sql[0].contains("[id] int GENERATED"), "{}", sql[0]);
+        // INFINITE is the engine's default, and not spelled.
+        let st = t.system_time.as_mut().unwrap();
+        st.hidden = false;
+        st.versioning.as_mut().unwrap().retention = None;
+        let sql = create(&t);
+        assert!(
+            sql[0].contains("GENERATED ALWAYS AS ROW START NOT NULL")
+                && sql[0].ends_with("(HISTORY_TABLE = [hist].[t_history]));"),
+            "{}",
+            sql[0]
+        );
+        // The period alone: no versioning, no `WITH`.
+        t.system_time.as_mut().unwrap().versioning = None;
+        let sql = create(&t);
+        assert!(
+            sql[0].contains("PERIOD FOR SYSTEM_TIME") && !sql[0].contains("WITH"),
+            "{}",
+            sql[0]
+        );
     }
 
     /// A key's layout is always spelled, because a bare `PRIMARY KEY` beside

@@ -604,6 +604,15 @@ impl Dialect for Postgres {
                 ),
             });
         }
+        // SQL Server's (#1176). PostgreSQL has no system-versioned table.
+        if table.system_time.is_some() {
+            found.push(DialectError::Invalid {
+                dialect: crate::types::DIALECT,
+                message: "`system_time` is SQL Server's `PERIOD FOR SYSTEM_TIME` and system \
+                          versioning; PostgreSQL has neither, so remove the block"
+                    .to_owned(),
+            });
+        }
         // The names first, and this is not a formality: `quote_ident` refuses
         // an identifier over [`MAX_IDENT_BYTES`], so a table this method called
         // clean is one the emitter cannot spell. `validate` is the command that
@@ -1219,6 +1228,40 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("computed column") && m.contains("generated:")),
             "{found:?}"
+        );
+    }
+
+    /// `system_time` is SQL Server's period and system versioning, which
+    /// PostgreSQL has neither of: refused by name (#1176).
+    #[test]
+    fn system_time_is_refused_on_postgres() {
+        use pbps_dialect::Dialect;
+        let mut table = pbps_model::Table::default();
+        for c in ["vf", "vt"] {
+            table.columns.insert(
+                c.into(),
+                pbps_model::Column::new("timestamptz".parse().unwrap()).not_null(),
+            );
+        }
+        let name: pbps_model::TableName = "app.t".parse().unwrap();
+        let found = |t: &pbps_model::Table| -> Vec<String> {
+            super::Postgres::default()
+                .validate_table(&name, t)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert!(found(&table).is_empty(), "{:?}", found(&table));
+        table.system_time = Some(pbps_model::SystemTime {
+            start: "vf".into(),
+            end: "vt".into(),
+            hidden: false,
+            versioning: None,
+        });
+        let refused = found(&table);
+        assert!(
+            refused.iter().any(|m| m.contains("`system_time`")),
+            "{refused:?}"
         );
     }
 

@@ -53,6 +53,251 @@ pub struct RawTable {
     pub is_dropped_ledger_table: bool,
     /// The ledger view the engine maintains for a ledger table.
     pub ledger_view_id: Option<i32>,
+    /// `sys.tables.history_table_id`: a system-versioned table's history
+    /// (#1176). `None` on an ordinary table, and where it cannot be read.
+    pub history_table_id: Option<i32>,
+    /// `history_retention_period` and its unit: `-1` is INFINITE, and the
+    /// unit is 3 to 6 for a day, week, month or year. `(-1, -1)` on a
+    /// server older than retention, which keeps every history row.
+    pub retention: Option<(i32, i32)>,
+    /// The period's start and end columns, by name.
+    pub period: Option<(String, String)>,
+    /// The lowest and highest `data_compression` of the table's rows (its
+    /// heap or clustered index), over its partitions.
+    pub compression: Option<(u8, u8)>,
+}
+
+/// What each table with a period, or with a column the engine writes or
+/// hides, reads as (#1176, DEC-1176.1): its `system_time`, or why it stays
+/// out of the declarations. By the table's object id; a history table is
+/// not a key, but part of its table's answer.
+fn temporal_tables(raw: &RawCatalog) -> BTreeMap<i32, Result<pbps_model::SystemTime, String>> {
+    let by_id: BTreeMap<i32, &RawTable> = raw.tables.iter().map(|t| (t.object_id, t)).collect();
+    let mut columns: BTreeMap<i32, Vec<&RawColumn>> = BTreeMap::new();
+    for c in &raw.columns {
+        columns.entry(c.object_id).or_default().push(c);
+    }
+    let mut out = BTreeMap::new();
+    for t in &raw.tables {
+        // The ledger is refused before this is asked, and a history is
+        // answered by its table.
+        if t.ledger_type != 0 || t.is_dropped_ledger_table || t.temporal_type == 1 {
+            continue;
+        }
+        let cols = columns.get(&t.object_id).map_or(&[][..], Vec::as_slice);
+        let engine_written = cols
+            .iter()
+            .any(|c| c.generated_always_type != 0 || c.is_hidden);
+        if t.temporal_type == 0 && !t.has_period && !engine_written {
+            continue;
+        }
+        out.insert(t.object_id, system_time(raw, t, cols, &by_id, &columns));
+    }
+    out
+}
+
+fn system_time(
+    raw: &RawCatalog,
+    t: &RawTable,
+    cols: &[&RawColumn],
+    by_id: &BTreeMap<i32, &RawTable>,
+    columns: &BTreeMap<i32, Vec<&RawColumn>>,
+) -> Result<pbps_model::SystemTime, String> {
+    let Some((start, end)) = t.period.clone().filter(|_| t.has_period) else {
+        return Err(if t.has_period || t.temporal_type == 2 {
+            "its PERIOD FOR SYSTEM_TIME columns cannot be read".to_owned()
+        } else {
+            "a column the engine writes or hides (GENERATED ALWAYS or HIDDEN) outside a \
+             PERIOD FOR SYSTEM_TIME, which pbps cannot express"
+                .to_owned()
+        });
+    };
+    for column in [&start, &end] {
+        if !cols.iter().any(|c| &c.name == column) {
+            return Err(format!("its period column `{column}` cannot be read"));
+        }
+    }
+    // Every column the engine writes or hides is one of the period's, and
+    // the period's are what the engine says they are.
+    let mut hidden = 0;
+    for c in cols {
+        let expected = if c.name == start {
+            1
+        } else if c.name == end {
+            2
+        } else {
+            0
+        };
+        if c.generated_always_type != expected {
+            return Err(format!(
+                "column `{}` is GENERATED ALWAYS (generated_always_type = {}), which pbps can \
+                 express only as a period's start (1) or end (2)",
+                c.name, c.generated_always_type
+            ));
+        }
+        if c.is_hidden {
+            if expected == 0 {
+                return Err(format!(
+                    "column `{}` is HIDDEN, which pbps can express only on a period's columns",
+                    c.name
+                ));
+            }
+            hidden += 1;
+        }
+    }
+    let hidden = match hidden {
+        0 => false,
+        2 => true,
+        _ => {
+            return Err(
+                "one of its period's columns is HIDDEN and the other is not, which pbps cannot \
+                 express"
+                    .to_owned(),
+            );
+        }
+    };
+    let versioning = match (t.temporal_type, t.history_table_id) {
+        (0, _) => None,
+        (2, Some(history)) => Some(versioning(
+            raw,
+            t,
+            (&start, &end),
+            cols,
+            by_id.get(&history).copied(),
+            columns.get(&history).map_or(&[][..], Vec::as_slice),
+        )?),
+        (2, None) => return Err("its history table cannot be read".to_owned()),
+        (other, _) => return Err(format!("temporal_type = {other} is not one pbps knows")),
+    };
+    Ok(pbps_model::SystemTime {
+        start,
+        end,
+        hidden,
+        versioning,
+    })
+}
+
+/// The history, held to the layout `CREATE TABLE … WITH (SYSTEM_VERSIONING
+/// = ON (HISTORY_TABLE = …))` builds, which is the only one the model has
+/// (DEC-1176.1, measured on 17.0): one clustered, non-unique index named
+/// `ix_<history>` on `(end, start)`, nothing else, and the table's columns.
+/// Compared by the same reads as an ordinary table's indexes, field by
+/// field; never inferred from a name alone.
+fn versioning(
+    raw: &RawCatalog,
+    t: &RawTable,
+    (start, end): (&str, &str),
+    cols: &[&RawColumn],
+    history: Option<&RawTable>,
+    history_cols: &[&RawColumn],
+) -> Result<pbps_model::SystemVersioning, String> {
+    let Some(h) = history.filter(|h| h.temporal_type == 1) else {
+        return Err("its history table cannot be read".to_owned());
+    };
+    let name = TableName::new(h.schema.clone(), h.name.clone());
+    let retention = match t.retention {
+        Some((-1, _)) => None,
+        Some((count, unit)) if count > 0 => {
+            let unit = match unit {
+                3 => pbps_model::RetentionUnit::Day,
+                4 => pbps_model::RetentionUnit::Week,
+                5 => pbps_model::RetentionUnit::Month,
+                6 => pbps_model::RetentionUnit::Year,
+                other => {
+                    return Err(format!(
+                        "its history retention unit ({other}) is not one pbps knows"
+                    ));
+                }
+            };
+            Some(pbps_model::Retention {
+                count: count.unsigned_abs(),
+                unit,
+            })
+        }
+        Some((count, unit)) => {
+            return Err(format!(
+                "its history retention ({count}, unit {unit}) is not one pbps knows"
+            ));
+        }
+        None => return Err("its history retention cannot be read".to_owned()),
+    };
+    let layout = |what: &str| {
+        Err(format!(
+            "its history table {name} {what}, and pbps holds only the layout SQL Server builds \
+             for a new history table"
+        ))
+    };
+    let mirrors = history_cols.len() == cols.len()
+        && history_cols.iter().zip(cols).all(|(h, c)| {
+            h.name == c.name
+                && h.type_name == c.type_name
+                && h.max_length == c.max_length
+                && h.precision == c.precision
+                && h.scale == c.scale
+                && h.is_nullable == c.is_nullable
+                && h.collation == c.collation
+        });
+    if !mirrors {
+        return layout("does not mirror the table's columns");
+    }
+    if history_cols.iter().any(|h| {
+        h.default.is_some()
+            || h.identity.is_some()
+            || h.is_computed
+            || h.generated_always_type != 0
+            || h.is_hidden
+    }) {
+        return layout("has a default, identity or computed column of its own");
+    }
+    if raw.key_columns.iter().any(|k| k.object_id == h.object_id)
+        || raw.checks.iter().any(|c| c.object_id == h.object_id)
+        || raw
+            .foreign_key_columns
+            .iter()
+            .any(|f| f.object_id == h.object_id)
+    {
+        return layout("has a constraint of its own");
+    }
+    let index: Vec<&RawIndexColumn> = raw
+        .index_columns
+        .iter()
+        .filter(|i| i.object_id == h.object_id)
+        .collect();
+    let expected = format!("ix_{}", h.name);
+    if index.iter().any(|i| i.index_name != expected) {
+        return layout(&format!("has an index other than `{expected}`"));
+    }
+    let keys: Vec<(&str, bool, bool)> = index
+        .iter()
+        .map(|i| (i.column.as_str(), i.is_descending, i.is_included))
+        .collect();
+    if keys != [(end, false, false), (start, false, false)] {
+        return layout(&format!(
+            "has no clustered index `{expected}` on ({end}, {start}) alone"
+        ));
+    }
+    if index.iter().any(|i| {
+        i.kind != IndexKind::Clustered
+            || i.is_unique
+            || i.filter.is_some()
+            || i.is_disabled
+            || i.ignore_dup_key
+            || i.rows_partitioned
+    }) {
+        return layout(&format!("has `{expected}` with options of its own"));
+    }
+    // The engine compresses a new history PAGE where the edition does so by
+    // itself and leaves it NONE elsewhere (Express, measured on 17.0), and an
+    // ordinary table's compression is not read at all: either is the
+    // default, and neither is held.
+    match h.compression {
+        Some((low, high)) if low == high && (low == 0 || low == 2) => {}
+        _ => return layout("is compressed otherwise than PAGE or NONE throughout"),
+    }
+    Ok(pbps_model::SystemVersioning {
+        history: name,
+        retention,
+    })
 }
 
 /// How a ledger table is named to the operator, by `sys.tables.ledger_type`.
@@ -97,6 +342,11 @@ pub struct RawColumn {
     pub computed_definition: Option<String>,
     /// `sys.computed_columns.is_persisted`; false for an ordinary column.
     pub computed_persisted: bool,
+    /// `sys.columns.generated_always_type`: 1 and 2 are a period's start and
+    /// end; zero is a column a row writes (#1176).
+    pub generated_always_type: u8,
+    /// `sys.columns.is_hidden`: left out of `SELECT *`.
+    pub is_hidden: bool,
 }
 
 /// One column of a PRIMARY KEY or UNIQUE constraint, in key order.
@@ -760,6 +1010,16 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     // The ledger views of omitted ledger tables, so each is inventoried as
     // what it is rather than as a view that happens to depend on one.
     let mut ledger_views = BTreeSet::new();
+    // A system-versioned table and its history are one table of the model
+    // (#1176, DEC-1176.1); this says which pairs and periods are read, and
+    // why each other one stays out.
+    let temporal = temporal_tables(raw);
+    let histories: BTreeMap<i32, &RawTable> = raw
+        .tables
+        .iter()
+        .filter(|t| t.temporal_type == 2)
+        .filter_map(|t| t.history_table_id.map(|h| (h, t)))
+        .collect();
 
     for t in &raw.tables {
         // The engine maintains a ledger table's hidden GENERATED ALWAYS
@@ -791,29 +1051,66 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             );
             continue;
         }
-        // Both halves of active versioning, and a current table whose period
-        // remains after versioning is disabled, must stay unmanaged. Declaring
-        // any of them as ordinary loses temporal semantics on bootstrap.
-        if t.temporal_type != 0 || t.has_period {
-            let name = TableName::new(t.schema.clone(), t.name.clone());
-            omitted_tables.insert(name.clone(), "temporal table");
+        let name = TableName::new(t.schema.clone(), t.name.clone());
+        // A history is part of its table, never a table of its own. A module
+        // bound to it stays out with the rest of the closure: it would name a
+        // table no declaration lists.
+        if t.temporal_type == 1 {
             unavailable_object_ids.insert(t.object_id);
+            let current = histories.get(&t.object_id);
+            if current.is_some_and(|c| temporal.get(&c.object_id).is_some_and(Result::is_ok)) {
+                continue;
+            }
+            omitted_tables.insert(name.clone(), "temporal history table");
+            let why = match current {
+                Some(c) => format!(
+                    "the history table of {}, which was left out; it was left out with it",
+                    TableName::new(c.schema.clone(), c.name.clone())
+                ),
+                None => "a history table whose system-versioned table cannot be read; it was \
+                         left out of the declarations"
+                    .to_owned(),
+            };
             push_limitation(
                 &mut warnings,
                 &mut limitations,
                 Some(&name),
-                format!(
-                    "{name}: system versioning or PERIOD FOR SYSTEM_TIME (temporal_type = {}, has_period = {}) is not supported yet; the table was left out of the declarations",
-                    t.temporal_type, t.has_period
-                ),
+                format!("{name}: {why}"),
             );
             continue;
         }
-        names.insert(
-            t.object_id,
-            TableName::new(t.schema.clone(), t.name.clone()),
-        );
-        tables.insert(t.object_id, Table::default());
+        let mut table = Table::default();
+        match temporal.get(&t.object_id) {
+            None => {}
+            // Declared as ordinary, the table would lose its period, or its
+            // history, on bootstrap.
+            Some(Err(why)) => {
+                omitted_tables.insert(name.clone(), "temporal table");
+                unavailable_object_ids.insert(t.object_id);
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    Some(&name),
+                    format!("{name}: {why}; the table was left out of the declarations"),
+                );
+                continue;
+            }
+            Some(Ok(st)) => {
+                if let Some(v) = &st.versioning
+                    && v.history.name == format!("MSSQL_TemporalHistoryFor_{}", t.object_id)
+                {
+                    onboarding_notices.push(format!(
+                        "{name}: SQL Server named its history table {}; the declaration names \
+                         it explicitly, so a table created from it keeps this name instead of \
+                         another the engine would choose",
+                        v.history
+                    ));
+                }
+                table.system_time = Some(st.clone());
+            }
+        }
+        names.insert(t.object_id, name);
+        tables.insert(t.object_id, table);
     }
     let name_of = |id: i32, names: &BTreeMap<i32, TableName>| {
         names
@@ -1770,15 +2067,340 @@ mod tests {
             ledger_type: 0,
             is_dropped_ledger_table: false,
             ledger_view_id: None,
+            history_table_id: None,
+            retention: None,
+            period: None,
+            compression: None,
         }
     }
 
+    /// A versioned pair as the engine builds one (#1176, measured on 17.0):
+    /// `dbo.t` with its period `vf`/`vt`, and `hist.t_history` mirroring its
+    /// columns under one clustered index `ix_t_history` on `(vt, vf)`, PAGE.
+    fn versioned_pair() -> RawCatalog {
+        let mut current = raw_table(1, "dbo", "t");
+        current.temporal_type = 2;
+        current.has_period = true;
+        current.history_table_id = Some(2);
+        current.retention = Some((6, 5));
+        current.period = Some(("vf".into(), "vt".into()));
+        current.compression = Some((0, 0));
+        let mut history = raw_table(2, "hist", "t_history");
+        history.temporal_type = 1;
+        history.compression = Some((2, 2));
+        let mut columns = Vec::new();
+        for id in [1, 2] {
+            let mut key = raw_column(id, "id", "int");
+            key.is_nullable = false;
+            columns.push(key);
+            for (name, edge) in [("vf", 1), ("vt", 2)] {
+                let mut c = raw_column(id, name, "datetime2");
+                c.is_nullable = false;
+                c.precision = 27;
+                c.scale = 7;
+                if id == 1 {
+                    c.generated_always_type = edge;
+                }
+                columns.push(c);
+            }
+        }
+        let key = |column: &str| RawIndexColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
+            object_id: 2,
+            index_name: "ix_t_history".into(),
+            is_unique: false,
+            kind: IndexKind::Clustered,
+            filter: None,
+            column: column.into(),
+            is_included: false,
+            is_descending: false,
+            rows_partitioned: false,
+        };
+        RawCatalog {
+            tables: vec![current, history],
+            columns,
+            index_columns: vec![key("vt"), key("vf")],
+            ..Default::default()
+        }
+    }
+
+    /// The pair reads as one table: its period, its history by name, its
+    /// retention, and no table for the history (#1176).
+    #[test]
+    fn a_versioned_pair_reads_as_one_table() {
+        let pulled = assemble(&versioned_pair());
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        assert_eq!(
+            pulled
+                .schema
+                .tables
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["dbo.t"]
+        );
+        let t = &pulled.schema.tables[&TableName::new("dbo", "t")];
+        assert_eq!(
+            t.system_time,
+            Some(pbps_model::SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: false,
+                versioning: Some(pbps_model::SystemVersioning {
+                    history: TableName::new("hist", "t_history"),
+                    retention: Some("6 months".parse().unwrap()),
+                }),
+            })
+        );
+        assert_eq!(
+            t.columns.keys().collect::<Vec<_>>(),
+            ["id", "vf", "vt"],
+            "the period's columns are the table's"
+        );
+        assert!(
+            pulled.onboarding_notices.is_empty(),
+            "{:?}",
+            pulled.onboarding_notices
+        );
+
+        // INFINITE, hidden, NONE (Express), and a name the engine chose,
+        // which is written out with a notice.
+        let mut raw = versioned_pair();
+        raw.tables[0].retention = Some((-1, -1));
+        raw.tables[1].compression = Some((0, 0));
+        raw.tables[1].name = "MSSQL_TemporalHistoryFor_1".into();
+        for i in &mut raw.index_columns {
+            i.index_name = "ix_MSSQL_TemporalHistoryFor_1".into();
+        }
+        for c in raw
+            .columns
+            .iter_mut()
+            .filter(|c| c.object_id == 1 && c.name != "id")
+        {
+            c.is_hidden = true;
+        }
+        let pulled = assemble(&raw);
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        let st = pulled.schema.tables[&TableName::new("dbo", "t")]
+            .system_time
+            .clone()
+            .unwrap();
+        assert!(st.hidden);
+        let v = st.versioning.unwrap();
+        assert_eq!(v.retention, None);
+        assert_eq!(
+            v.history,
+            TableName::new("hist", "MSSQL_TemporalHistoryFor_1")
+        );
+        assert!(
+            pulled.onboarding_notices.len() == 1
+                && pulled.onboarding_notices[0].contains("explicitly"),
+            "{:?}",
+            pulled.onboarding_notices
+        );
+
+        // A period alone, with versioning off, is the table with no history.
+        let mut raw = versioned_pair();
+        raw.tables[0].temporal_type = 0;
+        raw.tables[0].history_table_id = None;
+        raw.tables.truncate(1);
+        let pulled = assemble(&raw);
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        let st = pulled.schema.tables[&TableName::new("dbo", "t")]
+            .system_time
+            .clone()
+            .unwrap();
+        assert_eq!(st.versioning, None);
+    }
+
+    /// Anything the reader cannot hold leaves the pair out, both tables
+    /// named, and never reads as the default (#1176): a history layout other
+    /// than the engine's own, field by field, an unreadable history or
+    /// retention, and engine-written or hidden columns outside the period.
+    #[test]
+    fn what_a_pair_cannot_hold_leaves_it_out() {
+        type Change = fn(&mut RawCatalog);
+        let cases: [(&str, Change, &str); 16] = [
+            (
+                "an extra index",
+                |r| {
+                    let mut extra = r.index_columns[0].clone();
+                    extra.index_name = "ix_extra".into();
+                    extra.kind = IndexKind::Nonclustered;
+                    r.index_columns.push(extra);
+                },
+                "has an index other than `ix_t_history`",
+            ),
+            (
+                "its index renamed",
+                |r| {
+                    for i in &mut r.index_columns {
+                        i.index_name = "cx_t_history".into();
+                    }
+                },
+                "has an index other than `ix_t_history`",
+            ),
+            (
+                "a heap",
+                |r| r.index_columns.clear(),
+                "has no clustered index",
+            ),
+            (
+                "keys swapped",
+                |r| r.index_columns.reverse(),
+                "has no clustered index",
+            ),
+            (
+                "a descending key",
+                |r| r.index_columns[0].is_descending = true,
+                "has no clustered index",
+            ),
+            (
+                "a unique index",
+                |r| {
+                    for i in &mut r.index_columns {
+                        i.is_unique = true;
+                    }
+                },
+                "with options of its own",
+            ),
+            (
+                "a partitioned history",
+                |r| {
+                    for i in &mut r.index_columns {
+                        i.rows_partitioned = true;
+                    }
+                },
+                "with options of its own",
+            ),
+            (
+                "ROW compression",
+                |r| r.tables[1].compression = Some((1, 1)),
+                "compressed otherwise",
+            ),
+            (
+                "mixed compression",
+                |r| r.tables[1].compression = Some((0, 2)),
+                "compressed otherwise",
+            ),
+            (
+                "a history default",
+                |r| {
+                    r.columns
+                        .iter_mut()
+                        .find(|c| c.object_id == 2 && c.name == "id")
+                        .unwrap()
+                        .default = Some("((0))".into());
+                },
+                "has a default",
+            ),
+            (
+                "a history column of another type",
+                |r| {
+                    r.columns
+                        .iter_mut()
+                        .find(|c| c.object_id == 2 && c.name == "id")
+                        .unwrap()
+                        .type_name = "bigint".into();
+                },
+                "does not mirror",
+            ),
+            (
+                "an unreadable history",
+                |r| {
+                    r.tables.truncate(1);
+                },
+                "history table cannot be read",
+            ),
+            (
+                "an unknown retention unit",
+                |r| r.tables[0].retention = Some((6, 9)),
+                "retention unit",
+            ),
+            (
+                "an unreadable retention",
+                |r| r.tables[0].retention = None,
+                "retention cannot be read",
+            ),
+            (
+                "one hidden period column",
+                |r| {
+                    r.columns
+                        .iter_mut()
+                        .find(|c| c.object_id == 1 && c.name == "vf")
+                        .unwrap()
+                        .is_hidden = true;
+                },
+                "one of its period's columns is HIDDEN",
+            ),
+            (
+                "a hidden non-period column",
+                |r| {
+                    r.columns
+                        .iter_mut()
+                        .find(|c| c.object_id == 1 && c.name == "id")
+                        .unwrap()
+                        .is_hidden = true;
+                },
+                "column `id` is HIDDEN",
+            ),
+        ];
+        for (what, change, says) in cases {
+            let mut raw = versioned_pair();
+            change(&mut raw);
+            let pulled = assemble(&raw);
+            assert!(
+                pulled.schema.tables.is_empty(),
+                "{what}: {:?}",
+                pulled.schema.tables.keys()
+            );
+            assert!(
+                pulled.limitations.iter().any(|l| {
+                    l.target.object_name() == TableName::new("dbo", "t") && l.detail.contains(says)
+                }),
+                "{what}: {:?}",
+                pulled.limitations
+            );
+            if raw.tables.len() == 2 {
+                assert!(
+                    pulled.limitations.iter().any(|l| {
+                        l.target.object_name() == TableName::new("hist", "t_history")
+                            && l.detail.contains("the history table of dbo.t")
+                    }),
+                    "{what}: {:?}",
+                    pulled.limitations
+                );
+            }
+        }
+        // And on a table with no period: a column the engine writes.
+        let mut raw = RawCatalog::default();
+        raw.tables.push(raw_table(5, "dbo", "plain"));
+        let mut c = raw_column(5, "tx", "bigint");
+        c.generated_always_type = 5;
+        raw.columns.push(c);
+        let pulled = assemble(&raw);
+        assert!(pulled.schema.tables.is_empty());
+        assert!(
+            pulled.limitations[0]
+                .detail
+                .contains("outside a PERIOD FOR SYSTEM_TIME"),
+            "{:?}",
+            pulled.limitations
+        );
+    }
+
+    /// A versioned pair whose period cannot be read stays out together: the
+    /// table, and its history named as its history (#1176).
     #[test]
     fn system_versioning_and_history_are_reported_instead_of_managed() {
         let mut raw = RawCatalog::default();
         for (id, name, temporal_type) in [(1, "current", 2), (2, "history", 1), (3, "plain", 0)] {
             let mut table = raw_table(id, "dbo", name);
             table.temporal_type = temporal_type;
+            if temporal_type == 2 {
+                table.history_table_id = Some(2);
+            }
             raw.tables.push(table);
             raw.columns.push(raw_column(id, "id", "int"));
         }
@@ -1790,16 +2412,18 @@ mod tests {
                 .contains_key("id")
         );
         assert_eq!(pulled.limitations.len(), 2);
-        for name in ["current", "history"] {
+        for (name, says) in [
+            ("current", "PERIOD FOR SYSTEM_TIME columns cannot be read"),
+            ("history", "the history table of dbo.current"),
+        ] {
             assert!(pulled.limitations.iter().any(|l| {
-                l.target.object_name() == TableName::new("dbo", name)
-                    && l.detail.contains("system versioning")
+                l.target.object_name() == TableName::new("dbo", name) && l.detail.contains(says)
             }));
             assert!(
                 pulled
                     .warnings
                     .iter()
-                    .any(|w| w.contains(name) && w.contains("system versioning"))
+                    .any(|w| w.contains(name) && w.contains(says))
             );
         }
     }
@@ -1840,6 +2464,8 @@ mod tests {
             collation: None,
             computed_definition: None,
             computed_persisted: false,
+            generated_always_type: 0,
+            is_hidden: false,
         }
     }
 
@@ -1984,7 +2610,11 @@ mod tests {
 
     #[test]
     fn omitted_temporal_character_tables_do_not_report_a_database_collation() {
-        for (temporal_type, has_period) in [(2, true), (1, false), (0, true)] {
+        for (temporal_type, has_period, says) in [
+            (2, true, "PERIOD FOR SYSTEM_TIME"),
+            (1, false, "history table"),
+            (0, true, "PERIOD FOR SYSTEM_TIME"),
+        ] {
             let mut omitted = raw_table(10, "dbo", "omitted");
             omitted.temporal_type = temporal_type;
             omitted.has_period = has_period;
@@ -2010,11 +2640,7 @@ mod tests {
                 pulled.limitations[0].target.object_name(),
                 TableName::new("dbo", "omitted")
             );
-            assert!(
-                pulled.limitations[0]
-                    .detail
-                    .contains("PERIOD FOR SYSTEM_TIME")
-            );
+            assert!(pulled.limitations[0].detail.contains(says));
             assert_eq!(pulled.warnings, vec![pulled.limitations[0].detail.clone()]);
         }
     }
@@ -3226,6 +3852,10 @@ mod module_tests {
                 ledger_type: 0,
                 is_dropped_ledger_table: false,
                 ledger_view_id: None,
+                history_table_id: None,
+                retention: None,
+                period: None,
+                compression: None,
             }],
             columns: vec![RawColumn {
                 object_id: 1,
@@ -3243,6 +3873,8 @@ mod module_tests {
                 collation: None,
                 computed_definition: None,
                 computed_persisted: false,
+                generated_always_type: 0,
+                is_hidden: false,
             }],
             ..Default::default()
         }

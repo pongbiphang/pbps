@@ -513,6 +513,9 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
             errs.push(e);
         }
     }
+    if let Some(st) = &table.system_time {
+        errs.extend(system_time(name, table, st));
+    }
 
     let mut identity_columns = Vec::new();
     for (col_name, col) in &table.columns {
@@ -935,6 +938,70 @@ enum Computed {
 }
 
 /// The checks shared by every construct that builds a key out of columns.
+/// What the engine takes for `PERIOD FOR SYSTEM_TIME` and its history
+/// (#1176, measured on 17.0): two distinct `datetime2` columns, not nullable,
+/// the engine's to write. A default is accepted, and kept.
+fn system_time(name: &TableName, table: &Table, st: &pbps_model::SystemTime) -> Vec<DialectError> {
+    let mut errs = Vec::new();
+    if st.start == st.end {
+        errs.push(invalid(format!(
+            "`system_time` names `{}` as both the start and the end of its period; name two \
+             columns",
+            st.start
+        )));
+    }
+    for (role, column) in [("start", &st.start), ("end", &st.end)] {
+        let Some(col) = table.columns.get(column) else {
+            errs.push(invalid(format!(
+                "`system_time` names `{column}` as its period's {role}, but no column of that \
+                 name is declared; declare it under `columns:` as `datetime2`, not nullable"
+            )));
+            continue;
+        };
+        // The engine refuses any other type, `datetime` too (Msg 13501).
+        if col.ty.base != "datetime2" {
+            errs.push(invalid(format!(
+                "column `{column}` is the period's {role}, which SQL Server requires to be \
+                 `datetime2`, not `{}`",
+                col.ty
+            )));
+        }
+        if col.nullable {
+            errs.push(invalid(format!(
+                "column `{column}` is the period's {role}, which is never NULL; declare it \
+                 `nullable: false`"
+            )));
+        }
+        if col.identity.is_some() {
+            errs.push(invalid(format!(
+                "column `{column}` is the period's {role}, which the engine writes, so it \
+                 cannot also be an identity"
+            )));
+        }
+    }
+    // Every write to a row writes history, and the period's columns are the
+    // engine's: rows are not this slice's to manage (#1177).
+    if table.data.is_some() {
+        errs.push(invalid(
+            "a table with `system_time` cannot declare `data:` rows yet: every row written \
+             also writes its period and its history",
+        ));
+    }
+    if let Some(v) = &st.versioning {
+        for part in [&v.history.schema, &v.history.name] {
+            if let Err(e) = ident::quote(part) {
+                errs.push(e);
+            }
+        }
+        if &v.history == name {
+            errs.push(invalid(format!(
+                "`system_time` names `{name}` itself as its history table; name another table"
+            )));
+        }
+    }
+    errs
+}
+
 fn key_columns(
     what: &str,
     columns: &[String],
@@ -1205,6 +1272,100 @@ mod tests {
             refused.iter().any(|m| m.contains("`unlogged`")),
             "{refused:?}"
         );
+    }
+
+    /// A period and its history are validated as the engine would take them
+    /// (#1176, measured on 17.0): two distinct declared `datetime2` columns,
+    /// not nullable, no identity; no `data:` rows; a history other than the
+    /// table itself. Each is refused by name, and a valid one is clean.
+    #[test]
+    fn a_period_is_held_to_what_sql_server_takes() {
+        use pbps_model::{SystemTime, SystemVersioning};
+        let valid = || {
+            let mut table = Table::default();
+            table
+                .columns
+                .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+            for c in ["vf", "vt"] {
+                table.columns.insert(
+                    c.into(),
+                    Column::new("datetime2(7)".parse().unwrap()).not_null(),
+                );
+            }
+            // A default on a period column is accepted by the engine, and kept.
+            table.columns.get_mut("vf").unwrap().default = Some("SYSUTCDATETIME()".into());
+            table.system_time = Some(SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: true,
+                versioning: Some(SystemVersioning {
+                    history: "hist.t_history".parse().unwrap(),
+                    retention: Some("6 months".parse().unwrap()),
+                }),
+            });
+            table
+        };
+        let found = |t: &Table| {
+            super::table(&"dbo.t".parse().unwrap(), t)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(found(&valid()).is_empty(), "{:?}", found(&valid()));
+        fn st(t: &mut Table) -> &mut SystemTime {
+            t.system_time.as_mut().unwrap()
+        }
+        type Break = fn(&mut Table);
+        let cases: [(Break, &str); 8] = [
+            (|t| st(t).end = "vf".into(), "as both the start and the end"),
+            (|t| st(t).end = "missing".into(), "no column of that name"),
+            (
+                |t| t.columns.get_mut("vt").unwrap().ty = "datetime".parse().unwrap(),
+                "`datetime2`, not `datetime`",
+            ),
+            (
+                |t| t.columns.get_mut("vf").unwrap().nullable = true,
+                "declare it `nullable: false`",
+            ),
+            (
+                |t| {
+                    t.columns.get_mut("vf").unwrap().identity = Some(pbps_model::Identity {
+                        seed: 1,
+                        increment: 1,
+                    })
+                },
+                "cannot also be an identity",
+            ),
+            (
+                |t| {
+                    t.data = Some(pbps_model::TableData {
+                        mode: pbps_model::DataMode::Exact,
+                        rows: Default::default(),
+                    })
+                },
+                "cannot declare `data:` rows",
+            ),
+            (
+                |t| st(t).versioning.as_mut().unwrap().history = "dbo.t".parse().unwrap(),
+                "itself as its history table",
+            ),
+            (
+                |t| {
+                    st(t).versioning.as_mut().unwrap().history =
+                        TableName::new("hist", "a]b".repeat(60))
+                },
+                "",
+            ),
+        ];
+        for (break_it, says) in cases {
+            let mut t = valid();
+            break_it(&mut t);
+            let refused = found(&t);
+            assert!(
+                !refused.is_empty() && refused.iter().any(|m| m.contains(says)),
+                "{says}: {refused:?}"
+            );
+        }
     }
 
     /// A GIN method or an operator class is PostgreSQL's, and is refused on

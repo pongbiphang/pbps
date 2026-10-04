@@ -2633,6 +2633,49 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
     problems
 }
 
+/// Whether a system-versioned table's history (#1176) takes a name something
+/// else in the declaration holds: a table, another table's history, or a
+/// module the engine keeps beside tables. The history is a table in the
+/// database, in the schema's one namespace, though no declaration lists it
+/// as one, so `CREATE TABLE … HISTORY_TABLE` would meet the other object
+/// mid-apply.
+pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut histories: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+    for (table, versioning) in schema.tables.iter().filter_map(|(name, t)| {
+        t.system_time
+            .as_ref()
+            .and_then(|st| st.versioning.as_ref())
+            .map(|v| (name, v))
+    }) {
+        let history = &versioning.history;
+        if schema.tables.contains_key(history) {
+            problems.push(format!(
+                "`{table}` names `{history}` as its history table, which is also declared as a \
+                 table; the history is created with `{table}`, so name it something else"
+            ));
+        }
+        if let Some(first) = histories.insert(history, table) {
+            problems.push(format!(
+                "`{first}` and `{table}` both name `{history}` as their history table; each \
+                 system-versioned table needs its own"
+            ));
+        }
+        for (id, module) in &schema.modules {
+            if dialect.shares_namespace_with_tables(module.kind) && &id.object_name() == history {
+                problems.push(format!(
+                    "`{table}` names `{history}` as its history table, which is also declared \
+                     as a {}; {} keeps tables and {}s in one namespace per schema",
+                    module.kind,
+                    dialect.name(),
+                    module.kind
+                ));
+            }
+        }
+    }
+    problems
+}
+
 /// The whole-schema question of whether a declared index, or the index behind
 /// a named primary key or unique constraint, collides with another relation
 /// in its schema — a third case of the namespace-sharing rule 201 moved to
@@ -3744,6 +3787,55 @@ mod tests {
             schema.modules.insert(id.parse().unwrap(), module(*kind));
         }
         schema
+    }
+
+    /// A history table takes a name in the schema's namespace although no
+    /// declaration lists it as a table: a declared table, another table's
+    /// history, or a module sharing that namespace under the same name is
+    /// refused, and a history named apart from all of them is not (#1176).
+    #[test]
+    fn a_history_name_something_else_holds_is_refused() {
+        let versioned = |history: &str| Table {
+            system_time: Some(pbps_model::SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: false,
+                versioning: Some(pbps_model::SystemVersioning {
+                    history: history.parse().unwrap(),
+                    retention: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut schema = schema_with(&[("app.v", ModuleKind::View)], &["app.other"]);
+        schema
+            .tables
+            .insert("app.a".parse().unwrap(), versioned("hist.a_history"));
+        assert!(
+            check_history_names(&schema, &MinimalDialect).is_empty(),
+            "{:?}",
+            check_history_names(&schema, &MinimalDialect)
+        );
+        // A period alone has no history to collide.
+        let mut period_only = versioned("app.other");
+        period_only.system_time.as_mut().unwrap().versioning = None;
+        schema.tables.insert("app.p".parse().unwrap(), period_only);
+        assert!(check_history_names(&schema, &MinimalDialect).is_empty());
+        for (history, says) in [
+            ("app.other", "also declared as a table"),
+            ("hist.a_history", "both name `hist.a_history`"),
+            ("app.v", "also declared as a view"),
+        ] {
+            let mut clash = schema.clone();
+            clash
+                .tables
+                .insert("app.b".parse().unwrap(), versioned(history));
+            let problems = check_history_names(&clash, &MinimalDialect);
+            assert!(
+                problems.len() == 1 && problems[0].contains(says),
+                "{history}: {problems:?}"
+            );
+        }
     }
 
     /// Whether a module competes with a table for its name is the engine's

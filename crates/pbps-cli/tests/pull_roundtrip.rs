@@ -30,6 +30,8 @@ fn full_catalog() -> RawCatalog {
         collation: None,
         computed_definition: None,
         computed_persisted: false,
+        generated_always_type: 0,
+        is_hidden: false,
     };
 
     let mut id = col(1, "id", "bigint");
@@ -181,6 +183,10 @@ fn raw_table(object_id: i32, schema: &str, name: &str) -> RawTable {
         ledger_type: 0,
         is_dropped_ledger_table: false,
         ledger_view_id: None,
+        history_table_id: None,
+        retention: None,
+        period: None,
+        compression: None,
     }
 }
 

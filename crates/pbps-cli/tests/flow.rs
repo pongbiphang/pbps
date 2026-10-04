@@ -1867,7 +1867,9 @@ fn pull_reports_system_versioning_without_declaring_either_temporal_table() {
              valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
              valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
              PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
-         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));",
+         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));
+         -- A history layout of its own leaves the pair out (#1176).
+         CREATE INDEX ix_extra ON dbo.versioned_history (id);",
     );
     let d = Demo::new("temporal-pull");
     for table in ["versioned", "plain"] {
@@ -1883,7 +1885,7 @@ fn pull_reports_system_versioning_without_declaring_either_temporal_table() {
         assert!(
             warnings
                 .lines()
-                .any(|line| line.contains(name) && line.contains("system versioning")),
+                .any(|line| line.contains(name) && line.contains("history table")),
             "{warnings}"
         );
         assert!(!d.dir.join("schema").join(format!("{name}.yml")).exists());
@@ -2445,6 +2447,99 @@ fn computed_columns_round_trip_and_change_through_the_cli() {
     assert_ne!(code(&o), 0, "{}", stdout(&o));
     assert!(
         stderr(&o).contains("computed column dbo.t.doubled may read `a`"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// A system-versioned table goes the whole way through the CLI (#1176).
+/// `pull` declares its period and its history, with no file for the history;
+/// the next connected plan is empty; a bootstrap onto a database where the
+/// history's name is taken is refused by name; `bootstrap` onto an empty one
+/// rebuilds the pair, whose history then keeps a replaced row, and a second
+/// `pull` writes the same file. A change to the table is refused by name,
+/// offline, before anything runs.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_system_versioned_table_round_trips_through_the_cli() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let source = OwnDatabase::new(&server, "temporal1176_src");
+    let target = OwnDatabase::new(&server, "temporal1176_dst");
+    let taken = OwnDatabase::new(&server, "temporal1176_taken");
+    on_server(
+        source.connection(),
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, v int NULL,
+             vf datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (vf, vt))
+         WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.t_history,
+                                       HISTORY_RETENTION_PERIOD = 3 DAYS));
+         INSERT dbo.t (id, v) VALUES (1, 5);
+         UPDATE dbo.t SET v = 6 WHERE id = 1;",
+    );
+    // Columns the history's would match, and the clustered index a finite
+    // retention needs: the engine would adopt it, rows and all.
+    on_server(
+        taken.connection(),
+        "CREATE TABLE dbo.t_history (id int NOT NULL, v int NULL,
+             vf datetime2 NOT NULL, vt datetime2 NOT NULL);
+         CREATE CLUSTERED INDEX ix_t_history ON dbo.t_history (vt, vf);",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let file = |d: &Demo| std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
+
+    let d = Demo::new("temporal1176");
+    ok(&d.run(&["pull", "--db", source.connection()]));
+    let pulled = file(&d);
+    assert!(
+        pulled.contains(
+            "\nsystem_time:\n  period: [vf, vt]\n  versioning:\n    history: dbo.t_history\n    retention: 3 days\n"
+        ),
+        "{pulled}"
+    );
+    assert!(!d.dir.join("schema/dbo.t_history.yml").exists());
+    d.commit();
+    ok(&d.run(&["baseline", "--db", source.connection(), "--reason", "adopt"]));
+    let o = d.run(&["plan", "--db", source.connection()]);
+    ok(&o);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+
+    let refused = d.run(&["bootstrap", "--db", taken.connection()]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("dbo.t names dbo.t_history as its history table"),
+        "{}",
+        stderr(&refused)
+    );
+    on_server(
+        taken.connection(),
+        "IF OBJECT_ID('dbo.t') IS NOT NULL THROW 50000, 'bootstrap ran', 1;",
+    );
+
+    ok(&d.run(&["bootstrap", "--db", target.connection()]));
+    on_server(
+        target.connection(),
+        "INSERT dbo.t (id, v) VALUES (1, 5);
+         UPDATE dbo.t SET v = 6 WHERE id = 1;
+         IF (SELECT COUNT(*) FROM dbo.t_history WHERE v = 5) <> 1
+             THROW 50000, 'no history kept', 1;
+         IF (SELECT history_retention_period FROM sys.tables WHERE name = 't') <> 3
+             THROW 50000, 'retention not kept', 1;",
+    );
+    let again = Demo::new("temporal1176-again");
+    ok(&again.run(&["pull", "--db", target.connection()]));
+    assert_eq!(file(&again), file(&d));
+
+    // Negative: a column added to it is refused by name before anything
+    // connects, rather than planned with history side effects.
+    let path = d.dir.join("schema/dbo.t.yml");
+    let added = pulled.replacen("  vf:\n", "  note:\n    type: int\n  vf:\n", 1);
+    assert_ne!(added, pulled, "{pulled}");
+    std::fs::write(&path, added).unwrap();
+    let o = d.run(&["plan"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("dbo.t has `system_time`"),
         "{}",
         stderr(&o)
     );

@@ -284,6 +284,27 @@ pub fn render(
     if table.unlogged {
         s.push_str("\nunlogged: true\n");
     }
+    // After the columns it names (#1176).
+    if let Some(st) = &table.system_time {
+        let _ = writeln!(
+            s,
+            "\nsystem_time:\n  period: {}",
+            seq(&[st.start.clone(), st.end.clone()])
+        );
+        if st.hidden {
+            s.push_str("  hidden: true\n");
+        }
+        if let Some(v) = &st.versioning {
+            let _ = writeln!(
+                s,
+                "  versioning:\n    history: {}",
+                scalar(&v.history.to_string())
+            );
+            if let Some(r) = &v.retention {
+                let _ = writeln!(s, "    retention: {}", scalar(&r.to_string()));
+            }
+        }
+    }
     // One parameter a line, by name, each in its canonical spelling, bare:
     // every canonical value is a plain token (`true`, `70`, `0.05`, `auto`),
     // and quoted it would read as text, which is the same value but not
@@ -959,6 +980,86 @@ indexes:
         let t = crate::load_table_str(Path::new("t.yml"), base).unwrap();
         assert_eq!(t.table.replica_identity, None);
         assert!(!render(&t.name, &t.table, &t.intents, None).contains("replica_identity"));
+    }
+
+    /// `system_time` reads into the model and renders to the same text, in
+    /// each of its shapes: a versioned table with hidden period columns and
+    /// a retention, one with neither, and a period alone (#1176).
+    #[test]
+    fn system_time_round_trips_in_each_shape() {
+        let base = "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  valid_from: {type: datetime2(7), nullable: false}\n  valid_to: {type: datetime2(7), nullable: false}\n\nprimary_key: [id]\n";
+        for (block, hidden, history, retention) in [
+            (
+                "system_time:\n  period: [valid_from, valid_to]\n  hidden: true\n  versioning:\n    history: hist.t_history\n    retention: 6 months\n",
+                true,
+                Some("hist.t_history"),
+                Some("6 months"),
+            ),
+            (
+                "system_time:\n  period: [valid_from, valid_to]\n  versioning:\n    history: dbo.MSSQL_TemporalHistoryFor_42\n",
+                false,
+                Some("dbo.MSSQL_TemporalHistoryFor_42"),
+                None,
+            ),
+            (
+                "system_time:\n  period: [valid_from, valid_to]\n",
+                false,
+                None,
+                None,
+            ),
+        ] {
+            let yaml = format!("{base}\n{block}");
+            round_trip(&yaml);
+            let t = crate::load_table_str(Path::new("t.yml"), &yaml).unwrap();
+            let st = t.table.system_time.clone().expect(block);
+            assert_eq!(
+                (st.start.as_str(), st.end.as_str()),
+                ("valid_from", "valid_to")
+            );
+            assert_eq!(st.hidden, hidden, "{block}");
+            assert_eq!(
+                st.versioning.as_ref().map(|v| v.history.to_string()),
+                history.map(str::to_owned),
+                "{block}"
+            );
+            assert_eq!(
+                st.versioning
+                    .as_ref()
+                    .and_then(|v| v.retention)
+                    .map(|r| r.to_string()),
+                retention.map(str::to_owned),
+                "{block}"
+            );
+            let out = render(&t.name, &t.table, &t.intents, None);
+            assert!(out.contains(&format!("\n{block}")), "{out}");
+        }
+        // Negative: absent is an ordinary table, and renders nothing.
+        let t = crate::load_table_str(Path::new("t.yml"), base).unwrap();
+        assert_eq!(t.table.system_time, None);
+        assert!(!render(&t.name, &t.table, &t.intents, None).contains("system_time"));
+    }
+
+    /// A `system_time` the loader cannot read is a load error naming what is
+    /// wrong, never an ordinary table or an INFINITE retention.
+    #[test]
+    fn an_unreadable_system_time_is_rejected() {
+        for block in [
+            "system_time:\n  period: [valid_from]\n",
+            "system_time:\n  period: [valid_from, valid_to, extra]\n",
+            "system_time:\n  period: [valid_from, valid_to]\n  versioning:\n    history: no_schema\n",
+            "system_time:\n  period: [valid_from, valid_to]\n  versioning:\n    history: dbo.h\n    retention: 0 days\n",
+            "system_time:\n  period: [valid_from, valid_to]\n  versioning:\n    history: dbo.h\n    retention: forever\n",
+            "system_time:\n  period: [valid_from, valid_to]\n  versioning:\n    history: dbo.h\n    retension: 6 months\n",
+            "system_time:\n  period: [valid_from, valid_to]\n  history: dbo.h\n",
+        ] {
+            let yaml = format!(
+                "table: dbo.t\ncolumns:\n  valid_from: {{type: datetime2, nullable: false}}\n  valid_to: {{type: datetime2, nullable: false}}\n{block}"
+            );
+            assert!(
+                crate::load_table_str(Path::new("t.yml"), &yaml).is_err(),
+                "{block} should not load"
+            );
+        }
     }
 
     /// Storage parameters read back in their canonical spelling, whatever

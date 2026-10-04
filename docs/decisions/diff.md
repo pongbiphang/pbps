@@ -2050,3 +2050,93 @@ Tests: `an_unlogged_table_round_trips_and_permanence_writes_nothing`
 `a_persistence_switch_by_someone_else_is_movement` (`crates/pbps-cli`); the
 live `unlogged_tables_round_trip_and_switch_in_foreign_key_order` (on 16 and
 18) and `an_unlogged_table_switches_through_the_cli_behind_its_risk`.
+
+<a id="dec-1176-1"></a>
+
+**DEC-1176.1. A SQL Server system-versioned table and its history are one
+table of the model, declared under `system_time:`. Only the history layout
+the engine builds is read, and until #1177 every change to such a table is
+refused (#1176).**
+
+Measured on 17.0.4075.5, Developer and Express editions:
+
+- `CREATE TABLE … WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = h))` builds
+  `h` with one clustered, non-unique index `ix_<h>` on `(end, start)`. It is
+  compressed PAGE on Developer and NONE on Express, which does take PAGE when
+  asked.
+- Without `HISTORY_TABLE`, the engine names the history
+  `MSSQL_TemporalHistoryFor_<object_id>`, a name a recreated table does not
+  get.
+- `SET (SYSTEM_VERSIONING = OFF)` keeps the period, and the history becomes an
+  ordinary table.
+- Given an existing table whose columns match, `HISTORY_TABLE` adopts it as
+  the history, with its rows and its layout, instead of refusing.
+- A history table takes a default constraint and further indexes. It refuses
+  a CHECK constraint (13564) and a trigger (13569).
+- A period column must be `datetime2` (13501). It may have a default.
+
+**The model.** Leon chose all three design points on the issue.
+
+- `Table::system_time` holds `start` and `end`, each naming a column in
+  `columns:`, which keeps its type, nullability and place. `hidden` covers both
+  period columns. `versioning: {history, retention}` is absent for a period
+  alone, which is a state the engine has, so a pair read with versioning off
+  shows as a difference rather than as a missing table.
+- The history has no uid. It is a property of its table. Its name is always
+  written out, the engine's own choice included (with an onboarding notice),
+  so a rebuild keeps it.
+- No row writes a period column, so `data:` on such a table is refused.
+- PostgreSQL refuses `system_time`.
+
+**The reader holds the engine's history layout only.** It compares the same
+fields it reads for an ordinary index:
+
+- exactly one index, named `ix_<history>`;
+- clustered, non-unique, unfiltered, enabled and unpartitioned;
+- keys `(end ASC, start ASC)` and nothing included;
+- no key, check or foreign-key constraint, and no default, identity or
+  computed column;
+- columns that mirror the table's, in order.
+
+Anything else leaves the pair out, both tables named. Compression is not held,
+and PAGE and NONE both count as the default. The edition decides between them,
+and an ordinary table's compression is not read either. ROW, columnstore, or
+a mix across partitions stays a limitation.
+
+**The reader fails closed.** Each of these is a limitation, never an ordinary
+table or a default:
+
+- a history it cannot see;
+- a retention it cannot read;
+- a `generated_always_type` other than a period's 1 and 2;
+- a hidden column outside the period;
+- one period column hidden and the other not.
+
+A module bound to the history stays out with it, and a grant on the history
+is reported as one on an object outside the model.
+
+**The history's name** takes a place in the schema's namespace although no
+declaration lists it:
+
+- validation refuses a table, another history or a module of the same name;
+- `plan --db` reads it and refuses an occupant, through the `sys.objects`
+  walk;
+- `bootstrap` refuses an occupant before anything runs, since the engine
+  would adopt a matching one;
+- `doctor` asks for its schema.
+
+**Changes.** Creating the table is one statement, so the engine builds the
+history. Every other change to a table with `system_time` on either side is
+refused by name until #1177. This covers:
+
+- a difference in `system_time` itself, which no change carries and which
+  would otherwise plan nothing;
+- dropping the table, which the engine refuses (13552);
+- renaming it;
+- every column, constraint and index change. Some succeed with history side
+  effects: DROP COLUMN deletes the column's history, and ADD NOT NULL with a
+  default writes into every history row.
+
+A grant or a trigger on the table, and a change to another table referencing
+it, are not changes to the pair.
+
