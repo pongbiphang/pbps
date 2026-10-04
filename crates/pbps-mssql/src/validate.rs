@@ -1024,11 +1024,13 @@ fn system_time(name: &TableName, table: &Table, st: &pbps_model::SystemTime) -> 
         }
         // Its index is `ix_` and the name, which the engine cuts at 127
         // characters (measured on 17.0): a longer name has no index name it
-        // could read back as the engine's own.
-        if v.history.name.chars().count() > 124 {
+        // could read back as the engine's own. Counted as `sysname` counts,
+        // in UTF-16 units, as `ident::quote` does: an emoji is two.
+        if v.history.name.encode_utf16().count() > 124 {
             errs.push(invalid(format!(
-                "history table `{}` has a name longer than 124 characters, which leaves its \
-                 index, `ix_` and the name, no room in SQL Server's 128; name it shorter",
+                "history table `{}` has a name longer than 124 characters (UTF-16 units, as \
+                 SQL Server counts them), which leaves its index, `ix_` and the name, no room in \
+                 SQL Server's 128; name it shorter",
                 v.history
             )));
         }
@@ -1374,6 +1376,11 @@ mod tests {
         let mut bare = valid();
         bare.columns.get_mut("vf").unwrap().ty = "datetime2".parse().unwrap();
         assert!(found(&bare).is_empty(), "{:?}", found(&bare));
+        // A name of 124 UTF-16 units leaves `ix_` room, in emoji too.
+        let mut paired = valid();
+        st(&mut paired).versioning.as_mut().unwrap().history =
+            TableName::new("hist", "\u{1F600}".repeat(62));
+        assert!(found(&paired).is_empty(), "{:?}", found(&paired));
         // A name of 124 characters leaves `ix_` room.
         let mut longest = valid();
         st(&mut longest).versioning.as_mut().unwrap().history =
@@ -1391,7 +1398,7 @@ mod tests {
             assert!(found(&t).is_empty(), "{longest}: {:?}", found(&t));
         }
         type Break = fn(&mut Table);
-        let cases: [(Break, &str); 13] = [
+        let cases: [(Break, &str); 14] = [
             (|t| st(t).end = "vf".into(), "as both the start and the end"),
             (|t| st(t).end = "missing".into(), "no column of that name"),
             (
@@ -1436,6 +1443,13 @@ mod tests {
                 |t| {
                     st(t).versioning.as_mut().unwrap().history =
                         TableName::new("hist", "h".repeat(125))
+                },
+                "longer than 124 characters",
+            ),
+            (
+                |t| {
+                    st(t).versioning.as_mut().unwrap().history =
+                        TableName::new("hist", "\u{1F600}".repeat(63))
                 },
                 "longer than 124 characters",
             ),
