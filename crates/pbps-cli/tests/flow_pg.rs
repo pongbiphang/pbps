@@ -394,7 +394,7 @@ fn psql_script(db: &OwnDatabase, script: &str) -> Output {
     let script = script.to_owned();
     let feeder = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
     let output = child.wait_with_output().unwrap();
-    feeder.join().unwrap().unwrap();
+    fed(feeder.join().unwrap());
     output
 }
 
@@ -8157,7 +8157,7 @@ fn a_plan_saved_before_a_grammar_upgrade_is_refused_after_the_transfer() {
     let dumped = dump.stdout.clone();
     let feeder = std::thread::spawn(move || stdin.write_all(&dumped));
     let restored = restore.wait_with_output().unwrap();
-    feeder.join().unwrap().unwrap();
+    fed(feeder.join().unwrap());
     assert!(
         restored.status.success(),
         "{}",
@@ -15066,6 +15066,46 @@ fn a_routine_replaced_while_the_statements_run_rolls_the_apply_back() {
         "SELECT $1 > 0",
         "the replacement rolled back with the DDL"
     );
+}
+
+/// The result of feeding a child's stdin from a thread. With
+/// `ON_ERROR_STOP` psql stops at the first error and closes stdin, so a
+/// script longer than the pipe meets `BrokenPipe` on the way: that is the
+/// child having finished early, and its output carries the verdict. Any other
+/// write error is the fixture's own failure.
+fn fed(result: std::io::Result<()>) {
+    match result {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("feeding the child's stdin failed: {error}"),
+    }
+}
+
+/// A child that stops reading stdin early still reports its own exit code,
+/// and the unread input is not a fixture failure (review on #1504). Needs no
+/// server, so it runs with the ordinary tests.
+#[cfg(unix)]
+#[test]
+fn a_child_that_closes_stdin_early_keeps_its_own_verdict() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("sh")
+        .args(["-c", "head -c 1 >/dev/null; exit 3"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let feeder = std::thread::spawn(move || stdin.write_all(&vec![b'x'; 1 << 22]));
+    let output = child.wait_with_output().unwrap();
+    let result = feeder.join().unwrap();
+    assert!(
+        matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe),
+        "{result:?}"
+    );
+    fed(result);
+    assert_eq!(output.status.code(), Some(3));
 }
 
 /// A spawned `pbps` whose stdout and stderr are read as it writes them.
