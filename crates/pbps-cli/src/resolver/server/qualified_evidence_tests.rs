@@ -5438,10 +5438,19 @@ async fn unnamed_primary_key_case(new_table: bool) {
         .into_iter()
         .filter(|object| !references.contains(object))
         .collect();
+    // On 18 a created table also installs a NOT NULL constraint for each
+    // key column. The key is the table constraint with an index of its own
+    // name, so the count holds on every major.
     let key_records: Vec<_> = exact
         .iter()
         .filter(|object| {
-            object.class == "pg_constraint" && object.signature.get(1) == Some(&table_id)
+            object.class == "pg_constraint"
+                && object.signature.get(1) == Some(&table_id)
+                && exact.contains(&ObjectIdentity {
+                    class: "pg_class".into(),
+                    name: vec![cases::SCHEMA.into(), object.name[0].clone()],
+                    signature: Vec::new(),
+                })
         })
         .collect();
     assert_eq!(
