@@ -355,6 +355,26 @@ impl Handoff {
         }
         Ok(())
     }
+
+    /// One launch request, abandoned at the attempt's deadline (#1497). The
+    /// checks above stop a request from *beginning* late; this stops the
+    /// supervisor *waiting* past the deadline on one already sent, so cleanup
+    /// starts then rather than up to a request budget later. Dropping a
+    /// request poisons this connection (`RequestGuard`), and cleanup then
+    /// removes the run through a fresh one to the same peer. Docker still
+    /// cannot recall a `start` it received; that engine is removed as soon as
+    /// cleanup reaches it.
+    async fn bounded<T>(
+        &self,
+        request: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<T, Error> {
+        match self.abandon_at {
+            Some(at) => tokio::time::timeout_at(at, request)
+                .await
+                .unwrap_or(Err(Error::Start)),
+            None => request.await,
+        }
+    }
 }
 
 /// Cleanup inspects and removes by the recorded id whichever check stops it.
@@ -368,12 +388,12 @@ async fn create_start(
     abandoned()?;
     let body = serde_json::to_vec(&launch.body).map_err(|_| Error::Create)?;
     owner.creation = Creation::Uncertain;
-    let (status, body) = api
-        .request_body(
+    let (status, body) = handoff
+        .bounded(api.request_body(
             Method::POST,
             &format!("{API}/containers/create?name={}", owner.name),
             Bytes::from(body),
-        )
+        ))
         .await?;
     if status != StatusCode::CREATED {
         // A conflict never grants ownership of the pre-existing name.
@@ -397,12 +417,15 @@ async fn create_start(
         .ok_or(Error::Create)?;
     owner.creation = Creation::Created(id.to_owned());
     abandoned()?;
-    let state = inspect(api, id).await?.ok_or(Error::RuntimeChanged)?;
+    let state = handoff
+        .bounded(inspect(api, id))
+        .await?
+        .ok_or(Error::RuntimeChanged)?;
     owned_id(owner, &state)?;
     launch.check_configuration(&state)?;
     abandoned()?;
-    let (status, _) = api
-        .request(Method::POST, &format!("{API}/containers/{id}/start"))
+    let (status, _) = handoff
+        .bounded(api.request(Method::POST, &format!("{API}/containers/{id}/start")))
         .await?;
     if status != StatusCode::NO_CONTENT {
         #[cfg(test)]
@@ -413,7 +436,10 @@ async fn create_start(
         return Err(Error::Start);
     }
     abandoned()?;
-    let state = inspect(api, id).await?.ok_or(Error::Start)?;
+    let state = handoff
+        .bounded(inspect(api, id))
+        .await?
+        .ok_or(Error::Start)?;
     running(owner, &state)
 }
 

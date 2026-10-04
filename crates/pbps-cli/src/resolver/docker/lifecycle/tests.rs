@@ -15,6 +15,8 @@ struct Observations {
     lose_create_reply: bool,
     delay_create: bool,
     delay_inspect: bool,
+    /// How long the `/start` reply is held, on that connection only.
+    start_delay: Option<Duration>,
     creations: usize,
     deletions: usize,
     deletion_in_progress: bool,
@@ -57,40 +59,54 @@ impl Fixture {
         let listener = UnixListener::bind(&path).unwrap();
         let seen = Arc::new(Mutex::new(observed));
         let server_seen = seen.clone();
+        // One task per connection, as a daemon serves them: a cleanup that
+        // reconnects must not queue behind a reply held on the first one.
         let server = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                while let Some((request, body)) = read_request(&mut socket).await {
-                    let (status, reply, disconnect, delay) = {
-                        let mut seen = server_seen.lock().unwrap();
-                        seen.requests.push(request.clone());
-                        answer(&mut seen, &request, body)
-                    };
-                    if delay {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                    if disconnect {
-                        break;
-                    }
-                    let reply = if status.starts_with("204 ") {
-                        String::new()
-                    } else {
-                        reply.to_string()
-                    };
-                    if socket
-                        .write_all(
-                            format!(
-                                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{reply}",
-                                reply.len()
+                let server_seen = server_seen.clone();
+                tokio::spawn(async move {
+                    while let Some((request, body)) = read_request(&mut socket).await {
+                        let (status, reply, disconnect, delay, held) = {
+                            let mut seen = server_seen.lock().unwrap();
+                            seen.requests.push(request.clone());
+                            let held = request
+                                .contains("/start ")
+                                .then_some(seen.start_delay)
+                                .flatten();
+                            let (status, reply, disconnect, delay) =
+                                answer(&mut seen, &request, body);
+                            (status, reply, disconnect, delay, held)
+                        };
+                        if delay {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                        if let Some(held) = held {
+                            tokio::time::sleep(held).await;
+                        }
+                        if disconnect {
+                            break;
+                        }
+                        let reply = if status.starts_with("204 ") {
+                            String::new()
+                        } else {
+                            reply.to_string()
+                        };
+                        if socket
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{reply}",
+                                    reply.len()
+                                )
+                                .as_bytes(),
                             )
-                            .as_bytes(),
-                        )
-                        .await
-                        .is_err()
-                    {
-                        break;
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                }
+                });
             }
         });
         Self { path, seen, server }
@@ -465,6 +481,40 @@ async fn the_supervisor_stops_launching_at_its_deadline_with_ready_still_open() 
         // inspect, and nothing after, when it passes during that inspect.
         assert_eq!(requests.len(), expected, "{requests:#?}");
     }
+}
+
+/// A `start` already sent when the deadline passes is not waited out
+/// (#1497). The daemon holds the reply for five seconds; the supervisor stops
+/// waiting at the deadline and removes the run through a fresh connection,
+/// well before that reply would have come. Without the bound the removal
+/// waits for the reply and misses the three seconds `removed` allows.
+#[tokio::test]
+async fn an_in_flight_start_is_not_waited_out_past_the_deadline() {
+    let fixture = Fixture::new(Observations {
+        start_delay: Some(Duration::from_secs(5)),
+        ..Default::default()
+    });
+    let token = format!("{:032x}", rand::random::<u128>());
+    let launch = Launch::new(&candidate(), Driver::Postgres, &token).unwrap();
+    let failure = CandidateRun::start_launch_by(
+        Instant::now() + Duration::from_millis(300),
+        fixture.api().await,
+        candidate(),
+        token.clone(),
+        launch,
+        LIFETIME_SECS,
+    )
+    .await
+    .err()
+    .expect("a start held past the deadline must not yield a run");
+    assert!(matches!(failure.cause, Error::Start), "{:?}", failure.cause);
+    assert_eq!(failure.recovery_names, [format!("pbps-resolver-{token}")]);
+    let requests = fixture.seen.lock().unwrap().requests.clone();
+    assert!(
+        requests.iter().any(|r| r.contains("/start ")),
+        "{requests:#?}"
+    );
+    fixture.removed().await;
 }
 
 #[tokio::test]
