@@ -1840,10 +1840,20 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
         }
     }
 
-    let mut out = vec![Statement::new(format!(
-        "CREATE TABLE {qualified_name} (\n    {}\n){with};{rename}",
+    let create = format!(
+        "CREATE TABLE {qualified_name} (\n    {}\n){with};",
         body.join(",\n    ")
-    ))];
+    );
+    // The renames and the `CREATE` stand or fall together: a staged apply
+    // runs each statement outside a transaction, and a rename that failed
+    // there would leave the table and its engine-named history committed
+    // with no checkpoint for them (#1501 review). Its own batch, for its
+    // variables.
+    let mut out = vec![if rename.is_empty() {
+        Statement::new(create)
+    } else {
+        Statement::new(atomically(&format!("{create}{rename}"))).own_batch()
+    }];
 
     // The clustered constraint or index first, if another object is the
     // clustered one: the table is empty, so the order costs nothing today,
@@ -2243,6 +2253,13 @@ mod tests {
         });
         let sql = create(&t);
         assert_eq!(sql.len(), 1, "{sql:?}");
+        // One transaction of its own, which a staged apply needs (#1501).
+        assert!(
+            sql[0].starts_with("BEGIN TRANSACTION;\nBEGIN TRY\nCREATE TABLE")
+                && sql[0].contains("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;"),
+            "{}",
+            sql[0]
+        );
         for part in [
             "[vf] datetime2(3) GENERATED ALWAYS AS ROW START HIDDEN NOT NULL CONSTRAINT",
             "[vt] datetime2(3) GENERATED ALWAYS AS ROW END HIDDEN NOT NULL",

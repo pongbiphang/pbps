@@ -2623,12 +2623,13 @@ fn a_history_name_taken_after_the_plan_is_refused_at_apply() {
 }
 
 /// A table that appears at a history's name after every check before the
-/// statements, and before the `CREATE TABLE` that names it, is never taken as
+/// statements, and before the history is renamed to it, is never taken as
 /// the history: the history is created under the engine's own name and
-/// renamed, and the rename onto a taken name fails, so the whole plan rolls
-/// back (#1501 review). A database DDL trigger stands in for the other
-/// session: it fires inside the apply's own transaction when the plan
-/// creates `dbo.a`, ahead of `dbo.t`.
+/// renamed, and the rename onto a taken name fails, taking the `CREATE` back
+/// with it, in a transactional apply and in a staged one, whose statements
+/// commit one by one (#1501 review). A database DDL trigger stands in for the
+/// other session: it fires inside the statement's own transaction when the
+/// engine creates `dbo.t`, ahead of the renames.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn a_history_taken_over_mid_apply_rolls_the_plan_back() {
@@ -2644,62 +2645,71 @@ fn a_history_taken_over_mid_apply_rolls_the_plan_back() {
     d.commit();
     ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
     std::fs::write(
-        d.dir.join("schema/dbo.a.yml"),
-        "table: dbo.a\ncolumns:\n  id: {type: int, nullable: false}\n",
-    )
-    .unwrap();
-    std::fs::write(
         d.dir.join("schema/dbo.t.yml"),
         "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  vf: {type: datetime2(7), nullable: false}\n  vt: {type: datetime2(7), nullable: false}\n\nprimary_key: [id]\n\nsystem_time:\n  period: [vf, vt]\n  versioning:\n    history: dbo.t_history\n",
     )
     .unwrap();
     ok(&d.run(&["plan"]));
     d.commit();
-    let path = d.dir.join("plan.json");
-    ok(&d.run(&[
-        "plan",
-        "--db",
-        own.connection(),
-        "--out",
-        path.to_str().unwrap(),
-    ]));
-    on_server(
-        own.connection(),
-        "CREATE TRIGGER tr_sneak ON DATABASE FOR CREATE_TABLE AS
-         IF EVENTDATA().value('(/EVENT_INSTANCE/ObjectName)[1]', 'sysname') = N'a'
-         BEGIN
-             CREATE TABLE dbo.t_history (id int NOT NULL, vf datetime2 NOT NULL,
-                                         vt datetime2 NOT NULL);
-             -- The layout the engine would build, so the read-back alone
-             -- cannot tell it from the statement's own.
-             CREATE CLUSTERED INDEX ix_t_history ON dbo.t_history (vt, vf)
-                 WITH (DATA_COMPRESSION = PAGE);
-             INSERT dbo.t_history VALUES (7, '2000-01-01', '2001-01-01');
-         END;",
-    );
-    let checksum = plan_checksum(&path);
-    let refused = d.run(&[
-        "apply",
-        "--db",
-        own.connection(),
-        "--plan",
-        path.to_str().unwrap(),
-        "--checksum",
-        &checksum,
-    ]);
-    on_server(own.connection(), "DROP TRIGGER tr_sneak ON DATABASE;");
-    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
-    assert!(
-        stderr(&refused).contains("'t_history' is already in use"),
-        "{}",
-        stderr(&refused)
-    );
-    on_server(
-        own.connection(),
-        "IF OBJECT_ID('dbo.t') IS NOT NULL OR OBJECT_ID('dbo.a') IS NOT NULL
-             OR OBJECT_ID('dbo.t_history') IS NOT NULL
-             THROW 50000, 'the plan was not rolled back', 1;",
-    );
+    // A transactional apply, and a staged one, whose statements commit one
+    // by one: the history's renames must not leave the `CREATE` behind.
+    for staged in [false, true] {
+        let path = d.dir.join(if staged { "staged.json" } else { "plan.json" });
+        let mut args = vec![
+            "plan",
+            "--db",
+            own.connection(),
+            "--out",
+            path.to_str().unwrap(),
+        ];
+        if staged {
+            args.push("--staged");
+        }
+        ok(&d.run(&args));
+        on_server(
+            own.connection(),
+            "CREATE TRIGGER tr_sneak ON DATABASE FOR CREATE_TABLE AS
+             IF EVENTDATA().value('(/EVENT_INSTANCE/ObjectName)[1]', 'sysname') = N't'
+             BEGIN
+                 CREATE TABLE dbo.t_history (id int NOT NULL, vf datetime2 NOT NULL,
+                                             vt datetime2 NOT NULL);
+                 -- The layout the engine would build, so the read-back alone
+                 -- cannot tell it from the statement's own.
+                 CREATE CLUSTERED INDEX ix_t_history ON dbo.t_history (vt, vf)
+                     WITH (DATA_COMPRESSION = PAGE);
+                 INSERT dbo.t_history VALUES (7, '2000-01-01', '2001-01-01');
+             END;",
+        );
+        let checksum = plan_checksum(&path);
+        let mut args = vec![
+            "apply",
+            "--db",
+            own.connection(),
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        if staged {
+            args.push("--staged");
+        }
+        let refused = d.run(&args);
+        on_server(own.connection(), "DROP TRIGGER tr_sneak ON DATABASE;");
+        assert_ne!(code(&refused), 0, "staged {staged}: {}", stdout(&refused));
+        assert!(
+            stderr(&refused).contains("'t_history' is already in use"),
+            "staged {staged}: {}",
+            stderr(&refused)
+        );
+        // Nothing is left: not the table, not an engine-named history, and
+        // not the trigger's table, which ran in the statement's transaction.
+        on_server(
+            own.connection(),
+            "IF OBJECT_ID('dbo.t') IS NOT NULL OR OBJECT_ID('dbo.t_history') IS NOT NULL
+                 OR EXISTS (SELECT 1 FROM sys.tables WHERE name LIKE 'MSSQL_TemporalHistoryFor%')
+                 THROW 50000, 'the CREATE was left behind', 1;",
+        );
+    }
 }
 
 /// A history's schema is held to the database's spelling before bootstrap

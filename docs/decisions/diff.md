@@ -2169,7 +2169,9 @@ and that nothing can hold. In the same batch it then moves the history to
 the declared schema and renames it and its `ix_` index. The engine accepts
 both renames and the transfer while versioning is on, in one transaction. A
 declared name that is taken fails the rename (15335), and the plan rolls back
-with it. The checks before the statements still give a taken name a refusal
+with it. The `CREATE` and the renames are one transaction of their own, which
+nests in a transactional apply, so a staged apply, whose statements commit one
+by one, cannot leave the table behind without its checkpoint. The checks before the statements still give a taken name a refusal
 that names it. The engine cuts the index name at 127 characters, so a history
 name longer than 124 characters is refused.
 
