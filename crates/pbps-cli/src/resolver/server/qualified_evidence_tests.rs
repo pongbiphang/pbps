@@ -531,6 +531,7 @@ async fn produced(
     for _ in 0..60 {
         let produced = super::producer::produce_with(
             &socket,
+            pbps_db::Driver::Postgres,
             &resolver,
             &connection,
             &inputs.binding(),
@@ -567,6 +568,42 @@ async fn produced(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     panic!("the supplied native fixture did not become exclusive: {refusals:?}");
+}
+
+/// The production run connects with the driver its caller chose, so a SQL
+/// Server target's string is read as one: its written insecure option is
+/// refused by name, never misread as a PostgreSQL string (#1514 review).
+#[tokio::test]
+async fn the_production_run_connects_with_the_callers_driver() {
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let refused = super::producer::produce_with(
+        Path::new("/nonexistent"),
+        pbps_db::Driver::Mssql,
+        &ResolverProfile::Server {
+            url_env: "PBPS_1514_UNSET".into(),
+        },
+        "Server=localhost,1;User Id=sa;Password=x;Encrypt=false",
+        &inputs.binding(),
+        inputs.base(),
+        inputs.desired(),
+        &inputs.hints,
+        &[],
+        &key.project,
+        Some(ENVIRONMENT),
+    )
+    .await
+    .err()
+    .expect("an unverified SQL Server target is refused");
+    assert!(
+        matches!(
+            refused,
+            ProduceError::Target(crate::resolver::native::TargetConnectError::Connect(
+                pbps_db::DbError::Refused(_)
+            ))
+        ),
+        "{refused:?}"
+    );
 }
 
 async fn close(run: &mut ScratchRun, owned: &mut Option<ObservedContainers>) {

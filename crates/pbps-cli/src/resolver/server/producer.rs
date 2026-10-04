@@ -325,13 +325,15 @@ impl From<super::ServerFailure> for ProduceError {
     }
 }
 
-/// One production resolver run for a connected plan (DEC-1514.1). It binds the
+/// One production resolver run for a connected plan (DEC-1514.1), for the
+/// target's driver as the caller chose it. It binds the
 /// selected target to its native service, opens the profile's scratch run,
 /// produces the sealed order and evidence, and closes the run before any
 /// result leaves. Every refusal has already released what the run owned, or
 /// names exactly what it could not confirm.
 #[allow(clippy::too_many_arguments)]
 pub async fn produce(
+    driver: pbps_db::Driver,
     profile: &pbps_config::resolver::ResolverProfile,
     target_connection: &str,
     binding: &BindingRequest<'_>,
@@ -344,6 +346,7 @@ pub async fn produce(
 ) -> Result<ResolvedPlan, ProduceError> {
     produce_with(
         std::path::Path::new(NATIVE_DOCKER_SOCKET),
+        driver,
         profile,
         target_connection,
         binding,
@@ -361,6 +364,7 @@ pub async fn produce(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn produce_with(
     docker_socket: &std::path::Path,
+    driver: pbps_db::Driver,
     profile: &pbps_config::resolver::ResolverProfile,
     target_connection: &str,
     binding: &BindingRequest<'_>,
@@ -371,7 +375,10 @@ pub(crate) async fn produce_with(
     project: &pbps_config::Project,
     environment: Option<&str>,
 ) -> Result<ResolvedPlan, ProduceError> {
-    let mut target = NativeTarget::connect(pbps_db::Driver::Postgres, target_connection).await?;
+    // The caller's driver, chosen where the CLI chooses engines
+    // (`db::driver_for`): this run names none, so an engine without evidence
+    // reaches `plan_resolved`'s named refusal rather than a parse error.
+    let mut target = NativeTarget::connect(driver, target_connection).await?;
     let recipe = target
         .database_recipe()
         .await
