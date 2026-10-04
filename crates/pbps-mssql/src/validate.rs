@@ -988,6 +988,13 @@ fn system_time(name: &TableName, table: &Table, st: &pbps_model::SystemTime) -> 
         ));
     }
     if let Some(v) = &st.versioning {
+        // A period alone needs none (measured on 17.0).
+        if table.primary_key.is_none() {
+            errs.push(invalid(
+                "a system-versioned table must have a primary key (SQL Server refuses it \
+                 otherwise, 13553); declare one, or leave `versioning` out for the period alone",
+            ));
+        }
         for part in [&v.history.schema, &v.history.name] {
             if let Err(e) = ident::quote(part) {
                 errs.push(e);
@@ -1308,6 +1315,11 @@ mod tests {
                     Column::new("datetime2(7)".parse().unwrap()).not_null(),
                 );
             }
+            table.primary_key = Some(pbps_model::PrimaryKey {
+                name: Some("pk_t".into()),
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            });
             // A default on a period column is accepted by the engine, and kept.
             table.columns.get_mut("vf").unwrap().default = Some("SYSUTCDATETIME()".into());
             table.system_time = Some(SystemTime {
@@ -1331,6 +1343,11 @@ mod tests {
             t.system_time.as_mut().unwrap()
         }
         assert!(found(&valid()).is_empty(), "{:?}", found(&valid()));
+        // A period alone needs no key.
+        let mut period_only = valid();
+        period_only.primary_key = None;
+        st(&mut period_only).versioning = None;
+        assert!(found(&period_only).is_empty(), "{:?}", found(&period_only));
         // The longest retention the engine takes, in each unit, is valid.
         for longest in ["365242 days", "52177 weeks", "12000 months", "1000 years"] {
             let mut t = valid();
@@ -1338,7 +1355,7 @@ mod tests {
             assert!(found(&t).is_empty(), "{longest}: {:?}", found(&t));
         }
         type Break = fn(&mut Table);
-        let cases: [(Break, &str); 10] = [
+        let cases: [(Break, &str); 11] = [
             (|t| st(t).end = "vf".into(), "as both the start and the end"),
             (|t| st(t).end = "missing".into(), "no column of that name"),
             (
@@ -1378,6 +1395,7 @@ mod tests {
                 },
                 "longer than SQL Server keeps",
             ),
+            (|t| t.primary_key = None, "must have a primary key"),
             (
                 |t| {
                     st(t).versioning.as_mut().unwrap().retention =

@@ -2074,6 +2074,8 @@ Measured on 17.0.4075.5, Developer and Express editions:
 - A history table takes a default constraint and further indexes. It refuses
   a CHECK constraint (13564) and a trigger (13569).
 - A period column must be `datetime2` (13501). It may have a default.
+- A system-versioned table must have a primary key (13553); a period alone
+  needs none.
 - History is kept for at most 1000 years in any unit (365242 days, 52177
   weeks, 12000 months, 1000 years; 13749 beyond, found by bisection), so
   validation refuses a longer retention.
