@@ -811,9 +811,10 @@ struct Declared {
 /// (12), so the delete guard finds no child through it. Which declared keys
 /// those are is the differ's comparison, made after it resolves every rename
 /// through the uids, so it is asked rather than re-derived: the environment's
-/// recorded state against the declarations, exactly as a connected plan diffs
-/// them. Nothing is planned for use and no plan file is read; the change set
-/// is consulted for its foreign-key additions and dropped.
+/// recorded state against the declarations, as a connected plan diffs them.
+/// Nothing is planned for use and no plan file is read; the change set is
+/// consulted for its foreign-key additions and dropped, and an addition counts
+/// only when the key's own definition changed ([`redefined`]).
 ///
 /// `None` when the declarations do not load, the environment has recorded no
 /// state, or the differ cannot express a change. The caller then keeps every
@@ -862,7 +863,9 @@ fn surviving_keys(
     let mut keys = pbps_db::doctor::DeclaredKeys::new();
     for (table_name, table) in &loaded.schema.tables {
         for (key_name, key) in &table.foreign_keys {
-            if !added.contains(&(table_name, key_name.as_str())) {
+            let gone = added.contains(&(table_name, key_name.as_str()))
+                && redefined(declared, snapshot, table_name, key_name, key);
+            if !gone {
                 keys.entry(table_name.clone())
                     .or_default()
                     .insert(key.references_table.clone());
@@ -870,6 +873,71 @@ fn surviving_keys(
         }
     }
     Some(keys)
+}
+
+/// Whether the declared key differs from the one the environment recorded
+/// under its name, compared through the uids (review on #1510).
+///
+/// An `AddForeignKey` alone is not enough. Connected planning normalizes the
+/// declarations against the target before it diffs (a declared default
+/// collation taken out, among others), and a mismatch there makes this diff
+/// rebuild a column and re-add an unchanged key around it. Dropping that key
+/// from the surviving set would be the unsafe side: no destination demand for
+/// a key that is in fact there. So only a change to the key itself counts: no
+/// recorded key of that name, or a different column list, target or action.
+/// Normalization never touches those. Anything the uids cannot map reads as
+/// unchanged, which keeps the demand.
+fn redefined(
+    declared: &Declared,
+    snapshot: &pbps_model::StateSnapshot,
+    table: &pbps_model::TableName,
+    name: &str,
+    key: &pbps_model::ForeignKey,
+) -> bool {
+    let recorded_name = |declared_table: &pbps_model::TableName| {
+        let uid = declared.ids.table_uid(declared_table)?;
+        snapshot.ids.tables.get(uid)
+    };
+    let Some(recorded_table) = recorded_name(table) else {
+        return false;
+    };
+    let Some(recorded) = snapshot
+        .schema
+        .tables
+        .get(recorded_table)
+        .and_then(|t| t.foreign_keys.get(name))
+    else {
+        // No key of this name was recorded on this table: the plan creates it.
+        return true;
+    };
+    // The recorded key, spelled the way the declarations spell its objects.
+    let declared_column = |recorded_table: &pbps_model::TableName, column: &str| {
+        let uid = snapshot.ids.column_uid(&recorded_table.column(column))?;
+        declared.ids.columns.get(uid).map(|c| c.name.clone())
+    };
+    let declared_target = snapshot
+        .ids
+        .table_uid(&recorded.references_table)
+        .and_then(|uid| declared.ids.tables.get(uid));
+    let columns: Option<Vec<String>> = recorded
+        .columns
+        .iter()
+        .map(|c| declared_column(recorded_table, c))
+        .collect();
+    let referenced: Option<Vec<String>> = recorded
+        .references_columns
+        .iter()
+        .map(|c| declared_column(&recorded.references_table, c))
+        .collect();
+    let (Some(target), Some(columns), Some(referenced)) = (declared_target, columns, referenced)
+    else {
+        return false;
+    };
+    *target != key.references_table
+        || columns != key.columns
+        || referenced != key.references_columns
+        || recorded.on_delete != key.on_delete
+        || recorded.on_update != key.on_update
 }
 
 /// Everything one environment can be asked without writing to it.
@@ -1495,6 +1563,103 @@ mod tests {
         assert!(
             !changed.get(&moved).is_some_and(|t| t.contains(&target)),
             "{changed:?}"
+        );
+    }
+
+    /// A key the diff re-adds only because a column around it is rebuilt is
+    /// still there as far as its definition goes (review on #1510). Connected
+    /// planning takes a declared default collation out before it diffs; this
+    /// diff does not, so a collation the recording never carried rebuilds the
+    /// referencing column and re-adds an unchanged key. Leaving it out of the
+    /// surviving set would drop a demand the delete guard needs.
+    #[test]
+    fn a_key_re_added_around_a_rebuilt_column_still_survives() {
+        let parent = (
+            "app.p.yml",
+            "table: app.p\ncolumns:\n  id: {type: varchar(10)}\nprimary_key: [id]\n".to_owned(),
+        );
+        let child = |collation: &str| {
+            (
+                "c.yml",
+                format!(
+                    "table: dst.c\ncolumns:\n  id: {{type: int}}\n  p:\n    type: varchar(10)\n{collation}\
+                     foreign_keys:\n  fk_c_p:\n    columns: [p]\n    references: app.p(id)\n"
+                ),
+            )
+        };
+        let recorded = loaded_from(&[parent.clone(), child("")]);
+        let declared = loaded_from(&[
+            parent.clone(),
+            child("    collation: SQL_Latin1_General_CP1_CI_AS\n"),
+        ]);
+        let mut ids = pbps_model::IdsFile::default();
+        for table in ["app.p", "dst.c"] {
+            ids.tables.insert(
+                pbps_model::Uid::generate(pbps_model::UidKind::Table),
+                table.parse().unwrap(),
+            );
+        }
+        for (table, column) in [("app.p", "id"), ("dst.c", "id"), ("dst.c", "p")] {
+            ids.columns.insert(
+                pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                table
+                    .parse::<pbps_model::TableName>()
+                    .unwrap()
+                    .column(column),
+            );
+        }
+        let dialect = crate::dialect_for(pbps_config::DialectName::Mssql);
+        let changes = pbps_diff::diff(
+            pbps_diff::Side {
+                schema: &recorded.schema,
+                ids: &ids,
+            },
+            pbps_diff::Side {
+                schema: &declared.schema,
+                ids: &ids,
+            },
+            dialect.as_ref(),
+            &declared.hints,
+        )
+        .unwrap();
+        assert!(
+            changes.changes.iter().any(|c| matches!(
+                &c.change,
+                pbps_model::Change::AddForeignKey { name, .. } if name == "fk_c_p"
+            )),
+            "the diff must re-add the key for this test to mean anything"
+        );
+        let entry = pbps_db::LedgerEntry {
+            id: 1,
+            applied_at: "2026-10-04T00:00:00.000".into(),
+            snapshot: pbps_model::StateSnapshot::new(
+                pbps_model::StateKind::Apply,
+                recorded.schema.clone(),
+                ids.clone(),
+                "ci-deploy",
+            ),
+        };
+        let kept = surviving_keys(
+            &Declared {
+                schemas: Vec::new(),
+                tables: Vec::new(),
+                referenced: Vec::new(),
+                referenced_columns: Default::default(),
+                declared_keys: Default::default(),
+                granted: Default::default(),
+                data: Default::default(),
+                ids,
+                loaded: Some(declared),
+                dialect: pbps_config::DialectName::Mssql,
+            },
+            &entry,
+        )
+        .unwrap();
+        let child: pbps_model::TableName = "dst.c".parse().unwrap();
+        assert!(
+            kept.get(&child)
+                .is_some_and(|t| t.contains(&"app.p".parse().unwrap())),
+            "{kept:?}"
         );
     }
 
