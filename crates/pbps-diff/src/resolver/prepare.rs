@@ -39,9 +39,10 @@ pub(super) fn coverage(
     observations: &[SurfaceResolution],
 ) -> Result<(), Error> {
     let after = surfaces(desired.schema);
-    let before: BTreeSet<_> = surfaces(base.schema)
+    let opening = surfaces(base.schema);
+    let before: BTreeSet<_> = opening
         .iter()
-        .map(|surface| removal_spelling(surface, base, desired, &after))
+        .map(|surface| removal_spelling(surface, base, desired, &opening, &after))
         .collect();
     let expected: BTreeSet<_> = before.union(&after).cloned().collect();
     let actual: BTreeSet<_> = observations.iter().map(|o| o.surface.clone()).collect();
@@ -63,19 +64,23 @@ pub(super) fn coverage(
 
 /// The spelling under which a base surface is covered. One the plan keeps is
 /// its own; one the plan removes is named as its removal names it once the
-/// plan's renames have run, through the recorded identities, unless that
-/// spelling belongs to a surface the plan keeps (a rename that keeps it).
+/// plan's renames have run, through the recorded identities, unless another
+/// surface already holds that spelling: one the plan keeps (a rename that
+/// keeps it), or another base surface, such as a dropped table's whose name
+/// the renamed table takes. A removal named there is covered by that surface,
+/// and two removals are never collapsed onto one spelling.
 pub(super) fn removal_spelling(
     surface: &Surface,
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
+    before: &BTreeSet<Surface>,
     after: &BTreeSet<Surface>,
 ) -> Surface {
     if after.contains(surface) {
         return surface.clone();
     }
     let named = forward(surface, base.ids, desired.ids);
-    if after.contains(&named) {
+    if after.contains(&named) || (&named != surface && before.contains(&named)) {
         surface.clone()
     } else {
         named

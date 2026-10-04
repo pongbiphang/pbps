@@ -32,9 +32,10 @@ pub fn removal_spelling(
     surface: &Surface,
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
+    base_surfaces: &BTreeSet<Surface>,
     desired_surfaces: &BTreeSet<Surface>,
 ) -> Surface {
-    prepare::removal_spelling(surface, base, desired, desired_surfaces)
+    prepare::removal_spelling(surface, base, desired, base_surfaces, desired_surfaces)
 }
 
 /// Output for the evidence seal. The final emitter receives `changes` exactly

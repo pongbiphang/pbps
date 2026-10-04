@@ -1441,4 +1441,59 @@ mod generated_surface_coverage {
             Err(super::Error::Coverage(_))
         ));
     }
+
+    /// Dropping `app.a` and renaming `app.b` to it, with each table's check
+    /// removed: the dropped table's check holds the shared spelling, so the
+    /// renamed table's is covered under its opening one, and each removal
+    /// still needs its own resolution.
+    #[test]
+    fn removals_sharing_a_reused_name_are_covered_apart() {
+        let checked = || {
+            let mut t = table(None);
+            t.checks.insert(
+                "c".into(),
+                pbps_model::CheckConstraint {
+                    expression: "a > 0".into(),
+                },
+            );
+            t
+        };
+        let a: pbps_model::TableName = "app.a".parse().unwrap();
+        let b: pbps_model::TableName = "app.b".parse().unwrap();
+        let mut base = Schema::default();
+        base.tables.insert(a.clone(), checked());
+        base.tables.insert(b.clone(), checked());
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut desired = Schema::default();
+        desired.tables.insert(a.clone(), table(None));
+        let mut after_ids = before_ids.clone();
+        let dropped = before_ids.table_uid(&a).unwrap().clone();
+        after_ids.tables.remove(&dropped);
+        after_ids.columns.retain(|_, column| column.table != a);
+        after_ids.rename_table(&b, &a);
+        let removed = |table: &pbps_model::TableName| SurfaceResolution {
+            surface: Surface::Check {
+                table: table.clone(),
+                name: "c".into(),
+            },
+            current: Some(bound("pg_constraint", "app.x.c", &[], "int4gt")),
+            desired: None,
+        };
+        // Coverage alone: the ordering graph keys its same-table rule by
+        // name, so a reused name is a separate, deferred limit.
+        let base_side = crate::Side {
+            schema: &base,
+            ids: &before_ids,
+        };
+        let desired_side = crate::Side {
+            schema: &desired,
+            ids: &after_ids,
+        };
+        super::super::prepare::coverage(base_side, desired_side, &[removed(&a), removed(&b)])
+            .unwrap();
+        assert!(matches!(
+            super::super::prepare::coverage(base_side, desired_side, &[removed(&a)]),
+            Err(super::super::Error::Coverage(_))
+        ));
+    }
 }

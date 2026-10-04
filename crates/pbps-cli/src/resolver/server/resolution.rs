@@ -112,7 +112,9 @@ pub(super) fn from_sides(
     resolve(
         base.schema,
         desired.schema,
-        &|surface, after| pbps_diff::resolver::removal_spelling(surface, base, desired, after),
+        &|surface, before, after| {
+            pbps_diff::resolver::removal_spelling(surface, base, desired, before, after)
+        },
         opening,
         compiled,
         assessment,
@@ -130,17 +132,20 @@ pub(super) fn from_records(
     resolve(
         base,
         desired,
-        &|surface, _| surface.clone(),
+        &|surface, _, _| surface.clone(),
         opening,
         compiled,
         assessment,
     )
 }
 
+/// Names a base surface given the base and desired surface sets.
+type Relocate<'a> = dyn Fn(&Surface, &BTreeSet<Surface>, &BTreeSet<Surface>) -> Surface + 'a;
+
 fn resolve(
     base: &Schema,
     desired: &Schema,
-    relocate: &dyn Fn(&Surface, &BTreeSet<Surface>) -> Surface,
+    relocate: &Relocate<'_>,
     opening: &[BindingRecord],
     compiled: &[BindingRecord],
     assessment: &Assessment,
@@ -152,7 +157,7 @@ fn resolve(
         // A removed surface is resolved by its opening spelling and named by
         // the one its removal uses. One the plan keeps keeps its own.
         if before.contains(surface) && !after.contains(surface) {
-            let named = relocate(surface, &after);
+            let named = relocate(surface, &before, &after);
             if &named != surface {
                 let current = Some(bound(opening, surface)?);
                 resolved.push(SurfaceResolution {

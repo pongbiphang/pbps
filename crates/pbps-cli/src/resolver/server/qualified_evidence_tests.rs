@@ -3732,6 +3732,96 @@ fn a_surface_removed_after_its_rename_is_named_as_its_removal_names_it() {
     assert!(unmapped.iter().any(|r| r.surface == check));
 }
 
+/// A plan that drops `app.a` and renames `app.b` to `app.a`, removing each
+/// table's check `c`, would name both removals `app.a.c` after the renames.
+/// The dropped table's check holds that spelling, so the renamed table's
+/// keeps its opening one, and neither removal is lost or refused.
+#[test]
+fn a_reused_name_keeps_two_removed_surfaces_distinct() {
+    use pbps_db::resolver::capture::ObjectIdentity;
+    use pbps_model::{CheckConstraint, Column, Table};
+    use pbps_pg::resolver::capture::{Assessment, BindingRecord};
+
+    let a: pbps_model::TableName = "app.a".parse().unwrap();
+    let b: pbps_model::TableName = "app.b".parse().unwrap();
+    let checked = || {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("n".into(), Column::new("integer".parse().unwrap()));
+        table.checks.insert(
+            "c".into(),
+            CheckConstraint {
+                expression: "n > 0".into(),
+            },
+        );
+        table
+    };
+    let mut base = Schema::default();
+    base.tables.insert(a.clone(), checked());
+    base.tables.insert(b.clone(), checked());
+    let base_ids = ids(&base, &IdsFile::default());
+    let dropped = base_ids.table_uid(&a).unwrap().clone();
+    let mut bare = Table::default();
+    bare.columns
+        .insert("n".into(), Column::new("integer".parse().unwrap()));
+    let mut desired = Schema::default();
+    desired.tables.insert(a.clone(), bare);
+    let mut desired_ids = base_ids.clone();
+    desired_ids.tables.remove(&dropped);
+    desired_ids.columns.retain(|_, column| column.table != a);
+    desired_ids.rename_table(&b, &a);
+    let check = |table: &pbps_model::TableName| BindingRecord {
+        object: ObjectIdentity {
+            class: "pg_constraint".into(),
+            name: vec!["c".into()],
+            signature: vec![ObjectIdentity {
+                class: "pg_class".into(),
+                name: vec!["app".into(), table.name.clone()],
+                signature: vec![],
+            }],
+        },
+        ownership: ObjectOwnership::Surface(Surface::Check {
+            table: table.clone(),
+            name: "c".into(),
+        }),
+        bindings: vec![],
+    };
+    let resolutions = super::resolution::from_sides(
+        pbps_diff::Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        pbps_diff::Side {
+            schema: &desired,
+            ids: &desired_ids,
+        },
+        &[check(&a), check(&b)],
+        &[],
+        &Assessment::default(),
+    )
+    .expect("two removals keep two spellings");
+    let named: BTreeSet<_> = resolutions.iter().map(|r| r.surface.clone()).collect();
+    assert_eq!(
+        named,
+        BTreeSet::from([
+            Surface::Check {
+                table: a.clone(),
+                name: "c".into(),
+            },
+            Surface::Check {
+                table: b.clone(),
+                name: "c".into(),
+            },
+        ])
+    );
+    assert!(
+        resolutions
+            .iter()
+            .all(|r| r.current.is_some() && r.desired.is_none())
+    );
+}
+
 /// The explicit ordered extra is an input to ordinary bootstrap, qualification,
 /// scratch compilation and final planning, not a value inferred from the
 /// target session's transient search_path.
