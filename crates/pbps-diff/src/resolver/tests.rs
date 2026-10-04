@@ -1167,4 +1167,219 @@ mod generated_surface_coverage {
             ordered.proof.validate(&ordered.changes).unwrap();
         }
     }
+
+    /// A routine every case below calls from a generation expression.
+    fn routine() -> (pbps_model::ModuleId, pbps_model::Module) {
+        (
+            "app.f(integer)".parse().unwrap(),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::Function,
+                description: None,
+                definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+            },
+        )
+    }
+
+    fn bound(class: &str, name: &str, inputs: &[Surface], binds: &str) -> BoundSurface {
+        BoundSurface {
+            object: ObjectIdentity {
+                class: class.into(),
+                name: name.split('.').map(str::to_owned).collect(),
+                signature: vec![],
+            },
+            bindings: vec![Binding {
+                node: "FuncExpr".into(),
+                path: vec!["expr".into()],
+                target: ObjectIdentity {
+                    class: "pg_proc".into(),
+                    name: vec!["app".into(), binds.into()],
+                    signature: vec![],
+                },
+            }],
+            managed_inputs: inputs.iter().cloned().collect(),
+        }
+    }
+
+    fn sided(base: &Schema, desired: &Schema, observations: &[SurfaceResolution]) -> Ordered {
+        let before_ids = ids(base, &IdsFile::default());
+        let after_ids = ids(desired, &before_ids);
+        super::plan(
+            crate::Side {
+                schema: base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: desired,
+                ids: &after_ids,
+            },
+            &Hints::default(),
+            observations,
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap()
+    }
+
+    fn at(ordered: &Ordered, f: &dyn Fn(&Change) -> bool) -> usize {
+        ordered
+            .changes
+            .changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("missing from {:?}", ordered.changes.changes))
+    }
+
+    fn table(expression: Option<&str>) -> Table {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        if let Some(expression) = expression {
+            table.columns.insert("g".into(), generated(expression));
+        }
+        table
+    }
+
+    /// A rewritten generation expression lets go of the routine its old text
+    /// called, so it precedes that routine's drop.
+    #[test]
+    fn a_rewritten_generation_expression_precedes_the_drop_of_what_it_called() {
+        let (id, module) = routine();
+        let mut base = Schema::default();
+        base.modules.insert(id.clone(), module);
+        base.tables
+            .insert("app.t".parse().unwrap(), table(Some("app.f(a)")));
+        let mut desired = Schema::default();
+        desired
+            .tables
+            .insert("app.t".parse().unwrap(), table(Some("a * 2")));
+        let function = Surface::Module(id.clone());
+        let ordered = sided(
+            &base,
+            &desired,
+            &[
+                SurfaceResolution {
+                    surface: Surface::Default("app.t.g".parse().unwrap()),
+                    current: Some(bound(
+                        "pg_attrdef",
+                        "app.t.g",
+                        std::slice::from_ref(&function),
+                        "f",
+                    )),
+                    desired: Some(bound("pg_attrdef", "app.t.g", &[], "int4mul")),
+                },
+                SurfaceResolution {
+                    surface: function,
+                    current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                    desired: None,
+                },
+            ],
+        );
+        let rewrite = at(&ordered, &|c| {
+            matches!(c, Change::AlterColumnExpression { .. })
+        });
+        let drop = at(
+            &ordered,
+            &|c| matches!(c, Change::DropModule { id: d, .. } if d == &id),
+        );
+        assert!(rewrite < drop, "{:?}", ordered.changes.changes);
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// A generated column computes its rows as it is added, so an execute
+    /// grant on the routine it calls goes first.
+    #[test]
+    fn an_execute_grant_precedes_the_generated_column_that_calls_the_routine() {
+        let (id, module) = routine();
+        let mut base = Schema::default();
+        base.modules.insert(id.clone(), module);
+        base.tables.insert("app.t".parse().unwrap(), table(None));
+        base.roles
+            .insert("reader".into(), pbps_model::Role::default());
+        let mut desired = base.clone();
+        desired
+            .tables
+            .insert("app.t".parse().unwrap(), table(Some("app.f(a)")));
+        desired.roles.get_mut("reader").unwrap().grants.insert(
+            pbps_model::GrantTarget::Routine(match &id {
+                pbps_model::ModuleId::Routine(routine) => routine.clone(),
+                other @ (pbps_model::ModuleId::Named(_) | pbps_model::ModuleId::Trigger { .. }) => {
+                    panic!("{other:?}")
+                }
+            }),
+            BTreeSet::from([pbps_model::Permission::Execute]),
+        );
+        let function = Surface::Module(id.clone());
+        let ordered = sided(
+            &base,
+            &desired,
+            &[
+                SurfaceResolution {
+                    surface: Surface::Default("app.t.g".parse().unwrap()),
+                    current: None,
+                    desired: Some(bound(
+                        "pg_attrdef",
+                        "app.t.g",
+                        std::slice::from_ref(&function),
+                        "f",
+                    )),
+                },
+                SurfaceResolution {
+                    surface: function,
+                    current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                    desired: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                },
+            ],
+        );
+        let grant = at(&ordered, &|c| matches!(c, Change::Grant { .. }));
+        let column = at(
+            &ordered,
+            &|c| matches!(c, Change::AddColumn { name, .. } if name == "g"),
+        );
+        assert!(grant < column, "{:?}", ordered.changes.changes);
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// An unchanged generation expression that binds differently is rewritten
+    /// with its own text, so the new binding is installed.
+    #[test]
+    fn a_rebinding_generation_expression_is_rewritten_with_its_own_text() {
+        let (id, module) = routine();
+        let mut base = Schema::default();
+        base.modules.insert(id.clone(), module);
+        base.tables
+            .insert("app.t".parse().unwrap(), table(Some("app.f(a)")));
+        let desired = base.clone();
+        let function = Surface::Module(id);
+        let ordered = sided(
+            &base,
+            &desired,
+            &[
+                SurfaceResolution {
+                    surface: Surface::Default("app.t.g".parse().unwrap()),
+                    current: Some(bound(
+                        "pg_attrdef",
+                        "app.t.g",
+                        std::slice::from_ref(&function),
+                        "f",
+                    )),
+                    desired: Some(bound(
+                        "pg_attrdef",
+                        "app.t.g",
+                        std::slice::from_ref(&function),
+                        "f_exact",
+                    )),
+                },
+                SurfaceResolution {
+                    surface: function,
+                    current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                    desired: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                },
+            ],
+        );
+        assert!(ordered.changes.changes.iter().any(|p| matches!(
+            &p.change,
+            Change::AlterColumnExpression { from, to, .. } if from == "app.f(a)" && to == "app.f(a)"
+        )));
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
 }

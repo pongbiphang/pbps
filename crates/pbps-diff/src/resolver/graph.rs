@@ -65,11 +65,29 @@ fn release(c: &Change, surface: &Surface) -> bool {
             Surface::Default(r),
         ) => column == r,
         (Change::DropColumn { column, .. }, Surface::Default(r)) => column == r,
+        // A rewritten generation expression lets go of what the old one
+        // bound, as a dropped default does, so it precedes the drop of a
+        // routine the old text called (DEC-1168.1).
+        (Change::AlterColumnExpression { column, .. }, Surface::Default(r)) => column == r,
         (Change::DropCheck { table, name }, Surface::Check { table: t, name: n })
         | (Change::DropIndex { table, name }, Surface::Index { table: t, name: n }) => {
             table == t && name == n
         }
         (Change::DropTable { name, .. }, surface) => table_of(surface).is_some_and(|t| t == name),
+        _ => false,
+    }
+}
+
+/// Whether a step writes a column's `pg_attrdef` expression in its own DDL:
+/// an added column's default or generation expression, a new table's
+/// generation expression, or a rewritten one. A generated column computes
+/// its rows as the step runs, so a routine it calls must be executable then.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn writes_attrdef(c: &Change) -> bool {
+    match c {
+        Change::AddColumn { column, .. } => column.default.is_some() || column.generated.is_some(),
+        Change::CreateTable { table, .. } => table.columns.values().any(|c| c.generated.is_some()),
+        Change::AlterColumnExpression { .. } => true,
         _ => false,
     }
 }
@@ -280,8 +298,7 @@ pub(super) fn constraints(
                 _ => None,
             };
             if let Some(target) = target
-                && (expression(other) == Some(true)
-                    || matches!(other, Change::AddColumn { column, .. } if column.default.is_some()))
+                && (expression(other) == Some(true) || writes_attrdef(other))
                 && (observations.iter().any(|o| {
                     made[j].contains(&o.surface)
                         && o.desired.as_ref().is_some_and(|d| {
@@ -342,7 +359,9 @@ pub(super) fn constraints(
             .map(|(i, _)| i)
             .collect();
         for &drop in &removes {
-            for &create in &creates {
+            // A rewritten expression both lets go of its old binding and
+            // installs its new one: no step precedes itself.
+            for &create in creates.iter().filter(|&&create| create != drop) {
                 edge(drop, create, OrderReason::Restoration);
             }
         }

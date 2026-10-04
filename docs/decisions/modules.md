@@ -1620,6 +1620,16 @@ foreign key naming it waits for the end of the modules, when every table
 exists. A function the table calls that would itself have to follow the table
 is refused by name.
 
+The resolver's own ordering of a sealed plan treats a generation expression as
+it treats a default, since both are the column's `pg_attrdef` (DEC-1168.1): the
+step that writes one provides its surface, so a function it calls precedes it;
+a rewritten expression releases what the old text bound, so it precedes the
+drop of a routine that text called; an execute grant on a routine it calls
+precedes it; and an unchanged expression that binds differently is rewritten in
+place with its own text, which a server without `SET EXPRESSION` refuses by
+name. A step's binding edge to itself is skipped, since a new table's
+generation expression reads columns the same `CREATE TABLE` makes.
+
 Pinned by `a_new_table_generating_from_a_new_function_follows_it_whole`
 (`crates/pbps-cli/src/dependents.rs`),
 `a_table_generating_from_a_declared_function_compiles_after_it`

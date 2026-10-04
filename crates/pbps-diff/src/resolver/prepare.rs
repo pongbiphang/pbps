@@ -140,8 +140,11 @@ pub(super) fn invalidates(change: &Change, surface: &Surface) -> bool {
             .columns_redefined()
             .iter()
             .any(|(r, field)| r == column && *field != pbps_model::ColumnField::Deprecated),
+        // A rewritten generation expression replaces its `pg_attrdef` as a
+        // changed default does (DEC-1168.1).
         Surface::Default(column) => {
             matches!(change, Change::AlterColumnDefault { column: r, from: Some(_), .. } if r == column)
+                || matches!(change, Change::AlterColumnExpression { column: r, .. } if r == column)
         }
         Surface::Check { table, name } => {
             matches!(change, Change::DropCheck { table: t, name: n } if t == table && n == name)
@@ -284,6 +287,42 @@ pub(super) fn changes(
                 let Surface::Default(before_column) = &previous else {
                     unreachable!("surface kind is preserved")
                 };
+                let generated = |schema: &Schema, at: &pbps_model::ColumnRef| {
+                    schema
+                        .tables
+                        .get(&at.table)
+                        .and_then(|t| t.columns.get(&at.name))
+                        .and_then(|c| c.generated.clone())
+                };
+                // A generation expression is rewritten in place with its own
+                // text, keeping the column and its place in the column order,
+                // so the engine binds it anew (DEC-1168.1). A server with no
+                // in-place form refuses that change by name.
+                if let (Some(old), Some(new)) =
+                    (generated(base, before_column), generated(desired, column))
+                {
+                    let uid = ids
+                        .column_uid(column)
+                        .ok_or_else(|| Error::Definition(surface.clone()))?
+                        .clone();
+                    let rewrite = Change::AlterColumnExpression {
+                        uid,
+                        column: column.clone(),
+                        from: old.expression,
+                        to: new.expression,
+                    };
+                    if !changes.iter().any(|p| p.change == rewrite) {
+                        let mut planned = PlannedChange::new(rewrite);
+                        planned.risks = dialect.change_risks(&planned.change);
+                        planned.strategy = hints
+                            .strategies
+                            .get(&column.table)
+                            .copied()
+                            .unwrap_or_default();
+                        changes.push(planned);
+                    }
+                    continue;
+                }
                 let Some(old) = base
                     .tables
                     .get(&before_column.table)
