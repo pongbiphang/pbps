@@ -811,3 +811,51 @@ The live regression is `the_nearest_inherited_grantor_decides_an_adopted_revoke`
 It asks doctor and the catalog read, then checks each case with an actual
 `REVOKE` and an ACL readback: owner nearer, holder nearer, a tie, and a
 non-inheritable owner.
+
+<a id="dec-678-1"></a>
+
+**DEC-678.1. Which declared keys survive the deletes is the differ's answer,
+asked in memory.** DECISIONS 513 demands a moved delete-count child's
+destination only while its declaration still names a key into a removable
+parent. That narrows by *target*, not by key. A key into the same parent whose
+definition changed (its columns, its action or its name) is a `DropForeignKey`
+(`order_key` 2) and an `AddForeignKey` (13) either side of the `DeleteRow`
+(12). The delete guard therefore finds no child through it, and the demand was
+a `GRANT` nothing would spend (#678).
+
+Telling the two apart needs the differ's own comparison, made after it
+resolves renames through the uids. A comparison by spelling reads every
+renamed table or column as a dropped key, which is the permissive mistake.
+Re-deriving that resolution inside `doctor` would contradict DECISIONS 38,
+which says `doctor` reimplements nothing, and it would drift from the planner.
+So `doctor` runs `pbps_diff::diff` in memory, per environment: the recorded
+snapshot (overlaid with what was declared, as a connected plan does) against
+the declarations and the project's ids. A declared key leaves the keys handed
+on only when the change set *adds* it **and** its own definition changed:
+either no key of that name was recorded on the table, or the recorded one,
+spelled through the uids as the declarations spell it, differs in its columns,
+target or actions.
+
+The second condition is what keeps this on the safe side. Connected planning
+normalizes the declarations against the target before it diffs, for example
+by taking out a declared default collation, and this diff does not. A
+normalization mismatch rebuilds a column and re-adds an unchanged key around
+it, and dropping that key would withhold a demand the delete guard needs.
+Normalization never changes a key's columns, target or actions, so it cannot
+pass the second test. Anything the uids cannot map counts as unchanged.
+
+Nothing is planned for use and no plan file is read. The change set is
+consulted for its foreign-key additions only. In each of the following cases
+every declared key is kept, which is DECISIONS 513's safe over-demand:
+- the declarations do not load;
+- a `renamed_from` is still pending, one the checked-in ids have not absorbed
+  and the next `plan` would resolve before it diffs;
+- the environment has recorded no state;
+- the ledger cannot be read;
+- the differ refuses. Two unit tests cover this.
+`only_keys_the_plan_does_not_re_add_survive_the_deletes` covers an unchanged
+key, a referencing column renamed through its uid, and a changed referencing
+column; only the last one leaves the surviving set.
+`a_key_re_added_around_a_rebuilt_column_still_survives` covers a key the diff
+re-adds only because a declared collation rebuilds its column, and that key
+stays.

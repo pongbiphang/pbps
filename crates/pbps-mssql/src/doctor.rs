@@ -1844,10 +1844,12 @@ pub async fn permissions(
     // *inside* the delete's transaction, by which time a `DropForeignKey` has
     // already run (`order_key` 2 against 12), so the catalog no longer names
     // that child and nothing reads it. `doctor` never looks at a plan, but it
-    // does not have to: a key the environment holds and the declarations do
-    // not name is one the next apply takes away, and the declarations are
-    // already in hand (`declared_keys`). Demanding the destination for it
-    // would report a gap against a plan this account can run (DECISIONS 513).
+    // does not have to: a key the environment holds and `declared_keys` does
+    // not name is one the next apply takes away before the deletes, whether
+    // the declarations dropped it (DECISIONS 513) or redefined it so that it
+    // is dropped and re-added around them (DEC-678.1, which the CLI resolves
+    // with the differ). Demanding the destination for it would report a gap
+    // against a plan this account can run.
     let removable: BTreeMap<&ObjectName, ObjectName> = data
         .iter()
         .filter(|(_, demand)| demand.removes())
