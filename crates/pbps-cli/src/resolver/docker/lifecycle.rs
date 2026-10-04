@@ -156,12 +156,13 @@ impl CandidateRun {
     /// spends a create, a start and their inspects, each with its own
     /// request budget, so an attempt begun just inside a shared deadline could
     /// otherwise go on issuing them after it. Abandoning is safe: the
-    /// supervisor sees its `ready` receiver go, issues no `start` after that
-    /// (`create_start` checks immediately before it) and removes what it
-    /// created. What the bound cannot do is recall a `start` already sent
-    /// before the deadline: Docker has no way to cancel one, so that engine
-    /// may come up just after the deadline and is then removed like any other
-    /// abandoned run. The removal is not confirmed when this returns, so the
+    /// supervisor sees its `ready` receiver go, begins no further launch
+    /// request (`create_start` checks before each one) and removes what it
+    /// created; that cleanup's own requests necessarily follow the deadline.
+    /// What the bound cannot do is recall a request already sent
+    /// before the deadline: Docker has no way to cancel a `start`, so that
+    /// engine may come up just after the deadline and is then removed like any
+    /// other abandoned run. The removal is not confirmed when this returns, so the
     /// name is reported for recovery, which a retrying caller treats as
     /// terminal (DECISIONS 500).
     pub(crate) async fn start_launch_by(
@@ -352,6 +353,12 @@ async fn create_start(
         })
         .ok_or(Error::Create)?;
     owner.creation = Creation::Created(id.to_owned());
+    // Checked before every launch request, not only before `start`: an
+    // abandoned attempt (`start_launch_by`, #645) must begin none after its
+    // deadline. Cleanup inspects and removes by the recorded id regardless.
+    if ready.is_closed() {
+        return Err(Error::ControlLost);
+    }
     let state = inspect(api, id).await?.ok_or(Error::RuntimeChanged)?;
     owned_id(owner, &state)?;
     launch.check_configuration(&state)?;
@@ -368,6 +375,9 @@ async fn create_start(
             status.as_u16()
         );
         return Err(Error::Start);
+    }
+    if ready.is_closed() {
+        return Err(Error::ControlLost);
     }
     let state = inspect(api, id).await?.ok_or(Error::Start)?;
     running(owner, &state)

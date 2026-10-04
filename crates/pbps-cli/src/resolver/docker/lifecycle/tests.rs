@@ -356,15 +356,23 @@ async fn a_launch_past_its_deadline_is_abandoned_named_and_removed() {
     assert!(matches!(failure.cause, Error::Start), "{:?}", failure.cause);
     assert_eq!(failure.recovery_names, [format!("pbps-resolver-{token}")]);
     fixture.removed().await;
+    let requests = fixture.seen.lock().unwrap().requests.clone();
     assert!(
-        !fixture
-            .seen
-            .lock()
-            .unwrap()
-            .requests
-            .iter()
-            .any(|r| r.contains("/start "))
+        !requests.iter().any(|r| r.contains("/start ")),
+        "{requests:#?}"
     );
+    // The create reply arrives after the deadline: the launch's own ownership
+    // inspect must not follow it. The one read before the removal is
+    // cleanup's (review on #1496).
+    let removal = requests
+        .iter()
+        .position(|r| r.starts_with("DELETE "))
+        .expect("a removal");
+    let reads = requests[..removal]
+        .iter()
+        .filter(|r| r.starts_with("GET ") && r.contains("/json "))
+        .count();
+    assert_eq!(reads, 1, "{requests:#?}");
 
     let fixture = Fixture::new(Observations {
         delay_create: true,
