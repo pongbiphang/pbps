@@ -11847,8 +11847,8 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
     // Both operations are ordered and approved in the same change set. Each
     // ends with a `CREATE`, so each is followed by the revoke that takes this
     // engine's default `EXECUTE` to `PUBLIC` off the routine it made
-    // (issue #318) — those sort after every module change and are checked
-    // below rather than counted in with them.
+    // (issue #318) — each directly after its own create (#687), and checked
+    // below rather than counted in with the modules.
     let modules: Vec<&pbps_model::Change> = cs
         .changes
         .iter()
@@ -11909,8 +11909,13 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
         "without the rebuild the environment still means the old binding — this is the line \
          that costs a whole plan cycle"
     );
+    let rebuild = cs
+        .changes
+        .iter()
+        .find(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }))
+        .expect("the synthesized rebuild");
     for stmt in pg
-        .emit(&cs.changes[1].change, cs.changes[1].strategy)
+        .emit(&rebuild.change, rebuild.strategy)
         .expect("emit the synthesized rebuild")
     {
         conn.execute(&stmt.sql)

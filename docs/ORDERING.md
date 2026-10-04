@@ -33,9 +33,9 @@ The differ sorts every planned change by, in order:
    | 11 | `InsertRow`, `UpdateRow` |
    | 12 | `DeleteRow` |
    | 13 | `SetPrimaryKey { to: Some }`, `AddUnique`, `AddForeignKey`, `AddCheck`, `AddIndex`; P: the other `SetReplicaIdentity`, last |
-   | 14 | `CreateModule`, `AlterModule` |
+   | 14 | `CreateModule`, `AlterModule`; `PublicExecution` immediately after its routine's create (#687) |
    | 15 | `CreateRole` |
-   | 16 | `Grant`, `PublicExecution` |
+   | 16 | `Grant` |
    | 17 | `SetDataMode` |
 
 2. **A rank inside the class**, `sort_class` and `dependency_rank` in the same
@@ -171,7 +171,8 @@ requirement is common to all of them, so it is listed once,
 | `AddCheck` | 13 | Its columns, valid data. Functions it calls: *content* | A check |
 | `CreateModule`, `AlterModule` | 14 | What its definition names: other modules, by lexed name (DECISIONS 315); tables, columns and types | A module. P `AlterModule`: a drop and a create |
 | `CreateRole` | 15 | The name free | A role |
-| `Grant`, `PublicExecution` | 16 | The role and the target exist | A permission |
+| `PublicExecution` | 14, at its routine's create rank | The routine exists | `PUBLIC`'s execute on a routine, settled in the statement after its `CREATE` (#687) |
+| `Grant` | 16 | The role and the target exist | A permission |
 | `SetDataMode` | 17 | The table's rows written | The table's data mode |
 
 ## Pairs that interact
@@ -267,7 +268,8 @@ and the expression-bearing changes that need a function.
 | P: `SetPrimaryKey`, `AddUnique` or `AddIndex` of the identity's index, new or rebuilt → `SetReplicaIdentity` | fixed | rank 2, last in class 13. A rebuilt index is not the identity until it is set again, so the differ plans the identity wherever the plan re-adds its index | ✓ DEC-1444.1 |
 | P: `SetReplicaIdentity` to a target that stands → `DropIndex`, `DropUnique` or `SetPrimaryKey { to: None }` of the old identity's index | fixed | (0, 1) before class 2. Dropped first, the old index leaves the table identifying no row until the identity is set | ✓ DEC-1444.1 |
 | `CreateRole` → `Grant` to it | fixed | class 15 before 16 | ✓ |
-| `CreateModule` or `AlterModule` → `Grant` or `PublicExecution` on the routine | fixed | class 14 before 16. P: a rebuild's lost grants and `PUBLIC` execute are restated after it | ✓ ADR-0010 §5 |
+| `CreateModule` or `AlterModule` → `Grant` on the routine | fixed | class 14 before 16. P: a rebuild's lost grants are restated after it | ✓ ADR-0010 §5 |
+| `CreateModule` or `AlterModule` → `PublicExecution` on the routine | fixed | same class, same create rank and subject: the next statement, so an autocommit `--sql` script never leaves the routine executable by `PUBLIC` past its own `CREATE` | ✓ #687 |
 | Tightening → primary key or unique key over the column | fixed | class 9 before 13 | ✓ |
 | Row writes → `SetDataMode` of their table | fixed | class 11 and 12 before 17 | ✓ |
 | Module → module that names it | content, over-approximated | `creation_order_with`, lexed names (DECISIONS 315) | ✓ |
