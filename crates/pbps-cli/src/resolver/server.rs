@@ -37,6 +37,7 @@ use std::time::Instant;
 pub(crate) mod engine;
 pub(crate) mod exclusivity;
 mod producer;
+pub use producer::{NATIVE_DOCKER_SOCKET, ProduceError, produce};
 pub(crate) mod profile;
 mod resolution;
 mod runtime;

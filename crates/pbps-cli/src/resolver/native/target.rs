@@ -54,6 +54,20 @@ pub enum NativeTargetError {
     Binding(#[from] UnqualifiedProcess),
 }
 
+/// Why a target connection did not become a native target binding (#1514).
+#[derive(Debug, thiserror::Error)]
+pub enum TargetConnectError {
+    #[error(
+        "the target connection must verify its server (PostgreSQL `sslmode=require` with a \
+         trusted root): {0}"
+    )]
+    Connect(pbps_db::DbError),
+    #[error(transparent)]
+    Discovery(#[from] super::ServiceDiscovery),
+    #[error(transparent)]
+    Target(#[from] NativeTargetError),
+}
+
 struct BoundTarget {
     connection: PeerVerifiedConn,
     lease: Arc<SocketOwnerLease>,
@@ -143,6 +157,20 @@ impl NativeTarget {
     /// observed connected holder must have a positive parent relation to that
     /// service; a namespace peer or PID label alone cannot qualify a backend.
     /// Trusted provisioning excludes hostile socket sharing (DECISIONS 533).
+    /// Connects to the selected target and binds it to the engine service
+    /// holding the connection's server end on this host. The service is
+    /// found from the connection, never named by configuration (DEC-1514.1).
+    pub async fn connect(
+        driver: pbps_db::Driver,
+        connection_string: &str,
+    ) -> Result<Self, TargetConnectError> {
+        let connection = PeerVerifiedConn::connect(driver, connection_string)
+            .await
+            .map_err(TargetConnectError::Connect)?;
+        let service = super::discover_service(&connection)?;
+        Ok(Self::establish(connection, service).await?)
+    }
+
     pub async fn establish(
         mut connection: PeerVerifiedConn,
         service_pid: u32,

@@ -1325,3 +1325,45 @@ removal spellings, and the desired surfaces as they are. The rebuild check
 reads it through recorded UIDs, comparing the opening record of a base surface
 with the compiled record of the surface it becomes (`forward`). Pairing the
 records inside one observation by UID would make that check map twice.
+
+<a id="dec-1514-1"></a>
+
+**DEC-1514.1. A connected plan finds the target's engine service from its own connection, and names no PID in configuration.**
+
+`NativeTarget::establish` binds a target to one service process. Until #1514,
+only test fixtures supplied that PID. A configured PID or pid file was the
+obvious source, but it would let one setting point the binding at a process
+other than the one serving the connection. `NativeTarget::connect` therefore
+derives the service from the verified connection:
+
+- the loopback pair's server end in this host's TCP table;
+- the one process holding that socket, read from the host init's PID
+  namespace, so its PID is one this observer can capture;
+- that process's ancestors, while they run the same executable.
+
+`establish` then verifies every premise of the result, as before.
+
+Each failure is named and refuses:
+
+- a target reached other than over loopback is not on this host;
+- no holder means this host does not run the target;
+- more than one holder leaves the service unidentified;
+- an unreadable process table needs the observer's permission.
+
+None of these reads as "no resolver needed". The target must be on the same
+host, which is the premise RESOLVER-RUNTIME already states; a remote target
+needs its own measured profile.
+
+`resolver::server::produce` is the one production run (#615 sub-issue 1):
+
+1. bind the target;
+2. open the profile's scratch run, a supplied server or a container on the
+   native daemon's `/var/run/docker.sock`;
+3. produce the sealed order and evidence;
+4. close the run before any result leaves.
+
+A refusal reports either what the run released or the exact names whose
+cleanup was not confirmed. The supplied path does not retry a server that is
+still settling into exclusivity; that refusal is the profile being
+unavailable. Connected planning does not call `produce` yet: #1515 adds lazy
+acquisition.

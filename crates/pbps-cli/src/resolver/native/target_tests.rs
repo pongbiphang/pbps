@@ -4,6 +4,27 @@ use pbps_db::Driver;
 #[path = "target_proxy_tests.rs"]
 mod proxy;
 
+/// A plaintext or opportunistic target connection never becomes a native
+/// binding: the refusal comes before any socket, and names the remedy
+/// (#1514).
+#[tokio::test]
+async fn a_target_without_verified_tls_is_refused_before_connecting() {
+    for mode in ["disable", "prefer"] {
+        let refused = NativeTarget::connect(
+            Driver::Postgres,
+            &format!("host=localhost port=1 user=u dbname=d sslmode={mode}"),
+        )
+        .await
+        .err()
+        .expect("an unverified connection is refused");
+        assert!(
+            matches!(refused, TargetConnectError::Connect(_)),
+            "{mode}: {refused:?}"
+        );
+        assert!(refused.to_string().contains("sslmode=require"), "{refused}");
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires an explicitly owned TLS engine fixture and native process-inspection permissions"]
 async fn native_aliases_share_one_instance_and_backend_children_cannot_claim_another() {
@@ -26,6 +47,21 @@ async fn native_aliases_share_one_instance_and_backend_children_cannot_claim_ano
     let upstream = first.tcp_endpoints().peer();
     let started = std::time::Instant::now();
     let mut first = NativeTarget::establish(first, main_pid).await.unwrap();
+    // The production binding finds the same service from the connection
+    // alone, with no PID configured (#1514).
+    let discovered = NativeTarget::connect(driver, &primary).await.unwrap();
+    assert_eq!(
+        discovered
+            .current
+            .as_ref()
+            .unwrap()
+            .lease
+            .service()
+            .observer_pid()
+            .unwrap(),
+        main_pid,
+        "discovery binds the fixture's own service"
+    );
     eprintln!(
         "native fixture driver={driver:?} establish_ms={}",
         started.elapsed().as_millis()
