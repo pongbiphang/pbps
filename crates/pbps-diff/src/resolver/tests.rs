@@ -1831,4 +1831,117 @@ mod generated_surface_coverage {
         );
         ordered.proof.validate(&ordered.changes).unwrap();
     }
+
+    /// A default removal the differ spells by the column's final address
+    /// follows that column's recorded rename (#1292): `app.t.id DEFAULT 1`
+    /// becomes `app.u.n` with no default. A table-only rename and a kept
+    /// default are the controls.
+    #[test]
+    fn a_default_removal_at_the_final_address_follows_the_column_rename() {
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let u: pbps_model::TableName = "app.u".parse().unwrap();
+        let column = |default: Option<&str>| {
+            let mut c = Column::new("int".parse().unwrap());
+            c.default = default.map(Into::into);
+            c
+        };
+        let schema = |table: &pbps_model::TableName, name: &str, default: Option<&str>| {
+            let mut t = Table::default();
+            t.columns.insert(name.into(), column(default));
+            let mut schema = Schema::default();
+            schema.tables.insert(table.clone(), t);
+            schema
+        };
+        let base = schema(&t, "id", Some("1"));
+        let before_ids = ids(&base, &IdsFile::default());
+        let plan = |name: &str, default: Option<&str>| {
+            let desired = schema(&u, name, default);
+            let mut after_ids = before_ids.clone();
+            after_ids.rename_table(&t, &u);
+            let uid = before_ids.column_uid(&t.column("id")).unwrap();
+            after_ids.columns.get_mut(uid).unwrap().name = name.into();
+            let attrdef = || Some(bound("pg_attrdef", "app.x.d", &[], "int4in"));
+            // A removed default is covered under the spelling its removal
+            // uses; a kept one under its base and final spellings.
+            let observations = if default.is_some() {
+                vec![
+                    SurfaceResolution {
+                        surface: Surface::Default(t.column("id")),
+                        current: attrdef(),
+                        desired: None,
+                    },
+                    SurfaceResolution {
+                        surface: Surface::Default(u.column(name)),
+                        current: None,
+                        desired: attrdef(),
+                    },
+                ]
+            } else {
+                vec![SurfaceResolution {
+                    surface: Surface::Default(u.column(name)),
+                    current: attrdef(),
+                    desired: None,
+                }]
+            };
+            super::plan(
+                crate::Side {
+                    schema: &base,
+                    ids: &before_ids,
+                },
+                crate::Side {
+                    schema: &desired,
+                    ids: &after_ids,
+                },
+                &Hints::default(),
+                &observations,
+                &pbps_dialect::MinimalDialect,
+            )
+            .unwrap()
+        };
+        let removal = |ordered: &Ordered| {
+            ordered
+                .changes
+                .changes
+                .iter()
+                .position(|p| matches!(p.change, Change::AlterColumnDefault { to: None, .. }))
+        };
+        let renames = |ordered: &Ordered| -> Vec<usize> {
+            ordered
+                .changes
+                .changes
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| {
+                    matches!(
+                        p.change,
+                        Change::RenameTable { .. } | Change::RenameColumn { .. }
+                    )
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        // Combined table and column rename.
+        let both = plan("n", None);
+        let at = removal(&both).expect("the default is removed");
+        assert_eq!(renames(&both).len(), 2, "{:?}", both.changes.changes);
+        assert!(
+            renames(&both).iter().all(|&r| r < at),
+            "{:?}",
+            both.changes.changes
+        );
+        both.proof.validate(&both.changes).unwrap();
+        // Table-only rename.
+        let table_only = plan("id", None);
+        let at = removal(&table_only).expect("the default is removed");
+        assert!(
+            renames(&table_only).iter().all(|&r| r < at),
+            "{:?}",
+            table_only.changes.changes
+        );
+        table_only.proof.validate(&table_only.changes).unwrap();
+        // A kept default is not removed at all.
+        let kept = plan("n", Some("1"));
+        assert_eq!(removal(&kept), None, "{:?}", kept.changes.changes);
+        kept.proof.validate(&kept.changes).unwrap();
+    }
 }

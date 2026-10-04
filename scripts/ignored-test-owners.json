@@ -1671,6 +1671,7 @@
         "resolver::binding_tests::the_observed_historical_binding_is_compared_not_a_fresh_bootstrap_of_the_old_source",
         "resolver::capture::baseline::tests::a_captured_baseline_requires_the_complete_ordinary_ledger_recipe",
         "resolver::capture::metadata_tests::deprecation_keeps_column_bound_modules_and_their_unmanaged_dependents",
+        "resolver::capture::ordering_tests::a_final_address_default_removal_executes_after_the_column_rename",
         "resolver::capture::ordering_tests::resolver_orders_cross_kind_binding_changes",
         "resolver::capture::read::coverage_tests::a_large_constant_does_not_refuse_a_supported_stored_expression",
         "resolver::capture::read::coverage_tests::inherited_row_coercions_keep_parent_type_and_field_bindings",

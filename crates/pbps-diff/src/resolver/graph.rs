@@ -277,10 +277,25 @@ pub(super) fn constraints(
             {
                 edge(j, i, OrderReason::Identity);
             }
+            // A default spelled by its column's final name follows that
+            // column's rename, as an expression change follows its table's
+            // and as the ordinary plan orders it (docs/ORDERING.md,
+            // `RenameColumn` before later changes naming the column; #1292).
+            // The removal-first rule below would address the column by a
+            // name it does not have yet.
+            let renamed_into = matches!(
+                (change, other),
+                (Change::AlterColumnDefault { column, .. }, Change::RenameColumn { table, to, .. })
+                    if column == &table.column(to)
+            ) && same_table(i, j);
+            if renamed_into {
+                edge(j, i, OrderReason::Identity);
+            }
             if let (Some(t), Some(u), Some(install)) =
                 (change.table(), other.table(), expression(change))
                 && t == u
                 && same_table(i, j)
+                && !renamed_into
                 && expression(other).is_none()
                 // A replica identity follows the index it names and goes
                 // ahead of the old identity's index's drop, as the differ
