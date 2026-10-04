@@ -2084,5 +2084,40 @@ mod generated_surface_coverage {
             folded.changes.changes
         );
         folded.proof.validate(&folded.changes).unwrap();
+
+        // A drop frees the name instead: the old `b` is dropped, `a` takes
+        // its name and loses its default. The drop goes first, as the
+        // ordinary plan orders it, then the rename, then the removal.
+        let base = schema(&[("a", Some("1")), ("b", None)]);
+        let desired = schema(&[("b", None)]);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        let a = before_ids.column_uid(&t.column("a")).unwrap().clone();
+        let dropped = before_ids.column_uid(&t.column("b")).unwrap().clone();
+        after_ids.columns.remove(&dropped);
+        after_ids.columns.get_mut(&a).unwrap().name = "b".into();
+        let freed = super::plan(
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+            &Hints::default(),
+            &[SurfaceResolution {
+                surface: Surface::Default(t.column("b")),
+                current: attrdef("int4in"),
+                desired: None,
+            }],
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap_or_else(|error| panic!("freeing drop: {error:?}"));
+        let drop = position(&freed, &|c| matches!(c, Change::DropColumn { .. }));
+        let into = position(&freed, &rename("a"));
+        let at = position(&freed, &removal);
+        assert!(drop < into && into < at, "{:?}", freed.changes.changes);
+        freed.proof.validate(&freed.changes).unwrap();
     }
 }
