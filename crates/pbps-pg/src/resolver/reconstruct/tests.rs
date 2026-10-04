@@ -375,6 +375,15 @@ fn a_table_generating_from_a_declared_function_compiles_after_it() {
                 definition: "SELECT g FROM app.n".into(),
             },
         );
+        // Names the table only inside an OID-alias literal.
+        schema.modules.insert(
+            "app.w".parse().unwrap(),
+            Module {
+                kind: ModuleKind::View,
+                description: None,
+                definition: "SELECT 'app.n'::regclass AS r".into(),
+            },
+        );
         schema
     };
     let bootstrap = |schema: &Schema| {
@@ -424,6 +433,7 @@ fn a_table_generating_from_a_declared_function_compiles_after_it() {
     );
     assert!(at("table app.n") < at("index n_ix on app.n"), "{order:?}");
     assert!(at("table app.n") < at("view app.v"), "{order:?}");
+    assert!(at("table app.n") < at("view app.w"), "{order:?}");
     let key = order
         .iter()
         .rposition(|(_, d)| *d == "table app.plain")

@@ -1630,6 +1630,13 @@ place with its own text, which a server without `SET EXPRESSION` refuses by
 name. A step's binding edge to itself is skipped, since a new table's
 generation expression reads columns the same `CREATE TABLE` makes.
 
+Whether a later change names such a table is read as `may_call` reads a
+function: the name as code or inside a string literal, since an OID-alias
+literal such as `'app.a'::regclass` names the table to the engine as a default
+or view is created (measured on 16 and 18). A new table names an earlier one
+only that way, through a column of its row type or through a foreign key;
+otherwise two new tables stay independent.
+
 Pinned by `a_new_table_generating_from_a_new_function_follows_it_whole`
 (`crates/pbps-cli/src/dependents.rs`),
 `a_table_generating_from_a_declared_function_compiles_after_it`

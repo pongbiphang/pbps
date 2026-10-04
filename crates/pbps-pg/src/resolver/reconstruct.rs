@@ -639,11 +639,13 @@ fn after_their_functions(
     if late.is_empty() {
         return Ok(steps);
     }
+    // A literal counts: an OID-alias literal such as `'app.n'::regclass`
+    // names the table to the engine as the step compiles (DEC-1364.1).
     let names = |at: usize, name: &str| {
         steps[at]
             .statements
             .iter()
-            .any(|sql| crate::generated::may_name(sql, name))
+            .any(|sql| crate::generated::may_call(sql, name))
     };
     let early = |at: usize| matches!(steps[at].phase, Phase::Tables | Phase::Keys);
     // A foreign key naming a late table waits for the end of the modules:

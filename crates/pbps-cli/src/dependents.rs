@@ -1318,9 +1318,12 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps) -> bool {
 
 /// Whether a new table's definition may name another new table `made`: a
 /// column of its row type, a foreign key to it, or an expression whose text
-/// may name it, read by the engine's lexer as a module's is.
+/// may name it, read by the engine's lexer as a module's is. A string
+/// literal counts too: an OID-alias literal such as `'app.a'::regclass` is
+/// resolved as the default or check is installed (measured on 16 and 18),
+/// as `may_call` reads a function's (DEC-1364.1).
 fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
-    let named = |text: &str| pbps_pg::generated::may_name(text, &made.name);
+    let named = |text: &str| pbps_pg::generated::may_call(text, &made.name);
     let typed = |base: &str| base == made.name || base == made.to_string();
     table.columns.values().any(|column| {
         typed(&column.ty.base)
@@ -2242,10 +2245,23 @@ mod tests {
                 table: Box::new(t),
             }
         };
+        // A later new table naming app.n only inside an OID-alias literal.
+        let literal_table = || {
+            let mut t = Table::default();
+            let mut r = Column::new("regclass".parse().unwrap());
+            r.default = Some("'app.n'::regclass".into());
+            t.columns.insert("r".into(), r);
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, "app.literal", 0),
+                name: "app.literal".parse().unwrap(),
+                table: Box::new(t),
+            }
+        };
         let mut cs = plan(vec![
             new_table("app.n", &[("id", None), ("g", Some("app.f(id)"))], None),
             new_table("app.other", &[("id", None)], None),
             new_table("app.child", &[("id", None)], Some("app.n")),
+            literal_table(),
             routine("app.f(integer)", "SELECT count(*)::integer FROM app.other"),
         ]);
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
@@ -2259,6 +2275,7 @@ mod tests {
         assert!(table_at("app.other") < created, "{order:?}");
         assert!(created < table_at("app.n"), "{order:?}");
         assert!(table_at("app.n") < table_at("app.child"), "{order:?}");
+        assert!(table_at("app.n") < table_at("app.literal"), "{order:?}");
     }
 
     /// DEC-1364.1: a literal an OID-alias type reads names the function to
