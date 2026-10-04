@@ -385,6 +385,35 @@ async fn a_launch_past_its_deadline_is_abandoned_named_and_removed() {
     run.close().await.unwrap();
 }
 
+/// A launch that completes as its deadline passes is not accepted (review on
+/// #1496): `timeout_at` hands back a run whose last reply won the race with
+/// its timer, so the run is checked against the deadline once more, closed,
+/// and its confirmed removal leaves nothing to recover. Inside the deadline
+/// the same run is kept.
+#[tokio::test]
+async fn a_run_that_came_up_after_its_deadline_is_closed_not_accepted() {
+    let fixture = Fixture::new(Observations::default());
+    let run = CandidateRun::start(fixture.api().await, candidate(), Driver::Postgres)
+        .await
+        .unwrap();
+    let kept = run
+        .refuse_after(Instant::now() + Duration::from_secs(30))
+        .await
+        .expect("a run inside its deadline is kept");
+    let failure = kept
+        .refuse_after(Instant::now())
+        .await
+        .err()
+        .expect("a run at its deadline must not be accepted");
+    assert!(matches!(failure.cause, Error::Start), "{:?}", failure.cause);
+    assert!(
+        failure.recovery_names.is_empty(),
+        "{:?}",
+        failure.recovery_names
+    );
+    fixture.removed().await;
+}
+
 #[tokio::test]
 async fn failed_startup_is_cleaned_and_does_not_echo_the_server_error() {
     let fixture = Fixture::new(Observations {

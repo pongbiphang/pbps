@@ -173,16 +173,35 @@ impl CandidateRun {
         lifetime_secs: u64,
     ) -> Result<Self, StartFailure> {
         let name = resource_name(&token);
-        tokio::time::timeout_at(
+        match tokio::time::timeout_at(
             deadline,
             Self::start_launch(api, image, token, launch, lifetime_secs),
         )
         .await
-        .unwrap_or_else(|_| {
-            Err(StartFailure {
+        {
+            Ok(Ok(run)) => run.refuse_after(deadline).await,
+            Ok(failure) => failure,
+            Err(_) => Err(StartFailure {
                 cause: Error::Start,
                 recovery_names: vec![name],
-            })
+            }),
+        }
+    }
+
+    /// A run that came up at or after `deadline` is closed rather than
+    /// handed back. `timeout_at` polls the launch before its timer, so a
+    /// launch whose last reply lands as the deadline passes is returned as
+    /// `Ok` (review on #1496). Its removal is awaited here, so only a removal
+    /// that could not be confirmed is reported for recovery.
+    async fn refuse_after(self, deadline: Instant) -> Result<Self, StartFailure> {
+        if Instant::now() < deadline {
+            return Ok(self);
+        }
+        let name = self.name.clone();
+        let recovered = self.close().await.is_ok();
+        Err(StartFailure {
+            cause: Error::Start,
+            recovery_names: (!recovered).then_some(name).into_iter().collect(),
         })
     }
 
