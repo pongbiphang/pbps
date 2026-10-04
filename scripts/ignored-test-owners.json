@@ -1501,6 +1501,7 @@
         "a_spatial_cell_whose_srid_alone_differs_from_its_default_is_still_drift",
         "a_staged_checkpoint_survives_the_ledger",
         "a_table_name_needing_quoting_still_reports_what_blocks_its_rename",
+        "a_temporal_column_is_added_with_alter_on_both_schemas_and_no_control",
         "a_timestamp_column_cannot_be_altered_into_or_out_of",
         "a_trigger_that_undoes_a_row_write_rolls_the_statement_back",
         "a_type_with_no_native_equality_is_read_back_against_its_default",

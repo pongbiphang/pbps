@@ -2210,6 +2210,10 @@ Measured on 17.0.4075.5, on a populated versioned table:
   the table is undisturbed.
 - No toggle of versioning is involved, so none of the OFF/ON choreography the
   feasibility review measured is admitted.
+- The `ADD` needs ALTER on the table's schema and on the history's, not CONTROL
+  on either table: a login holding no CONTROL adds the column to both, and one
+  without ALTER on the history's schema is refused (1088). `doctor` asks for
+  ALTER on the history's schema, as a managed one (DEC-1176.1).
 
 That is the whole of what is admitted: an `AddColumn` whose column is nullable,
 on a table that keeps its `system_time`. A period column is declared through

@@ -2219,6 +2219,90 @@ async fn system_versioned_tables_round_trip_through_an_empty_database() {
     assert_eq!(counts, (1, 1));
 }
 
+/// The rights a nullable column added to a system-versioned table needs
+/// (#1177, #1520 review): ALTER on the table's schema and on the history's,
+/// which a least-privilege deployer holds on its managed schemas and `doctor`
+/// asks for, the history's included (DEC-1176.1). Not CONTROL on either table:
+/// the login below holds none, and the column reaches the history. Without
+/// ALTER on the history's schema the engine refuses it, and the plan rolls
+/// back.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_temporal_column_is_added_with_alter_on_both_schemas_and_no_control() {
+    let mut db = TestDb::create("temporal1177_rights").await;
+    let login = format!("pbps_tc_{}", std::process::id());
+    // Not a secret: a login for one test in a throwaway container.
+    let password = "pbpsLeastPrivilege!1";
+    let as_login = least_privilege_login(&mut db, &login, password).await;
+    for statement in [
+        "CREATE SCHEMA other;",
+        "CREATE TABLE app.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY,
+             vf datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (vf, vt))
+         WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = app.t_history));",
+        "CREATE TABLE app.u (id int NOT NULL CONSTRAINT pk_u PRIMARY KEY,
+             vf datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (vf, vt))
+         WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = other.u_history));",
+    ] {
+        db.conn.execute(statement).await.expect(statement);
+    }
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect the pairs");
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
+    let control = holds_at_object_scope(&mut lp, "app.t", "CONTROL").await;
+    let with_note = |table: &str| {
+        let mut schema = pulled.schema.clone();
+        schema
+            .tables
+            .get_mut(&TableName::new("app", table))
+            .unwrap()
+            .columns
+            .insert("note".into(), pbps_model::Column::new(ty("int")));
+        schema
+    };
+    let ids = mint_ids(&pulled.schema, &IdsFile::default(), &[]);
+    let mut outcome = Vec::new();
+    for table in ["t", "u"] {
+        let declared = with_note(table);
+        let declared_ids = mint_ids(&declared, &ids, &[]);
+        let cs = plan(&pulled.schema, &ids, &declared, &declared_ids);
+        outcome.push(try_apply(&mut lp, &cs).await);
+    }
+    let columns = db
+        .conn
+        .query(
+            "SELECT CONVERT(int, ISNULL(COL_LENGTH('app.t_history', 'note'), 0)) AS t_hist,
+                    CONVERT(int, ISNULL(COL_LENGTH('app.u', 'note'), 0)) AS u_cur;",
+        )
+        .await
+        .expect("read the columns");
+    let t_hist = columns[0].try_get::<i32>("t_hist").unwrap().unwrap();
+    let u_cur = columns[0].try_get::<i32>("u_cur").unwrap().unwrap();
+    drop(lp);
+    db.drop().await;
+    let mut admin = connect_live(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+
+    assert!(!control, "the premise: the login holds no CONTROL on app.t");
+    outcome[0]
+        .as_ref()
+        .unwrap_or_else(|e| panic!("ALTER on both schemas suffices: {e}"));
+    assert!(t_hist > 0, "the column reached the history");
+    let refused = outcome[1]
+        .as_ref()
+        .expect_err("no ALTER on the history's schema");
+    assert!(refused.contains("u_history"), "{refused}");
+    assert_eq!(u_cur, 0, "the refused plan rolled back");
+}
+
 /// #1186 found a key's backing index layout was never read, so bootstrap
 /// turned a heap's nonclustered primary key clustered and swapped a
 /// nonclustered primary key with a clustered unique constraint; it left both
