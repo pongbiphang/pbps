@@ -6674,6 +6674,9 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         );
     };
     refuse_mid_deployment(&entry, &target.label)?;
+    // Under the lock, before anything runs: a table made at a history's name
+    // since the plan was computed would be adopted, not refused (#1176).
+    refuse_taken_history_names(conn, &plan.changes, &target.label).await?;
     let original_ids = entry.snapshot.ids.clone();
     let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids)
         .await?
@@ -7000,6 +7003,11 @@ async fn apply_staged_under_lock(
     // statement to start at, and the state the checkpoints are measured
     // against. Returned together so there is no way to reach the loop with a
     // baseline from some other read (DECISIONS 174).
+    // A fresh run asks what a transactional one does; a resumed one created
+    // the history itself, before its checkpoint (DEC-1176.1).
+    if !resume {
+        refuse_taken_history_names(conn, &plan.changes, &target.label).await?;
+    }
     let (start, mut previous) = if resume {
         let progress = match (&entry.snapshot.staged, entry.snapshot.kind) {
             (Some(p), StateKind::Staged | StateKind::Failed) => p.clone(),

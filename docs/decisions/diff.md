@@ -2130,6 +2130,10 @@ declaration lists it:
   walk;
 - `bootstrap` refuses an occupant before anything runs, since the engine
   would adopt a matching one;
+- `apply` asks the same under the lock, before anything runs, for a table made
+  there since the plan was computed. A staged run asks when it starts, not on
+  a resume, whose own earlier statement created the history;
+- validation refuses the ledger's own table names for it, as for a table;
 - `doctor` asks for its schema.
 
 **Changes.** Creating the table is one statement, so the engine builds the

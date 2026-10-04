@@ -2545,6 +2545,83 @@ fn a_system_versioned_table_round_trips_through_the_cli() {
     );
 }
 
+/// A table made at a history's name after `plan --db` and before `apply` is
+/// refused under the lock, before anything runs, by a transactional apply and
+/// a staged one alike: SQL Server would take it as the history, rows and all,
+/// and the closing read would fold it into the pair (#1501 review).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_history_name_taken_after_the_plan_is_refused_at_apply() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "temporal1176_late");
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.base (id int NOT NULL CONSTRAINT pk_base PRIMARY KEY);",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("temporal1176-late");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    std::fs::write(
+        d.dir.join("schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  vf: {type: datetime2(7), nullable: false}\n  vt: {type: datetime2(7), nullable: false}\n\nprimary_key: [id]\n\nsystem_time:\n  period: [vf, vt]\n  versioning:\n    history: dbo.t_history\n",
+    )
+    .unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = |name: &str, staged: bool| {
+        let path = d.dir.join(name);
+        let mut args = vec![
+            "plan",
+            "--db",
+            own.connection(),
+            "--out",
+            path.to_str().unwrap(),
+        ];
+        if staged {
+            args.push("--staged");
+        }
+        ok(&d.run(&args));
+        path
+    };
+    let transactional = plan("plan.json", false);
+    let staged = plan("staged.json", true);
+    // Now, and adoptable: matching columns, and a clustered index.
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.t_history (id int NOT NULL, vf datetime2 NOT NULL, vt datetime2 NOT NULL);
+         CREATE CLUSTERED INDEX ix_t_history ON dbo.t_history (vt, vf);
+         INSERT dbo.t_history VALUES (7, '2000-01-01', '2001-01-01');",
+    );
+    for (path, extra) in [(&transactional, None), (&staged, Some("--staged"))] {
+        let checksum = plan_checksum(path);
+        let mut args = vec![
+            "apply",
+            "--db",
+            own.connection(),
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        args.extend(extra);
+        let refused = d.run(&args);
+        assert_ne!(code(&refused), 0, "{extra:?}: {}", stdout(&refused));
+        assert!(
+            stderr(&refused).contains("dbo.t names dbo.t_history as its history table"),
+            "{extra:?}: {}",
+            stderr(&refused)
+        );
+        on_server(
+            own.connection(),
+            "IF OBJECT_ID('dbo.t') IS NOT NULL THROW 50000, 'the table was created', 1;
+             IF (SELECT temporal_type FROM sys.tables WHERE name = 't_history') <> 0
+                 THROW 50000, 'the table was adopted', 1;",
+        );
+    }
+}
+
 /// Every file under `dir`, at any depth.
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
