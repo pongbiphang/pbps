@@ -116,6 +116,22 @@ impl CandidateRun {
         launch: Launch,
         lifetime_secs: u64,
     ) -> Result<Self, StartFailure> {
+        Self::launch_until(api, image, token, launch, lifetime_secs, None).await
+    }
+
+    /// The launch itself. `abandon_at` is handed to the supervisor so that it
+    /// stops issuing launch requests at that instant on its own clock, not
+    /// only once the caller's dropped future closes `ready`: the supervisor
+    /// may run, or be woken by a reply, after the deadline and before the
+    /// caller's timer has been polled (review on #1496).
+    async fn launch_until(
+        api: LocalApi,
+        image: CandidateImage,
+        token: String,
+        launch: Launch,
+        lifetime_secs: u64,
+        abandon_at: Option<Instant>,
+    ) -> Result<Self, StartFailure> {
         let owner = Owner {
             name: resource_name(&token),
             token,
@@ -135,7 +151,7 @@ impl CandidateRun {
             launch,
             deadline,
             receiver,
-            ready,
+            Handoff { ready, abandon_at },
             cleanup_report,
         ));
         let running = started.await.map_err(|_| StartFailure {
@@ -156,9 +172,10 @@ impl CandidateRun {
     /// spends a create, a start and their inspects, each with its own
     /// request budget, so an attempt begun just inside a shared deadline could
     /// otherwise go on issuing them after it. Abandoning is safe: the
-    /// supervisor sees its `ready` receiver go, begins no further launch
-    /// request (`create_start` checks before each one) and removes what it
-    /// created; that cleanup's own requests necessarily follow the deadline.
+    /// supervisor is given the same deadline, begins no further launch request
+    /// once it has passed or `ready` has closed (`create_start` checks both
+    /// before each one) and removes what it created; that cleanup's own
+    /// requests necessarily follow the deadline.
     /// What the bound cannot do is recall a request already sent
     /// before the deadline: Docker has no way to cancel a `start`, so that
     /// engine may come up just after the deadline and is then removed like any
@@ -176,7 +193,7 @@ impl CandidateRun {
         let name = resource_name(&token);
         match tokio::time::timeout_at(
             deadline,
-            Self::start_launch(api, image, token, launch, lifetime_secs),
+            Self::launch_until(api, image, token, launch, lifetime_secs, Some(deadline)),
         )
         .await
         {
@@ -317,12 +334,38 @@ async fn check(
     Ok(())
 }
 
+/// Where the supervisor hands its started run back, and when the caller
+/// stops wanting it.
+struct Handoff {
+    ready: oneshot::Sender<Result<Running, StartFailure>>,
+    abandon_at: Option<Instant>,
+}
+
+impl Handoff {
+    /// Checked before every launch request: an abandoned attempt begins none
+    /// after its deadline (#645). Both signals are read because either can be
+    /// first — the caller's dropped future closes `ready`, while this task
+    /// may run past `abandon_at` before that caller's timer is polled.
+    fn abandoned(&self) -> Result<(), Error> {
+        if self.ready.is_closed() {
+            return Err(Error::ControlLost);
+        }
+        if self.abandon_at.is_some_and(|at| Instant::now() >= at) {
+            return Err(Error::Start);
+        }
+        Ok(())
+    }
+}
+
+/// Cleanup inspects and removes by the recorded id whichever check stops it.
 async fn create_start(
     api: &mut LocalApi,
     owner: &mut Owner,
     launch: &Launch,
-    ready: &oneshot::Sender<Result<Running, StartFailure>>,
+    handoff: &Handoff,
 ) -> Result<Running, Error> {
+    let abandoned = || handoff.abandoned();
+    abandoned()?;
     let body = serde_json::to_vec(&launch.body).map_err(|_| Error::Create)?;
     owner.creation = Creation::Uncertain;
     let (status, body) = api
@@ -353,18 +396,11 @@ async fn create_start(
         })
         .ok_or(Error::Create)?;
     owner.creation = Creation::Created(id.to_owned());
-    // Checked before every launch request, not only before `start`: an
-    // abandoned attempt (`start_launch_by`, #645) must begin none after its
-    // deadline. Cleanup inspects and removes by the recorded id regardless.
-    if ready.is_closed() {
-        return Err(Error::ControlLost);
-    }
+    abandoned()?;
     let state = inspect(api, id).await?.ok_or(Error::RuntimeChanged)?;
     owned_id(owner, &state)?;
     launch.check_configuration(&state)?;
-    if ready.is_closed() {
-        return Err(Error::ControlLost);
-    }
+    abandoned()?;
     let (status, _) = api
         .request(Method::POST, &format!("{API}/containers/{id}/start"))
         .await?;
@@ -376,9 +412,7 @@ async fn create_start(
         );
         return Err(Error::Start);
     }
-    if ready.is_closed() {
-        return Err(Error::ControlLost);
-    }
+    abandoned()?;
     let state = inspect(api, id).await?.ok_or(Error::Start)?;
     running(owner, &state)
 }
@@ -469,15 +503,16 @@ async fn supervise(
     launch: Launch,
     deadline: Instant,
     mut commands: mpsc::Receiver<Command>,
-    ready: oneshot::Sender<Result<Running, StartFailure>>,
+    handoff: Handoff,
     cleaned: oneshot::Sender<Result<(), Error>>,
 ) {
-    if ready.is_closed() {
+    if handoff.ready.is_closed() {
         return;
     }
     // The operation keeps its ownership context even if the caller cancels
     // while Docker is creating/starting it. HTTP itself has a bounded timeout.
-    let start = create_start(&mut api, &mut owner, &launch, &ready).await;
+    let start = create_start(&mut api, &mut owner, &launch, &handoff).await;
+    let ready = handoff.ready;
     // Credentials are not surfaced until the full channel admission exists.
     // Keeping them out of CandidateRun also prevents accidental Debug output.
     let pinned = match start {

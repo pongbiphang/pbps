@@ -422,6 +422,51 @@ async fn a_run_that_came_up_after_its_deadline_is_closed_not_accepted() {
     fixture.removed().await;
 }
 
+/// The supervisor stops on its own clock, not only when the caller lets go
+/// (review on #1496). With `ready` still open, a deadline already passed
+/// stops `create_start` before its first request, and one that passes while
+/// the post-create inspect is delayed stops it before `start`.
+#[tokio::test]
+async fn the_supervisor_stops_launching_at_its_deadline_with_ready_still_open() {
+    for (already, expected) in [(true, 0), (false, 2)] {
+        let fixture = Fixture::new(Observations {
+            delay_inspect: true,
+            ..Default::default()
+        });
+        let token = format!("{:032x}", rand::random::<u128>());
+        let launch = Launch::new(&candidate(), Driver::Postgres, &token).unwrap();
+        let mut owner = Owner {
+            name: resource_name(&token),
+            token,
+            image: candidate().identity.image_id.clone(),
+            creation: Creation::NotRequested,
+        };
+        let (ready, _held) = oneshot::channel();
+        let handoff = Handoff {
+            ready,
+            abandon_at: Some(if already {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_millis(100)
+            }),
+        };
+        let mut api = fixture.api().await;
+        let cause = create_start(&mut api, &mut owner, &launch, &handoff)
+            .await
+            .err()
+            .expect("a launch past its deadline must stop");
+        assert!(matches!(cause, Error::Start), "{cause:?}");
+        let requests = fixture.seen.lock().unwrap().requests.clone();
+        assert!(
+            !requests.iter().any(|r| r.contains("/start ")),
+            "{requests:#?}"
+        );
+        // Nothing at all before an elapsed deadline; the create and its
+        // inspect, and nothing after, when it passes during that inspect.
+        assert_eq!(requests.len(), expected, "{requests:#?}");
+    }
+}
+
 #[tokio::test]
 async fn failed_startup_is_cleaned_and_does_not_echo_the_server_error() {
     let fixture = Fixture::new(Observations {
