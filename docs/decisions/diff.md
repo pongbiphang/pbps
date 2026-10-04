@@ -2083,6 +2083,7 @@ review):
 | Limitation | On 17.0 | pbps |
 |---|---|---|
 | No primary key on a versioned table | refused (13553) | validation refuses it |
+| Period columns of two precisions (an omitted one is 7) | refused (13513) | validation refuses it |
 | An INSTEAD OF trigger on a versioned table | refused (13569) | validation refuses it |
 | An AFTER trigger on it, or either kind with a period alone | accepted | held |
 | A cascading foreign key from or to a versioned table | accepted | held; the restriction was 2016's (#1502) |

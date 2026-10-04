@@ -979,6 +979,23 @@ fn system_time(name: &TableName, table: &Table, st: &pbps_model::SystemTime) -> 
             )));
         }
     }
+    // One precision for both: the engine refuses two (13513), and reads an
+    // omitted one as 7 (measured on 17.0).
+    let precision = |column: &str| {
+        table.columns.get(column).map(|c| match c.ty.args.first() {
+            Some(pbps_model::TypeArg::Int(p)) => *p,
+            _ => 7,
+        })
+    };
+    if let (Some(start), Some(end)) = (precision(&st.start), precision(&st.end))
+        && start != end
+    {
+        errs.push(invalid(format!(
+            "the period's columns `{}` and `{}` are `datetime2({start})` and `datetime2({end})`, \
+             and SQL Server requires one precision for both",
+            st.start, st.end
+        )));
+    }
     // Every write to a row writes history, and the period's columns are the
     // engine's: rows are not this slice's to manage (#1177).
     if table.data.is_some() {
@@ -1343,6 +1360,10 @@ mod tests {
             t.system_time.as_mut().unwrap()
         }
         assert!(found(&valid()).is_empty(), "{:?}", found(&valid()));
+        // An omitted precision is 7, the same as a declared one.
+        let mut bare = valid();
+        bare.columns.get_mut("vf").unwrap().ty = "datetime2".parse().unwrap();
+        assert!(found(&bare).is_empty(), "{:?}", found(&bare));
         // A period alone needs no key.
         let mut period_only = valid();
         period_only.primary_key = None;
@@ -1355,7 +1376,7 @@ mod tests {
             assert!(found(&t).is_empty(), "{longest}: {:?}", found(&t));
         }
         type Break = fn(&mut Table);
-        let cases: [(Break, &str); 11] = [
+        let cases: [(Break, &str); 12] = [
             (|t| st(t).end = "vf".into(), "as both the start and the end"),
             (|t| st(t).end = "missing".into(), "no column of that name"),
             (
@@ -1396,6 +1417,10 @@ mod tests {
                 "longer than SQL Server keeps",
             ),
             (|t| t.primary_key = None, "must have a primary key"),
+            (
+                |t| t.columns.get_mut("vt").unwrap().ty = "datetime2(3)".parse().unwrap(),
+                "requires one precision for both",
+            ),
             (
                 |t| {
                     st(t).versioning.as_mut().unwrap().retention =
