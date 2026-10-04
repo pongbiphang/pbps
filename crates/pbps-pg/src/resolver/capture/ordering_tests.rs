@@ -589,3 +589,130 @@ async fn new_table_online_indexes_are_transactional(target: &mut Conn) {
     }
     target.execute("ROLLBACK").await.unwrap();
 }
+
+/// A default removal spelled by its column's final address runs after the
+/// recorded table and column renames that give the column that address
+/// (#1292), on every supported engine. A table-only rename and a kept
+/// default are the controls; each ends with the declared column and default.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_final_address_default_removal_executes_after_the_column_rename() {
+    let t: pbps_model::TableName = "app.t".parse().unwrap();
+    let u: pbps_model::TableName = "app.u".parse().unwrap();
+    let schema = |table: &pbps_model::TableName, name: &str, default: Option<&str>| {
+        let mut column = Column::new("integer".parse().unwrap());
+        column.default = default.map(Into::into);
+        let mut declared = Table::default();
+        declared.columns.insert(name.into(), column);
+        let mut schema = Schema::default();
+        schema.tables.insert(table.clone(), declared);
+        schema
+    };
+    let base = schema(&t, "id", Some("1"));
+    let base_ids = ids(&base, &IdsFile::default());
+    let attrdef = || BoundSurface {
+        object: ObjectIdentity {
+            class: "pg_attrdef".into(),
+            name: vec!["app".into(), "d".into()],
+            signature: vec![],
+        },
+        bindings: vec![],
+        managed_inputs: BTreeSet::new(),
+    };
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base_connection = std::env::var(variable).unwrap();
+        for (name, default) in [("n", None), ("id", None), ("n", Some("1"))] {
+            let desired = schema(&u, name, default);
+            let mut desired_ids = base_ids.clone();
+            desired_ids.rename_table(&t, &u);
+            let uid = base_ids.column_uid(&t.column("id")).unwrap();
+            desired_ids.columns.get_mut(uid).unwrap().name = name.into();
+            let observations = if default.is_some() {
+                vec![
+                    SurfaceResolution {
+                        surface: Surface::Default(t.column("id")),
+                        current: Some(attrdef()),
+                        desired: None,
+                    },
+                    SurfaceResolution {
+                        surface: Surface::Default(u.column(name)),
+                        current: None,
+                        desired: Some(attrdef()),
+                    },
+                ]
+            } else {
+                vec![SurfaceResolution {
+                    surface: Surface::Default(u.column(name)),
+                    current: Some(attrdef()),
+                    desired: None,
+                }]
+            };
+            let ordered = pbps_diff::resolver::plan(
+                pbps_diff::Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                pbps_diff::Side {
+                    schema: &desired,
+                    ids: &desired_ids,
+                },
+                &Hints::default(),
+                &observations,
+                &crate::Postgres::default(),
+            )
+            .unwrap();
+            ordered.proof.validate(&ordered.changes).unwrap();
+            let token = crate::catalog::probe_token().replace('-', "_");
+            let database = format!("pbps_order1292_{token}");
+            let mut admin = Conn::connect(Driver::Postgres, &base_connection)
+                .await
+                .unwrap();
+            admin
+                .execute(&format!("CREATE DATABASE {database}"))
+                .await
+                .unwrap();
+            let mut target = Conn::connect(
+                Driver::Postgres,
+                &format!("{base_connection} dbname={database}"),
+            )
+            .await
+            .unwrap();
+            target
+                .execute("CREATE SCHEMA app; CREATE TABLE app.t (id integer DEFAULT 1)")
+                .await
+                .unwrap();
+            target.execute("BEGIN").await.unwrap();
+            let applied = execute(&mut target, &ordered.changes).await;
+            target.execute("COMMIT").await.unwrap();
+            let rows = target
+                .query(
+                    "SELECT c.relname::text AS t, a.attname::text AS n, \
+                        pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS d \
+                     FROM pg_catalog.pg_attribute a \
+                     JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+                     JOIN pg_catalog.pg_namespace s ON s.oid = c.relnamespace \
+                     LEFT JOIN pg_catalog.pg_attrdef d \
+                       ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+                     WHERE s.nspname = 'app' AND a.attnum > 0 AND NOT a.attisdropped",
+                )
+                .await;
+            drop(target);
+            admin
+                .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+                .await
+                .unwrap();
+            applied.unwrap_or_else(|error| {
+                panic!(
+                    "{variable} {name} {default:?}: {error}: {:?}",
+                    ordered.changes
+                )
+            });
+            let rows = rows.unwrap();
+            assert_eq!(rows.len(), 1, "{variable} {name} {default:?}");
+            let text = |field: &str| rows[0].try_get::<&str>(field).unwrap().map(str::to_owned);
+            assert_eq!(text("t").as_deref(), Some("u"));
+            assert_eq!(text("n").as_deref(), Some(name));
+            assert_eq!(text("d").as_deref(), default, "{variable} {name}");
+        }
+    }
+}

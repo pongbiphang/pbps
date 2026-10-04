@@ -265,6 +265,18 @@ pub(super) fn constraints(
         }
     }
 
+    // A default change spelled by its own column's final name: where the
+    // plan renames that column, by its UID, into the name the change uses.
+    let own_rename: Vec<Option<usize>> = steps
+        .iter()
+        .map(|c| match c {
+            Change::AlterColumnDefault { uid, column, .. } => steps.iter().position(|r| {
+                matches!(r, Change::RenameColumn { uid: renamed, table, to, .. }
+                    if renamed == uid && *table == column.table && *to == column.name)
+            }),
+            _ => None,
+        })
+        .collect();
     for (i, change) in steps.iter().enumerate() {
         for (j, other) in steps.iter().enumerate() {
             if i == j {
@@ -277,10 +289,32 @@ pub(super) fn constraints(
             {
                 edge(j, i, OrderReason::Identity);
             }
+            // A default spelled by its column's final name follows every
+            // column rename of its table: the name is the one the column has
+            // once they have all run, as an expression change follows its
+            // table's rename and as the ordinary plan orders `RenameColumn`
+            // before later changes naming the column (docs/ORDERING.md;
+            // #1292). Whose rename frees that name is not read from names: a
+            // chain may fold case, as the differ's rename order does. The
+            // removal-first rule below would address the name before the
+            // column holds it. A teardown spelled by the base name keeps it.
+            let renamed_into = own_rename[i].is_some()
+                && matches!(other, Change::RenameColumn { table, .. }
+                    if change.table() == Some(table))
+                && same_table(i, j);
+            // What the differ placed ahead of that rename, such as a drop
+            // that frees the name, runs before the name exists, so it does
+            // not wait for a removal that needs the name.
+            let ahead_of_the_name = own_rename[i].is_some_and(|rename| j < rename);
+            if renamed_into {
+                edge(j, i, OrderReason::Identity);
+            }
             if let (Some(t), Some(u), Some(install)) =
                 (change.table(), other.table(), expression(change))
                 && t == u
                 && same_table(i, j)
+                && !renamed_into
+                && !ahead_of_the_name
                 && expression(other).is_none()
                 // A replica identity follows the index it names and goes
                 // ahead of the old identity's index's drop, as the differ
