@@ -41,6 +41,43 @@ fn an_endpoint_needs_every_field_and_never_echoes_its_password() {
     }
 }
 
+/// A credential with a space, or any byte the separator or the grammar would
+/// take, is spelled percent-encoded and arrives exactly (#677). The encoding
+/// adds one legal spelling to `user` and `password` only; a malformed escape
+/// is refused, and no other field decodes anything.
+#[test]
+fn percent_encoded_credentials_round_trip_and_malformed_ones_are_refused() {
+    let endpoint = ScratchEndpoint::parse(
+        "profile=linux-dedicated-v1 container=c \
+         user=pbps%20admin password=s%203cret%25%3D%C3%A9",
+    )
+    .unwrap();
+    assert_eq!(endpoint.user, "pbps admin");
+    assert_eq!(endpoint.password, "s 3cret%=é");
+    let rendered = format!("{endpoint:?}");
+    assert!(!rendered.contains("3cret"), "{rendered}");
+    // A `%` without two hex digits, a non-UTF-8 result or a NUL is refused.
+    for value in [
+        "profile=linux-dedicated-v1 container=c user=u password=p%",
+        "profile=linux-dedicated-v1 container=c user=u password=p%2",
+        "profile=linux-dedicated-v1 container=c user=u password=p%zz",
+        "profile=linux-dedicated-v1 container=c user=u password=p%+1",
+        "profile=linux-dedicated-v1 container=c user=u password=%ff",
+        "profile=linux-dedicated-v1 container=c user=u password=%00",
+        "profile=linux-dedicated-v1 container=c user=% password=p",
+    ] {
+        assert!(
+            matches!(ScratchEndpoint::parse(value), Err(Error::Endpoint)),
+            "{value:?} must not parse"
+        );
+    }
+    // Only the credentials decode: an escaped container name is still refused.
+    assert!(
+        ScratchEndpoint::parse("profile=linux-dedicated-v1 container=c%2Fd user=u password=p")
+            .is_err()
+    );
+}
+
 /// The profile name reaches a refusal message, so it may not carry anything
 /// but an ordinary configured name.
 #[test]
