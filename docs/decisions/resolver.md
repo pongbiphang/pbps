@@ -1528,7 +1528,8 @@ code (`resolution::Case`), output and tests:
 (`pbps_diff::resolver::assess`); it reads no catalog. The questions are the
 surfaces the target holds and the plan keeps.
 
-- **Rebuild:** a surface the plan recreates from its own declaration.
+- **Rebuild:** a surface the plan recreates from its own declaration,
+  including one whose table or column it replaces under a new recorded UID.
 - **Unaffected:** every other surface, but only when no change in the plan can
   move a name lookup. Such changes are relations, columns and their types,
   index names where they share the relation namespace (PostgreSQL, not SQL

@@ -4,7 +4,7 @@
 
 use super::prepare::{forward, invalidates, surfaces};
 use pbps_model::resolver::Surface;
-use pbps_model::{Change, ChangeSet, GrantTarget};
+use pbps_model::{Change, ChangeSet, GrantTarget, IdsFile};
 use std::collections::BTreeMap;
 
 /// One question's answer.
@@ -92,10 +92,11 @@ fn assessed_with(
         if !after.contains(&kept) {
             continue;
         }
-        let answer = if ordinary
-            .changes
-            .iter()
-            .any(|p| recreates(&p.change, &surface, &kept, base, desired))
+        let answer = if replaced(&surface, &kept, base.ids, desired.ids)
+            || ordinary
+                .changes
+                .iter()
+                .any(|p| recreates(&p.change, &surface, &kept, base, desired))
         {
             Answer::Rebuild
         } else if moved {
@@ -106,6 +107,26 @@ fn assessed_with(
         questions.insert(kept, answer);
     }
     Assessment { questions }
+}
+
+/// Whether the surface found under the same spelling belongs to another table
+/// or column: one the plan drops and creates again under a new UID, as when
+/// an environment skipped the revision that dropped the old one. Its new
+/// surface is created from the declaration, so it is a rebuild, not a kept
+/// surface (#1526 review). Only recorded UIDs that differ prove it; a UID
+/// either side lacks proves nothing, and the surface stays a question.
+fn replaced(surface: &Surface, kept: &Surface, from: &IdsFile, to: &IdsFile) -> bool {
+    let differ = |a: Option<&pbps_model::Uid>, b: Option<&pbps_model::Uid>| matches!((a, b), (Some(a), Some(b)) if a != b);
+    match (surface, kept) {
+        (Surface::Default(before), Surface::Default(after)) => {
+            differ(from.column_uid(before), to.column_uid(after))
+        }
+        (Surface::Check { table: before, .. }, Surface::Check { table: after, .. })
+        | (Surface::Index { table: before, .. }, Surface::Index { table: after, .. }) => {
+            differ(from.table_uid(before), to.table_uid(after))
+        }
+        _ => false,
+    }
 }
 
 /// Whether this change recreates the surface because its declaration says
@@ -485,6 +506,75 @@ mod tests {
                 "{change:?}"
             );
         }
+    }
+
+    /// A table dropped and created again under its old name, with a new UID,
+    /// takes its default and check with it: the new ones are created from the
+    /// declarations, so they are rebuilds and ask the engine nothing, even
+    /// though the drop and create move lookups elsewhere (#1526 review).
+    #[test]
+    fn a_surface_on_a_replaced_table_is_a_rebuild_not_a_kept_question() {
+        let base = bound();
+        let mut base_only = base.clone();
+        base_only.modules.clear();
+        let base_ids = ids(&base_only, &IdsFile::default());
+        let mut desired_ids = base_ids.clone();
+        let table: pbps_model::TableName = "app.t".parse().unwrap();
+        let old = base_ids.table_uid(&table).unwrap().clone();
+        desired_ids.tables.remove(&old);
+        desired_ids.tables.insert(
+            pbps_model::Uid::generate(pbps_model::UidKind::Table),
+            table.clone(),
+        );
+        let columns: Vec<_> = desired_ids.columns.keys().cloned().collect();
+        for uid in columns {
+            let column = desired_ids.columns.remove(&uid).unwrap();
+            desired_ids.columns.insert(
+                pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                column,
+            );
+        }
+        let ordinary = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::DropTable {
+                    name: table.clone(),
+                    uid: old,
+                    detach_from: None,
+                }),
+                PlannedChange::new(Change::CreateTable {
+                    uid: desired_ids.table_uid(&table).unwrap().clone(),
+                    name: table.clone(),
+                    table: Box::new(base_only.tables[&table].clone()),
+                }),
+            ],
+        };
+        let assessment = assessed_with(
+            crate::Side {
+                schema: &base_only,
+                ids: &base_ids,
+            },
+            crate::Side {
+                schema: &base_only,
+                ids: &desired_ids,
+            },
+            &ordinary,
+            true,
+        );
+        assert!(!assessment.requires_resolution(), "{assessment:?}");
+        // The same surfaces kept under their recorded UIDs are questions.
+        let kept = assessed_with(
+            crate::Side {
+                schema: &base_only,
+                ids: &base_ids,
+            },
+            crate::Side {
+                schema: &base_only,
+                ids: &base_ids,
+            },
+            &ordinary,
+            true,
+        );
+        assert!(kept.requires_resolution(), "{kept:?}");
     }
 
     /// Where an index is named per table, as on SQL Server, adding or dropping
