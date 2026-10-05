@@ -132,6 +132,7 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
             Change::DropModule { .. }
             | Change::CreateTable { .. }
             | Change::DropTable { .. }
+            | Change::DetachPartition { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
             | Change::AlterColumnType { .. }

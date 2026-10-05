@@ -932,6 +932,108 @@ fn create_index(
     Ok(s)
 }
 
+/// Detaches a partition and gives what it keeps the declared names (#1544,
+/// DEC-1544.1), in one batch, so no apply stops between the two.
+///
+/// Measured on 16 and 18: while attached, a partition's clone of its
+/// parent's key, unique constraint, foreign key or index takes a new name,
+/// and after the detach nothing links it to its parent any more
+/// (`conparentid` is 0, the index leaves `pg_inherits`). So the clones are
+/// found through their parents and renamed first, in a `DO` block as
+/// [`drop_primary_key`] handles an engine-chosen name, and then detached. An
+/// inherited CHECK refuses a rename while attached, and keeps its parent's
+/// name, which the plan knows, so it is renamed after. A clone not found is
+/// an error, which rolls the batch back, rather than a rename skipped.
+fn detach_partition(
+    table: &TableName,
+    parent: &TableName,
+    names: &[pbps_model::DetachedName],
+) -> Result<String, DialectError> {
+    use pbps_model::DetachedKind as K;
+    let q = qualified(table)?;
+    let p = qualified(parent)?;
+    let mut renames = Vec::new();
+    for n in names {
+        let found = match n.kind {
+            K::PrimaryKey => format!(
+                "SELECT k.conname FROM pg_catalog.pg_constraint k \
+                 WHERE k.conrelid = {t}::pg_catalog.regclass AND k.contype = 'p'",
+                t = literal(&q)
+            ),
+            K::Unique | K::ForeignKey => format!(
+                "SELECT k.conname FROM pg_catalog.pg_constraint k \
+                 JOIN pg_catalog.pg_constraint pk ON pk.oid = k.conparentid \
+                 WHERE k.conrelid = {t}::pg_catalog.regclass \
+                 AND pk.conrelid = {p}::pg_catalog.regclass AND pk.conname = {n}",
+                t = literal(&q),
+                p = literal(&p),
+                n = literal(&n.parent)
+            ),
+            K::Index => format!(
+                "SELECT ci.relname FROM pg_catalog.pg_inherits h \
+                 JOIN pg_catalog.pg_class ci ON ci.oid = h.inhrelid \
+                 JOIN pg_catalog.pg_index i ON i.indexrelid = ci.oid \
+                 JOIN pg_catalog.pg_class pi ON pi.oid = h.inhparent \
+                 JOIN pg_catalog.pg_index x ON x.indexrelid = pi.oid \
+                 WHERE i.indrelid = {t}::pg_catalog.regclass \
+                 AND x.indrelid = {p}::pg_catalog.regclass AND pi.relname = {n}",
+                t = literal(&q),
+                p = literal(&p),
+                n = literal(&n.parent)
+            ),
+            // Renamed after the detach, below.
+            K::Check => continue,
+        };
+        // The table's name is escaped for `format`, where a `%` is a
+        // placeholder, and both go in literal position, as in
+        // `drop_primary_key`.
+        let statement = match n.kind {
+            K::Index => format!(
+                "ALTER INDEX {}.%I RENAME TO %I",
+                quote(&table.schema)?.replace('%', "%%")
+            ),
+            K::PrimaryKey | K::Unique | K::ForeignKey | K::Check => format!(
+                "ALTER TABLE {} RENAME CONSTRAINT %I TO %I",
+                q.replace('%', "%%")
+            ),
+        };
+        let to = match &n.name {
+            Some(name) => name.clone(),
+            None => crate::generated_name(&table.name, None, "pkey"),
+        };
+        renames.push(format!(
+            "    c := ({found});\n\
+             \x20   IF c IS NULL THEN\n\
+             \x20       RAISE EXCEPTION 'no clone of % on % to rename', {what}, {t};\n\
+             \x20   END IF;\n\
+             \x20   IF c <> {to} THEN\n\
+             \x20       EXECUTE pg_catalog.format({statement}, c, {to});\n\
+             \x20   END IF;",
+            what = literal(&n.parent),
+            t = literal(&q),
+            to = literal(&to),
+            statement = literal(&statement)
+        ));
+    }
+    let mut out = String::new();
+    if !renames.is_empty() {
+        let body = format!("DECLARE c name;\nBEGIN\n{}\nEND", renames.join("\n"));
+        let tag = dollar_tag(&body);
+        out.push_str(&format!("DO {tag}\n{body}\n{tag};\n"));
+    }
+    out.push_str(&format!("ALTER TABLE {p} DETACH PARTITION {q};"));
+    for n in names.iter().filter(|n| n.kind == K::Check) {
+        if let Some(name) = n.name.as_ref().filter(|name| **name != n.parent) {
+            out.push_str(&format!(
+                "\nALTER TABLE {q} RENAME CONSTRAINT {} TO {};",
+                quote(&n.parent)?,
+                quote(name)?
+            ));
+        }
+    }
+    Ok(out)
+}
+
 /// Drops whatever primary key the table currently has.
 ///
 /// A `DO` block when the declaration did not name it, for the reason SQL
@@ -2109,6 +2211,12 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             detach_from: None,
             ..
         } => one(pg, name, format!("DROP TABLE {};", qualified(name)?)),
+        Change::DetachPartition {
+            table,
+            parent,
+            names,
+            ..
+        } => one(pg, table, detach_partition(table, parent, names)?),
 
         // Two statements when both halves move, and neither engine has one that
         // does both: `RENAME TO` cannot cross a schema and `SET SCHEMA` cannot
@@ -3751,6 +3859,76 @@ fn row_statement(
 
 #[cfg(test)]
 mod tests {
+    /// A detach renames the clones it keeps before it detaches, through
+    /// their parents and quoted by the engine, and the checks after, in one
+    /// batch; a key left unnamed takes the engine's name for the table's
+    /// (#1544).
+    #[test]
+    fn a_detach_renames_what_it_keeps_around_one_batch() {
+        use pbps_model::{DetachedKind as K, DetachedName};
+        let name = |kind, parent: &str, name: Option<&str>| DetachedName {
+            kind,
+            parent: parent.into(),
+            name: name.map(str::to_owned),
+        };
+        let detach = |table: &str, names: Vec<DetachedName>| {
+            Postgres::new()
+                .emit(
+                    &Change::DetachPartition {
+                        uid: "t_aaaaaa".parse().unwrap(),
+                        table: table.parse().unwrap(),
+                        parent: "app.ev".parse().unwrap(),
+                        names,
+                        shape: Box::default(),
+                    },
+                    Default::default(),
+                )
+                .expect("emit")
+                .into_iter()
+                .map(|s| s.sql)
+                .collect::<Vec<_>>()
+        };
+        let sql = detach(
+            "app.p%1",
+            vec![
+                name(K::PrimaryKey, "ev_pk", None),
+                name(K::Index, "ev_n", Some("arch_n")),
+                name(K::Check, "ev_ck", Some("arch_ck")),
+            ],
+        );
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        let sql = &sql[0];
+        let block = sql.find("DO $").expect("the renames");
+        let detached = sql
+            .find("ALTER TABLE \"app\".\"ev\" DETACH PARTITION \"app\".\"p%1\";")
+            .expect("the detach");
+        let check = sql
+            .find("ALTER TABLE \"app\".\"p%1\" RENAME CONSTRAINT \"ev_ck\" TO \"arch_ck\";")
+            .expect("the check's rename");
+        assert!(block < detached && detached < check, "{sql}");
+        // The `%` in the name is the table's, escaped for `format`; the
+        // placeholders are the renames'.
+        assert!(
+            sql.contains("'ALTER TABLE \"app\".\"p%%1\" RENAME CONSTRAINT %I TO %I'"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("'ALTER INDEX \"app\".%I RENAME TO %I'"),
+            "{sql}"
+        );
+        assert!(sql.contains("c, 'p%1_pkey'"), "{sql}");
+        assert!(sql.contains("pi.relname = 'ev_n'"), "{sql}");
+        // Negative: nothing to rename, nothing but the detach.
+        let plain = detach("app.p2", Vec::new());
+        assert_eq!(
+            plain[0]
+                .lines()
+                .filter(|l| !l.starts_with("SET ") && !l.starts_with("RESET "))
+                .collect::<Vec<_>>(),
+            ["ALTER TABLE \"app\".\"ev\" DETACH PARTITION \"app\".\"p2\";"]
+        );
+    }
+
     /// A partition is dropped by one statement that detaches it from its
     /// parent first, so no apply can stop between the two; any other table
     /// is dropped alone (#1171).

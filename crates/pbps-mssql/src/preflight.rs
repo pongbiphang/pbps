@@ -384,6 +384,7 @@ impl AsStored {
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
+                | Change::DetachPartition { .. }
                 | Change::PublicExecution { .. } => {}
             }
         }
@@ -597,6 +598,7 @@ impl AsStored {
                 | Change::SetTablePersistence { .. }
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
+                | Change::DetachPartition { .. }
                 | Change::PublicExecution { .. } => {}
             }
         }
@@ -1018,6 +1020,7 @@ fn build(
         // the module docs.
         Change::CreateTable { .. }
         | Change::DropTable { .. }
+        | Change::DetachPartition { .. }
         | Change::RenameTable { .. }
         | Change::AddColumn { .. }
         | Change::DropColumn { .. }

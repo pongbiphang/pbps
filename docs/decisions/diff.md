@@ -2428,3 +2428,75 @@ exclusion or the `drop_blockers` removal; the CLI
 `a_partition_is_detached_and_dropped_in_one_statement`,
 `a_range_end_compares_the_columns_before_its_first_unbounded_end` and
 `a_partition_change_under_a_standing_parent_is_probed`.
+
+<a id="dec-1544-1"></a>
+
+**DEC-1544.1. A partition declared as an ordinary table of its parent's shape
+is detached and kept, as a `DetachPartition` change that renames what it keeps
+to the declared names in the same batch. Any other shape is refused (#1544).**
+
+Measured on 18.6 and 16.15, identical:
+
+- While attached, a partition's clone of its parent's key, unique constraint,
+  foreign key or index can be renamed. An inherited CHECK refuses it (`cannot
+  rename inherited constraint`).
+- `DETACH PARTITION` ends every link to the parent: `conparentid` is 0 and no
+  index is left in `pg_inherits`. Columns turn local with the parent's
+  defaults. A CHECK keeps its parent's name, and on 18 so do the NOT NULL rows.
+- The detach is refused while rows reference the partition (23503), which
+  #1171's pre-flight already counts.
+- A unique constraint's or a key's index shares the schema's relation
+  namespace, so it cannot keep its parent's name in the same schema. A foreign
+  key's or a check's is the table's own and can.
+
+**The declaration.** Leon chose it on the issue (2026-10-05): the detached
+table is pbps's, and its names are the declaration's, not the engine's. The
+partition leaves `partitions:` for a file of its own, under the same name and
+so the same uid. The alternatives were to make the declaration copy the
+engine's names, or to leave the table unmanaged.
+
+**The differ.** A table that was a partition and is declared as an ordinary,
+unpartitioned table plans one `DetachPartition` and nothing else. Its base
+holds no columns of its own, so a column-by-column diff would read every one
+as new. The declaration must be its parent's shape:
+
+- the columns, in order;
+- a key on the same columns;
+- every unique constraint, foreign key, check and index matched one to one
+  with the parent's by definition, names aside;
+- every other field equal: description, settings, `data:`.
+
+Anything else is `DetachedShape`, named, and is a second change to make in a
+later revision. A rename at the same time stays #1170's refusal.
+
+**The change** carries:
+
+- each of the parent's objects with the name its clone takes. A key left
+  unnamed is `None`, and the dialect spells it, `<table>_pkey`, which is what
+  the reader then reads;
+- the declared shape. The apply holds the read-back to that shape, as it holds
+  a created table to its `CREATE`, and does not compare it with the partition's
+  empty base. The declared-expression record takes its text from the shape and
+  its bindings from the parent, re-keyed to the declared names.
+
+It sorts in class 6, so it frees its range before a partition is created over
+it. It is `destructive`: no row is deleted, but every row of the partition
+leaves its parent, and a query on the parent stops returning them. Plan
+version 27 carries it, and SQL Server refuses it.
+
+**The statement** is one batch:
+
+1. A `DO` block finds each clone through its parent object, as
+   `drop_primary_key` finds an engine-chosen name: `conparentid` for a key, a
+   unique constraint or a foreign key, and `pg_inherits` for an index. It
+   renames each with `EXECUTE format(... %I ...)`, the table's name escaped for
+   `format`. A clone not found raises, rolling the batch back.
+2. The detach.
+3. The checks' renames, from the parent's names.
+
+Pinned by the live `a_partition_is_detached_and_kept_under_its_declared_names`
+(on 16 and 18), which fails without the renames; the CLI
+`a_partition_is_detached_and_kept_through_the_cli`, which fails without the
+apply holding the table to its declared shape; and the unit tests
+`a_partition_declared_as_its_parents_shape_is_detached`, which fails without
+the shape check, and `a_detach_renames_what_it_keeps_around_one_batch`.

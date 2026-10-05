@@ -760,6 +760,17 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
                 Lock::AccessExclusive,
             )
         }),
+        Change::DetachPartition { table, parent, .. } => e(
+            format!("detaching the partition {table} from {parent}"),
+            parent,
+            Rewrite::No,
+            Reads::Unknown(
+                "each table with a foreign key to the parent is checked for rows that \
+                 reference the partition"
+                    .into(),
+            ),
+            Lock::AccessExclusive,
+        ),
         Change::DropTable {
             name,
             detach_from: Some(parent),

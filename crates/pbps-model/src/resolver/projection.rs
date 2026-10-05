@@ -601,6 +601,19 @@ fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
         Change::RenameTable { from, .. } => {
             (WithChildren(Surface::Table(from.clone())), true, true)
         }
+        // The detached table and everything on it change: its columns turn
+        // local and its clones take the declared names. So does its parent's
+        // membership (#1544).
+        Change::DetachPartition { table, parent, .. } => {
+            return Some((
+                vec![
+                    WithChildren(Surface::Table(table.clone())),
+                    Exact(Surface::Table(parent.clone())),
+                ],
+                true,
+                true,
+            ));
+        }
         Change::AddColumn { table, name, .. } => (
             WithChildren(Surface::Column(table.column(name))),
             false,

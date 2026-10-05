@@ -71,9 +71,11 @@ parent's and nothing else, and leaves any other tree out whole, by name. A
 tree is created whole, and a partition nobody declared is refused with the
 commands that adopt it (#1170, DEC-1170.1). A partition is then added under its
 standing parent, or dropped with drop intent; the apply's pre-flight refuses a
-range over DEFAULT-partition rows and the drop of a referenced partition. The
-parent's own changes, detaching with the rows kept, and attaching an existing
-table stay refused by name (#1171, DEC-1171.1; #1544–#1547).
+range over DEFAULT-partition rows and the drop of a referenced partition
+(#1171, DEC-1171.1). A partition declared in a file of its own with its
+parent's shape is detached and kept, under its declared names (#1544,
+DEC-1544.1). The parent's own changes and attaching an existing table stay
+refused by name (#1545–#1547).
 
 A SQL Server column may name its collation (`collation:`); `pull` declares one
 that differs from the database's default, and a collation change is a planned

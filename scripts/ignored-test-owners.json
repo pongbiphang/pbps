@@ -1325,7 +1325,8 @@
         "an_unlogged_table_switches_through_the_cli_behind_its_risk",
         "an_array_column_widens_through_the_cli",
         "a_partition_tree_round_trips_through_the_cli",
-        "partitions_are_added_and_dropped_through_the_cli"
+        "partitions_are_added_and_dropped_through_the_cli",
+        "a_partition_is_detached_and_kept_through_the_cli"
       ]
     },
     {
@@ -1835,6 +1836,7 @@
         "a_null_default_is_one_this_engine_does_not_keep",
         "a_nullable_primary_key_column_is_refused_because_this_engine_would_not",
         "a_parent_whose_referenced_columns_the_session_cannot_read_refuses_the_delete",
+        "a_partition_is_detached_and_kept_under_its_declared_names",
         "a_plan_that_supplies_the_parent_row_first_is_not_refused_for_its_absence",
         "a_planned_key_across_collations_is_counted_under_the_referenced_collation",
         "a_planned_key_on_unchanged_columns_sees_the_survivor_too",

@@ -246,6 +246,7 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 Change::AddComputedColumn { .. } | Change::DropComputedColumn { .. } => None,
                 Change::AlterColumnType { .. }
                 | Change::CreateTable { .. }
+                | Change::DetachPartition { .. }
                 | Change::DropTable { .. }
                 | Change::RenameTable { .. }
                 | Change::RenameColumn { .. }

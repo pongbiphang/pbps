@@ -278,10 +278,13 @@ indexes:
   are refused (DEC-1170.1). Under a standing parent a partition is added, or
   dropped with drop intent, which detaches it first and is `destructive`. The
   apply's pre-flight refuses a range over rows the parent's DEFAULT partition
-  holds, and the drop of a partition rows still reference (DEC-1171.1). Every
-  other change stays refused by name: the parent's own changes until #1546,
-  detaching a partition and keeping its rows until #1544, attaching an existing
-  table until #1545.
+  holds, and the drop of a partition rows still reference (DEC-1171.1). A
+  partition moved out of `partitions:` into a file of its own, declared with its
+  parent's columns, keys, constraints and indexes under any names, is detached
+  and kept with its rows, `destructive` since they leave the parent; any other
+  shape is refused, to be changed in a later revision (DEC-1544.1). Every other
+  change stays refused by name: the parent's own changes until #1546, attaching
+  an existing table until #1545.
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

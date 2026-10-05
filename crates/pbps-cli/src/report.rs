@@ -321,6 +321,7 @@ fn role_of(change: &Change) -> Option<&str> {
         | Change::Revoke { role: name, .. } => Some(name.as_str()),
         Change::RenameRole { from, .. } => Some(from.as_str()),
         Change::CreateTable { .. }
+        | Change::DetachPartition { .. }
         | Change::DropTable { .. }
         | Change::RenameTable { .. }
         | Change::AddColumn { .. }
@@ -374,6 +375,7 @@ fn renames(cs: &ChangeSet) -> Renames {
                 roles.insert(from.clone(), to.clone());
             }
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -694,6 +696,18 @@ pub fn describe(c: &Change) -> String {
             detach_from: None,
             ..
         } => format!("- drop table {name}"),
+        Change::DetachPartition {
+            table,
+            parent,
+            names,
+            ..
+        } => format!(
+            "~ detach table {table} from {parent}, keeping its rows, with {} name(s) of its own",
+            names
+                .iter()
+                .filter(|n| n.name.as_ref() != Some(&n.parent))
+                .count()
+        ),
         // Said, because the detach is a statement of its own and locks the
         // parent (#1171).
         Change::DropTable {
@@ -1020,6 +1034,28 @@ mod tests {
             "- drop table app.p1, a partition of app.ev, detached from it first"
         );
         assert_eq!(super::describe(&drop(None)), "- drop table app.p1");
+        let detach = Change::DetachPartition {
+            uid: "t_aaaaaa".parse().unwrap(),
+            table: "app.p1".parse().unwrap(),
+            parent: "app.ev".parse().unwrap(),
+            names: vec![
+                pbps_model::DetachedName {
+                    kind: pbps_model::DetachedKind::Index,
+                    parent: "ev_n".into(),
+                    name: Some("arch_n".into()),
+                },
+                pbps_model::DetachedName {
+                    kind: pbps_model::DetachedKind::Check,
+                    parent: "ev_ck".into(),
+                    name: Some("ev_ck".into()),
+                },
+            ],
+            shape: Box::default(),
+        };
+        assert_eq!(
+            super::describe(&detach),
+            "~ detach table app.p1 from app.ev, keeping its rows, with 1 name(s) of its own"
+        );
     }
 
     #[test]

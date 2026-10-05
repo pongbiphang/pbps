@@ -391,6 +391,9 @@ impl Unchecked {
             }
             Change::AlterColumnType { column, .. } => format!("type conversion of {column}"),
             Change::DeleteRow { table, key, .. } => format!("references to row {key} in {table}"),
+            Change::DetachPartition { table, parent, .. } => {
+                format!("references to the partition {table}, detached from {parent}")
+            }
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }

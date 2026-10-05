@@ -4311,6 +4311,159 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
     }
 }
 
+/// A partition declared as an ordinary table of its parent's shape is
+/// detached under the declared names (#1544): its rows stay with it and
+/// leave the parent, it reads back as declared, and nothing is left to plan.
+/// A key left unnamed takes the engine's own name for the table's. On 16
+/// and 18.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_partition_is_detached_and_kept_under_its_declared_names() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
+    for connection in [conn_str(), old] {
+        let database = format!("pbps_test_part1544_{}", std::process::id());
+        let mut admin = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+        admin
+            .execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+            .await
+            .expect("clear a database left by an earlier run");
+        admin
+            .execute(&format!("CREATE DATABASE {database}"))
+            .await
+            .expect("create the database");
+        let own = connection.replace("dbname=pbps_test", &format!("dbname={database}"));
+        assert_ne!(
+            own, connection,
+            "the fixture names its database `pbps_test`"
+        );
+        let mut conn = Conn::connect(Driver::Postgres, &own).await.unwrap();
+        let s = emit_schema("part1544");
+        fresh(&mut conn, &s).await;
+        conn.execute(&format!(
+            "CREATE TABLE {s}.r (id integer PRIMARY KEY);
+             CREATE TABLE {s}.ev (id integer NOT NULL, ts date NOT NULL DEFAULT '2025-01-01',
+                 v text CONSTRAINT ev_v_ck CHECK (v <> ''),
+                 rid integer CONSTRAINT ev_rid_fk REFERENCES {s}.r (id),
+                 CONSTRAINT ev_pk PRIMARY KEY (id, ts), CONSTRAINT ev_vt UNIQUE (v, ts))
+                 PARTITION BY RANGE (ts);
+             CREATE INDEX ev_rid ON {s}.ev (rid);
+             CREATE TABLE {s}.ev_2025 PARTITION OF {s}.ev
+                 FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+             CREATE TABLE {s}.ev_2026 PARTITION OF {s}.ev
+                 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+             INSERT INTO {s}.r VALUES (1);
+             INSERT INTO {s}.ev VALUES (1, '2025-06-01', 'a', 1), (2, '2026-06-01', 'b', 1),
+                 (3, '2025-07-01', 'c', NULL);"
+        ))
+        .await
+        .expect("the tree");
+        let read = |pulled: &pbps_pg::introspect::Pulled| {
+            let mut held = Schema::default();
+            for (name, table) in &pulled.schema.tables {
+                if name.schema == s {
+                    held.tables.insert(name.clone(), table.clone());
+                }
+            }
+            held
+        };
+        let t = |name: &str| TableName::new(&s, name);
+        let base = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
+        let ids = mint_ids(&base, &IdsFile::default(), &[]);
+        let parent = base.tables[&t("ev")].clone();
+        // The parent's shape, every name the declaration's own.
+        let mut archived = pbps_model::Table {
+            partition_by: None,
+            ..parent.clone()
+        };
+        archived.primary_key.as_mut().unwrap().name = Some("arch_pk".into());
+        fn rename<V>(map: &mut std::collections::BTreeMap<String, V>, from: &str, to: &str) {
+            let v = map.remove(from).expect(from);
+            map.insert(to.to_owned(), v);
+        }
+        rename(&mut archived.unique, "ev_vt", "arch_vt");
+        rename(&mut archived.foreign_keys, "ev_rid_fk", "arch_rid_fk");
+        rename(&mut archived.checks, "ev_v_ck", "arch_v_ck");
+        rename(&mut archived.indexes, "ev_rid", "arch_rid");
+        let mut declared = base.clone();
+        declared.tables.insert(t("ev_2025"), archived.clone());
+        let declared_ids = mint_ids(&declared, &ids, &[]);
+        let pg = Postgres::new();
+        let step = plan(&base, &ids, &declared, &declared_ids);
+        let kinds: Vec<String> = step
+            .changes
+            .iter()
+            .map(|p| {
+                format!("{:?}", p.change)
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(kinds, ["DetachPartition"], "{:?}", step.changes);
+        for probe in pg.preflight(&step).probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        apply(&mut conn, &pg, &step).await;
+        let after = read(
+            &pbps_pg::catalog::introspect(&mut conn)
+                .await
+                .expect("read back"),
+        );
+        assert_eq!(after.tables.get(&t("ev_2025")), Some(&archived));
+        assert!(plan(&after, &declared_ids, &declared, &declared_ids).is_empty());
+        assert_eq!(
+            counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.ev_2025")).await,
+            2
+        );
+        assert_eq!(
+            counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.ev")).await,
+            1
+        );
+
+        // A key left unnamed takes the engine's own name for the table's. A
+        // foreign key and a check keep their parent's names, which are the
+        // table's own to share; a unique constraint and an index need names
+        // of their own, sharing the schema's relation namespace.
+        let mut unnamed = pbps_model::Table {
+            partition_by: None,
+            ..parent.clone()
+        };
+        unnamed.primary_key.as_mut().unwrap().name = None;
+        rename(&mut unnamed.unique, "ev_vt", "ev26_vt");
+        rename(&mut unnamed.indexes, "ev_rid", "ev26_rid");
+        let mut second = declared.clone();
+        second.tables.insert(t("ev_2026"), unnamed);
+        let second_ids = mint_ids(&second, &declared_ids, &[]);
+        let step = plan(&after, &declared_ids, &second, &second_ids);
+        apply(&mut conn, &pg, &step).await;
+        let last = read(
+            &pbps_pg::catalog::introspect(&mut conn)
+                .await
+                .expect("read back"),
+        );
+        assert_eq!(
+            last.tables[&t("ev_2026")]
+                .primary_key
+                .as_ref()
+                .and_then(|k| k.name.clone()),
+            Some("ev_2026_pkey".to_owned())
+        );
+        assert!(plan(&last, &second_ids, &second, &second_ids).is_empty());
+
+        drop(conn);
+        admin
+            .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .await
+            .expect("drop the database");
+    }
+}
+
 /// Emits and executes every change of a plan, in plan order.
 ///
 /// One statement at a time through [`Conn::execute`], which is what `apply`

@@ -941,6 +941,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
                 checked += 1;
             }
             change @ pbps_model::Change::DropTable { .. }
+            | change @ pbps_model::Change::DetachPartition { .. }
             | change @ pbps_model::Change::RenameTable { .. }
             | change @ pbps_model::Change::AddColumn { .. }
             | change @ pbps_model::Change::DropColumn { .. }
@@ -6696,6 +6697,106 @@ fn partitions_are_added_and_dropped_through_the_cli() {
     assert_eq!(
         scalar(&connection, "SELECT count(*) FROM app.ev_2026 WHERE id = 3"),
         1
+    );
+}
+
+/// A partition moved out of `partitions:` into a file of its own, of its
+/// parent's shape under names of its own, is detached and kept through the
+/// CLI (#1544): behind `--allow destructive`, its rows kept and gone from the
+/// parent, after which `verify` is clean and nothing is left to plan. A
+/// declaration of another shape is refused by name before a plan exists.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_partition_is_detached_and_kept_through_the_cli() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "detach-1544");
+    let connection = own.connection().to_owned();
+    on_server(&connection, "CREATE SCHEMA app");
+    let d = Demo::new("detach-1544");
+    let columns = "columns:\n  id: {type: integer, nullable: false}\n  \
+                   ts: {type: date, nullable: false}\n  n: {type: integer}\n";
+    let tree = |partitions: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.ev.yml"),
+            format!(
+                "table: app.ev\n{columns}primary_key: [id, ts]\nindexes:\n  ev_n: {{columns: [n]}}\n\
+                 checks:\n  ev_n_ck: n > 0\npartition_by: [ts]\npartitions:\n{partitions}"
+            ),
+        )
+        .unwrap();
+    };
+    let p2025 = "  ev_2025: {from: [\"2025-01-01\"], to: [\"2026-01-01\"]}\n";
+    let p2026 = "  ev_2026: {from: [\"2026-01-01\"], to: [\"2027-01-01\"]}\n";
+    tree(&format!("{p2025}{p2026}"));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &connection]));
+    on_server(
+        &connection,
+        "INSERT INTO app.ev VALUES (1, '2025-06-01', 5), (2, '2026-06-01', 6)",
+    );
+
+    // Another shape: refused by name, before a plan exists.
+    tree(p2026);
+    let archived = d.dir.join("schema/app.ev_2025.yml");
+    std::fs::write(
+        &archived,
+        format!("table: app.ev_2025\n{columns}primary_key: [id, ts]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        said.contains("app.ev_2025 is detached from app.ev, and declared as other than")
+            && said.contains("index `ev_n` is missing"),
+        "{said}"
+    );
+
+    // Its parent's shape, its own names: detached behind its risk.
+    std::fs::write(
+        &archived,
+        format!(
+            "table: app.ev_2025\n{columns}primary_key:\n  name: arch_pk\n  columns: [id, ts]\n\
+             indexes:\n  arch_n: {{columns: [n]}}\nchecks:\n  arch_n_ck: n > 0\n"
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&o).contains("~ detach table app.ev_2025 from app.ev, keeping its rows"),
+        "{}",
+        stdout(&o)
+    );
+    let o = approved_apply(&d, &connection, &plan, &[]);
+    assert_ne!(
+        code(&o),
+        0,
+        "a detach needs its risk allowed: {}",
+        stdout(&o)
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(scalar(&connection, "SELECT count(*) FROM app.ev_2025"), 1);
+    assert_eq!(scalar(&connection, "SELECT count(*) FROM app.ev"), 1);
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_constraint WHERE conname IN ('arch_pk', 'arch_n_ck')"
+        ),
+        2
     );
 }
 
