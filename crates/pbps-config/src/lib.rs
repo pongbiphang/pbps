@@ -362,7 +362,7 @@ impl Config {
         }) {
             return Err(ConfigError::AmbiguousFingerprintKey { name: name.clone() });
         }
-        if config.schema_dir.is_relative() && names_its_base(&config.schema_dir) {
+        if config.schema_dir.is_relative() && only_the_current_directory(&config.schema_dir) {
             return Err(ConfigError::SchemaDirIsProjectRoot {
                 path: path.to_owned(),
             });
@@ -371,24 +371,17 @@ impl Config {
     }
 }
 
-/// Whether a relative path, read lexically, names the directory it is relative
-/// to: `.`, `./`, an empty path, `a/..` and the like.
-fn names_its_base(path: &Path) -> bool {
+/// Whether a relative path names its base by spelling alone: empty, `.`,
+/// `./` and the like, with no directory name in it.
+///
+/// Not `a/..`: a name and a `..` cancel only lexically, and when `a` is a
+/// symlink the pair leads somewhere else entirely (review on #1548). Such a
+/// path is judged where it can be, against the filesystem in
+/// [`Project::load`], and lexically only where git's own tree is all there
+/// is (`baseline`, which reads configs from history).
+fn only_the_current_directory(path: &Path) -> bool {
     use std::path::Component;
-    let mut depth: isize = 0;
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => depth -= 1,
-            Component::Normal(_) => depth += 1,
-            Component::RootDir | Component::Prefix(_) => return false,
-        }
-        // Once above the base, a later name is a different directory beside it.
-        if depth < 0 {
-            return false;
-        }
-    }
-    depth == 0
+    path.components().all(|c| matches!(c, Component::CurDir))
 }
 
 /// A located project: its root directory plus its configuration.
@@ -600,7 +593,7 @@ mod tests {
     /// sibling and a path that only passes through `..` are not.
     #[test]
     fn a_schema_dir_naming_the_project_root_is_refused() {
-        for root in [".", "./", "", "a/..", "./a/../.", "a/b/../.."] {
+        for root in [".", "./", "", "./."] {
             let text = format!("dialect: mssql\nschema_dir: \"{root}\"\n");
             let err = Config::parse(&text, Path::new("pbps.yml")).unwrap_err();
             assert!(
@@ -609,12 +602,15 @@ mod tests {
             );
             assert!(err.to_string().contains("schema/"), "{err}");
         }
+        // `a/..` is not judged by spelling: a symlink can make it lead
+        // elsewhere, so `Project::load` judges it on disk.
         for fine in [
             "schema",
             "./schema",
             "db/tables",
             "../shared/schema",
             "a/../b",
+            "a/..",
         ] {
             let text = format!("dialect: mssql\nschema_dir: \"{fine}\"\n");
             assert!(
@@ -659,8 +655,22 @@ mod tests {
             matches!(err, ConfigError::SchemaDirIsProjectRoot { .. }),
             "{err}"
         );
+        // A real directory and its `..` lead back to the root on disk too.
+        std::fs::create_dir_all(tmp.join("a")).unwrap();
+        std::fs::write(&config, "dialect: mssql\nschema_dir: \"a/..\"\n").unwrap();
+        let err = Project::load(&config).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SchemaDirIsProjectRoot { .. }),
+            "{err}"
+        );
         #[cfg(unix)]
         {
+            // But a symlink into a subdirectory makes `alias/..` that
+            // subdirectory's parent, `schema`, a valid declarations directory.
+            std::fs::create_dir_all(tmp.join("schema/nested")).unwrap();
+            std::os::unix::fs::symlink(tmp.join("schema/nested"), tmp.join("alias")).unwrap();
+            std::fs::write(&config, "dialect: mssql\nschema_dir: \"alias/..\"\n").unwrap();
+            assert!(Project::load(&config).is_ok());
             std::os::unix::fs::symlink(".", tmp.join("here")).unwrap();
             std::fs::write(&config, "dialect: mssql\nschema_dir: here\n").unwrap();
             let err = Project::load(&config).unwrap_err();

@@ -1122,6 +1122,24 @@ fn a_project_whose_schema_dir_is_its_root_is_refused_by_name() {
     std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
     let o = d.run(&["validate"]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // A committed revision is read from git's tree, where `a/..` can only be
+    // the project root: the baseline refuses it by the same rule, rather than
+    // listing the whole tree as declarations (review on #1548).
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nschema_dir: \"a/..\"\n",
+    )
+    .unwrap();
+    d.commit();
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    let o = d.run(&["plan"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("`schema_dir`") && err.contains("names the project root"),
+        "{err}"
+    );
 }
 
 /// The way a user actually reaches this: two `renamed_from:` annotations name

@@ -181,10 +181,19 @@ fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String)> {
     // `relative_to` answers by running git inside the path's own parent. The
     // project root is the one directory that is always there (DECISIONS 166).
     let prefix = relative_to(root)?;
-    Ok((
-        under(&prefix, &config.schema_dir)?,
-        under(&prefix, &config.ids_file)?,
-    ))
+    let schema = under(&prefix, &config.schema_dir)?;
+    // A historical config is read from git's tree, where a path resolves only
+    // by its spelling, so this is the lexical half of the rule `pbps-config`
+    // applies (#739). `Config::parse` refuses only names with no directory in
+    // them, since a symlink can make `a/..` lead elsewhere on disk; in a
+    // revision, `a/..` is the project root, and that is refused here.
+    if schema == prefix.trim_end_matches('/') {
+        anyhow::bail!(
+            "`schema_dir` in `{config_rel}` at `{rev}` names the project root; declarations \
+             live in a subdirectory of the project, such as `schema/` (the default)"
+        );
+    }
+    Ok((schema, under(&prefix, &config.ids_file)?))
 }
 
 /// A path the config states, relative to the project root, as the path git
@@ -248,9 +257,10 @@ fn tree_paths(root: &Path, rev: &str, rel: &str) -> anyhow::Result<Vec<String>> 
     // root. Without it a project in a subdirectory lists nothing, and — since
     // the identity file is still found — the plan comes back as "no changes"
     // against a baseline that holds no tables at all.
-    // `rel` is never empty: the declarations directory is a subdirectory of
-    // the project, which `pbps-config` refuses otherwise (#739), so the
-    // pathspec always names it rather than the whole tree.
+    // `rel` never names the project root: a historical config that spells it
+    // is refused where its paths are composed above, and a current one by
+    // `pbps-config` (#739). The pathspec always names the declarations
+    // directory rather than the whole tree.
     let args = [
         "ls-tree",
         "-r",
