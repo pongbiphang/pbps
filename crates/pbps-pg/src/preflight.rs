@@ -3699,7 +3699,7 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
             }
         }
     }
-    partition_probes(changes, &mut out, &mut unchecked);
+    partition_probes(changes, &names, &mut out, &mut unchecked);
     Preflight {
         probes: out,
         unchecked,
@@ -3712,7 +3712,12 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
 /// and whether rows elsewhere still reference a partition about to be
 /// dropped, which the engine refuses to detach. Both are asked of the whole
 /// plan, because a partition the same plan drops takes its rows with it.
-fn partition_probes(changes: &ChangeSet, out: &mut Vec<Probe>, unchecked: &mut Vec<Unchecked>) {
+fn partition_probes(
+    changes: &ChangeSet,
+    names: &AsStored,
+    out: &mut Vec<Probe>,
+    unchecked: &mut Vec<Unchecked>,
+) {
     let created: BTreeSet<&TableName> = changes
         .changes
         .iter()
@@ -3753,7 +3758,7 @@ fn partition_probes(changes: &ChangeSet, out: &mut Vec<Probe>, unchecked: &mut V
             ..
         } = &p.change
         {
-            partition_reference_probe(name, parent)
+            partition_reference_probe(name, parent, names)
         } else {
             continue;
         };
@@ -3872,10 +3877,13 @@ fn partition_range_probe(
 /// row of `partition`. The detach that drops it is refused while any remain
 /// (`removing partition … violates foreign key constraint`), measured on 16
 /// and 18. A referencing partitioned table is counted with its partitions,
-/// an ordinary one alone (#1171).
+/// an ordinary one alone (#1171). A key this plan removes first, or a table
+/// it drops, is left out the way the delete probe leaves them out
+/// ([`gone_keys`]): the drop comes in class 6, after the key's in class 2.
 fn partition_reference_probe(
     partition: &TableName,
     parent: &TableName,
+    names: &AsStored,
 ) -> Result<Probe, DialectError> {
     let child = value_literal(&format!(
         " AS r WHERE EXISTS (SELECT 1 FROM ONLY {} AS p WHERE ",
@@ -3889,8 +3897,8 @@ fn partition_reference_probe(
                    JOIN pg_catalog.pg_attribute pa \
                    ON pa.attrelid = con.confrelid AND pa.attnum = con.confkey[s.i])";
     let text = format!(
-        "'SELECT count(*) AS n FROM ' || CASE WHEN rc.relkind = 'p' THEN '' ELSE 'ONLY ' END \
-         || pg_catalog.quote_ident(rn.nspname) || '.' || pg_catalog.quote_ident(rc.relname) \
+        "'SELECT count(*) AS n FROM ' || CASE WHEN cl.relkind = 'p' THEN '' ELSE 'ONLY ' END \
+         || pg_catalog.quote_ident(ns.nspname) || '.' || pg_catalog.quote_ident(cl.relname) \
          || {child} || {matched} || ')'"
     );
     Ok(Probe::new(
@@ -3905,11 +3913,12 @@ fn partition_reference_probe(
                 "COALESCE((SELECT sum((pg_catalog.xpath('/row/n/text()', \
                  pg_catalog.query_to_xml({text}, false, true, '')))[1]::text::numeric) \
                  FROM pg_catalog.pg_constraint con \
-                 JOIN pg_catalog.pg_class rc ON rc.oid = con.conrelid \
-                 JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace \
+                 JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid \
+                 JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace \
                  WHERE con.contype = 'f' AND con.conparentid = 0 \
-                 AND con.confrelid = pg_catalog.to_regclass({})), 0)",
-                value_literal(&qualified(parent)?)
+                 AND con.confrelid = pg_catalog.to_regclass({}) {}), 0)",
+                value_literal(&qualified(parent)?),
+                gone_keys(names)
             ))
         ),
     ))

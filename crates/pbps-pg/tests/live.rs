@@ -4154,6 +4154,24 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         assert_eq!(sqlstate(&refused), "23503", "{refused:?}");
         rollback(&mut conn).await;
 
+        // The same drop with the foreign key removed by the same plan: the key
+        // goes first (class 2), so the rows that pointed through it count
+        // none, and the engine takes the whole plan (#1549 review).
+        let mut unkeyed = fewer.clone();
+        unkeyed
+            .tables
+            .get_mut(&t("r"))
+            .unwrap()
+            .foreign_keys
+            .clear();
+        let unkeyed_step = plan(&added, &added_ids, &unkeyed, &fewer_ids);
+        let unkeyed_probes = pg.preflight(&unkeyed_step).probes;
+        assert_eq!(unkeyed_probes.len(), 1, "{unkeyed_probes:#?}");
+        assert_eq!(counted(&mut conn, &unkeyed_probes[0].sql).await, 0);
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &unkeyed_step).await;
+        rollback(&mut conn).await;
+
         // With nothing referencing it, counted 0, and nothing in the catalog
         // blocks it either: the foreign key's clone on `r` that names it goes
         // with the detach.
