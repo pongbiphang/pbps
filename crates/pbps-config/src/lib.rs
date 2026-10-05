@@ -52,6 +52,16 @@ pub enum ConfigError {
          keep the one its key is delivered through"
     )]
     AmbiguousFingerprintKey { name: String },
+
+    /// The declarations directory is the project root itself (#739). Every
+    /// `.yml` beneath it is read as a declaration, `pbps.yml` included, so
+    /// this layout never loaded; it is refused here, by name, instead of
+    /// surfacing as "the YAML in `pbps.yml`" is not a declaration.
+    #[error(
+        "`schema_dir` in `{path}` names the project root; declarations live in a \
+         subdirectory of the project, such as `schema/` (the default)"
+    )]
+    SchemaDirIsProjectRoot { path: PathBuf },
 }
 
 /// The target database dialect.
@@ -352,8 +362,33 @@ impl Config {
         }) {
             return Err(ConfigError::AmbiguousFingerprintKey { name: name.clone() });
         }
+        if config.schema_dir.is_relative() && names_its_base(&config.schema_dir) {
+            return Err(ConfigError::SchemaDirIsProjectRoot {
+                path: path.to_owned(),
+            });
+        }
         Ok(config)
     }
+}
+
+/// Whether a relative path, read lexically, names the directory it is relative
+/// to: `.`, `./`, an empty path, `a/..` and the like.
+fn names_its_base(path: &Path) -> bool {
+    use std::path::Component;
+    let mut depth: isize = 0;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => depth -= 1,
+            Component::Normal(_) => depth += 1,
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+        // Once above the base, a later name is a different directory beside it.
+        if depth < 0 {
+            return false;
+        }
+    }
+    depth == 0
 }
 
 /// A located project: its root directory plus its configuration.
@@ -389,6 +424,24 @@ impl Project {
         // A config file is always inside some directory; the only way to have no
         // parent is to have been handed an empty path.
         let root = config_path.parent().unwrap_or(Path::new(".")).to_owned();
+        // An absolute `schema_dir` can name the root too; `parse` cannot tell
+        // without knowing where the file is.
+        if config.schema_dir.is_absolute() {
+            let real = |p: &Path| {
+                std::fs::canonicalize(if p.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    p
+                })
+            };
+            if let (Ok(dir), Ok(base)) = (real(&config.schema_dir), real(&root))
+                && dir == base
+            {
+                return Err(ConfigError::SchemaDirIsProjectRoot {
+                    path: config_path.to_owned(),
+                });
+            }
+        }
         Ok(Self { root, config })
     }
 
@@ -540,6 +593,60 @@ mod tests {
 
     /// `dialect` has no default: guessing wrong produces SQL that is
     /// syntactically valid and semantically wrong.
+    /// #739: the declarations directory is never the project root. Every
+    /// spelling of the root is refused by name, while a subdirectory, a
+    /// sibling and a path that only passes through `..` are not.
+    #[test]
+    fn a_schema_dir_naming_the_project_root_is_refused() {
+        for root in [".", "./", "", "a/..", "./a/../.", "a/b/../.."] {
+            let text = format!("dialect: mssql\nschema_dir: \"{root}\"\n");
+            let err = Config::parse(&text, Path::new("pbps.yml")).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::SchemaDirIsProjectRoot { .. }),
+                "{root:?}: {err}"
+            );
+            assert!(err.to_string().contains("schema/"), "{err}");
+        }
+        for fine in [
+            "schema",
+            "./schema",
+            "db/tables",
+            "../shared/schema",
+            "a/../b",
+        ] {
+            let text = format!("dialect: mssql\nschema_dir: \"{fine}\"\n");
+            assert!(
+                Config::parse(&text, Path::new("pbps.yml")).is_ok(),
+                "{fine:?}"
+            );
+        }
+        // An absolute path is judged where the file is: the root itself is
+        // refused, a directory inside it is not.
+        let tmp = std::env::temp_dir().join(format!("pbps-cfg739-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("schema")).unwrap();
+        let config = tmp.join("pbps.yml");
+        std::fs::write(
+            &config,
+            format!("dialect: mssql\nschema_dir: \"{}\"\n", tmp.display()),
+        )
+        .unwrap();
+        let err = Project::load(&config).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SchemaDirIsProjectRoot { .. }),
+            "{err}"
+        );
+        std::fs::write(
+            &config,
+            format!(
+                "dialect: mssql\nschema_dir: \"{}\"\n",
+                tmp.join("schema").display()
+            ),
+        )
+        .unwrap();
+        assert!(Project::load(&config).is_ok());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
     #[test]
     fn dialect_is_required() {
         assert!(Config::parse("schema_dir: schema\n", Path::new("pbps.yml")).is_err());

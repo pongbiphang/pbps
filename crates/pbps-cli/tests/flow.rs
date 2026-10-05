@@ -1099,6 +1099,31 @@ fn fmt_normalises_and_check_mode_never_writes() {
     );
 }
 
+/// A project whose declarations directory is its own root is refused by name
+/// (#739). That layout read `pbps.yml` itself as a declaration and failed on
+/// its first key, a message that pointed nowhere near the cause. Every command
+/// that loads the project refuses it the same way, and moving the
+/// declarations into a subdirectory is the whole remedy.
+#[test]
+fn a_project_whose_schema_dir_is_its_root_is_refused_by_name() {
+    let d = Demo::new("rootschema739");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n");
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\nschema_dir: .\n").unwrap();
+    for args in [&["validate"][..], &["plan"][..]] {
+        let o = d.run(args);
+        assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
+        let err = stderr(&o);
+        assert!(
+            err.contains("`schema_dir`") && err.contains("names the project root"),
+            "{args:?}: {err}"
+        );
+        assert!(!err.contains("a declaration file starts with"), "{err}");
+    }
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
 /// The way a user actually reaches this: two `renamed_from:` annotations name
 /// one column. A copy-paste, a bad merge, a half-finished edit.
 ///
