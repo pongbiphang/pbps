@@ -1,6 +1,9 @@
 // Evaluate the expressions read from the workflow with GitHub's own parser.
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
 import { test } from 'node:test';
 import { Lexer, Parser, Evaluator, data } from '@actions/expressions';
 import { falsy } from '@actions/expressions/result';
@@ -141,13 +144,14 @@ test('every job uses one validated intended-base checkout rather than the stale 
   const currentMerge = 'c'.repeat(40);
   const edited = context('pull_request', 'edited', { base: { ref: { from: 'parent' } } });
   edited.sha = staleMerge;
+  edited.workflow_sha = "d".repeat(40);
   edited.event.pull_request.head.sha = head;
   const approve = job('approve');
   assert.match(approve, /checkout_sha: \$\{\{ steps\.checkout\.outputs\.checkout_sha \}\}/);
   assert.match(approve, /python3 scripts\/ci_pr_checkout\.py/);
   const bootstrap = approve.match(/uses: actions\/checkout@v7\n        with:\n          ref: (.+)/);
-  assert.ok(bootstrap, 'approval bootstraps the reviewed source before selecting its merge ref');
-  assert.equal(evaluate(bootstrap[1], edited).coerceString(), head);
+  assert.ok(bootstrap, 'approval bootstraps the defining workflow before selecting its merge ref');
+  assert.equal(evaluate(bootstrap[1], edited).coerceString(), edited.workflow_sha);
   for (const [name, block] of [...workflow.split('jobs:\n')[1].matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/gm)].map(match => [match[1], match[2]])) {
     if (name === 'approve') continue;
     assert.match(block, /^    needs: (approve|\[[^\]\n]*\bapprove\b[^\]\n]*\])$/m, `${name} directly receives approval outputs`);
@@ -156,5 +160,39 @@ test('every job uses one validated intended-base checkout rather than the stale 
     const selected = evaluate(checkouts[0][1], edited, { approve: { outputs: { checkout_sha: currentMerge } } }).coerceString();
     assert.equal(selected, currentMerge, `${name} shares the validated merge SHA`);
     assert.notEqual(selected, staleMerge, 'edited-event GITHUB_SHA cannot select the former base');
+  }
+});
+
+
+test('existing PR heads can bootstrap newly introduced helpers without rebasing', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'pbps-ci-workflow-source-'));
+  const git = (...args) => execFileSync('git', ['-c', 'user.name=CI fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', ...args], { cwd: fixture, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  try {
+    git('init', '--quiet');
+    git('commit', '--quiet', '--allow-empty', '-m', 'Existing PR head before the selector');
+    const oldHead = git('rev-parse', 'HEAD');
+    const approve = job('approve');
+    const selectorPath = property(approve, 'run').replace(/^python3 /, '');
+    const selectorSource = '# CI helper introduced with its defining workflow\n';
+    mkdirSync(dirname(join(fixture, selectorPath)), { recursive: true });
+    writeFileSync(join(fixture, selectorPath), selectorSource);
+    mkdirSync(join(fixture, '.github/workflows'), { recursive: true });
+    writeFileSync(join(fixture, '.github/workflows/ci.yml'), workflow);
+    git('add', '.');
+    git('commit', '--quiet', '-m', 'Defining workflow introduces its selector');
+    const workflowSha = git('rev-parse', 'HEAD');
+    assert.throws(() => git('show', `${oldHead}:${selectorPath}`), 'the unchanged pre-existing head has no new helper');
+    const event = context('pull_request', 'edited', { base: { ref: { from: 'parent' } } });
+    event.sha = oldHead;
+    event.event.pull_request.head.sha = oldHead;
+    event.workflow_sha = workflowSha;
+    const selected = evaluate(property(approve, 'ref'), event).coerceString();
+    assert.equal(git('show', `${selected}:${selectorPath}`), selectorSource.trim(), 'bootstrap must find the helper in the immutable defining workflow');
+    const marker = approve.match(/- name: Pin the validated CI tree \((.+)\)/);
+    assert.ok(marker, 'CI step metadata names the actual workflow source');
+    assert.equal(evaluate(marker[1], event).coerceString(), selected);
+    assert.equal(event.event.pull_request.head.sha, oldHead, 'the reviewed PR head is unchanged');
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
   }
 });

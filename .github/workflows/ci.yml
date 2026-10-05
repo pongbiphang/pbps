@@ -80,11 +80,11 @@ jobs:
     outputs:
       checkout_sha: ${{ steps.checkout.outputs.checkout_sha }}
     steps:
-      # Bootstrap the reviewed source, not an edited event's stale merge SHA.
+      # Older PR heads can lack new CI helpers; use the defining workflow tree.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      - name: Pin the validated CI tree
+          ref: ${{ github.workflow_sha }}
+      - name: Pin the validated CI tree (${{ github.workflow_sha }})
         id: checkout
         env:
           GITHUB_TOKEN: ${{ github.token }}

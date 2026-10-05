@@ -118,8 +118,11 @@ An actual base edit starts a new PR-associated merge-ref run behind approval
 (DEC-1457.1). Refresh OPEN/base/unchanged head/remaining diff and review evidence,
 then select and approve that base-edit run on the current head. Require its
 complete matrix and `ci-gate` before enqueueing. Verify the approval-selected
-merge SHA has the intended base and reviewed head as its parents, and every job
-checks out that same pinned SHA. The edited event itself can retain the former
+merge SHA has the intended base and reviewed head as its parents, and every
+execution job checks out that same pinned SHA. Verify approval bootstraps the
+immutable defining workflow revision: pre-existing reviewed heads may lack a
+new selector, and acquiring that helper must not require rebasing. The edited
+event itself can retain the former
 base merge SHA even while its run correctly names the new PR base. Require the
 base parent to include the event's base commit and belong to the intended base
 branch; a stable merge ref may precede later advancement of that same branch.

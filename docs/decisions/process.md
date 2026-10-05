@@ -872,8 +872,12 @@ remaining diff and review evidence before approving that associated run.
 An edited event can still carry its former base's `GITHUB_SHA`: #1535's
 restored-master run 37273424527 was associated with the right PR/head/base,
 yet its default checkout `b66f67da589c5fc5ba2eb0ffcd5e7a755b61844d`
-had the former base as its first parent. After approval, bootstrap the reviewed
-source and select the live `refs/pull/N/merge` only when complete, stable PR/ref
+had the former base as its first parent. After approval, bootstrap the immutable
+revision defining the workflow (`github.workflow_sha`), because an existing
+reviewed PR head may predate the new selector. This keeps the helper and its
+workflow together without rebasing the reviewed head. Name the workflow source
+in the selection step so actual CI evidence can verify it. Select the live
+`refs/pull/N/merge` only when complete, stable PR/ref
 snapshots and both commit parents match the event's reviewed head and intended
 base ref. The immutable event base SHA is an ancestry floor: the selected base
 parent must include it and itself be included in the live intended base branch.
@@ -881,8 +885,8 @@ Actual #1535 reads also showed that GitHub may keep a stable earlier merge ref
 while `master` advances. Equality with the latest branch tip would refuse valid
 same-base movement; the ancestry checks preserve it without rebasing while
 refusing a former-base tree even when its commit is already an ancestor of the
-new base. Pin the selected SHA as an approval output and give every job that
-exact checkout; association and a
+new base. Pin the selected SHA as an approval output and give every execution
+job that exact checkout; association and a
 green matrix alone do not prove the intended tree. Missing, unreadable, changed
 or ambiguous evidence fails the bounded selector instead of accepting an old
 merge. Non-PR events retain their exact event SHA.

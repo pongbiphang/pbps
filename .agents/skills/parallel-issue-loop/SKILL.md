@@ -119,7 +119,9 @@ and merge order.
   and current-head CI gates before enqueueing. Select the actual base-edit
   associated run and require its complete matrix after approval. Verify the
   approval-selected merge SHA has the intended base and reviewed head as its
-  parents and every job uses it; edited-event SHAs can retain the old base.
+  parents and every execution job uses it; edited-event SHAs can retain the old
+  base. Verify approval bootstraps the immutable defining workflow revision so
+  existing reviewed heads need no rebase just to acquire the new selector.
   Require that base parent to include the event base and belong to the intended
   base branch; later same-base advancement needs no rebase. Metadata-only
   runs create no `ci-gate` and cannot qualify the PR (DEC-1457.1). Do not rebase merely for this

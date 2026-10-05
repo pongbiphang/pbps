@@ -123,8 +123,10 @@ checksum-pinned, and state lives in the database itself.
   (DEC-1457.1). Refresh the dependent's OPEN/base/head/diff and review evidence,
   then approve the base-edit run on its current head and require the complete
   matrix before enqueueing. Verify the approval-selected merge SHA has the
-  intended base and reviewed head as its parents, and that every job checks
-  out that same pinned SHA; an edited event can retain the former base SHA.
+  intended base and reviewed head as its parents, and that every execution job
+  checks out that same pinned SHA; an edited event can retain the former base
+  SHA. Verify approval bootstraps the immutable defining workflow revision,
+  which supplies its selector even when the reviewed head predates that helper.
   Require the base parent to include the event's base commit and belong to the
   intended base branch. Later advancement of that branch needs no rebase.
   Ignore metadata-only runs: they create no
