@@ -3744,6 +3744,9 @@ fn partition_probes(
                 }
                 by_parent
             });
+    // Partitions dropped so far, in plan order: by a partition's own drop,
+    // their rows are gone, and so are their references.
+    let mut dropped_before: Vec<&TableName> = Vec::new();
     for p in &changes.changes {
         let probe = if let Change::CreateTable { name, table, .. } = &p.change
             && let Some(of) = &table.partition_of
@@ -3758,7 +3761,9 @@ fn partition_probes(
             ..
         } = &p.change
         {
-            partition_reference_probe(name, parent, names)
+            let probe = partition_reference_probe(name, parent, names, &dropped_before);
+            dropped_before.push(name);
+            probe
         } else {
             continue;
         };
@@ -3880,11 +3885,22 @@ fn partition_range_probe(
 /// an ordinary one alone (#1171). A key this plan removes first, or a table
 /// it drops, is left out the way the delete probe leaves them out
 /// ([`gone_keys`]): the drop comes in class 6, after the key's in class 2.
+/// So are the rows of a referencing table's partitions that the plan drops
+/// before this one, which `gone_keys` cannot reach: the key names their
+/// still-standing parent (#1549 review).
 fn partition_reference_probe(
     partition: &TableName,
     parent: &TableName,
     names: &AsStored,
+    dropped_before: &[&TableName],
 ) -> Result<Probe, DialectError> {
+    let mut gone_rows = String::new();
+    for earlier in dropped_before {
+        gone_rows.push_str(&format!(
+            " AND r.tableoid IS DISTINCT FROM pg_catalog.to_regclass({})",
+            value_literal(&qualified(earlier)?)
+        ));
+    }
     let child = value_literal(&format!(
         " AS r WHERE EXISTS (SELECT 1 FROM ONLY {} AS p WHERE ",
         qualified(partition)?
@@ -3899,7 +3915,8 @@ fn partition_reference_probe(
     let text = format!(
         "'SELECT count(*) AS n FROM ' || CASE WHEN cl.relkind = 'p' THEN '' ELSE 'ONLY ' END \
          || pg_catalog.quote_ident(ns.nspname) || '.' || pg_catalog.quote_ident(cl.relname) \
-         || {child} || {matched} || ')'"
+         || {child} || {matched} || ')' || {}",
+        value_literal(&gone_rows)
     );
     Ok(Probe::new(
         format!(

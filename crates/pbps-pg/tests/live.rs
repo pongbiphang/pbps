@@ -4177,6 +4177,75 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         // with the detach.
         conn.execute(&format!("DELETE FROM {s}.r")).await.unwrap();
         assert_eq!(counted(&mut conn, &probes[0].sql).await, 0);
+        // A partitioned table referencing the parent, one of whose partitions
+        // the same plan drops first: that partition's rows go with it, so the
+        // referenced partition's drop after it counts none (#1549 review).
+        conn.execute(&format!(
+            "CREATE TABLE {s}.aref (id integer, ev_id integer, ev_ts date, at integer NOT NULL,
+                 CONSTRAINT aref_ev FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.ev (id, ts))
+                 PARTITION BY RANGE (at);
+             CREATE TABLE {s}.aref_1 PARTITION OF {s}.aref FOR VALUES FROM (0) TO (10);
+             INSERT INTO {s}.aref VALUES (1, 1, '2025-06-01', 5);"
+        ))
+        .await
+        .expect("the referencing tree");
+        let with_aref = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
+        let aref_ids = mint_ids(&with_aref, &added_ids, &[]);
+        let mut both = with_aref.clone();
+        both.tables.remove(&t("aref_1"));
+        both.tables.remove(&t("ev_2025"));
+        let both_intents = [
+            Intent::DropTable {
+                table: t("aref_1"),
+                reason: "gone".into(),
+            },
+            Intent::DropTable {
+                table: t("ev_2025"),
+                reason: "gone".into(),
+            },
+        ];
+        let both_step = plan(
+            &with_aref,
+            &aref_ids,
+            &both,
+            &mint_ids(&both, &aref_ids, &both_intents),
+        );
+        let order: Vec<String> = both_step
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let pbps_model::Change::DropTable { name, .. } = &p.change {
+                    Some(name.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(order, ["aref_1", "ev_2025"]);
+        for probe in pg.preflight(&both_step).probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &both_step).await;
+        rollback(&mut conn).await;
+        // Negative: the referencing partition kept, its row is counted.
+        let mut alone = with_aref.clone();
+        alone.tables.remove(&t("ev_2025"));
+        let alone_step = plan(
+            &with_aref,
+            &aref_ids,
+            &alone,
+            &mint_ids(&alone, &aref_ids, &archive),
+        );
+        let alone_probes = pg.preflight(&alone_step).probes;
+        assert_eq!(alone_probes.len(), 1, "{alone_probes:#?}");
+        assert_eq!(counted(&mut conn, &alone_probes[0].sql).await, 1);
+        conn.execute(&format!("DROP TABLE {s}.aref")).await.unwrap();
         // A range split in the same plan: the partition's rows go with its
         // drop, so the halves created over them count none.
         let mut split = fewer.clone();
