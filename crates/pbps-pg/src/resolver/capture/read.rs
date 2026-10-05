@@ -186,17 +186,27 @@ async fn within(
     if !matches!(major, 16 | 18) {
         return Err(Failure::Version);
     }
-    let (raw, witnesses) = batch(conn, major, None).await?;
+    let (rows, witnesses) = batch(conn, major, None).await?;
+    let raw = Catalog::new(rows).map_err(|_| Failure::Incomplete)?;
     properties::qualify_layout(&raw, major).map_err(|_| Failure::Incomplete)?;
     let session = environment.logical(&raw)?;
     let selected = qualify(&raw, major)?;
     // Ledger recipe facts deparse defaults/constraints too. They share the
     // qualified rendering boundary and cannot run before source/type coverage.
     let baseline = super::baseline::read(conn, &raw).await?;
-    let (rendered, held) = batch(conn, major, Some(&selected)).await?;
-    if held != witnesses {
-        return Err(Failure::Changed);
+    // Only the selected rows are read again, to render them; every other row
+    // is the first pass's, in the same snapshot (#1538).
+    let (selection, held) = batch(conn, major, Some(&selected)).await?;
+    for (class, values) in &held {
+        if !values.is_subset(&witnesses[class]) {
+            return Err(Failure::Changed);
+        }
     }
+    let mut rows = raw.rows;
+    selected
+        .overlay(&mut rows, selection)
+        .map_err(|_| Failure::Incomplete)?;
+    let rendered = Catalog::new(rows).map_err(|_| Failure::Incomplete)?;
     let dropped = identify(conn, dropped).await?;
     Ok((
         Read {
@@ -215,7 +225,7 @@ async fn batch(
     conn: &mut impl QueryConnection,
     major: u32,
     selection: Option<&Selection>,
-) -> Result<(Catalog, Witnesses), Failure> {
+) -> Result<(BTreeMap<String, Vec<Row>>, Witnesses), Failure> {
     let sql = queries::batch(major, selection).map_err(|_| Failure::Incomplete)?;
     let mut catalogs: BTreeMap<String, Vec<Row>> = properties::CLASSES
         .iter()
@@ -242,8 +252,7 @@ async fn batch(
     if markers.len() != properties::CLASSES.len() {
         return Err(Failure::Incomplete);
     }
-    let catalog = Catalog::new(catalogs).map_err(|_| Failure::Incomplete)?;
-    Ok((catalog, witnesses))
+    Ok((catalogs, witnesses))
 }
 
 fn text<'a>(row: &'a pbps_db::Row, name: &str) -> Result<Option<&'a str>, Failure> {
@@ -412,6 +421,13 @@ mod tests {
     async fn exercise_owned_capture(connection: String, fixture_role: String) {
         let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
         conn.execute("CREATE SCHEMA app; CREATE TABLE app.a(id integer); CREATE VIEW app.v AS SELECT id FROM app.a; SET search_path=app; SET timezone='Pacific/Honolulu'; SET default_transaction_isolation='read committed'").await.unwrap();
+        // A setting for a role in every database is a `pg_db_role_setting`
+        // row with `setdatabase = 0`, which the class's read scope keeps. The
+        // rendering pass must not keep it too: that class has nothing to
+        // render (#1538 review).
+        conn.execute(&format!("ALTER ROLE {fixture_role} SET work_mem = '8MB'"))
+            .await
+            .unwrap();
         let read = owned(&mut conn, &BTreeSet::new(), |catalog, major| {
             // A new catalog property must be noticed even though the
             // SQL projection still names only previously known fields.

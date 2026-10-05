@@ -84,7 +84,10 @@ pub(super) fn batch(major: u32, selection: Option<&Selection>) -> Result<String>
         ));
         let row = format!("pg_catalog.jsonb_build_object({})", columns.join(", "));
         let witness = row_witness(class, major)?;
-        let filter = filter(class);
+        // The rendering pass reads the selected rows alone: an unselected
+        // row renders nothing, so it is the first pass's row unchanged and
+        // the caller keeps that one (#1538).
+        let filter = clause(class, selection.map(|_| selected.as_str()));
         // A marker represents an empty but successfully read catalog. Each
         // following row is fetched through the same snapshot cursor; a large
         // unrelated catalog must not become one oversized JSON value.
@@ -98,7 +101,7 @@ pub(super) fn witness(major: u32) -> Result<String> {
         .iter()
         .map(|class| {
             let witness = row_witness(class, major)?;
-            Ok(format!("SELECT '{class}' AS part, NULL::text AS witness UNION ALL SELECT '{class}', {witness}::text FROM pg_catalog.{class} c {}", filter(class)))
+            Ok(format!("SELECT '{class}' AS part, NULL::text AS witness UNION ALL SELECT '{class}', {witness}::text FROM pg_catalog.{class} c {}", clause(class, None)))
         })
         .collect::<Result<Vec<_>>>()
         .map(|parts| parts.join("\nUNION ALL\n"))
@@ -123,13 +126,27 @@ fn row_witness(class: &str, major: u32) -> Result<String> {
     Ok(format!("pg_catalog.jsonb_build_object({columns})"))
 }
 
-fn filter(class: &str) -> &'static str {
-    match class {
-        "pg_database" => "WHERE c.datname = current_database()",
-        "pg_db_role_setting" => {
-            "WHERE c.setdatabase = 0 OR c.setdatabase = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())"
-        }
-        _ => "",
+/// The rows a class is read for, and, in the rendering pass, the selection
+/// on top of them. Each predicate is grouped whole before the next is
+/// joined: `pg_db_role_setting`'s is a disjunction, and an ungrouped `AND`
+/// would bind only its second half (#1538 review).
+fn clause(class: &str, selected: Option<&str>) -> String {
+    let scope = match class {
+        "pg_database" => Some("c.datname = current_database()"),
+        "pg_db_role_setting" => Some(
+            "c.setdatabase = 0 OR c.setdatabase = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())",
+        ),
+        _ => None,
+    };
+    let predicates = scope
+        .into_iter()
+        .chain(selected)
+        .map(|predicate| format!("({predicate})"))
+        .collect::<Vec<_>>();
+    if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", predicates.join(" AND "))
     }
 }
 
