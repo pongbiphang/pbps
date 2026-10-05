@@ -16,7 +16,11 @@ pub(super) async fn read(
     conn.query(&format!("DECLARE {cursor} NO SCROLL CURSOR FOR {sql}"))
         .await
         .map_err(|_| Failure::Read)?;
-    let fetch = format!("FETCH FORWARD 256 FROM {cursor}");
+    // Each group is one round trip. A capture reads about 14,000 rows, nearly
+    // all built-in, so 256 rows a group made the round trips most of its
+    // cost; a group is still bounded, and a catalog of user rows is no larger
+    // per row (#1538).
+    let fetch = format!("FETCH FORWARD 4096 FROM {cursor}");
     loop {
         let rows = conn.query(&fetch).await.map_err(|_| Failure::Read)?;
         if rows.is_empty() {

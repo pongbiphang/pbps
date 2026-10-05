@@ -84,7 +84,14 @@ pub(super) fn batch(major: u32, selection: Option<&Selection>) -> Result<String>
         ));
         let row = format!("pg_catalog.jsonb_build_object({})", columns.join(", "));
         let witness = row_witness(class, major)?;
-        let filter = filter(class);
+        // The rendering pass reads the selected rows alone: an unselected
+        // row renders nothing, so it is the first pass's row unchanged and
+        // the caller keeps that one (#1538).
+        let filter = match (selection, filter(class)) {
+            (None, filter) => filter.to_owned(),
+            (Some(_), "") => format!("WHERE {selected}"),
+            (Some(_), filter) => format!("{filter} AND ({selected})"),
+        };
         // A marker represents an empty but successfully read catalog. Each
         // following row is fetched through the same snapshot cursor; a large
         // unrelated catalog must not become one oversized JSON value.
