@@ -294,15 +294,17 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             ..
         } => one(format!("DROP TABLE {};", qualified(name)?)),
         // A partition is PostgreSQL's in this model, refused on this engine
-        // by validation; a plan that carries one anyway is not run (#1171).
+        // by validation; a plan that carries one anyway is not run (#1171,
+        // #1544).
         Change::DropTable {
-            name,
+            name: table,
             detach_from: Some(parent),
             ..
-        } => Err(DialectError::Invalid {
+        }
+        | Change::DetachPartition { table, parent, .. } => Err(DialectError::Invalid {
             dialect: crate::types::DIALECT,
             message: format!(
-                "{name} is a partition of {parent}, which SQL Server's model does not hold"
+                "{table} is a partition of {parent}, which SQL Server's model does not hold"
             ),
         }),
 

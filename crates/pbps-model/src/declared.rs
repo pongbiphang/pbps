@@ -158,6 +158,23 @@ fn remove_nested<V>(
     }
 }
 
+/// `from`'s records copied to `to`, each key passed through `rename`.
+fn copy_table<V: Clone>(
+    map: &mut BTreeMap<TableName, BTreeMap<String, V>>,
+    from: &TableName,
+    to: &TableName,
+    rename: impl Fn(&String) -> String,
+) {
+    let Some(records) = map.get(from) else {
+        return;
+    };
+    let copied: BTreeMap<String, V> = records
+        .iter()
+        .map(|(k, v)| (rename(k), v.clone()))
+        .collect();
+    map.insert(to.clone(), copied);
+}
+
 fn rekey_table<V>(
     map: &mut BTreeMap<TableName, BTreeMap<String, V>>,
     from: &TableName,
@@ -272,6 +289,47 @@ impl Declared {
                     self.expressions.keys.extend(fresh.expressions.keys);
                 }
                 Change::DropTable { name, .. } => self.forget_table(name),
+                // The detached table holds its parent's expressions, which
+                // the engine copied into it, under its own name, and its
+                // checks and index filters under the declared names (#1544).
+                Change::DetachPartition {
+                    table,
+                    parent,
+                    names,
+                    shape,
+                    ..
+                } => {
+                    // The declared text is the shape's, as a created table's
+                    // is its payload's. The bindings are its parent's, which
+                    // the engine copied into it, under the declared names.
+                    let fresh = Self::from_schema(&Schema {
+                        tables: [(table.clone(), (**shape).clone())].into_iter().collect(),
+                        ..Schema::default()
+                    });
+                    self.forget_table(table);
+                    self.expressions.defaults.extend(fresh.expressions.defaults);
+                    self.expressions
+                        .generated
+                        .extend(fresh.expressions.generated);
+                    self.expressions.computed.extend(fresh.expressions.computed);
+                    self.expressions.checks.extend(fresh.expressions.checks);
+                    self.expressions.filters.extend(fresh.expressions.filters);
+                    self.expressions.keys.extend(fresh.expressions.keys);
+                    let renamed = |kind: crate::DetachedKind, of: &String| {
+                        names
+                            .iter()
+                            .find(|n| n.kind == kind && &n.parent == of)
+                            .and_then(|n| n.name.clone())
+                            .unwrap_or_else(|| of.clone())
+                    };
+                    copy_table(&mut self.bindings.defaults, parent, table, String::clone);
+                    copy_table(&mut self.bindings.checks, parent, table, |of| {
+                        renamed(crate::DetachedKind::Check, of)
+                    });
+                    copy_table(&mut self.bindings.filters, parent, table, |of| {
+                        renamed(crate::DetachedKind::Index, of)
+                    });
+                }
                 Change::RenameTable { from, to, .. } => {
                     rekey_table(&mut self.expressions.defaults, from, to);
                     rekey_table(&mut self.expressions.generated, from, to);

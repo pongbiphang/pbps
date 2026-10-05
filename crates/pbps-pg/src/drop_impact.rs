@@ -200,6 +200,7 @@ pub async fn drop_blockers(
                 Some((index, format!("index `{name}` on {table}")))
             }
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::RenameColumn { .. }
@@ -348,6 +349,7 @@ fn stored(
                 table: on, name, ..
             } if on == &table && column.as_ref() == Some(name) => return None,
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -531,6 +533,7 @@ async fn removal(
                 .map_err(Into::into)
         }
         Change::CreateTable { .. }
+        | Change::DetachPartition { .. }
         | Change::RenameTable { .. }
         | Change::AddColumn { .. }
         | Change::RenameColumn { .. }

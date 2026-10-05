@@ -167,6 +167,37 @@ impl std::str::FromStr for RiskClass {
 
 /// A single atomic change.
 ///
+/// What a detached partition's clone of one of its parent's objects is
+/// called after the detach (#1544): found through the parent's object, which
+/// the plan knows by name, and renamed to the declaration's.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetachedName {
+    pub kind: DetachedKind,
+    /// The parent's object. A key is found as the table's only one, so its
+    /// parent's name is carried for the record only.
+    pub parent: String,
+    /// The name the declaration gives the detached table's. `None` only for
+    /// a key the declaration leaves unnamed, which keeps whatever name the
+    /// engine gave its clone: an unnamed key matches any name.
+    pub name: Option<String>,
+}
+
+/// The kinds of object a partition holds a clone of. A key, a unique
+/// constraint or a foreign key is found through `conparentid`, an index
+/// through `pg_inherits`; a CHECK is inherited under its parent's name.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DetachedKind {
+    PrimaryKey,
+    Unique,
+    ForeignKey,
+    Check,
+    Index,
+}
+
 /// Every variant carries the UID of the object it affects, so that applying a
 /// plan never has to match on names — names are exactly what may be changing.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -186,6 +217,19 @@ pub enum Change {
         /// other table, which an older plan's drops all are.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detach_from: Option<TableName>,
+    },
+    /// A partition leaves its parent and stays, as an ordinary table of the
+    /// declared shape, which is its parent's under names of its own (#1544,
+    /// DEC-1544.1). Its rows leave the parent with it.
+    DetachPartition {
+        uid: Uid,
+        table: TableName,
+        parent: TableName,
+        /// The name each of the parent's objects takes on the detached table.
+        names: Vec<DetachedName>,
+        /// The table the detach leaves, as declared: what the apply holds
+        /// the read-back to, as it holds a created table to its `CREATE`.
+        shape: Box<Table>,
     },
     RenameTable {
         uid: Uid,
@@ -1125,7 +1169,8 @@ impl Change {
             | Change::InsertRow { table, .. }
             | Change::UpdateRow { table, .. }
             | Change::DeleteRow { table, .. }
-            | Change::SetDataMode { table, .. } => table,
+            | Change::SetDataMode { table, .. }
+            | Change::DetachPartition { table, .. } => table,
             Change::DropColumn { column, .. }
             | Change::AlterColumnType { column, .. }
             | Change::AlterColumnNullability { column, .. }
@@ -1173,7 +1218,10 @@ impl Change {
     pub fn objects(&self) -> impl Iterator<Item = &TableName> {
         let far_end = match self {
             Change::RenameTable { to, .. } => Some(to),
+            // The parent's rows change, not its shape, and a partitioned
+            // table holds no declared rows (#1544).
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -1287,6 +1335,7 @@ impl Change {
             )),
             Change::DeleteRow { table, key, .. } => Some((table, key, RowAfter::Gone)),
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -1360,6 +1409,7 @@ impl Change {
             Change::AlterColumnNullability { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
@@ -1466,6 +1516,7 @@ impl Change {
                 vec![(column.clone(), ColumnField::Deprecated)]
             }
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
@@ -1519,6 +1570,7 @@ impl Change {
             Change::DropTable { name, .. } => Some(Dropped::Table(name.clone())),
             Change::DropModule { id, .. } => Some(Dropped::Module(id.clone())),
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -1596,6 +1648,7 @@ impl Change {
             // ever puts there, and the whole set would then read as drift.
             Change::PublicExecution { .. } => None,
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -1651,6 +1704,7 @@ impl Change {
             // no declaration, ids file or pull ever names it (ADR-0010 §5).
             Change::PublicExecution { .. } => (None, None),
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -1700,6 +1754,8 @@ impl Change {
     pub fn tables_after(&self) -> Vec<(&TableName, Presence)> {
         match self {
             Change::CreateTable { name, .. } => vec![(name, Presence::Present)],
+            // The table stays, as an ordinary one (#1544).
+            Change::DetachPartition { table, .. } => vec![(table, Presence::Present)],
             Change::DropTable { name, .. } => vec![(name, Presence::Absent)],
             Change::RenameTable { from, to, .. } => {
                 vec![(from, Presence::Absent), (to, Presence::Present)]
@@ -1802,6 +1858,7 @@ impl Change {
             | Change::DropColumn { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
@@ -1864,6 +1921,7 @@ impl Change {
                 vec![(column.clone(), Presence::Present)]
             }
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
@@ -1990,6 +2048,7 @@ impl Change {
                 it(table, Some(name), PartAfter::Gone(Part::Computed))
             }
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -2032,6 +2091,7 @@ impl Change {
                 vec![(from, Presence::Absent), (to, Presence::Present)]
             }
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -2089,6 +2149,7 @@ impl Change {
             }
             Change::DropModule { id, .. } => Some((id, ModuleAfter::Gone)),
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -2134,6 +2195,7 @@ impl Change {
             | Change::AlterModule { id, .. }
             | Change::DropModule { id, .. } => Some(id),
             Change::CreateTable { .. }
+            | Change::DetachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -2193,7 +2255,10 @@ impl Change {
             | Change::DropComputedColumn { .. }
             // Removing uniqueness needs approval even without deleting rows;
             // FK/CHECK relaxation has a separate policy (DECISIONS 486).
-            | Change::DropUnique { .. } => {
+            | Change::DropUnique { .. }
+            // No row is deleted, but every row of the partition leaves its
+            // parent: a query on the parent stops returning them (#1544).
+            | Change::DetachPartition { .. } => {
                 r.insert(RiskClass::Destructive);
             }
             // What a dropped module destroys is the validity of whatever

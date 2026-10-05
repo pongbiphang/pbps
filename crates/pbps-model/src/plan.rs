@@ -190,7 +190,10 @@ use crate::schema::Schema;
 /// Bumped to 26 for partition changes (DEC-1171.1): a dropped table's
 /// `detach_from`, without which an older build would drop a partition while
 /// still attached, which the engine refuses where a foreign key reaches it.
-pub const CURRENT_VERSION: u32 = 26;
+///
+/// Bumped to 27 for `DetachPartition` (DEC-1544.1), a change an older build
+/// cannot read.
+pub const CURRENT_VERSION: u32 = 27;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -649,7 +652,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 26);
+        assert_eq!(CURRENT_VERSION, 27);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

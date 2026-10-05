@@ -479,6 +479,11 @@ pub(super) fn derive(
             | Change::DropForeignKey { table, .. } => {
                 (Surface::Table(table.clone()), false, true, true, None)
             }
+            // The table stays, and every key, constraint and index on it is
+            // renamed (#1544).
+            Change::DetachPartition { table, .. } => {
+                (Surface::Table(table.clone()), true, true, true, None)
+            }
             Change::AddCheck { table, name, .. } => (
                 Surface::Check {
                     table: table.clone(),

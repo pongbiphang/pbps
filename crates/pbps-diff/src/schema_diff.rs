@@ -27,9 +27,10 @@ use pbps_dialect::Dialect;
 use pbps_model::change::DeleteCause;
 use pbps_model::data::cell;
 use pbps_model::{
-    Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, GrantTarget, Hints, IdsFile, Index,
-    IndexMethod, IndexPart, ModuleId, Permission, PlannedChange, PrimaryKey, PublicAccess, Renames,
-    ReplicaIdentity, RoutineOrigin, Schema, Table, TableName, Uid, UniqueConstraint, Value,
+    Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, DetachedKind, DetachedName,
+    GrantTarget, Hints, IdsFile, Index, IndexMethod, IndexPart, ModuleId, Permission,
+    PlannedChange, PrimaryKey, PublicAccess, Renames, ReplicaIdentity, RoutineOrigin, Schema,
+    Table, TableName, Uid, UniqueConstraint, Value,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -132,6 +133,21 @@ pub enum DiffError {
         what.join(", ")
     )]
     PartitionedTableChange { table: TableName, what: Vec<String> },
+
+    /// A partition declared as an ordinary table whose shape is not its
+    /// parent's, names aside (#1544): the detach gives it the parent's shape,
+    /// and anything more is a second change to make in a later revision.
+    #[error(
+        "{table} is detached from {parent}, and declared as other than its parent's shape: {}. \
+         Declare it with its parent's columns, keys, constraints and indexes (under any names), \
+         and change it in a later revision.",
+        what.join("; ")
+    )]
+    DetachedShape {
+        table: TableName,
+        parent: TableName,
+        what: Vec<String>,
+    },
 
     /// A `data:` table whose primary key moved to a different column. The row
     /// keys on each side are values of that side's key column, so the two sets
@@ -422,6 +438,40 @@ fn diff_partial_rebuilding(
         ) else {
             continue;
         };
+        // A partition declared as an ordinary table is detached, and that is
+        // all this plan does to it (#1544, DEC-1544.1): its base holds no
+        // columns of its own, so a column-by-column diff would read every one
+        // as new.
+        if let Some(of) = &base_table.partition_of
+            && declared_table.partition_of.is_none()
+            && declared_table.partition_by.is_none()
+        {
+            match base
+                .schema
+                .tables
+                .get(&of.parent)
+                .ok_or_else(|| vec![format!("its parent {} is not in the base", of.parent)])
+                // The parent as this plan leaves it: a foreign key to a
+                // table renamed in the same plan is declared under the new
+                // name, as `diff_constraints` reads it below.
+                .and_then(|parent| {
+                    detached_names(&renames.apply(parent, &of.parent), declared_table, dialect)
+                }) {
+                Ok(names) => changes.push(Change::DetachPartition {
+                    uid: uid.clone(),
+                    table: declared_name.clone(),
+                    parent: of.parent.clone(),
+                    names,
+                    shape: Box::new(declared_table.clone()),
+                }),
+                Err(what) => errs.push(DiffError::DetachedShape {
+                    table: declared_name.clone(),
+                    parent: of.parent.clone(),
+                    what,
+                }),
+            }
+            continue;
+        }
 
         diff_columns(
             base,
@@ -502,6 +552,7 @@ fn diff_partial_rebuilding(
             Change::CreateTable { name, .. } => Some(ModuleId::Named(name.clone())),
             Change::RenameTable { to, .. } => Some(ModuleId::Named(to.clone())),
             Change::DropTable { .. }
+            | Change::DetachPartition { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
             | Change::RenameColumn { .. }
@@ -547,6 +598,7 @@ fn diff_partial_rebuilding(
             | Change::DropModule { id, .. } => Some(id.clone()),
             Change::CreateTable { .. }
             | Change::DropTable { .. }
+            | Change::DetachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -698,6 +750,7 @@ fn diff_partial_rebuilding(
             Change::RenameColumn { table, .. } => Some(table.clone()),
             Change::CreateTable { .. }
             | Change::DropTable { .. }
+            | Change::DetachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -746,6 +799,7 @@ fn diff_partial_rebuilding(
             }
             Change::CreateTable { .. }
             | Change::DropTable { .. }
+            | Change::DetachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::RenameColumn { .. }
@@ -1063,6 +1117,13 @@ fn diff_partial_rebuilding(
         }
         if matches!(c, Change::AddComputedColumn { .. }) {
             return (COLUMN_ALTERATIONS, 3);
+        }
+        // A detach comes after every table drop of its class: it claims the
+        // declared names of what it keeps, and a dropped table's index or
+        // key may be what holds one now. A drop claims no name, so nothing
+        // waits the other way (#1544).
+        if matches!(c, Change::DetachPartition { .. }) {
+            return (order_key(c), 2);
         }
         // A partition is created after every parent, whose columns, keys and
         // indexes the engine gives it as it is made (#1170).
@@ -1382,6 +1443,7 @@ fn recreate_referenced_foreign_keys(
             }
             Change::CreateTable { .. }
             | Change::DropTable { .. }
+            | Change::DetachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -1669,6 +1731,7 @@ fn recreate_retyped_dependents(
         } => Some((column.clone(), dialect.nullability_dependents(*to_nullable))),
         Change::CreateTable { .. }
         | Change::DropTable { .. }
+        | Change::DetachPartition { .. }
         | Change::RenameTable { .. }
         | Change::AddColumn { .. }
         | Change::DropColumn { .. }
@@ -1989,6 +2052,137 @@ fn refuse_temporal_changes(
     );
 }
 
+/// What each of `parent`'s keys, constraints and indexes is called on the
+/// partition declared as `declared` once detached, or what keeps the
+/// declaration from being the shape a detach gives it: the parent's columns
+/// in order, and every key, constraint and index matched one to one by
+/// definition, its name aside (#1544, DEC-1544.1).
+fn detached_names(
+    parent: &Table,
+    declared: &Table,
+    dialect: &dyn Dialect,
+) -> Result<Vec<DetachedName>, Vec<String>> {
+    let mut names = Vec::new();
+    let mut what = Vec::new();
+    // Types in the engine's spelling, as `diff_columns` compares them: the
+    // parent's base reads `integer` back where its file says `int`. A
+    // description is prose `diff` does not compare, and a connected base
+    // never holds one, so it is not compared here either.
+    let columns = |t: &Table| -> Vec<(String, pbps_model::Column)> {
+        t.columns
+            .iter()
+            .map(|(name, c)| {
+                let ty = dialect
+                    .normalize_type(&c.ty)
+                    .unwrap_or_else(|_| c.ty.clone());
+                let column = pbps_model::Column {
+                    ty,
+                    description: None,
+                    ..c.clone()
+                };
+                (name.clone(), column)
+            })
+            .collect()
+    };
+    if columns(parent) != columns(declared) {
+        what.push("its columns are not its parent's, in its parent's order".to_owned());
+    }
+    match (&parent.primary_key, &declared.primary_key) {
+        (None, None) => {}
+        (Some(from), Some(to))
+            if from.columns == to.columns && from.storage_parameters == to.storage_parameters =>
+        {
+            names.push(DetachedName {
+                kind: DetachedKind::PrimaryKey,
+                parent: from.name.clone().unwrap_or_default(),
+                name: to.name.clone(),
+            });
+        }
+        (Some(_), _) | (None, Some(_)) => {
+            what.push("its primary key is not its parent's".to_owned());
+        }
+    }
+    fn matched<V: PartialEq>(
+        kind: DetachedKind,
+        words: &str,
+        parent: &BTreeMap<String, V>,
+        declared: &BTreeMap<String, V>,
+        names: &mut Vec<DetachedName>,
+        what: &mut Vec<String>,
+    ) {
+        let mut unused: Vec<(&String, &V)> = declared.iter().collect();
+        for (from, definition) in parent {
+            match unused.iter().position(|(_, d)| *d == definition) {
+                Some(at) => {
+                    let (to, _) = unused.remove(at);
+                    names.push(DetachedName {
+                        kind,
+                        parent: from.clone(),
+                        name: Some(to.clone()),
+                    });
+                }
+                None => what.push(format!("its parent's {words} `{from}` is missing")),
+            }
+        }
+        for (to, _) in unused {
+            what.push(format!("the {words} `{to}` is not its parent's"));
+        }
+    }
+    matched(
+        DetachedKind::Unique,
+        "unique constraint",
+        &parent.unique,
+        &declared.unique,
+        &mut names,
+        &mut what,
+    );
+    matched(
+        DetachedKind::ForeignKey,
+        "foreign key",
+        &parent.foreign_keys,
+        &declared.foreign_keys,
+        &mut names,
+        &mut what,
+    );
+    matched(
+        DetachedKind::Check,
+        "check",
+        &parent.checks,
+        &declared.checks,
+        &mut names,
+        &mut what,
+    );
+    matched(
+        DetachedKind::Index,
+        "index",
+        &parent.indexes,
+        &declared.indexes,
+        &mut names,
+        &mut what,
+    );
+    // Everything else is the parent's too, the partitioning aside.
+    let rest = |t: &Table| Table {
+        columns: Default::default(),
+        primary_key: None,
+        unique: Default::default(),
+        foreign_keys: Default::default(),
+        checks: Default::default(),
+        indexes: Default::default(),
+        partition_by: None,
+        partition_of: None,
+        description: None,
+        ..t.clone()
+    };
+    if rest(parent) != rest(declared) {
+        what.push("it declares a setting or `data:` its parent does not have".to_owned());
+    }
+    if what.is_empty() {
+        Ok(names)
+    } else {
+        Err(what)
+    }
+}
+
 fn refuse_partition_changes(
     base: Side<'_>,
     declared: Side<'_>,
@@ -2017,6 +2211,8 @@ fn refuse_partition_changes(
             base.schema.tables.get(base_name),
             declared.schema.tables.get(declared_name),
         ) && (b.partition_by != d.partition_by || b.partition_of != d.partition_of)
+            // A partition declared as an ordinary table is detached (#1544).
+            && !(b.partition_of.is_some() && d.partition_of.is_none() && d.partition_by.is_none())
         {
             refuse(declared_name, "change its partitioning".to_owned());
         }
@@ -2042,12 +2238,15 @@ fn refuse_partition_changes(
             continue;
         }
         // A partition is dropped, detached first, while its parent stands
-        // (#1171). Its parent's own drop is still refused below.
-        if let Change::DropTable {
-            detach_from: Some(_),
-            ..
-        } = change
-        {
+        // (#1171), or detached and kept (#1544). Its parent's own drop is
+        // still refused below.
+        if matches!(
+            change,
+            Change::DropTable {
+                detach_from: Some(_),
+                ..
+            } | Change::DetachPartition { .. }
+        ) {
             continue;
         }
         let ends_a_table = matches!(
@@ -2172,6 +2371,7 @@ fn refuse_computed_dependencies(
                     }
                     Change::CreateTable { .. }
                     | Change::DropTable { .. }
+                    | Change::DetachPartition { .. }
                     | Change::RenameTable { .. }
                     | Change::AddColumn { .. }
                     | Change::DropColumn { .. }
@@ -3161,6 +3361,7 @@ fn dependency_rank(
         Change::DropModule { id, .. } => -(drop_rank.get(id).map_or(0, |r| *r as isize)),
         Change::CreateTable { .. }
         | Change::DropTable { .. }
+        | Change::DetachPartition { .. }
         | Change::RenameTable { .. }
         | Change::AddColumn { .. }
         | Change::DropColumn { .. }
@@ -3790,7 +3991,9 @@ fn order_key(c: &Change) -> u8 {
         // is never emitted (see `diff_roles`).
         Change::Revoke { .. } => 4,
         Change::DropColumn { .. } => 5,
-        Change::DropTable { .. } => 6,
+        // A detach frees its range, as a drop does, before a partition is
+        // created over it in class 7 (#1544).
+        Change::DropTable { .. } | Change::DetachPartition { .. } => 6,
         Change::CreateTable { .. } => 7,
         Change::AddColumn { .. } => 8,
         Change::AlterColumnType { .. }
@@ -4064,6 +4267,62 @@ mod tests {
             &Hints::default(),
         )
         .unwrap()
+    }
+
+    /// `MinimalDialect`, except that `int` and `integer` are one type, as
+    /// they are to PostgreSQL.
+    struct Aliases;
+
+    impl Dialect for Aliases {
+        fn name(&self) -> &'static str {
+            "aliases"
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(ident)
+        }
+        fn emit(
+            &self,
+            change: &Change,
+            strategy: pbps_model::Strategy,
+        ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
+            MinimalDialect.emit(change, strategy)
+        }
+        fn normalize_type(
+            &self,
+            ty: &pbps_model::ColumnType,
+        ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+            let mut ty = ty.clone();
+            if ty.base == "integer" {
+                ty.base = "int".into();
+            }
+            Ok(ty)
+        }
+        fn type_change_risk(
+            &self,
+            from: &pbps_model::ColumnType,
+            to: &pbps_model::ColumnType,
+        ) -> pbps_dialect::TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(ident)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(
+            &self,
+            name: &pbps_model::TableName,
+            table: &Table,
+        ) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(name, table)
+        }
+        fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing()
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
     }
 
     /// A dialect whose collation changes take every dependent down, and whose
@@ -4948,6 +5207,354 @@ mod tests {
             kinds(&planned).contains(&"CreateTable".to_owned()),
             "{:?}",
             kinds(&planned)
+        );
+    }
+
+    /// A partition declared as an ordinary table of its parent's shape is
+    /// detached, under the names the declaration gives each of its parent's
+    /// objects, and nothing else is planned for it (#1544). Any other shape
+    /// is refused by name, and so is a detach and a rename at once. A type in
+    /// another spelling, and a foreign key to a table this plan renames
+    /// declared under the new name, are still the parent's shape.
+    #[test]
+    fn a_partition_declared_as_its_parents_shape_is_detached() {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+        let mut parent = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("ts", Column::new(ty("date")).not_null()),
+            ("n", Column::new(ty("int"))),
+        ]);
+        parent.primary_key = Some(PrimaryKey {
+            name: Some("ev_pk".into()),
+            columns: vec!["id".into(), "ts".into()],
+            storage_parameters: Default::default(),
+        });
+        parent.checks.insert(
+            "ev_n_ck".into(),
+            pbps_model::CheckConstraint {
+                expression: "n > 0".into(),
+            },
+        );
+        parent.indexes.insert(
+            "ev_n".into(),
+            Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Column("n".to_owned()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            },
+        );
+        parent.foreign_keys.insert(
+            "ev_n_fk".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["n".into()],
+                references_table: "app.r".parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: pbps_model::ReferentialAction::NoAction,
+                on_update: pbps_model::ReferentialAction::NoAction,
+            },
+        );
+        parent.partition_by = Some(PartitionBy {
+            columns: vec!["ts".into()],
+        });
+        let mut tree = schema_of("app.ev", parent.clone());
+        let mut referenced = table(&[("id", Column::new(ty("int")).not_null())]);
+        referenced.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+        });
+        tree.tables.insert("app.r".parse().unwrap(), referenced);
+        tree.tables.insert(
+            "app.ev_1".parse().unwrap(),
+            Table {
+                partition_of: Some(PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: PartitionBound::Default,
+                }),
+                ..Default::default()
+            },
+        );
+        let shape = |f: &dyn Fn(&mut Table)| {
+            let mut t = Table {
+                partition_by: None,
+                ..parent.clone()
+            };
+            t.primary_key.as_mut().unwrap().name = None;
+            let check = t.checks.remove("ev_n_ck").unwrap();
+            t.checks.insert("arch_ck".into(), check);
+            let index = t.indexes.remove("ev_n").unwrap();
+            t.indexes.insert("arch_n".into(), index);
+            f(&mut t);
+            let mut declared = tree.clone();
+            declared.tables.insert("app.ev_1".parse().unwrap(), t);
+            declared
+        };
+        let outcome_in = |declared: &Schema, intents: &[Intent], dialect: &dyn Dialect| {
+            let base_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: &tree,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                dialect,
+                &Hints::default(),
+            )
+        };
+        let outcome =
+            |declared: &Schema, intents: &[Intent]| outcome_in(declared, intents, &MinimalDialect);
+        let planned = outcome(&shape(&|_| {}), &[]).expect("a detach is planned");
+        assert_eq!(planned.changes.len(), 1, "{:?}", planned.changes);
+        let Change::DetachPartition {
+            table: detached,
+            parent: from,
+            names,
+            ..
+        } = &planned.changes[0].change
+        else {
+            panic!("{:?}", planned.changes)
+        };
+        assert_eq!(detached.to_string(), "app.ev_1");
+        assert_eq!(from.to_string(), "app.ev");
+        let pairs: Vec<(DetachedKind, &str, Option<&str>)> = names
+            .iter()
+            .map(|n| (n.kind, n.parent.as_str(), n.name.as_deref()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                (DetachedKind::PrimaryKey, "ev_pk", None),
+                (DetachedKind::ForeignKey, "ev_n_fk", Some("ev_n_fk")),
+                (DetachedKind::Check, "ev_n_ck", Some("arch_ck")),
+                (DetachedKind::Index, "ev_n", Some("arch_n")),
+            ]
+        );
+
+        // A detach claiming a name a dropped table's index holds runs after
+        // the drop, though the drop's table sorts later by name.
+        let mut handed = shape(&|t| {
+            let index = t.indexes.remove("arch_n").unwrap();
+            t.indexes.insert("old_n".into(), index);
+        });
+        handed
+            .tables
+            .remove(&"app.z_old".parse::<TableName>().unwrap());
+        let mut with_old = tree.clone();
+        let mut old = table(&[("n", Column::new(ty("int")))]);
+        old.indexes
+            .insert("old_n".into(), parent.indexes["ev_n"].clone());
+        with_old.tables.insert("app.z_old".parse().unwrap(), old);
+        let base_ids = crate::resolve(&with_old, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let handed_ids = crate::resolve(
+            &handed,
+            &base_ids,
+            &[Intent::DropTable {
+                table: "app.z_old".parse().unwrap(),
+                reason: "archived".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let planned = diff(
+            Side {
+                schema: &with_old,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &handed,
+                ids: &handed_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .expect("a detach beside a drop");
+        let kinds: Vec<&str> = planned
+            .changes
+            .iter()
+            .map(|p| match p.change {
+                Change::DetachPartition { .. } => "detach",
+                Change::DropTable { .. } => "drop",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["drop", "detach"], "{:?}", planned.changes);
+
+        // A description is prose, and differs from the parent's freely: a
+        // connected base never holds one.
+        let described = shape(&|t| {
+            t.description = Some("last year's events".into());
+            t.columns["n"].description = Some("a count".into());
+        });
+        let planned = outcome(&described, &[]).expect("a description is not shape");
+        assert!(
+            matches!(
+                planned.changes.as_slice(),
+                [p] if matches!(p.change, Change::DetachPartition { .. })
+            ),
+            "{:?}",
+            planned.changes
+        );
+
+        // A type in another spelling is the parent's type, in a dialect that
+        // spells both alike; one that does not tells them apart.
+        let respelled = shape(&|t| t.columns["id"].ty = ty("integer"));
+        let planned = outcome_in(&respelled, &[], &Aliases).expect("an alias is the same type");
+        assert!(
+            matches!(
+                planned.changes.as_slice(),
+                [p] if matches!(p.change, Change::DetachPartition { .. })
+            ),
+            "{:?}",
+            planned.changes
+        );
+        let errors = outcome(&respelled, &[]).expect_err("two types are refused");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("its columns are not its parent's")),
+            "{errors:?}"
+        );
+
+        // A foreign key to a table this plan renames is declared under the
+        // new name, and is still the parent's.
+        let mut moved = shape(&|t| {
+            t.foreign_keys.get_mut("ev_n_fk").unwrap().references_table = "app.r2".parse().unwrap();
+        });
+        let rename_r = |s: &mut Schema| {
+            let r = s
+                .tables
+                .remove(&"app.r".parse::<TableName>().unwrap())
+                .unwrap();
+            s.tables.insert("app.r2".parse().unwrap(), r);
+            s.tables
+                .get_mut(&"app.ev".parse::<TableName>().unwrap())
+                .unwrap()
+                .foreign_keys
+                .get_mut("ev_n_fk")
+                .unwrap()
+                .references_table = "app.r2".parse().unwrap();
+        };
+        rename_r(&mut moved);
+        let planned = outcome(
+            &moved,
+            &[Intent::RenameTable {
+                from: "app.r".parse().unwrap(),
+                to: "app.r2".parse().unwrap(),
+            }],
+        )
+        .expect("a detach beside a rename of what it references");
+        let mut kinds: Vec<&str> = planned
+            .changes
+            .iter()
+            .map(|p| match p.change {
+                Change::DetachPartition { .. } => "detach",
+                Change::RenameTable { .. } => "rename",
+                _ => "other",
+            })
+            .collect();
+        kinds.sort_unstable();
+        assert_eq!(kinds, ["detach", "rename"], "{:?}", planned.changes);
+        // Negative: the old name is no longer the parent's reference.
+        let mut stale = shape(&|_| {});
+        rename_r(&mut stale);
+        let errors = outcome(
+            &stale,
+            &[Intent::RenameTable {
+                from: "app.r".parse().unwrap(),
+                to: "app.r2".parse().unwrap(),
+            }],
+        )
+        .expect_err("a key still naming the old table is not the parent's");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("foreign key `ev_n_fk` is missing")),
+            "{errors:?}"
+        );
+
+        for (declared, expected) in [
+            (
+                shape(&|t| {
+                    let n = t.columns.shift_remove("n").unwrap();
+                    t.columns.shift_insert(0, "n".into(), n);
+                }),
+                "its columns are not its parent's",
+            ),
+            (
+                shape(&|t| {
+                    t.indexes.clear();
+                }),
+                "index `ev_n` is missing",
+            ),
+            (
+                shape(&|t| {
+                    t.unique.insert(
+                        "extra".into(),
+                        UniqueConstraint {
+                            columns: vec!["n".into()],
+                            storage_parameters: Default::default(),
+                        },
+                    );
+                }),
+                "unique constraint `extra` is not its parent's",
+            ),
+            (
+                shape(&|t| {
+                    t.data = Some(pbps_model::TableData {
+                        mode: DataMode::Exact,
+                        rows: Default::default(),
+                    });
+                }),
+                "`data:` its parent does not have",
+            ),
+        ] {
+            let errors = outcome(&declared, &[]).expect_err(expected);
+            let said: Vec<String> = errors.iter().map(ToString::to_string).collect();
+            assert!(
+                said.iter()
+                    .any(|e| e.contains("is detached from app.ev") && e.contains(expected)),
+                "{expected}: {said:?}"
+            );
+        }
+
+        // Negative: a detach and a rename at once is the rename's refusal.
+        let mut renamed = shape(&|_| {});
+        let moved = renamed
+            .tables
+            .remove(&"app.ev_1".parse::<TableName>().unwrap())
+            .unwrap();
+        renamed.tables.insert("app.ev_old".parse().unwrap(), moved);
+        let errors = outcome(
+            &renamed,
+            &[Intent::RenameTable {
+                from: "app.ev_1".parse().unwrap(),
+                to: "app.ev_old".parse().unwrap(),
+            }],
+        )
+        .expect_err("a rename of a partition is refused");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, DiffError::PartitionedTableChange { .. })),
+            "{errors:?}"
         );
     }
 

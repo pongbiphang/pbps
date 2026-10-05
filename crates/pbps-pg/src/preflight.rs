@@ -812,6 +812,7 @@ impl AsStored {
                 | Change::SetTablePersistence { .. }
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
+                | Change::DetachPartition { .. }
                 | Change::PublicExecution { .. } => {}
             }
         }
@@ -3388,6 +3389,7 @@ fn build(
         | Change::SetTablePersistence { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
+        | Change::DetachPartition { .. }
         | Change::PublicExecution { .. } => Ok(Vec::new()),
     }
 }
@@ -3633,6 +3635,7 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
+            | Change::DetachPartition { .. }
             | Change::PublicExecution { .. } => Vec::new(),
         };
         for (table, name, constraint) in keys {
@@ -3734,9 +3737,16 @@ fn partition_probes(
             .changes
             .iter()
             .fold(BTreeMap::new(), |mut by_parent, p| {
+                // A detached partition's rows leave the parent as a dropped
+                // one's do (#1544).
                 if let Change::DropTable {
                     name,
                     detach_from: Some(parent),
+                    ..
+                }
+                | Change::DetachPartition {
+                    table: name,
+                    parent,
                     ..
                 } = &p.change
                 {
@@ -3764,6 +3774,12 @@ fn partition_probes(
             let probe = partition_reference_probe(name, parent, names, &dropped_before);
             dropped_before.push(name);
             probe
+        } else if let Change::DetachPartition { table, parent, .. } = &p.change {
+            // Refused while rows reference it, as a drop's detach is. Its own
+            // rows are not left out of a later count: a referencing
+            // partition's key becomes its own on the detach, and still
+            // references the parent (#1544).
+            partition_reference_probe(table, parent, names, &dropped_before)
         } else {
             continue;
         };

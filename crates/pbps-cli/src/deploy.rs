@@ -3055,6 +3055,7 @@ fn refuse_unplanned_movement(
     // And their uids, which a replica identity split out of the `CREATE`
     // carries (#1467 review).
     let mut created_uids: BTreeMap<&TableName, &pbps_model::Uid> = BTreeMap::new();
+    let mut detached: BTreeSet<&TableName> = BTreeSet::new();
     // The parts this plan puts on a table by a change of its own. A created
     // table's `CREATE` payload is *not* everything it will hold: the differ
     // takes the foreign keys out of it (`std::mem::take`) and emits each as
@@ -3211,6 +3212,13 @@ fn refuse_unplanned_movement(
         if let pbps_model::Change::CreateTable { uid, name, table } = &p.change {
             created.insert(name, table.as_ref());
             created_uids.insert(name, uid);
+        }
+        // A detached table is held to the shape the plan declares for it, as
+        // a created one is, and not to its partition's: that held no columns
+        // of its own (#1544).
+        if let pbps_model::Change::DetachPartition { table, shape, .. } = &p.change {
+            created.insert(table, shape.as_ref());
+            detached.insert(table);
         }
         if let pbps_model::Change::SetReplicaIdentity { uid, table, to } = &p.change {
             identities.insert(uid, (to.as_ref(), table));
@@ -3739,6 +3747,11 @@ fn refuse_unplanned_movement(
                 ));
             }
         }
+        // Held to its declared shape above; its partition held nothing to
+        // compare it with.
+        if detached.contains(now_name) {
+            continue;
+        }
         if let (Some(was), Some(now)) = (before.tables.get(name), after.tables.get(now_name)) {
             // A rename carries the constraints that name the column or the
             // table with it — a primary key, a unique, an index's key and
@@ -4143,6 +4156,7 @@ fn refuse_unplanned_movement(
                         } if table == now_name => planned = Some((Part::Index, name.as_str())),
                         pbps_model::Change::CreateTable { .. }
                         | pbps_model::Change::DropTable { .. }
+                        | pbps_model::Change::DetachPartition { .. }
                         | pbps_model::Change::RenameTable { .. }
                         | pbps_model::Change::AddColumn { .. }
                         | pbps_model::Change::DropColumn { .. }

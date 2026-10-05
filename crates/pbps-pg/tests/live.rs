@@ -4311,6 +4311,368 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
     }
 }
 
+/// A partition declared as an ordinary table of its parent's shape is
+/// detached under the declared names (#1544): its rows stay with it and
+/// leave the parent, it reads back as declared, and nothing is left to plan.
+/// Names may be exchanged, and a key left unnamed keeps the engine's name
+/// for it. On 16 and 18.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_partition_is_detached_and_kept_under_its_declared_names() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
+    for connection in [conn_str(), old] {
+        let database = format!("pbps_test_part1544_{}", std::process::id());
+        let mut admin = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+        admin
+            .execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+            .await
+            .expect("clear a database left by an earlier run");
+        admin
+            .execute(&format!("CREATE DATABASE {database}"))
+            .await
+            .expect("create the database");
+        let own = connection.replace("dbname=pbps_test", &format!("dbname={database}"));
+        assert_ne!(
+            own, connection,
+            "the fixture names its database `pbps_test`"
+        );
+        let mut conn = Conn::connect(Driver::Postgres, &own).await.unwrap();
+        let s = emit_schema("part1544");
+        fresh(&mut conn, &s).await;
+        conn.execute(&format!(
+            "CREATE TABLE {s}.r (id integer PRIMARY KEY);
+             CREATE TABLE {s}.ev (id integer NOT NULL, ts date NOT NULL DEFAULT '2025-01-01',
+                 v text CONSTRAINT ev_v_ck CHECK (v <> ''),
+                 CONSTRAINT ev_id_ck CHECK (id > 0),
+                 rid integer CONSTRAINT ev_rid_fk REFERENCES {s}.r (id),
+                 CONSTRAINT ev_pk PRIMARY KEY (id, ts), CONSTRAINT ev_vt UNIQUE (v, ts))
+                 PARTITION BY RANGE (ts);
+             CREATE INDEX ev_rid ON {s}.ev (rid);
+             CREATE TABLE {s}.ev_2025 PARTITION OF {s}.ev
+                 FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+             CREATE TABLE {s}.ev_2026 PARTITION OF {s}.ev
+                 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+             CREATE SEQUENCE {s}.ev_2027_pkey;
+             CREATE TABLE {s}.ev_2027 PARTITION OF {s}.ev
+                 FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');
+             INSERT INTO {s}.r VALUES (1);
+             INSERT INTO {s}.ev VALUES (1, '2025-06-01', 'a', 1), (2, '2026-06-01', 'b', 1),
+                 (3, '2025-07-01', 'c', NULL);"
+        ))
+        .await
+        .expect("the tree");
+        let read = |pulled: &pbps_pg::introspect::Pulled| {
+            let mut held = Schema::default();
+            for (name, table) in &pulled.schema.tables {
+                if name.schema == s {
+                    held.tables.insert(name.clone(), table.clone());
+                }
+            }
+            held
+        };
+        let t = |name: &str| TableName::new(&s, name);
+        let base = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
+        let ids = mint_ids(&base, &IdsFile::default(), &[]);
+        let parent = base.tables[&t("ev")].clone();
+        // The parent's shape, every name the declaration's own.
+        let mut archived = pbps_model::Table {
+            partition_by: None,
+            ..parent.clone()
+        };
+        archived.primary_key.as_mut().unwrap().name = Some("arch_pk".into());
+        fn rename<V>(map: &mut std::collections::BTreeMap<String, V>, from: &str, to: &str) {
+            let v = map.remove(from).expect(from);
+            map.insert(to.to_owned(), v);
+        }
+        rename(&mut archived.unique, "ev_vt", "arch_vt");
+        rename(&mut archived.foreign_keys, "ev_rid_fk", "arch_rid_fk");
+        rename(&mut archived.checks, "ev_v_ck", "arch_v_ck");
+        rename(&mut archived.indexes, "ev_rid", "arch_rid");
+        let mut declared = base.clone();
+        declared.tables.insert(t("ev_2025"), archived.clone());
+        let declared_ids = mint_ids(&declared, &ids, &[]);
+        let pg = Postgres::new();
+        let step = plan(&base, &ids, &declared, &declared_ids);
+        let kinds: Vec<String> = step
+            .changes
+            .iter()
+            .map(|p| {
+                format!("{:?}", p.change)
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(kinds, ["DetachPartition"], "{:?}", step.changes);
+        for probe in pg.preflight(&step).probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        apply(&mut conn, &pg, &step).await;
+        let after = read(
+            &pbps_pg::catalog::introspect(&mut conn)
+                .await
+                .expect("read back"),
+        );
+        assert_eq!(after.tables.get(&t("ev_2025")), Some(&archived));
+        assert!(plan(&after, &declared_ids, &declared, &declared_ids).is_empty());
+        assert_eq!(
+            counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.ev_2025")).await,
+            2
+        );
+        assert_eq!(
+            counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.ev")).await,
+            1
+        );
+
+        // A declaration may exchange names: here the engine's names for the
+        // unique constraint's and the index's clones, and the two checks'.
+        // Renamed straight across, each would collide with the other.
+        let clones = counted(
+            &mut conn,
+            &format!(
+                "SELECT count(*)::int FROM pg_catalog.pg_class \
+                 WHERE relnamespace = '{s}'::regnamespace \
+                 AND relname IN ('ev_2026_v_ts_key', 'ev_2026_rid_idx', 'ev_2027_pkey1')"
+            ),
+        )
+        .await;
+        assert_eq!(clones, 3, "the engine's names the exchanges below rely on");
+        let mut exchanged = pbps_model::Table {
+            partition_by: None,
+            ..parent.clone()
+        };
+        exchanged.primary_key.as_mut().unwrap().name = Some("ev26_pk".into());
+        rename(&mut exchanged.unique, "ev_vt", "ev_2026_rid_idx");
+        rename(&mut exchanged.indexes, "ev_rid", "ev_2026_v_ts_key");
+        let (v, id) = (
+            exchanged.checks.remove("ev_v_ck").unwrap(),
+            exchanged.checks.remove("ev_id_ck").unwrap(),
+        );
+        exchanged.checks.insert("ev_id_ck".into(), v);
+        exchanged.checks.insert("ev_v_ck".into(), id);
+        // A key left unnamed keeps the name the engine gave it, which is not
+        // the table's default when another relation already holds that. A
+        // foreign key and a check keep their parent's names, which are the
+        // table's own to share; a unique constraint and an index need names
+        // of their own, sharing the schema's relation namespace.
+        let mut unnamed = pbps_model::Table {
+            partition_by: None,
+            ..parent.clone()
+        };
+        unnamed.primary_key.as_mut().unwrap().name = None;
+        rename(&mut unnamed.unique, "ev_vt", "ev27_vt");
+        rename(&mut unnamed.indexes, "ev_rid", "ev27_rid");
+        let mut second = declared.clone();
+        second.tables.insert(t("ev_2026"), exchanged.clone());
+        second.tables.insert(t("ev_2027"), unnamed);
+        let second_ids = mint_ids(&second, &declared_ids, &[]);
+        let step = plan(&after, &declared_ids, &second, &second_ids);
+        apply(&mut conn, &pg, &step).await;
+        let last = read(
+            &pbps_pg::catalog::introspect(&mut conn)
+                .await
+                .expect("read back"),
+        );
+        assert_eq!(last.tables.get(&t("ev_2026")), Some(&exchanged));
+        assert_eq!(
+            last.tables[&t("ev_2027")]
+                .primary_key
+                .as_ref()
+                .and_then(|k| k.name.clone()),
+            Some("ev_2027_pkey1".to_owned())
+        );
+        assert!(plan(&last, &second_ids, &second, &second_ids).is_empty());
+
+        drop(conn);
+        admin
+            .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .await
+            .expect("drop the database");
+    }
+}
+
+/// A detach locks the parent before it renames anything on the partition,
+/// the order every query on the tree takes them in (#1544). The other order
+/// deadlocks against a reader that holds the parent and has not reached the
+/// partition yet: the rename holds the partition, the detach waits for the
+/// parent, the reader waits for the partition.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_detach_takes_the_parent_before_the_partition() {
+    let s = emit_schema("detach_lock");
+    let mut a = connect().await;
+    fresh(&mut a, &s).await;
+    a.execute(&format!(
+        "CREATE TABLE {s}.ev (id integer NOT NULL, ts date NOT NULL,
+             CONSTRAINT ev_pk PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+         CREATE TABLE {s}.ev_1 PARTITION OF {s}.ev
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+         INSERT INTO {s}.ev VALUES (1, '2025-06-01');"
+    ))
+    .await
+    .expect("the tree");
+    let detach = Postgres::new()
+        .emit(
+            &pbps_model::Change::DetachPartition {
+                uid: "t_aaaaaa".parse().unwrap(),
+                table: TableName::new(&s, "ev_1"),
+                parent: TableName::new(&s, "ev"),
+                names: vec![pbps_model::DetachedName {
+                    kind: pbps_model::DetachedKind::PrimaryKey,
+                    parent: "ev_pk".into(),
+                    name: Some("arch_pk".into()),
+                }],
+                shape: Box::default(),
+            },
+            Default::default(),
+        )
+        .expect("emit");
+
+    // A reader that holds the parent and reaches the partition later.
+    let mut b = connect().await;
+    b.execute("BEGIN").await.expect("the reader's transaction");
+    b.execute(&format!("LOCK TABLE ONLY {s}.ev IN ACCESS SHARE MODE"))
+        .await
+        .expect("the reader holds the parent");
+    let deploy = tokio::spawn(async move {
+        for stmt in &detach {
+            if let Err(e) = a.execute(&stmt.sql).await {
+                return (a, Err(e.to_string()));
+            }
+        }
+        (a, Ok(()))
+    });
+    wait_until_something_queues_behind(&mut b).await;
+    let read = b
+        .query(&format!("SELECT count(*)::int FROM {s}.ev_1"))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    b.execute("COMMIT").await.expect("the reader commits");
+    let (mut a, applied) = deploy.await.expect("the deploy task");
+    assert_eq!(read, Ok(()), "the reader was aborted");
+    assert_eq!(applied, Ok(()), "the detach was aborted");
+    assert_eq!(
+        number(
+            &mut a,
+            &format!(
+                "SELECT count(*)::int FROM pg_catalog.pg_constraint \
+                 WHERE conrelid = '{s}.ev_1'::regclass AND conname = 'arch_pk' \
+                 AND NOT (SELECT relispartition FROM pg_catalog.pg_class \
+                          WHERE oid = '{s}.ev_1'::regclass)"
+            )
+        )
+        .await,
+        1
+    );
+    drop_schema(&mut a, &s).await;
+}
+
+/// A detach calls no operator a user of the table's schema could add (#1544).
+/// The batch runs on that schema's path, and an operator matching its
+/// arguments exactly is chosen over a built-in that needs a cast even with
+/// `pg_catalog` searched first: measured, `text || oid` and
+/// `oid = regclass`. Each here writes a row when called, and none is.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_detach_calls_no_operator_a_schema_user_could_add() {
+    let s = emit_schema("detach_ops");
+    let mut a = connect().await;
+    fresh(&mut a, &s).await;
+    a.execute(&format!(
+        "CREATE TABLE {s}.called (what text);
+         CREATE FUNCTION {s}.cat(text, oid) RETURNS text LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO {s}.called VALUES ('||'); RETURN $1 || $2::text; END $$;
+         CREATE OPERATOR {s}.|| (leftarg = text, rightarg = oid, function = {s}.cat);
+         CREATE FUNCTION {s}.eq(oid, regclass) RETURNS boolean LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO {s}.called VALUES ('='); RETURN $1 = $2::oid; END $$;
+         CREATE OPERATOR {s}.= (leftarg = oid, rightarg = regclass, function = {s}.eq);
+         CREATE TABLE {s}.ev (id integer NOT NULL, ts date NOT NULL, v text,
+             CONSTRAINT ev_pk PRIMARY KEY (id, ts), CONSTRAINT ev_vt UNIQUE (v, ts))
+             PARTITION BY RANGE (ts);
+         CREATE INDEX ev_v ON {s}.ev (v);
+         CREATE TABLE {s}.ev_1 PARTITION OF {s}.ev
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');"
+    ))
+    .await
+    .expect("the tree and the operators");
+    // The trap springs where nothing guards against it.
+    a.execute(&format!(
+        "DO $$ BEGIN PERFORM 'x' || '{s}.ev'::regclass::oid; END $$"
+    ))
+    .await
+    .expect("the bare concatenation");
+    a.execute(&format!("SET search_path = {s}"))
+        .await
+        .expect("the path");
+    a.execute(&format!(
+        "DO $$ BEGIN PERFORM 'x' || '{s}.ev'::regclass::oid; END $$"
+    ))
+    .await
+    .expect("the bare concatenation on the schema's path");
+    a.execute("RESET search_path").await.expect("reset");
+    assert_eq!(
+        number(&mut a, &format!("SELECT count(*)::int FROM {s}.called")).await,
+        1,
+        "the operator is chosen on its schema's path"
+    );
+    a.execute(&format!("TRUNCATE {s}.called"))
+        .await
+        .expect("clear");
+
+    let named = |kind, parent: &str, name: &str| pbps_model::DetachedName {
+        kind,
+        parent: parent.into(),
+        name: Some(name.into()),
+    };
+    use pbps_model::DetachedKind as K;
+    let detach = Postgres::new()
+        .emit(
+            &pbps_model::Change::DetachPartition {
+                uid: "t_aaaaaa".parse().unwrap(),
+                table: TableName::new(&s, "ev_1"),
+                parent: TableName::new(&s, "ev"),
+                names: vec![
+                    named(K::PrimaryKey, "ev_pk", "arch_pk"),
+                    named(K::Unique, "ev_vt", "arch_vt"),
+                    named(K::Index, "ev_v", "arch_v"),
+                ],
+                shape: Box::default(),
+            },
+            Default::default(),
+        )
+        .expect("emit");
+    for stmt in &detach {
+        a.execute(&stmt.sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
+    }
+    assert_eq!(
+        number(&mut a, &format!("SELECT count(*)::int FROM {s}.called")).await,
+        0,
+        "the detach called an operator of the schema's"
+    );
+    assert_eq!(
+        number(
+            &mut a,
+            &format!(
+                "SELECT count(*)::int FROM pg_catalog.pg_class \
+                 WHERE relnamespace = '{s}'::regnamespace \
+                 AND relname IN ('arch_pk', 'arch_vt', 'arch_v')"
+            )
+        )
+        .await,
+        3
+    );
+    drop_schema(&mut a, &s).await;
+}
+
 /// Emits and executes every change of a plan, in plan order.
 ///
 /// One statement at a time through [`Conn::execute`], which is what `apply`
