@@ -1586,6 +1586,22 @@ async fn managed_state_full(
     })
 }
 
+/// The declarations as a connected plan compares them, on a database whose
+/// default collation is `database_collation` (#1175): a declared collation
+/// equal to it is a column with none, which is how the engine reads it back.
+///
+/// One function because three diffs depend on it agreeing: `plan --db`, the
+/// `--dev` rehearsal, and `doctor`'s question of which keys survive the
+/// deletes. A normalization one of them skipped would rebuild a column the
+/// others leave alone, and in `doctor` that phantom rebuild withholds a demand
+/// the apply needs (#1511, DEC-1511.1).
+pub fn declarations_as_compared(declared: &Schema, database_collation: Option<&str>) -> Schema {
+    match database_collation {
+        Some(default) => declared.without_collation(default),
+        None => declared.clone(),
+    }
+}
+
 /// Refuses a plan whose target's default collation has changed since it was
 /// computed (#1175). What a column declared with no collation means is that
 /// default, and the checksum cannot see it move when no managed character
@@ -5792,10 +5808,8 @@ pub fn cmd_plan_db(
         // written, an unchanged column was altered to the collation it
         // already has on every plan, and a created one read back without
         // it failed the apply's own postcondition.
-        let declared = match &managed.database_collation {
-            Some(default) => loaded.schema.without_collation(default),
-            None => loaded.schema.clone(),
-        };
+        let declared =
+            declarations_as_compared(&loaded.schema, managed.database_collation.as_deref());
         crate::engine::refuse_unknown_collations(&mut conn, &declared).await?;
         // And now that the default is known, an absent collation facing a
         // named one on a foreign key is decidable (#1247 review).

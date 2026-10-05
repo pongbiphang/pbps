@@ -7068,6 +7068,167 @@ fn doctor_unions_only_the_columns_external_foreign_keys_reference() {
     );
 }
 
+/// #1511, DEC-1511.1. A moved delete-count child costs `SELECT` on its
+/// destination schema only while its key into the parent survives the plan.
+/// `doctor` asks the differ which keys do, with the declarations normalized
+/// against the database's default collation as `plan --db` normalizes them.
+/// On a database whose default is not the server's, a column declaring that
+/// default rebuilds nothing, so its key stays and the demand stays; a column
+/// the declarations genuinely retype rebuilds the key around the deletes, and
+/// the demand goes.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn doctor_demands_a_moved_childs_destination_only_while_its_key_survives() {
+    struct Login(String, String);
+    impl Drop for Login {
+        fn drop(&mut self) {
+            after_test_on_server(&self.0, &format!("DROP LOGIN [{}]", self.1));
+        }
+    }
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let collation = "Latin1_General_CS_AS";
+    let login = Login(
+        server.clone(),
+        format!("pbps_keys1511_{}", std::process::id()),
+    );
+    let password = "pbpsSurviving1511!1";
+    let db = OwnDatabase::collated(&server, "doctorkeys1511", collation);
+    let d = Demo::new("doctor-keys1511");
+    let write = |file: &str, body: String| {
+        std::fs::write(d.dir.join("schema").join(file), body).unwrap();
+    };
+    let declare = |parent_type: &str, rows: &str, child_schema: &str, child_column: &str| {
+        write(
+            "app.p.yml",
+            format!(
+                "table: app.p\ncolumns:\n  id: {{type: {parent_type}, nullable: false}}\n\
+                 primary_key: {{name: pk_p, columns: [id]}}\n\
+                 data:\n  mode: exact\n  rows:\n{rows}"
+            ),
+        );
+        let moved = if child_schema == "src" {
+            String::new()
+        } else {
+            "renamed_from: src.c\n".to_owned()
+        };
+        write(
+            "c.yml",
+            format!(
+                "table: {child_schema}.c\n{moved}columns:\n  id: {{type: int, nullable: false}}\n  \
+                 p: {child_column}\nprimary_key: {{name: pk_c, columns: [id]}}\n\
+                 foreign_keys:\n  fk_c_p:\n    columns: [p]\n    references: app.p(id)\n"
+            ),
+        );
+    };
+    std::fs::remove_file(d.dir.join("schema/dbo.t.yml")).ok();
+    declare(
+        "varchar(10)",
+        "    a: {}\n    b: {}\n",
+        "src",
+        "{type: varchar(10)}",
+    );
+    on_server(
+        db.connection(),
+        "EXEC(N'CREATE SCHEMA app;'); EXEC(N'CREATE SCHEMA src;'); EXEC(N'CREATE SCHEMA dst;');",
+    );
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["bootstrap", "--db", db.connection()]));
+
+    // Everything the account could need here is granted except reading the
+    // destination, so that demand is the only gap that can come and go.
+    on_server(
+        &server,
+        &format!(
+            "CREATE LOGIN [{}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;",
+            login.1
+        ),
+    );
+    on_server(
+        db.connection(),
+        &format!(
+            "CREATE USER [{0}] FOR LOGIN [{0}]; \
+             GRANT VIEW DEFINITION TO [{0}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{0}]; \
+             GRANT CONTROL ON SCHEMA::app TO [{0}]; \
+             GRANT CONTROL ON SCHEMA::src TO [{0}]; \
+             GRANT CONTROL ON SCHEMA::dbo TO [{0}]; \
+             GRANT ALTER, REFERENCES ON SCHEMA::dst TO [{0}]; \
+             GRANT CREATE TABLE, CREATE SCHEMA TO [{0}];",
+            login.1
+        ),
+    );
+    let connection = with_key(
+        &with_key(db.connection(), "User Id", &login.1),
+        "Password",
+        password,
+    );
+    let destination_gap = || {
+        ok(&d.run(&["plan"]));
+        let o = d.run(&["doctor", "--db", &connection, "--format", "json"]);
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("invalid doctor JSON: {e}: {} {}", stdout(&o), stderr(&o)));
+        let gaps = v["data"]["environments"][0]["missing_permissions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no permission list: {v}"))
+            .clone();
+        let demanded = gaps
+            .iter()
+            .any(|g| g.as_str().unwrap().starts_with("SELECT on SCHEMA::[dst]"));
+        (demanded, v)
+    };
+    // What the real plan does with the key, read from its script: whether the
+    // key is dropped before the delete of `b`. `doctor` must agree with it.
+    let sql = d.dir.join("plan1511.sql");
+    let key_dropped_before_delete = || {
+        ok(&d.run(&["plan"]));
+        d.commit();
+        ok(&d.run(&[
+            "plan",
+            "--db",
+            db.connection(),
+            "--sql",
+            sql.to_str().unwrap(),
+        ]));
+        let script = std::fs::read_to_string(&sql).unwrap();
+        let delete = script
+            .find("DELETE")
+            .unwrap_or_else(|| panic!("no delete in:\n{script}"));
+        script
+            .find("DROP CONSTRAINT [fk_c_p]")
+            .is_some_and(|drop| drop < delete)
+    };
+
+    // The child moves to `dst` while row `b` is deleted, its column declaring
+    // the database's own default collation. `plan --db` takes that collation
+    // out and rebuilds nothing, so the key is there when the delete counts
+    // `dst.c`, and so is the demand.
+    declare(
+        "varchar(10)",
+        "    a: {}\n",
+        "dst",
+        &format!("{{type: varchar(10), collation: {collation}}}"),
+    );
+    assert!(!key_dropped_before_delete());
+    let (demanded, v) = destination_gap();
+    assert!(
+        demanded,
+        "a surviving key keeps the destination demand: {v}"
+    );
+
+    // The same move with both key columns genuinely widened: the key is
+    // dropped before the delete and added after it, nothing counts `dst.c`
+    // through it, and nothing is demanded on `dst`.
+    declare("varchar(20)", "    a: {}\n", "dst", "{type: varchar(20)}");
+    assert!(key_dropped_before_delete());
+    let (demanded, v) = destination_gap();
+    assert!(
+        !demanded,
+        "a rebuilt key carries no destination demand: {v}"
+    );
+}
+
 // ---- Phase 3.1: the interactive prompt (SPEC 6.3) ----
 
 /// The conversation itself is unit-tested in `prompt`; what only the real binary
