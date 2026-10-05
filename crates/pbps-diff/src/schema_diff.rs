@@ -1118,6 +1118,13 @@ fn diff_partial_rebuilding(
         if matches!(c, Change::AddComputedColumn { .. }) {
             return (COLUMN_ALTERATIONS, 3);
         }
+        // A detach comes after every table drop of its class: it claims the
+        // declared names of what it keeps, and a dropped table's index or
+        // key may be what holds one now. A drop claims no name, so nothing
+        // waits the other way (#1544).
+        if matches!(c, Change::DetachPartition { .. }) {
+            return (order_key(c), 2);
+        }
         // A partition is created after every parent, whose columns, keys and
         // indexes the engine gives it as it is made (#1170).
         if let Change::CreateTable { table, .. } = c
@@ -5337,6 +5344,58 @@ mod tests {
                 (DetachedKind::Index, "ev_n", Some("arch_n")),
             ]
         );
+
+        // A detach claiming a name a dropped table's index holds runs after
+        // the drop, though the drop's table sorts later by name.
+        let mut handed = shape(&|t| {
+            let index = t.indexes.remove("arch_n").unwrap();
+            t.indexes.insert("old_n".into(), index);
+        });
+        handed
+            .tables
+            .remove(&"app.z_old".parse::<TableName>().unwrap());
+        let mut with_old = tree.clone();
+        let mut old = table(&[("n", Column::new(ty("int")))]);
+        old.indexes
+            .insert("old_n".into(), parent.indexes["ev_n"].clone());
+        with_old.tables.insert("app.z_old".parse().unwrap(), old);
+        let base_ids = crate::resolve(&with_old, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let handed_ids = crate::resolve(
+            &handed,
+            &base_ids,
+            &[Intent::DropTable {
+                table: "app.z_old".parse().unwrap(),
+                reason: "archived".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let planned = diff(
+            Side {
+                schema: &with_old,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &handed,
+                ids: &handed_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .expect("a detach beside a drop");
+        let kinds: Vec<&str> = planned
+            .changes
+            .iter()
+            .map(|p| match p.change {
+                Change::DetachPartition { .. } => "detach",
+                Change::DropTable { .. } => "drop",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["drop", "detach"], "{:?}", planned.changes);
 
         // A description is prose, and differs from the parent's freely: a
         // connected base never holds one.

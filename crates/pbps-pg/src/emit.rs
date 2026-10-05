@@ -1053,12 +1053,19 @@ fn detach_partition(
     }
     // The temporary names carry the table's oid, which no declared name
     // spells, so they cannot meet a name already in the schema.
+    //
+    // The parent is locked first, as the detach would lock it, because a
+    // rename locks the partition: in the other order a reader holding the
+    // parent and reaching for the partition deadlocks with the batch, and
+    // the engine aborts one of the two (measured on 18). `ONLY`, so the
+    // other partitions are left to the detach, which does not lock them.
     let body = format!(
         "DECLARE\n\
          \x20   c name;\n\
          \x20   moved boolean[] := '{{}}';\n\
          \x20   pre text := 'pbps_detach_' || {t}::pg_catalog.regclass::pg_catalog.oid || '_';\n\
          BEGIN\n\
+         \x20   LOCK TABLE ONLY {p} IN ACCESS EXCLUSIVE MODE;\n\
          {vacate}\n\
          \x20   {detach}\n\
          {checks}\n\
@@ -3950,6 +3957,7 @@ mod tests {
         let index = "'ALTER INDEX \"app\".%I RENAME TO %I'";
         let order = [
             at("DO $"),
+            at("LOCK TABLE ONLY \"app\".\"ev\" IN ACCESS EXCLUSIVE MODE;"),
             at(&format!("pg_catalog.format({index}, c, pre || '2')")),
             at("ALTER TABLE \"app\".\"ev\" DETACH PARTITION \"app\".\"p%1\";"),
             at(&format!(

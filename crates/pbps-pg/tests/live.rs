@@ -4497,6 +4497,83 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
     }
 }
 
+/// A detach locks the parent before it renames anything on the partition,
+/// the order every query on the tree takes them in (#1544). The other order
+/// deadlocks against a reader that holds the parent and has not reached the
+/// partition yet: the rename holds the partition, the detach waits for the
+/// parent, the reader waits for the partition.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_detach_takes_the_parent_before_the_partition() {
+    let s = emit_schema("detach_lock");
+    let mut a = connect().await;
+    fresh(&mut a, &s).await;
+    a.execute(&format!(
+        "CREATE TABLE {s}.ev (id integer NOT NULL, ts date NOT NULL,
+             CONSTRAINT ev_pk PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+         CREATE TABLE {s}.ev_1 PARTITION OF {s}.ev
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+         INSERT INTO {s}.ev VALUES (1, '2025-06-01');"
+    ))
+    .await
+    .expect("the tree");
+    let detach = Postgres::new()
+        .emit(
+            &pbps_model::Change::DetachPartition {
+                uid: "t_aaaaaa".parse().unwrap(),
+                table: TableName::new(&s, "ev_1"),
+                parent: TableName::new(&s, "ev"),
+                names: vec![pbps_model::DetachedName {
+                    kind: pbps_model::DetachedKind::PrimaryKey,
+                    parent: "ev_pk".into(),
+                    name: Some("arch_pk".into()),
+                }],
+                shape: Box::default(),
+            },
+            Default::default(),
+        )
+        .expect("emit");
+
+    // A reader that holds the parent and reaches the partition later.
+    let mut b = connect().await;
+    b.execute("BEGIN").await.expect("the reader's transaction");
+    b.execute(&format!("LOCK TABLE ONLY {s}.ev IN ACCESS SHARE MODE"))
+        .await
+        .expect("the reader holds the parent");
+    let deploy = tokio::spawn(async move {
+        for stmt in &detach {
+            if let Err(e) = a.execute(&stmt.sql).await {
+                return (a, Err(e.to_string()));
+            }
+        }
+        (a, Ok(()))
+    });
+    wait_until_something_queues_behind(&mut b).await;
+    let read = b
+        .query(&format!("SELECT count(*)::int FROM {s}.ev_1"))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    b.execute("COMMIT").await.expect("the reader commits");
+    let (mut a, applied) = deploy.await.expect("the deploy task");
+    assert_eq!(read, Ok(()), "the reader was aborted");
+    assert_eq!(applied, Ok(()), "the detach was aborted");
+    assert_eq!(
+        number(
+            &mut a,
+            &format!(
+                "SELECT count(*)::int FROM pg_catalog.pg_constraint \
+                 WHERE conrelid = '{s}.ev_1'::regclass AND conname = 'arch_pk' \
+                 AND NOT (SELECT relispartition FROM pg_catalog.pg_class \
+                          WHERE oid = '{s}.ev_1'::regclass)"
+            )
+        )
+        .await,
+        1
+    );
+    drop_schema(&mut a, &s).await;
+}
+
 /// Emits and executes every change of a plan, in plan order.
 ///
 /// One statement at a time through [`Conn::execute`], which is what `apply`

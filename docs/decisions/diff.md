@@ -2486,12 +2486,20 @@ change to make in a later revision. A rename at the same time stays #1170's refu
   its bindings from the parent, re-keyed to the declared names.
 
 It sorts in class 6, so it frees its range before a partition is created over
-it. It is `destructive`: no row is deleted, but every row of the partition
+it, and after every table drop of that class, since a dropped table's index or
+key may hold a name the detach claims; a drop claims none. A name an engine
+gave another partition's clone, which only the catalog holds, is not ordered
+for (#1558). It is `destructive`: no row is deleted, but every row of the partition
 leaves its parent, and a query on the parent stops returning them. Plan
 version 27 carries it, and SQL Server refuses it.
 
 **The statement** is one `DO` block:
 
+0. It locks the parent (`LOCK TABLE ONLY`, `ACCESS EXCLUSIVE`) before anything
+   else. A rename locks the partition, and a reader holding the parent while
+   reaching for the partition would otherwise deadlock with the batch; measured
+   on 18, the engine aborts one of the two. Pinned by the live
+   `a_detach_takes_the_parent_before_the_partition`.
 1. It finds each clone through its parent object, as `drop_primary_key` finds
    an engine-chosen name: `conparentid` for a key, a unique constraint or a
    foreign key, and `pg_inherits` for an index. Each one whose name changes is
