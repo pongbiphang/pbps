@@ -2307,12 +2307,16 @@ pub async fn account_for_module_dependents(
         *changes = rediff(&untouched)?;
         found = module_dependents(conn, changes).await?;
     }
+    // Out of the way of the reordering passes, and back beside each routine's
+    // final `CREATE` once they are done (#687).
+    let decisions = crate::dependents::take_public_execution(changes);
     let added = crate::dependents::weave(changes, &found, declared, ids, dialect)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     let split = crate::dependents::split_new_tables(changes, ids, dialect);
     let released = crate::dependents::released(changes, &found);
     let moved = crate::dependents::after_the_rebuilds(changes, &released, deps)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
+    crate::dependents::settle_public_execution(changes, decisions);
     let left = crate::dependents::unaccounted(changes, &found);
     if !left.is_empty() {
         anyhow::bail!(

@@ -3146,8 +3146,12 @@ fn dependency_rank(
         Change::CreateRole { .. }
         | Change::RenameRole { .. }
         | Change::Grant { .. }
-        | Change::Revoke { .. }
-        | Change::PublicExecution { .. } => 0,
+        | Change::Revoke { .. } => 0,
+        // The rank of the routine it settles, so it sorts beside that
+        // routine's `CREATE` in class 14 (see `order_key`, #687).
+        Change::PublicExecution { routine, .. } => create_rank
+            .get(&ModuleId::Routine(routine.clone()))
+            .map_or(0, |r| *r as isize),
     }
 }
 
@@ -3706,16 +3710,21 @@ fn order_key(c: &Change) -> u8 {
         // moves the rest to the front.
         Change::SetReplicaIdentity { .. } => 13,
         Change::CreateModule { .. } | Change::AlterModule { .. } => 14,
+        // The `PUBLIC` decision for a routine travels with the routine: class
+        // 14 at that routine's own create rank (`dependency_rank`), and its
+        // subject is the routine's, so the sort puts it immediately after its
+        // `CREATE` or `ALTER` with nothing between them. In a transactional
+        // apply nothing outside sees the gap either way; in the autocommit
+        // script `--sql` renders (DECISIONS 259) a routine created at 14 and
+        // revoked at 16 held the engine's default `EXECUTE` for `PUBLIC` for
+        // the rest of the modules and every role create (#687). A class of its
+        // own after the modules would still leave a later routine's `CREATE`
+        // in between, and would renumber every ordinal below (DEC-687.1).
+        Change::PublicExecution { .. } => 14,
         // A grant names an object, so it comes after every object exists —
         // and after the role does.
         Change::CreateRole { .. } => 15,
-        // Sharing the grant's class rather than taking one of its own, which
-        // would renumber every ordinal below it and the prose that quotes
-        // them: both are permission statements on objects that now exist, and
-        // the two never touch the same grantee — `PUBLIC` is not a role a
-        // declaration can name (ADR-0010 §5), so no order between them
-        // decides anything.
-        Change::Grant { .. } | Change::PublicExecution { .. } => 16,
+        Change::Grant { .. } => 16,
         // Emits nothing; it exists so the recorded state matches the file. Last
         // keeps it out of the way of everything that does emit.
         Change::SetDataMode { .. } => 17,
@@ -12817,6 +12826,48 @@ mod tests {
             // nothing, so the gate is not asked: `--allow revoke` in front of
             // every plan that declares a function is friction without safety.
             assert!(cs.risks().is_empty(), "{:?}", cs.risks());
+        }
+
+        /// #687: each routine's `PUBLIC` decision is the statement right after
+        /// its own `CREATE`, not one after every module. In the autocommit
+        /// script `--sql` renders, anything between them is a window in which
+        /// the whole cluster can execute the new routine. Three routines, so a
+        /// placement after all modules, or one ordered by name alone, puts
+        /// another routine's `CREATE` in between.
+        #[test]
+        fn each_routine_is_closed_to_public_in_the_statement_after_its_create() {
+            let body = "RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql";
+            // `b` calls `a`, so `b` has a later create rank than its peers: its
+            // decision must follow its own rank, not sort at rank 0 ahead of
+            // the `CREATE` it settles.
+            let calls_a = "RETURNS integer AS $$ SELECT app.a(1) $$ LANGUAGE sql";
+            let declared = schema_with(&[
+                ("app.a(integer)", pbps_model::ModuleKind::Function, body),
+                ("app.b(integer)", pbps_model::ModuleKind::Function, calls_a),
+                ("app.c(integer)", pbps_model::ModuleKind::Function, body),
+            ]);
+            let cs = run(
+                &PublicExecutes,
+                &Schema::default(),
+                &declared,
+                &Hints::default(),
+            );
+            let mut closed = 0;
+            for (at, planned) in cs.changes.iter().enumerate() {
+                if let Change::PublicExecution { routine, .. } = &planned.change {
+                    closed += 1;
+                    let before = at.checked_sub(1).map(|i| &cs.changes[i].change);
+                    assert!(
+                        matches!(
+                            before,
+                            Some(Change::CreateModule { id: ModuleId::Routine(r), .. }) if r == routine
+                        ),
+                        "{routine} is not settled right after its own CREATE: {:?}",
+                        kinds(&cs)
+                    );
+                }
+            }
+            assert_eq!(closed, 3, "{:?}", kinds(&cs));
         }
 
         /// The opt-out the user writes. One line in the declaration, so the

@@ -2228,3 +2228,42 @@ pair only while the history still mirrors the table, so a column the engine
 did not add to the history leaves the pair a limitation that refuses the
 recording. The estimate stays unmeasured for a temporal table, as it is.
 
+<a id="dec-687-1"></a>
+
+**DEC-687.1. A routine's `PUBLIC` decision sorts in the module class at that
+routine's own rank, so it is the statement after its `CREATE`.**
+`Change::PublicExecution` used to share class 16 with the grants, two classes
+after the `CreateModule` (14) it belongs to. Inside a transactional apply,
+nobody outside sees that gap. In the script `bootstrap --sql` and `plan --sql`
+render, each statement is its own autocommit (DECISIONS 259), so a routine
+created at 14 held the engine's default `EXECUTE` for `PUBLIC` until the
+revoke at 16 ran, after every remaining module create and every role create.
+For a `SECURITY DEFINER` routine, that is the exposure #318 closed, reopened
+for the length of the script (#687).
+
+The issue proposed a class of its own after the modules. That would still
+leave a later routine's `CREATE` between a routine and its revoke, and it
+would renumber every ordinal below it together with the prose that quotes
+them. Instead, `order_key` puts `PublicExecution` in class 14, and
+`dependency_rank` gives it the create rank of the routine it settles. Its
+subject is already the routine's name, so the sort's subject tiebreak places
+it next to that routine's `CREATE` or `ALTER`, and the change's rendering puts
+it after. No other class moves. Wrapping the script in a transaction stays
+refused for DECISIONS 259's reasons, as does refusing `--sql` for routines.
+The connected planner's PostgreSQL passes reorder modules after the sort.
+`weave` puts dependents around a drop, and `after_the_rebuilds` and
+`after_their_functions` place additions after the functions they call. Those
+passes chain the changes they do not move in plan order. A decision sitting
+between two creates was such a change, and it tied one routine's create to
+another routine's revoke, a cycle the passes then refused as a plan no order
+performs. `account_for_module_dependents` therefore sets every decision aside
+(`take_public_execution`) before the passes and puts each back after its
+routine's last `CREATE` or `ALTER` (`settle_public_execution`) once the order
+is final. A decision depends on nothing but its routine.
+
+The unit test `each_routine_is_closed_to_public_in_the_statement_after_its_create`
+creates three routines, one of which calls another, and requires each decision
+to follow its own `CREATE` directly. Putting the decision back at class 16
+fails it, and so does ranking it at 0. The pass-level behaviour is pinned by
+`public_decisions_return_beside_their_routines_final_create`, and the live
+`flow_pg` fixtures with functions created around new columns fail without it.

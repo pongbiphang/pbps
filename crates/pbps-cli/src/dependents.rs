@@ -938,6 +938,55 @@ pub(crate) fn split_new_tables(
     added
 }
 
+/// Takes the plan's `PUBLIC` decisions out, so that the passes below reorder
+/// modules and what may need them without them (#687).
+///
+/// Each decision sorts directly after its routine's `CREATE` (DEC-687.1), in
+/// the very stretch [`after_their_functions`] and [`weave`] reorder. There it
+/// is one more change those passes must not overtake, and it chained a
+/// routine's create to another routine's revoke: a cycle where none exists.
+/// A decision depends only on its routine existing, so it is set aside and
+/// put back by [`settle_public_execution`] once the order is final.
+pub(crate) fn take_public_execution(cs: &mut ChangeSet) -> Vec<PlannedChange> {
+    let (decisions, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut cs.changes)
+        .into_iter()
+        .partition(|p| matches!(p.change, Change::PublicExecution { .. }));
+    cs.changes = rest;
+    decisions
+}
+
+/// Puts each `PUBLIC` decision back directly after the last `CREATE` or
+/// `ALTER` of its routine, which is where DEC-687.1 orders it. A decision
+/// on a routine this plan does not create or rebuild goes ahead of the roles
+/// and grants, where its class leaves it.
+pub(crate) fn settle_public_execution(cs: &mut ChangeSet, decisions: Vec<PlannedChange>) {
+    for decision in decisions {
+        let Change::PublicExecution { routine, .. } = &decision.change else {
+            cs.changes.push(decision);
+            continue;
+        };
+        let id = ModuleId::Routine(routine.clone());
+        let at = cs
+            .changes
+            .iter()
+            .rposition(|p| {
+                matches!(&p.change,
+                    Change::CreateModule { id: x, .. } | Change::AlterModule { id: x, .. } if *x == id)
+            })
+            .map(|i| i + 1)
+            .or_else(|| {
+                cs.changes.iter().position(|p| {
+                    matches!(
+                        p.change,
+                        Change::CreateRole { .. } | Change::Grant { .. } | Change::SetDataMode { .. }
+                    )
+                })
+            })
+            .unwrap_or(cs.changes.len());
+        cs.changes.insert(at, decision);
+    }
+}
+
 /// Moves what this plan adds that may call a function it creates or rebuilds
 /// to after that function's create (#942, DEC-942.1, DEC-1364.1). Returns how
 /// many changes moved, or why no order performs the plan.
@@ -1581,6 +1630,81 @@ mod tests {
                 other => format!("{other:?}"),
             })
             .collect()
+    }
+
+    /// #687: the `PUBLIC` decisions are set aside while the passes reorder
+    /// and come back directly after their routine's last `CREATE` or
+    /// `ALTER`. A decision on a routine the plan does not touch goes ahead of
+    /// the roles and grants instead.
+    #[test]
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn public_decisions_return_beside_their_routines_final_create() {
+        let decision = |routine: &str| Change::PublicExecution {
+            routine: routine.parse().unwrap(),
+            access: pbps_model::PublicAccess::Revoked,
+            origin: pbps_model::RoutineOrigin::Created,
+        };
+        let f = module(
+            ModuleKind::Function,
+            "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT x $$",
+        );
+        let create = |name: &str| Change::CreateModule {
+            id: id(name),
+            module: Box::new(f.clone()),
+        };
+        let role = Change::CreateRole {
+            uid: Uid::generate(UidKind::Role),
+            name: "reader".into(),
+        };
+        let mut cs = plan(vec![
+            create("app.f(integer)"),
+            decision("app.f(integer)"),
+            create("app.g(integer)"),
+            decision("app.g(integer)"),
+            decision("app.h(integer)"),
+            role.clone(),
+        ]);
+        let decisions = take_public_execution(&mut cs);
+        assert_eq!(decisions.len(), 3);
+        assert!(
+            cs.changes
+                .iter()
+                .all(|p| !matches!(p.change, Change::PublicExecution { .. }))
+        );
+        // A pass moved `g` ahead of `f` and rebuilt `f` once more after it.
+        cs.changes.swap(0, 1);
+        cs.changes.insert(
+            2,
+            PlannedChange::new(Change::AlterModule {
+                id: id("app.f(integer)"),
+                module: Box::new(f.clone()),
+            }),
+        );
+        settle_public_execution(&mut cs, decisions);
+        let order: Vec<String> = cs
+            .changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::PublicExecution { routine, .. } => format!("public {routine}"),
+                Change::CreateRole { name, .. } => format!("role {name}"),
+                other => rendered(&ChangeSet {
+                    changes: vec![PlannedChange::new(other.clone())],
+                })
+                .remove(0),
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "create app.g(integer)",
+                "public app.g(integer)",
+                "create app.f(integer)",
+                "alter app.f(integer)",
+                "public app.f(integer)",
+                "public app.h(integer)",
+                "role reader",
+            ]
+        );
     }
 
     fn alter(s: &Schema, name: &str) -> Change {
