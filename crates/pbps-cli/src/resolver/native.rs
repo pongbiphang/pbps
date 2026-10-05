@@ -631,12 +631,16 @@ impl SocketOwnerLease {
     fn check_socket_held(&self) -> Result<(), UnqualifiedProcess> {
         self.service.check()?;
         self.owner.check()?;
-        if peer_inode(self.local, self.peer)? == self.socket_inode
-            && owns_socket(&self.owner, self.socket_inode, &self.held)?
-        {
-            return self.owner.check();
+        if peer_inode(self.local, self.peer)? != self.socket_inode {
+            return self.check_socket();
         }
-        self.check_socket()
+        held_or_observed(
+            &self.owner,
+            self.socket_inode,
+            &self.held,
+            |path| std::fs::read_link(path),
+            || self.check_socket(),
+        )
     }
 
     fn check_socket(&self) -> Result<(), UnqualifiedProcess> {
@@ -651,6 +655,24 @@ impl SocketOwnerLease {
         }
         Ok(())
     }
+}
+
+/// The witness half of [`SocketOwnerLease::check_held`]. Only a yes from the
+/// owner's table answers. A table that cannot be read, or that outruns the
+/// daemon's scan budget, is no answer either way, so it is the full
+/// observation's to judge, which has no such budget. Refusing here would
+/// refuse a target binding the full observation accepts.
+fn held_or_observed(
+    owner: &ProcessLease,
+    inode: u64,
+    held: &AtomicI32,
+    read_link: impl FnMut(&Path) -> std::io::Result<PathBuf>,
+    observe: impl FnOnce() -> Result<(), UnqualifiedProcess>,
+) -> Result<(), UnqualifiedProcess> {
+    if matches!(owns_with(owner, inode, held, read_link), Ok(true)) {
+        return owner.check();
+    }
+    observe()
 }
 
 fn owns_socket(
@@ -2352,6 +2374,40 @@ mod tests {
         lease.check().expect("the owner itself lives on");
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    /// A target check's witness answers only yes (DEC-1550.1). An owner's
+    /// table it cannot read, or one past the daemon's scan budget, is handed
+    /// to the full observation instead of refusing the binding, and the full
+    /// observation's own answer stands either way.
+    #[test]
+    fn a_witness_that_cannot_read_the_owner_defers_to_the_full_observation() {
+        let mut command = Command::new("/bin/bash");
+        command
+            .args(["-c", "read -r _; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawned_and_execed(&mut command, "bash");
+        let lease = ProcessLease::capture(child.id()).unwrap();
+        let unreadable = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let held = AtomicI32::new(-1);
+        let mut observed = 0;
+        let accepted = held_or_observed(&lease, 1, &held, unreadable, || {
+            observed += 1;
+            Ok(())
+        });
+        let refused = held_or_observed(&lease, 1, &held, unreadable, || {
+            Err(Reading::SocketOwner.refuse())
+        });
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            accepted.is_ok(),
+            "an unreadable witness is no answer, not a refusal: {accepted:?}"
+        );
+        assert_eq!(observed, 1, "the full observation judged it");
+        assert!(refused.is_err(), "the full observation's refusal stands");
     }
 }
 
