@@ -859,3 +859,43 @@ column; only the last one leaves the surviving set.
 `a_key_re_added_around_a_rebuilt_column_still_survives` covers a key the diff
 re-adds only because a declared collation rebuilds its column, and that key
 stays.
+
+*Amended by [DEC-1511.1](#dec-1511-1): the declarations are normalized against
+the database's default collation before the diff, and every addition counts.
+The second condition is gone, and so is the over-demand it kept. The
+collation test above is now
+`a_key_re_added_only_for_the_default_collation_keeps_its_demand`.*
+
+<a id="dec-1511-1"></a>
+
+**DEC-1511.1. `doctor` diffs the declarations as `plan --db` compares them, and
+every foreign-key addition in that diff leaves the surviving set.** DEC-678.1
+dropped a key from the surviving set only when its own definition changed,
+because its diff skipped the connected planner's normalization: a declared
+default collation rebuilt the column and re-added an unchanged key that the real
+plan leaves alone. That guard also kept the keys the real plan *does* rebuild
+around a genuine change, such as a retyped or recollated referencing column or a
+rebuilt referenced key. The key is dropped before the deletes and added after
+them, yet `doctor` still demanded `SELECT` on the moved child's destination
+(#1511).
+
+The guard was standing in for a missing step, so the step is restored instead.
+`doctor` reads the target's default collation as `plan --db` does. Both now
+call one function, `deploy::declarations_as_compared`, as the `--dev`
+rehearsal does too, so the three diffs cannot normalize differently. The
+change set is then taken at its word. A collation read that fails keeps every
+declared key: an unread default is not "no default", and DECISIONS 513's
+over-demand is the safe side.
+
+Where the two diffs still differ, they differ only on a drifted target. There,
+`doctor` reads the recorded state and the planner reads the live one, and
+`plan --db` refuses the drift.
+
+Pinned by:
+- `a_key_re_added_only_for_the_default_collation_keeps_its_demand` and
+  `a_key_rebuilt_around_a_retyped_column_loses_its_demand`
+  (`crates/pbps-cli/src/doctor.rs`);
+- `doctor_demands_a_moved_childs_destination_only_while_its_key_survives`
+  (`crates/pbps-cli/tests/flow.rs`). This test runs on a database whose
+  default collation is not the server's, and reads the real plan's script to
+  check that `doctor` agrees with it.

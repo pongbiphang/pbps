@@ -56,7 +56,9 @@ pub struct Ask<'a> {
     /// deletes and the demands that key would have carried are not made
     /// (DECISIONS 513). Where the environment's recorded state lets the
     /// differ answer, a declared key the plan drops and *re-adds* is left out
-    /// too, since it is just as absent while the deletes run (DEC-678.1).
+    /// too, since it is just as absent while the deletes run (DEC-678.1). That
+    /// includes an unchanged key rebuilt around a column the plan retypes
+    /// (DEC-1511.1).
     pub declared_keys: &'a DeclaredKeys,
 }
 

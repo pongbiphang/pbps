@@ -323,10 +323,8 @@ async fn rehearse_in(
         .with_observed_rows(&rows, &declared_data, declared)?;
     // As `plan --db` compares it: a collation equal to this database's
     // default reads back as none (#1175).
-    let declared_here = match &built.database_collation {
-        Some(default) => declared.without_collation(default),
-        None => declared.clone(),
-    };
+    let declared_here =
+        crate::deploy::declarations_as_compared(declared, built.database_collation.as_deref());
     let remaining = pbps_diff::diff(
         pbps_diff::Side {
             schema: &engine,

@@ -1067,6 +1067,7 @@
         "doctor_and_explain_see_a_lock_that_outlived_its_state_table",
         "doctor_asks_about_a_column_under_the_name_a_pending_rename_has_not_changed_yet",
         "doctor_asks_for_the_dml_a_declared_data_block_needs",
+        "doctor_demands_a_moved_childs_destination_only_while_its_key_survives",
         "doctor_does_not_report_ready_while_the_lock_is_held",
         "doctor_reports_server_capabilities_or_says_it_could_not_read_them",
         "doctor_resolver_discovery_is_advisory_and_never_acquires_an_engine",

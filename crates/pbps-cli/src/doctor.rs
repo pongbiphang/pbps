@@ -811,26 +811,30 @@ struct Declared {
 }
 
 /// The declared foreign keys still in place when the next apply's row deletes
-/// run, by the table that holds them (#678, DEC-678.1).
+/// run, by the table that holds them (#678, DEC-678.1, DEC-1511.1).
 ///
 /// A declared key the plan *adds* is not there yet: a key whose definition
 /// changed — its columns, its action, its name — is a `DropForeignKey`
 /// (`order_key` 2) and an `AddForeignKey` (13) either side of the `DeleteRow`
-/// (12), so the delete guard finds no child through it. Which declared keys
-/// those are is the differ's comparison, made after it resolves every rename
-/// through the uids, so it is asked rather than re-derived: the environment's
-/// recorded state against the declarations, as a connected plan diffs them.
-/// Nothing is planned for use and no plan file is read; the change set is
-/// consulted for its foreign-key additions and dropped, and an addition counts
-/// only when the key's own definition changed ([`redefined`]).
+/// (12), so the delete guard finds no child through it. So is an unchanged key
+/// the differ rebuilds around a column it retypes or recollates, or around the
+/// referenced key it rebuilds. Which declared keys those are is the differ's
+/// comparison, made after it resolves every rename through the uids, so it is
+/// asked rather than re-derived: the environment's recorded state against the
+/// declarations as a connected plan compares them, normalized against the
+/// database's default collation the same way
+/// ([`crate::deploy::declarations_as_compared`]). Every foreign-key addition in
+/// that change set leaves the surviving set. Nothing is planned for use and no
+/// plan file is read.
 ///
 /// `None` when the declarations do not load, a rename annotation is still
 /// pending, the environment has recorded no state, or the differ cannot express
-/// a change. The caller then keeps every
-/// declared key, which over-demands on the safe side (DECISIONS 513).
+/// a change. The caller then keeps every declared key, which over-demands on
+/// the safe side (DECISIONS 513).
 fn surviving_keys(
     declared: &Declared,
     entry: &pbps_db::LedgerEntry,
+    database_collation: Option<&str>,
 ) -> Option<pbps_db::doctor::DeclaredKeys> {
     let loaded = declared.loaded.as_ref()?;
     // A `renamed_from` the checked-in ids have not absorbed yet is a rename
@@ -858,6 +862,10 @@ fn surviving_keys(
             hints.module_deps.insert(name.clone(), dependencies.clone());
         }
     }
+    // Compared as written, a declared default collation would rebuild its
+    // column here and nowhere in the real plan, and the unchanged key around it
+    // would lose a demand the delete guard needs (#1511).
+    let compared = crate::deploy::declarations_as_compared(&loaded.schema, database_collation);
     let dialect = crate::dialect_for(declared.dialect);
     let changes = pbps_diff::diff(
         pbps_diff::Side {
@@ -865,7 +873,7 @@ fn surviving_keys(
             ids: &snapshot.ids,
         },
         pbps_diff::Side {
-            schema: &loaded.schema,
+            schema: &compared,
             ids: &declared.ids,
         },
         dialect.as_ref(),
@@ -886,9 +894,7 @@ fn surviving_keys(
     let mut keys = pbps_db::doctor::DeclaredKeys::new();
     for (table_name, table) in &loaded.schema.tables {
         for (key_name, key) in &table.foreign_keys {
-            let gone = added.contains(&(table_name, key_name.as_str()))
-                && redefined(declared, snapshot, table_name, key_name, key);
-            if !gone {
+            if !added.contains(&(table_name, key_name.as_str())) {
                 keys.entry(table_name.clone())
                     .or_default()
                     .insert(key.references_table.clone());
@@ -896,71 +902,6 @@ fn surviving_keys(
         }
     }
     Some(keys)
-}
-
-/// Whether the declared key differs from the one the environment recorded
-/// under its name, compared through the uids (review on #1510).
-///
-/// An `AddForeignKey` alone is not enough. Connected planning normalizes the
-/// declarations against the target before it diffs (a declared default
-/// collation taken out, among others), and a mismatch there makes this diff
-/// rebuild a column and re-add an unchanged key around it. Dropping that key
-/// from the surviving set would be the unsafe side: no destination demand for
-/// a key that is in fact there. So only a change to the key itself counts: no
-/// recorded key of that name, or a different column list, target or action.
-/// Normalization never touches those. Anything the uids cannot map reads as
-/// unchanged, which keeps the demand.
-fn redefined(
-    declared: &Declared,
-    snapshot: &pbps_model::StateSnapshot,
-    table: &pbps_model::TableName,
-    name: &str,
-    key: &pbps_model::ForeignKey,
-) -> bool {
-    let recorded_name = |declared_table: &pbps_model::TableName| {
-        let uid = declared.ids.table_uid(declared_table)?;
-        snapshot.ids.tables.get(uid)
-    };
-    let Some(recorded_table) = recorded_name(table) else {
-        return false;
-    };
-    let Some(recorded) = snapshot
-        .schema
-        .tables
-        .get(recorded_table)
-        .and_then(|t| t.foreign_keys.get(name))
-    else {
-        // No key of this name was recorded on this table: the plan creates it.
-        return true;
-    };
-    // The recorded key, spelled the way the declarations spell its objects.
-    let declared_column = |recorded_table: &pbps_model::TableName, column: &str| {
-        let uid = snapshot.ids.column_uid(&recorded_table.column(column))?;
-        declared.ids.columns.get(uid).map(|c| c.name.clone())
-    };
-    let declared_target = snapshot
-        .ids
-        .table_uid(&recorded.references_table)
-        .and_then(|uid| declared.ids.tables.get(uid));
-    let columns: Option<Vec<String>> = recorded
-        .columns
-        .iter()
-        .map(|c| declared_column(recorded_table, c))
-        .collect();
-    let referenced: Option<Vec<String>> = recorded
-        .references_columns
-        .iter()
-        .map(|c| declared_column(&recorded.references_table, c))
-        .collect();
-    let (Some(target), Some(columns), Some(referenced)) = (declared_target, columns, referenced)
-    else {
-        return false;
-    };
-    *target != key.references_table
-        || columns != key.columns
-        || referenced != key.references_columns
-        || recorded.on_delete != key.on_delete
-        || recorded.on_update != key.on_update
 }
 
 /// Everything one environment can be asked without writing to it.
@@ -1028,8 +969,14 @@ async fn examine(
     // The keys still present when the deletes run, where the differ can say;
     // every declared key otherwise. An unreadable ledger is not "nothing
     // survives": it falls back to the over-demand, never to an all-clear.
+    // The default collation is read for the same reason `plan --db` reads it:
+    // the declarations are compared as this database reads them back. Unread,
+    // it is not "no default": the keys fall back to the over-demand too.
     let surviving = match crate::engine::latest(&mut conn).await {
-        Ok(Some(entry)) => surviving_keys(declared, &entry),
+        Ok(Some(entry)) => match crate::engine::database_collation(&mut conn).await {
+            Ok(collation) => surviving_keys(declared, &entry, collation.as_deref()),
+            Err(_) => None,
+        },
         _ => None,
     };
     let ask = pbps_db::doctor::Ask {
@@ -1554,6 +1501,7 @@ mod tests {
                     dialect: pbps_config::DialectName::Mssql,
                 },
                 &entry,
+                None,
             )
             .expect("the differ answers for these declarations")
         };
@@ -1609,6 +1557,7 @@ mod tests {
                     dialect: pbps_config::DialectName::Mssql,
                 },
                 &entry,
+                None,
             )
             .is_none()
         );
@@ -1624,32 +1573,31 @@ mod tests {
         );
     }
 
-    /// A key the diff re-adds only because a column around it is rebuilt is
-    /// still there as far as its definition goes (review on #1510). Connected
-    /// planning takes a declared default collation out before it diffs; this
-    /// diff does not, so a collation the recording never carried rebuilds the
-    /// referencing column and re-adds an unchanged key. Leaving it out of the
-    /// surviving set would drop a demand the delete guard needs.
-    #[test]
-    fn a_key_re_added_around_a_rebuilt_column_still_survives() {
-        let parent = (
-            "app.p.yml",
-            "table: app.p\ncolumns:\n  id: {type: varchar(10)}\nprimary_key: [id]\n".to_owned(),
-        );
-        let child = |collation: &str| {
-            (
-                "c.yml",
-                format!(
-                    "table: dst.c\ncolumns:\n  id: {{type: int}}\n  p:\n    type: varchar(10)\n{collation}\
-                     foreign_keys:\n  fk_c_p:\n    columns: [p]\n    references: app.p(id)\n"
+    /// A recorded parent `app.p(id)` and child `dst.c(p)` keyed into it, and
+    /// the same project declared with `column` as the child's `p` and `parent`
+    /// as the parent's `id`; then which keys survive against a database whose
+    /// default collation is `collation`. Also asserts that the declarations,
+    /// compared as written, re-add the key, so that a surviving key means the
+    /// normalization kept it rather than a diff that never touched it.
+    fn surviving_around(parent: &str, column: &str, collation: &str) -> bool {
+        let files = |parent: &str, column: &str| {
+            [
+                (
+                    "app.p.yml",
+                    format!("table: app.p\ncolumns:\n  id:\n{parent}primary_key: [id]\n"),
                 ),
-            )
+                (
+                    "c.yml",
+                    format!(
+                        "table: dst.c\ncolumns:\n  id: {{type: int}}\n  p:\n{column}\
+                         foreign_keys:\n  fk_c_p:\n    columns: [p]\n    references: app.p(id)\n"
+                    ),
+                ),
+            ]
         };
-        let recorded = loaded_from(&[parent.clone(), child("")]);
-        let declared = loaded_from(&[
-            parent.clone(),
-            child("    collation: SQL_Latin1_General_CP1_CI_AS\n"),
-        ]);
+        let text = "    type: varchar(10)\n";
+        let recorded = loaded_from(&files(text, text));
+        let declared = loaded_from(&files(parent, column));
         let mut ids = pbps_model::IdsFile::default();
         for table in ["app.p", "dst.c"] {
             ids.tables.insert(
@@ -1685,7 +1633,7 @@ mod tests {
                 &c.change,
                 pbps_model::Change::AddForeignKey { name, .. } if name == "fk_c_p"
             )),
-            "the diff must re-add the key for this test to mean anything"
+            "the diff as written must re-add the key for this test to mean anything"
         );
         let entry = pbps_db::LedgerEntry {
             id: 1,
@@ -1711,14 +1659,43 @@ mod tests {
                 dialect: pbps_config::DialectName::Mssql,
             },
             &entry,
+            Some(collation),
         )
         .unwrap();
         let child: pbps_model::TableName = "dst.c".parse().unwrap();
-        assert!(
-            kept.get(&child)
-                .is_some_and(|t| t.contains(&"app.p".parse().unwrap())),
-            "{kept:?}"
-        );
+        kept.get(&child)
+            .is_some_and(|t| t.contains(&"app.p".parse().unwrap()))
+    }
+
+    /// A key the diff re-adds only because a column declares the database's
+    /// own default collation is there when the deletes run: `plan --db` takes
+    /// that collation out and rebuilds nothing, so the demand stays (#1511).
+    /// Against a database with another default the same declaration is a real
+    /// recollation, the key is dropped and re-added, and the demand goes.
+    #[test]
+    fn a_key_re_added_only_for_the_default_collation_keeps_its_demand() {
+        let text = "    type: varchar(10)\n";
+        let collated = "    type: varchar(10)\n    collation: SQL_Latin1_General_CP1_CI_AS\n";
+        assert!(surviving_around(
+            text,
+            collated,
+            "SQL_Latin1_General_CP1_CI_AS"
+        ));
+        assert!(!surviving_around(text, collated, "Latin1_General_CS_AS"));
+    }
+
+    /// A key rebuilt around a referencing column the declarations genuinely
+    /// retype, or around the referenced key they retype, is absent while the
+    /// deletes run, so no destination demand is made for it (#1511).
+    #[test]
+    fn a_key_rebuilt_around_a_retyped_column_loses_its_demand() {
+        let text = "    type: varchar(10)\n";
+        let wider = "    type: varchar(20)\n";
+        let default = "SQL_Latin1_General_CP1_CI_AS";
+        // The referencing column.
+        assert!(!surviving_around(text, wider, default));
+        // The referenced primary key's column, which rebuilds the key itself.
+        assert!(!surviving_around(wider, text, default));
     }
 
     use super::*;
