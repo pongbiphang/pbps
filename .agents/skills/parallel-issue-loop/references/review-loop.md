@@ -114,25 +114,20 @@ request, so it goes green in the Actions tab while the required check stays
 unsatisfied (DECISIONS 206, 501). A red CI result requires a fix, push, and
 return to the draft loop.
 
-An actual base edit starts a new PR-associated merge-ref run behind approval
-(DEC-1457.1). Refresh OPEN/base/unchanged head/remaining diff and review evidence,
-then select and approve that base-edit run on the current head. Require its
-complete matrix and `ci-gate` before enqueueing. Verify the approval-selected
-merge SHA has the intended base and reviewed head as its parents, and every
-execution job checks out that same pinned SHA. Verify approval bootstraps the
-immutable defining workflow revision: pre-existing reviewed heads may lack a
-new selector, and acquiring that helper must not require rebasing. The edited
-event itself can retain the former
-base merge SHA even while its run correctly names the new PR base. Require the
-base parent to include the event's base commit and belong to the intended base
-branch; a stable merge ref may precede later advancement of that same branch.
-Metadata-only runs use separate
-concurrency groups, run no matrix and emit no required `ci-gate`; never select
-one as CI evidence. A rerun retains its original event head/base intent: the
-selector may retry the same intended base, but refuses a newly retargeted base
-and cannot manufacture its associated event. Missing
-base-edit evidence stops admission; it does not permit close/reopen, head
-rewrites, dispatch or a bypass.
+After an actual base edit, refresh OPEN/base/unchanged head/remaining diff and
+review evidence (DEC-1457.1). When fresh CI is required, add `ci-retest` to the
+owned PR; remove only that label first if it is already present. Verify the
+head/base around the event, then select its new PR-associated run and approve
+only after the existing review gate qualifies. Every label addition enters
+approval and the full matrix; removing a label or editing title/body triggers
+nothing. Require the complete matrix and actual required-check admission, not
+just a retained green run. Verify the immutable defining-workflow bootstrap,
+intended-base/reviewed-head merge parents and every job's identical pinned SHA.
+The base parent includes the event base and belongs to the intended branch;
+a stable merge ref may precede later same-base advancement. A rerun keeps its
+original event head/base intent and cannot manufacture a newly retargeted
+event. Missing associated evidence stops admission; it does not permit
+close/reopen, head rewrites, dispatch or a bypass.
 
 `master` moving before merge needs no action: the queue rebuilds the PR against
 current `master` when it is enqueued.

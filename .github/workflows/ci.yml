@@ -37,7 +37,7 @@ name: CI
 # nothing that can clear it.
 on:
   pull_request:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [master]
   merge_group:
@@ -50,18 +50,15 @@ permissions:
   contents: read
   pull-requests: read
 
-# Keyed on the pull request number where there is one, so that a run on
-# `refs/pull/N/merge` and a later run on the branch do not share a group.
-# A base edit needs a fresh PR-associated merge-ref run (DEC-1457.1). Other
-# edits get their own group: even a non-cancelling run in the same group could
-# replace the pending approved-head run. They also emit no `ci-gate` check.
-# Only qualifying pull-request runs are cancelled: a `push` or `merge_group`
-# run is the only run its commit will ever get, and cancelling it reports `cancelled`
-# where the gate expects an answer.
+# A label addition explicitly requests fresh PR-associated CI after a base
+# change (DEC-1457.1). Title/body edits are excluded at the event trigger: a
+# skipped, renamed gate still supersedes qualified checks in GitHub's merge
+# box. Every admitted label runs the same approval/full-matrix route, so label
+# filtering cannot publish a skipped required check or lose its previous name.
+# Only PR runs cancel predecessors; master and merge groups need an answer.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.base.ref.from && format('metadata-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
-  # Cancellation requires a boolean; missing base changes cannot yield null.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base.ref.from != '') }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -74,7 +71,6 @@ jobs:
   # approval fails it, which skips everything after it and shuts `ci-gate`.
   approve:
     name: approval
-    if: ${{ github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from }}
     runs-on: ubuntu-latest
     environment: ${{ github.event_name == 'pull_request' && 'ci-approval' || '' }}
     outputs:
@@ -652,9 +648,9 @@ jobs:
   # should shut rather than open, and a `paths` filter added later cannot
   # quietly qualify a pull request that nothing ran on.
   gate:
-    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.base.ref.from && 'ci-metadata' || 'ci-gate' }}
+    name: ci-gate
     needs: [approve, lint, quick, windows, live, live-transport-mssql, live-editions, live-pg, dev-rehearsal, resolver, msrv]
-    if: ${{ always() && (github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from) }}
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
       # This job is the one required check and only as strong as its `needs`:

@@ -23,7 +23,7 @@ const concurrency = workflow.match(/^concurrency:\n([\s\S]*?)(?=^\S)/m)[1];
 const policy = {
   group: property(concurrency, 'group'),
   cancel: property(concurrency, 'cancel-in-progress'),
-  approve: property(job('approve'), 'if'),
+  approve: '${{ true }}',
   environment: property(job('approve'), 'environment'),
   gate: property(job('gate'), 'if'),
   check: property(job('gate'), 'name'),
@@ -68,53 +68,68 @@ function requiresFullCi(github, pr = true) {
   return actual;
 }
 
-test('concurrency cancellation remains boolean for absent and populated base changes', () => {
-  for (const changes of [undefined, {}, { body: { from: 'Old body' } }, { base: { ref: { from: '' } } }, { base: { ref: { from: 'master' } } }]) {
-    const result = evaluate(policy.cancel, context('pull_request', 'edited', changes));
-    assert.ok(result instanceof data.BooleanData, 'GitHub rejects null/string cancellation before creating jobs');
-  }
-});
+const pullRequestTypes = workflow.match(/^  pull_request:\n    types: \[([^\]]+)\]/m);
+assert.ok(pullRequestTypes, 'PR activity types are explicit');
+const admittedTypes = pullRequestTypes[1].split(',').map(item => item.trim());
+function admitted(github) {
+  return github.event_name !== 'pull_request' || admittedTypes.includes(github.event.action);
+}
 
 test('opened, synchronize and reopened still require approved full CI', () => {
   for (const action of ['opened', 'synchronize', 'reopened']) {
-    assert.equal(requiresFullCi(context('pull_request', action)).group, 'CI-1457');
+    const event = context('pull_request', action);
+    assert.equal(admitted(event), true);
+    assert.equal(requiresFullCi(event).group, 'CI-1457');
   }
-  const trigger = workflow.match(/^  pull_request:\n    types: \[([^\]]+)\]/m);
-  assert.ok(trigger);
-  assert.deepEqual(trigger[1].split(',').map(item => item.trim()).sort(), ['edited', 'opened', 'reopened', 'synchronize']);
+  assert.deepEqual([...admittedTypes].sort(), ['labeled', 'opened', 'reopened', 'synchronize']);
 });
 
-test('the base-edited payload creates a fresh associated gate without changing head', () => {
-  // The webhook schema uses changes.base.ref.from and changes.base.sha.from.
-  const edited = context('pull_request', 'edited', { base: { ref: { from: 'fix/issue-1212-parent' }, sha: { from: 'old-base-sha' } } });
-  assert.equal(edited.event.pull_request.head.sha, 'unchanged-head');
-  assert.equal(requiresFullCi(edited).group, 'CI-1457');
-  // Existing success and missing evidence both leave the new run behind approval.
+test('an explicit label requests associated CI on the unchanged head and intended base', () => {
+  const labeled = context('pull_request', 'labeled');
+  labeled.event.pull_request.base.ref = 'retargeted-base';
+  labeled.event.label = { name: 'ci-retest' };
+  assert.equal(admitted(labeled), true);
+  assert.equal(labeled.event.pull_request.head.sha, 'unchanged-head');
   for (const existing of ['success', null]) {
-    edited.event.pull_request.checks = existing;
-    requiresFullCi(edited);
+    labeled.event.pull_request.checks = existing;
+    assert.equal(requiresFullCi(labeled).group, 'CI-1457');
   }
 });
 
-test('title and body edits neither cancel CI nor create a passing required context', () => {
-  for (const changes of [{ base: { ref: { from: '' } } }, { title: { from: 'Old title' } }, { body: { from: '' } }, { title: { from: 'a' }, body: { from: 'b' } }, undefined, {}, { base: { sha: { from: 'old-sha' } } }]) {
-    const one = outcome(context('pull_request', 'edited', changes, 42));
-    const two = outcome(context('pull_request', 'edited', changes, 43));
-    assert.equal(one.approve, false, JSON.stringify({ changes, one }));
-    assert.equal(one.gate, false, JSON.stringify({ changes, one }));
-    assert.equal(one.check, 'ci-metadata');
-    assert.equal(one.cancel, false);
-    assert.notEqual(one.group, 'CI-1457');
-    assert.notEqual(one.group, two.group);
-    assert.notEqual(outcome(context('pull_request', 'edited', changes, 1457)).group, 'CI-1457');
+test('title and body edits cannot create a suite that supersedes qualified checks', () => {
+  for (const changes of [{ title: { from: 'Old title' } }, { body: { from: '' } }, { title: { from: 'a' }, body: { from: 'b' } }, undefined, {}, { base: { sha: { from: 'old-sha' } } }]) {
+    assert.equal(admitted(context('pull_request', 'edited', changes)), false);
   }
+  // Skipped/renamed jobs preserved the run but made real queue admission fail.
+  assert.equal(policy.check, 'ci-gate');
+  assert.doesNotMatch(workflow, /ci-metadata|metadata-\{|changes\.base/);
 });
 
-test('simultaneous base and metadata edits still require full CI', () => {
-  requiresFullCi(context('pull_request', 'edited', { base: { ref: { from: 'parent' } }, title: { from: 'Old' } }));
+test('a base edit requires a fresh explicit retry rather than silently rerunning CI', () => {
+  const changed = context('pull_request', 'edited', { base: { ref: { from: 'parent' }, sha: { from: 'old-base-sha' } }, title: { from: 'Old' } });
+  assert.equal(admitted(changed), false);
+  changed.event.action = 'labeled';
+  changed.event.label = { name: 'ci-retest' };
+  assert.equal(admitted(changed), true);
+  requiresFullCi(changed);
+  assert.equal(admitted(context('pull_request', 'unlabeled')), false, 'removing a retry label cannot cancel CI');
 });
 
-test('master, merge groups and dispatch keep the full gate without approval or cancellation', () => {
+test('no admitted label can skip approval or manufacture a passing required context', () => {
+  assert.doesNotMatch(job('approve'), /^    if:/m, 'all admitted labels enter approval');
+  for (const name of ['ci-retest', 'ordinary-triage', '']) {
+    const event = context('pull_request', 'labeled');
+    event.event.label = { name };
+    assert.equal(admitted(event), true);
+    requiresFullCi(event);
+  }
+  assert.equal(policy.check, 'ci-gate');
+});
+
+test('concurrency cancellation is boolean and never applies to non-PR events', () => {
+  for (const changes of [undefined, {}, { body: { from: 'Old body' } }, { base: { ref: { from: 'master' } } }]) {
+    assert.ok(evaluate(policy.cancel, context('pull_request', 'labeled', changes)) instanceof data.BooleanData);
+  }
   for (const event of ['push', 'merge_group', 'workflow_dispatch']) {
     const github = { workflow: 'CI', event_name: event, event: {}, ref: 'refs/heads/master', run_id: 42 };
     assert.equal(requiresFullCi(github, false).group, 'CI-refs/heads/master');
@@ -122,13 +137,9 @@ test('master, merge groups and dispatch keep the full gate without approval or c
 });
 
 test('failure and cancellation cannot skip the required qualifying gate', () => {
-  // always() remains true after failure/cancellation; no !cancelled() filter.
   assert.match(policy.gate, /\balways\(\)/);
   assert.doesNotMatch(policy.gate, /cancelled\(/);
-  for (const action of ['opened', 'edited']) {
-    const github = context('pull_request', action, { base: { ref: { from: 'parent' } } });
-    assert.equal(outcome(github).gate, true);
-  }
+  for (const action of ['opened', 'labeled']) assert.equal(outcome(context('pull_request', action)).gate, true);
   assert.match(job('gate'), /all\(\.\[\]; \.result == "success"\)/);
   assert.match(job('gate'), /python3 scripts\/check_gate_needs\.py/);
   for (const [name, block] of [...workflow.split('jobs:\n')[1].matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/gm)].map(match => [match[1], match[2]])) {
@@ -137,29 +148,28 @@ test('failure and cancellation cannot skip the required qualifying gate', () => 
   }
 });
 
-
-test('every job uses one validated intended-base checkout rather than the stale edited-event SHA', () => {
+test('every job uses one validated intended-base checkout rather than an unverified event SHA', () => {
   const head = 'a'.repeat(40);
   const staleMerge = 'b'.repeat(40);
   const currentMerge = 'c'.repeat(40);
-  const edited = context('pull_request', 'edited', { base: { ref: { from: 'parent' } } });
-  edited.sha = staleMerge;
-  edited.workflow_sha = "d".repeat(40);
-  edited.event.pull_request.head.sha = head;
+  const event = context('pull_request', 'labeled');
+  event.sha = staleMerge;
+  event.workflow_sha = "d".repeat(40);
+  event.event.pull_request.head.sha = head;
   const approve = job('approve');
   assert.match(approve, /checkout_sha: \$\{\{ steps\.checkout\.outputs\.checkout_sha \}\}/);
   assert.match(approve, /python3 scripts\/ci_pr_checkout\.py/);
   const bootstrap = approve.match(/uses: actions\/checkout@v7\n        with:\n          ref: (.+)/);
   assert.ok(bootstrap, 'approval bootstraps the defining workflow before selecting its merge ref');
-  assert.equal(evaluate(bootstrap[1], edited).coerceString(), edited.workflow_sha);
+  assert.equal(evaluate(bootstrap[1], event).coerceString(), event.workflow_sha);
   for (const [name, block] of [...workflow.split('jobs:\n')[1].matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/gm)].map(match => [match[1], match[2]])) {
     if (name === 'approve') continue;
     assert.match(block, /^    needs: (approve|\[[^\]\n]*\bapprove\b[^\]\n]*\])$/m, `${name} directly receives approval outputs`);
     const checkouts = [...block.matchAll(/uses: actions\/checkout@v7\n        with:\n          ref: (.+)/g)];
     assert.equal(checkouts.length, 1, `${name} has one explicit checkout`);
-    const selected = evaluate(checkouts[0][1], edited, { approve: { outputs: { checkout_sha: currentMerge } } }).coerceString();
+    const selected = evaluate(checkouts[0][1], event, { approve: { outputs: { checkout_sha: currentMerge } } }).coerceString();
     assert.equal(selected, currentMerge, `${name} shares the validated merge SHA`);
-    assert.notEqual(selected, staleMerge, 'edited-event GITHUB_SHA cannot select the former base');
+    assert.notEqual(selected, staleMerge, 'an event SHA cannot select an unverified former-base tree');
   }
 });
 
@@ -182,7 +192,7 @@ test('existing PR heads can bootstrap newly introduced helpers without rebasing'
     git('commit', '--quiet', '-m', 'Defining workflow introduces its selector');
     const workflowSha = git('rev-parse', 'HEAD');
     assert.throws(() => git('show', `${oldHead}:${selectorPath}`), 'the unchanged pre-existing head has no new helper');
-    const event = context('pull_request', 'edited', { base: { ref: { from: 'parent' } } });
+    const event = context('pull_request', 'labeled');
     event.sha = oldHead;
     event.event.pull_request.head.sha = oldHead;
     event.workflow_sha = workflowSha;

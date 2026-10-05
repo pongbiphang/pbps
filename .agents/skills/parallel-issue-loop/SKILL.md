@@ -116,15 +116,16 @@ and merge order.
   needed; an open-only scan cannot authorize local cleanup (DEC-1458.1).
   Never rely on automatic retargeting (DEC-1228.1). Refresh each dependent's
   existing review
-  and current-head CI gates before enqueueing. Select the actual base-edit
-  associated run and require its complete matrix after approval. Verify the
-  approval-selected merge SHA has the intended base and reviewed head as its
-  parents and every execution job uses it; edited-event SHAs can retain the old
-  base. Verify approval bootstraps the immutable defining workflow revision so
-  existing reviewed heads need no rebase just to acquire the new selector.
-  Require that base parent to include the event base and belong to the intended
-  base branch; later same-base advancement needs no rebase. Metadata-only
-  runs create no `ci-gate` and cannot qualify the PR (DEC-1457.1). Do not rebase merely for this
+  and current-head CI gates before enqueueing. When fresh retargeted CI is
+  required, add `ci-retest` to the owned PR; if already present, remove only
+  that label and add it again. Verify OPEN/base/unchanged head/diff around the
+  label event and select its new associated run. Label additions require
+  approval and the full matrix; title/body edits and label removal trigger
+  nothing (DEC-1457.1). Verify the immutable defining-workflow bootstrap and
+  the approval-selected merge SHA's intended-base/reviewed-head parents. Every
+  job must use it; its base parent includes the event base and belongs to the
+  intended branch. Require complete CI and actual required-check admission,
+  not a retained green run alone. Do not rebase merely for this
   base change or because `master` moved. Two things do
   need you, and both begin by rebasing onto current `master`, because neither
   reproduces on a branch that predates it: a conflict, which ejects the PR from
