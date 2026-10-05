@@ -555,6 +555,70 @@ fn a_task_the_kernel_marks_exiting_has_departed_while_its_state_still_reads_live
     }
 }
 
+/// A group whose only thread is in `do_exit` reads `R` with `PF_EXITING`
+/// and one thread in its own stat: it is going, not hidden. The same flag
+/// with a second thread proves nothing, since that thread may be one the
+/// listing passed before it was created. A group that lists no task and
+/// reads live is hidden too (#1554 review).
+#[test]
+fn a_group_whose_last_thread_is_exiting_is_going_and_any_other_is_hidden() {
+    let root = std::env::temp_dir().join(format!("pbps-group-{}", rand::random::<u64>()));
+    let stat = |id: &str, state: &str, flags: &str, threads: &str| {
+        let mut fields = vec!["0"; 49];
+        fields[0] = state;
+        fields[6] = flags;
+        fields[17] = threads;
+        fields[19] = "42";
+        format!("{id} (worker) {}\n", fields.join(" "))
+    };
+    // Group stat, then the single listed task's stat when there is one.
+    for (group, state, flags, threads, task) in [
+        ("8", "R", "4194564", "1", Some(("R", "4194564"))),
+        ("9", "R", "4194560", "1", None),
+        ("10", "R", "4194564", "2", Some(("R", "4194564"))),
+        ("11", "S", "4194560", "1", Some(("S", "4194564"))),
+    ] {
+        let tasks = root.join(group).join("task");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            root.join(group).join("stat"),
+            stat(group, state, flags, threads),
+        )
+        .unwrap();
+        if let Some((state, flags)) = task {
+            std::fs::create_dir_all(tasks.join(group)).unwrap();
+            std::fs::write(
+                tasks.join(group).join("stat"),
+                stat(group, state, flags, threads),
+            )
+            .unwrap();
+        }
+    }
+    let directory = File::open(&root).unwrap();
+    let handle = Arc::new(File::open(&root).unwrap());
+    let namespace = FileIdentity::of(&handle).unwrap();
+    let visit = |group: &str| {
+        let group_directory = open(&directory, group, OFlags::DIRECTORY).unwrap();
+        matches!(
+            visit_group::<NamespaceError>(
+                &group_directory,
+                group.parse().unwrap(),
+                namespace,
+                &handle,
+                &mut |_| panic!("no task here is live"),
+            ),
+            Err(ScanError::Namespace(NamespaceError::Unreadable))
+        )
+    };
+    let refused: Vec<bool> = ["8", "9", "10", "11"].iter().map(|g| visit(g)).collect();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(
+        refused,
+        [false, true, true, true],
+        "last thread exiting is going; no task, a second thread, or a live group is hidden"
+    );
+}
+
 #[test]
 fn namespace_procfs_fixture_observes_external_parent_tasks_and_retains_identity() {
     let Ok(pid) = std::env::var("PBPS_NAMESPACE_FIXTURE_PID") else {
