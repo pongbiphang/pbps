@@ -59,7 +59,8 @@ permissions:
 # where the gate expects an answer.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.base.ref.from && format('metadata-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base.ref.from) }}
+  # Cancellation requires a boolean; missing base changes cannot yield null.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base.ref.from != '') }}
 
 env:
   CARGO_TERM_COLOR: always

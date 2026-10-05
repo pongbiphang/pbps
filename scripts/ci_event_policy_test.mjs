@@ -50,6 +50,8 @@ function context(event_name, action, changes, run_id = 42) {
 function outcome(github) {
   return Object.fromEntries(Object.entries(policy).map(([key, template]) => {
     const result = evaluate(template, github);
+    // Unlike job conditions, cancellation rejects a null or string result.
+    if (key === 'cancel') assert.ok(result instanceof data.BooleanData, 'concurrency cancellation must evaluate to a boolean');
     return [key, ['approve', 'gate', 'cancel'].includes(key) ? !falsy(result) : result.coerceString()];
   }));
 }
@@ -62,6 +64,13 @@ function requiresFullCi(github, pr = true) {
   assert.equal(actual.cancel, pr);
   return actual;
 }
+
+test('concurrency cancellation remains boolean for absent and populated base changes', () => {
+  for (const changes of [undefined, {}, { body: { from: 'Old body' } }, { base: { ref: { from: '' } } }, { base: { ref: { from: 'master' } } }]) {
+    const result = evaluate(policy.cancel, context('pull_request', 'edited', changes));
+    assert.ok(result instanceof data.BooleanData, 'GitHub rejects null/string cancellation before creating jobs');
+  }
+});
 
 test('opened, synchronize and reopened still require approved full CI', () => {
   for (const action of ['opened', 'synchronize', 'reopened']) {

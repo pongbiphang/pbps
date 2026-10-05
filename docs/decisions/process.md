@@ -871,6 +871,9 @@ remaining diff and review evidence before approving that associated run.
 
 A title or body edit is a separate concurrency group keyed by run ID, so it
 neither cancels a running qualified-head run nor replaces a pending one. Its
+`cancel-in-progress` expression explicitly returns a boolean: unlike a job
+condition, GitHub rejects null or string cancellation values before creating
+jobs, so the previous base ref is compared with the empty string.
 approval and gate jobs are skipped and its gate is named `ci-metadata`, never
 `ci-gate`: GitHub treats a skipped required job as passing, which could otherwise
 hide missing CI. No full matrix starts. The normal fan-in still waits for every
