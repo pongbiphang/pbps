@@ -1293,6 +1293,7 @@
         "omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload",
         "permission_versions_are_checked_before_planning_bootstrap_apply_and_resume",
         "postgres_rename_impact_reaches_the_cli_as_advisory_and_requires_explicit_approval",
+        "pull_adopts_a_cluster_role_only_once_this_database_grants_it_something",
         "pull_data_on_a_table_validate_refuses_leaves_it_out_and_reads_the_rest",
         "pull_draws_the_line_the_projects_own_rules_draw",
         "pull_leaves_out_and_names_what_validate_would_refuse",

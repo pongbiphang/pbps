@@ -192,6 +192,10 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                     &mut pulled,
                     crate::dialect_for(config.dialect).as_ref(),
                 );
+                crate::adopt::leave_out_cluster_roles_without_grants(
+                    &mut pulled,
+                    crate::dialect_for(config.dialect).as_ref(),
+                );
                 let ids = mint_ids(&pulled.schema, &root)?;
                 (
                     pulled.schema,

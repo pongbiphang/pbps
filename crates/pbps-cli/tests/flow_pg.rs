@@ -11538,6 +11538,64 @@ fn update_of_generated_columns_follows_their_source_columns() {
 /// Cluster-wide roles outlive the database that uses them, so a test holding
 /// both drops the database first: `DROP ROLE` fails while the role still owns
 /// an object anywhere in the cluster.
+/// A cluster role this database grants nothing to is not adopted (#690).
+/// Roles are cluster objects (ADR-0010 §3), so a `pull` that kept every one
+/// wrote a grantless declaration and minted a uid for each role in the
+/// cluster, and the next `plan --db` then required every one of them to
+/// exist. Once the database grants the role something, it is this project's
+/// to declare, and `pull` adopts it.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn pull_adopts_a_cluster_role_only_once_this_database_grants_it_something() {
+    let admin = server();
+    let role = format!("pbps_grantless_{}", std::process::id());
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![role.clone()],
+    };
+    on_server(&admin, &format!("CREATE ROLE {role} NOLOGIN"));
+    let own = OwnDatabase::new(&admin, "pull_grantless_690");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.t (id integer PRIMARY KEY)",
+    );
+    let declared_roles = |d: &Demo| -> Vec<String> {
+        std::fs::read_dir(d.dir.join("schema/roles"))
+            .map(|entries| {
+                entries
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let ids = |d: &Demo| std::fs::read_to_string(d.dir.join("schema.ids.json")).unwrap();
+
+    let before = Demo::new("pull-grantless-690");
+    succeeds(before.run(&["pull", "--db", connection]));
+    assert!(
+        declared_roles(&before).is_empty(),
+        "no role is granted anything here: {:?}",
+        declared_roles(&before)
+    );
+    assert!(!ids(&before).contains(&role), "{}", ids(&before));
+    assert!(before.dir.join("schema/app.t.yml").exists());
+
+    // With the schema's `USAGE`, which `validate` requires of a table grant;
+    // without it the grant is left out as unexpressible and the role with it.
+    on_server(
+        connection,
+        &format!("GRANT USAGE ON SCHEMA app TO {role}; GRANT SELECT ON app.t TO {role}"),
+    );
+    let after = Demo::new("pull-granted-690");
+    succeeds(after.run(&["pull", "--db", connection]));
+    assert_eq!(declared_roles(&after), [format!("{role}.yml")]);
+    let declaration =
+        std::fs::read_to_string(after.dir.join(format!("schema/roles/{role}.yml"))).unwrap();
+    assert!(declaration.contains("app.t"), "{declaration}");
+    assert!(ids(&after).contains(&role), "{}", ids(&after));
+}
+
 struct ClusterRoles {
     server: String,
     names: Vec<String>,
