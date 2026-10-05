@@ -132,11 +132,15 @@ fn moves_bindings(change: &Change, base: crate::Side<'_>, desired: crate::Side<'
         | Change::AlterColumnType { .. }
         | Change::AddComputedColumn { .. }
         | Change::DropComputedColumn { .. }
-        // Each creates an index, and an index's name is a relation's name: an
-        // unqualified relation lookup on the path finds it first.
+        // Each creates or drops an index, and an index's name is a relation's
+        // name: an unqualified relation lookup on the path finds it first,
+        // and one that bound it, such as a `regclass` constant, finds
+        // another relation once it is gone.
         | Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
+        | Change::DropUnique { .. }
         | Change::AddIndex { .. }
+        | Change::DropIndex { .. }
         // Renames the clones of its parent's indexes and keys to the
         // declaration's names, and its table leaves the parent's inheritance.
         | Change::DetachPartition { .. }
@@ -149,13 +153,12 @@ fn moves_bindings(change: &Change, base: crate::Side<'_>, desired: crate::Side<'
             matches!(target, GrantTarget::Schema(_))
         }
         // An expression's own definition is its own question; changing it
-        // brings no name anywhere.
+        // brings no name anywhere. A check's or foreign key's name is a
+        // constraint's, which no lookup in an expression reaches.
         Change::AlterColumnDefault { .. }
         | Change::AlterColumnExpression { .. }
         | Change::AddCheck { .. }
         | Change::DropCheck { .. }
-        | Change::DropIndex { .. }
-        | Change::DropUnique { .. }
         | Change::AddForeignKey { .. }
         | Change::DropForeignKey { .. }
         | Change::AlterColumnNullability { .. }
@@ -404,6 +407,46 @@ mod tests {
         let found = assessed(&base, &desired);
         assert!(found.questions.is_empty(), "{found:?}");
         assert!(!found.requires_resolution());
+    }
+
+    /// An index's name leaves the relation namespace with it: a surface
+    /// that bound it, a `regclass` constant for one, finds another relation
+    /// afterwards, and only the engine can say which (#1526 review). A
+    /// constraint's name is no relation's.
+    #[test]
+    fn a_dropped_index_name_moves_lookups_and_a_dropped_check_does_not() {
+        let base = bound();
+        let table: pbps_model::TableName = "app.t".parse().unwrap();
+        for change in [
+            Change::DropIndex {
+                table: table.clone(),
+                name: "ix_gone".into(),
+            },
+            Change::DropUnique {
+                table: table.clone(),
+                name: "uq_gone".into(),
+            },
+        ] {
+            assert!(
+                with(&base, vec![change.clone()]).requires_resolution(),
+                "{change:?}"
+            );
+        }
+        for change in [
+            Change::DropCheck {
+                table: table.clone(),
+                name: "ck_gone".into(),
+            },
+            Change::DropForeignKey {
+                table,
+                name: "fk_gone".into(),
+            },
+        ] {
+            assert!(
+                !with(&base, vec![change.clone()]).requires_resolution(),
+                "{change:?}"
+            );
+        }
     }
 
     /// The lookup skips a schema its role may not use, so who may use one is
