@@ -1517,8 +1517,8 @@ code (`resolution::Case`), output and tests:
   - **Findings (exit 2):** an unresolved declared surface, an analysis scope
     measured incompatible (`Error::Incompatible`, split from an unreadable
     one), a supplied server measured short of its profile, an engine with no
-    binding adapter (SQL Server, or a host other than Linux), and a missing
-    key.
+    binding adapter (SQL Server), a selected profile whose runtime this host
+    cannot provide, and a missing key.
   - **Unanswerable (exit 1):** connecting, acquiring, starting, an
     unreadable scope and an unconfirmed cleanup.
   - **An answer** is not yet published: `resolver.publication-unavailable`,
@@ -1552,3 +1552,10 @@ input being replaced. This is the motivating pair: the irrelevant arrival no
 longer rebuilds the view, so its unmanaged dependent no longer refuses the
 plan, while the view whose binding moves is rebuilt. Ordinary planning keeps
 the candidate rule unchanged.
+
+**The seam is profile-neutral** (#1528). The cases, the assessment, the key
+and the refusal classes hold for every profile; only the producer behind
+`resolution::resolve` is profile-specific. Today's producers are the measured
+profiles, which bind the target by observing its engine service
+(DEC-1514.1); that same-host premise is theirs, not resolution's. An
+operator-trusted profile plugs in beside them without reshaping the cases.

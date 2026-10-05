@@ -321,9 +321,9 @@ pub fn connected(server: &str, dialect: &str) {
 /// DEC-1515.1's case 1 and case 3 refusals, through the binary. A view the
 /// target holds is a binding question once a column arrives on its table.
 /// No resolver here can answer: the bare target names no key, the
-/// environment's key is absent, and a keyed run cannot verify a plaintext
-/// target. Each refuses with the right class, and existing files stay
-/// byte-identical.
+/// environment's key is absent, and the measured profile it selects cannot
+/// verify a plaintext target. Each refuses with the right class, and
+/// existing files stay byte-identical.
 pub fn required(server: &str, dialect: &str) {
     let own = OwnDatabase::new(server, "resolver1515");
     let connection = own.connection();
@@ -419,8 +419,9 @@ pub fn required(server: &str, dialect: &str) {
         assert_eq!(value["findings"][0]["id"], id);
         return;
     }
-    // With the key present the run starts, and the plaintext target cannot
-    // be verified: an operational failure, not a finding (SPEC 9.8).
+    // With the key present the run starts, and the measured profile cannot
+    // verify the plaintext target (DEC-1514.1): an operational failure, not
+    // a finding (SPEC 9.8).
     successful(run(
         &d,
         &["key", "generate", "--out", key_file(&d).to_str().unwrap()],

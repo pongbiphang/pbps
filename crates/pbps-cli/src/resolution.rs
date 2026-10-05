@@ -132,11 +132,14 @@ fn unresolved(request: &Request<'_>, why: impl std::fmt::Display) -> Refused {
 /// reads the key or opens a resolver resource, and it reads the key first,
 /// so a missing key costs no image and no scratch server.
 ///
+/// Everything here holds for any profile: the engine with a binding adapter,
+/// the key every persisted fingerprint needs (DEC-952.1), the bootstrap and
+/// the refusal classes. Only [`producer::produce`] is profile-specific
+/// (#1528), so a profile that binds its target differently plugs in there.
+///
 /// The evidence is not returned: nothing publishes it before the recheck
 /// that #1516 adds, and a value no caller may use is one a caller will.
-#[cfg(target_os = "linux")]
 pub async fn resolve(request: &Request<'_>) -> Result<pbps_model::ChangeSet, Refused> {
-    use pbps_cli::resolver::server::{Error, ProduceError};
     let driver = request.target.driver();
     if driver != pbps_db::Driver::Postgres {
         return Err(unresolved(
@@ -173,72 +176,99 @@ pub async fn resolve(request: &Request<'_>) -> Result<pbps_model::ChangeSet, Ref
     .into_iter()
     .map(|planned| planned.change)
     .collect();
-    let binding = pbps_cli::resolver::server::BindingRequest {
-        bootstrap: &bootstrap,
-        desired: request.desired.schema,
-        base: request.base.schema,
-    };
-    pbps_cli::resolver::server::produce(
-        driver,
-        &request.selection.profile,
-        request.target.connection(),
-        &binding,
-        request.base,
-        request.desired,
-        request.hints,
-        // The CLI's PostgreSQL dialect configures no write-path extras
-        // (`dialect_for`), so the plan it diffed has none either.
-        &[],
-        request.project,
-        request.target.environment(),
-    )
-    .await
-    .map(|resolved| resolved.changes)
-    .map_err(|failure| match failure {
-        ProduceError::Run(error) => match error {
-            // Answered: a declared surface had no sound verdict, or the
-            // environment was measured and differs, or this run's profile
-            // cannot serve the engine.
-            Error::Binding(_) | Error::Incompatible(_) | Error::UnsupportedProfile { .. } => {
-                unresolved(request, error)
-            }
-            // The supplied server was measured and does not meet the profile
-            // it claims: also an answer.
-            Error::Container(_)
-            | Error::Configuration(_)
-            | Error::EngineExecutable
-            | Error::Containment(_)
-            | Error::Mount(_)
-            | Error::TargetInstance => unresolved(request, error),
-            // Not answered: the run could not establish what it needed.
-            Error::Endpoint
-            | Error::Daemon(_)
-            | Error::Channel(_)
-            | Error::Exclusivity(_)
-            | Error::Unqualified(_)
-            | Error::Identity(_)
-            | Error::Deadline
-            | Error::Cancelled
-            | Error::Scratch
-            | Error::Cleanup
-            | Error::Consumed
-            | Error::Scope(_) => Refused::Unanswerable(error.into()),
-        },
-        ProduceError::Target(_)
-        | ProduceError::Recipe(_)
-        | ProduceError::Acquire(_)
-        | ProduceError::Cleanup(_) => Refused::Unanswerable(failure.into()),
-    })
+    producer::produce(request, driver, &bootstrap).await
 }
 
-/// No resolver runtime exists off Linux (RESOLVER-RUNTIME); the question
-/// still needs an answer, so the plan is refused rather than guessed.
+/// The producers of the profiles pbps implements. Today every one is a
+/// measured profile (RESOLVER-RUNTIME): its run binds the target by observing
+/// the engine service that holds the connection (DEC-1514.1). That premise
+/// belongs to these profiles, not to resolution.
+#[cfg(target_os = "linux")]
+mod producer {
+    use super::{Refused, Request, unresolved};
+    use pbps_cli::resolver::server::{Error, ProduceError};
+
+    pub(super) async fn produce(
+        request: &Request<'_>,
+        driver: pbps_db::Driver,
+        bootstrap: &[pbps_model::Change],
+    ) -> Result<pbps_model::ChangeSet, Refused> {
+        let binding = pbps_cli::resolver::server::BindingRequest {
+            bootstrap,
+            desired: request.desired.schema,
+            base: request.base.schema,
+        };
+        pbps_cli::resolver::server::produce(
+            driver,
+            &request.selection.profile,
+            request.target.connection(),
+            &binding,
+            request.base,
+            request.desired,
+            request.hints,
+            // The CLI's PostgreSQL dialect configures no write-path extras
+            // (`dialect_for`), so the plan it diffed has none either.
+            &[],
+            request.project,
+            request.target.environment(),
+        )
+        .await
+        .map(|resolved| resolved.changes)
+        .map_err(|failure| match failure {
+            ProduceError::Run(error) => match error {
+                // Answered: a declared surface had no sound verdict, or the
+                // environment was measured and differs, or this run's profile
+                // cannot serve the engine.
+                Error::Binding(_) | Error::Incompatible(_) | Error::UnsupportedProfile { .. } => {
+                    unresolved(request, error)
+                }
+                // The supplied server was measured and does not meet the
+                // profile it claims: also an answer.
+                Error::Container(_)
+                | Error::Configuration(_)
+                | Error::EngineExecutable
+                | Error::Containment(_)
+                | Error::Mount(_)
+                | Error::TargetInstance => unresolved(request, error),
+                // Not answered: the run could not establish what it needed.
+                Error::Endpoint
+                | Error::Daemon(_)
+                | Error::Channel(_)
+                | Error::Exclusivity(_)
+                | Error::Unqualified(_)
+                | Error::Identity(_)
+                | Error::Deadline
+                | Error::Cancelled
+                | Error::Scratch
+                | Error::Cleanup
+                | Error::Consumed
+                | Error::Scope(_) => Refused::Unanswerable(error.into()),
+            },
+            ProduceError::Target(_)
+            | ProduceError::Recipe(_)
+            | ProduceError::Acquire(_)
+            | ProduceError::Cleanup(_) => Refused::Unanswerable(failure.into()),
+        })
+    }
+}
+
+/// The measured profiles run on a native Linux host (RESOLVER-RUNTIME), and
+/// no other profile exists yet; the question still needs an answer, so the
+/// plan is refused rather than guessed.
 #[cfg(not(target_os = "linux"))]
-pub async fn resolve(request: &Request<'_>) -> Result<pbps_model::ChangeSet, Refused> {
-    Err(unresolved(
-        request,
-        "binding resolution runs only on a Linux host",
-    ))
+mod producer {
+    use super::{Refused, Request, unresolved};
+
+    pub(super) async fn produce(
+        request: &Request<'_>,
+        _driver: pbps_db::Driver,
+        _bootstrap: &[pbps_model::Change],
+    ) -> Result<pbps_model::ChangeSet, Refused> {
+        Err(unresolved(
+            request,
+            "the selected profile's runtime needs a native Linux host (RESOLVER-RUNTIME)",
+        ))
+    }
 }
 
 #[cfg(test)]
