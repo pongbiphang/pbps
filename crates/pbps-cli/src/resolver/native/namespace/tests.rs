@@ -502,7 +502,7 @@ fn opaque_names_do_not_relax_required_task_identity_fields() {
         bytes
     };
     let valid = record("12", "S", "42");
-    assert_eq!(task_stat(&valid).unwrap(), (12, "S", 42));
+    assert_eq!(task_stat(&valid).unwrap(), (12, false, 42));
     for invalid in [
         record("0", "S", "42"),
         record("bad", "S", "42"),
@@ -513,6 +513,45 @@ fn opaque_names_do_not_relax_required_task_identity_fields() {
         record("12", "S", ""),
     ] {
         assert!(matches!(task_stat(&invalid), Err(NamespaceError::Metadata)));
+    }
+}
+
+/// A task in `do_exit` keeps reading as running or sleeping until it becomes
+/// a zombie, but its memory and descriptors are already gone. The kernel's
+/// `PF_EXITING` flag says it has departed, as `Z` and `X` do; any other flag,
+/// and any other state, is a live task (#1554).
+#[test]
+fn a_task_the_kernel_marks_exiting_has_departed_while_its_state_still_reads_live() {
+    let record = |state: &str, flags: &str| {
+        let mut fields = vec!["0"; 18];
+        fields[5] = flags;
+        format!("12 (worker) {state} {} 42", fields.join(" ")).into_bytes()
+    };
+    for (state, flags, departed) in [
+        ("R", "4194560", false),
+        ("S", "4194560", false),
+        ("D", "4194560", false),
+        // PF_EXITING alone and among the other flags a worker carries.
+        ("R", "4", true),
+        ("S", "4194564", true),
+        ("D", "4194564", true),
+        ("Z", "4194560", true),
+        ("X", "0", true),
+    ] {
+        assert_eq!(
+            task_stat(&record(state, flags)).unwrap(),
+            (12, departed, 42),
+            "state {state} flags {flags}"
+        );
+    }
+    for unreadable in ["", "-4", "four", "4294967296"] {
+        assert!(
+            matches!(
+                task_stat(&record("S", unreadable)),
+                Err(NamespaceError::Metadata)
+            ),
+            "flags {unreadable:?} is no reading"
+        );
     }
 }
 

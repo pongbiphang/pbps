@@ -287,11 +287,11 @@ impl<'a> NamespaceProcfs<'a> {
                         Some(stat) => stat,
                         None => continue,
                     };
-                    let (number, state, start_ticks) = task_stat(&stat)?;
+                    let (number, departed, start_ticks) = task_stat(&stat)?;
                     if number != tid {
                         return Err(NamespaceError::Unreadable.into());
                     }
-                    if matches!(state, "X" | "Z") {
+                    if departed {
                         continue;
                     }
                     let task = TaskObservation {
@@ -455,23 +455,42 @@ fn task_alive(directory: &File, id: u32, start: u64) -> Result<bool, NamespaceEr
     let Some(stat) = read_stat(directory)? else {
         return Ok(false);
     };
-    let (current_id, state, current_start) = task_stat(&stat)?;
+    let (current_id, departed, current_start) = task_stat(&stat)?;
     if current_id != id || current_start != start {
         return Err(NamespaceError::Replaced);
     }
-    Ok(!matches!(state, "X" | "Z"))
+    Ok(!departed)
 }
 
-fn task_stat(stat: &[u8]) -> Result<(u32, &str, u64), NamespaceError> {
+/// `PF_EXITING`, from the kernel's `include/linux/sched.h`.
+const PF_EXITING: u32 = 0x4;
+
+/// A task's number, whether it has departed, and its start time.
+///
+/// Departed is a zombie or dead task, or one the kernel has marked
+/// `PF_EXITING`. `do_exit` sets that flag before it releases the task's
+/// memory and descriptors, and the task never returns to user space after
+/// it. The state still reads running or sleeping until `exit_notify` makes it
+/// a zombie, though. In that interval the task's `exe` and descriptor reads
+/// fail while it still reads as live, which refused an unchanged container
+/// profile under fork/exit churn (#1554).
+fn task_stat(stat: &[u8]) -> Result<(u32, bool, u64), NamespaceError> {
     let (number, fields) = super::stat_fields(stat).map_err(|_| NamespaceError::Metadata)?;
-    let mut fields = fields.split_whitespace();
-    let state = fields.next().ok_or(NamespaceError::Metadata)?;
-    let start = fields
-        .nth(18)
+    // proc_pid_stat(5): state is field 3, flags field 9, starttime field 22.
+    let fields: Vec<&str> = fields.split_whitespace().collect();
+    let state = *fields.first().ok_or(NamespaceError::Metadata)?;
+    let flags: u32 = fields
+        .get(6)
         .ok_or(NamespaceError::Metadata)?
         .parse()
         .map_err(|_| NamespaceError::Metadata)?;
-    Ok((number, state, start))
+    let start = fields
+        .get(19)
+        .ok_or(NamespaceError::Metadata)?
+        .parse()
+        .map_err(|_| NamespaceError::Metadata)?;
+    let departed = matches!(state, "X" | "Z") || flags & PF_EXITING != 0;
+    Ok((number, departed, start))
 }
 
 fn status_id(status: &str, key: &str) -> Result<u32, NamespaceError> {
