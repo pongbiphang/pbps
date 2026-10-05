@@ -56,6 +56,23 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
             why.join("; ")
         ));
     }
+    // A partition goes with its parent (#1170): written alone it would name
+    // a parent the declarations do not have, which the whole-schema check
+    // refuses for the whole write.
+    let orphans: Vec<_> = schema
+        .tables
+        .iter()
+        .filter_map(|(name, table)| {
+            let of = table.partition_of.as_ref()?;
+            (!schema.tables.contains_key(&of.parent)).then(|| (name.clone(), of.parent.clone()))
+        })
+        .collect();
+    for (name, parent) in orphans {
+        schema.tables.remove(&name);
+        pulled.warnings.push(format!(
+            "table `{name}` was left out: it is a partition of `{parent}`, which was left out"
+        ));
+    }
 
     let refused: Vec<_> = schema
         .modules
@@ -272,9 +289,21 @@ pub(crate) fn write_declarations(
     declaration_file::refuse_folded_paths(&declaration_file::paths_of(dir, schema)?)?;
     let mut written = BTreeSet::new();
     for (name, table) in &schema.tables {
+        // A partition is written in its parent's file (#1170).
+        if table.partition_of.is_some() {
+            continue;
+        }
+        let partitions: Vec<(&pbps_model::TableName, &pbps_model::Table)> = schema
+            .tables
+            .iter()
+            .filter(|(_, t)| t.partition_of.as_ref().is_some_and(|p| &p.parent == name))
+            .collect();
         let path = declaration_file::path(dir, name, None)?;
-        std::fs::write(&path, pbps_load::render(name, table, &[], None))
-            .with_context(|| format!("cannot write `{}`", path.display()))?;
+        std::fs::write(
+            &path,
+            pbps_load::render_partitioned(name, table, &partitions, &[], None),
+        )
+        .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
     }
     // Modules go into files of their own, named for the kind as well as the
@@ -489,6 +518,43 @@ mod tests {
             "{warned}"
         );
         assert_eq!(pulled.warnings.len(), 2, "{warned}");
+    }
+
+    /// A partition goes with a parent validation refuses, named, rather than
+    /// being written alone and refused with every other file (#1170).
+    #[test]
+    fn a_partition_is_left_out_with_its_parent() {
+        let mut pulled = Pulled::default();
+        let s = &mut pulled.schema;
+        let mut parent = table("integer", None);
+        parent.partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["id".into()],
+        });
+        s.tables
+            .insert(TableName::new("$user", "p"), parent.clone());
+        s.tables.insert(TableName::new("app", "kept"), parent);
+        for (name, of) in [("p_rest", ("$user", "p")), ("kept_rest", ("app", "kept"))] {
+            s.tables.insert(
+                TableName::new("app", name),
+                pbps_model::Table {
+                    partition_of: Some(pbps_model::PartitionOf {
+                        parent: TableName::new(of.0, of.1),
+                        bound: pbps_model::PartitionBound::Default,
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+
+        leave_out_what_validate_refuses(&mut pulled, pg().as_ref());
+
+        let kept: Vec<String> = pulled.schema.tables.keys().map(|n| n.to_string()).collect();
+        assert_eq!(kept, ["app.kept", "app.kept_rest"]);
+        let warned = pulled.warnings.join("\n");
+        assert!(
+            warned.contains("table `app.p_rest` was left out: it is a partition of `$user.p`"),
+            "{warned}"
+        );
     }
 
     /// A grant is judged by what removing it fixes. Validated on its own,

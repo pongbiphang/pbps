@@ -1659,6 +1659,10 @@ pub(crate) fn declaration_problems(
     for problem in pbps_dialect::check_history_names(schema, dialect) {
         out.push(("schema.name-collision", problem));
     }
+    // And a partition's parent and bound (#1170).
+    for problem in pbps_dialect::check_partitions(schema) {
+        out.push(("dialect.rejected", problem));
+    }
     // And a trigger the engine refuses on a system-versioned table (#1176).
     for problem in pbps_dialect::check_system_time_triggers(schema, dialect) {
         out.push(("dialect.rejected", problem));
@@ -2149,8 +2153,16 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                     t.intents.iter().cloned().partition(|i| {
                         !pbps_diff::intent_is_absorbed(i, &ids, RenameSource::of(i, &declared))
                     });
+                let partitions: Vec<(&TableName, &pbps_model::Table)> =
+                    t.partitions.iter().map(|(n, p)| (n, p)).collect();
                 (
-                    pbps_load::render(&t.name, &t.table, &pending, t.strategy.as_ref()),
+                    pbps_load::render_partitioned(
+                        &t.name,
+                        &t.table,
+                        &partitions,
+                        &pending,
+                        t.strategy.as_ref(),
+                    ),
                     absorbed,
                 )
             }

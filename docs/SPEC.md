@@ -265,6 +265,19 @@ indexes:
   is created whole, and the one change it takes is a nullable column, which
   the engine adds to its history too; every other change is refused by name.
   PostgreSQL refuses `system_time` (DEC-1176.1, DEC-1177.1).
+- **`partition_by: [ts]` makes a PostgreSQL table RANGE-partitioned** over
+  those columns, and `partitions:` declares each partition in the parent's
+  file: `name: {from: [...], to: [...]}` with one value per key column, each a
+  quoted value, `MINVALUE` or `MAXVALUE`, or `name: default`. A partition in
+  another schema is named qualified. A partition is a table of its own, with
+  an identity, and declares nothing else: its columns, keys and indexes are its
+  parent's. A bound value is written as the engine prints it, and a connected
+  command refuses any other spelling with the engine's. A tree is created
+  whole; every other change to a partitioned table or a partition, a partition
+  added under an existing parent included, is refused by name until #1171. A
+  partition the database has and the declarations do not is refused with the
+  commands that adopt it. `data:` beside a tree, and partitioning on SQL Server,
+  are refused (DEC-1170.1).
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

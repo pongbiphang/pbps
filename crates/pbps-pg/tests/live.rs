@@ -44,7 +44,7 @@ async fn the_pull_keeps_project_ledger_names_beside_the_real_ledger() {
          CREATE TABLE app.__pbps_state (id integer PRIMARY KEY);
          CREATE TABLE app.__pbps_lock (id integer REFERENCES app.__pbps_state(id));
          CREATE TABLE app.__pbps_customers (id integer);
-         CREATE TABLE limited.__pbps_state (id integer) PARTITION BY RANGE (id);
+         CREATE TABLE limited.__pbps_state (id integer) PARTITION BY LIST (id);
          CREATE FUNCTION app.ledger185_fn() RETURNS trigger LANGUAGE plpgsql
              AS $$ BEGIN RETURN NEW; END $$;
          CREATE TRIGGER ledger185_trigger BEFORE INSERT ON app.__pbps_state
@@ -2144,7 +2144,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              CREATE TABLE {s}.referring (
                  a integer, CONSTRAINT referring_fk FOREIGN KEY (a)
                      REFERENCES {s}.referenced (a));
-             CREATE TABLE {s}.parted (id integer, at date) PARTITION BY RANGE (at);
+             CREATE TABLE {s}.parted (id integer, at date) PARTITION BY LIST (at);
              CREATE TABLE {s}.ancestor (a integer, b integer);
              CREATE TABLE {s}.descendant (c integer) INHERITS ({s}.ancestor);
              CREATE TABLE {s}.__pbps_state (id integer);
@@ -3670,6 +3670,288 @@ async fn array_columns_round_trip_and_widen_their_elements() {
 
     drop_schema(&mut target, &s).await;
     target.drop().await;
+}
+
+/// A RANGE partition tree whose partitions are its parent's and nothing else
+/// is read with them, rebuilt from the declaration alone, and routes rows as
+/// it did; a tree with anything else in any table is left out whole and
+/// named (#1170). On 16 and 18, whose catalogs differ in NOT NULL rows and in
+/// the names of a foreign key's clones.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn range_partition_trees_round_trip_whole_or_not_at_all() {
+    use pbps_model::{BoundDatum, PartitionBound, PartitionOf};
+
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
+    for connection in [conn_str(), old] {
+        // A database of its own on each server: the pull reads the whole
+        // catalog in one snapshot, and the suite's other tests change the
+        // shared one while it does.
+        let database = format!("pbps_test_part1170_{}", std::process::id());
+        let mut admin = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+        admin
+            .execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+            .await
+            .expect("clear a database left by an earlier run");
+        admin
+            .execute(&format!("CREATE DATABASE {database}"))
+            .await
+            .expect("create the database");
+        let own = connection.replace("dbname=pbps_test", &format!("dbname={database}"));
+        assert_ne!(
+            own, connection,
+            "the fixture names its database `pbps_test`"
+        );
+        let mut conn = Conn::connect(Driver::Postgres, &own).await.unwrap();
+        let s = emit_schema("part1170");
+        let x = format!("{s}_x");
+        fresh(&mut conn, &s).await;
+        fresh(&mut conn, &x).await;
+        let trees = format!(
+            "CREATE TABLE {s}.ev (id integer NOT NULL, ts date NOT NULL DEFAULT '2025-01-01',
+                 v text CHECK (v <> ''), PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+             CREATE INDEX ev_v ON {s}.ev (v);
+             CREATE TABLE {s}.ev_old PARTITION OF {s}.ev
+                 FOR VALUES FROM (MINVALUE) TO ('2025-01-01');
+             CREATE TABLE {s}.ev_2025 PARTITION OF {s}.ev
+                 FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+             CREATE TABLE {x}.ev_2026 PARTITION OF {s}.ev
+                 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+             CREATE TABLE {s}.ev_rest PARTITION OF {s}.ev DEFAULT;
+             CREATE TABLE {s}.m (a integer NOT NULL, b integer NOT NULL, note text)
+                 PARTITION BY RANGE (a, b);
+             CREATE TABLE {s}.m_low PARTITION OF {s}.m
+                 FOR VALUES FROM (MINVALUE, MINVALUE) TO (-5, 0);
+             CREATE TABLE {s}.m_mid PARTITION OF {s}.m
+                 FOR VALUES FROM (-5, 0) TO (10, MAXVALUE);
+             CREATE TABLE {s}.r (id integer PRIMARY KEY, ev_id integer, ev_ts date,
+                 CONSTRAINT r_ev FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.ev (id, ts));"
+        );
+        conn.execute(&trees).await.expect("the held trees");
+        // Each of these is a tree pbps does not hold, for one reason each.
+        conn.execute(&format!(
+            "CREATE TABLE {s}.att (id integer NOT NULL, ts date NOT NULL DEFAULT '2025-01-01')
+                 PARTITION BY RANGE (ts);
+             CREATE TABLE {s}.att_1 (ts date NOT NULL, id integer NOT NULL);
+             ALTER TABLE {s}.att ATTACH PARTITION {s}.att_1
+                 FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+             CREATE TABLE {s}.ex (x integer) PARTITION BY RANGE ((x + 1));
+             CREATE TABLE {s}.own (x integer) PARTITION BY RANGE (x);
+             CREATE TABLE {s}.own_1 PARTITION OF {s}.own FOR VALUES FROM (0) TO (10);
+             CREATE INDEX own_1_x ON {s}.own_1 (x);
+             CREATE TABLE {s}.nest (x integer, y integer) PARTITION BY RANGE (x);
+             CREATE TABLE {s}.nest_1 PARTITION OF {s}.nest
+                 FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (y);
+             CREATE TABLE {s}.lst (x integer) PARTITION BY LIST (x);
+             CREATE TABLE {s}.granted (x integer) PARTITION BY RANGE (x);
+             CREATE TABLE {s}.granted_1 PARTITION OF {s}.granted FOR VALUES FROM (0) TO (10);
+             GRANT SELECT ON {s}.granted_1 TO PUBLIC;"
+        ))
+        .await
+        .expect("the trees left out");
+
+        let pulled = pbps_pg::catalog::introspect(&mut conn).await.expect("pull");
+        let mut held = Schema::default();
+        for (name, table) in &pulled.schema.tables {
+            if name.schema == s || name.schema == x {
+                held.tables.insert(name.clone(), table.clone());
+            }
+        }
+        let t = |schema: &str, name: &str| TableName::new(schema, name);
+        let ev = &held.tables[&t(&s, "ev")];
+        assert_eq!(
+            ev.partition_by.as_ref().map(|p| p.columns.clone()),
+            Some(vec!["ts".to_owned()])
+        );
+        assert_eq!(ev.columns.len(), 3);
+        assert!(ev.columns["ts"].default.is_some());
+        assert!(ev.primary_key.is_some());
+        assert_eq!(ev.checks.len(), 1);
+        assert_eq!(ev.indexes.len(), 1, "{:?}", ev.indexes);
+        let partition = |parent: &TableName, bound: PartitionBound| pbps_model::Table {
+            partition_of: Some(PartitionOf {
+                parent: parent.clone(),
+                bound,
+            }),
+            ..Default::default()
+        };
+        let value = |v: &str| BoundDatum::Value(v.to_owned());
+        let range = |from: Vec<BoundDatum>, to: Vec<BoundDatum>| PartitionBound::Range { from, to };
+        let (ev_name, m_name) = (t(&s, "ev"), t(&s, "m"));
+        for (name, expected) in [
+            (
+                t(&s, "ev_old"),
+                partition(
+                    &ev_name,
+                    range(vec![BoundDatum::MinValue], vec![value("2025-01-01")]),
+                ),
+            ),
+            (
+                t(&s, "ev_2025"),
+                partition(
+                    &ev_name,
+                    range(vec![value("2025-01-01")], vec![value("2026-01-01")]),
+                ),
+            ),
+            (
+                t(&x, "ev_2026"),
+                partition(
+                    &ev_name,
+                    range(vec![value("2026-01-01")], vec![value("2027-01-01")]),
+                ),
+            ),
+            (
+                t(&s, "ev_rest"),
+                partition(&ev_name, PartitionBound::Default),
+            ),
+            (
+                t(&s, "m_low"),
+                partition(
+                    &m_name,
+                    range(
+                        vec![BoundDatum::MinValue, BoundDatum::MinValue],
+                        vec![value("-5"), value("0")],
+                    ),
+                ),
+            ),
+            (
+                t(&s, "m_mid"),
+                partition(
+                    &m_name,
+                    range(
+                        vec![value("-5"), value("0")],
+                        vec![value("10"), BoundDatum::MaxValue],
+                    ),
+                ),
+            ),
+        ] {
+            assert_eq!(held.tables.get(&name), Some(&expected), "{name}");
+        }
+        // Nothing held is also named: a clone dropped as unreadable would be a
+        // limitation on its table, which refuses every command on it.
+        let named: Vec<String> = pulled
+            .limitations
+            .iter()
+            .map(|l| l.target.object_name().to_string())
+            .collect();
+        for name in held.tables.keys() {
+            assert!(
+                !named.contains(&name.to_string()),
+                "{name}: {:?}",
+                pulled.limitations
+            );
+        }
+        // The foreign key, once: its clones to each partition are the engine's.
+        let r = &held.tables[&t(&s, "r")];
+        assert_eq!(r.foreign_keys.keys().collect::<Vec<_>>(), ["r_ev"]);
+        for name in [
+            "att",
+            "att_1",
+            "ex",
+            "own",
+            "own_1",
+            "nest",
+            "nest_1",
+            "lst",
+            "granted",
+            "granted_1",
+        ] {
+            assert!(!held.tables.contains_key(&t(&s, name)), "{name} is held");
+            assert!(
+                pulled
+                    .limitations
+                    .iter()
+                    .any(|l| l.target.object_name().to_string() == format!("{s}.{name}")),
+                "{name} is not named: {:?}",
+                pulled.limitations
+            );
+        }
+
+        // A declared bound the engine spells otherwise, or cannot read, is
+        // named with the engine's spelling before anything is written.
+        let mut misspelt = held.clone();
+        for (name, to) in [("ev_2025", "2026-1-1"), ("ev_old", "2025-13-01")] {
+            if let Some(PartitionOf {
+                bound: PartitionBound::Range { to: end, .. },
+                ..
+            }) = &mut misspelt.tables.get_mut(&t(&s, name)).unwrap().partition_of
+            {
+                end[0] = value(to);
+            }
+        }
+        let found = pbps_pg::catalog::misspelt(&mut conn, &misspelt, &Default::default())
+            .await
+            .expect("ask");
+        let mut bounds: Vec<_> = found
+            .bounds
+            .iter()
+            .map(|b| {
+                (
+                    b.partition.name.as_str(),
+                    b.declared.as_str(),
+                    b.canonical.as_deref(),
+                )
+            })
+            .collect();
+        bounds.sort();
+        assert_eq!(
+            bounds,
+            [
+                ("ev_2025", "2026-1-1", Some("2026-01-01")),
+                ("ev_old", "2025-13-01", None)
+            ]
+        );
+        let clean = pbps_pg::catalog::misspelt(&mut conn, &held, &Default::default())
+            .await
+            .expect("ask");
+        assert!(clean.bounds.is_empty(), "{:?}", clean.bounds);
+
+        // Rebuilt from the declaration alone: the same tree, routing rows the
+        // same way, and nothing left to plan.
+        let ids = mint_ids(&held, &IdsFile::default(), &[]);
+        fresh(&mut conn, &s).await;
+        fresh(&mut conn, &x).await;
+        apply(
+            &mut conn,
+            &Postgres::new(),
+            &plan(&Schema::default(), &IdsFile::default(), &held, &ids),
+        )
+        .await;
+        let rebuilt = pbps_pg::catalog::introspect(&mut conn)
+            .await
+            .expect("read back");
+        let mut back = Schema::default();
+        for (name, table) in &rebuilt.schema.tables {
+            if name.schema == s || name.schema == x {
+                back.tables.insert(name.clone(), table.clone());
+            }
+        }
+        assert_eq!(back, held);
+        assert!(plan(&back, &ids, &held, &ids).is_empty());
+        conn.execute(&format!(
+            "INSERT INTO {s}.ev (id, ts) VALUES (1, '2024-06-01'), (2, '2026-06-01'),
+                 (3, '2030-01-01')"
+        ))
+        .await
+        .expect("route the rows");
+        let routed = conn
+            .query(&format!(
+                "SELECT string_agg(tableoid::regclass::text, ',' ORDER BY id) AS r FROM {s}.ev"
+            ))
+            .await
+            .unwrap()[0]
+            .try_get::<&str>("r")
+            .unwrap()
+            .unwrap()
+            .to_owned();
+        assert_eq!(routed, format!("{s}.ev_old,{x}.ev_2026,{s}.ev_rest"));
+
+        drop(conn);
+        admin
+            .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .await
+            .expect("drop the database");
+    }
 }
 
 /// Emits and executes every change of a plan, in plan order.

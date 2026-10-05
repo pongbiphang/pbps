@@ -171,6 +171,92 @@ fn generation_problems(column: &str, declared: &pbps_model::Column) -> Vec<Diale
     found
 }
 
+/// What a RANGE-partitioned parent and its partitions must be (#1170,
+/// DEC-1170.1): a key over declared columns, which every key and UNIQUE
+/// constraint includes (the engine refuses one that does not); a partition
+/// that declares nothing of its own, since it inherits all of it and the
+/// first slice holds no partition-level extra (#1532); and no `data:` on
+/// either, whose rows the engine routes by bound.
+fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
+    let invalid = |message: String| DialectError::Invalid {
+        dialect: crate::types::DIALECT,
+        message,
+    };
+    let mut found = Vec::new();
+    if let Some(by) = &table.partition_by {
+        if by.columns.is_empty() {
+            found.push(invalid("`partition_by` names no column".to_owned()));
+        }
+        // What the reader leaves a tree out over, so that a parent pbps
+        // creates is one it reads back (DEC-1170.1).
+        if !table.storage_parameters.is_empty()
+            || table.unlogged
+            || table.replica_identity.is_some()
+        {
+            found.push(invalid(
+                "a partitioned table takes no `storage_parameters`, `unlogged` or \
+                 `replica_identity` yet"
+                    .to_owned(),
+            ));
+        }
+        for column in &by.columns {
+            if !table.columns.contains_key(column) {
+                found.push(invalid(format!(
+                    "`partition_by` names `{column}`, which is not a declared column"
+                )));
+            }
+        }
+        let keys = table
+            .primary_key
+            .iter()
+            .map(|k| ("the primary key".to_owned(), &k.columns))
+            .chain(
+                table
+                    .unique
+                    .iter()
+                    .map(|(n, u)| (format!("unique constraint `{n}`"), &u.columns)),
+            );
+        for (what, columns) in keys {
+            for key in &by.columns {
+                if !columns.contains(key) {
+                    found.push(invalid(format!(
+                        "{what} does not include the partition key column `{key}`, which \
+                         PostgreSQL requires of every key on a partitioned table"
+                    )));
+                }
+            }
+        }
+    }
+    if table.partition_of.is_some() {
+        let own = !table.columns.is_empty()
+            || !table.computed.is_empty()
+            || table.primary_key.is_some()
+            || !table.unique.is_empty()
+            || !table.foreign_keys.is_empty()
+            || !table.checks.is_empty()
+            || !table.indexes.is_empty()
+            || table.clustered.is_some()
+            || table.replica_identity.is_some()
+            || !table.storage_parameters.is_empty()
+            || table.unlogged
+            || table.system_time.is_some()
+            || table.partition_by.is_some();
+        if own {
+            found.push(invalid(
+                "a partition declares nothing of its own: its columns, keys and indexes are \
+                 its parent's"
+                    .to_owned(),
+            ));
+        }
+    }
+    if table.data.is_some() && (table.partition_by.is_some() || table.partition_of.is_some()) {
+        found.push(invalid(
+            "`data:` cannot be declared on a partitioned table or a partition yet".to_owned(),
+        ));
+    }
+    found
+}
+
 fn identity_problems(column: &str, declared: &pbps_model::Column) -> Vec<DialectError> {
     let Some(identity) = declared.identity else {
         return Vec::new();
@@ -622,6 +708,7 @@ impl Dialect for Postgres {
                 }
             }
         }
+        found.extend(partition_problems(table));
         // SQL Server's (#1176). PostgreSQL has no system-versioned table.
         if table.system_time.is_some() {
             found.push(DialectError::Invalid {
@@ -1212,6 +1299,88 @@ fn generated_name(name1: &str, name2: Option<&str>, label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn partitioned(columns: &[&str], key: &[&str]) -> pbps_model::Table {
+        let mut table = pbps_model::Table::default();
+        for c in columns {
+            let mut column = pbps_model::Column::new("integer".parse().unwrap());
+            column.nullable = false;
+            table.columns.insert((*c).into(), column);
+        }
+        table.partition_by = Some(pbps_model::PartitionBy {
+            columns: key.iter().map(|c| (*c).to_owned()).collect(),
+        });
+        table
+    }
+
+    fn problems(table: &pbps_model::Table) -> Vec<String> {
+        use pbps_dialect::Dialect;
+        super::Postgres::default()
+            .validate_table(&"app.t".parse().unwrap(), table)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// A partitioned parent and its partitions hold what the reader reads
+    /// back and nothing more (#1170): a key over declared columns that every
+    /// key includes, a partition that declares nothing, and no `data:` or
+    /// setting the reader would leave the tree out over.
+    #[test]
+    fn a_partition_tree_declares_only_what_is_read_back() {
+        let mut ok = partitioned(&["id", "ts"], &["ts"]);
+        ok.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".into(), "ts".into()],
+            storage_parameters: Default::default(),
+        });
+        assert!(problems(&ok).is_empty(), "{:?}", problems(&ok));
+        let partition = pbps_model::Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: "app.p".parse().unwrap(),
+                bound: pbps_model::PartitionBound::Default,
+            }),
+            ..Default::default()
+        };
+        assert!(problems(&partition).is_empty());
+
+        let mut cases: Vec<(&str, pbps_model::Table)> = Vec::new();
+        cases.push(("names no column", partitioned(&["id"], &[])));
+        cases.push(("not a declared column", partitioned(&["id"], &["ts"])));
+        let mut key = ok.clone();
+        key.primary_key.as_mut().unwrap().columns = vec!["id".into()];
+        cases.push(("does not include the partition key", key));
+        let mut unlogged = ok.clone();
+        unlogged.unlogged = true;
+        cases.push(("takes no `storage_parameters`", unlogged));
+        let mut identity = ok.clone();
+        identity.replica_identity = Some(pbps_model::ReplicaIdentity::Full);
+        cases.push(("takes no `storage_parameters`", identity));
+        let mut rows = ok.clone();
+        rows.data = Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Exact,
+            rows: Default::default(),
+        });
+        cases.push(("`data:` cannot be declared", rows));
+        let mut own = partition.clone();
+        own.columns.insert(
+            "x".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+        cases.push(("declares nothing of its own", own));
+        let mut nested = partition.clone();
+        nested.partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["x".into()],
+        });
+        cases.push(("declares nothing of its own", nested));
+        for (expected, table) in cases {
+            let found = problems(&table);
+            assert!(
+                found.iter().any(|p| p.contains(expected)),
+                "{expected}: {found:?}"
+            );
+        }
+    }
+
     /// A computed column is SQL Server's in this model, and refused on
     /// PostgreSQL by name, where a generated column is the form (#1174).
     #[test]

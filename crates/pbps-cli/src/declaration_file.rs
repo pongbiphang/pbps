@@ -173,7 +173,12 @@ pub fn paths_of(
     schema: &pbps_model::Schema,
 ) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let mut out = Vec::new();
-    for name in schema.tables.keys() {
+    // A partition is written in its parent's file, not one of its own
+    // (#1170).
+    for (name, table) in &schema.tables {
+        if table.partition_of.is_some() {
+            continue;
+        }
         out.push((name.to_string(), path(directory, &name.clone(), None)?));
     }
     for (id, module) in &schema.modules {

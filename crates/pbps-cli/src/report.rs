@@ -658,9 +658,37 @@ pub fn rehearsal(r: &crate::dev::Rehearsal) -> String {
 
 pub fn describe(c: &Change) -> String {
     match c {
-        Change::CreateTable { name, table, .. } => {
-            format!("+ create table {name} ({} columns)", table.columns.len())
-        }
+        // A partition has no columns of its own to count; what it is, is its
+        // parent and the rows it takes (#1170).
+        Change::CreateTable { name, table, .. } => match &table.partition_of {
+            Some(of) => match &of.bound {
+                pbps_model::PartitionBound::Default => {
+                    format!(
+                        "+ create table {name}, the default partition of {}",
+                        of.parent
+                    )
+                }
+                pbps_model::PartitionBound::Range { from, to } => {
+                    let list = |data: &[pbps_model::BoundDatum]| {
+                        data.iter()
+                            .map(|d| match d {
+                                pbps_model::BoundDatum::Value(v) => format!("{v:?}"),
+                                end @ (pbps_model::BoundDatum::MinValue
+                                | pbps_model::BoundDatum::MaxValue) => end.to_string(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    format!(
+                        "+ create table {name}, a partition of {} for rows from ({}) to ({})",
+                        of.parent,
+                        list(from),
+                        list(to)
+                    )
+                }
+            },
+            None => format!("+ create table {name} ({} columns)", table.columns.len()),
+        },
         Change::DropTable { name, .. } => format!("- drop table {name}"),
         Change::RenameTable { from, to, .. } => format!("~ rename table {from} -> {to}"),
         Change::AddColumn { name, column, .. } => {
@@ -939,6 +967,40 @@ pub fn env_arg(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A partition is described by its parent and the rows it takes, not by
+    /// the columns it has none of (#1170); an ordinary table by its columns.
+    #[test]
+    fn a_created_partition_is_described_by_its_parent_and_bound() {
+        use pbps_model::{BoundDatum as D, Change, PartitionBound as B};
+        let create = |bound: Option<B>| Change::CreateTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            name: "app.p1".parse().unwrap(),
+            table: Box::new(pbps_model::Table {
+                partition_of: bound.map(|bound| pbps_model::PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound,
+                }),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            super::describe(&create(Some(B::Range {
+                from: vec![D::MinValue, D::Value("2025-01-01".into())],
+                to: vec![D::Value("it's".into()), D::MaxValue],
+            }))),
+            "+ create table app.p1, a partition of app.ev for rows from (MINVALUE, \"2025-01-01\") \
+             to (\"it's\", MAXVALUE)"
+        );
+        assert_eq!(
+            super::describe(&create(Some(B::Default))),
+            "+ create table app.p1, the default partition of app.ev"
+        );
+        assert_eq!(
+            super::describe(&create(None)),
+            "+ create table app.p1 (0 columns)"
+        );
+    }
+
     #[test]
     fn intent_reports_describe_the_operation_without_inventing_its_source() {
         use pbps_model::Intent;

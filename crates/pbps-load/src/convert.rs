@@ -29,6 +29,9 @@ pub struct LoadedTable {
     /// `None` when the file declares no `strategy:` block. Kept out of `table`
     /// so that `Schema` equality stays a question about the database alone.
     pub strategy: Option<Strategy>,
+    /// The partitions this file declares under its table (#1170): each a
+    /// table of its own, in the parent's schema unless named otherwise.
+    pub partitions: Vec<(TableName, Table)>,
 }
 
 /// The result of loading one module declaration.
@@ -469,6 +472,74 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
         })
     });
 
+    let partition_by = dto
+        .partition_by
+        .map(|columns| pbps_model::PartitionBy { columns });
+    let mut partitions = Vec::new();
+    if partition_by.is_none() && !dto.partitions.is_empty() {
+        errs.push(LoadError::semantic(
+            src,
+            to_span(&dto.table.defined),
+            "`partitions:` is declared without `partition_by:`",
+            "a partition needs its parent's key",
+        ));
+    }
+    if let Some(parent) = &name {
+        for (child, partition) in dto.partitions {
+            let child_name = if child.contains('.') {
+                match TableName::from_str(&child) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        errs.push(LoadError::semantic(
+                            src,
+                            to_span(&dto.table.defined),
+                            format!("invalid partition name `{child}`: {e}"),
+                            "not a partition name",
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                TableName::new(parent.schema.clone(), child.clone())
+            };
+            let datum = |v: crate::dto::BoundValueDto| match v {
+                crate::dto::BoundValueDto::Text(t) => pbps_model::BoundDatum::declared(&t),
+                crate::dto::BoundValueDto::Int(i) => pbps_model::BoundDatum::Value(i.to_string()),
+            };
+            let bound = match partition {
+                crate::dto::PartitionDto::Default(word) if word.eq_ignore_ascii_case("default") => {
+                    pbps_model::PartitionBound::Default
+                }
+                crate::dto::PartitionDto::Default(word) => {
+                    errs.push(LoadError::semantic(
+                        src,
+                        to_span(&dto.table.defined),
+                        format!(
+                            "partition `{child}` is `{word}`: write `default`, or a mapping of \
+                             `from:` and `to:`"
+                        ),
+                        "not a partition bound",
+                    ));
+                    continue;
+                }
+                crate::dto::PartitionDto::Range(r) => pbps_model::PartitionBound::Range {
+                    from: r.from.into_iter().map(datum).collect(),
+                    to: r.to.into_iter().map(datum).collect(),
+                },
+            };
+            partitions.push((
+                child_name,
+                Table {
+                    partition_of: Some(pbps_model::PartitionOf {
+                        parent: parent.clone(),
+                        bound,
+                    }),
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+
     match (name, errs.is_empty()) {
         (Some(name), true) => Ok(LoadedTable {
             name,
@@ -510,9 +581,12 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                 storage_parameters,
                 unlogged: dto.unlogged,
                 system_time,
+                partition_by,
+                partition_of: None,
             },
             intents,
             strategy: dto.strategy.map(|s| Strategy { online: s.online }),
+            partitions,
         }),
         _ => Err(errs),
     }

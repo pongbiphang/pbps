@@ -2848,7 +2848,44 @@ fn no_clustered_layout(table: &TableName) -> DialectError {
     ))
 }
 
+/// A RANGE partition's bound clause: `DEFAULT`, or `FOR VALUES FROM (…) TO
+/// (…)` with each value as a literal the session cannot reinterpret, which
+/// the engine converts to its key column's type (#1170).
+fn bound_clause(bound: &pbps_model::PartitionBound) -> String {
+    let list = |data: &[pbps_model::BoundDatum]| {
+        data.iter()
+            .map(|d| match d {
+                pbps_model::BoundDatum::MinValue => "MINVALUE".to_owned(),
+                pbps_model::BoundDatum::MaxValue => "MAXVALUE".to_owned(),
+                pbps_model::BoundDatum::Value(v) => value_literal(v),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match bound {
+        pbps_model::PartitionBound::Default => "DEFAULT".to_owned(),
+        pbps_model::PartitionBound::Range { from, to } => {
+            format!("FOR VALUES FROM ({}) TO ({})", list(from), list(to))
+        }
+    }
+}
+
 fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
+    // A partition is its parent's columns, keys and indexes, which the
+    // engine gives it as it is created (#1170): one statement, after the
+    // parent's.
+    if let Some(of) = &table.partition_of {
+        return Ok(vec![on(
+            pg,
+            name,
+            &format!(
+                "CREATE TABLE {} PARTITION OF {} {} USING heap;",
+                qualified(name)?,
+                qualified(&of.parent)?,
+                bound_clause(&of.bound)
+            ),
+        )?]);
+    }
     if table.columns.is_empty() {
         return Err(invalid(format!("table `{name}` has no columns")));
     }
@@ -2891,11 +2928,25 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
         pg,
         name,
         &format!(
-            "CREATE {}TABLE {q} (\n    {}\n) USING heap{};",
+            "CREATE {}TABLE {q} (\n    {}\n){}{};",
             // Unlogged from its creation, so it is never written to the log
             // and switched after (#1443).
             if table.unlogged { "UNLOGGED " } else { "" },
             body.join(",\n    "),
+            // A partitioned parent has no storage of its own, and 16 refuses
+            // an access method on one; its partitions each say `USING heap`
+            // (#1170).
+            match &table.partition_by {
+                Some(by) => format!(
+                    " PARTITION BY RANGE ({})",
+                    by.columns
+                        .iter()
+                        .map(|c| quote(c))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .join(", ")
+                ),
+                None => " USING heap".to_owned(),
+            },
             // In the `CREATE`, so the table never exists without them (#1441).
             if table.storage_parameters.is_empty() {
                 String::new()
@@ -3679,6 +3730,79 @@ fn row_statement(
 
 #[cfg(test)]
 mod tests {
+    /// A partitioned parent is created with its key and no access method,
+    /// and a partition as one statement naming its parent and its bound,
+    /// each value a literal no session setting reinterprets (#1170).
+    #[test]
+    fn a_partition_tree_is_created_parent_then_partition() {
+        let mut parent = pbps_model::Table::default();
+        parent.columns.insert(
+            "ts".into(),
+            pbps_model::Column::new("date".parse().unwrap()),
+        );
+        parent.partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["ts".into()],
+        });
+        let create = |name: &str, table: &pbps_model::Table| {
+            Postgres::new()
+                .emit(
+                    &Change::CreateTable {
+                        uid: "t_aaaaaa".parse().unwrap(),
+                        name: name.parse().unwrap(),
+                        table: Box::new(table.clone()),
+                    },
+                    Default::default(),
+                )
+                .expect("emit")
+                .into_iter()
+                .map(|s| s.sql)
+                .collect::<Vec<_>>()
+        };
+        let sql = create("app.ev", &parent);
+        assert!(
+            sql[0].contains("\n) PARTITION BY RANGE (\"ts\");"),
+            "{sql:?}"
+        );
+        assert!(!sql[0].contains("USING"), "{sql:?}");
+        let partition = pbps_model::Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: pbps_model::PartitionBound::Range {
+                    from: vec![pbps_model::BoundDatum::MinValue],
+                    to: vec![pbps_model::BoundDatum::Value("it's".into())],
+                },
+            }),
+            ..Default::default()
+        };
+        let sql = create("app.ev_old", &partition);
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(
+            sql[0].contains(
+                "CREATE TABLE \"app\".\"ev_old\" PARTITION OF \"app\".\"ev\" FOR VALUES FROM \
+                 (MINVALUE) TO (E'it''s') USING heap;"
+            ),
+            "{sql:?}"
+        );
+        let default = pbps_model::Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: pbps_model::PartitionBound::Default,
+            }),
+            ..Default::default()
+        };
+        assert!(
+            create("app.ev_rest", &default)[0]
+                .contains("PARTITION OF \"app\".\"ev\" DEFAULT USING heap;")
+        );
+        // Negative: an ordinary table keeps `USING heap` and no key.
+        parent.partition_by = None;
+        let sql = create("app.t", &parent);
+        assert!(
+            sql[0].contains("\n) USING heap;") && !sql[0].contains("PARTITION"),
+            "{sql:?}"
+        );
+    }
+
     use super::*;
     use pbps_dialect::Dialect;
     use pbps_model::{CheckConstraint, ColumnRef, ColumnType, Identity, IndexColumn, Uid, UidKind};

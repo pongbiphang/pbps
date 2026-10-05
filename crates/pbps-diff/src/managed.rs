@@ -92,10 +92,24 @@ pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ModuleId
 
     let mut scoped = Schema::default();
     let mut unmanaged = Vec::new();
+    let mut unexpressible = Vec::new();
     for (name, table) in &schema.tables {
         if managed.contains(name) {
             scoped.tables.insert(name.clone(), table.clone());
         } else {
+            // A partition nobody declared under a parent pbps manages is not
+            // somebody else's table the way an unmanaged one is: the managed
+            // parent routes its rows into it (#1170).
+            if let Some(of) = &table.partition_of
+                && managed.contains(&of.parent)
+            {
+                unexpressible.push(format!(
+                    "{name} is a partition of the managed table {} and is not declared; declare \
+                     it with `pbps pull` and record it with `pbps baseline --reason …`, or detach \
+                     it by hand",
+                    of.parent
+                ));
+            }
             unmanaged.push(name.clone());
         }
     }
@@ -175,7 +189,7 @@ pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ModuleId
         unmanaged_modules,
         unmanaged_roles,
         missing_roles,
-        unexpressible: Vec::new(),
+        unexpressible,
         public_execute: Default::default(),
         owners: BTreeMap::new(),
         session_role: String::new(),
@@ -317,6 +331,48 @@ mod tests {
         );
         assert_eq!(scoped.unmanaged, vec![t("dbo.legacy_audit")]);
         assert!(scoped.missing.is_empty());
+    }
+
+    /// A partition of a managed parent that nobody declared is named, with
+    /// the commands that adopt it: the parent routes rows into it, so it is
+    /// not somebody else's table. A partition of an unmanaged parent is just
+    /// unmanaged, and a managed one is kept (#1170).
+    #[test]
+    fn an_undeclared_partition_of_a_managed_parent_is_named() {
+        let partition_of = |parent: &str| Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: t(parent),
+                bound: pbps_model::PartitionBound::Default,
+            }),
+            ..Default::default()
+        };
+        let mut live = schema(&["app.ev", "app.other"]);
+        live.tables.insert(t("app.ev_rest"), partition_of("app.ev"));
+        live.tables
+            .insert(t("app.other_rest"), partition_of("app.other"));
+        let scoped = scope(&live, &ids(&[("t_aaaaaa", "app.ev")]), &BTreeSet::new());
+        assert_eq!(scoped.unexpressible.len(), 1, "{:?}", scoped.unexpressible);
+        assert!(
+            scoped.unexpressible[0]
+                .contains("app.ev_rest is a partition of the managed table app.ev")
+                && scoped.unexpressible[0].contains("pbps pull")
+                && scoped.unexpressible[0].contains("pbps baseline"),
+            "{:?}",
+            scoped.unexpressible
+        );
+        assert!(scoped.unmanaged.contains(&t("app.other_rest")));
+        // Declared and recorded, it is managed like any table.
+        let scoped = scope(
+            &live,
+            &ids(&[("t_aaaaaa", "app.ev"), ("t_bbbbbb", "app.ev_rest")]),
+            &BTreeSet::new(),
+        );
+        assert!(
+            scoped.unexpressible.is_empty(),
+            "{:?}",
+            scoped.unexpressible
+        );
+        assert!(scoped.schema.tables.contains_key(&t("app.ev_rest")));
     }
 
     /// Somebody else's table is not drift. Without this the check would fire on

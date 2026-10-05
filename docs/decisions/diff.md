@@ -2267,3 +2267,90 @@ to follow its own `CREATE` directly. Putting the decision back at class 16
 fails it, and so does ranking it at 0. The pass-level behaviour is pinned by
 `public_decisions_return_beside_their_routines_final_create`, and the live
 `flow_pg` fixtures with functions created around new columns fail without it.
+
+<a id="dec-1170-1"></a>
+
+**DEC-1170.1. A PostgreSQL RANGE-partitioned table declares its key and its
+partitions in its own file; each partition is a table of the model holding
+only its parent and bound. A tree is read whole or not at all, and until
+#1171 it is created whole and never changed (#1170).**
+
+Measured on 18.6 and 16.15:
+
+- `pg_get_partkeydef` prints `RANGE (ts)`, and prints an expression, an
+  operator class or a collation when the key has one.
+- `pg_get_expr(relpartbound)` prints `DEFAULT` or `FOR VALUES FROM (…) TO
+  (…)`. Each datum is `MINVALUE`, `MAXVALUE`, a quoted literal, or an unquoted
+  number, never with a type. Unquoted, a value is its key type's `::text` under
+  the session pbps pins (`TimeZone` UTC, ISO dates), measured for `numeric`,
+  `real`, `timestamp`, `timestamptz`, `interval`, `varchar`, `uuid` and `bytea`.
+  A `timestamptz` bound prints in the session's time zone, which is why the
+  pin matters.
+- A bound value is coerced with the key column's typmod, and a value that
+  does not fit is an error, as `pg_input_is_valid` reports.
+- A partition's key and foreign-key constraints are clones (`conparentid` set),
+  and so are the foreign keys a table *referencing* the parent gets to each
+  partition (`r_fk_1` on 18, `r_p_id_p_ts_fkey1` on 16). A partition's CHECK
+  and, on 18, NOT NULL rows are inherited and not local. Its indexes are
+  attached in `pg_inherits`.
+- A table `ATTACH`ed as a partition ends with every column and constraint
+  inherited, as one created `PARTITION OF` does, but keeps its own column order
+  and none of the parent's defaults.
+
+**The model.** Leon chose each point on the issue.
+
+- `Table::partition_by` holds the key's columns. Only RANGE over plain columns
+  is held; an expression key, a key operator class or collation, LIST and HASH
+  stay limitations.
+- A partition is an ordinary entry in the schema's tables with
+  `partition_of: {parent, bound}` and nothing else. It therefore has a uid of
+  its own, which #1171 needs to follow a detach or a drop, and occupancy,
+  scope and drift treat it as the table it is. Validation refuses a partition
+  that declares anything, a grant included (#1532 relaxes that).
+- A bound value is the engine's own text, unquoted. The connected spelling
+  check asks the engine for each declared value's reading as its key column's
+  type, under the pinned session, and refuses a different one with the
+  engine's spelling. A value is never trimmed or compared as SQL.
+- Partitions are written in the parent's file under `partitions:`, in name
+  order, each value double-quoted: bare, YAML would read `0x1F` as 31 and a
+  text value `MINVALUE` as the unbounded end. The reader leaves a tree out
+  rather than hold a text bound spelled like an unbounded end.
+
+**The reader holds a tree only if rebuilding it from the declaration gives it
+back.** The parent is RANGE with a key that is its quoted column names and
+nothing else, has no access method, storage parameters, row security, rules,
+triggers or replica identity, and is permanent. Each partition is attached
+with no detach pending, an ordinary permanent heap table with none of those
+either and no grant on it or a column. Its columns are inherited and equal to
+its parent's in order, type, collation, NOT NULL, identity, generation and
+default. Every constraint is a clone or inherited, and every index attached.
+Anything else in any table of the tree, nested partitioning and a foreign
+table among them, leaves the whole tree out, every table named. So does a
+bound the reader cannot parse, and a parent left out for another reason takes
+its partitions with it. Clones are dropped by catalog parentage, never by name.
+
+**The plan.** A bootstrap creates the parent with `PARTITION BY RANGE (…)` and
+without `USING heap`, which 16 refuses on a partitioned table. Each partition
+follows as `CREATE TABLE … PARTITION OF … FOR VALUES … USING heap`, ordered
+after every parent, and the engine gives it the parent's keys and indexes.
+Every other change to a table that is partitioned or a partition on either
+side is refused by name, as `PartitionedTableChange`. That includes a
+difference in the key or a bound, which no change carries, and a partition
+created under a parent that already stands; both are #1171's to qualify. A
+change to another table, a foreign key to the parent included, is not refused.
+A partition the database has under a managed parent and the declarations do
+not is reported by the scope as something the declarations cannot express,
+with `pbps pull` and `pbps baseline` as the remedy: the parent routes rows
+into it, so it is not somebody else's table.
+
+`data:` on a partitioned table or a partition is refused in this slice, and so
+are `partition_by` and `partitions` on SQL Server.
+
+Pinned by the live `range_partition_trees_round_trip_whole_or_not_at_all` (on
+16 and 18), which fails without the clone filter, the column comparison, the
+ACL check or the bound probe; the CLI
+`a_partition_tree_round_trips_through_the_cli`, which fails without the
+undeclared-partition refusal; and the unit tests
+`a_partition_tree_is_created_whole_and_otherwise_refused`,
+`partitions_load_as_tables_and_render_back_in_the_parent_file` and
+`a_deparsed_bound_comes_apart_and_nothing_else_does`.

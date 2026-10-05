@@ -17,7 +17,7 @@ use pbps_model::{Hints, Schema, TableName};
 
 pub use convert::{LoadedModule, LoadedRole, LoadedTable};
 pub use error::{LoadError, Semantic, SourceFile};
-pub use fmt::{render, render_module, render_role};
+pub use fmt::{render, render_module, render_partitioned, render_role};
 pub use pbps_model::Intent;
 
 /// The result of loading an entire `schema/` directory.
@@ -195,6 +195,21 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
                     errs.push(already(&path, &format!("`{}`", t.name), first));
                     continue;
                 }
+                // A partition is a table too, declared in its parent's file
+                // (#1170): its name is taken there, once.
+                let mut taken = false;
+                for (child, _) in &t.partitions {
+                    if let Some(first) = seen_tables.get(child) {
+                        errs.push(already(&path, &format!("`{child}`"), first));
+                        taken = true;
+                    }
+                }
+                if taken {
+                    continue;
+                }
+                for (child, _) in &t.partitions {
+                    seen_tables.insert(child.clone(), path.clone());
+                }
                 seen_tables.insert(t.name.clone(), path);
                 LoadedFile::Table(t)
             }
@@ -227,6 +242,9 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
                     loaded.hints.strategies.insert(t.name.clone(), s);
                 }
                 loaded.schema.tables.insert(t.name, t.table);
+                for (child, table) in t.partitions {
+                    loaded.schema.tables.insert(child, table);
+                }
             }
             LoadedFile::Module(m) => {
                 let m = *m;

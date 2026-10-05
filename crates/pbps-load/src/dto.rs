@@ -384,6 +384,16 @@ pub struct TableDto {
     #[serde(default)]
     pub unlogged: bool,
 
+    /// A PostgreSQL RANGE-partitioned parent's key columns, `[ts]`.
+    #[serde(default)]
+    pub partition_by: Option<Vec<String>>,
+
+    /// The parent's partitions, by name (qualified when in another schema):
+    /// `{from: ['2025-01-01'], to: ['2026-01-01']}`, `MINVALUE`/`MAXVALUE`
+    /// for an unbounded end, or `default`.
+    #[serde(default)]
+    pub partitions: IndexMap<String, PartitionDto>,
+
     /// SQL Server `PERIOD FOR SYSTEM_TIME` and system versioning:
     /// `{period: [valid_from, valid_to], hidden: true, versioning: {history:
     /// dbo.orders_history, retention: 6 months}}`. Absent is an ordinary
@@ -574,6 +584,86 @@ macro_rules! list_or_spec {
         }
     };
 }
+// Read by hand rather than `#[serde(untagged)]`, for the reason
+// `list_or_spec!` is: buffered first, a bound value would be matched as
+// whatever YAML type it buffered as, and the error would name no variant.
+
+/// A RANGE partition's bound: `default`, or `{from: [...], to: [...]}` with one
+/// value per key column.
+#[derive(Debug, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum PartitionDto {
+    /// `default`.
+    Default(String),
+    Range(PartitionRangeDto),
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionRangeDto {
+    pub from: Vec<BoundValueDto>,
+    pub to: Vec<BoundValueDto>,
+}
+
+impl<'de> serde::Deserialize<'de> for PartitionDto {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = PartitionDto;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("`default`, or a mapping of `from:` and `to:`")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PartitionDto, E> {
+                Ok(PartitionDto::Default(v.to_owned()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<PartitionDto, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(PartitionDto::Range)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// One key column's end of a range: a value as text or a whole number, or
+/// `MINVALUE`/`MAXVALUE`. Not a decimal or a boolean, whose YAML reading is
+/// not the text the engine prints: quote those.
+#[derive(Debug, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum BoundValueDto {
+    Text(String),
+    Int(i64),
+}
+
+impl<'de> serde::Deserialize<'de> for BoundValueDto {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = BoundValueDto;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "a bound value: text, a whole number, MINVALUE or MAXVALUE (quote a decimal)",
+                )
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<BoundValueDto, E> {
+                Ok(BoundValueDto::Text(v.to_owned()))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<BoundValueDto, E> {
+                Ok(BoundValueDto::Int(v))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<BoundValueDto, E> {
+                i64::try_from(v)
+                    .map(BoundValueDto::Int)
+                    .map_err(|_| E::custom("a bound value out of range: quote it"))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 list_or_spec!(
     PrimaryKeyDto,
     PrimaryKeySpecDto,
@@ -771,9 +861,11 @@ pub enum IndexOrder {
 #[serde(untagged)]
 #[schemars(title = "pbps declaration")]
 pub enum DeclarationFile {
-    Table(TableDto),
-    Module(ModuleDto),
-    Role(RoleDto),
+    // Boxed for their sizes: the enum is only ever a schema, and a box is
+    // transparent to it.
+    Table(Box<TableDto>),
+    Module(Box<ModuleDto>),
+    Role(Box<RoleDto>),
 }
 
 #[cfg(test)]

@@ -513,6 +513,12 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
             errs.push(e);
         }
     }
+    if table.partition_by.is_some() || table.partition_of.is_some() {
+        errs.push(invalid(
+            "`partition_by` and `partitions` are PostgreSQL's range partitioning; SQL Server's \
+             partitioning is not modelled, so remove them",
+        ));
+    }
     if let Some(st) = &table.system_time {
         errs.extend(system_time(name, table, st));
     }
@@ -1267,6 +1273,42 @@ mod tests {
             refused.iter().any(|m| m.contains("`replica_identity`")),
             "{refused:?}"
         );
+    }
+
+    /// Range partitioning is PostgreSQL's in this model, and refused on SQL
+    /// Server by name, on a parent and on a partition (#1170).
+    #[test]
+    fn range_partitioning_is_refused_on_sql_server() {
+        let found = |t: &Table| {
+            super::table(&"dbo.t".parse().unwrap(), t)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        let mut parent = Table::default();
+        parent
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        assert!(found(&parent).is_empty());
+        parent.partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["a".into()],
+        });
+        let partition = Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: "dbo.p".parse().unwrap(),
+                bound: pbps_model::PartitionBound::Default,
+            }),
+            ..Default::default()
+        };
+        for t in [&parent, &partition] {
+            let refused = found(t);
+            assert!(
+                refused
+                    .iter()
+                    .any(|m| m.contains("`partition_by` and `partitions`")),
+                "{refused:?}"
+            );
+        }
     }
 
     /// Storage parameters are PostgreSQL's, and are refused on SQL Server by

@@ -182,7 +182,11 @@ use crate::schema::Schema;
 ///
 /// Bumped to 24 for PostgreSQL array columns (DEC-1167.1): a column's type may
 /// be `T[]`, which an older build cannot parse.
-pub const CURRENT_VERSION: u32 = 24;
+///
+/// Bumped to 25 for PostgreSQL range partitions (DEC-1170.2): a created
+/// table's `partition_by` or `partition_of`, which an older build would drop
+/// and create an ordinary table.
+pub const CURRENT_VERSION: u32 = 25;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -641,7 +645,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 24);
+        assert_eq!(CURRENT_VERSION, 25);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads
