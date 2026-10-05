@@ -1367,3 +1367,28 @@ cleanup was not confirmed. The supplied path does not retry a server that is
 still settling into exclusivity; that refusal is the profile being
 unavailable. Connected planning does not call `produce` yet: #1515 adds lazy
 acquisition.
+
+<a id="dec-1540-1"></a>
+
+**DEC-1540.1. The daemon socket check reads the descriptor that held the socket last time first, and only its naming the socket answers yes.**
+
+RESOLVER-RUNTIME checks the daemon's ownership of the accepted socket on every
+API request and every poll of an attach stream. One resolver run checks it
+about 17,000 times. Each check read dockerd's whole descriptor table, about 60
+entries on a CI runner: one run spent 5.7 s of its 25 s there (#1540).
+
+Checking less often was the obvious saving. It would change the premise:
+traffic would no longer be checked on every poll. Instead, each check reads
+first the descriptor number that held the socket last time.
+
+- If that descriptor still names the socket, the daemon holds it, which is
+  the same yes the whole table would give.
+- Any other reading of it falls back to the whole table, as before. That
+  covers a closed descriptor, or a number reused for something else.
+- The table also finds a socket the daemon moved to another descriptor, and
+  that descriptor is remembered next.
+
+The remembered number is never an answer by itself.
+
+The process checks around the read, and the sock_diag peer check, are
+unchanged.

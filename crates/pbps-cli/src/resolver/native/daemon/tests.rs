@@ -185,3 +185,61 @@ fn kernel_diagnostics_reject_truncation_wrong_identity_and_duplicate_peers() {
     duplicate[..4].copy_from_slice(&(48_u32.to_ne_bytes()));
     assert!(parse_peer(&duplicate, 77, 81, 91).is_err());
 }
+
+/// The descriptor that held the socket is a witness only while it still
+/// names it (#1540). A child plays the daemon, holding one end of a pair as
+/// its stdin; the test points the remembered number at other descriptors.
+#[test]
+fn the_remembered_descriptor_answers_only_while_it_still_holds_the_socket() {
+    use std::os::fd::AsRawFd as _;
+    let (held, other) = std::os::unix::net::UnixStream::pair().unwrap();
+    let inode_of = |stream: &std::os::unix::net::UnixStream| -> u32 {
+        std::fs::metadata(format!("/proc/self/fd/{}", stream.as_raw_fd()))
+            .unwrap()
+            .ino()
+            .try_into()
+            .unwrap()
+    };
+    let inode = inode_of(&held);
+    let elsewhere = inode_of(&other);
+    let mut command = Command::new("/usr/bin/sleep");
+    command
+        .arg("30")
+        .stdin(Stdio::from(OwnedFd::from(held)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = crate::resolver::native::spawned_and_execed(&mut command, "sleep");
+    let lease = ProcessLease::capture(child.id()).unwrap();
+    let reads = std::cell::Cell::new(0);
+    let counted = |path: &Path| {
+        reads.set(reads.get() + 1);
+        std::fs::read_link(path)
+    };
+    let remembered = AtomicI32::new(-1);
+
+    // Nothing remembered: the whole table is read and the descriptor noted.
+    assert!(owns_with(&lease, inode, &remembered, counted).unwrap());
+    assert_eq!(remembered.load(Ordering::Relaxed), 0);
+    assert!(reads.get() > 1);
+
+    // Remembered and still holding it: one read answers.
+    reads.set(0);
+    assert!(owns_with(&lease, inode, &remembered, counted).unwrap());
+    assert_eq!(reads.get(), 1);
+
+    // A remembered number that now names something else, or nothing, is not
+    // trusted: the table answers, and the holding descriptor is noted again.
+    for stale in [1, 999] {
+        remembered.store(stale, Ordering::Relaxed);
+        reads.set(0);
+        assert!(owns_with(&lease, inode, &remembered, counted).unwrap());
+        assert!(reads.get() > 1, "{stale}");
+        assert_eq!(remembered.load(Ordering::Relaxed), 0);
+    }
+
+    // The negative: the remembered descriptor holds a socket, but not this
+    // one, so the answer comes from the table, which does not hold it.
+    assert!(!owns_with(&lease, elsewhere, &remembered, counted).unwrap());
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
