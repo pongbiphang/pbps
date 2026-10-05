@@ -92,7 +92,9 @@ def main():
                 "exec docker-entrypoint.sh postgres -c ssl=on "
                 "-c ssl_cert_file=/tmp/pbps-peer.pem -c ssl_key_file=/tmp/pbps-peer.key"
             )
-            probe = ["pg_isready", "-U", "postgres"]
+            # Initialization's temporary server accepts Unix sockets before
+            # the TCP endpoint used by these TLS clients exists (#1471).
+            probe = ["pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
         else:
             environment = ["-e", "ACCEPT_EULA=Y", "-e", f"MSSQL_SA_PASSWORD={PASSWORD}"]
             command = (

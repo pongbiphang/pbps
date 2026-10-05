@@ -4,10 +4,14 @@
 import contextlib
 import importlib.util
 import io
+import json
+import os
 from pathlib import Path
 import re
 import shlex
 import subprocess
+import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -48,6 +52,88 @@ class LiveExecution(unittest.TestCase):
                     "\n  live:\n      - run: " + command + "\n")
         self.assertNotIn(shlex.split(command), job_commands(workflow, "live-pg"))
         self.assertEqual(job_commands(workflow, "absent"), [])
+
+    def test_ci_postgresql_health_checks_refuse_the_initialization_server(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        commands = [shlex.split(value) for value in
+                    re.findall(r'--health-cmd "(pg_isready[^"\n]+)"', workflow)]
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            with self.subTest(command=command):
+                # Socket readiness is true while docker-entrypoint.sh is
+                # initializing; the measured temporary server has no TCP.
+                accepts_temporary = "-h" not in command or command[command.index("-h") + 1].startswith("/")
+                self.assertFalse(accepts_temporary)
+                self.assertEqual(command[command.index("-h") + 1], "127.0.0.1")
+
+    def test_local_postgresql_deadlines_stop_before_any_client_suite(self):
+        for mode, failing in (("deadline-new", "pbps-test-pg"),
+                              ("deadline-old", "pbps-test-pg16")):
+            with self.subTest(mode=mode):
+                result, calls = self.local_pg_script(mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(failing + " did not become TCP-ready", result.stderr)
+                self.assertFalse(any(c[0] in ("cargo", "python3") for c in calls))
+                probes = [c for c in calls if c[:3] == ["docker", "exec", failing]]
+                self.assertEqual(len(probes), 60)
+                self.assertIn(["docker", "logs", failing], calls)
+                self.assertFalse(any(c[:2] == ["docker", "rm"] for c in calls))
+
+    def test_local_postgresql_clients_wait_for_both_final_tcp_servers(self):
+        result, calls = self.local_pg_script("initializing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        first_client = next(i for i, c in enumerate(calls) if c[0] == "cargo")
+        for name in ("pbps-test-pg", "pbps-test-pg16"):
+            probes = [c for c in calls[:first_client] if c[:3] == ["docker", "exec", name]]
+            self.assertEqual(len(probes), 3)
+        self.assertEqual([c for c in calls if c[0] in ("cargo", "python3")], [
+            ["cargo", "test", "-p", "pbps-pg", "--test", "live", "--", "--ignored"],
+            ["cargo", "test", "--profile", "live-test", "-p", "pbps-pg", "--lib", "--", "--ignored", "--test-threads=1"],
+            ["cargo", "test", "-p", "pbps-db", "--test", "live_pg", "--", "--ignored"],
+            ["python3", "scripts/live-transport.py", "pg"],
+            ["cargo", "test", "-p", "pbps-cli", "--bin", "pbps", "--", "--ignored", "--test-threads=1"],
+            ["cargo", "test", "-p", "pbps-cli", "--test", "flow_pg", "--", "--ignored", "--test-threads=1"],
+        ])
+
+    def local_pg_script(self, mode):
+        # Run the real shell control flow. Only external clients are replaced;
+        # no database is started and the production loop limit is retained.
+        with tempfile.TemporaryDirectory(prefix="pbps-pg-admission-") as directory:
+            root = Path(directory)
+            fake = root / "client"
+            fake.write_text(f"#!{sys.executable}\n" + r'''
+import json, os, sys
+from pathlib import Path
+root = Path(os.environ["PBPS_ADMISSION_CONTROL"])
+command = [Path(sys.argv[0]).name, *sys.argv[1:]]
+with (root / "calls").open("a") as log:
+    log.write(json.dumps(command) + "\n")
+if command[:2] == ["docker", "ps"]:
+    print("pbps-test-pg\npbps-test-pg16")
+elif command[:2] == ["docker", "exec"]:
+    name = command[2]
+    state = root / name
+    count = int(state.read_text()) + 1 if state.exists() else 1
+    state.write_text(str(count))
+    mode = os.environ["PBPS_ADMISSION_MODE"]
+    tcp = "-h" in command and command[command.index("-h") + 1] == "127.0.0.1"
+    deadline = (mode == "deadline-new" and name == "pbps-test-pg" or
+                mode == "deadline-old" and name == "pbps-test-pg16")
+    sys.exit(2 if tcp and (deadline or mode == "initializing" and count <= 2) else 0)
+elif command[:2] == ["docker", "logs"]:
+    print("controlled server still initializing", file=sys.stderr)
+elif command[0] not in ("cargo", "python3", "sleep"):
+    raise RuntimeError("Unexpected external command: " + repr(command))
+''')
+            fake.chmod(0o755)
+            for name in ("docker", "cargo", "python3", "sleep"):
+                (root / name).symlink_to(fake)
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+                       PBPS_ADMISSION_CONTROL=str(root), PBPS_ADMISSION_MODE=mode)
+            result = subprocess.run(["bash", "scripts/live-tests-pg.sh"], cwd=ROOT,
+                                    env=env, text=True, capture_output=True, timeout=30)
+            calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+            return result, calls
 
     def test_native_root_runner_executes_daemon_target_and_factory(self):
         env = {"PBPS_RESOLVER_TEST_SOCKET": "/owned/docker.sock",

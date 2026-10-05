@@ -55,12 +55,21 @@ start "$OLD_NAME" "$OLD_PORT" "$OLD_IMAGE"
 
 echo "waiting for PostgreSQL..."
 for name in "$NAME" "$OLD_NAME"; do
+    ready=false
     for _ in $(seq 1 60); do
-        if docker exec "$name" pg_isready -U postgres -d "$DB" >/dev/null 2>&1; then
+        # The initialization server accepts sockets but not our clients' TCP
+        # connections. Only the final server can admit the live suite (#1471).
+        if docker exec "$name" pg_isready -h 127.0.0.1 -U postgres -d "$DB" >/dev/null 2>&1; then
+            ready=true
             break
         fi
         sleep 2
     done
+    if [[ $ready != true ]]; then
+        echo "PostgreSQL fixture $name did not become TCP-ready" >&2
+        docker logs "$name" >&2
+        exit 1
+    fi
 done
 
 # A libpq keyword string rather than a URL: both are accepted, and this one
