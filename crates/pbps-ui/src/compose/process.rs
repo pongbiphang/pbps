@@ -31,7 +31,18 @@ fn kill(child: &mut Child) {
     let _ = child.wait();
 }
 
-pub(super) fn run(mut command: Command, input: &[u8], deadline: Duration) -> Result<Output> {
+pub(super) fn run(command: Command, input: &[u8], deadline: Duration) -> Result<Output> {
+    run_with(command, input, deadline, std::thread::sleep)
+}
+
+/// [`run`] with the pause between status polls supplied, so a test can see
+/// how long a run waits rather than infer it from wall time.
+fn run_with(
+    mut command: Command,
+    input: &[u8],
+    deadline: Duration,
+    mut pause: impl FnMut(Duration),
+) -> Result<Output> {
     use std::os::unix::process::CommandExt as _;
     command
         .process_group(0)
@@ -60,45 +71,70 @@ pub(super) fn run(mut command: Command, input: &[u8], deadline: Duration) -> Res
         let _ = send.send((2, written));
     });
     let started = Instant::now();
-    let mut status = None;
     let mut streams: [Option<Vec<u8>>; 3] = [None, None, None];
-    loop {
-        while let Ok((which, result)) = receive.try_recv() {
-            match result {
-                Ok(bytes) => streams[which] = Some(bytes),
-                Err(_) => {
-                    kill(&mut child);
-                    return Err(Error::new(
-                        "Could not exchange bounded compose subprocess data",
-                    ));
-                }
-            }
-        }
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(value) => status = value,
-                Err(_) => {
-                    kill(&mut child);
-                    return Err(Error::new("Could not determine compose subprocess outcome"));
-                }
-            }
-        }
-        if let Some(status) = status
-            && streams.iter().all(Option::is_some)
-        {
-            return Ok(Output {
-                status,
-                stdout: streams[0].take().expect("read stdout"),
-                stderr: streams[1].take().expect("read stderr"),
-            });
-        }
+    // Block on the readers rather than polling: a child that finishes in a
+    // millisecond must not wait out a fixed interval, and a compose operation
+    // runs hundreds of them (#1539).
+    while streams.iter().any(Option::is_none) {
         // The deadline includes pipe drainage: a helper can retain a pipe
         // after its parent exits. Joining readers first would wait forever.
-        if started.elapsed() >= deadline {
+        let Some(remaining) = left(started, deadline) else {
             kill(&mut child);
             return Err(Error::new("Compose subprocess exceeded its deadline"));
+        };
+        match receive.recv_timeout(remaining) {
+            Ok((which, Ok(bytes))) => streams[which] = Some(bytes),
+            Err(mpsc::RecvTimeoutError::Timeout) => (),
+            Ok((_, Err(_))) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                kill(&mut child);
+                return Err(Error::new(
+                    "Could not exchange bounded compose subprocess data",
+                ));
+            }
         }
-        std::thread::sleep(Duration::from_millis(5));
+    }
+    match reaped(&mut child, started, deadline, &mut pause) {
+        Ok(Some(status)) => Ok(Output {
+            status,
+            stdout: streams[0].take().expect("read stdout"),
+            stderr: streams[1].take().expect("read stderr"),
+        }),
+        Ok(None) => {
+            kill(&mut child);
+            Err(Error::new("Compose subprocess exceeded its deadline"))
+        }
+        Err(_) => {
+            kill(&mut child);
+            Err(Error::new("Could not determine compose subprocess outcome"))
+        }
+    }
+}
+
+fn left(started: Instant, deadline: Duration) -> Option<Duration> {
+    deadline
+        .checked_sub(started.elapsed())
+        .filter(|d| !d.is_zero())
+}
+
+/// The child's status once its pipes have closed, or `None` at the deadline.
+/// Closing them at exit makes the first poll the usual answer; the backoff
+/// covers a child that closed its pipes and lives on, without spinning.
+fn reaped(
+    child: &mut Child,
+    started: Instant,
+    deadline: Duration,
+    pause: &mut impl FnMut(Duration),
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let mut wait = Duration::from_micros(50);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let Some(remaining) = left(started, deadline) else {
+            return Ok(None);
+        };
+        pause(wait.min(remaining));
+        wait = (wait * 2).min(Duration::from_millis(5));
     }
 }
 
@@ -114,6 +150,49 @@ mod tests {
         let error = run(command, &[], Duration::from_millis(100)).unwrap_err();
         assert!(error.to_string().contains("deadline"));
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_quick_child_is_not_held_for_a_polling_interval() {
+        // A fixed 5 ms poll paused every run at least that long before it
+        // looked again (#1539). This counts the pauses a run asks for, not
+        // its wall time, so a loaded host's slow spawns cannot fail it.
+        let least = (0..20)
+            .map(|_| {
+                let mut paused = Duration::ZERO;
+                let output = run_with(Command::new("true"), &[], Duration::from_secs(5), |d| {
+                    paused += d;
+                    std::thread::sleep(d);
+                })
+                .unwrap();
+                assert!(output.status.success());
+                paused
+            })
+            .min()
+            .unwrap();
+        assert!(least < Duration::from_millis(5), "{least:?}");
+    }
+
+    #[test]
+    fn a_child_living_on_after_closing_its_pipes_still_meets_the_deadline() {
+        // The pipes close first, so the wait for the status is the only
+        // thing left to bound.
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec >&- 2>&- <&-; sleep 30"]);
+        let start = Instant::now();
+        let error = run(command, &[], Duration::from_millis(100)).unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_failing_child_is_reported_with_its_status_not_as_success() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf out; printf err >&2; exit 3"]);
+        let output = run(command, &[], Duration::from_secs(5)).unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
     }
 
     #[test]
