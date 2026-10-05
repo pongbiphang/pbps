@@ -625,12 +625,14 @@ mod tests {
         }
         // An absolute path is judged where the file is: the root itself and
         // a directory above it are refused, a directory inside it is not.
+        // The paths go in single-quoted YAML, which has no escapes: a double-
+        // quoted Windows path reads `\U` in `C:\Users` as a broken escape.
         let tmp = std::env::temp_dir().join(format!("pbps-cfg739-{}", std::process::id()));
         std::fs::create_dir_all(tmp.join("schema")).unwrap();
         let config = tmp.join("pbps.yml");
         std::fs::write(
             &config,
-            format!("dialect: mssql\nschema_dir: \"{}\"\n", tmp.display()),
+            format!("dialect: mssql\nschema_dir: '{}'\n", tmp.display()),
         )
         .unwrap();
         let err = Project::load(&config).unwrap_err();
@@ -641,7 +643,7 @@ mod tests {
         std::fs::write(
             &config,
             format!(
-                "dialect: mssql\nschema_dir: \"{}\"\n",
+                "dialect: mssql\nschema_dir: '{}'\n",
                 tmp.parent().unwrap().display()
             ),
         )
@@ -654,7 +656,7 @@ mod tests {
         std::fs::write(
             &config,
             format!(
-                "dialect: mssql\nschema_dir: \"{}\"\n",
+                "dialect: mssql\nschema_dir: '{}'\n",
                 tmp.join("schema").display()
             ),
         )
