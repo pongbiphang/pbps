@@ -8054,9 +8054,11 @@ async fn the_database_owner_is_no_exception_to_the_ledger_editor_rule() {
 /// The ledger's trust check stays linear in the cluster's roles (#1529). Its
 /// editor branches asked every login role about every role in the cluster,
 /// `pg_has_role` roles² times: about 1.9 s a call on a 2285-role cluster, paid
-/// by every command that checks the ledger. With three thousand login roles
-/// that hold nothing on the ledger, the check finishes well inside a bound
-/// the quadratic shape cannot meet, and still names none of them.
+/// by every command that checks the ledger. With ten thousand login roles it
+/// finishes well inside a bound the quadratic shape cannot meet, both when
+/// they hold nothing on the ledger (it names none of them) and when `TRIGGER`
+/// or the sequence's `UPDATE` is granted to `PUBLIC`, the dense case where
+/// every role is an editor (it names them all; review on #1531).
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn the_ledger_trust_check_stays_linear_in_the_clusters_roles() {
@@ -8066,32 +8068,54 @@ async fn the_ledger_trust_check_stays_linear_in_the_clusters_roles() {
     let mut admin = Conn::connect(Driver::Postgres, &conn_str()).await.unwrap();
     admin
         .execute(&format!(
-            "DO $$ BEGIN FOR i IN 1..3000 LOOP \
+            "DO $$ BEGIN FOR i IN 1..10000 LOOP \
                EXECUTE format('CREATE ROLE %I LOGIN NOSUPERUSER', '{prefix}' || i); \
              END LOOP; END $$"
         ))
         .await
         .unwrap();
-    let started = std::time::Instant::now();
-    let problems = state::ledger_problems(&mut db.conn).await;
-    let took = started.elapsed();
+    // How long one check takes, and how many of the crowd it names.
+    let check = async |conn: &mut Conn| {
+        let started = std::time::Instant::now();
+        let problems = state::ledger_problems(conn).await;
+        (started.elapsed(), problems)
+    };
+    let mut results = Vec::new();
+    // Nobody holds anything: the editor sets are a handful of roles.
+    results.push(("no grant", check(&mut db.conn).await, 0));
+    // The grants this check exists to report make every role an editor of
+    // its own, which the hashed membership test answers without a walk
+    // (review on #1531).
+    db.conn
+        .execute("GRANT TRIGGER ON public.__pbps_lock TO PUBLIC")
+        .await
+        .unwrap();
+    results.push(("TRIGGER to PUBLIC", check(&mut db.conn).await, 10000));
+    db.conn
+        .execute(
+            "REVOKE TRIGGER ON public.__pbps_lock FROM PUBLIC;
+             GRANT UPDATE ON SEQUENCE public.__pbps_state_id_seq TO PUBLIC",
+        )
+        .await
+        .unwrap();
+    results.push(("UPDATE to PUBLIC", check(&mut db.conn).await, 10000));
     admin
         .execute(&format!(
-            "DO $$ BEGIN FOR i IN 1..3000 LOOP \
+            "DO $$ BEGIN FOR i IN 1..10000 LOOP \
                EXECUTE format('DROP ROLE IF EXISTS %I', '{prefix}' || i); \
              END LOOP; END $$"
         ))
         .await
         .unwrap();
-    let problems = problems.unwrap();
-    assert!(
-        !problems.iter().any(|p| p.contains(&prefix)),
-        "a role holding nothing on the ledger is named: {problems:#?}"
-    );
-    assert!(
-        took < std::time::Duration::from_secs(2),
-        "the ledger check took {took:?} with three thousand login roles"
-    );
+    for (case, (took, problems), named) in results {
+        let problems = problems.unwrap();
+        let crowd = problems.iter().filter(|p| p.contains(&prefix)).count();
+        assert_eq!(crowd, named, "{case}: {problems:#?}");
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "{case}: the ledger check took {took:?} with ten thousand login roles"
+        );
+    }
     db.drop().await;
 }
 
