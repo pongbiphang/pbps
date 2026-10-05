@@ -93,6 +93,11 @@ pub struct RawTable {
     /// `relpersistence = 'u'`: an unlogged table (#1443). A temporary one is
     /// never here; it stays a limitation.
     pub unlogged: bool,
+    /// A RANGE-partitioned parent's key columns, in order (#1170).
+    pub partition_key: Option<Vec<String>>,
+    /// A partition's parent, by oid, and its bound as `pg_get_expr` deparses
+    /// it under the canonical session (#1170).
+    pub partition_of: Option<(i64, String)>,
 }
 
 /// One module, with the text this engine deparses for it.
@@ -688,6 +693,11 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         })
         .map(|t| t.oid)
         .collect();
+    // A partition tree is read whole or not at all (#1170): a parent left
+    // out takes its partitions with it, and a bound this reader cannot parse
+    // takes its whole tree, since a partition missing from a pull is one the
+    // next plan would never know about.
+    let refused = refuse_partition_trees(raw, refused, &mut pulled);
 
     let mut lookups = Lookups {
         tables: raw
@@ -747,6 +757,28 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         if refused.contains(&raw_table.oid) {
             continue;
         }
+        // A partition is its bound and its parent, nothing else: its columns,
+        // keys and indexes are the parent's, which the engine gave it, and
+        // the reader has already checked that is all it has (#1170).
+        if let Some((parent, bound)) = &raw_table.partition_of {
+            let (Some(parent), Some(bound)) = (lookups.tables.get(parent), parse_bound(bound))
+            else {
+                // `refuse_partition_trees` left out every partition whose
+                // parent or bound this could not take.
+                continue;
+            };
+            pulled.schema.tables.insert(
+                name,
+                Table {
+                    partition_of: Some(pbps_model::PartitionOf {
+                        parent: parent.clone(),
+                        bound,
+                    }),
+                    ..Table::default()
+                },
+            );
+            continue;
+        }
         let parts = Parts {
             name: name.clone(),
             by_attnum: raw_columns
@@ -760,6 +792,10 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 .iter()
                 .map(|c| (c.name.clone(), column(c, &parts, &mut pulled)))
                 .collect(),
+            partition_by: raw_table
+                .partition_key
+                .clone()
+                .map(|columns| pbps_model::PartitionBy { columns }),
             ..Table::default()
         };
 
@@ -2266,6 +2302,131 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
 /// Returns whether the constraint reached the pull. For a key constraint that
 /// is what says its backing index is there; for the rest the answer is unused
 /// and honest anyway.
+/// `refused`, and every table of a partition tree one of whose tables is in
+/// it or whose bound [`parse_bound`] cannot read, each named (#1170).
+fn refuse_partition_trees(
+    raw: &RawCatalog,
+    mut refused: BTreeSet<i64>,
+    pulled: &mut Pulled,
+) -> BTreeSet<i64> {
+    let root = |t: &RawTable| t.partition_of.as_ref().map_or(t.oid, |(parent, _)| *parent);
+    let held: BTreeSet<i64> = raw.tables.iter().map(|t| t.oid).collect();
+    let mut bad_roots: BTreeSet<i64> = BTreeSet::new();
+    for t in &raw.tables {
+        if t.partition_key.is_none() && t.partition_of.is_none() {
+            continue;
+        }
+        let unreadable = t
+            .partition_of
+            .as_ref()
+            .is_some_and(|(parent, bound)| !held.contains(parent) || parse_bound(bound).is_none());
+        if unreadable || refused.contains(&t.oid) {
+            bad_roots.insert(root(t));
+        }
+    }
+    for t in &raw.tables {
+        if (t.partition_key.is_some() || t.partition_of.is_some())
+            && bad_roots.contains(&root(t))
+            && refused.insert(t.oid)
+        {
+            note(
+                pulled,
+                &TableName::new(&t.schema, &t.name),
+                "a table of a partition tree another of whose tables, or a bound, this reader \
+                 cannot hold; the tree is read whole or not at all"
+                    .to_owned(),
+            );
+        }
+    }
+    refused
+}
+
+/// A RANGE partition's bound as `pg_get_expr` deparses it: `DEFAULT`, or
+/// `FOR VALUES FROM (…) TO (…)` with each datum `MINVALUE`, `MAXVALUE`, a
+/// quoted literal or an unquoted one (a number). Measured on 16 and 18: the
+/// engine prints a datum without a type, and unquoted, once its quotes are
+/// taken off, it is the key type's `::text` under the canonical session.
+/// `None` for anything else, which leaves the tree out rather than guessing.
+pub(crate) fn parse_bound(text: &str) -> Option<pbps_model::PartitionBound> {
+    if text == "DEFAULT" {
+        return Some(pbps_model::PartitionBound::Default);
+    }
+    let rest = text.strip_prefix("FOR VALUES FROM (")?;
+    let (from, rest) = bound_list(rest)?;
+    let rest = rest.strip_prefix(" TO (")?;
+    let (to, rest) = bound_list(rest)?;
+    if !rest.is_empty() || from.is_empty() || from.len() != to.len() {
+        return None;
+    }
+    Some(pbps_model::PartitionBound::Range { from, to })
+}
+
+/// The datums up to the `)` closing the list, and the text after it.
+fn bound_list(text: &str) -> Option<(Vec<pbps_model::BoundDatum>, &str)> {
+    let mut out = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    loop {
+        let datum = match chars.peek()? {
+            (_, '\'') => {
+                chars.next();
+                let mut value = String::new();
+                loop {
+                    match chars.next()? {
+                        (_, '\'') if chars.peek().is_some_and(|(_, c)| *c == '\'') => {
+                            chars.next();
+                            value.push('\'');
+                        }
+                        (_, '\'') => break,
+                        (_, c) => value.push(c),
+                    }
+                }
+                // A text key's value spelled like an unbounded end: a
+                // declaration reads the word as the end, so the tree would be
+                // rebuilt with a different partition.
+                if value.eq_ignore_ascii_case("minvalue") || value.eq_ignore_ascii_case("maxvalue")
+                {
+                    return None;
+                }
+                pbps_model::BoundDatum::Value(value)
+            }
+            (start, _) => {
+                let start = *start;
+                let mut end = start;
+                while let Some((i, c)) = chars.peek() {
+                    if matches!(c, ',' | ')') {
+                        break;
+                    }
+                    end = *i + c.len_utf8();
+                    chars.next();
+                }
+                match &text[start..end] {
+                    "MINVALUE" => pbps_model::BoundDatum::MinValue,
+                    "MAXVALUE" => pbps_model::BoundDatum::MaxValue,
+                    word if !word.is_empty()
+                        && word
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')) =>
+                    {
+                        pbps_model::BoundDatum::Value(word.to_owned())
+                    }
+                    _ => return None,
+                }
+            }
+        };
+        out.push(datum);
+        match chars.next()? {
+            (_, ')') => {
+                let at = chars.peek().map_or(text.len(), |(i, _)| *i);
+                return Some((out, &text[at..]));
+            }
+            (i, ',') if text[i + 1..].starts_with(' ') => {
+                chars.next();
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn add_constraint(
     raw: &RawConstraint,
     parts: &Parts,
@@ -3035,6 +3196,61 @@ fn unresolved(pulled: &mut Pulled, parts: &Parts, kind: &str, name: &str, attnum
 
 #[cfg(test)]
 mod tests {
+    /// Every bound the engine deparses comes apart into its datums, and
+    /// anything else is refused rather than guessed at (#1170). The shapes
+    /// are the ones measured on 16 and 18.
+    #[test]
+    fn a_deparsed_bound_comes_apart_and_nothing_else_does() {
+        use pbps_model::{BoundDatum as D, PartitionBound as B};
+        let v = |s: &str| D::Value(s.to_owned());
+        for (text, expected) in [
+            ("DEFAULT", B::Default),
+            (
+                "FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+                B::Range {
+                    from: vec![v("2025-01-01")],
+                    to: vec![v("2026-01-01")],
+                },
+            ),
+            (
+                "FOR VALUES FROM ('-5', 1.50) TO (10, MAXVALUE)",
+                B::Range {
+                    from: vec![v("-5"), v("1.50")],
+                    to: vec![v("10"), D::MaxValue],
+                },
+            ),
+            (
+                "FOR VALUES FROM (MINVALUE, MINVALUE) TO ('-5', '0')",
+                B::Range {
+                    from: vec![D::MinValue, D::MinValue],
+                    to: vec![v("-5"), v("0")],
+                },
+            ),
+            (
+                "FOR VALUES FROM ('it''s, (x)') TO ('z\\n')",
+                B::Range {
+                    from: vec![v("it's, (x)")],
+                    to: vec![v("z\\n")],
+                },
+            ),
+        ] {
+            assert_eq!(super::parse_bound(text), Some(expected), "{text}");
+        }
+        for text in [
+            "",
+            "FOR VALUES IN (1, 2)",
+            "FOR VALUES WITH (modulus 4, remainder 0)",
+            "FOR VALUES FROM (1) TO (2, 3)",
+            "FOR VALUES FROM () TO ()",
+            "FOR VALUES FROM ('a) TO ('b')",
+            "FOR VALUES FROM ('a'::text) TO ('b')",
+            "FOR VALUES FROM (1) TO (2) trailing",
+            "FOR VALUES FROM ('MINVALUE') TO ('b')",
+            "FOR VALUES FROM ('a') TO ('maxvalue')",
+        ] {
+            assert_eq!(super::parse_bound(text), None, "{text}");
+        }
+    }
 
     fn raw_module(kind: char, name: &str, definition: &str) -> RawModule {
         RawModule {
@@ -3127,6 +3343,8 @@ mod tests {
                 reloptions: Vec::new(),
                 toast_reloptions: Vec::new(),
                 unlogged: false,
+                partition_key: None,
+                partition_of: None,
             }],
             modules: vec![
                 RawModule {
@@ -4073,6 +4291,8 @@ mod tests {
                 reloptions: Vec::new(),
                 toast_reloptions: Vec::new(),
                 unlogged: false,
+                partition_key: None,
+                partition_of: None,
             }],
             grants: vec![grant(
                 Some("app_reader"),
@@ -4391,6 +4611,8 @@ mod tests {
             reloptions: Vec::new(),
             toast_reloptions: Vec::new(),
             unlogged: false,
+            partition_key: None,
+            partition_of: None,
         }
     }
 

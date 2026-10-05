@@ -1968,7 +1968,7 @@ pub(crate) async fn refuse_misspelt(
     let found = crate::engine::misspelt(conn, schema, at)
         .await
         .context("cannot ask the engine how it reads the declared rows")?;
-    if found.misspelt.is_empty() && found.conflicts.is_empty() {
+    if found.misspelt.is_empty() && found.conflicts.is_empty() && found.bounds.is_empty() {
         return Ok(());
     }
     // Two keys the engine reads as one row would insert twice and fail on
@@ -1995,6 +1995,19 @@ pub(crate) async fn refuse_misspelt(
                 ),
             }),
     );
+    // A bound the engine stores in its own spelling would differ from the
+    // declaration on every plan after (#1170).
+    lines.extend(found.bounds.iter().map(|b| match &b.canonical {
+        None => format!(
+            "partition {} bound on `{}`: {:?} cannot be read as {} by the engine",
+            b.partition, b.column, b.declared, b.ty
+        ),
+        Some(canonical) => format!(
+            "partition {} bound on `{}` is written {:?}, and the engine reads it back as \
+             {canonical:?}; write it that way",
+            b.partition, b.column, b.declared
+        ),
+    }));
     bail!(
         "{} declared value(s) would not come back as written:\n  {}\n\
          A declaration that disagrees with its own database on every plan is worse than \

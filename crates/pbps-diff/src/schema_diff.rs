@@ -122,6 +122,17 @@ pub enum DiffError {
     )]
     TemporalTableChange { table: TableName, what: Vec<String> },
 
+    /// A change to a partitioned table or a partition, on either side, other
+    /// than creating it (#1170, DEC-1170.1): the changes a hierarchy takes
+    /// are #1171's to qualify, and some reach every partition under a lock.
+    #[error(
+        "{table} is a partitioned table or a partition, and pbps can create one but not change \
+         it yet; this plan would {}. Declare {table} as it is recorded, and make the change by \
+         hand.",
+        what.join(", ")
+    )]
+    PartitionedTableChange { table: TableName, what: Vec<String> },
+
     /// A `data:` table whose primary key moved to a different column. The row
     /// keys on each side are values of that side's key column, so the two sets
     /// have nothing in common and matching them by text would update and
@@ -472,6 +483,7 @@ fn diff_partial_rebuilding(
     );
     refuse_computed_dependencies(base.schema, declared.schema, dialect, &changes, &mut errs);
     refuse_temporal_changes(base, declared, &changes, &mut errs);
+    refuse_partition_changes(base, declared, &changes, &mut errs);
     // A module declaration can stay byte-for-byte identical while a new
     // overload or shadow changes what it should bind to. Ask the dialect
     // before sorting, rather than appending unreviewed SQL at apply time.
@@ -1043,6 +1055,13 @@ fn diff_partial_rebuilding(
         }
         if matches!(c, Change::AddComputedColumn { .. }) {
             return (COLUMN_ALTERATIONS, 3);
+        }
+        // A partition is created after every parent, whose columns, keys and
+        // indexes the engine gives it as it is made (#1170).
+        if let Change::CreateTable { table, .. } = c
+            && table.partition_of.is_some()
+        {
+            return (order_key(c), 2);
         }
         if let Change::RenameColumn { table, from, .. } = c {
             let depth = chain_depth
@@ -1959,6 +1978,99 @@ fn refuse_temporal_changes(
         refused
             .into_iter()
             .map(|(table, what)| DiffError::TemporalTableChange { table, what }),
+    );
+}
+
+fn refuse_partition_changes(
+    base: Side<'_>,
+    declared: Side<'_>,
+    changes: &[Change],
+    errs: &mut Vec<DiffError>,
+) {
+    let partitioned = |schema: &Schema, name: &TableName| {
+        schema
+            .tables
+            .get(name)
+            .is_some_and(|t| t.partition_by.is_some() || t.partition_of.is_some())
+    };
+    let mut refused: BTreeMap<TableName, Vec<String>> = BTreeMap::new();
+    let mut refuse = |table: &TableName, what: String| {
+        let list = refused.entry(table.clone()).or_default();
+        if !list.contains(&what) {
+            list.push(what);
+        }
+    };
+    // A difference in the key or the bound itself, which no change carries.
+    for (uid, declared_name) in &declared.ids.tables {
+        let Some(base_name) = base.ids.tables.get(uid) else {
+            continue;
+        };
+        if let (Some(b), Some(d)) = (
+            base.schema.tables.get(base_name),
+            declared.schema.tables.get(declared_name),
+        ) && (b.partition_by != d.partition_by || b.partition_of != d.partition_of)
+        {
+            refuse(declared_name, "change its partitioning".to_owned());
+        }
+    }
+    // As for a temporal table: the changes split out of a table this plan
+    // creates are the creation; a drop or a rename is asked of the side it
+    // acts on.
+    let created: BTreeSet<&TableName> = changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::CreateTable { name, .. } = c {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for change in changes {
+        // A partition is created with its parent, which is how this slice
+        // builds a tree; one added under a parent that already stands is
+        // #1171's to qualify.
+        if let Change::CreateTable { name, table, .. } = change {
+            if let Some(of) = &table.partition_of
+                && !created.contains(&of.parent)
+            {
+                refuse(&of.parent, format!("add the partition {name}"));
+            }
+            continue;
+        }
+        let ends_a_table = matches!(
+            change,
+            Change::DropTable { .. } | Change::RenameTable { .. }
+        );
+        if !ends_a_table && change.table().is_some_and(|t| created.contains(t)) {
+            continue;
+        }
+        let asked: Vec<&TableName> = if let Change::DropTable { name, .. } = change {
+            vec![name]
+                .into_iter()
+                .filter(|n| partitioned(base.schema, n))
+                .collect()
+        } else if let Change::RenameTable { from, to, .. } = change {
+            [(from, base.schema), (to, declared.schema)]
+                .into_iter()
+                .filter(|(n, side)| partitioned(side, n))
+                .map(|(n, _)| n)
+                .collect()
+        } else {
+            change
+                .table()
+                .into_iter()
+                .filter(|n| partitioned(base.schema, n) || partitioned(declared.schema, n))
+                .collect()
+        };
+        for table in asked {
+            refuse(table, change_in_words(change));
+        }
+    }
+    errs.extend(
+        refused
+            .into_iter()
+            .map(|(table, what)| DiffError::PartitionedTableChange { table, what }),
     );
 }
 
@@ -4626,6 +4738,152 @@ mod tests {
         assert!(
             errors.iter().any(|e| matches!(e, DiffError::PermanentReferencesUnlogged { key, .. } if key == "ch_pa")),
             "{errors:?}"
+        );
+    }
+
+    /// A partition tree is created parent first and every partition after
+    /// it, whatever the names' order; any other change to a partitioned table
+    /// or a partition is refused by name until #1171, a partition added under
+    /// a parent that already stands included. A change to another table, even
+    /// one referencing the parent, is not refused (#1170).
+    #[test]
+    fn a_partition_tree_is_created_whole_and_otherwise_refused() {
+        use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionOf};
+        let mut parent = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("ts", Column::new(ty("date")).not_null()),
+        ]);
+        parent.partition_by = Some(PartitionBy {
+            columns: vec!["ts".into()],
+        });
+        let partition = |bound: PartitionBound| Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound,
+            }),
+            ..Default::default()
+        };
+        let range = |from: &str, to: &str| PartitionBound::Range {
+            from: vec![BoundDatum::Value(from.into())],
+            to: vec![BoundDatum::Value(to.into())],
+        };
+        // `a_old` sorts before its parent by name, and must not be created
+        // before it.
+        let mut tree = schema_of("app.ev", parent.clone());
+        tree.tables.insert(
+            "app.a_old".parse().unwrap(),
+            partition(range("2024-01-01", "2025-01-01")),
+        );
+        tree.tables.insert(
+            "app.z_rest".parse().unwrap(),
+            partition(PartitionBound::Default),
+        );
+        let outcome = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+        };
+        let refused = |base: &Schema, declared: &Schema, intents: &[Intent]| -> Vec<String> {
+            match outcome(base, declared, intents) {
+                Ok(cs) => panic!("planned {:?}", kinds(&cs)),
+                Err(errors) => errors
+                    .iter()
+                    .filter(|e| matches!(e, DiffError::PartitionedTableChange { .. }))
+                    .map(ToString::to_string)
+                    .collect(),
+            }
+        };
+
+        let created = outcome(&Schema::default(), &tree, &[]).expect("a tree is created");
+        let order: Vec<String> = created
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::CreateTable { name, .. } => Some(name.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order[0], "app.ev", "{order:?}");
+        assert_eq!(order.len(), 3, "{order:?}");
+        // Unchanged, nothing to plan.
+        assert!(outcome(&tree, &tree, &[]).unwrap().changes.is_empty());
+
+        let mut column = tree.clone();
+        column
+            .tables
+            .get_mut(&"app.ev".parse().unwrap())
+            .unwrap()
+            .columns
+            .insert("note".into(), Column::new(ty("int")));
+        let mut bound = tree.clone();
+        bound.tables.insert(
+            "app.a_old".parse().unwrap(),
+            partition(range("2023-01-01", "2025-01-01")),
+        );
+        let mut more = tree.clone();
+        more.tables.insert(
+            "app.m_more".parse().unwrap(),
+            partition(range("2025-01-01", "2026-01-01")),
+        );
+        let mut fewer = tree.clone();
+        fewer
+            .tables
+            .remove(&"app.z_rest".parse::<TableName>().unwrap());
+        let drop = [Intent::DropTable {
+            table: "app.z_rest".parse().unwrap(),
+            reason: "gone".into(),
+        }];
+        for (declared, intents, expected) in [
+            (&column, &[][..], "app.ev is a partitioned table"),
+            (&bound, &[][..], "change its partitioning"),
+            (&more, &[][..], "add the partition app.m_more"),
+            (&fewer, &drop[..], "app.z_rest is a partitioned table"),
+        ] {
+            let found = refused(&tree, declared, intents);
+            assert!(
+                found.iter().any(|e| e.contains(expected)),
+                "{expected}: {found:?}"
+            );
+        }
+
+        // Negative: a new table beside the tree, referencing its parent, is
+        // planned.
+        let mut beside = tree.clone();
+        let mut referencing = table(&[
+            ("ev_id", Column::new(ty("int"))),
+            ("ev_ts", Column::new(ty("date"))),
+        ]);
+        referencing.foreign_keys.insert(
+            "fk_ev".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["ev_id".into(), "ev_ts".into()],
+                references_table: "app.ev".parse().unwrap(),
+                references_columns: vec!["id".into(), "ts".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        beside.tables.insert("app.r".parse().unwrap(), referencing);
+        let planned = outcome(&tree, &beside, &[]).expect("a referencing table is planned");
+        assert!(
+            kinds(&planned).contains(&"CreateTable".to_owned()),
+            "{:?}",
+            kinds(&planned)
         );
     }
 

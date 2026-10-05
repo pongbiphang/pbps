@@ -44,6 +44,19 @@ pub fn render(
     intents: &[Intent],
     strategy: Option<&Strategy>,
 ) -> String {
+    render_partitioned(name, table, &[], intents, strategy)
+}
+
+/// [`render`], for a partitioned parent with its partitions, which are
+/// written in its file (#1170). Each is named bare in the parent's schema,
+/// qualified in another, in name order.
+pub fn render_partitioned(
+    name: &TableName,
+    table: &Table,
+    partitions: &[(&TableName, &Table)],
+    intents: &[Intent],
+    strategy: Option<&Strategy>,
+) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "table: {}", scalar(&name.to_string()));
 
@@ -284,6 +297,38 @@ pub fn render(
     if table.unlogged {
         s.push_str("\nunlogged: true\n");
     }
+    if let Some(by) = &table.partition_by {
+        let _ = writeln!(s, "\npartition_by: {}", seq(&by.columns));
+        if !partitions.is_empty() {
+            s.push_str("\npartitions:\n");
+            let mut sorted: Vec<&(&TableName, &Table)> = partitions.iter().collect();
+            sorted.sort_by(|a, b| a.0.cmp(b.0));
+            for (child, t) in sorted {
+                let label = if child.schema == name.schema {
+                    child.name.clone()
+                } else {
+                    child.to_string()
+                };
+                let bound = match t.partition_of.as_ref().map(|p| &p.bound) {
+                    Some(pbps_model::PartitionBound::Range { from, to }) => {
+                        let list = |d: &[pbps_model::BoundDatum]| {
+                            d.iter()
+                                .map(|v| match v {
+                                    pbps_model::BoundDatum::Value(text) => bound_value(text),
+                                    end @ (pbps_model::BoundDatum::MinValue
+                                    | pbps_model::BoundDatum::MaxValue) => end.to_string(),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        format!("{{from: [{}], to: [{}]}}", list(from), list(to))
+                    }
+                    Some(pbps_model::PartitionBound::Default) | None => "default".to_owned(),
+                };
+                let _ = writeln!(s, "  {}: {bound}", scalar(&label));
+            }
+        }
+    }
     // After the columns it names (#1176).
     if let Some(st) = &table.system_time {
         let _ = writeln!(
@@ -488,6 +533,25 @@ fn scalar(s: &str) -> String {
     }
 }
 
+/// A bound value, always double-quoted: it is the engine's text for a value
+/// of any key type, and bare it would be read by YAML's rules, `0x1F` as 31
+/// and `MINVALUE` as the unbounded end (#1170).
+fn bound_value(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn needs_quotes(s: &str) -> bool {
     if s.is_empty() || s != s.trim() {
         return true;
@@ -540,16 +604,27 @@ mod tests {
     fn round_trip(yaml: &str) {
         let a = crate::load_table_str(Path::new("t.yml"), yaml)
             .unwrap_or_else(|e| panic!("the original file failed to load: {e:?}"));
-        let out = render(&a.name, &a.table, &a.intents, a.strategy.as_ref());
+        let render_all = |t: &crate::LoadedTable| {
+            let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
+            render_partitioned(
+                &t.name,
+                &t.table,
+                &partitions,
+                &t.intents,
+                t.strategy.as_ref(),
+            )
+        };
+        let out = render_all(&a);
         let b = crate::load_table_str(Path::new("t.yml"), &out).unwrap_or_else(|e| {
             panic!("the rewritten file does not read back: {e:?}\noutput:\n{out}")
         });
         assert_eq!(a.name, b.name, "output:\n{out}");
         assert_eq!(a.table, b.table, "output:\n{out}");
         assert_eq!(a.intents, b.intents, "output:\n{out}");
+        assert_eq!(a.partitions, b.partitions, "output:\n{out}");
 
         // Idempotence: formatting an already-formatted file must change nothing.
-        let out2 = render(&b.name, &b.table, &b.intents, b.strategy.as_ref());
+        let out2 = render_all(&b);
         assert_eq!(out, out2, "fmt is not idempotent");
     }
 
@@ -1055,6 +1130,171 @@ indexes:
             let yaml = format!(
                 "table: dbo.t\ncolumns:\n  valid_from: {{type: datetime2, nullable: false}}\n  valid_to: {{type: datetime2, nullable: false}}\n{block}"
             );
+            assert!(
+                crate::load_table_str(Path::new("t.yml"), &yaml).is_err(),
+                "{block} should not load"
+            );
+        }
+    }
+
+    /// A parent's partitions load as tables of their own, in its schema unless
+    /// qualified, with each bound as written, and render back into the
+    /// parent's file in name order (#1170).
+    #[test]
+    fn partitions_load_as_tables_and_render_back_in_the_parent_file() {
+        use pbps_model::{BoundDatum as D, PartitionBound as B};
+        let yaml = "table: app.ev\ncolumns:\n  id: {type: int, nullable: false}\n  ts: {type: date, nullable: false}\n\nprimary_key: [id, ts]\n\npartition_by: [ts]\n\npartitions:\n  ev_old: {from: [MINVALUE], to: ['2025-01-01']}\n  ev_rest: default\n  hist.ev_2026: {from: ['2026-01-01'], to: [maxvalue]}\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        assert_eq!(
+            t.table.partition_by.as_ref().map(|p| p.columns.clone()),
+            Some(vec!["ts".to_owned()])
+        );
+        let bounds: Vec<(String, B)> = t
+            .partitions
+            .iter()
+            .map(|(n, p)| {
+                let of = p.partition_of.clone().expect("a partition");
+                assert_eq!(of.parent, t.name);
+                // A partition declares nothing else.
+                assert_eq!(
+                    p,
+                    &pbps_model::Table {
+                        partition_of: Some(of.clone()),
+                        ..Default::default()
+                    }
+                );
+                (n.to_string(), of.bound)
+            })
+            .collect();
+        let value = |v: &str| D::Value(v.to_owned());
+        assert_eq!(
+            bounds,
+            [
+                (
+                    "app.ev_old".to_owned(),
+                    B::Range {
+                        from: vec![D::MinValue],
+                        to: vec![value("2025-01-01")]
+                    }
+                ),
+                ("app.ev_rest".to_owned(), B::Default),
+                (
+                    "hist.ev_2026".to_owned(),
+                    B::Range {
+                        from: vec![value("2026-01-01")],
+                        to: vec![D::MaxValue]
+                    }
+                ),
+            ]
+        );
+        let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
+        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None);
+        assert!(
+            out.contains("\npartition_by: [ts]\n\npartitions:\n  ev_old: {from: [MINVALUE], to: [\"2025-01-01\"]}\n  ev_rest: default\n  hist.ev_2026: {from: [\"2026-01-01\"], to: [MAXVALUE]}\n"),
+            "{out}"
+        );
+        // Every value the engine can print comes back as itself, whatever
+        // YAML would make of it bare.
+        for v in [
+            "010",
+            "0x1F",
+            "0o17",
+            "1e3",
+            ".inf",
+            "-0",
+            "+5",
+            "true",
+            "null",
+            "~",
+            "it's",
+            "a: b",
+            "#x",
+            " x",
+            "x\ny",
+            "back\\slash",
+            "\"q\"",
+        ] {
+            let child = TableName::new("app", "p1");
+            let table = pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: TableName::new("app", "t"),
+                    bound: B::Range {
+                        from: vec![value(v)],
+                        to: vec![D::MaxValue],
+                    },
+                }),
+                ..Default::default()
+            };
+            let parent = pbps_model::Table {
+                partition_by: Some(pbps_model::PartitionBy {
+                    columns: vec!["a".to_owned()],
+                }),
+                ..crate::load_table_str(
+                    Path::new("t.yml"),
+                    "table: app.t\ncolumns:\n  a: {type: text}\n",
+                )
+                .unwrap()
+                .table
+            };
+            let out = render_partitioned(
+                &TableName::new("app", "t"),
+                &parent,
+                &[(&child, &table)],
+                &[],
+                None,
+            );
+            let back = crate::load_table_str(Path::new("t.yml"), &out)
+                .unwrap_or_else(|e| panic!("{v:?}: {e:?}\n{out}"));
+            assert_eq!(back.partitions, [(child, table)], "{v:?}\n{out}");
+        }
+        // A whole number may be written bare; it is the engine's text either way.
+        let t = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: app.m\ncolumns:\n  a: {type: int}\npartition_by: [a]\npartitions:\n  m_1: {from: [-5], to: ['10']}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            t.partitions[0]
+                .1
+                .partition_of
+                .as_ref()
+                .map(|p| p.bound.clone()),
+            Some(B::Range {
+                from: vec![value("-5")],
+                to: vec![value("10")]
+            })
+        );
+        // Negative: no `partitions:` is a parent with none, and no
+        // `partition_by:` an ordinary table that renders neither.
+        let t = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: app.t\ncolumns:\n  a: {type: int}\n",
+        )
+        .unwrap();
+        assert!(t.partitions.is_empty() && t.table.partition_by.is_none());
+        assert!(!render(&t.name, &t.table, &[], None).contains("partition"));
+    }
+
+    /// A partition block the loader cannot read is a load error, never an
+    /// ordinary table or a guessed bound (#1170).
+    #[test]
+    fn an_unreadable_partition_block_is_rejected() {
+        for block in [
+            // Partitions with no key to divide by.
+            "partitions:\n  p1: default\n",
+            // A word that is not `default`.
+            "partition_by: [a]\npartitions:\n  p1: rest\n",
+            // A decimal and a boolean, whose YAML reading is not the text.
+            "partition_by: [a]\npartitions:\n  p1: {from: [1.5], to: ['2']}\n",
+            "partition_by: [a]\npartitions:\n  p1: {from: [true], to: ['2']}\n",
+            // A missing end, and an unknown key.
+            "partition_by: [a]\npartitions:\n  p1: {from: ['1']}\n",
+            "partition_by: [a]\npartitions:\n  p1: {from: ['1'], to: ['2'], at: ['3']}\n",
+            // A name that is not one.
+            "partition_by: [a]\npartitions:\n  'a.b.c': default\n",
+        ] {
+            let yaml = format!("table: app.t\ncolumns:\n  a: {{type: int}}\n{block}");
             assert!(
                 crate::load_table_str(Path::new("t.yml"), &yaml).is_err(),
                 "{block} should not load"

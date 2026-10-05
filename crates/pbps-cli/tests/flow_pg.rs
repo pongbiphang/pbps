@@ -2712,7 +2712,7 @@ fn a_newly_declared_name_the_database_already_uses_is_refused_before_the_plan() 
         "CREATE TABLE app.x (id integer PRIMARY KEY); \
          CREATE VIEW app.v AS SELECT 1 AS n; \
          CREATE FUNCTION app.g(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$; \
-         CREATE TABLE app.p (id integer NOT NULL) PARTITION BY RANGE (id)",
+         CREATE TABLE app.p (id integer NOT NULL) PARTITION BY LIST (id)",
     );
     let table = |name: &str| {
         std::fs::write(
@@ -6460,6 +6460,102 @@ fn an_array_column_widens_through_the_cli() {
         stdout(&o),
         stderr(&o)
     );
+}
+
+/// A RANGE partition tree goes the whole way through the CLI (#1170): pulled
+/// into one file, its parent's, which bootstraps an empty database into the
+/// same tree, verifies and leaves nothing to plan. A bound the engine spells
+/// otherwise is refused with the engine's spelling; a partition added by hand
+/// is refused with the commands that adopt it, and adopting it that way
+/// leaves nothing to plan.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_partition_tree_round_trips_through_the_cli() {
+    let server = server();
+    let source = OwnDatabase::new(&server, "parts-1170");
+    let target = OwnDatabase::new(&server, "parts-1170-target");
+    let (src, tgt) = (
+        source.connection().to_owned(),
+        target.connection().to_owned(),
+    );
+    on_server(
+        &src,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, PRIMARY KEY (id, ts)) \
+             PARTITION BY RANGE (ts); \
+         CREATE TABLE app.ev_2025 PARTITION OF app.ev \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
+         CREATE TABLE app.ev_rest PARTITION OF app.ev DEFAULT",
+    );
+    let d = Demo::new("parts-1170");
+    succeeds(d.run(&["pull", "--db", &src]));
+    let path = d.dir.join("schema/app.ev.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains(
+            "\npartition_by: [ts]\n\npartitions:\n  ev_2025: {from: [\"2025-01-01\"], to: \
+             [\"2026-01-01\"]}\n  ev_rest: default\n"
+        ),
+        "{text}"
+    );
+    // A partition has no file of its own.
+    assert!(!d.dir.join("schema/app.ev_2025.yml").exists());
+    succeeds(d.run(&["fmt", "--check"]));
+    d.commit();
+
+    on_server(&tgt, "CREATE SCHEMA app");
+    succeeds(d.run(&["bootstrap", "--db", &tgt]));
+    succeeds(d.run(&["verify", "--db", &tgt]));
+    let next = succeeds(d.run(&["plan", "--db", &tgt]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    on_server(
+        &tgt,
+        "INSERT INTO app.ev VALUES (1, '2025-06-01'), (2, '2030-01-01'); \
+         DO $$ BEGIN \
+           IF (SELECT string_agg(tableoid::regclass::text, ',' ORDER BY id) FROM app.ev) \
+              <> 'app.ev_2025,app.ev_rest' THEN RAISE EXCEPTION 'not routed'; END IF; \
+         END $$",
+    );
+
+    // A bound spelled otherwise than the engine does, refused with its
+    // spelling before a plan exists.
+    std::fs::write(&path, text.replace("[\"2026-01-01\"]", "[\"2026-1-1\"]")).unwrap();
+    d.commit();
+    let o = d.run(&["plan", "--db", &tgt]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("partition app.ev_2025 bound on `ts` is written \"2026-1-1\"")
+            && stderr(&o).contains("\"2026-01-01\""),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::write(&path, &text).unwrap();
+    d.commit();
+
+    // A partition added by hand, refused by name with the adoption.
+    on_server(
+        &tgt,
+        "CREATE TABLE app.ev_2026 PARTITION OF app.ev \
+             FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')",
+    );
+    let o = d.run(&["plan", "--db", &tgt]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("app.ev_2026 is a partition of the managed table app.ev")
+            && stderr(&o).contains("pbps pull"),
+        "{}",
+        stderr(&o)
+    );
+    succeeds(d.run(&["pull", "--db", &tgt, "--force"]));
+    let adopted = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        adopted.contains("  ev_2026: {from: [\"2026-01-01\"]"),
+        "{adopted}"
+    );
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &tgt, "--reason", "adopt ev_2026"]));
+    let next = succeeds(d.run(&["plan", "--db", &tgt]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
 /// Index storage parameters go the whole way through the CLI (#1442):

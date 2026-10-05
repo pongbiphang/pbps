@@ -555,8 +555,8 @@ SELECT w.schema_name, w.table_name,
 }
 
 /// A table this project manages, or one of the two the tool owns: an ordinary
-/// table, and nothing else.
-const MANAGED_KINDS: [&str; 1] = ["r"];
+/// table, or a partitioned parent (#1170), whose partitions are ordinary.
+const MANAGED_KINDS: [&str; 2] = ["r", "p"];
 
 /// A table a declared foreign key points at: ordinary or partitioned, which are
 /// the two kinds this engine lets a key reference.
@@ -1550,15 +1550,14 @@ mod tests {
         }
     }
 
-    /// The two lists ask about different kinds, and the difference is measured:
-    /// a partitioned table is not a table this model can hold, and it is a
-    /// perfectly ordinary thing for somebody else's foreign-key target to be.
-    /// Asked at `r` alone, such a target read as absent and no grant was
-    /// demanded for it.
+    /// Both lists ask about partitioned tables too. A foreign-key target may
+    /// be one: asked at `r` alone, such a target read as absent and no grant
+    /// was demanded for it. And since #1170 a managed table may be one: asked
+    /// at `r` alone, a managed parent read as absent.
     #[test]
-    fn a_referenced_target_may_be_partitioned_where_a_managed_table_may_not() {
+    fn a_managed_table_and_a_referenced_target_may_be_partitioned() {
         assert!(
-            table_question(1, &MANAGED_KINDS).contains("c.relkind IN ('r')"),
+            table_question(1, &MANAGED_KINDS).contains("c.relkind IN ('r', 'p')"),
             "{}",
             table_question(1, &MANAGED_KINDS)
         );

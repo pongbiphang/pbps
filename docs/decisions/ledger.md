@@ -1170,3 +1170,12 @@ array column out as a limitation, so no recorded column is an array, and an
 older state reads exactly as it did. An older build cannot parse `T[]`, so it
 refuses a version 24 plan or state rather than misreading one.
 
+<a id="dec-1170-2"></a>
+
+**DEC-1170.2. State version 20 adds a table's `partition_by` and
+`partition_of` and still reads 6 to 19; plan version 25 turns 24 away.** An
+older reader left a partitioned table and every partition out as a
+limitation, so every table it recorded is neither, which is what the absent
+fields read as. An older build reading a version 25 plan would create an
+ordinary table where a partition tree was planned. The published schema set
+is 29.

@@ -317,13 +317,28 @@ pub struct Misspelt {
     pub canonical: Option<String>,
 }
 
+/// One declared partition bound value the engine reads back differently, or
+/// cannot read as its key column's type at all (#1170).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MisspeltBound {
+    pub partition: TableName,
+    /// The key column the value bounds.
+    pub column: String,
+    pub declared: String,
+    pub ty: String,
+    /// What the engine reads back; `None` when it cannot convert the text.
+    pub canonical: Option<String>,
+}
+
 /// What the engine says about the declared spellings of every table that
 /// declares rows: the ones it would not read back as written, and the keys
-/// it reads as one row.
+/// it reads as one row. And of every partition bound's values.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Spellings {
     /// Declared texts the engine reads back differently, or not at all.
     pub misspelt: Vec<Misspelt>,
     /// Two declared keys the engine reads as one row (DECISIONS 106).
     pub conflicts: Vec<RowConflict>,
+    /// Declared bound values the engine reads back differently (#1170).
+    pub bounds: Vec<MisspeltBound>,
 }

@@ -126,8 +126,25 @@ fn not_one_of_our_tables() -> String {
 fn tables_query() -> String {
     let not_one_of_ours = not_one_of_ours();
     let not_an_extensions = not_an_extensions("c.oid", "pg_class");
+    let held_tree = partition_tree_table();
     format!(
         "SELECT c.oid::int8 AS oid, n.nspname AS schema_name, c.relname AS table_name,
+            CASE WHEN c.relkind = 'p'
+                 THEN (SELECT pg_catalog.to_jsonb(pg_catalog.array_agg(a.attname::text ORDER BY k.n))
+                         FROM pg_catalog.pg_partitioned_table pt
+                        CROSS JOIN LATERAL pg_catalog.unnest(pt.partattrs::int2[])
+                                   WITH ORDINALITY AS k(attnum, n)
+                         JOIN pg_catalog.pg_attribute a
+                           ON a.attrelid = c.oid AND a.attnum = k.attnum
+                        WHERE pt.partrelid = c.oid)
+            END AS partition_key,
+            CASE WHEN c.relispartition
+                 THEN (SELECT h.inhparent::int8 FROM pg_catalog.pg_inherits h
+                        WHERE h.inhrelid = c.oid)
+            END AS partition_parent,
+            CASE WHEN c.relispartition
+                 THEN pg_catalog.pg_get_expr(c.relpartbound, c.oid)
+            END AS partition_bound,
             c.relreplident::text AS replica_identity,
             COALESCE((SELECT x.indexrelid::int8 FROM pg_catalog.pg_index x
                        WHERE x.indrelid = c.oid AND x.indisreplident), 0) AS identity_index,
@@ -137,11 +154,118 @@ fn tables_query() -> String {
                        WHERE tc.oid = c.reltoastrelid), '{{}}'::text[]) AS toast_reloptions
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-      WHERE {ORDINARY_TABLE}
+      WHERE ({ORDINARY_TABLE} OR {held_tree})
         AND {NOT_A_PROJECTS_SCHEMA}
         AND {not_one_of_ours}
         AND {not_an_extensions}
       ORDER BY n.nspname, c.relname"
+    )
+}
+
+/// Whether the partitioned table whose oid is `root` heads a tree this model
+/// holds (#1170, DEC-1170.1): RANGE over plain columns, and partitions that
+/// are their parent's and nothing else, so that rebuilding the tree from the
+/// parent and each partition's bound gives back what is there.
+///
+/// **The parent**: not itself a partition, RANGE, and a key whose deparsed
+/// text is its columns' quoted names and nothing else, so that an expression,
+/// an operator class or a collation, each of which `pg_get_partkeydef` prints,
+/// leaves it out. Permanent, no storage parameters, the default replica
+/// identity, no access method of its own, no row security, rules or triggers:
+/// none of them is in the partitioned table's declaration yet.
+///
+/// **Each partition**: attached (no detach pending), an ordinary permanent
+/// heap table, the same in all of that, with no grant on it or on a column (a
+/// partition declares none), whose columns are inherited and its parent's in
+/// the parent's order with the
+/// parent's defaults, NOT NULLs, identities and generations. Measured on 16 and
+/// 18: a table `ATTACH`ed as a partition keeps its own column order and has
+/// none of the parent's defaults, which `PARTITION OF` would give it, so
+/// `attislocal` alone does not say so. Every constraint a clone
+/// (`conparentid`, the keys and foreign keys) or inherited and not local (a
+/// CHECK, and on 18 a NOT NULL row); every index attached to one of the
+/// parent's. Anything else in any partition leaves the whole tree out, named.
+fn partition_tree(root: &str) -> String {
+    let columns = |rel: &str| {
+        format!(
+            "(SELECT pg_catalog.array_agg(ROW(a.attname, a.atttypid, a.atttypmod, a.attcollation,
+                                               a.attnotnull, a.attidentity, a.attgenerated,
+                                               pg_catalog.pg_get_expr(d.adbin, d.adrelid))::text
+                                           ORDER BY a.attnum)
+                FROM pg_catalog.pg_attribute a
+                LEFT JOIN pg_catalog.pg_attrdef d
+                  ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+               WHERE a.attrelid = {rel} AND a.attnum > 0 AND NOT a.attisdropped)"
+        )
+    };
+    let plain = |rel: &str| {
+        format!(
+            "NOT {rel}.relrowsecurity AND NOT {rel}.relforcerowsecurity
+             AND NOT {rel}.relhasrules AND {rel}.reloftype = 0
+             AND {rel}.relpersistence = 'p' AND {rel}.reloptions IS NULL
+             AND {rel}.relreplident = 'd'
+             AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol
+                              WHERE pol.polrelid = {rel}.oid)
+             AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger tg
+                              WHERE tg.tgrelid = {rel}.oid AND NOT tg.tgisinternal)"
+        )
+    };
+    let parent_plain = plain("pc");
+    let child_plain = plain("ch");
+    let parent_columns = columns("pc.oid");
+    let child_columns = columns("ch.oid");
+    format!(
+        "EXISTS (SELECT 1 FROM pg_catalog.pg_class pc
+                   JOIN pg_catalog.pg_partitioned_table pt ON pt.partrelid = pc.oid
+                  WHERE pc.oid = {root} AND pc.relkind = 'p' AND NOT pc.relispartition
+                    AND pt.partstrat = 'r' AND pc.relam = 0
+                    AND {parent_plain}
+                    AND pg_catalog.pg_get_partkeydef(pc.oid) = 'RANGE (' ||
+                        (SELECT pg_catalog.string_agg(pg_catalog.quote_ident(a.attname), ', '
+                                                      ORDER BY k.n)
+                           FROM pg_catalog.unnest(pt.partattrs::int2[])
+                                WITH ORDINALITY AS k(attnum, n)
+                           JOIN pg_catalog.pg_attribute a
+                             ON a.attrelid = pc.oid AND a.attnum = k.attnum) || ')'
+                    AND NOT EXISTS (
+                      SELECT 1 FROM pg_catalog.pg_inherits h
+                        JOIN pg_catalog.pg_class ch ON ch.oid = h.inhrelid
+                       WHERE h.inhparent = pc.oid
+                         AND NOT (ch.relkind = 'r' AND ch.relispartition
+                                  AND NOT h.inhdetachpending
+                                  AND {child_plain}
+                                  AND ch.relacl IS NULL
+                                  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute ca
+                                                   WHERE ca.attrelid = ch.oid AND ca.attnum > 0
+                                                     AND (ca.attislocal OR ca.attacl IS NOT NULL))
+                                  AND ch.relam = (SELECT am.oid FROM pg_catalog.pg_am am
+                                                   WHERE am.amname = 'heap')
+                                  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class tc
+                                                   WHERE tc.oid = ch.reltoastrelid
+                                                     AND tc.reloptions IS NOT NULL)
+                                  AND {child_columns} IS NOT DISTINCT FROM {parent_columns}
+                                  AND NOT EXISTS (
+                                    SELECT 1 FROM pg_catalog.pg_constraint k
+                                     WHERE k.conrelid = ch.oid
+                                       AND k.conparentid = 0
+                                       AND NOT (k.contype IN ('c', 'n') AND NOT k.conislocal))
+                                  AND NOT EXISTS (
+                                    SELECT 1 FROM pg_catalog.pg_index i
+                                     WHERE i.indrelid = ch.oid
+                                       AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits ih
+                                                        WHERE ih.inhrelid = i.indexrelid)))))"
+    )
+}
+
+/// Whether `c` is a table of a partition tree [`partition_tree`] holds: its
+/// parent, or one of its partitions.
+fn partition_tree_table() -> String {
+    format!(
+        "((c.relkind = 'p' AND {}) OR (c.relkind = 'r' AND c.relispartition AND {}))",
+        partition_tree("c.oid"),
+        partition_tree(
+            "(SELECT h.inhparent FROM pg_catalog.pg_inherits h WHERE h.inhrelid = c.oid)"
+        )
     )
 }
 
@@ -428,6 +552,7 @@ fn unheld_modules_query() -> String {
 fn partitioned_query() -> String {
     let not_one_of_ours = not_one_of_ours();
     let not_an_extensions = not_an_extensions("c.oid", "pg_class");
+    let held_tree = partition_tree_table();
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS table_name, c.relkind::text AS kind,
             c.relrowsecurity AS row_security, c.relpersistence::text AS persistence,
@@ -438,13 +563,15 @@ fn partitioned_query() -> String {
             c.relhasrules AS has_rules, am.amname AS access_method,
             c.reloftype::regtype::text AS of_type,
             EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid)
-              AS inherited_from
+              AS inherited_from,
+            c.relispartition AS partition
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
        LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
       WHERE {NOT_A_PROJECTS_SCHEMA}
         AND {not_one_of_ours}
         AND {not_an_extensions}
+        AND NOT {held_tree}
         AND (c.relkind IN ('p', 'f')
              OR (c.relkind = 'r'
                  AND (EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
@@ -534,7 +661,7 @@ fn columns_query() -> String {
                     ON iseq.oid = idep.objid AND iseq.relkind = 'S')
               ON idep.refobjid = a.attrelid AND idep.refobjsubid = a.attnum
              AND idep.classid = 'pg_class'::regclass AND idep.deptype = 'i'
-      WHERE c.relkind = 'r'
+      WHERE c.relkind IN ('r', 'p')
         AND {NOT_A_PROJECTS_SCHEMA}
         AND a.attnum > 0
         AND NOT a.attisdropped
@@ -580,8 +707,9 @@ fn constraints_query() -> String {
        FROM pg_catalog.pg_constraint con
        JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind = 'r'
+      WHERE c.relkind IN ('r', 'p')
         AND con.contype <> 't'
+        AND con.conparentid = 0
         AND {NOT_A_PROJECTS_SCHEMA}
       ORDER BY con.conrelid, con.conname"
     )
@@ -692,7 +820,7 @@ fn indexes_query() -> String {
        JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
        JOIN pg_catalog.pg_am am ON am.oid = ic.relam
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind = 'r'
+      WHERE c.relkind IN ('r', 'p')
         AND {NOT_A_PROJECTS_SCHEMA}
       ORDER BY i.indrelid, ic.relname"
     )
@@ -936,7 +1064,16 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         // An `r` reaches here for one of three reasons, and the message has to
         // say which: none of them is visible in `relkind`.
         let kind = match text(row, "kind")?.as_str() {
-            "p" => "a partitioned table",
+            // A tree is held whole or not at all (#1170, DEC-1170.1).
+            "p" => {
+                "a partitioned table other than one pbps holds: RANGE over plain columns, with \
+                 no row security, rules, triggers, storage parameters or replica identity, and \
+                 partitions that are its own and nothing else"
+            }
+            "r" if flag(row, "partition")? => {
+                "a partition of a partitioned table pbps does not hold whole, or one that has \
+                 columns, constraints, indexes, grants or settings of its own"
+            }
             "f" => "a foreign table",
             "r" if flag(row, "row_security")? => {
                 "a table with row-level security enabled, whose policies this model does not hold"
@@ -1018,6 +1155,18 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             reloptions: strings(row, "reloptions")?,
             toast_reloptions: strings(row, "toast_reloptions")?,
             unlogged: text(row, "persistence")? == "u",
+            // Present on every row, `null` on all but a partitioned parent:
+            // a row without the field is a malformed read, not an ordinary
+            // table.
+            partition_key: match row.get("partition_key") {
+                None => return Err(missing("partition_key")),
+                Some(serde_json::Value::Null) => None,
+                Some(_) => Some(strings(row, "partition_key")?),
+            },
+            partition_of: match optional_text(row, "partition_bound")? {
+                Some(bound) => Some((number(row, "partition_parent")?, bound)),
+                None => None,
+            },
         });
     }
     for row in batch.get("columns").ok_or_else(|| missing("columns"))? {
@@ -2356,6 +2505,28 @@ async fn ask_about_every_spelling(
             source: Box::new(e),
         })?;
     let mut out = Spellings::default();
+    for (partition, q) in crate::rows::bound_spelling_queries(schema)? {
+        let read = |source| crate::rows::RowsError::Read {
+            table: partition.clone(),
+            source: Box::new(source),
+        };
+        for row in &conn.query(&q.sql).await.map_err(read)? {
+            let (i, canonical) = crate::rows::decode_spelling(&partition, row)?;
+            let Some(declared) = q.values.get(i) else {
+                continue;
+            };
+            if canonical.as_deref() == Some(declared.as_str()) {
+                continue;
+            }
+            out.bounds.push(pbps_db::catalog::MisspeltBound {
+                partition: partition.clone(),
+                column: q.column.clone(),
+                declared: declared.clone(),
+                ty: q.ty.clone(),
+                canonical,
+            });
+        }
+    }
     let as_declared = crate::rows::Catalogued::default();
     for (name, table) in &schema.tables {
         let at = at.get(name).unwrap_or(&as_declared);
@@ -3009,14 +3180,19 @@ mod tests {
             columns_query().contains("NOT a.attisdropped"),
             "ADR-0012 §6"
         );
+        assert!(tables_query().contains("relkind = 'r'"), "TABLES");
+        // A partitioned parent's columns, keys and indexes are read as an
+        // ordinary table's (#1170); an index or a sequence is still neither.
         for (name, sql) in [
-            ("TABLES", tables_query()),
             ("COLUMNS", columns_query()),
             ("CONSTRAINTS", constraints_query()),
             ("INDEXES", indexes_query()),
         ] {
-            assert!(sql.contains("relkind = 'r'"), "{name}");
+            assert!(sql.contains("c.relkind IN ('r', 'p')"), "{name}");
         }
+        // A clone is its parent constraint's, on a partition or on the table
+        // a foreign key to a partitioned table is declared on (#1170).
+        assert!(constraints_query().contains("con.conparentid = 0"));
         for (name, sql) in [
             ("TABLES", tables_query()),
             ("PARTITIONED", partitioned_query()),

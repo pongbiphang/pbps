@@ -2633,6 +2633,83 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
     problems
 }
 
+/// What only the whole schema can say about RANGE partitions (#1170): a
+/// partition's parent is a declared partitioned table, and not itself a
+/// partition (nested partitioning is not held); its bound has one datum per
+/// key column at each end; and a parent has one default partition at most,
+/// which the engine also enforces.
+pub fn check_partitions(schema: &Schema) -> Vec<String> {
+    let mut problems = Vec::new();
+    // A partition declares nothing of its own, grants included, until #1532.
+    for (role, declared) in &schema.roles {
+        for target in declared.grants.keys() {
+            if let pbps_model::GrantTarget::Object(name) = target
+                && schema
+                    .tables
+                    .get(name)
+                    .is_some_and(|t| t.partition_of.is_some())
+            {
+                problems.push(format!(
+                    "role `{role}` is granted on `{name}`, a partition, which takes no grant of \
+                     its own"
+                ));
+            }
+        }
+    }
+    let mut defaults: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+    for (child, table) in &schema.tables {
+        let Some(of) = &table.partition_of else {
+            continue;
+        };
+        let Some(parent) = schema.tables.get(&of.parent) else {
+            problems.push(format!(
+                "`{child}` is a partition of `{}`, which is not declared",
+                of.parent
+            ));
+            continue;
+        };
+        let Some(by) = &parent.partition_by else {
+            problems.push(format!(
+                "`{child}` is a partition of `{}`, which declares no `partition_by`",
+                of.parent
+            ));
+            continue;
+        };
+        if parent.partition_of.is_some() {
+            problems.push(format!(
+                "`{}` is both partitioned and a partition, and pbps does not hold nested \
+                 partitioning",
+                of.parent
+            ));
+        }
+        match &of.bound {
+            pbps_model::PartitionBound::Default => {
+                if let Some(first) = defaults.insert(&of.parent, child) {
+                    problems.push(format!(
+                        "`{first}` and `{child}` are both the default partition of `{}`, which \
+                         takes one",
+                        of.parent
+                    ));
+                }
+            }
+            pbps_model::PartitionBound::Range { from, to } => {
+                let key = by.columns.len();
+                if from.len() != key || to.len() != key {
+                    problems.push(format!(
+                        "`{child}` is bounded by {} value(s) from and {} to, and `{}` is \
+                         partitioned by {key} column(s): give one value per key column at each \
+                         end",
+                        from.len(),
+                        to.len(),
+                        of.parent
+                    ));
+                }
+            }
+        }
+    }
+    problems
+}
+
 /// Whether a system-versioned table's history (#1176) takes a name something
 /// else in the declaration holds: another table's history, or any object the
 /// engine keeps beside tables. That is a table, a module of a kind that shares
@@ -3845,6 +3922,102 @@ mod tests {
             schema.modules.insert(id.parse().unwrap(), module(*kind));
         }
         schema
+    }
+
+    /// A partition names a declared, partitioned, unpartitioned-itself
+    /// parent, with one value per key column at each end, at most one default
+    /// per parent, and no grant of its own (#1170).
+    #[test]
+    fn a_partition_needs_its_parent_and_its_key() {
+        use pbps_model::{BoundDatum as D, PartitionBound as B};
+        let partitioned = |key: &[&str]| Table {
+            partition_by: Some(pbps_model::PartitionBy {
+                columns: key.iter().map(|k| (*k).to_owned()).collect(),
+            }),
+            ..Default::default()
+        };
+        let of = |parent: &str, bound: B| Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: parent.parse().unwrap(),
+                bound,
+            }),
+            ..Default::default()
+        };
+        let one = |v: &str| B::Range {
+            from: vec![D::Value(v.into())],
+            to: vec![D::MaxValue],
+        };
+        let mut ok = Schema::default();
+        ok.tables
+            .insert("app.p".parse().unwrap(), partitioned(&["a"]));
+        ok.tables
+            .insert("app.p1".parse().unwrap(), of("app.p", one("1")));
+        ok.tables
+            .insert("app.p2".parse().unwrap(), of("app.p", B::Default));
+        assert!(
+            check_partitions(&ok).is_empty(),
+            "{:?}",
+            check_partitions(&ok)
+        );
+
+        let mut cases: Vec<(&str, Schema)> = Vec::new();
+        let mut missing = ok.clone();
+        missing
+            .tables
+            .insert("app.q1".parse().unwrap(), of("app.q", B::Default));
+        cases.push(("which is not declared", missing));
+        let mut plain = ok.clone();
+        plain
+            .tables
+            .insert("app.q".parse().unwrap(), Table::default());
+        plain
+            .tables
+            .insert("app.q1".parse().unwrap(), of("app.q", B::Default));
+        cases.push(("declares no `partition_by`", plain));
+        let mut nested = ok.clone();
+        let mut middle = of("app.p", one("5"));
+        middle.partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["a".into()],
+        });
+        nested.tables.insert("app.p3".parse().unwrap(), middle);
+        nested
+            .tables
+            .insert("app.p31".parse().unwrap(), of("app.p3", B::Default));
+        cases.push(("nested partitioning", nested));
+        let mut short = ok.clone();
+        short
+            .tables
+            .insert("app.p".parse().unwrap(), partitioned(&["a", "b"]));
+        cases.push(("one value per key column", short));
+        let mut defaults = ok.clone();
+        defaults
+            .tables
+            .insert("app.p3".parse().unwrap(), of("app.p", B::Default));
+        cases.push(("both the default partition", defaults));
+        let mut granted = ok.clone();
+        let mut role = pbps_model::Role::default();
+        role.grants.insert(
+            pbps_model::GrantTarget::Object("app.p1".parse().unwrap()),
+            Default::default(),
+        );
+        granted.roles.insert("reader".into(), role);
+        cases.push(("takes no grant of its own", granted));
+        for (expected, schema) in cases {
+            let found = check_partitions(&schema);
+            assert!(
+                found.iter().any(|p| p.contains(expected)),
+                "{expected}: {found:?}"
+            );
+        }
+        // Negative: a grant on the parent is the parent's own.
+        let mut on_parent = ok.clone();
+        let mut role = pbps_model::Role::default();
+        role.grants.insert(
+            pbps_model::GrantTarget::Object("app.p".parse().unwrap()),
+            Default::default(),
+        );
+        on_parent.roles.insert("reader".into(), role);
+        assert!(check_partitions(&on_parent).is_empty());
     }
 
     /// A history table takes a name in the schema's namespace although no

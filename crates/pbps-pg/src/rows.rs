@@ -1272,6 +1272,89 @@ fn collatable(base: &str) -> bool {
 
 /// Reads one row of a spelling query: the literal's index and what the
 /// engine made of it.
+/// The question [`spelling_queries`] asks of a row's values, asked of one
+/// partition's bound values on one key column (#1170).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundSpellingQuery {
+    pub column: String,
+    pub ty: String,
+    /// The declared values, by the index the query returns.
+    pub values: Vec<String>,
+    pub sql: String,
+}
+
+/// One query per partition and key column whose bound declares a value: the
+/// engine's reading of each as the key column's type, under the canonical
+/// session, which is the text the reader gets back (measured on 16 and 18).
+/// A partition whose parent or key column is not declared has nothing to ask;
+/// validation names it.
+pub fn bound_spelling_queries(
+    schema: &pbps_model::Schema,
+) -> Result<Vec<(TableName, BoundSpellingQuery)>, RowsError> {
+    let mut out = Vec::new();
+    for (name, table) in &schema.tables {
+        let Some(of) = &table.partition_of else {
+            continue;
+        };
+        let pbps_model::PartitionBound::Range { from, to } = &of.bound else {
+            continue;
+        };
+        let Some(parent) = schema.tables.get(&of.parent) else {
+            continue;
+        };
+        let Some(by) = &parent.partition_by else {
+            continue;
+        };
+        for (i, column) in by.columns.iter().enumerate() {
+            let Some(spec) = parent.columns.get(column) else {
+                continue;
+            };
+            let values: Vec<String> = [from.get(i), to.get(i)]
+                .into_iter()
+                .flatten()
+                .filter_map(|d| match d {
+                    pbps_model::BoundDatum::Value(v) => Some(v.clone()),
+                    pbps_model::BoundDatum::MinValue | pbps_model::BoundDatum::MaxValue => None,
+                })
+                .collect();
+            if values.is_empty() {
+                continue;
+            }
+            let ty = crate::types::normalize(&spec.ty)
+                .map_err(|e| RowsError::Unreadable {
+                    table: name.clone(),
+                    why: e.to_string(),
+                })?
+                .to_string();
+            let readable = format!("pg_catalog.pg_input_is_valid(v.s, {})", value_literal(&ty));
+            let rendered = read_expr(&format!("CAST(v.s AS {ty})"));
+            let list = values
+                .iter()
+                .enumerate()
+                .map(|(i, text)| format!("({i}, {})", value_literal(text)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // The fence for the reason `spelling_queries` has one (DECISIONS
+            // 324): one row would be folded and cast while planning.
+            let sql = format!(
+                "SELECT v.i AS i, CASE WHEN {readable} THEN {rendered} END AS c\n  \
+                 FROM (SELECT pbps_v.i, pbps_v.s FROM (VALUES {list}) AS pbps_v(i, s) OFFSET 0) \
+                 AS v(i, s);"
+            );
+            out.push((
+                name.clone(),
+                BoundSpellingQuery {
+                    column: column.clone(),
+                    ty,
+                    values,
+                    sql,
+                },
+            ));
+        }
+    }
+    Ok(out)
+}
+
 pub fn decode_spelling(
     name: &TableName,
     row: &pbps_db::Row,

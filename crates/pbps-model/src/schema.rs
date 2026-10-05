@@ -452,6 +452,18 @@ pub struct Table {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_time: Option<SystemTime>,
 
+    /// A PostgreSQL RANGE-partitioned parent's key, by column (#1170,
+    /// DEC-1170.1). `None` is an ordinary table, which every table an older
+    /// reader recorded was: it left a partitioned one out as a limitation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_by: Option<PartitionBy>,
+
+    /// This table is a partition of another, with its bound (#1170). A
+    /// partition holds nothing of its own: its columns, keys and indexes are
+    /// its parent's, which the engine gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_of: Option<PartitionOf>,
+
     /// Declared reference data (ADR-0004).
     ///
     /// `None` — the overwhelmingly common case — is the opt-in switch being
@@ -463,6 +475,70 @@ pub struct Table {
     /// existed describes a table that declares no rows, not a broken file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<TableData>,
+}
+
+/// `PARTITION BY RANGE (…)` over plain columns (#1170).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionBy {
+    /// The key's columns, in order.
+    pub columns: Vec<String>,
+}
+
+/// A partition's parent and the rows it takes (#1170).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionOf {
+    pub parent: TableName,
+    pub bound: PartitionBound,
+}
+
+/// What a RANGE partition takes: every row no other partition does, or a
+/// range from one key value (inclusive) to another (exclusive), one datum per
+/// key column.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionBound {
+    Default,
+    Range {
+        from: Vec<BoundDatum>,
+        to: Vec<BoundDatum>,
+    },
+}
+
+/// One key column's end of a range: the engine's own text for a value,
+/// unquoted, or one of the two unbounded ends.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundDatum {
+    MinValue,
+    MaxValue,
+    Value(String),
+}
+
+/// As a declaration writes one: `MINVALUE`, `MAXVALUE`, or the value.
+impl std::fmt::Display for BoundDatum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BoundDatum::MinValue => f.write_str("MINVALUE"),
+            BoundDatum::MaxValue => f.write_str("MAXVALUE"),
+            BoundDatum::Value(v) => f.write_str(v),
+        }
+    }
+}
+
+impl BoundDatum {
+    /// A declared datum: `MINVALUE` and `MAXVALUE` in any case are the
+    /// unbounded ends, anything else a value as written.
+    pub fn declared(text: &str) -> Self {
+        if text.eq_ignore_ascii_case("minvalue") {
+            BoundDatum::MinValue
+        } else if text.eq_ignore_ascii_case("maxvalue") {
+            BoundDatum::MaxValue
+        } else {
+            BoundDatum::Value(text.to_owned())
+        }
+    }
 }
 
 /// A SQL Server table's `PERIOD FOR SYSTEM_TIME`, and its system versioning

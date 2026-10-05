@@ -89,6 +89,9 @@ use crate::schema::Schema;
 /// Bumped to 19 when a column's type could be a PostgreSQL array, `T[]`
 /// (DEC-1167.1). Versions 6 to 18 stay readable.
 ///
+/// Bumped to 20 when a table could be a PostgreSQL range-partitioned parent
+/// or one of its partitions (DEC-1170.2). Versions 6 to 19 stay readable.
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
 ///
@@ -107,7 +110,7 @@ use crate::schema::Schema;
 /// order, which can drop a schema-bound dependency before its dependent.
 /// Refused, with the remedy `check_version` already names: re-record it with
 /// `pbps baseline --reason ...`.
-pub const CURRENT_VERSION: u32 = 19;
+pub const CURRENT_VERSION: u32 = 20;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -183,6 +186,10 @@ pub const CURRENT_VERSION: u32 = 19;
 /// Still 6 at version 19, whose array types an older state never holds
 /// (DEC-1167.2): an older reader left a table with an array column out as a
 /// limitation, so no recorded column is an array.
+///
+/// Still 6 at version 20 (DEC-1170.2): an older reader left a partitioned
+/// table and every partition out as a limitation, so every recorded table is
+/// neither, which is what absent fields read as.
 pub const OLDEST_READABLE_VERSION: u32 = 6;
 
 /// How this state came about.
@@ -585,7 +592,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 19);
+        assert_eq!(CURRENT_VERSION, 20);
     }
 
     fn schema_with(ty: &str) -> Schema {

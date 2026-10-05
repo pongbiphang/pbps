@@ -65,6 +65,13 @@ created whole, and gains a nullable column in place, its history with it;
 every other change to one is refused by name (#1176, #1177, DEC-1176.1,
 DEC-1177.1).
 
+A PostgreSQL table declares `partition_by:` and its RANGE partitions under
+`partitions:`, in its own file. `pull` reads a tree whose partitions are their
+parent's and nothing else, and leaves any other tree out whole, by name. A
+tree is created whole; every other change to one is refused by name until
+#1171, and a partition nobody declared is refused with the commands that adopt
+it (#1170, DEC-1170.1).
+
 A SQL Server column may name its collation (`collation:`); `pull` declares one
 that differs from the database's default, and a collation change is a planned
 `ALTER COLUMN` that rebuilds the keys around it (#1175, DEC-1175.1).
