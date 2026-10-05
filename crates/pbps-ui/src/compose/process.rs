@@ -31,7 +31,18 @@ fn kill(child: &mut Child) {
     let _ = child.wait();
 }
 
-pub(super) fn run(mut command: Command, input: &[u8], deadline: Duration) -> Result<Output> {
+pub(super) fn run(command: Command, input: &[u8], deadline: Duration) -> Result<Output> {
+    run_with(command, input, deadline, std::thread::sleep)
+}
+
+/// [`run`] with the pause between status polls supplied, so a test can see
+/// how long a run waits rather than infer it from wall time.
+fn run_with(
+    mut command: Command,
+    input: &[u8],
+    deadline: Duration,
+    mut pause: impl FnMut(Duration),
+) -> Result<Output> {
     use std::os::unix::process::CommandExt as _;
     command
         .process_group(0)
@@ -82,7 +93,7 @@ pub(super) fn run(mut command: Command, input: &[u8], deadline: Duration) -> Res
             }
         }
     }
-    match reaped(&mut child, started, deadline) {
+    match reaped(&mut child, started, deadline, &mut pause) {
         Ok(Some(status)) => Ok(Output {
             status,
             stdout: streams[0].take().expect("read stdout"),
@@ -112,8 +123,9 @@ fn reaped(
     child: &mut Child,
     started: Instant,
     deadline: Duration,
+    pause: &mut impl FnMut(Duration),
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
-    let mut pause = Duration::from_micros(50);
+    let mut wait = Duration::from_micros(50);
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));
@@ -121,8 +133,8 @@ fn reaped(
         let Some(remaining) = left(started, deadline) else {
             return Ok(None);
         };
-        std::thread::sleep(pause.min(remaining));
-        pause = (pause * 2).min(Duration::from_millis(5));
+        pause(wait.min(remaining));
+        wait = (wait * 2).min(Duration::from_millis(5));
     }
 }
 
@@ -141,20 +153,24 @@ mod tests {
     }
 
     #[test]
-    fn a_quick_child_returns_without_waiting_out_a_polling_interval() {
-        // A fixed 5 ms poll made every run take at least 5 ms (#1539). The
-        // fastest of twenty is robust to a loaded host, which slows some
-        // spawns but not all of them.
-        let fastest = (0..20)
+    fn a_quick_child_is_not_held_for_a_polling_interval() {
+        // A fixed 5 ms poll paused every run at least that long before it
+        // looked again (#1539). This counts the pauses a run asks for, not
+        // its wall time, so a loaded host's slow spawns cannot fail it.
+        let least = (0..20)
             .map(|_| {
-                let start = Instant::now();
-                let output = run(Command::new("true"), &[], Duration::from_secs(5)).unwrap();
+                let mut paused = Duration::ZERO;
+                let output = run_with(Command::new("true"), &[], Duration::from_secs(5), |d| {
+                    paused += d;
+                    std::thread::sleep(d);
+                })
+                .unwrap();
                 assert!(output.status.success());
-                start.elapsed()
+                paused
             })
             .min()
             .unwrap();
-        assert!(fastest < Duration::from_millis(5), "{fastest:?}");
+        assert!(least < Duration::from_millis(5), "{least:?}");
     }
 
     #[test]
