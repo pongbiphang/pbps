@@ -8051,6 +8051,50 @@ async fn the_database_owner_is_no_exception_to_the_ledger_editor_rule() {
     }
 }
 
+/// The ledger's trust check stays linear in the cluster's roles (#1529). Its
+/// editor branches asked every login role about every role in the cluster,
+/// `pg_has_role` roles² times: about 1.9 s a call on a 2285-role cluster, paid
+/// by every command that checks the ledger. With three thousand login roles
+/// that hold nothing on the ledger, the check finishes well inside a bound
+/// the quadratic shape cannot meet, and still names none of them.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_ledger_trust_check_stays_linear_in_the_clusters_roles() {
+    let mut db = TestDb::create("ledger_many_roles").await;
+    state::ensure_tables(&mut db.conn).await.unwrap();
+    let prefix = format!("pbps_crowd_{}_", std::process::id());
+    let mut admin = Conn::connect(Driver::Postgres, &conn_str()).await.unwrap();
+    admin
+        .execute(&format!(
+            "DO $$ BEGIN FOR i IN 1..3000 LOOP \
+               EXECUTE format('CREATE ROLE %I LOGIN NOSUPERUSER', '{prefix}' || i); \
+             END LOOP; END $$"
+        ))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let problems = state::ledger_problems(&mut db.conn).await;
+    let took = started.elapsed();
+    admin
+        .execute(&format!(
+            "DO $$ BEGIN FOR i IN 1..3000 LOOP \
+               EXECUTE format('DROP ROLE IF EXISTS %I', '{prefix}' || i); \
+             END LOOP; END $$"
+        ))
+        .await
+        .unwrap();
+    let problems = problems.unwrap();
+    assert!(
+        !problems.iter().any(|p| p.contains(&prefix)),
+        "a role holding nothing on the ledger is named: {problems:#?}"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "the ledger check took {took:?} with three thousand login roles"
+    );
+    db.drop().await;
+}
+
 /// Issue #313: a role with `CREATE` on `public` makes the ledger tables before
 /// pbps does and attaches a trigger. The deployment account must refuse
 /// before its first write, so the trigger never runs — the marker it would

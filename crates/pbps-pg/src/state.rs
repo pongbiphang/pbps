@@ -909,7 +909,39 @@ pub(crate) fn ledger_facts() -> String {
             WHERE n.nspname = '{LEDGER_SCHEMA}'
               AND c.relname IN ('{STATE_TABLE_NAME}', '{LOCK_TABLE_NAME}')
          ),
-         ledger AS (SELECT * FROM occupant WHERE relkind = 'r')
+         ledger AS (SELECT * FROM occupant WHERE relkind = 'r'),
+         -- The roles that can themselves add a trigger to each ledger table,
+         -- found once per table (#1529). Asking each candidate actor about
+         -- every role in the cluster first made the editor branches call
+         -- `pg_has_role` roles² times: ~1.9 s a call on a 2285-role cluster.
+         -- This set is the owner, its members and the few grantees, and the
+         -- actor test below is asked only against it. The same predicate as
+         -- before, split in two; who is named does not change.
+         trigger_editor AS MATERIALIZED (
+           SELECT l.oid AS ledger, g.oid AS role
+             FROM ledger l CROSS JOIN pg_catalog.pg_roles g
+            WHERE pg_catalog.has_schema_privilege(g.oid, l.relnamespace, 'USAGE')
+              AND (pg_catalog.has_table_privilege(g.oid, l.oid, 'TRIGGER')
+                   OR pg_catalog.pg_has_role(g.oid, l.relowner, 'USAGE'))
+         ),
+         -- Likewise the roles that can themselves move a ledger identity
+         -- sequence: `UPDATE` on it and `EXECUTE` on either `setval`.
+         sequence_editor AS MATERIALIZED (
+           SELECT d.objid AS sequence, g.oid AS role
+             FROM ledger l
+             JOIN pg_catalog.pg_depend d
+               ON d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+              AND d.refobjid = l.oid AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+              AND d.deptype = 'i'
+             JOIN pg_catalog.pg_sequence s ON s.seqrelid = d.objid
+             CROSS JOIN pg_catalog.pg_roles g
+            WHERE pg_catalog.has_sequence_privilege(g.oid, d.objid, 'UPDATE')
+              AND (pg_catalog.has_function_privilege(
+                       g.oid, 'pg_catalog.setval(pg_catalog.regclass, bigint)', 'EXECUTE')
+                   OR pg_catalog.has_function_privilege(
+                       g.oid, 'pg_catalog.setval(pg_catalog.regclass, bigint, boolean)',
+                       'EXECUTE'))
+         )
          SELECT o.relname, 'occupant ' || o.relkind::text AS fact
            FROM occupant o WHERE o.relkind <> 'r'
          UNION ALL
@@ -1026,21 +1058,15 @@ pub(crate) fn ledger_facts() -> String {
             -- named here.
             AND NOT EXISTS (
                 {TRIGGER_EDITOR})
+            -- And can call `setval` at all: measured on 18.6 and 16.15, with
+            -- EXECUTE on both overloads revoked from PUBLIC, UPDATE alone is
+            -- refused by either, so naming such a role would refuse a ledger
+            -- nobody can reorder. The same role must hold both: under `SET
+            -- ROLE` the call runs with one role's privileges (`sequence_editor`).
             AND EXISTS (
-                SELECT 1 FROM pg_catalog.pg_roles g
-                 WHERE pg_catalog.pg_has_role(e.oid, g.oid, 'SET')
-                   AND pg_catalog.has_sequence_privilege(g.oid, d.objid, 'UPDATE')
-                   -- And can call `setval` at all: measured on 18.6 and 16.15,
-                   -- with EXECUTE on both overloads revoked from PUBLIC, UPDATE
-                   -- alone is refused by either, so naming such a role would
-                   -- refuse a ledger nobody can reorder. The same role `g`
-                   -- must hold both: under `SET ROLE` the call runs with one
-                   -- role's privileges.
-                   AND (pg_catalog.has_function_privilege(
-                            g.oid, 'pg_catalog.setval(pg_catalog.regclass, bigint)', 'EXECUTE')
-                        OR pg_catalog.has_function_privilege(
-                            g.oid, 'pg_catalog.setval(pg_catalog.regclass, bigint, boolean)',
-                            'EXECUTE')))"
+                SELECT 1 FROM sequence_editor se
+                 WHERE se.sequence = d.objid
+                   AND pg_catalog.pg_has_role(e.oid, se.role, 'SET'))"
     )
 }
 
@@ -1049,11 +1075,12 @@ pub(crate) fn ledger_facts() -> String {
 /// `CREATE TRIGGER` resolves the table by name (DEC-834.1). Shared by the
 /// trigger branch of [`ledger_facts`] and the sequence branch that leaves the
 /// same roles out, so the two agree on exactly who the first one names.
-const TRIGGER_EDITOR: &str = "SELECT 1 FROM pg_catalog.pg_roles g
-                 WHERE pg_catalog.pg_has_role(e.oid, g.oid, 'SET')
-                   AND pg_catalog.has_schema_privilege(g.oid, l.relnamespace, 'USAGE')
-                   AND (pg_catalog.has_table_privilege(g.oid, l.oid, 'TRIGGER')
-                        OR pg_catalog.pg_has_role(g.oid, l.relowner, 'USAGE'))";
+///
+/// The editors themselves are `ledger_facts`' `trigger_editor`, computed once
+/// per table; this asks only whether `e` can become one of them (#1529).
+const TRIGGER_EDITOR: &str = "SELECT 1 FROM trigger_editor te
+                 WHERE te.ledger = l.oid
+                   AND pg_catalog.pg_has_role(e.oid, te.role, 'SET')";
 
 /// Who counts as able to act against the deployment account, for both editor
 /// branches of [`ledger_facts`] (DEC-834.1, DEC-862.1): a login role, or one

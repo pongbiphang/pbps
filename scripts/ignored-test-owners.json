@@ -2022,6 +2022,7 @@
         "the_ledger_is_created_on_heap_whatever_the_default_access_method",
         "the_ledger_names_are_hidden_only_for_tables_in_its_schema",
         "the_ledger_returns_exactly_what_was_recorded",
+        "the_ledger_trust_check_stays_linear_in_the_clusters_roles",
         "the_legacy_fallback_batches_past_postgresqls_parameter_ceiling",
         "the_lock_admits_one_holder_and_names_it_to_the_second",
         "the_lock_each_statement_takes_is_the_one_the_estimate_names",
