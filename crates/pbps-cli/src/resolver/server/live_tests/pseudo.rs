@@ -59,7 +59,10 @@ async fn foreign_pseudo_roots_refuse_admission_and_discard_live_analysis() {
         .unwrap();
         let retained = analysis
             .runtime
-            .check(&[&control.guard, &scratch.guard])
+            .check(
+                &[&control.guard, &scratch.guard],
+                &run.inner.control.retired,
+            )
             .is_err();
         let refused_run = run.check(&mut target).await.is_err();
         changed.restore();

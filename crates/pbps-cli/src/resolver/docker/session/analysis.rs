@@ -268,6 +268,10 @@ pub(crate) struct ContainerControl {
     census: Census,
     pub(crate) admin: Option<ContainerSession>,
     retired: Vec<CandidateRun>,
+    /// The retired sessions' socket pairs and engine session keys, which
+    /// stay in the engine's tables until the processes holding them exit
+    /// (#1559, DEC-1559.1).
+    leaving: Vec<exclusivity::Leaving>,
     unconfirmed: Vec<String>,
     pending_relay: Option<CandidateRun>,
     pending_relay_name: Option<String>,
@@ -312,6 +316,10 @@ impl ContainerControl {
     }
     pub(crate) fn retire(&mut self, session: ContainerSession) {
         drop(session.connection);
+        self.leaving.push(exclusivity::Leaving::new(
+            session.kernel.pair,
+            session.kernel.key,
+        ));
         self.retired.push(session.run);
     }
     pub(crate) fn retire_admin(&mut self) {
@@ -370,7 +378,7 @@ impl ContainerControl {
         }
         let mut pairs = vec![&self.control_kernel.pair];
         pairs.extend(scratch.map(ContainerSession::pair));
-        exclusivity::census(&root, &pairs)?;
+        exclusivity::census(&root, &pairs, &self.leaving)?;
         let expected: BTreeSet<String> = std::iter::once(self.control_kernel.key.clone())
             .chain(scratch.map(|session| session.key().to_owned()))
             .collect();
@@ -381,7 +389,7 @@ impl ContainerControl {
             return Err(invalid());
         }
         self.census.counted(&reported.counter)?;
-        exclusivity::only_our_sessions(&reported.clients, &expected)?;
+        exclusivity::only_our_sessions(&reported.clients, &expected, &self.leaving)?;
         let identity = server::engine::identity(&mut state.connection)
             .await
             .map_err(|error| Error::Identity(error.to_string()))?;
@@ -397,7 +405,7 @@ impl ContainerControl {
                 .check(&root, &scratch.run, scratch.connection.id())
                 .await?;
         }
-        exclusivity::census(&root, &pairs)?;
+        exclusivity::census(&root, &pairs, &self.leaving)?;
         state
             .target
             .as_ref()
@@ -497,7 +505,8 @@ impl ContainerControl {
         .map_err(|_| failed(invalid(), self.recovery_names()))?;
         let mut pairs = vec![&self.control_kernel.pair, &kernel.pair];
         pairs.extend(scratch.map(ContainerSession::pair));
-        exclusivity::census(&root, &pairs).map_err(|cause| failed(cause, self.recovery_names()))?;
+        exclusivity::census(&root, &pairs, &self.leaving)
+            .map_err(|cause| failed(cause, self.recovery_names()))?;
         let mut expected = BTreeSet::from([self.control_kernel.key.clone(), kernel.key.clone()]);
         if let Some(scratch) = scratch {
             expected.insert(scratch.key().to_owned());
@@ -512,7 +521,7 @@ impl ContainerControl {
             .map_err(|error| {
                 failed(Error::Exclusivity(server::signal(&error)), recovery.clone())
             })?;
-        exclusivity::only_our_sessions(&reported.clients, &expected)
+        exclusivity::only_our_sessions(&reported.clients, &expected, &self.leaving)
             .map_err(|cause| failed(cause, recovery.clone()))?;
         if reported.own != self.control_kernel.key
             || reported.counter.epoch != self.census.epoch
@@ -548,7 +557,8 @@ impl ContainerControl {
             )
             .await
             .map_err(|cause| failed(cause, recovery.clone()))?;
-        exclusivity::census(&root, &pairs).map_err(|cause| failed(cause, recovery.clone()))?;
+        exclusivity::census(&root, &pairs, &self.leaving)
+            .map_err(|cause| failed(cause, recovery.clone()))?;
         let relay = self.pending_relay.take().expect("owned relay");
         self.pending_relay_name = None;
         self.census.opened += 1;
@@ -879,6 +889,7 @@ impl CandidateSession {
         exclusivity::only_our_sessions(
             &inventory.clients,
             &BTreeSet::from([control_kernel.key.clone()]),
+            &[],
         )
         .map_err(|cause| failed(cause, Vec::new()))?;
         let names = server::generated_names().map_err(|cause| failed(cause, Vec::new()))?;
@@ -968,7 +979,7 @@ impl CandidateSession {
                 .map_err(|error| failed(converted(error), pending.names()))?,
         )
         .map_err(|_| failed(invalid(), pending.names()))?;
-        exclusivity::census(&root, &[&control_kernel.pair, &kernel.pair])
+        exclusivity::census(&root, &[&control_kernel.pair, &kernel.pair], &[])
             .map_err(|cause| failed(cause, pending.names()))?;
         let current = server::engine::client_sessions(&mut state.connection)
             .await
@@ -976,6 +987,7 @@ impl CandidateSession {
         exclusivity::only_our_sessions(
             &current.clients,
             &BTreeSet::from([control_kernel.key.clone(), kernel.key.clone()]),
+            &[],
         )
         .map_err(|cause| failed(cause, pending.names()))?;
         if current.own != control_kernel.key
@@ -998,7 +1010,7 @@ impl CandidateSession {
         if identity != state.identity {
             return Err(failed(invalid(), pending.names()));
         }
-        exclusivity::census(&root, &[&control_kernel.pair, &kernel.pair])
+        exclusivity::census(&root, &[&control_kernel.pair, &kernel.pair], &[])
             .map_err(|cause| failed(cause, pending.names()))?;
         let relay = pending.relay.take().expect("relay");
         pending.relay_name = None;
@@ -1026,6 +1038,7 @@ impl CandidateSession {
             census,
             admin: None,
             retired: Vec::new(),
+            leaving: Vec::new(),
             unconfirmed: Vec::new(),
             pending_relay: None,
             pending_relay_name: None,

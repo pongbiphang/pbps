@@ -425,6 +425,14 @@ struct Control {
     /// run-owned container nobody can confirm gone is a recovery name like
     /// the database and the login (finding on #640).
     stale: Vec<Forwarder>,
+    /// The guards of the retired sessions' forwarders, held so that the
+    /// census still knows their PID namespaces while their tasks leave the
+    /// engine's network namespace (#1559).
+    retired: Vec<ProcessLease>,
+    /// The retired sessions' socket pairs and engine session keys, which
+    /// stay in the engine's tables until the processes holding them exit
+    /// (#1559).
+    leaving: Vec<exclusivity::Leaving>,
     /// Forwarder containers already reported unconfirmed.
     unconfirmed: Vec<String>,
     /// Run-local authorization roles this run created on the shared server,
@@ -450,13 +458,28 @@ impl Control {
 
     /// Ends a session without confirming its forwarder's removal yet.
     fn retire(&mut self, session: Session) {
+        drop(self.set_aside(session));
+    }
+
+    /// Everything [`Self::retire`] records about a session, handing back its
+    /// connection. What the session holds in the kernel and the engine leaves
+    /// when its processes exit, not when the connection is dropped, so the
+    /// run keeps it as its own until then (#1559). Split out so a test can
+    /// hold the connection open and make that window certain.
+    fn set_aside(&mut self, session: Session) -> StreamConn {
         let Session {
             connection,
             forwarder,
+            guard,
+            pair,
+            session_key,
             ..
         } = session;
-        drop(connection);
         self.stale.push(forwarder);
+        self.retired.push(guard);
+        self.leaving
+            .push(exclusivity::Leaving::new(pair, session_key));
+        connection
     }
 }
 
@@ -665,7 +688,7 @@ impl Analysis {
             ));
         }
         self.counted(&reported.counter)?;
-        exclusivity::only_our_sessions(&reported.clients, &expected)?;
+        exclusivity::only_our_sessions(&reported.clients, &expected, &control.leaving)?;
         let identity = engine::identity(&mut session.connection)
             .await
             .map_err(|error| Error::Identity(error.to_string()))?;
@@ -696,7 +719,7 @@ impl Analysis {
         let session = control.session.as_ref().ok_or(Error::Cancelled)?;
         let mut forwarders = vec![&session.guard];
         forwarders.extend(extra.map(|extra| &extra.guard));
-        self.runtime.check(&forwarders)?;
+        self.runtime.check(&forwarders, &control.retired)?;
         let init = self.runtime.init();
         session.check(init).await?;
         if let Some(extra) = extra {
@@ -704,7 +727,7 @@ impl Analysis {
         }
         let mut pairs = vec![&session.pair];
         pairs.extend(extra.map(|extra| &extra.pair));
-        exclusivity::census(init, &pairs)?;
+        exclusivity::census(init, &pairs, &control.leaving)?;
         let mut expected = BTreeSet::from([session.session_key.clone()]);
         expected.extend(extra.map(|extra| extra.session_key.clone()));
         Ok(expected)
@@ -849,7 +872,7 @@ impl DedicatedServer {
         )?;
         profile::configuration(&state).map_err(Error::Configuration)?;
         let runtime = ServerRuntime::bind(processes, profile)?;
-        runtime.check(&[])?;
+        runtime.check(&[], &[])?;
         let image = api
             .inspect_image(&pinned.image)
             .await
@@ -900,6 +923,7 @@ impl DedicatedServer {
             exclusivity::only_our_sessions(
                 &inventory.clients,
                 &BTreeSet::from([session.session_key.clone()]),
+                &[],
             )?;
             // A cloned cluster can report the target's identifier. It is compared
             // in addition to the runtime separation above, never instead of it.
@@ -938,6 +962,8 @@ impl DedicatedServer {
                 pending: None,
                 in_flight: false,
                 stale: Vec::new(),
+                retired: Vec::new(),
+                leaving: Vec::new(),
                 unconfirmed: Vec::new(),
                 roles: Vec::new(),
                 admin: None,
@@ -979,7 +1005,9 @@ impl DedicatedServer {
             .map_err(|_| Error::Unqualified("the target binding this run was aimed at changed"))
             .and_then(|()| {
                 let session = inner.control.session.as_ref().ok_or(Error::Cancelled)?;
-                analysis.runtime.check(&[&session.guard])?;
+                analysis
+                    .runtime
+                    .check(&[&session.guard], &inner.control.retired)?;
                 session.check_kernel(analysis.runtime.init())
             });
         if let Err(cause) = &outcome {

@@ -59,7 +59,10 @@ async fn host_file_loss_refuses_admission_and_discards_live_analysis() {
         let scratch = run.scratch.as_ref().unwrap();
         let runtime_refused = analysis
             .runtime
-            .check(&[&control.guard, &scratch.guard])
+            .check(
+                &[&control.guard, &scratch.guard],
+                &run.inner.control.retired,
+            )
             .is_err();
         let forwarders_refused = [control, scratch]
             .iter()

@@ -75,7 +75,10 @@ async fn kernel_name_loss_refuses_admission_and_discards_each_live_view() {
                 let refused_view = if subject == "workload" {
                     analysis
                         .runtime
-                        .check(&[&control.guard, &scratch.guard])
+                        .check(
+                            &[&control.guard, &scratch.guard],
+                            &run.inner.control.retired,
+                        )
                         .is_err()
                 } else {
                     let session = if subject == "control" {
