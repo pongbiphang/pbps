@@ -2511,9 +2511,19 @@ version 27 carries it, and SQL Server refuses it.
    temporary name.
 4. Every temporary name is renamed to its declared one.
 
-The temporary names carry the table's oid. They exist because a declaration
-may exchange two names, or give a clone a name a check still holds; renaming
-straight across would collide with a name not yet vacated.
+The temporary names carry the table's oid, after a prefix no declared name
+starts with. They exist because a declaration may exchange two names, or give
+a clone a name a check still holds; renaming straight across would collide
+with a name not yet vacated.
+
+The block runs on the table's schema's path, where a user who may create there
+can add an operator. Measured on 16 and 18, an operator whose arguments match
+exactly (`text || oid`, `oid = regclass`) is chosen over a built-in that needs
+a cast, `pg_catalog` searched first or not; DECISIONS 276 protects only an
+identical signature. So the block uses no such operator: every class is
+compared as an `oid`, and every name is built by `pg_catalog.format`. Pinned by
+the live `a_detach_calls_no_operator_a_schema_user_could_add`, whose operators
+the previous block called 71 times.
 
 Pinned by the live `a_partition_is_detached_and_kept_under_its_declared_names`
 (on 16 and 18), which fails without the renames, with renames made straight

@@ -4574,6 +4574,105 @@ async fn a_detach_takes_the_parent_before_the_partition() {
     drop_schema(&mut a, &s).await;
 }
 
+/// A detach calls no operator a user of the table's schema could add (#1544).
+/// The batch runs on that schema's path, and an operator matching its
+/// arguments exactly is chosen over a built-in that needs a cast even with
+/// `pg_catalog` searched first: measured, `text || oid` and
+/// `oid = regclass`. Each here writes a row when called, and none is.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_detach_calls_no_operator_a_schema_user_could_add() {
+    let s = emit_schema("detach_ops");
+    let mut a = connect().await;
+    fresh(&mut a, &s).await;
+    a.execute(&format!(
+        "CREATE TABLE {s}.called (what text);
+         CREATE FUNCTION {s}.cat(text, oid) RETURNS text LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO {s}.called VALUES ('||'); RETURN $1 || $2::text; END $$;
+         CREATE OPERATOR {s}.|| (leftarg = text, rightarg = oid, function = {s}.cat);
+         CREATE FUNCTION {s}.eq(oid, regclass) RETURNS boolean LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO {s}.called VALUES ('='); RETURN $1 = $2::oid; END $$;
+         CREATE OPERATOR {s}.= (leftarg = oid, rightarg = regclass, function = {s}.eq);
+         CREATE TABLE {s}.ev (id integer NOT NULL, ts date NOT NULL, v text,
+             CONSTRAINT ev_pk PRIMARY KEY (id, ts), CONSTRAINT ev_vt UNIQUE (v, ts))
+             PARTITION BY RANGE (ts);
+         CREATE INDEX ev_v ON {s}.ev (v);
+         CREATE TABLE {s}.ev_1 PARTITION OF {s}.ev
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');"
+    ))
+    .await
+    .expect("the tree and the operators");
+    // The trap springs where nothing guards against it.
+    a.execute(&format!(
+        "DO $$ BEGIN PERFORM 'x' || '{s}.ev'::regclass::oid; END $$"
+    ))
+    .await
+    .expect("the bare concatenation");
+    a.execute(&format!("SET search_path = {s}"))
+        .await
+        .expect("the path");
+    a.execute(&format!(
+        "DO $$ BEGIN PERFORM 'x' || '{s}.ev'::regclass::oid; END $$"
+    ))
+    .await
+    .expect("the bare concatenation on the schema's path");
+    a.execute("RESET search_path").await.expect("reset");
+    assert_eq!(
+        number(&mut a, &format!("SELECT count(*)::int FROM {s}.called")).await,
+        1,
+        "the operator is chosen on its schema's path"
+    );
+    a.execute(&format!("TRUNCATE {s}.called"))
+        .await
+        .expect("clear");
+
+    let named = |kind, parent: &str, name: &str| pbps_model::DetachedName {
+        kind,
+        parent: parent.into(),
+        name: Some(name.into()),
+    };
+    use pbps_model::DetachedKind as K;
+    let detach = Postgres::new()
+        .emit(
+            &pbps_model::Change::DetachPartition {
+                uid: "t_aaaaaa".parse().unwrap(),
+                table: TableName::new(&s, "ev_1"),
+                parent: TableName::new(&s, "ev"),
+                names: vec![
+                    named(K::PrimaryKey, "ev_pk", "arch_pk"),
+                    named(K::Unique, "ev_vt", "arch_vt"),
+                    named(K::Index, "ev_v", "arch_v"),
+                ],
+                shape: Box::default(),
+            },
+            Default::default(),
+        )
+        .expect("emit");
+    for stmt in &detach {
+        a.execute(&stmt.sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
+    }
+    assert_eq!(
+        number(&mut a, &format!("SELECT count(*)::int FROM {s}.called")).await,
+        0,
+        "the detach called an operator of the schema's"
+    );
+    assert_eq!(
+        number(
+            &mut a,
+            &format!(
+                "SELECT count(*)::int FROM pg_catalog.pg_class \
+                 WHERE relnamespace = '{s}'::regnamespace \
+                 AND relname IN ('arch_pk', 'arch_vt', 'arch_v')"
+            )
+        )
+        .await,
+        3
+    );
+    drop_schema(&mut a, &s).await;
+}
+
 /// Emits and executes every change of a plan, in plan order.
 ///
 /// One statement at a time through [`Conn::execute`], which is what `apply`

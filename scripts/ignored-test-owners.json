@@ -1777,6 +1777,7 @@
         "a_default_whose_value_the_session_decides_is_refused_and_the_resolved_one_is_not",
         "a_default_written_for_the_new_type_is_set_after_the_type_is",
         "a_denied_legacy_row_leaves_the_callers_transaction_usable",
+        "a_detach_calls_no_operator_a_schema_user_could_add",
         "a_detach_takes_the_parent_before_the_partition",
         "a_drop_role_blocked_from_another_database_is_reported_with_that_database_named",
         "a_dropped_column_keeps_its_slot_and_its_type_is_not_readable",

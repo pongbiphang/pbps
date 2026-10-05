@@ -973,10 +973,21 @@ fn detach_partition(
         "ALTER INDEX {}.%I RENAME TO %I",
         quote(&table.schema)?.replace('%', "%%")
     ));
+    // A temporary name starts with a prefix no declared name starts with, so
+    // none can be a name the batch is about to give; the table's oid after it
+    // keeps it off the names already in the schema.
+    let mut prefix = String::from("pbps_detach_");
+    while names
+        .iter()
+        .filter_map(|n| n.name.as_deref())
+        .any(|name| name.starts_with(&prefix))
+    {
+        prefix.push('_');
+    }
     let (mut vacate, mut settle) = (Vec::new(), Vec::new());
     let mut checks = Vec::new();
     for (i, n) in names.iter().enumerate() {
-        let tmp = format!("pre || '{}'", i + 1);
+        let tmp = format!("pg_catalog.format('{prefix}%s_{}', o)", i + 1);
         let found = match (n.kind, &n.name) {
             (K::PrimaryKey, None) => continue,
             (K::Check, Some(to)) if *to != n.parent => {
@@ -993,14 +1004,16 @@ fn detach_partition(
             (K::Check, _) => continue,
             (K::PrimaryKey, Some(_)) => format!(
                 "SELECT k.conname FROM pg_catalog.pg_constraint k \
-                 WHERE k.conrelid = {t}::pg_catalog.regclass AND k.contype = 'p'",
+                 WHERE k.conrelid = {t}::pg_catalog.regclass::pg_catalog.oid \
+                 AND k.contype = 'p'",
                 t = literal(&q)
             ),
             (K::Unique | K::ForeignKey, _) => format!(
                 "SELECT k.conname FROM pg_catalog.pg_constraint k \
                  JOIN pg_catalog.pg_constraint pk ON pk.oid = k.conparentid \
-                 WHERE k.conrelid = {t}::pg_catalog.regclass \
-                 AND pk.conrelid = {p}::pg_catalog.regclass AND pk.conname = {n}",
+                 WHERE k.conrelid = {t}::pg_catalog.regclass::pg_catalog.oid \
+                 AND pk.conrelid = {p}::pg_catalog.regclass::pg_catalog.oid \
+                 AND pk.conname = {n}",
                 t = literal(&q),
                 p = literal(&p),
                 n = literal(&n.parent)
@@ -1011,8 +1024,9 @@ fn detach_partition(
                  JOIN pg_catalog.pg_index i ON i.indexrelid = ci.oid \
                  JOIN pg_catalog.pg_class pi ON pi.oid = h.inhparent \
                  JOIN pg_catalog.pg_index x ON x.indexrelid = pi.oid \
-                 WHERE i.indrelid = {t}::pg_catalog.regclass \
-                 AND x.indrelid = {p}::pg_catalog.regclass AND pi.relname = {n}",
+                 WHERE i.indrelid = {t}::pg_catalog.regclass::pg_catalog.oid \
+                 AND x.indrelid = {p}::pg_catalog.regclass::pg_catalog.oid \
+                 AND pi.relname = {n}",
                 t = literal(&q),
                 p = literal(&p),
                 n = literal(&n.parent)
@@ -1051,8 +1065,15 @@ fn detach_partition(
     if settle.is_empty() && vacate.is_empty() {
         return Ok(detach);
     }
-    // The temporary names carry the table's oid, which no declared name
-    // spells, so they cannot meet a name already in the schema.
+    // The batch runs on the table's schema's path, where anyone who may
+    // create there can add an operator, and an operator whose argument types
+    // match exactly is chosen over a built-in that needs a cast, wherever
+    // `pg_catalog` is on the path (measured on 16 and 18: `text || oid`, and
+    // `oid = regclass`). So no operator here has an argument a built-in
+    // would cast: every class is compared as an `oid`, every name is built by
+    // `pg_catalog.format`, and what is left (`name = name`, `name <> name`,
+    // `"char" = "char"`) is a built-in's exact signature, which `pg_catalog`
+    // wins (DECISIONS 276).
     //
     // The parent is locked first, as the detach would lock it, because a
     // rename locks the partition: in the other order a reader holding the
@@ -1063,7 +1084,7 @@ fn detach_partition(
         "DECLARE\n\
          \x20   c name;\n\
          \x20   moved boolean[] := '{{}}';\n\
-         \x20   pre text := 'pbps_detach_' || {t}::pg_catalog.regclass::pg_catalog.oid || '_';\n\
+         \x20   o pg_catalog.oid := {t}::pg_catalog.regclass::pg_catalog.oid;\n\
          BEGIN\n\
          \x20   LOCK TABLE ONLY {p} IN ACCESS EXCLUSIVE MODE;\n\
          {vacate}\n\
@@ -3958,20 +3979,24 @@ mod tests {
         let order = [
             at("DO $"),
             at("LOCK TABLE ONLY \"app\".\"ev\" IN ACCESS EXCLUSIVE MODE;"),
-            at(&format!("pg_catalog.format({index}, c, pre || '2')")),
+            at(&format!(
+                "pg_catalog.format({index}, c, pg_catalog.format('pbps_detach_%s_2', o))"
+            )),
             at("ALTER TABLE \"app\".\"ev\" DETACH PARTITION \"app\".\"p%1\";"),
             at(&format!(
-                "pg_catalog.format({constraint}, 'ev_ck', pre || '3')"
+                "pg_catalog.format({constraint}, 'ev_ck', pg_catalog.format('pbps_detach_%s_3', o))"
             )),
             at(&format!(
-                "pg_catalog.format({constraint}, 'ev_ck2', pre || '4')"
-            )),
-            at(&format!("pg_catalog.format({index}, pre || '2', 'arch_n')")),
-            at(&format!(
-                "pg_catalog.format({constraint}, pre || '3', 'ev_ck2')"
+                "pg_catalog.format({constraint}, 'ev_ck2', pg_catalog.format('pbps_detach_%s_4', o))"
             )),
             at(&format!(
-                "pg_catalog.format({constraint}, pre || '4', 'ev_ck')"
+                "pg_catalog.format({index}, pg_catalog.format('pbps_detach_%s_2', o), 'arch_n')"
+            )),
+            at(&format!(
+                "pg_catalog.format({constraint}, pg_catalog.format('pbps_detach_%s_3', o), 'ev_ck2')"
+            )),
+            at(&format!(
+                "pg_catalog.format({constraint}, pg_catalog.format('pbps_detach_%s_4', o), 'ev_ck')"
             )),
         ];
         assert!(order.is_sorted(), "{order:?}\n{sql}");
@@ -3981,10 +4006,31 @@ mod tests {
         assert!(!sql.contains("contype = 'p'"), "{sql}");
         assert!(!sql.contains("_pkey"), "{sql}");
         assert!(!sql.contains("'ev_same'"), "{sql}");
+        // No operator a schema's user could shadow with an exact match: no
+        // concatenation, and every class compared as an oid.
+        assert!(!sql.contains("||"), "{sql}");
+        assert_eq!(
+            sql.matches("::pg_catalog.regclass").count(),
+            sql.matches("::pg_catalog.regclass::pg_catalog.oid").count(),
+            "{sql}"
+        );
+        // A declared name that starts like a temporary one moves the
+        // temporaries' prefix off it.
+        let shadowed = detach(
+            "app.p4",
+            vec![name(K::Index, "ev_n", Some("pbps_detach_9_1"))],
+        );
+        assert!(
+            shadowed[0].contains("pg_catalog.format('pbps_detach__%s_1', o)"),
+            "{shadowed:?}"
+        );
         // A named key is found and renamed like any other clone.
         let named = detach("app.p3", vec![name(K::PrimaryKey, "ev_pk", Some("p3_pk"))]);
         assert!(named[0].contains("contype = 'p'"), "{named:?}");
-        assert!(named[0].contains("pre || '1', 'p3_pk')"), "{named:?}");
+        assert!(
+            named[0].contains("pg_catalog.format('pbps_detach_%s_1', o), 'p3_pk')"),
+            "{named:?}"
+        );
         // Negative: nothing to rename, nothing but the detach.
         for names in [Vec::new(), vec![name(K::PrimaryKey, "ev_pk", None)]] {
             let plain = detach("app.p2", names);
