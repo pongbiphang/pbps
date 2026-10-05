@@ -186,7 +186,11 @@ use crate::schema::Schema;
 /// Bumped to 25 for PostgreSQL range partitions (DEC-1170.2): a created
 /// table's `partition_by` or `partition_of`, which an older build would drop
 /// and create an ordinary table.
-pub const CURRENT_VERSION: u32 = 25;
+///
+/// Bumped to 26 for partition changes (DEC-1171.1): a dropped table's
+/// `detach_from`, without which an older build would drop a partition while
+/// still attached, which the engine refuses where a foreign key reaches it.
+pub const CURRENT_VERSION: u32 = 26;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -645,7 +649,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 25);
+        assert_eq!(CURRENT_VERSION, 26);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads
@@ -751,6 +755,7 @@ mod tests {
             changes: vec![PlannedChange::new(Change::DropTable {
                 uid: "t_a1b2c3".parse().unwrap(),
                 name: TableName::new("dbo", "customer"),
+                detach_from: None,
             })],
         });
         assert_ne!(empty.checksum(), one.checksum());
@@ -856,6 +861,7 @@ mod tests {
             changes: vec![PlannedChange::new(Change::DropTable {
                 uid: "t_a1b2c3".parse().unwrap(),
                 name: TableName::new("dbo", "customer"),
+                detach_from: None,
             })],
         }))
         .unwrap();

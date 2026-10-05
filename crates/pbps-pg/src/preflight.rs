@@ -3699,10 +3699,246 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
             }
         }
     }
+    partition_probes(changes, &names, &mut out, &mut unchecked);
     Preflight {
         probes: out,
         unchecked,
     }
+}
+
+/// The two questions a partition change asks of today's rows (#1171,
+/// DEC-1171.1): whether a range added under a standing parent covers rows
+/// that sit in its DEFAULT partition now, which the engine refuses to split;
+/// and whether rows elsewhere still reference a partition about to be
+/// dropped, which the engine refuses to detach. Both are asked of the whole
+/// plan, because a partition the same plan drops takes its rows with it.
+fn partition_probes(
+    changes: &ChangeSet,
+    names: &AsStored,
+    out: &mut Vec<Probe>,
+    unchecked: &mut Vec<Unchecked>,
+) {
+    let created: BTreeSet<&TableName> = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::CreateTable { name, .. } = &p.change {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let dropped: BTreeMap<&TableName, Vec<&TableName>> =
+        changes
+            .changes
+            .iter()
+            .fold(BTreeMap::new(), |mut by_parent, p| {
+                if let Change::DropTable {
+                    name,
+                    detach_from: Some(parent),
+                    ..
+                } = &p.change
+                {
+                    by_parent.entry(parent).or_insert_with(Vec::new).push(name);
+                }
+                by_parent
+            });
+    // Partitions dropped so far, in plan order: by a partition's own drop,
+    // their rows are gone, and so are their references.
+    let mut dropped_before: Vec<&TableName> = Vec::new();
+    for p in &changes.changes {
+        let probe = if let Change::CreateTable { name, table, .. } = &p.change
+            && let Some(of) = &table.partition_of
+            && let pbps_model::PartitionBound::Range { from, to } = &of.bound
+            && !created.contains(&of.parent)
+        {
+            let leaving = dropped.get(&of.parent).map_or(&[][..], Vec::as_slice);
+            partition_range_probe(name, &of.parent, from, to, leaving)
+        } else if let Change::DropTable {
+            name,
+            detach_from: Some(parent),
+            ..
+        } = &p.change
+        {
+            let probe = partition_reference_probe(name, parent, names, &dropped_before);
+            dropped_before.push(name);
+            probe
+        } else {
+            continue;
+        };
+        match probe {
+            Ok(probe) => out.push(probe),
+            Err(error) => unchecked.push(Unchecked::for_change(&p.change, error.to_string())),
+        }
+    }
+}
+
+/// The parent's key columns, `r.`-qualified, the first `count` of them, as
+/// SQL the engine evaluates to the list's text.
+fn key_prefix(count: usize) -> String {
+    format!(
+        "(SELECT pg_catalog.string_agg('r.' || pg_catalog.quote_ident(a.attname), ', ' \
+         ORDER BY k.n) FROM pg_catalog.unnest(pt.partattrs::int2[]) WITH ORDINALITY AS k(attnum, n) \
+         JOIN pg_catalog.pg_attribute a ON a.attrelid = pt.partrelid AND a.attnum = k.attnum \
+         WHERE k.n <= {count})"
+    )
+}
+
+/// One end of a range as a comparison of the key's leading columns, the way
+/// the engine bounds a RANGE partition: lexicographic, and the first
+/// `MINVALUE` or `MAXVALUE` decides everything after it. `lower` is the
+/// `FROM` end (inclusive), otherwise the `TO` end (exclusive).
+fn range_end(data: &[pbps_model::BoundDatum], lower: bool) -> String {
+    use pbps_model::BoundDatum as D;
+    let infinite = data
+        .iter()
+        .position(|d| matches!(d, D::MinValue | D::MaxValue));
+    let (prefix, op) = match (infinite.map(|i| (i, &data[i])), lower) {
+        (None, true) => (data.len(), ">="),
+        (None, false) => (data.len(), "<"),
+        // An unbounded first column: every row, or none.
+        (Some((0, D::MinValue)), true) | (Some((0, D::MaxValue)), false) => {
+            return value_literal("TRUE");
+        }
+        (Some((0, _)), _) => return value_literal("FALSE"),
+        (Some((i, D::MinValue)), true) => (i, ">="),
+        (Some((i, _)), true) => (i, ">"),
+        (Some((i, D::MaxValue)), false) => (i, "<="),
+        (Some((i, _)), false) => (i, "<"),
+    };
+    // Cut before the first unbounded end, so every datum here is a value.
+    let values: Vec<String> = data[..prefix]
+        .iter()
+        .filter_map(|d| {
+            if let D::Value(v) = d {
+                Some(value_literal(v))
+            } else {
+                None
+            }
+        })
+        .collect();
+    format!(
+        "'(' || {} || {}",
+        key_prefix(prefix),
+        value_literal(&format!(") {op} ({})", values.join(", ")))
+    )
+}
+
+/// The rows of `parent` inside the new partition's range, other than those
+/// of partitions this plan drops. A range cannot overlap another partition's
+/// (the engine refuses the `CREATE`), so every one of them is in the DEFAULT
+/// partition, and the engine refuses the `CREATE` over them. A row with a NULL
+/// in any key column is never in a range. Measured on 16 and 18 (#1171).
+fn partition_range_probe(
+    partition: &TableName,
+    parent: &TableName,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+    leaving: &[&TableName],
+) -> Result<Probe, DialectError> {
+    let not_null = "(SELECT pg_catalog.string_agg('r.' || pg_catalog.quote_ident(a.attname) || \
+                    ' IS NOT NULL', ' AND ' ORDER BY k.n) \
+                    FROM pg_catalog.unnest(pt.partattrs::int2[]) WITH ORDINALITY AS k(attnum, n) \
+                    JOIN pg_catalog.pg_attribute a \
+                    ON a.attrelid = pt.partrelid AND a.attnum = k.attnum)";
+    let mut excluded = String::new();
+    for child in leaving {
+        excluded.push_str(&format!(
+            " AND r.tableoid IS DISTINCT FROM pg_catalog.to_regclass({})",
+            value_literal(&qualified(child)?)
+        ));
+    }
+    let text = format!(
+        "{} || {not_null} || ' AND ' || {} || ' AND ' || {} || {}",
+        value_literal(&format!(
+            "SELECT count(*) AS n FROM {} AS r WHERE ",
+            qualified(parent)?
+        )),
+        range_end(from, true),
+        range_end(to, false),
+        value_literal(&excluded),
+    );
+    Ok(Probe::new(
+        format!(
+            "rows of {parent} inside the range of its new partition {partition}: they are in its \
+             DEFAULT partition now, and the engine will not create a partition over them; move \
+             or delete them first, then plan again"
+        ),
+        format!(
+            "SELECT {}",
+            saturated_count(&format!(
+                "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()', \
+                 pg_catalog.query_to_xml({text}, false, true, '')))[1]::text::numeric \
+                 FROM pg_catalog.pg_partitioned_table pt \
+                 WHERE pt.partrelid = pg_catalog.to_regclass({})), 0)",
+                value_literal(&qualified(parent)?)
+            ))
+        ),
+    ))
+}
+
+/// The rows of every table with a foreign key to `parent` that reference a
+/// row of `partition`. The detach that drops it is refused while any remain
+/// (`removing partition … violates foreign key constraint`), measured on 16
+/// and 18. A referencing partitioned table is counted with its partitions,
+/// an ordinary one alone (#1171). A key this plan removes first, or a table
+/// it drops, is left out the way the delete probe leaves them out
+/// ([`gone_keys`]): the drop comes in class 6, after the key's in class 2.
+/// So are the rows of a referencing table's partitions that the plan drops
+/// before this one, which `gone_keys` cannot reach: the key names their
+/// still-standing parent (#1549 review).
+fn partition_reference_probe(
+    partition: &TableName,
+    parent: &TableName,
+    names: &AsStored,
+    dropped_before: &[&TableName],
+) -> Result<Probe, DialectError> {
+    let mut gone_rows = String::new();
+    for earlier in dropped_before {
+        gone_rows.push_str(&format!(
+            " AND r.tableoid IS DISTINCT FROM pg_catalog.to_regclass({})",
+            value_literal(&qualified(earlier)?)
+        ));
+    }
+    let child = value_literal(&format!(
+        " AS r WHERE EXISTS (SELECT 1 FROM ONLY {} AS p WHERE ",
+        qualified(partition)?
+    ));
+    let matched = "(SELECT pg_catalog.string_agg('r.' || pg_catalog.quote_ident(ra.attname) || \
+                   ' = p.' || pg_catalog.quote_ident(pa.attname), ' AND ' ORDER BY s.i) \
+                   FROM pg_catalog.generate_subscripts(con.conkey, 1) AS s(i) \
+                   JOIN pg_catalog.pg_attribute ra \
+                   ON ra.attrelid = con.conrelid AND ra.attnum = con.conkey[s.i] \
+                   JOIN pg_catalog.pg_attribute pa \
+                   ON pa.attrelid = con.confrelid AND pa.attnum = con.confkey[s.i])";
+    let text = format!(
+        "'SELECT count(*) AS n FROM ' || CASE WHEN cl.relkind = 'p' THEN '' ELSE 'ONLY ' END \
+         || pg_catalog.quote_ident(ns.nspname) || '.' || pg_catalog.quote_ident(cl.relname) \
+         || {child} || {matched} || ')' || {}",
+        value_literal(&gone_rows)
+    );
+    Ok(Probe::new(
+        format!(
+            "rows that reference {partition} through a foreign key to {parent}: the engine will \
+             not detach it, and so not drop it, while any remain; delete or repoint them first, \
+             then plan again"
+        ),
+        format!(
+            "SELECT {}",
+            saturated_count(&format!(
+                "COALESCE((SELECT sum((pg_catalog.xpath('/row/n/text()', \
+                 pg_catalog.query_to_xml({text}, false, true, '')))[1]::text::numeric) \
+                 FROM pg_catalog.pg_constraint con \
+                 JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid \
+                 JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace \
+                 WHERE con.contype = 'f' AND con.conparentid = 0 \
+                 AND con.confrelid = pg_catalog.to_regclass({}) {}), 0)",
+                value_literal(&qualified(parent)?),
+                gone_keys(names)
+            ))
+        ),
+    ))
 }
 
 fn skip(change: &Change, reason: &str, unchecked: &mut Vec<Unchecked>) -> Vec<Probe> {
@@ -3887,6 +4123,94 @@ mod tests {
         let report = super::probes(&set(vec![deleting("app.p", "1")]));
         assert!(!report.probes.is_empty(), "{report:#?}");
         assert!(report.unchecked.is_empty(), "{report:#?}");
+    }
+
+    /// Each end of a range compares the key's leading columns the way the
+    /// engine bounds a partition: the first unbounded end decides the rest,
+    /// and an unbounded first column is every row or none (#1171). Pinned
+    /// against the engine by the live
+    /// `range_partitions_are_added_and_dropped_on_populated_trees`.
+    #[test]
+    fn a_range_end_compares_the_columns_before_its_first_unbounded_end() {
+        use pbps_model::BoundDatum as D;
+        let v = |s: &str| D::Value(s.into());
+        for (data, lower, prefix, op) in [
+            (vec![v("1"), v("2")], true, 2, ">="),
+            (vec![v("1"), v("2")], false, 2, "<"),
+            (vec![v("5"), D::MinValue], true, 1, ">="),
+            (vec![v("5"), D::MaxValue], true, 1, ">"),
+            (vec![v("5"), D::MaxValue], false, 1, "<="),
+            (vec![v("5"), D::MinValue], false, 1, "<"),
+        ] {
+            let sql = super::range_end(&data, lower);
+            assert!(sql.contains(&format!("k.n <= {prefix})")), "{sql}");
+            assert!(sql.contains(&format!(") {op} (")), "{sql}");
+        }
+        for (data, lower, all) in [
+            (vec![D::MinValue, D::MinValue], true, true),
+            (vec![D::MaxValue, D::MaxValue], false, true),
+            (vec![D::MaxValue, D::MaxValue], true, false),
+            (vec![D::MinValue, D::MinValue], false, false),
+        ] {
+            let expected = if all { "E'TRUE'" } else { "E'FALSE'" };
+            assert_eq!(super::range_end(&data, lower), expected);
+        }
+    }
+
+    /// A partition created with its parent asks nothing of rows; one created
+    /// under a standing parent, and a partition dropped, each ask one count
+    /// (#1171).
+    #[test]
+    fn a_partition_change_under_a_standing_parent_is_probed() {
+        use pbps_model::{PartitionBound as B, PartitionOf};
+        let partition = |bound: B| Change::CreateTable {
+            uid: "t_bbbbbb".parse().unwrap(),
+            name: "app.ev_1".parse().unwrap(),
+            table: Box::new(pbps_model::Table {
+                partition_of: Some(PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound,
+                }),
+                ..Default::default()
+            }),
+        };
+        let range = B::Range {
+            from: vec![pbps_model::BoundDatum::Value("1".into())],
+            to: vec![pbps_model::BoundDatum::MaxValue],
+        };
+        let alone = probes(&ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(partition(range.clone()))],
+        });
+        assert_eq!(alone.len(), 1, "{alone:?}");
+        assert!(alone[0].description.contains("DEFAULT partition"));
+        // A DEFAULT partition takes what no range does, and asks nothing.
+        assert!(
+            probes(&ChangeSet {
+                changes: vec![pbps_model::PlannedChange::new(partition(B::Default))],
+            })
+            .is_empty()
+        );
+        // With its parent created in the same plan, nothing to count.
+        let with_parent = probes(&ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "app.ev".parse().unwrap(),
+                    table: Box::default(),
+                }),
+                pbps_model::PlannedChange::new(partition(range)),
+            ],
+        });
+        assert!(with_parent.is_empty(), "{with_parent:?}");
+        let dropped = probes(&ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(Change::DropTable {
+                uid: "t_bbbbbb".parse().unwrap(),
+                name: "app.ev_1".parse().unwrap(),
+                detach_from: Some("app.ev".parse().unwrap()),
+            })],
+        });
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(dropped[0].description.contains("reference app.ev_1"));
     }
 
     #[test]
@@ -4663,6 +4987,7 @@ mod tests {
             Change::DropTable {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                 name: "app.gone".parse().expect("a table name"),
+                detach_from: None,
             },
             deleting("app.status", "old"),
         ]));

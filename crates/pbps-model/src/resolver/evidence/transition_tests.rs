@@ -132,6 +132,7 @@ fn dropped_surfaces() -> Vec<(Change, Surface)> {
             Change::DropTable {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
+                detach_from: None,
             },
             Surface::Table(table),
         ),
@@ -431,6 +432,7 @@ fn owner_coverage(
         Change::DropTable {
             uid: "t_000000".parse().unwrap(),
             name: table.clone(),
+            detach_from: None,
         },
         Surface::Table(table.clone()),
     );
@@ -635,6 +637,7 @@ fn table_drops_require_the_owner_even_with_a_child_transition() {
             Change::DropTable {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
+                detach_from: None,
             },
             Surface::Table(table.clone()),
             child,
@@ -1270,6 +1273,7 @@ fn aggregate_table_drops_require_all_owned_records() {
         Change::DropTable {
             uid: "t_000000".parse().unwrap(),
             name: table.clone(),
+            detach_from: None,
         },
         Surface::Table(table.clone()),
         Surface::Default(table.column("n")),
@@ -1479,6 +1483,7 @@ fn mutation_inventory(change: Change, owner: Surface, child: Surface) {
         Change::DropTable {
             uid: "t_000000".parse().unwrap(),
             name: table.clone(),
+            detach_from: None,
         },
         Surface::Table(table.clone()),
         Surface::Default(table.column("n")),
@@ -1666,6 +1671,7 @@ fn mutations_of_created_or_removed_targets_use_the_planned_endpoint() {
             Change::DropTable {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
+                detach_from: None,
             }
         };
         let (mut changes, mut evidence, _) = owner_coverage(
@@ -2416,6 +2422,7 @@ mod column_vector_parent {
                 Change::DropTable {
                     uid: "t_000000".parse().unwrap(),
                     name: table.clone(),
+                    detach_from: None,
                 }
             };
             if creating {

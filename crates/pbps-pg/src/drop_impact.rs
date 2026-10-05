@@ -255,9 +255,25 @@ pub async fn drop_blockers(
         .await?;
     let classes = Classes::read(conn).await?;
     let mut removals = Vec::new();
+    let mut detached = BTreeSet::new();
     for index in 0..=last {
         if let Some(address) = removal(conn, &classes, cs, index).await? {
             removals.push((index, address));
+            // A partition's drop detaches it first, and the detach removes
+            // the clones a foreign key to its parent keeps on each
+            // referencing table, which name this partition (#1171). Measured
+            // on 16 and 18: read as standing, the clone blocked every drop of
+            // a partition such a key reaches, with no row referencing it.
+            if let Change::DropTable {
+                detach_from: Some(_),
+                ..
+            } = &cs.changes[index].change
+            {
+                for clone in detached_clones(conn, &classes, address).await? {
+                    removals.push((index, clone));
+                    detached.insert(clone);
+                }
+            }
         } else if let Change::SetPrimaryKey {
             table,
             from: Some(_),
@@ -274,10 +290,13 @@ pub async fn drop_blockers(
         }
     }
     let roots: BTreeSet<_> = removals.iter().map(|(_, a)| *a).collect();
+    // A clone the detach removes promotes nothing either: its internal owner
+    // is the foreign key on its own table, which stays (#1171).
     let replaced: BTreeSet<Address> = removals
         .iter()
         .filter(|(i, _)| matches!(cs.changes[*i].change, Change::AlterColumnExpression { .. }))
         .map(|(_, a)| *a)
+        .chain(detached)
         .collect();
     let graph = read_graph(conn, &roots).await?;
     let mut reports = Vec::new();
@@ -399,6 +418,32 @@ async fn relation(
             })
         })
         .transpose()
+}
+
+/// The foreign-key clones on other tables that reference `partition`, which
+/// detaching it removes with it (#1171).
+async fn detached_clones(
+    conn: &mut Conn,
+    classes: &Classes,
+    partition: Address,
+) -> Result<Vec<Address>, ImpactError> {
+    let rows = conn
+        .query_with(
+            "SELECT con.oid::int8 AS oid FROM pg_catalog.pg_constraint con
+              WHERE con.contype = 'f' AND con.conparentid <> 0
+                AND con.confrelid = $1::int8::oid",
+            &[Param::I64(partition.object)],
+        )
+        .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(Address {
+                class: classes.constraint,
+                object: required(row, "oid")?,
+                part: 0,
+            })
+        })
+        .collect()
 }
 
 async fn removal(

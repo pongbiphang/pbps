@@ -2295,6 +2295,7 @@ fn an_object_grant_after_a_same_name_replacement_names_the_replacement() {
                     Change::DropTable {
                         uid: uid.clone(),
                         name: name.clone(),
+                        detach_from: None,
                     },
                     Change::CreateModule {
                         id: view_id.clone(),
@@ -2839,6 +2840,7 @@ fn a_rename_into_a_dropped_tables_name_inventories_both_opening_tables() {
             PlannedChange::new(Change::DropTable {
                 uid: dropped_uid,
                 name: target.clone(),
+                detach_from: None,
             }),
             PlannedChange::new(Change::RenameTable {
                 uid: renamed_uid,

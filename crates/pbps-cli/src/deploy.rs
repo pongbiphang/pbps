@@ -8496,6 +8496,7 @@ mod tests {
         let dropped = PlannedChange::new(Change::DropTable {
             uid: uid("dbo.old_history"),
             name: history.clone(),
+            detach_from: None,
         });
         assert!(blocking(vec![dropped, create.clone()]).is_empty());
         let renamed = PlannedChange::new(Change::RenameTable {
@@ -8577,6 +8578,7 @@ mod tests {
             PlannedChange::new(Change::DropTable {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.gone", 0),
                 name: name.clone(),
+                detach_from: None,
             })
         };
         let rename = |to: TableName| {
@@ -9742,6 +9744,7 @@ mod tests {
         let drop_table = PlannedChange::new(Change::DropTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.old", 0),
             name: owner.clone(),
+            detach_from: None,
         });
         for kind in ["index", "sequence"] {
             refuse_uninventoried_occupants(
@@ -14981,6 +14984,7 @@ mod tests {
                 pbps_model::Change::DropTable {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "dbo.t".parse().unwrap(),
+                    detach_from: None,
                 },
             )],
         };

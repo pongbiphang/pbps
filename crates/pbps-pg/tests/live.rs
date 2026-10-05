@@ -3954,6 +3954,363 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
     }
 }
 
+/// A managed partition tree gains a partition and loses one (#1171): each
+/// applies to populated partitions, keeps the rows it should, and replans
+/// empty. A range over rows the DEFAULT partition holds, and a drop of a
+/// partition other rows still reference, are counted before any DDL, the
+/// counts agreeing with the engine, whose refusal is the backstop. On 16
+/// and 18.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn range_partitions_are_added_and_dropped_on_populated_trees() {
+    use pbps_model::{BoundDatum as D, PartitionBound as B, PartitionOf};
+
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
+    for connection in [conn_str(), old] {
+        let database = format!("pbps_test_part1171_{}", std::process::id());
+        let mut admin = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+        admin
+            .execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+            .await
+            .expect("clear a database left by an earlier run");
+        admin
+            .execute(&format!("CREATE DATABASE {database}"))
+            .await
+            .expect("create the database");
+        let own = connection.replace("dbname=pbps_test", &format!("dbname={database}"));
+        assert_ne!(
+            own, connection,
+            "the fixture names its database `pbps_test`"
+        );
+        let mut conn = Conn::connect(Driver::Postgres, &own).await.unwrap();
+        let s = emit_schema("part1171");
+        fresh(&mut conn, &s).await;
+        conn.execute(&format!(
+            "CREATE TABLE {s}.ev (id integer NOT NULL, ts date NOT NULL, PRIMARY KEY (id, ts))
+                 PARTITION BY RANGE (ts);
+             CREATE TABLE {s}.ev_2025 PARTITION OF {s}.ev
+                 FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+             CREATE TABLE {s}.ev_rest PARTITION OF {s}.ev DEFAULT;
+             CREATE TABLE {s}.r (id integer PRIMARY KEY, ev_id integer, ev_ts date,
+                 CONSTRAINT r_ev FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.ev (id, ts));
+             INSERT INTO {s}.ev VALUES (1, '2025-06-01'), (2, '2027-03-01');
+             INSERT INTO {s}.r VALUES (1, 1, '2025-06-01');
+             CREATE TABLE {s}.m (a integer, b integer) PARTITION BY RANGE (a, b);
+             CREATE TABLE {s}.m_rest PARTITION OF {s}.m DEFAULT;
+             INSERT INTO {s}.m VALUES (5, 1), (5, 9), (6, 0), (4, 100), (NULL, 1), (5, NULL);"
+        ))
+        .await
+        .expect("the trees");
+        let read = |pulled: &pbps_pg::introspect::Pulled| {
+            let mut held = Schema::default();
+            for (name, table) in &pulled.schema.tables {
+                if name.schema == s {
+                    held.tables.insert(name.clone(), table.clone());
+                }
+            }
+            held
+        };
+        let base = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
+        let ids = mint_ids(&base, &IdsFile::default(), &[]);
+        let t = |name: &str| TableName::new(&s, name);
+        let value = |v: &str| D::Value(v.to_owned());
+        let partition = |parent: &str, bound: B| pbps_model::Table {
+            partition_of: Some(PartitionOf {
+                parent: t(parent),
+                bound,
+            }),
+            ..Default::default()
+        };
+        let range = |from: Vec<D>, to: Vec<D>| B::Range { from, to };
+        let pg = Postgres::new();
+
+        // A range the DEFAULT partition holds no row of: counted 0, created,
+        // and the next row in it is routed there.
+        let mut added = base.clone();
+        added.tables.insert(
+            t("ev_2026"),
+            partition(
+                "ev",
+                range(vec![value("2026-01-01")], vec![value("2027-01-01")]),
+            ),
+        );
+        let added_ids = mint_ids(&added, &ids, &[]);
+        let step = plan(&base, &ids, &added, &added_ids);
+        for probe in pg.preflight(&step).probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        apply(&mut conn, &pg, &step).await;
+        let after = read(
+            &pbps_pg::catalog::introspect(&mut conn)
+                .await
+                .expect("read back"),
+        );
+        assert_eq!(after, added);
+        assert!(plan(&after, &added_ids, &added, &added_ids).is_empty());
+        conn.execute(&format!("INSERT INTO {s}.ev VALUES (3, '2026-06-01')"))
+            .await
+            .unwrap();
+        assert_eq!(
+            counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.ev_2026")).await,
+            1
+        );
+
+        // A range over a row the DEFAULT partition holds: counted, and the
+        // engine refuses the same `CREATE`.
+        let mut over = added.clone();
+        over.tables.insert(
+            t("ev_2027"),
+            partition(
+                "ev",
+                range(vec![value("2027-01-01")], vec![value("2028-01-01")]),
+            ),
+        );
+        let over_step = plan(&added, &added_ids, &over, &mint_ids(&over, &added_ids, &[]));
+        let probes = pg.preflight(&over_step).probes;
+        assert_eq!(probes.len(), 1, "{probes:#?}");
+        assert_eq!(counted(&mut conn, &probes[0].sql).await, 1);
+        assert!(probes[0].description.contains("DEFAULT partition"));
+        in_a_transaction(&mut conn).await;
+        let refused = conn
+            .execute(&format!(
+                "CREATE TABLE {s}.ev_2027 PARTITION OF {s}.ev \
+                 FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')"
+            ))
+            .await
+            .expect_err("the engine refuses the range over the DEFAULT row");
+        assert_eq!(sqlstate(&refused), "23514", "{refused:?}");
+        rollback(&mut conn).await;
+
+        // Two key columns, with unbounded ends: each count is the rows the
+        // engine would route into the range, NULL keys never among them, and
+        // the engine refuses exactly the ranges counted above zero.
+        for (from, to, expected, sql) in [
+            (
+                vec![value("5"), D::MinValue],
+                vec![value("6"), D::MinValue],
+                2,
+                "FROM (5, MINVALUE) TO (6, MINVALUE)",
+            ),
+            (
+                vec![D::MinValue, D::MinValue],
+                vec![value("5"), value("5")],
+                2,
+                "FROM (MINVALUE, MINVALUE) TO (5, 5)",
+            ),
+            (
+                vec![value("5"), D::MaxValue],
+                vec![D::MaxValue, D::MaxValue],
+                1,
+                "FROM (5, MAXVALUE) TO (MAXVALUE, MAXVALUE)",
+            ),
+            (
+                vec![value("7"), value("0")],
+                vec![value("8"), value("0")],
+                0,
+                "FROM (7, 0) TO (8, 0)",
+            ),
+        ] {
+            let mut wanted = base.clone();
+            wanted
+                .tables
+                .insert(t("m_new"), partition("m", range(from, to)));
+            let step = plan(&base, &ids, &wanted, &mint_ids(&wanted, &ids, &[]));
+            let probes = pg.preflight(&step).probes;
+            assert_eq!(probes.len(), 1, "{sql}: {probes:#?}");
+            assert_eq!(counted(&mut conn, &probes[0].sql).await, expected, "{sql}");
+            in_a_transaction(&mut conn).await;
+            let engine = conn
+                .execute(&format!(
+                    "CREATE TABLE {s}.m_new PARTITION OF {s}.m FOR VALUES {sql}"
+                ))
+                .await;
+            assert_eq!(engine.is_err(), expected > 0, "{sql}: {engine:?}");
+            rollback(&mut conn).await;
+        }
+
+        // A partition another table's rows still reference: counted, and the
+        // engine refuses its detach.
+        let mut fewer = added.clone();
+        fewer.tables.remove(&t("ev_2025"));
+        let archive = [Intent::DropTable {
+            table: t("ev_2025"),
+            reason: "archived".into(),
+        }];
+        let fewer_ids = mint_ids(&fewer, &added_ids, &archive);
+        let drop_step = plan(&added, &added_ids, &fewer, &fewer_ids);
+        let probes = pg.preflight(&drop_step).probes;
+        assert_eq!(probes.len(), 1, "{probes:#?}");
+        assert_eq!(counted(&mut conn, &probes[0].sql).await, 1);
+        in_a_transaction(&mut conn).await;
+        let refused = conn
+            .execute(&format!("ALTER TABLE {s}.ev DETACH PARTITION {s}.ev_2025"))
+            .await
+            .expect_err("the engine refuses the detach");
+        assert_eq!(sqlstate(&refused), "23503", "{refused:?}");
+        rollback(&mut conn).await;
+
+        // The same drop with the foreign key removed by the same plan: the key
+        // goes first (class 2), so the rows that pointed through it count
+        // none, and the engine takes the whole plan (#1549 review).
+        let mut unkeyed = fewer.clone();
+        unkeyed
+            .tables
+            .get_mut(&t("r"))
+            .unwrap()
+            .foreign_keys
+            .clear();
+        let unkeyed_step = plan(&added, &added_ids, &unkeyed, &fewer_ids);
+        let unkeyed_probes = pg.preflight(&unkeyed_step).probes;
+        assert_eq!(unkeyed_probes.len(), 1, "{unkeyed_probes:#?}");
+        assert_eq!(counted(&mut conn, &unkeyed_probes[0].sql).await, 0);
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &unkeyed_step).await;
+        rollback(&mut conn).await;
+
+        // With nothing referencing it, counted 0, and nothing in the catalog
+        // blocks it either: the foreign key's clone on `r` that names it goes
+        // with the detach.
+        conn.execute(&format!("DELETE FROM {s}.r")).await.unwrap();
+        assert_eq!(counted(&mut conn, &probes[0].sql).await, 0);
+        // A partitioned table referencing the parent, one of whose partitions
+        // the same plan drops first: that partition's rows go with it, so the
+        // referenced partition's drop after it counts none (#1549 review).
+        conn.execute(&format!(
+            "CREATE TABLE {s}.aref (id integer, ev_id integer, ev_ts date, at integer NOT NULL,
+                 CONSTRAINT aref_ev FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.ev (id, ts))
+                 PARTITION BY RANGE (at);
+             CREATE TABLE {s}.aref_1 PARTITION OF {s}.aref FOR VALUES FROM (0) TO (10);
+             INSERT INTO {s}.aref VALUES (1, 1, '2025-06-01', 5);"
+        ))
+        .await
+        .expect("the referencing tree");
+        let with_aref = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
+        let aref_ids = mint_ids(&with_aref, &added_ids, &[]);
+        let mut both = with_aref.clone();
+        both.tables.remove(&t("aref_1"));
+        both.tables.remove(&t("ev_2025"));
+        let both_intents = [
+            Intent::DropTable {
+                table: t("aref_1"),
+                reason: "gone".into(),
+            },
+            Intent::DropTable {
+                table: t("ev_2025"),
+                reason: "gone".into(),
+            },
+        ];
+        let both_step = plan(
+            &with_aref,
+            &aref_ids,
+            &both,
+            &mint_ids(&both, &aref_ids, &both_intents),
+        );
+        let order: Vec<String> = both_step
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let pbps_model::Change::DropTable { name, .. } = &p.change {
+                    Some(name.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(order, ["aref_1", "ev_2025"]);
+        for probe in pg.preflight(&both_step).probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &both_step).await;
+        rollback(&mut conn).await;
+        // Negative: the referencing partition kept, its row is counted.
+        let mut alone = with_aref.clone();
+        alone.tables.remove(&t("ev_2025"));
+        let alone_step = plan(
+            &with_aref,
+            &aref_ids,
+            &alone,
+            &mint_ids(&alone, &aref_ids, &archive),
+        );
+        let alone_probes = pg.preflight(&alone_step).probes;
+        assert_eq!(alone_probes.len(), 1, "{alone_probes:#?}");
+        assert_eq!(counted(&mut conn, &alone_probes[0].sql).await, 1);
+        conn.execute(&format!("DROP TABLE {s}.aref")).await.unwrap();
+        // A range split in the same plan: the partition's rows go with its
+        // drop, so the halves created over them count none.
+        let mut split = fewer.clone();
+        for (name, from, to) in [
+            ("ev_h1", "2025-01-01", "2025-07-01"),
+            ("ev_h2", "2025-07-01", "2026-01-01"),
+        ] {
+            split.tables.insert(
+                t(name),
+                partition("ev", range(vec![value(from)], vec![value(to)])),
+            );
+        }
+        let split_step = plan(
+            &added,
+            &added_ids,
+            &split,
+            &mint_ids(&split, &added_ids, &archive),
+        );
+        let split_probes = pg.preflight(&split_step).probes;
+        assert_eq!(split_probes.len(), 3, "{split_probes:#?}");
+        for probe in &split_probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        in_a_transaction(&mut conn).await;
+        let blockers = pbps_pg::impact::drop_blockers(&mut conn, &drop_step)
+            .await
+            .expect("read the blockers");
+        rollback(&mut conn).await;
+        assert!(
+            blockers.iter().all(|b| b.blocking.is_empty()),
+            "{blockers:?}"
+        );
+        apply(&mut conn, &pg, &drop_step).await;
+        let after = read(
+            &pbps_pg::catalog::introspect(&mut conn)
+                .await
+                .expect("read back"),
+        );
+        assert_eq!(after, fewer);
+        assert!(plan(&after, &fewer_ids, &fewer, &fewer_ids).is_empty());
+        let kept = conn
+            .query(&format!(
+                "SELECT string_agg(id::text, ',' ORDER BY id) AS ids FROM {s}.ev"
+            ))
+            .await
+            .unwrap()[0]
+            .try_get::<&str>("ids")
+            .unwrap()
+            .unwrap()
+            .to_owned();
+        assert_eq!(kept, "2,3");
+
+        drop(conn);
+        admin
+            .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .await
+            .expect("drop the database");
+    }
+}
+
 /// Emits and executes every change of a plan, in plan order.
 ///
 /// One statement at a time through [`Conn::execute`], which is what `apply`
@@ -28117,6 +28474,7 @@ fn dropping_table(s: &str, name: &str) -> pbps_model::Change {
     pbps_model::Change::DropTable {
         uid: "t_aaaaaa".parse().unwrap(),
         name: TableName::new(s, name),
+        detach_from: None,
     }
 }
 

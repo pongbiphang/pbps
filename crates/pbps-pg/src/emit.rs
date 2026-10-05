@@ -2085,9 +2085,30 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             Ok(out)
         }
 
-        Change::DropTable { name, .. } => {
-            one(pg, name, format!("DROP TABLE {};", qualified(name)?))
-        }
+        // A partition is detached first: measured on 16 and 18, one that a
+        // foreign key to its parent reaches cannot be dropped while attached
+        // (`other objects depend on it`), and the detach refuses while rows
+        // still reference it. One statement, so that no apply, staged or
+        // not, can stop with the partition detached and not dropped (#1171).
+        Change::DropTable {
+            name,
+            detach_from: Some(parent),
+            ..
+        } => one(
+            pg,
+            name,
+            format!(
+                "ALTER TABLE {} DETACH PARTITION {};\nDROP TABLE {};",
+                qualified(parent)?,
+                qualified(name)?,
+                qualified(name)?
+            ),
+        ),
+        Change::DropTable {
+            name,
+            detach_from: None,
+            ..
+        } => one(pg, name, format!("DROP TABLE {};", qualified(name)?)),
 
         // Two statements when both halves move, and neither engine has one that
         // does both: `RENAME TO` cannot cross a schema and `SET SCHEMA` cannot
@@ -3730,6 +3751,44 @@ fn row_statement(
 
 #[cfg(test)]
 mod tests {
+    /// A partition is dropped by one statement that detaches it from its
+    /// parent first, so no apply can stop between the two; any other table
+    /// is dropped alone (#1171).
+    #[test]
+    fn a_partition_is_detached_and_dropped_in_one_statement() {
+        let drop = |detach_from: Option<&str>| {
+            Postgres::new()
+                .emit(
+                    &Change::DropTable {
+                        uid: "t_aaaaaa".parse().unwrap(),
+                        name: "app.ev_2025".parse().unwrap(),
+                        detach_from: detach_from.map(|p| p.parse().unwrap()),
+                    },
+                    Default::default(),
+                )
+                .expect("emit")
+                .into_iter()
+                .map(|s| s.sql)
+                .collect::<Vec<_>>()
+        };
+        let sql = drop(Some("app.ev"));
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(
+            sql[0].contains(
+                "ALTER TABLE \"app\".\"ev\" DETACH PARTITION \"app\".\"ev_2025\";\nDROP TABLE \
+                 \"app\".\"ev_2025\";"
+            ),
+            "{sql:?}"
+        );
+        // Negative: an ordinary table is not detached from anything.
+        let sql = drop(None);
+        assert!(!sql[0].contains("DETACH"), "{sql:?}");
+        assert!(
+            sql[0].contains("DROP TABLE \"app\".\"ev_2025\";"),
+            "{sql:?}"
+        );
+    }
+
     /// A partitioned parent is created with its key and no access method,
     /// and a partition as one statement naming its parent and its bound,
     /// each value a literal no session setting reinterprets (#1170).
@@ -5393,6 +5452,7 @@ mod tests {
             &Change::DropTable {
                 uid: Uid::generate(UidKind::Table),
                 name: name("app", "t"),
+                detach_from: None,
             },
         );
         assert_eq!(
@@ -5465,6 +5525,7 @@ mod tests {
                 &Change::DropTable {
                     uid: Uid::generate(UidKind::Table),
                     name: name(schema, "t"),
+                    detach_from: None,
                 },
                 Strategy::default(),
             )
@@ -5503,6 +5564,7 @@ mod tests {
                 &Change::DropTable {
                     uid: Uid::generate(UidKind::Table),
                     name: name(schema, "t"),
+                    detach_from: None,
                 },
                 Strategy::default(),
             )
@@ -5548,6 +5610,7 @@ mod tests {
                 &Change::DropTable {
                     uid: Uid::generate(UidKind::Table),
                     name: name("app", "t"),
+                    detach_from: None,
                 },
                 Strategy::default(),
             )

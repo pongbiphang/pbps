@@ -867,6 +867,7 @@ mod tests {
                 PlannedChange::new(Change::DropTable {
                     uid: "t_bbbbbb".parse().unwrap(),
                     name: tname("dbo.old"),
+                    detach_from: None,
                 }),
             ],
         };

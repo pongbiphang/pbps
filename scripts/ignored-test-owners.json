@@ -1324,7 +1324,8 @@
         "index_storage_parameters_change_in_place_through_the_cli",
         "an_unlogged_table_switches_through_the_cli_behind_its_risk",
         "an_array_column_widens_through_the_cli",
-        "a_partition_tree_round_trips_through_the_cli"
+        "a_partition_tree_round_trips_through_the_cli",
+        "partitions_are_added_and_dropped_through_the_cli"
       ]
     },
     {
@@ -1995,6 +1996,7 @@
         "quiet_ledger_rewinds_restore_the_callers_same_named_savepoint",
         "quoted_routine_bodies_report_calls_but_not_their_string_data",
         "range_partition_trees_round_trip_whole_or_not_at_all",
+        "range_partitions_are_added_and_dropped_on_populated_trees",
         "referenced_key_guards_use_actual_bindings_and_prior_removals",
         "relation_name_occupants_name_each_kind_and_its_owner",
         "rename_order_tests::rename_dependencies_execute_with_their_statement_time_names",

@@ -689,7 +689,18 @@ pub fn describe(c: &Change) -> String {
             },
             None => format!("+ create table {name} ({} columns)", table.columns.len()),
         },
-        Change::DropTable { name, .. } => format!("- drop table {name}"),
+        Change::DropTable {
+            name,
+            detach_from: None,
+            ..
+        } => format!("- drop table {name}"),
+        // Said, because the detach is a statement of its own and locks the
+        // parent (#1171).
+        Change::DropTable {
+            name,
+            detach_from: Some(parent),
+            ..
+        } => format!("- drop table {name}, a partition of {parent}, detached from it first"),
         Change::RenameTable { from, to, .. } => format!("~ rename table {from} -> {to}"),
         Change::AddColumn { name, column, .. } => {
             format!("+ add column {name} {}", column.ty)
@@ -999,6 +1010,16 @@ mod tests {
             super::describe(&create(None)),
             "+ create table app.p1 (0 columns)"
         );
+        let drop = |detach_from: Option<&str>| Change::DropTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            name: "app.p1".parse().unwrap(),
+            detach_from: detach_from.map(|p| p.parse().unwrap()),
+        };
+        assert_eq!(
+            super::describe(&drop(Some("app.ev"))),
+            "- drop table app.p1, a partition of app.ev, detached from it first"
+        );
+        assert_eq!(super::describe(&drop(None)), "- drop table app.p1");
     }
 
     #[test]

@@ -564,6 +564,7 @@ mod tests {
                 PlannedChange::new(Change::DropTable {
                     uid: "t_bbbbbb".parse().expect("a uid"),
                     name: tname("app.old"),
+                    detach_from: None,
                 }),
             ],
         };

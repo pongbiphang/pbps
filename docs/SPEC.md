@@ -273,11 +273,15 @@ indexes:
   an identity, and declares nothing else: its columns, keys and indexes are its
   parent's. A bound value is written as the engine prints it, and a connected
   command refuses any other spelling with the engine's. A tree is created
-  whole; every other change to a partitioned table or a partition, a partition
-  added under an existing parent included, is refused by name until #1171. A
-  partition the database has and the declarations do not is refused with the
+  whole, parent first. A partition the database has and the declarations do not is refused with the
   commands that adopt it. `data:` beside a tree, and partitioning on SQL Server,
-  are refused (DEC-1170.1).
+  are refused (DEC-1170.1). Under a standing parent a partition is added, or
+  dropped with drop intent, which detaches it first and is `destructive`. The
+  apply's pre-flight refuses a range over rows the parent's DEFAULT partition
+  holds, and the drop of a partition rows still reference (DEC-1171.1). Every
+  other change stays refused by name: the parent's own changes until #1546,
+  detaching a partition and keeping its rows until #1544, attaching an existing
+  table until #1545.
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

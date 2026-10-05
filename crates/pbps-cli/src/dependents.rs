@@ -3122,6 +3122,7 @@ mod tests {
             Change::DropTable {
                 uid: Uid::derived(UidKind::Table, "app.t", 0),
                 name: TableName::new("app", "t"),
+                detach_from: None,
             },
             alter(&s, "app.f(integer)"),
         ]);
@@ -3246,6 +3247,7 @@ mod tests {
             Change::DropTable {
                 uid: Uid::derived(UidKind::Table, "app.t", 0),
                 name: TableName::new("app", "t"),
+                detach_from: None,
             },
             Change::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.t", 1),
