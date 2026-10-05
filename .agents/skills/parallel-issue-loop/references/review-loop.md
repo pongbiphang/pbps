@@ -120,7 +120,10 @@ then select and approve that base-edit run on the current head. Require its
 complete matrix and `ci-gate` before enqueueing. Verify the approval-selected
 merge SHA has the intended base and reviewed head as its parents, and every job
 checks out that same pinned SHA. The edited event itself can retain the former
-base merge SHA even while its run correctly names the new PR base. Metadata-only runs use separate
+base merge SHA even while its run correctly names the new PR base. Require the
+base parent to include the event's base commit and belong to the intended base
+branch; a stable merge ref may precede later advancement of that same branch.
+Metadata-only runs use separate
 concurrency groups, run no matrix and emit no required `ci-gate`; never select
 one as CI evidence. A rerun retains its original event head/base intent: the
 selector may retry the same intended base, but refuses a newly retargeted base

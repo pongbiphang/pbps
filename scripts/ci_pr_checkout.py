@@ -56,15 +56,17 @@ def ref_sha(value, merge_ref):
         raise CheckoutError("Incomplete merge-ref evidence") from error
 
 
-def select_checkout(api, repository, number, expected_head, expected_base,
+def select_checkout(api, repository, number, expected_head, expected_base, expected_base_sha,
                     *, timeout=60, attempts=30, clock=time.monotonic, sleep=time.sleep):
     """Wait for matching live PR/ref/parent snapshots, then share that immutable SHA.
 
     DEC-1457.1: edited events can retain the former base's GITHUB_SHA. PR
     association alone therefore cannot prove what was tested. Head/base intent
-    is event-bound; movement of the same base branch is allowed without rebasing.
+    and its ancestry floor are event-bound; movement of the same base branch
+    is allowed without rebasing even when the synthetic merge ref stays behind.
     """
     sha(expected_head)
+    sha(expected_base_sha)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise CheckoutError("Invalid repository")
     if not isinstance(number, int) or isinstance(number, bool) or number <= 0 or not isinstance(expected_base, str) or not expected_base:
@@ -81,6 +83,20 @@ def select_checkout(api, repository, number, expected_head, expected_base,
         if clock() >= deadline:
             raise CheckoutError("Merge-ref selection exceeded its time bound")
         return result
+    def base_contains(ancestor, descendant):
+        if ancestor == descendant:
+            return True
+        comparison = read(f"{prefix}/compare/{ancestor}...{descendant}")
+        try:
+            if sha(comparison["base_commit"]["sha"]) != ancestor:
+                raise CheckoutError("Unexpected ancestry comparison base")
+            merge_base = sha(comparison["merge_base_commit"]["sha"])
+            status = comparison["status"]
+        except (KeyError, TypeError) as error:
+            raise CheckoutError("Incomplete base-ancestry evidence") from error
+        if status not in ("ahead", "identical", "behind", "diverged"):
+            raise CheckoutError("Unexpected base-ancestry status")
+        return merge_base == ancestor and status in ("ahead", "identical")
     for _ in range(attempts):
         if clock() >= deadline:
             break
@@ -89,7 +105,12 @@ def select_checkout(api, repository, number, expected_head, expected_base,
             sleep(2)
             continue
         current_base = ref_sha(read(f"{prefix}/git/ref/{base_path}"), base_ref)
-        if before["base_sha"] != current_base:
+        # The event's base is the earliest admissible integration tree.
+        # GitHub need not advance a PR merge ref every time master moves.
+        if not base_contains(expected_base_sha, before["base_sha"]):
+            sleep(2)
+            continue
+        if not base_contains(before["base_sha"], current_base):
             sleep(2)
             continue
         current = ref_sha(read(f"{prefix}/git/ref/pull/{number}/merge"), merge_ref)
@@ -138,11 +159,11 @@ def main():
             pr = payload["pull_request"]
             evidence = select_checkout(github_api(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_API_URL"]),
                                        os.environ["GITHUB_REPOSITORY"], payload["number"],
-                                       pr["head"]["sha"], pr["base"]["ref"])
+                                       pr["head"]["sha"], pr["base"]["ref"], pr["base"]["sha"])
         except (KeyError, TypeError) as error:
             raise CheckoutError("Incomplete immutable pull-request event intent") from error
         selected = evidence.checkout_sha
-        print(f"Selected CI checkout: {selected} (base: {evidence.base_sha}, head: {evidence.head_sha}, ref: {evidence.base_ref}, merge-ref: {evidence.merge_ref})")
+        print(f"Selected CI checkout: {selected} (base: {evidence.base_sha}, head: {evidence.head_sha}, ref: {evidence.base_ref}, merge-ref: {evidence.merge_ref}, event-base: {pr['base']['sha']})")
     else:
         # Merge groups, pushes and dispatches already carry their exact CI tree.
         selected = sha(os.environ["GITHUB_SHA"])

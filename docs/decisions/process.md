@@ -875,8 +875,14 @@ yet its default checkout `b66f67da589c5fc5ba2eb0ffcd5e7a755b61844d`
 had the former base as its first parent. After approval, bootstrap the reviewed
 source and select the live `refs/pull/N/merge` only when complete, stable PR/ref
 snapshots and both commit parents match the event's reviewed head and intended
-base ref. Movement of the same base branch is allowed. Pin the selected SHA as
-an approval output and give every job that exact checkout; association and a
+base ref. The immutable event base SHA is an ancestry floor: the selected base
+parent must include it and itself be included in the live intended base branch.
+Actual #1535 reads also showed that GitHub may keep a stable earlier merge ref
+while `master` advances. Equality with the latest branch tip would refuse valid
+same-base movement; the ancestry checks preserve it without rebasing while
+refusing a former-base tree even when its commit is already an ancestor of the
+new base. Pin the selected SHA as an approval output and give every job that
+exact checkout; association and a
 green matrix alone do not prove the intended tree. Missing, unreadable, changed
 or ambiguous evidence fails the bounded selector instead of accepting an old
 merge. Non-PR events retain their exact event SHA.

@@ -125,6 +125,8 @@ checksum-pinned, and state lives in the database itself.
   matrix before enqueueing. Verify the approval-selected merge SHA has the
   intended base and reviewed head as its parents, and that every job checks
   out that same pinned SHA; an edited event can retain the former base SHA.
+  Require the base parent to include the event's base commit and belong to the
+  intended base branch. Later advancement of that branch needs no rebase.
   Ignore metadata-only runs: they create no
   `ci-gate`, do not cancel qualified CI and run no matrix. Do not select a run
   merely because it is the newest or green in Actions.

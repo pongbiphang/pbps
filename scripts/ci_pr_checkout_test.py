@@ -34,6 +34,7 @@ class Api:
         self.incomplete = False
         self.absent = False
         self.stale_pr_base = False
+        self.actual_base = None
 
     def __call__(self, path):
         self.requests.append(path)
@@ -42,7 +43,12 @@ class Api:
         merge = OLD_MERGE if stale else NEW_MERGE if moving else MERGE
         base = NEW_BASE if moving else BASE
         if "/git/ref/heads/" in path:
-            return {"ref": "refs/heads/master", "object": {"type": "commit", "sha": base}}
+            return {"ref": "refs/heads/master", "object": {"type": "commit", "sha": self.actual_base or base}}
+        if "/compare/" in path:
+            ancestor, descendant = path.rsplit("/", 1)[1].split("...")
+            order = {OLD_BASE: 0, BASE: 1, NEW_BASE: 2}
+            status = "ahead" if order[ancestor] < order[descendant] else "behind"
+            return {"base_commit": {"sha": ancestor}, "merge_base_commit": {"sha": ancestor if status == "ahead" else descendant}, "status": status}
         if "/pulls/" in path:
             self.pulls_read += 1
             moving = self.move_base and self.pulls_read >= 2
@@ -59,7 +65,7 @@ class Api:
 
 class CheckoutTests(unittest.TestCase):
     def select(self, api, attempts=3):
-        return select_checkout(api, "pongbiphang/pbps", 1535, HEAD, "master", attempts=attempts, sleep=lambda _: None)
+        return select_checkout(api, "pongbiphang/pbps", 1535, HEAD, "master", BASE, attempts=attempts, sleep=lambda _: None)
 
     def test_former_base_merge_is_refused_even_when_its_head_and_association_match(self):
         # Actual #1535: GITHUB_SHA's parents were [former base, current head]
@@ -83,6 +89,28 @@ class CheckoutTests(unittest.TestCase):
     def test_current_base_movement_retries_and_pins_one_stable_snapshot(self):
         result = self.select(Api(move_base=True))
         self.assertEqual((result.checkout_sha, result.base_sha), (NEW_MERGE, NEW_BASE))
+
+    def test_same_base_branch_can_advance_without_rebasing_or_advancing_the_merge_ref(self):
+        # Actual #1535: master advanced, while PR.base.sha and the merge ref
+        # still named the earlier master tree. The queue owns later integration.
+        api = Api()
+        api.actual_base = NEW_BASE
+        result = self.select(api)
+        self.assertEqual((result.checkout_sha, result.base_sha), (MERGE, BASE))
+
+    def test_a_base_branch_that_no_longer_contains_the_selected_base_is_refused(self):
+        api = Api()
+        api.actual_base = OLD_BASE
+        with self.assertRaisesRegex(CheckoutError, "No stable merge ref"):
+            self.select(api, attempts=2)
+        api = Api()
+        api.actual_base = NEW_BASE
+        def unreadable_ancestry(path):
+            if "/compare/" in path:
+                return {"status": "ahead"}
+            return api(path)
+        with self.assertRaisesRegex(CheckoutError, "Incomplete base-ancestry"):
+            self.select(unreadable_ancestry)
 
     def test_changed_head_or_intended_base_ref_cannot_be_silently_admitted(self):
         for attribute, value in [("head", "2" * 40), ("base_ref", "parent")]:
@@ -115,7 +143,7 @@ class CheckoutTests(unittest.TestCase):
         api = Api()
         def divergent(path):
             row = copy.deepcopy(api(path))
-            if "/git/ref/" in path:
+            if "/git/ref/pull/" in path:
                 row["object"]["sha"] = OLD_MERGE
             return row
         with self.assertRaisesRegex(CheckoutError, "No stable merge ref"):
@@ -140,7 +168,7 @@ class CheckoutTests(unittest.TestCase):
             self.select(incomplete)
         ticks = iter([0, 60])
         with self.assertRaisesRegex(CheckoutError, "No stable merge ref"):
-            select_checkout(api, "pongbiphang/pbps", 1535, HEAD, "master", clock=lambda: next(ticks))
+            select_checkout(api, "pongbiphang/pbps", 1535, HEAD, "master", BASE, clock=lambda: next(ticks))
 
 
 class OutputTests(unittest.TestCase):
@@ -161,7 +189,7 @@ class OutputTests(unittest.TestCase):
             output = Path(directory) / "output"
             event = Path(directory) / "event.json"
             event.write_text(json.dumps({"number": 1535, "pull_request": {
-                "head": {"sha": HEAD}, "base": {"ref": "master"},
+                "head": {"sha": HEAD}, "base": {"ref": "master", "sha": BASE},
             }}))
             output.write_text("")
             with mock.patch.dict(os.environ, {
