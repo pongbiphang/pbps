@@ -4,7 +4,7 @@
   (Amendment 1) and §3's estimate with step 9 (Amendment 2); the PostgreSQL
   live suite re-measures both. Amendment 3 adds SQL Server's column estimates
   and live catalogue measurements.
-- Date: 2026-09-05, amended 2026-09-15
+- Date: 2026-09-05, amended 2026-09-15 and 2026-10-05 (Amendment 4, arrays)
 - Related: docs/SPEC.md §7.2, §11.2, §12, 14.1 (the P1 estimate row);
   [ADR-0003](ADR-0003-execution-strategy.md);
   [ADR-0009](ADR-0009-postgres-modules.md);
@@ -564,6 +564,22 @@ boundaries, lock and log controls, and connected identity/uncertainty behavior.
 PostgreSQL retains its own `relfilenode` matrix. CLI tests verify the existing
 JSON schema, catalog row counts, compression-dependent answers, and unchanged
 saved-plan and approval behavior. Cost remains outside correctness risk.
+
+## Amendment 4 — arrays of built-in elements (#1167)
+
+§1 kept arrays out because `ColumnType` had nowhere to put one, and it required
+both spellings to fail rather than one of them loading as a scalar. Since
+#1167, `ColumnType` carries an array marker. A declaration writes `T[]`, which
+is how `format_type` reads every array back, and the parser still refuses
+every other spelling, `T ARRAY` included, so the danger §1 named stays closed.
+
+The marker is a flag, not a dimension, because the engine enforces neither a
+size nor a dimension count (measured on 16 and 18). An element change is
+emitted only where §2 calls the element change `Safe`. Even then the table is
+rewritten: §3's dataset now has a row the scalar never had, since every element
+change of an array rewrites. Narrowing an element is refused, as is a change
+between a scalar and an array, which needs the `USING` of §5. User-defined
+element types remain out (#1523). The decision record is DEC-1167.1.
 
 ## Placement
 

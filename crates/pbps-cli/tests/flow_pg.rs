@@ -6373,6 +6373,95 @@ fn an_unlogged_table_switches_through_the_cli_behind_its_risk() {
     switch(true, &["--allow", "destructive"]);
 }
 
+/// An array column goes the whole way through the CLI (#1167): pulled as
+/// `integer[]`, widened to `bigint[]` by a saved plan that applies on
+/// populated rows, verifies and leaves nothing to plan; a narrowing is refused
+/// by name before anything connects, and so are rows declared beside an array.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_array_column_widens_through_the_cli() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "arrays-1167");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.t (id integer PRIMARY KEY, tags integer[]); \
+         INSERT INTO app.t VALUES (1, '{1,NULL,3}'), (2, '[0:1]={4,5}')",
+    );
+    let d = Demo::new("arrays-1167");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.t.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("integer[]"), "{text}");
+
+    let widened = text.replacen("integer[]", "bigint[]", 1);
+    std::fs::write(&path, &widened).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, &connection, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    on_server(
+        &connection,
+        "DO $$ BEGIN \
+           IF (SELECT string_agg(tags::text, ';' ORDER BY id) FROM app.t) \
+              <> '{1,NULL,3};[0:1]={4,5}' THEN RAISE EXCEPTION 'values moved'; END IF; \
+           IF format_type((SELECT atttypid FROM pg_attribute \
+                            WHERE attrelid = 'app.t'::regclass AND attname = 'tags'), NULL) \
+              <> 'bigint[]' THEN RAISE EXCEPTION 'not widened'; END IF; \
+         END $$",
+    );
+
+    // Negative: narrowing back is previewed as refused, and refused by name
+    // when the plan is computed against the database.
+    std::fs::write(&path, widened.replacen("bigint[]", "integer[]", 1)).unwrap();
+    let o = d.run(&["plan"]);
+    assert!(
+        stdout(&o).contains("narrows or converts an array's elements"),
+        "{}",
+        stdout(&o)
+    );
+    d.commit();
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("array's element type"),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::write(&path, &widened).unwrap();
+    // A pull of its rows stops at the array, by name, rather than reading
+    // `{1,NULL,3}` as a malformed integer (#1525 review).
+    let other = Demo::new("arrays-1167-data");
+    let o = other.run(&["pull", "--db", &connection, "--data", "app.t"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`tags`") && stderr(&o).contains("an array"),
+        "{}",
+        stderr(&o)
+    );
+    // And rows declared beside an array column.
+    std::fs::write(
+        &path,
+        format!("{widened}\ndata:\n  mode: exact\n  rows:\n    \"1\": {{}}\n"),
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        format!("{}{}", stdout(&o), stderr(&o)).contains("array column"),
+        "{}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+}
+
 /// Index storage parameters go the whole way through the CLI (#1442):
 /// pulled with the index, changed in place by one `ALTER INDEX` that
 /// applies and verifies, after which the next plan is empty.

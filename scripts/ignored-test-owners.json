@@ -1321,7 +1321,8 @@
         "a_replica_identity_moves_to_a_new_index_through_the_cli",
         "storage_parameters_change_through_the_cli",
         "index_storage_parameters_change_in_place_through_the_cli",
-        "an_unlogged_table_switches_through_the_cli_behind_its_risk"
+        "an_unlogged_table_switches_through_the_cli_behind_its_risk",
+        "an_array_column_widens_through_the_cli"
       ]
     },
     {
@@ -1927,6 +1928,7 @@
         "an_unparseable_count_beside_an_unsupported_version_is_still_refused_by_version",
         "an_unprobeable_default_beside_a_null_in_the_same_key_refuses_nothing",
         "an_unqualified_name_in_a_declared_expression_binds_through_the_write_path",
+        "array_columns_round_trip_and_widen_their_elements",
         "concurrent_build_recovery_preserves_existing_objects_and_quotes_its_own_artifact",
         "constraint_name_validation_preserves_legal_index_sharing",
         "continued_routine_bodies_create_the_callee_first_and_ignore_string_data",

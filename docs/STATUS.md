@@ -52,6 +52,11 @@ SET LOGGED/UNLOGGED`, ordered by the foreign keys between the tables it
 switches, and `destructive` to unlogged (#1443, DEC-1443.1). Temporary tables
 stay limitations.
 
+A PostgreSQL column of a built-in element type may be an array, `T[]`. It is
+pulled, rebuilt, and widened element-wise by a rewrite. Element narrowing,
+scalar-to-array changes and `data:` beside an array are refused by name. User-defined
+element types are #1523 (#1167, DEC-1167.1).
+
 A SQL Server table declares `system_time:`, its period and its system
 versioning into a history table that is part of it. `pull` reads a pair whose
 history has the layout the engine builds, and writes out a history name the

@@ -86,6 +86,9 @@ use crate::schema::Schema;
 /// Bumped to 18 when a table gained its SQL Server period and system
 /// versioning (DEC-1176.1). Versions 6 to 17 stay readable.
 ///
+/// Bumped to 19 when a column's type could be a PostgreSQL array, `T[]`
+/// (DEC-1167.1). Versions 6 to 18 stay readable.
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
 ///
@@ -104,7 +107,7 @@ use crate::schema::Schema;
 /// order, which can drop a schema-bound dependency before its dependent.
 /// Refused, with the remedy `check_version` already names: re-record it with
 /// `pbps baseline --reason ...`.
-pub const CURRENT_VERSION: u32 = 18;
+pub const CURRENT_VERSION: u32 = 19;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -176,6 +179,10 @@ pub const CURRENT_VERSION: u32 = 18;
 /// (DEC-1176.2): an older reader left every table with a period out as a
 /// limitation, so every recorded table was ordinary, which is what an absent
 /// `system_time` reads as.
+///
+/// Still 6 at version 19, whose array types an older state never holds
+/// (DEC-1167.2): an older reader left a table with an array column out as a
+/// limitation, so no recorded column is an array.
 pub const OLDEST_READABLE_VERSION: u32 = 6;
 
 /// How this state came about.
@@ -578,7 +585,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 18);
+        assert_eq!(CURRENT_VERSION, 19);
     }
 
     fn schema_with(ty: &str) -> Schema {

@@ -151,6 +151,20 @@ pub fn query(
     scope: &RowScope,
 ) -> Result<Option<RowQuery>, RowsError> {
     let key = key_column(name, table)?;
+    // A row's values are scalars, and an array's base is its element's: read
+    // as one, `{1,2}` would fail as a malformed integer, or worse. Refused
+    // by name before any query, as `validate` refuses `data:` beside one
+    // (#1167, #1525 review).
+    if let Some((column, spec)) = table.columns.iter().find(|(_, c)| c.ty.is_array()) {
+        return Err(RowsError::Unreadable {
+            table: name.clone(),
+            why: format!(
+                "its column `{column}` is `{}`, an array, and pbps reads no rows of a table \
+                 with an array column",
+                spec.ty
+            ),
+        });
+    }
     let Some(key_spec) = table.columns.get(&key) else {
         return Err(RowsError::Unreadable {
             table: name.clone(),
@@ -1560,6 +1574,42 @@ mod tests {
             storage_parameters: Default::default(),
         });
         t
+    }
+
+    /// A table with an array column is refused before any row query, by
+    /// the column, rather than read with the array taken for its element's
+    /// scalar (#1525 review); the same table without it is queried.
+    #[test]
+    fn rows_of_a_table_with_an_array_column_are_refused_by_name() {
+        let name: TableName = "app.t".parse().unwrap();
+        let with = table(
+            Some(vec!["id"]),
+            &[("id", "integer", None), ("tags", "integer[]", None)],
+        );
+        let e = query(
+            &name,
+            &with,
+            &RowScope::Every {
+                known: Default::default(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("`tags`") && e.contains("array"), "{e}");
+        let without = table(
+            Some(vec!["id"]),
+            &[("id", "integer", None), ("tags", "integer", None)],
+        );
+        assert!(
+            query(
+                &name,
+                &without,
+                &RowScope::Every {
+                    known: Default::default()
+                }
+            )
+            .is_ok()
+        );
     }
 
     fn name() -> TableName {

@@ -260,20 +260,6 @@ fn arity(ty: &ColumnType, detail: impl Into<String>) -> DialectError {
     }
 }
 
-/// A spelling the *model* cannot hold, as distinct from one the engine lacks.
-///
-/// [`DialectError::NotBuilt`] rather than `Unsupported`, and the distinction is
-/// the one that variant exists for: PostgreSQL has arrays. What is missing
-/// is a `pbps-model` representation, and a
-/// reader sent to the engine's documentation for a limitation of this tool
-/// would look in the wrong place.
-fn needs_a_model_change(part: impl Into<String>) -> DialectError {
-    DialectError::NotBuilt {
-        dialect: DIALECT,
-        part: part.into(),
-    }
-}
-
 /// The `serial` family: spellings that are not types (ADR-0011 Amendment 3).
 ///
 /// Refused rather than normalized, and the reason is the contract on
@@ -313,24 +299,14 @@ pub fn refuse_serial(ty: &ColumnType, column: Option<&str>) -> Option<DialectErr
     })
 }
 
-/// Whether this base name is an array spelling, in the one form that reaches
-/// here.
-///
-/// `text[]` never does: `ColumnType::from_str` allows only `[A-Za-z0-9_ ]` in a
-/// base name, so the square brackets are refused by the loader. **The
-/// SQL-standard spelling is not**, because spaces are legal in a base name
-/// (`double precision`, `timestamp with time zone`) — so `text ARRAY` loads
-/// happily as the base name `text array`, which no catalog will ever return.
-/// That is the dangerous one, and ADR-0012 §1 is explicit that both spellings
-/// have to fail rather than one of them being silently accepted into a
-/// comparison it can never win (DECISIONS 240; the model change is issue #130).
-fn is_array(base: &str) -> bool {
-    base.split_whitespace().next_back() == Some("array")
-}
-
 /// Expands aliases, fills in the arguments PostgreSQL fills in itself, and
 /// resolves the spellings the engine resolves.
 pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
+    // An array is its element, normalized, with the marker kept (#1167): the
+    // engine reads every array back as its element's spelling and `[]`.
+    if ty.is_array() {
+        return Ok(normalize(&ty.element())?.into_array());
+    }
     if let Some(refusal) = refuse_serial(ty, None) {
         return Err(refusal);
     }
@@ -339,15 +315,6 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
     // runs of spaces.
     let base_words: Vec<&str> = ty.base.split_whitespace().collect();
     let base = base_words.join(" ");
-    if is_array(&base) {
-        return Err(needs_a_model_change(
-            "an array column. `ColumnType` holds a base name and its arguments, with nowhere \
-             to put a dimension, so `text[]` and `text ARRAY` are both refused rather than one \
-             of them loading as the base name `text array` — which no catalog returns, so the \
-             column would be reported as changed on every run and no plan could fix it \
-             (ADR-0012 §1)",
-        ));
-    }
     let temporal_name = matches!(
         canonical_base(&base),
         "time without time zone"
@@ -518,7 +485,13 @@ fn check_numeric(ty: &ColumnType, p: i64, s: i64) -> Result<(), DialectError> {
 /// Server counterpart, which admits a `decimal` with scale zero — here
 /// `numeric(10,0)` is refused like any other.
 pub fn identity_range(ty: &ColumnType) -> Option<RangeInclusive<i64>> {
-    match normalize(ty).ok()?.base.as_str() {
+    let ty = normalize(ty).ok()?;
+    // An array of integers holds no identity: its base is the element's
+    // (#1167, #1525 review).
+    if ty.is_array() {
+        return None;
+    }
+    match ty.base.as_str() {
         "smallint" => Some(i64::from(i16::MIN)..=i64::from(i16::MAX)),
         "integer" => Some(i64::from(i32::MIN)..=i64::from(i32::MAX)),
         "bigint" => Some(i64::MIN..=i64::MAX),
@@ -978,6 +951,14 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
     if from == to {
         return TypeChangeRisk::Safe;
     }
+    // An array keeps its element's risk; to or from a scalar needs a `USING`
+    // the engine will not infer (#1167).
+    if from.is_array() || to.is_array() {
+        if from.is_array() != to.is_array() {
+            return TypeChangeRisk::Incompatible;
+        }
+        return change_risk(&from.element(), &to.element());
+    }
     let (a, b) = (family(from), family(to));
 
     match (a, b) {
@@ -1236,6 +1217,11 @@ fn renders_alike_under_the_pins(t: &ColumnType) -> bool {
 ///
 /// Both types must already be normalized, as everywhere else here.
 pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> Option<String> {
+    // An array's narrowing is refused by `emit` (#1167): a scalar predicate
+    // over an array value would count nothing it should.
+    if from.is_array() || to.is_array() {
+        return None;
+    }
     // Nothing to count where the engine will not attempt the change at all:
     // `emit` refuses it by name with the `USING` clause spelled out
     // (ADR-0012 §5), and a probe beside that refusal would only argue with it.
@@ -2107,6 +2093,49 @@ mod tests {
         routine_arg(&declared).as_str().to_owned()
     }
 
+    /// An array normalizes as its element, aliases expanded and modifiers
+    /// kept, and carries its element's risk; a change between a scalar and
+    /// an array needs a `USING`, and a narrowing element has no probe here
+    /// (#1167).
+    #[test]
+    fn an_array_is_normalized_and_classified_by_its_element() {
+        let ty = |s: &str| s.parse::<ColumnType>().unwrap();
+        for (declared, read_back) in [
+            ("int[]", "integer[]"),
+            ("varchar(10)[]", "character varying(10)[]"),
+            ("timestamptz(3)[]", "timestamp(3) with time zone[]"),
+            ("numeric(10,2)[]", "numeric(10, 2)[]"),
+        ] {
+            assert_eq!(
+                normalize(&ty(declared)).unwrap().to_string(),
+                read_back,
+                "{declared}"
+            );
+        }
+        let n = |s: &str| normalize(&ty(s)).unwrap();
+        assert_eq!(
+            change_risk(&n("int[]"), &n("bigint[]")),
+            TypeChangeRisk::Safe
+        );
+        assert_eq!(
+            change_risk(&n("bigint[]"), &n("int[]")),
+            TypeChangeRisk::Narrowing
+        );
+        assert_eq!(
+            change_risk(&n("int"), &n("int[]")),
+            TypeChangeRisk::Incompatible
+        );
+        assert_eq!(
+            change_risk(&n("int[]"), &n("int")),
+            TypeChangeRisk::Incompatible
+        );
+        assert_eq!(cannot_become(&n("bigint[]"), &n("int[]"), "c"), None);
+        // Negative: a scalar narrowing still has its probe.
+        assert!(cannot_become(&n("bigint"), &n("int"), "c").is_some());
+        // An element pbps cannot normalize is refused as an array too.
+        assert!(normalize(&ty("serial[]")).is_err());
+    }
+
     /// A name over the engine's byte limit is found wherever it is in the
     /// argument — bare, qualified, quoted with a doubled quote counted once,
     /// under a modifier or an array — and a name at the limit is not.
@@ -2675,27 +2704,21 @@ mod tests {
         }
     }
 
-    /// Both array spellings fail, which is the whole requirement: ADR-0012 §1
-    /// measured that `text[]` is refused by the loader and `text ARRAY` is
-    /// **not**, because spaces are legal in a base name. The silently accepted
-    /// one is the dangerous one.
+    /// The standard `T ARRAY` spelling is refused by the model, never read as
+    /// a scalar type named `text array` (ADR-0012 §1, the danger it named):
+    /// an array is `T[]` since #1167, and every other spelling stops at the
+    /// parser. A name that merely ends in those letters is not an array.
     #[test]
-    fn neither_array_spelling_is_accepted() {
-        // The bracketed form never reaches the dialect: the model refuses it.
-        assert!("text[]".parse::<ColumnType>().is_err());
-        assert!("integer[]".parse::<ColumnType>().is_err());
-        // The standard form parses, and this is where it stops.
+    fn the_standard_array_spelling_never_reaches_the_dialect() {
         for spelling in [
             "text ARRAY",
             "integer array",
             "double precision array",
             "time(3) ARRAY",
         ] {
-            let message = refused(spelling);
-            assert!(message.contains("array"), "{message}");
-            assert!(message.contains("dimension"), "{message}");
+            assert!(spelling.parse::<ColumnType>().is_err(), "{spelling}");
         }
-        // A name that merely ends in those letters is not an array.
+        assert!("text[]".parse::<ColumnType>().unwrap().is_array());
         assert!(refused("arrayish").contains("has no type"));
     }
 

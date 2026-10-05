@@ -179,7 +179,10 @@ use crate::schema::Schema;
 /// Bumped to 23 for SQL Server system-versioned tables (DEC-1176.1): a
 /// table's `system_time` in a created table's payload. An older build reading
 /// such a plan would create an ordinary table, without its period or history.
-pub const CURRENT_VERSION: u32 = 23;
+///
+/// Bumped to 24 for PostgreSQL array columns (DEC-1167.1): a column's type may
+/// be `T[]`, which an older build cannot parse.
+pub const CURRENT_VERSION: u32 = 24;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -638,7 +641,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 23);
+        assert_eq!(CURRENT_VERSION, 24);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

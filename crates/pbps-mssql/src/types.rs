@@ -175,6 +175,17 @@ fn arity(ty: &ColumnType, detail: impl Into<String>) -> DialectError {
 /// Expands aliases, fills in the arguments SQL Server fills in itself, and
 /// collapses the spellings the engine collapses.
 pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
+    // PostgreSQL's (#1167): read as its element, it would be a scalar column
+    // the declaration never asked for.
+    if ty.is_array() {
+        return Err(DialectError::Invalid {
+            dialect: DIALECT,
+            message: format!(
+                "`{ty}` is an array type, which SQL Server does not have; declare the element \
+                 type, or a separate table for the elements"
+            ),
+        });
+    }
     if ty.args_after_word().is_some() {
         return Err(arity(
             ty,
@@ -705,6 +716,17 @@ fn safe_if(cond: bool) -> TypeChangeRisk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An array is PostgreSQL's: refused by name, never read as its element
+    /// (#1167).
+    #[test]
+    fn an_array_type_is_refused() {
+        let e = normalize(&"int[]".parse().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("array type"), "{e}");
+        assert!(normalize(&"int".parse().unwrap()).is_ok());
+    }
 
     include!("../tests/support/estimate_types.rs");
 

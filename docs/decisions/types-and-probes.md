@@ -1701,3 +1701,58 @@ text and number; this entry is the correction. The unit test
 `adding_an_identity_backfills_rows_without_an_explicit_default` and the live
 `the_estimate_says_what_the_engine_does_about_rebuilding_the_table` pin both
 sides, with the plain and literal-default additions as negative controls.
+
+<a id="dec-1167-1"></a>
+
+**DEC-1167.1. A PostgreSQL array column is `T[]`: an array marker on its
+element type, not a rank. An element change is taken only where every element
+keeps its value (#1167).**
+
+Measured on 16.15 and 18.6, with identical results:
+
+- `int[3]`, `int[][]`, `integer ARRAY[4]` and `_int4` all read back as
+  `integer[]`, with `attndims` of 1, 2, 1 and 0. Neither a declared size nor a
+  dimension count is enforced. Element typmods are kept, a modifier inside the
+  name included: `timestamp(3) with time zone[]`.
+- Every element type change rewrites the table, the widenings a scalar takes in
+  place included: `integer[]→bigint[]`, `varchar(10)[]→varchar(20)[]` and
+  `numeric(10,2)[]→numeric(12,2)[]` each gave the table a new `relfilenode`.
+
+**The model.** `ColumnType` carries one array marker. A declaration writes
+`T[]`. The other spellings are refused by name, because they would read back as
+`T[]` and so be either rewritten silently or drift forever. Scalars serialize
+exactly as before. A routine's argument is a `RoutineArg`, not a `ColumnType`,
+so routine signatures are untouched. The reader keeps a type only where it
+parses and normalizes back to itself. So an array of an element pbps cannot
+name, such as a quoted `"char"` or a user-defined type (#1523), stays a named
+limitation and is never read as a scalar.
+
+**Changes.** An array keeps its element's risk class. A change between a
+scalar and an array is `Incompatible`, and the emitter refuses it for the
+`USING` it would need (ADR-0012 §5). The emitter also refuses an element change
+that is not `Safe`. Narrowing needs element-wise probes over NULL arrays, NULL
+elements, empty arrays, nondefault bounds and shape, and none count them yet,
+so the narrowing probe is not built for an array at all. The plan's note says
+the change is refused rather than counted. The estimate is a rewrite that reads
+every row under `AccessExclusiveLock`.
+
+**Rows.** `data:` on a table with an array column is refused. A row's `Value`
+is scalar, and an array's equality includes its bounds (`'[0:1]={1,2}'` is not
+`'{1,2}'`), so rows beside an array wait for a codec of their own.
+
+**SQL Server** refuses an array type by name, rather than reading `int[]` as
+`int`.
+
+**Every check that reads a type's base name was audited for arrays once**
+(#1525 review), because an array's base is its element's.
+- An identity on `integer[]` is refused.
+- So is a GIN index over `jsonb[]`, in validation and in the reader, which
+  leaves one out.
+- A default whose meaning depends on the session is held to the same rule for
+  an array of such elements, which is right as it stands.
+- The row reader refuses a table with an array column by name, before any
+  query. So does `pull --data`, which reads rows before any `data:` is
+  declared, rather than reading `{1,2}` as a malformed integer.
+- Every other check is behind an array test already: the estimate, the risk
+  classification and the probe.
+

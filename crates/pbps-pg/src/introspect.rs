@@ -2983,7 +2983,10 @@ fn key_class(
             let jsonb = table
                 .columns
                 .get(column)
-                .is_some_and(|c| crate::types::normalize(&c.ty).is_ok_and(|t| t.base == "jsonb"));
+                // Not `jsonb[]`, whose base is the element's (#1525 review).
+                .is_some_and(|c| {
+                    crate::types::normalize(&c.ty).is_ok_and(|t| t.base == "jsonb" && !t.is_array())
+                });
             if !jsonb {
                 left_out(
                     pulled,

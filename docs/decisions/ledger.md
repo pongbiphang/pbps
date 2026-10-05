@@ -1162,3 +1162,11 @@ a table with a period or system versioning out as a limitation. An older build
 reading a version 23 plan would create an ordinary table, without its period
 or history.
 
+<a id="dec-1167-2"></a>
+
+**DEC-1167.2. State version 19 admits array column types and still reads 6 to
+18; plan version 24 turns 23 away.** An older reader left a table with an
+array column out as a limitation, so no recorded column is an array, and an
+older state reads exactly as it did. An older build cannot parse `T[]`, so it
+refuses a version 24 plan or state rather than misreading one.
+

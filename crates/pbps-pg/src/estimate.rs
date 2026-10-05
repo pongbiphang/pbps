@@ -232,6 +232,13 @@ fn rewrites(from: &ColumnType, to: &ColumnType) -> Rewrite {
     if from == to {
         return Rewrite::No;
     }
+    // Every element change of an array rewrites the table, the widenings a
+    // scalar takes in place included: `integer[]` to `bigint[]` and
+    // `character varying(10)[]` to `character varying(20)[]` both gave the
+    // table a new `relfilenode` on 16 and 18 (#1167).
+    if from.is_array() || to.is_array() {
+        return Rewrite::Yes;
+    }
     // The session's `TimeZone` decides this one — measured, no rewrite from a
     // `UTC` session and a rebuild from `America/New_York`. `emit` refuses the
     // change for a different reason (the stored instant is the session's too,
@@ -905,6 +912,32 @@ mod tests {
 
     fn tname(s: &str) -> TableName {
         s.parse().expect("a table name")
+    }
+
+    /// Every element change of an array rewrites the table, the widenings a
+    /// scalar takes in place included (measured on 16 and 18, #1167); an
+    /// unchanged array, under an alias, does not.
+    #[test]
+    fn an_array_element_change_is_a_rewrite() {
+        for (from, to) in [
+            ("int[]", "bigint[]"),
+            ("varchar(10)[]", "varchar(20)[]"),
+            ("numeric(10,2)[]", "numeric(12,2)[]"),
+        ] {
+            assert!(
+                matches!(rewrites(&ty(from), &ty(to)), Rewrite::Yes),
+                "{from} -> {to}"
+            );
+        }
+        assert!(matches!(
+            rewrites(&ty("int[]"), &ty("integer[]")),
+            Rewrite::No
+        ));
+        // Negative: the scalar widening is still free.
+        assert!(matches!(
+            rewrites(&ty("varchar(10)"), &ty("varchar(20)")),
+            Rewrite::No
+        ));
     }
 
     /// A persistence switch rewrites the table, reading every row, under
