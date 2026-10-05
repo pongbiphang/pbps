@@ -4314,8 +4314,8 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
 /// A partition declared as an ordinary table of its parent's shape is
 /// detached under the declared names (#1544): its rows stay with it and
 /// leave the parent, it reads back as declared, and nothing is left to plan.
-/// A key left unnamed takes the engine's own name for the table's. On 16
-/// and 18.
+/// Names may be exchanged, and a key left unnamed keeps the engine's name
+/// for it. On 16 and 18.
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn a_partition_is_detached_and_kept_under_its_declared_names() {
@@ -4343,6 +4343,7 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
             "CREATE TABLE {s}.r (id integer PRIMARY KEY);
              CREATE TABLE {s}.ev (id integer NOT NULL, ts date NOT NULL DEFAULT '2025-01-01',
                  v text CONSTRAINT ev_v_ck CHECK (v <> ''),
+                 CONSTRAINT ev_id_ck CHECK (id > 0),
                  rid integer CONSTRAINT ev_rid_fk REFERENCES {s}.r (id),
                  CONSTRAINT ev_pk PRIMARY KEY (id, ts), CONSTRAINT ev_vt UNIQUE (v, ts))
                  PARTITION BY RANGE (ts);
@@ -4351,6 +4352,9 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
                  FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
              CREATE TABLE {s}.ev_2026 PARTITION OF {s}.ev
                  FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+             CREATE SEQUENCE {s}.ev_2027_pkey;
+             CREATE TABLE {s}.ev_2027 PARTITION OF {s}.ev
+                 FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');
              INSERT INTO {s}.r VALUES (1);
              INSERT INTO {s}.ev VALUES (1, '2025-06-01', 'a', 1), (2, '2026-06-01', 'b', 1),
                  (3, '2025-07-01', 'c', NULL);"
@@ -4426,7 +4430,34 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
             1
         );
 
-        // A key left unnamed takes the engine's own name for the table's. A
+        // A declaration may exchange names: here the engine's names for the
+        // unique constraint's and the index's clones, and the two checks'.
+        // Renamed straight across, each would collide with the other.
+        let clones = counted(
+            &mut conn,
+            &format!(
+                "SELECT count(*)::int FROM pg_catalog.pg_class \
+                 WHERE relnamespace = '{s}'::regnamespace \
+                 AND relname IN ('ev_2026_v_ts_key', 'ev_2026_rid_idx', 'ev_2027_pkey1')"
+            ),
+        )
+        .await;
+        assert_eq!(clones, 3, "the engine's names the exchanges below rely on");
+        let mut exchanged = pbps_model::Table {
+            partition_by: None,
+            ..parent.clone()
+        };
+        exchanged.primary_key.as_mut().unwrap().name = Some("ev26_pk".into());
+        rename(&mut exchanged.unique, "ev_vt", "ev_2026_rid_idx");
+        rename(&mut exchanged.indexes, "ev_rid", "ev_2026_v_ts_key");
+        let (v, id) = (
+            exchanged.checks.remove("ev_v_ck").unwrap(),
+            exchanged.checks.remove("ev_id_ck").unwrap(),
+        );
+        exchanged.checks.insert("ev_id_ck".into(), v);
+        exchanged.checks.insert("ev_v_ck".into(), id);
+        // A key left unnamed keeps the name the engine gave it, which is not
+        // the table's default when another relation already holds that. A
         // foreign key and a check keep their parent's names, which are the
         // table's own to share; a unique constraint and an index need names
         // of their own, sharing the schema's relation namespace.
@@ -4435,10 +4466,11 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
             ..parent.clone()
         };
         unnamed.primary_key.as_mut().unwrap().name = None;
-        rename(&mut unnamed.unique, "ev_vt", "ev26_vt");
-        rename(&mut unnamed.indexes, "ev_rid", "ev26_rid");
+        rename(&mut unnamed.unique, "ev_vt", "ev27_vt");
+        rename(&mut unnamed.indexes, "ev_rid", "ev27_rid");
         let mut second = declared.clone();
-        second.tables.insert(t("ev_2026"), unnamed);
+        second.tables.insert(t("ev_2026"), exchanged.clone());
+        second.tables.insert(t("ev_2027"), unnamed);
         let second_ids = mint_ids(&second, &declared_ids, &[]);
         let step = plan(&after, &declared_ids, &second, &second_ids);
         apply(&mut conn, &pg, &step).await;
@@ -4447,12 +4479,13 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
                 .await
                 .expect("read back"),
         );
+        assert_eq!(last.tables.get(&t("ev_2026")), Some(&exchanged));
         assert_eq!(
-            last.tables[&t("ev_2026")]
+            last.tables[&t("ev_2027")]
                 .primary_key
                 .as_ref()
                 .and_then(|k| k.name.clone()),
-            Some("ev_2026_pkey".to_owned())
+            Some("ev_2027_pkey1".to_owned())
         );
         assert!(plan(&last, &second_ids, &second, &second_ids).is_empty());
 

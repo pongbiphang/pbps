@@ -2472,8 +2472,9 @@ later revision. A rename at the same time stays #1170's refusal.
 **The change** carries:
 
 - each of the parent's objects with the name its clone takes. A key left
-  unnamed is `None`, and the dialect spells it, `<table>_pkey`, which is what
-  the reader then reads;
+  unnamed is `None` and keeps the name its clone has, since an unnamed key
+  matches any name. Renaming it to `<table>_pkey` would collide whenever
+  another relation holds that name, which is why the engine chose another;
 - the declared shape. The apply holds the read-back to that shape, as it holds
   a created table to its `CREATE`, and does not compare it with the partition's
   empty base. The declared-expression record takes its text from the shape and
@@ -2484,18 +2485,27 @@ it. It is `destructive`: no row is deleted, but every row of the partition
 leaves its parent, and a query on the parent stops returning them. Plan
 version 27 carries it, and SQL Server refuses it.
 
-**The statement** is one batch:
+**The statement** is one `DO` block:
 
-1. A `DO` block finds each clone through its parent object, as
-   `drop_primary_key` finds an engine-chosen name: `conparentid` for a key, a
-   unique constraint or a foreign key, and `pg_inherits` for an index. It
-   renames each with `EXECUTE format(... %I ...)`, the table's name escaped for
-   `format`. A clone not found raises, rolling the batch back.
+1. It finds each clone through its parent object, as `drop_primary_key` finds
+   an engine-chosen name: `conparentid` for a key, a unique constraint or a
+   foreign key, and `pg_inherits` for an index. Each one whose name changes is
+   renamed with `EXECUTE format(... %I ...)`, the table's name escaped for
+   `format`, to a temporary name. A clone not found raises, rolling the batch
+   back.
 2. The detach.
-3. The checks' renames, from the parent's names.
+3. Each check whose name changes is renamed from its parent's name to a
+   temporary name.
+4. Every temporary name is renamed to its declared one.
+
+The temporary names carry the table's oid. They exist because a declaration
+may exchange two names, or give a clone a name a check still holds; renaming
+straight across would collide with a name not yet vacated.
 
 Pinned by the live `a_partition_is_detached_and_kept_under_its_declared_names`
-(on 16 and 18), which fails without the renames; the CLI
+(on 16 and 18), which fails without the renames, with renames made straight
+across (an exchange of names), or with an unnamed key renamed to its default
+name while a sequence holds it; the CLI
 `a_partition_is_detached_and_kept_through_the_cli`, which fails without the
 apply holding the table to its declared shape; and the unit tests
 `a_partition_declared_as_its_parents_shape_is_detached`, which fails without

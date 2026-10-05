@@ -178,8 +178,8 @@ pub struct DetachedName {
     /// parent's name is carried for the record only.
     pub parent: String,
     /// The name the declaration gives the detached table's. `None` only for
-    /// a key the declaration leaves unnamed: the engine's own name for the
-    /// table's key, which only the dialect can spell.
+    /// a key the declaration leaves unnamed, which keeps whatever name the
+    /// engine gave its clone: an unnamed key matches any name.
     pub name: Option<String>,
 }
 
