@@ -1096,11 +1096,13 @@ pub(crate) fn ledger_facts() -> String {
 ///
 /// Whether `e` is an editor itself is asked first, through an uncorrelated
 /// `IN` the engine hashes. Only then is the set walked with `pg_has_role`.
-/// The set is small unless `TRIGGER` is granted to `PUBLIC`, which is exactly
-/// the grant this check exists to report, and then every actor is an editor
-/// itself and the walk never runs. What stays quadratic is a cluster with a
-/// great many members of the ledger owner *and* a great many other login
-/// roles, which only a SQL copy of `pg_has_role`'s walk would avoid (#1534).
+/// Under a `PUBLIC` grant, exactly the grant this check exists to report,
+/// every actor is an editor itself and the walk never runs. What stays
+/// quadratic is a large editor set whose members are mostly *not* the actors
+/// asked about: thousands of members of the ledger owner, or thousands of
+/// explicit (say `NOLOGIN`) grantees, beside thousands of other login roles.
+/// Only one closure of `SET`-able memberships, a SQL copy of `pg_has_role`'s
+/// walk, would avoid it (#1534).
 const TRIGGER_EDITOR: &str = "(l.oid, e.oid) IN (SELECT te.ledger, te.role FROM trigger_editor te)
                  OR EXISTS (
                 SELECT 1 FROM trigger_editors tes, pg_catalog.unnest(tes.roles) AS g(role)
