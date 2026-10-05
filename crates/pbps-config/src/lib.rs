@@ -53,15 +53,17 @@ pub enum ConfigError {
     )]
     AmbiguousFingerprintKey { name: String },
 
-    /// The declarations directory is the project root itself (#739). Every
-    /// `.yml` beneath it is read as a declaration, `pbps.yml` included, so
-    /// this layout never loaded; it is refused here, by name, instead of
-    /// surfacing as "the YAML in `pbps.yml`" is not a declaration.
+    /// The declarations directory holds the project itself: it is the project
+    /// root or a directory above it (#739). Every `.yml` beneath it is read as
+    /// a declaration, `pbps.yml` included, so such a layout never loaded; it
+    /// is refused here, by name, instead of surfacing as "the YAML in
+    /// `pbps.yml`" is not a declaration.
     #[error(
-        "`schema_dir` in `{path}` names the project root; declarations live in a \
-         subdirectory of the project, such as `schema/` (the default)"
+        "`schema_dir` in `{path}` is the project root or a directory above it, so it would \
+         read `pbps.yml` as a declaration; declarations live in a subdirectory of the \
+         project, such as `schema/` (the default)"
     )]
-    SchemaDirIsProjectRoot { path: PathBuf },
+    SchemaDirHoldsTheProject { path: PathBuf },
 }
 
 /// The target database dialect.
@@ -362,8 +364,8 @@ impl Config {
         }) {
             return Err(ConfigError::AmbiguousFingerprintKey { name: name.clone() });
         }
-        if config.schema_dir.is_relative() && only_the_current_directory(&config.schema_dir) {
-            return Err(ConfigError::SchemaDirIsProjectRoot {
+        if config.schema_dir.is_relative() && only_dot_segments(&config.schema_dir) {
+            return Err(ConfigError::SchemaDirHoldsTheProject {
                 path: path.to_owned(),
             });
         }
@@ -371,17 +373,19 @@ impl Config {
     }
 }
 
-/// Whether a relative path names its base by spelling alone: empty, `.`,
-/// `./` and the like, with no directory name in it.
+/// Whether a relative path is made only of `.` and `..`: the base itself or
+/// a directory above it, whatever symlinks lie on the way, since `..` from a
+/// real directory is always its physical parent.
 ///
 /// Not `a/..`: a name and a `..` cancel only lexically, and when `a` is a
 /// symlink the pair leads somewhere else entirely (review on #1548). Such a
 /// path is judged where it can be, against the filesystem in
 /// [`Project::load`], and lexically only where git's own tree is all there
 /// is (`baseline`, which reads configs from history).
-fn only_the_current_directory(path: &Path) -> bool {
+fn only_dot_segments(path: &Path) -> bool {
     use std::path::Component;
-    path.components().all(|c| matches!(c, Component::CurDir))
+    path.components()
+        .all(|c| matches!(c, Component::CurDir | Component::ParentDir))
 }
 
 /// A located project: its root directory plus its configuration.
@@ -430,10 +434,11 @@ impl Project {
                 p
             })
         };
+        // The root itself, or any directory above it: either holds `pbps.yml`.
         if let (Ok(dir), Ok(base)) = (real(&root.join(&config.schema_dir)), real(&root))
-            && dir == base
+            && base.starts_with(&dir)
         {
-            return Err(ConfigError::SchemaDirIsProjectRoot {
+            return Err(ConfigError::SchemaDirHoldsTheProject {
                 path: config_path.to_owned(),
             });
         }
@@ -592,12 +597,12 @@ mod tests {
     /// spelling of the root is refused by name, while a subdirectory, a
     /// sibling and a path that only passes through `..` are not.
     #[test]
-    fn a_schema_dir_naming_the_project_root_is_refused() {
-        for root in [".", "./", "", "./."] {
+    fn a_schema_dir_holding_the_project_is_refused() {
+        for root in [".", "./", "", "./.", "..", "../..", "./../."] {
             let text = format!("dialect: mssql\nschema_dir: \"{root}\"\n");
             let err = Config::parse(&text, Path::new("pbps.yml")).unwrap_err();
             assert!(
-                matches!(err, ConfigError::SchemaDirIsProjectRoot { .. }),
+                matches!(err, ConfigError::SchemaDirHoldsTheProject { .. }),
                 "{root:?}: {err}"
             );
             assert!(err.to_string().contains("schema/"), "{err}");
@@ -618,8 +623,8 @@ mod tests {
                 "{fine:?}"
             );
         }
-        // An absolute path is judged where the file is: the root itself is
-        // refused, a directory inside it is not.
+        // An absolute path is judged where the file is: the root itself and
+        // a directory above it are refused, a directory inside it is not.
         let tmp = std::env::temp_dir().join(format!("pbps-cfg739-{}", std::process::id()));
         std::fs::create_dir_all(tmp.join("schema")).unwrap();
         let config = tmp.join("pbps.yml");
@@ -630,7 +635,20 @@ mod tests {
         .unwrap();
         let err = Project::load(&config).unwrap_err();
         assert!(
-            matches!(err, ConfigError::SchemaDirIsProjectRoot { .. }),
+            matches!(err, ConfigError::SchemaDirHoldsTheProject { .. }),
+            "{err}"
+        );
+        std::fs::write(
+            &config,
+            format!(
+                "dialect: mssql\nschema_dir: \"{}\"\n",
+                tmp.parent().unwrap().display()
+            ),
+        )
+        .unwrap();
+        let err = Project::load(&config).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SchemaDirHoldsTheProject { .. }),
             "{err}"
         );
         std::fs::write(
@@ -652,7 +670,7 @@ mod tests {
         .unwrap();
         let err = Project::load(&config).unwrap_err();
         assert!(
-            matches!(err, ConfigError::SchemaDirIsProjectRoot { .. }),
+            matches!(err, ConfigError::SchemaDirHoldsTheProject { .. }),
             "{err}"
         );
         // A real directory and its `..` lead back to the root on disk too.
@@ -660,7 +678,7 @@ mod tests {
         std::fs::write(&config, "dialect: mssql\nschema_dir: \"a/..\"\n").unwrap();
         let err = Project::load(&config).unwrap_err();
         assert!(
-            matches!(err, ConfigError::SchemaDirIsProjectRoot { .. }),
+            matches!(err, ConfigError::SchemaDirHoldsTheProject { .. }),
             "{err}"
         );
         #[cfg(unix)]
@@ -675,7 +693,7 @@ mod tests {
             std::fs::write(&config, "dialect: mssql\nschema_dir: here\n").unwrap();
             let err = Project::load(&config).unwrap_err();
             assert!(
-                matches!(err, ConfigError::SchemaDirIsProjectRoot { .. }),
+                matches!(err, ConfigError::SchemaDirHoldsTheProject { .. }),
                 "{err}"
             );
         }

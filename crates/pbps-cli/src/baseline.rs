@@ -184,13 +184,18 @@ fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String)> {
     let schema = under(&prefix, &config.schema_dir)?;
     // A historical config is read from git's tree, where a path resolves only
     // by its spelling, so this is the lexical half of the rule `pbps-config`
-    // applies (#739). `Config::parse` refuses only names with no directory in
-    // them, since a symlink can make `a/..` lead elsewhere on disk; in a
-    // revision, `a/..` is the project root, and that is refused here.
-    if schema == prefix.trim_end_matches('/') {
+    // applies (#739): the declarations directory may not be the project root
+    // or a directory above it, either of which holds `pbps.yml`. In a
+    // revision `a/..` is the root and `../..` may be the repository root, so
+    // both are refused here; on disk a symlink can lead them elsewhere, which
+    // is why `Config::parse` does not judge them by spelling.
+    let holds =
+        |dir: &str| dir.is_empty() || prefix == dir || prefix.starts_with(&format!("{dir}/"));
+    if holds(&schema) {
         anyhow::bail!(
-            "`schema_dir` in `{config_rel}` at `{rev}` names the project root; declarations \
-             live in a subdirectory of the project, such as `schema/` (the default)"
+            "`schema_dir` in `{config_rel}` at `{rev}` is the project root or a directory \
+             above it, so it would read `pbps.yml` as a declaration; declarations live in a \
+             subdirectory of the project, such as `schema/` (the default)"
         );
     }
     Ok((schema, under(&prefix, &config.ids_file)?))
@@ -257,10 +262,10 @@ fn tree_paths(root: &Path, rev: &str, rel: &str) -> anyhow::Result<Vec<String>> 
     // root. Without it a project in a subdirectory lists nothing, and — since
     // the identity file is still found — the plan comes back as "no changes"
     // against a baseline that holds no tables at all.
-    // `rel` never names the project root: a historical config that spells it
-    // is refused where its paths are composed above, and a current one by
-    // `pbps-config` (#739). The pathspec always names the declarations
-    // directory rather than the whole tree.
+    // `rel` is never empty, never the project root and never above it: a
+    // historical config that spells one is refused where its paths are
+    // composed above, and a current one by `pbps-config` (#739). The pathspec
+    // always names a directory below the project rather than the whole tree.
     let args = [
         "ls-tree",
         "-r",
