@@ -32,7 +32,8 @@ Systemd socket activation (`dockerd -H fd://`) is supported with its protected
 file supplies only a candidate: kernel Unix socket diagnostics must bind the
 actual accepted peer inode to a descriptor held by the root-installed dockerd
 process. The client socket's kernel cookie, the peer descriptor and process
-lease are checked throughout ordinary API traffic and attach streams. Passing
+lease are checked on every API request and before every write to an attach
+stream; a read is the answer to a checked write (DEC-1550.1). Passing
 a protected PID file or plausible Docker replies through a proxy cannot qualify
 its socket. Missing or unreadable socket diagnostics refuse admission.
 
@@ -225,7 +226,10 @@ the selected service, with held identities and bracketed parent reads. Merely
 sharing a namespace or the engine executable name does not establish that
 relation. The authenticated connection identity, actual endpoint pair/socket
 inode, retained service/backend processes and engine-owned identity query are
-checked together. A new connection cannot reuse a lease; exit, exec replacement,
+checked together. Each target check observes the sole holder before the
+identity query; after it, and in a target witness, the retained owner must
+still hold the same socket inode, read through the descriptor that held it
+(DEC-1550.1). A new connection cannot reuse a lease; exit, exec replacement,
 changed endpoints, canceled checks and dropped target witnesses invalidate it.
 
 An empty observation receives one fresh pass for a backend that became visible
@@ -326,7 +330,7 @@ scope is belongs to each engine, behind `resolver::scope`. PostgreSQL first:
 | Compatibility | Under `pg-analysis-scope-v1`: equal patch-level version; encoding and locale, including the provider's *actual* collation version; every target extension installable on the resolver, with the native libraries its C functions name; the effective settings the dialect does not pin; and the deployer's effective schema visibility. Each fact is match, mismatch or unknown, and an unknown fact refuses like a provisioning failure rather than reading as a match |
 | Executables | The engine image and each loaded or required native library by content, not version: the running image through `/proc/<pid>/exe`, a loaded library through `/proc/<pid>/map_files`, an unloaded required library as a disk candidate; a library replaced under the running process is caught by inode identity, so a same-version build with different content or a parser-hook library is a mismatch |
 | Deployer | The planning connection's `current_user`, reproduced on scratch with run-local `pbps_role_<n>_<token>` roles created NOLOGIN with the measured attributes and memberships, reachable only under `SET ROLE`; the reproduction is verified by re-reading it as the mapped deployer, and compiling as the setup administrator instead is refused |
-| Stability | The target's facts and its deployer's authorization are read in one catalog snapshot, so the sealed scope never holds half of a change committed between them. The scope is sealed to the target and scratch connections, so a reopened session cannot inherit it, and requalified on every check, so an extension, setting, collation or authorization change between checks invalidates the run |
+| Stability | The target's facts and its deployer's authorization are read in one catalog snapshot, so the sealed scope never holds half of a change committed between them. The scope is sealed to the target and scratch connections, so a reopened session cannot inherit it, and requalified on every explicit check and once in each resolution, after its last read and before its outcome is sealed (DEC-1550.1), so an extension, setting, collation or authorization change since `qualify` that is still in place invalidates the run |
 
 The scope carries a deployment-authorization fingerprint later steps seal
 (#614) and apply rechecks against its own session (#616). What it does not
@@ -359,7 +363,7 @@ Qualification is not a binding adapter: SQL Server binding stays unimplemented
 | Compatibility | Under `mssql-analysis-scope-v1`: equal product version, level and update; the same operating system; server and database collation, compatibility level, containment and the database-level ANSI options, which the scratch database is created to match; the session's effective statement settings — language, date format, first day of the week and the SET options a statement persists or an indexed expression requires — which are the login's and the driver's, not the server's defaults; `QUOTED_IDENTIFIER` and `ANSI_NULLS` on, the only module settings this tool manages; user CLR assemblies by content, in both directions. A hosted or unknown product family (`EngineEdition` outside 2–4) is refused by name and never mapped to a boxed build; an edition difference inside the boxed family verifies with a named limitation, because binding is the same and capability stays the target's to check |
 | Executables | As for PostgreSQL, plus the engine's own packages: SQL Server for Linux maps its binaries out of `.sfp` files, so the ELF at `/proc/<pid>/exe` is only the loader and the mapped packages are the engine, hashed like any loaded library |
 | Deployer | The planning connection's database user, read as itself: `fn_my_permissions` on the database and each in-scope schema, `IS_ROLEMEMBER`, its default schema and language, the users it may impersonate, and the grant rows it can see. Reproduced with run-local users `WITHOUT LOGIN` and roles named `pbps_principal_<n>_<token>`, database-scoped, reachable only under `EXECUTE AS USER`; `dbo`, `public` and the fixed `db_` roles keep their identity; grants and DENYs are replayed under their own grantors. A `dbo` deployer — which a member of `sysadmin` is everywhere — is the run login itself, which owns its scratch database. The reproduction is verified against the target as read, and only then are the plan's grants run, as the reproduced deployer, so one it could not make is the engine's refusal |
-| Stability | Catalog views are not a snapshot under any isolation level, so the target's facts and authorization are read twice and must agree. The rest is PostgreSQL's: sealed to both connections, requalified on every check against what was sealed |
+| Stability | Catalog views are not a snapshot under any isolation level, so the target's facts and authorization are read twice and must agree. The rest is PostgreSQL's: sealed to both connections, requalified against what was sealed on every explicit check and once in each resolution (DEC-1550.1) |
 
 The scratch database is created the way the target's is: collation, containment,
 compatibility level and the database-level ANSI options. A **partially

@@ -1027,6 +1027,8 @@ impl DedicatedServer {
             scope: None,
             compiled: false,
             operation_in_flight: false,
+            #[cfg(test)]
+            requalified: 0,
         })
     }
 
@@ -1390,6 +1392,9 @@ pub struct ScratchRun {
     compiled: bool,
     /// A cancelled qualification or resolution leaves the analysis terminal.
     operation_in_flight: bool,
+    /// How many times the scope was re-qualified, so a test can pin it.
+    #[cfg(test)]
+    requalified: usize,
 }
 
 /// What a run is asked to qualify: the schemas its plan writes to, the extras
@@ -1492,6 +1497,8 @@ impl ScratchRun {
             scope: None,
             compiled: false,
             operation_in_flight: false,
+            #[cfg(test)]
+            requalified: 0,
         }
     }
 
@@ -1788,6 +1795,10 @@ impl ScratchRun {
     /// refused. The sealed scratch connection must still be the one in hand, so
     /// a reopened session cannot present the old scope as its own (case 14).
     async fn requalify(&mut self, target: &mut NativeTarget) -> Result<(), Error> {
+        #[cfg(test)]
+        {
+            self.requalified += 1;
+        }
         let Some(sealed) = self.scope.as_ref() else {
             return Ok(());
         };
@@ -1902,6 +1913,31 @@ impl ScratchRun {
             ));
         }
         Ok(())
+    }
+
+    /// Switches the scratch session to the deployer `qualify` sealed, as
+    /// [`Self::requalify`] did before compilation when it ran at every step.
+    /// `qualify` already entered it; this keeps the compilation's role from
+    /// depending on nothing else having used the session since.
+    async fn enter_deployer(&mut self) -> Result<(), Error> {
+        let driver = self.inner.driver();
+        let sealed = self.scope.as_ref().ok_or(Error::Cancelled)?;
+        let deployer = sealed
+            .map
+            .deployer(&sealed.authorization_context)
+            .map_err(|reason| Error::Scope(reason.into()))?;
+        let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
+        // In flight like a compilation: dropped mid-statement, the session's
+        // role is unknown, and the next check must end the run.
+        self.in_flight = true;
+        let entered = scope::enter(scratch.connection_mut(), driver, deployer.as_deref()).await;
+        self.in_flight = false;
+        entered.map_err(|error| Error::Scope(error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn requalified(&self) -> usize {
+        self.requalified
     }
 
     /// Opens an administrative session on the run's own scratch database.
@@ -2046,8 +2082,11 @@ impl ScratchRun {
         // The guards and request preparation above have no scratch effect.
         // From the first runtime check onward, failures end this run.
         *entered_runtime = true;
-        // Requalifies the scope and enters the reproduced deployer.
-        self.check_inner(target).await?;
+        // The scope `qualify` sealed is re-qualified once, after the last read
+        // and before the outcome is sealed; each step before that checks the
+        // runtime, channels, exclusivity and target binding (DEC-1550.1).
+        self.check_held(target).await?;
+        self.enter_deployer().await?;
         self.compiled = true;
         let outcome = self
             .resolve_checked(target, request, &extras, &mut reconstruction, key, planning)
@@ -2084,7 +2123,7 @@ impl ScratchRun {
         let compiled = engine::compile(reconstruction, extras, scratch.connection_mut()).await;
         self.in_flight = false;
         compiled.map_err(Error::Binding)?;
-        self.check_inner(target).await?;
+        self.check_held(target).await?;
         // Scratch is read through an administrative session: the capture
         // reads settings a least-privilege deployer need not see, and which
         // role reads a catalog row does not change what was bound.
@@ -2144,7 +2183,7 @@ impl ScratchRun {
         self.retire_admin();
         let (compiled_qualified, compiled, scope, compiled_manifest) =
             captured.map_err(Error::Binding)?;
-        self.check_inner(target).await?;
+        self.check_held(target).await?;
         let signatures = dropped.iter().filter_map(|(_, s)| s.clone()).collect();
         let (current, opening_manifest, opening_build) = match (key, planning) {
             (Some(key), Some((recorded, _))) => {
@@ -2272,6 +2311,21 @@ impl ScratchRun {
     }
 
     async fn check_inner(&mut self, target: &mut NativeTarget) -> Result<(), Error> {
+        self.check_with(target, true).await
+    }
+
+    /// [`Self::check_inner`] without re-qualifying the scope: for a step of
+    /// `resolve` that publishes nothing, followed by the full check before
+    /// the outcome is sealed (DEC-1550.1).
+    async fn check_held(&mut self, target: &mut NativeTarget) -> Result<(), Error> {
+        self.check_with(target, false).await
+    }
+
+    async fn check_with(
+        &mut self,
+        target: &mut NativeTarget,
+        requalify: bool,
+    ) -> Result<(), Error> {
         if self.in_flight {
             self.in_flight = false;
             if let Some(scratch) = self.scratch.take() {
@@ -2301,7 +2355,7 @@ impl ScratchRun {
         // `COMMIT` leaves that transaction open on the planning connection,
         // and the next check must find the flag and end the run rather than
         // read inside the stale snapshot (finding on #688).
-        if let Err(cause) = self.requalify(target).await {
+        if requalify && let Err(cause) = self.requalify(target).await {
             self.in_flight = false;
             self.inner.refuse(cause.clone());
             if let Some(scratch) = self.scratch.take() {

@@ -115,17 +115,21 @@ async fn session(endpoint: &ScratchEndpoint, database: &str) -> Admin {
 /// which is the point of this step. A session the fixture has just dropped
 /// takes a moment to leave the engine's own view and the kernel's tables, so
 /// the fixture waits for the server to be exclusive instead of the product
-/// tolerating it.
+/// tolerating it. The same holds for a forwarder: a test that ends by
+/// dropping its run requests the forwarder's removal without waiting for it,
+/// and until it is gone it shares the engine's network namespace from
+/// outside its PID namespace, which the census refuses (`Accounting`).
 async fn admit_when_exclusive(variable: &str, target: &mut NativeTarget) -> DedicatedServer {
     let mut refusals = Vec::new();
     for _ in 0..60 {
         match DedicatedServer::admit(endpoint(variable), target).await {
             Ok(server) => return server,
             Err(ServerFailure {
-                cause: Error::Exclusivity(signal),
+                cause:
+                    cause @ (Error::Exclusivity(_) | Error::Containment(super::Premise::Accounting)),
                 recovery_names,
             }) if recovery_names.is_empty() => {
-                refusals.push(signal);
+                refusals.push(cause);
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             Err(other) => panic!("the supported profile must admit this server: {other}"),
@@ -137,8 +141,9 @@ async fn admit_when_exclusive(variable: &str, target: &mut NativeTarget) -> Dedi
 /// Admission and the scratch open that follows each read the engine's PID
 /// namespace, and a task the previous step ended can still be leaving it
 /// at either reading: admission passed, then the open refused (#1044).
-/// Waited out here like exclusivity, not tolerated by the product. One
-/// bound covers both refusals at both steps, so a task or session that
+/// Waited out here like exclusivity, not tolerated by the product, as is the
+/// previous test's dropped forwarder ([`admit_when_exclusive`]). One bound
+/// covers every refusal at both steps, so a task, session or forwarder that
 /// stays is still a failure.
 async fn open_when_exclusive(target: &mut NativeTarget) -> ScratchRun {
     let mut refusals = Vec::new();
@@ -156,7 +161,8 @@ async fn open_when_exclusive(target: &mut NativeTarget) -> ScratchRun {
         match refused {
             ServerFailure {
                 cause:
-                    cause @ (Error::Exclusivity(_) | Error::Containment(super::Premise::Occupants)),
+                    cause @ (Error::Exclusivity(_)
+                    | Error::Containment(super::Premise::Occupants | super::Premise::Accounting)),
                 recovery_names,
             } if recovery_names.is_empty() => refusals.push(cause),
             other => panic!(

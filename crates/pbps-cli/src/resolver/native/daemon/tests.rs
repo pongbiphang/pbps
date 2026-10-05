@@ -1,6 +1,7 @@
 use super::*;
 use std::os::fd::OwnedFd;
 use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
 use tokio::io::AsyncReadExt as _;
 
 #[test]
@@ -193,12 +194,10 @@ fn kernel_diagnostics_reject_truncation_wrong_identity_and_duplicate_peers() {
 fn the_remembered_descriptor_answers_only_while_it_still_holds_the_socket() {
     use std::os::fd::AsRawFd as _;
     let (held, other) = std::os::unix::net::UnixStream::pair().unwrap();
-    let inode_of = |stream: &std::os::unix::net::UnixStream| -> u32 {
+    let inode_of = |stream: &std::os::unix::net::UnixStream| -> u64 {
         std::fs::metadata(format!("/proc/self/fd/{}", stream.as_raw_fd()))
             .unwrap()
             .ino()
-            .try_into()
-            .unwrap()
     };
     let inode = inode_of(&held);
     let elsewhere = inode_of(&other);
@@ -218,13 +217,13 @@ fn the_remembered_descriptor_answers_only_while_it_still_holds_the_socket() {
     let remembered = AtomicI32::new(-1);
 
     // Nothing remembered: the whole table is read and the descriptor noted.
-    assert!(owns_with(&lease, inode, &remembered, counted).unwrap());
+    assert!(super::super::owns_with(&lease, inode, &remembered, counted).unwrap());
     assert_eq!(remembered.load(Ordering::Relaxed), 0);
     assert!(reads.get() > 1);
 
     // Remembered and still holding it: one read answers.
     reads.set(0);
-    assert!(owns_with(&lease, inode, &remembered, counted).unwrap());
+    assert!(super::super::owns_with(&lease, inode, &remembered, counted).unwrap());
     assert_eq!(reads.get(), 1);
 
     // A remembered number that now names something else, or nothing, is not
@@ -232,14 +231,14 @@ fn the_remembered_descriptor_answers_only_while_it_still_holds_the_socket() {
     for stale in [1, 999] {
         remembered.store(stale, Ordering::Relaxed);
         reads.set(0);
-        assert!(owns_with(&lease, inode, &remembered, counted).unwrap());
+        assert!(super::super::owns_with(&lease, inode, &remembered, counted).unwrap());
         assert!(reads.get() > 1, "{stale}");
         assert_eq!(remembered.load(Ordering::Relaxed), 0);
     }
 
     // The negative: the remembered descriptor holds a socket, but not this
     // one, so the answer comes from the table, which does not hold it.
-    assert!(!owns_with(&lease, elsewhere, &remembered, counted).unwrap());
+    assert!(!super::super::owns_with(&lease, elsewhere, &remembered, counted).unwrap());
     child.kill().unwrap();
     child.wait().unwrap();
 }

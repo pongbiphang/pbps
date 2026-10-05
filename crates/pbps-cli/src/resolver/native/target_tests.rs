@@ -82,6 +82,23 @@ async fn native_aliases_share_one_instance_and_backend_children_cannot_claim_ano
     );
     let witness = first.witness().unwrap();
     witness.check().unwrap();
+    // One sole-holder observation per target check, before the identity
+    // query; after it, and in a witness, the retained owner answers
+    // (DEC-1550.1).
+    let scans = super::super::sole_holder_scans();
+    first.check().await.unwrap();
+    assert_eq!(
+        super::super::sole_holder_scans() - scans,
+        1,
+        "one full observation per target check"
+    );
+    let scans = super::super::sole_holder_scans();
+    witness.check().unwrap();
+    assert_eq!(
+        super::super::sole_holder_scans() - scans,
+        0,
+        "a witness confirms the retained owner"
+    );
     assert!(first.identity().is_ok(), "unchanged live native target");
     let second = PeerVerifiedConn::connect(driver, &alias).await.unwrap();
     assert!(

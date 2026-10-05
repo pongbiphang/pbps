@@ -1392,3 +1392,47 @@ The remembered number is never an answer by itself.
 
 The process checks around the read, and the sock_diag peer check, are
 unchanged.
+
+<a id="dec-1550-1"></a>
+
+**DEC-1550.1. A native run checks its premises per request and per step, not on every read: the attach stream before each write, the target's sole holder once per check, the scope once per resolution.**
+
+#1540 measured a producer run at about 25 s, about 17 s of which went to
+re-verifying the same premises. DEC-1540.1 made each check cheaper without
+changing what it establishes. This entry lowers how often three of them run.
+Each change gives up a short window, between two full checks, in which a
+change that appears and disappears again is not seen.
+
+- **The attach stream's daemon end is checked before each write, not on each
+  read.** A read is the answer to a write that was checked. The bulk of a
+  capture arrives in thousands of reads; a run makes about 175 API requests,
+  so nearly all of its 17,000 daemon checks were stream polls. Giving up the read window requires dockerd
+  itself to pass its end of the stream to another process mid-response, and
+  dockerd is inside the provisioning trust boundary (RESOLVER-RUNTIME).
+  Opening the stream and every API request are checked as before.
+- **A target check observes the socket's sole holder once, before the
+  identity query.** After the query, it confirms only that the socket is
+  still the same inode and the retained owner still holds it, reading the
+  descriptor that held it as DEC-1540.1 does for the daemon. Only that yes
+  answers; anything else is the full observation, as before, which also finds
+  a socket held in a worker's own descriptor table. A target witness checks
+  the same way. The window given up is a
+  second holder that appears for the length of one identity query and is gone
+  at the next check's opening scan. Producing that needs root on the host, and
+  the holder scan was never exhaustive (DECISIONS 533). In the CI fixture the
+  service's PID namespace is the host's, so each scan walked every task on
+  the host; a run made 60 of them.
+- **A resolution re-qualifies the scope once, after its last read and before
+  its outcome is sealed.** The steps before that, after compilation and after
+  the desired capture, check the runtime, the channels, exclusivity and the
+  target binding, as every check does. They publish nothing, and a scope
+  change that is still in place when the last check runs refuses the run as
+  before. Before compilation the scratch session re-enters the deployer
+  `qualify` sealed, so the compilation's role does not depend on the skipped
+  requalification. An explicit check still re-qualifies every time.
+
+What stays caught is every change that is still in place at the next full
+check: a restarted process fails its lease, a restarted engine its identity
+query, a replaced connection its cookie or TLS session. Under #1528 the
+measured profiles are the advanced tier, so this cost falls only on users who
+choose them.

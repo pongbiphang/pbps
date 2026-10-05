@@ -120,11 +120,15 @@ pub(crate) struct TargetWitness {
 }
 
 impl TargetWitness {
+    /// The retained owner still holding the bound socket. The sole holder is
+    /// observed by the target's own checks; a witness, checked at each step
+    /// of a scratch run, confirms the owner the last of them found
+    /// (DEC-1550.1).
     pub(crate) fn check(&self) -> Result<(), UnqualifiedProcess> {
         self.lease
             .upgrade()
             .ok_or(UnqualifiedProcess)?
-            .check_socket()
+            .check_socket_held()
     }
 
     pub(crate) fn connection_id(&self) -> pbps_db::transport::ConnectionId {
@@ -323,9 +327,11 @@ impl NativeTarget {
             return Err(stage("identity-changed")(UnqualifiedProcess));
         }
         correlate(&bound.lease, &current).map_err(stage("correlate"))?;
+        // The opening observation found the sole holder; closing the bracket,
+        // the retained owner still holding the same socket answers (DEC-1550.1).
         bound
             .lease
-            .check(&bound.connection)
+            .check_held(&bound.connection)
             .map_err(stage("lease-after"))?;
         self.current = Some(bound);
         Ok(())

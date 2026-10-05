@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 mod daemon;
 pub(crate) mod executables;
@@ -569,6 +570,8 @@ pub struct SocketOwnerLease {
     service: ProcessLease,
     owner: ProcessLease,
     socket_inode: u64,
+    /// The owner's descriptor that last held the socket, read first next time.
+    held: AtomicI32,
 }
 
 impl SocketOwnerLease {
@@ -586,6 +589,7 @@ impl SocketOwnerLease {
             service,
             owner,
             socket_inode,
+            held: AtomicI32::new(-1),
         };
         lease.check(connection)?;
         Ok(lease)
@@ -599,13 +603,44 @@ impl SocketOwnerLease {
     }
 
     pub fn check(&self, connection: &PeerVerifiedConn) -> Result<(), UnqualifiedProcess> {
+        self.same_connection(connection)?;
+        self.check_socket()
+    }
+
+    /// [`Self::check`] once the same check has observed the sole holder: the
+    /// socket is still the same inode and the retained owner still holds it,
+    /// read through the descriptor that held it. Only that yes answers;
+    /// anything else is the full observation, as before (DEC-1550.1). A
+    /// worker with its own descriptor table holds the socket outside the
+    /// owner's, which the full observation still finds.
+    pub fn check_held(&self, connection: &PeerVerifiedConn) -> Result<(), UnqualifiedProcess> {
+        self.same_connection(connection)?;
+        self.check_socket_held()
+    }
+
+    fn same_connection(&self, connection: &PeerVerifiedConn) -> Result<(), UnqualifiedProcess> {
         if connection.id() != self.connection
             || connection.tcp_endpoints().local() != self.local
             || connection.tcp_endpoints().peer() != self.peer
         {
             return Err(Reading::Connection.refuse());
         }
-        self.check_socket()
+        Ok(())
+    }
+
+    fn check_socket_held(&self) -> Result<(), UnqualifiedProcess> {
+        self.service.check()?;
+        self.owner.check()?;
+        if peer_inode(self.local, self.peer)? != self.socket_inode {
+            return self.check_socket();
+        }
+        held_or_observed(
+            &self.owner,
+            self.socket_inode,
+            &self.held,
+            |path| std::fs::read_link(path),
+            || self.check_socket(),
+        )
     }
 
     fn check_socket(&self) -> Result<(), UnqualifiedProcess> {
@@ -620,6 +655,79 @@ impl SocketOwnerLease {
         }
         Ok(())
     }
+}
+
+/// The witness half of [`SocketOwnerLease::check_held`]. Only a yes from the
+/// owner's table answers. A table that cannot be read, or that outruns the
+/// daemon's scan budget, is no answer either way, so it is the full
+/// observation's to judge, which has no such budget. Refusing here would
+/// refuse a target binding the full observation accepts.
+fn held_or_observed(
+    owner: &ProcessLease,
+    inode: u64,
+    held: &AtomicI32,
+    read_link: impl FnMut(&Path) -> std::io::Result<PathBuf>,
+    observe: impl FnOnce() -> Result<(), UnqualifiedProcess>,
+) -> Result<(), UnqualifiedProcess> {
+    if matches!(owns_with(owner, inode, held, read_link), Ok(true)) {
+        return owner.check();
+    }
+    observe()
+}
+
+fn owns_socket(
+    process: &ProcessLease,
+    inode: u64,
+    held: &AtomicI32,
+) -> Result<bool, UnqualifiedProcess> {
+    owns_with(process, inode, held, |path| std::fs::read_link(path))
+}
+
+/// Whether the process holds the socket. The daemon check asks this on every
+/// API request and stream write, and a target check after its identity query
+/// (DEC-1550.1); a daemon's descriptor table runs to hundreds of entries
+/// (#1540). So the descriptor that held the socket last time is read first:
+/// naming the socket still, it is a witness of the same answer. Any other
+/// reading of it, closed or reused, falls back to the whole table, which also
+/// finds a socket the process moved to another descriptor. The answer is
+/// never taken from the remembered number alone (DEC-1540.1).
+fn owns_with(
+    process: &ProcessLease,
+    inode: u64,
+    held: &AtomicI32,
+    mut read_link: impl FnMut(&Path) -> std::io::Result<PathBuf>,
+) -> Result<bool, UnqualifiedProcess> {
+    let expected = PathBuf::from(format!("socket:[{inode}]"));
+    let table = proc_base(&process.directory).join("fd");
+    let last = held.load(Ordering::Relaxed);
+    if last >= 0 {
+        match read_link(&table.join(last.to_string())) {
+            Ok(path) if path == expected => return Ok(true),
+            Ok(_) => (),
+            Err(error) if process_gone(&error) => (),
+            Err(_) => return Err(UnqualifiedProcess),
+        }
+    }
+    let entries = std::fs::read_dir(&table).map_err(|_| UnqualifiedProcess)?;
+    let mut owned = false;
+    for (count, entry) in entries.enumerate() {
+        if count >= 65536 {
+            return Err(UnqualifiedProcess);
+        }
+        let entry = entry.map_err(|_| UnqualifiedProcess)?;
+        match read_link(&entry.path()) {
+            Ok(path) if path == expected => {
+                owned = true;
+                if let Some(number) = entry.file_name().to_str().and_then(|n| n.parse().ok()) {
+                    held.store(number, Ordering::Relaxed);
+                }
+            }
+            Ok(_) => (),
+            Err(error) if process_gone(&error) => (),
+            Err(_) => return Err(UnqualifiedProcess),
+        }
+    }
+    Ok(owned)
 }
 
 fn proc_base(directory: &File) -> PathBuf {
@@ -1392,11 +1500,25 @@ pub(crate) fn groups(process: &ProcessLease) -> Result<(Vec<u32>, Vec<u32>), Unq
     Ok((gids, supplementary))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Full sole-holder observations on this thread, so a test can pin how
+    /// often a target check makes one (DEC-1550.1).
+    static SOLE_HOLDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn sole_holder_scans() -> usize {
+    SOLE_HOLDER_SCANS.with(std::cell::Cell::get)
+}
+
 fn socket_owner(
     service: &ProcessLease,
     local: SocketAddr,
     peer: SocketAddr,
 ) -> Result<(ProcessLease, u64), UnqualifiedProcess> {
+    #[cfg(test)]
+    SOLE_HOLDER_SCANS.with(|scans| scans.set(scans.get() + 1));
     service.check()?;
     let self_net = File::open("/proc/self/ns/net").map_err(Reading::NetNamespace.named())?;
     let own_net = service
@@ -2207,6 +2329,85 @@ mod tests {
             invalidated,
             "a stable numeric PID cannot preserve an exec-replaced peer's lease"
         );
+    }
+
+    /// The negative for the held-descriptor witness a target check closes
+    /// with (DEC-1550.1): once the owner closes the descriptor that held the
+    /// socket, the remembered number no longer answers, and neither does the
+    /// owner's table. The child holds the socket on descriptor 3 until it
+    /// reads a line from it, then closes it and lives on.
+    #[test]
+    fn an_owner_that_closed_its_descriptor_no_longer_holds_the_socket() {
+        use std::io::Write as _;
+        use std::os::fd::OwnedFd;
+        let (held, mut other) = std::os::unix::net::UnixStream::pair().unwrap();
+        let inode = std::fs::metadata(format!("/proc/self/fd/{}", held.as_raw_fd()))
+            .unwrap()
+            .ino();
+        let mut command = Command::new("/bin/bash");
+        command
+            .args([
+                "-c",
+                "exec 3<&0 </dev/null; read -r _ <&3; exec 3<&-; sleep 30; exit 0",
+            ])
+            .stdin(Stdio::from(OwnedFd::from(held)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawned_and_execed(&mut command, "bash");
+        let lease = ProcessLease::capture(child.id()).unwrap();
+        let remembered = AtomicI32::new(-1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while remembered.load(Ordering::Relaxed) != 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child moves the socket to 3"
+            );
+            owns_socket(&lease, inode, &remembered).unwrap();
+        }
+        assert!(owns_socket(&lease, inode, &remembered).unwrap());
+        other.write_all(b"close\n").unwrap();
+        let mut closed = false;
+        while !closed && std::time::Instant::now() < deadline {
+            closed = !owns_socket(&lease, inode, &remembered).unwrap();
+        }
+        assert!(closed, "a closed descriptor is not a holder");
+        lease.check().expect("the owner itself lives on");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// A target check's witness answers only yes (DEC-1550.1). An owner's
+    /// table it cannot read, or one past the daemon's scan budget, is handed
+    /// to the full observation instead of refusing the binding, and the full
+    /// observation's own answer stands either way.
+    #[test]
+    fn a_witness_that_cannot_read_the_owner_defers_to_the_full_observation() {
+        let mut command = Command::new("/bin/bash");
+        command
+            .args(["-c", "read -r _; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawned_and_execed(&mut command, "bash");
+        let lease = ProcessLease::capture(child.id()).unwrap();
+        let unreadable = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let held = AtomicI32::new(-1);
+        let mut observed = 0;
+        let accepted = held_or_observed(&lease, 1, &held, unreadable, || {
+            observed += 1;
+            Ok(())
+        });
+        let refused = held_or_observed(&lease, 1, &held, unreadable, || {
+            Err(Reading::SocketOwner.refuse())
+        });
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            accepted.is_ok(),
+            "an unreadable witness is no answer, not a refusal: {accepted:?}"
+        );
+        assert_eq!(observed, 1, "the full observation judged it");
+        assert!(refused.is_err(), "the full observation's refusal stands");
     }
 }
 

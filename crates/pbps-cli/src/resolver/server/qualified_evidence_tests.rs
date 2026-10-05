@@ -550,8 +550,12 @@ async fn produced(
                 }
                 return plan;
             }
+            // A supplied server's previous test can leave a dropped run's
+            // forwarder still leaving its network namespace; waited out like
+            // a leaving task (live_tests::admit_when_exclusive).
             Err(ProduceError::Run(
-                cause @ (Error::Exclusivity(_) | Error::Containment(Premise::Occupants)),
+                cause @ (Error::Exclusivity(_)
+                | Error::Containment(Premise::Occupants | Premise::Accounting)),
             )) if matches!(profile, Profile::Supplied) => refusals.push(cause),
             Err(refused) => {
                 let recovery = if let ProduceError::Cleanup(names) = &refused {
