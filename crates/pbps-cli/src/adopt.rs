@@ -115,6 +115,33 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
     }
 }
 
+/// Leaves out a cluster role this database grants nothing to, on a dialect
+/// that does not manage roles (#690).
+///
+/// A PostgreSQL role is a cluster object: pbps manages what it is granted in
+/// *this* database, never whether it exists (ADR-0010 §3, DECISIONS 211).
+/// Introspection reads every role in the cluster, so an adoption kept them
+/// all, each as a grantless declaration with a uid of its own. Measured on
+/// the live 18.6 server, an empty database pulled thousands of them. Each one
+/// then became a declared role the next `plan --db` requires to exist, so an
+/// unrelated `DROP ROLE` elsewhere in the cluster refused a project that never
+/// chose to manage it.
+///
+/// The line is `bootstrap`'s: `dialect.manages_roles() ||
+/// !role.grants.is_empty()`. A role left out stays unmanaged, where a later
+/// declaration can still take it over deliberately (DECISIONS 377, 421). Run
+/// after [`leave_out_what_validate_refuses`], so a role whose every grant was
+/// left out as unexpressible goes too.
+pub(crate) fn leave_out_cluster_roles_without_grants(pulled: &mut Pulled, dialect: &dyn Dialect) {
+    if dialect.manages_roles() {
+        return;
+    }
+    pulled
+        .schema
+        .roles
+        .retain(|_, role| !role.grants.is_empty());
+}
+
 /// Whether a trigger on `on` has somewhere to be: the rule
 /// `module::check_names` applies, a table or a view.
 fn a_trigger_target(schema: &Schema, on: &pbps_model::ObjectName) -> bool {

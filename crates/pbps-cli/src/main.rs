@@ -1162,6 +1162,7 @@ fn cmd_pull(
         let read_before: std::collections::BTreeSet<TableName> =
             pulled.schema.tables.keys().cloned().collect();
         adopt::leave_out_what_validate_refuses(&mut pulled, dialect.as_ref());
+        adopt::leave_out_cluster_roles_without_grants(&mut pulled, dialect.as_ref());
         // `--data`: the table's rows become a `data: exact` block (ADR-0004),
         // in the engine's own spelling — which is the spelling a declaration
         // has to use to compare equal against this database from now on.
