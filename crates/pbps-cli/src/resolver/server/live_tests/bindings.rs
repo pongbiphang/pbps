@@ -120,6 +120,9 @@ async fn a_qualified_run_resolves_desired_bindings_against_the_target() {
     match driver() {
         Driver::Postgres => {
             let assessment = resolved.expect("a verified scope resolves");
+            // Each step checks the runtime and the binding; the scope itself
+            // is re-qualified once, before the outcome is sealed (DEC-1550.1).
+            assert_eq!(run.requalified(), 1, "one requalification per resolve");
             let view = assessment
                 .surfaces
                 .iter()
@@ -152,6 +155,40 @@ async fn a_qualified_run_resolves_desired_bindings_against_the_target() {
         .expect("cleanup removes the run's resources");
     target.check().await.unwrap();
     if driver() == Driver::Postgres {
+        // The negative: a target that moves after `qualify` is still refused
+        // before the outcome is sealed, now by the one requalification after
+        // the last read rather than by the check before compilation.
+        let mut run = open_when_exclusive(&mut target).await;
+        let verdict = run
+            .qualify(
+                &mut target,
+                &ScopeRequest {
+                    schemas: vec![SCHEMA.to_owned()],
+                    write_path_extras: Vec::new(),
+                    planned: Vec::new(),
+                },
+            )
+            .await
+            .expect("qualify runs");
+        assert_eq!(verdict, Verdict::Verified, "{verdict:?}");
+        setup
+            .query("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+            .await
+            .unwrap();
+        let refused = run
+            .resolve(&mut target, &request)
+            .await
+            .expect_err("a target that moved since qualify is refused before sealing");
+        assert!(
+            refused.to_string().contains("changed under the run")
+                && refused.to_string().contains("extensions"),
+            "{refused}"
+        );
+        assert_eq!(run.requalified(), 1, "{refused}");
+        setup.query("DROP EXTENSION pgcrypto").await.unwrap();
+        run.close()
+            .await
+            .expect("cleanup removes the refused run's resources");
         setup
             .query("DROP SCHEMA pbps_bind613 CASCADE")
             .await

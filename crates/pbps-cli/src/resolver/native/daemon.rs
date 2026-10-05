@@ -3,12 +3,12 @@
 //! its acceptor. Linux UNIX_DIAG_PEER supplies the actual connected socket;
 //! a protected PID file is only a candidate, never proof of that ownership.
 
-use super::{ProcessLease, UnqualifiedProcess, proc_base, process_gone};
+use super::{ProcessLease, UnqualifiedProcess, owns_socket};
 use rustix::net::{self, netlink, sockopt};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt as _;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::path::Path;
+use std::sync::atomic::AtomicI32;
 use std::time::Duration;
 use tokio::net::UnixStream;
 
@@ -122,7 +122,7 @@ impl UnixPeer {
                 process.check()?;
                 let peer = unix_peer(inode, cookie)?;
                 let held = AtomicI32::new(-1);
-                if peer != 0 && owns_socket(process, peer, &held)? {
+                if peer != 0 && owns_socket(process, u64::from(peer), &held)? {
                     return Ok(Self {
                         inode,
                         cookie,
@@ -140,67 +140,12 @@ impl UnixPeer {
     fn check(&self, process: &ProcessLease) -> Result<(), UnqualifiedProcess> {
         process.check()?;
         if unix_peer(self.inode, self.cookie)? != self.peer
-            || !owns_socket(process, self.peer, &self.held)?
+            || !owns_socket(process, u64::from(self.peer), &self.held)?
         {
             return Err(UnqualifiedProcess);
         }
         process.check()
     }
-}
-
-fn owns_socket(
-    process: &ProcessLease,
-    inode: u32,
-    held: &AtomicI32,
-) -> Result<bool, UnqualifiedProcess> {
-    owns_with(process, inode, held, |path| std::fs::read_link(path))
-}
-
-/// Whether the daemon holds the socket. Every API request and every poll of
-/// an attach stream asks this, thousands of times in one resolver run, and a
-/// daemon's descriptor table runs to hundreds of entries (#1540). So the
-/// descriptor that held the socket last time is read first: naming the socket
-/// still, it is a witness of the same answer. Any other reading of it, closed
-/// or reused, falls back to the whole table, which also finds a socket the
-/// daemon moved to another descriptor. The answer is never taken from the
-/// remembered number alone (DEC-1540.1).
-fn owns_with(
-    process: &ProcessLease,
-    inode: u32,
-    held: &AtomicI32,
-    mut read_link: impl FnMut(&Path) -> std::io::Result<PathBuf>,
-) -> Result<bool, UnqualifiedProcess> {
-    let expected = PathBuf::from(format!("socket:[{inode}]"));
-    let table = proc_base(&process.directory).join("fd");
-    let last = held.load(Ordering::Relaxed);
-    if last >= 0 {
-        match read_link(&table.join(last.to_string())) {
-            Ok(path) if path == expected => return Ok(true),
-            Ok(_) => (),
-            Err(error) if process_gone(&error) => (),
-            Err(_) => return Err(UnqualifiedProcess),
-        }
-    }
-    let entries = std::fs::read_dir(&table).map_err(|_| UnqualifiedProcess)?;
-    let mut owned = false;
-    for (count, entry) in entries.enumerate() {
-        if count >= 65536 {
-            return Err(UnqualifiedProcess);
-        }
-        let entry = entry.map_err(|_| UnqualifiedProcess)?;
-        match read_link(&entry.path()) {
-            Ok(path) if path == expected => {
-                owned = true;
-                if let Some(number) = entry.file_name().to_str().and_then(|n| n.parse().ok()) {
-                    held.store(number, Ordering::Relaxed);
-                }
-            }
-            Ok(_) => (),
-            Err(error) if process_gone(&error) => (),
-            Err(_) => return Err(UnqualifiedProcess),
-        }
-    }
-    Ok(owned)
 }
 
 fn unix_peer(inode: u32, cookie: u64) -> Result<u32, UnqualifiedProcess> {

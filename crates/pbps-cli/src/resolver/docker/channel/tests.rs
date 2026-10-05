@@ -134,3 +134,38 @@ async fn an_immediate_peer_without_native_daemon_qualification_cannot_attach() {
         Err(Error::NativeDaemon)
     ));
 }
+
+#[tokio::test]
+async fn the_daemon_guard_runs_before_each_write_and_never_on_a_read() {
+    let fixture = super::super::tests::Fixture::new();
+    let api = fixture.client().await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = fixture.listener.accept().await.unwrap();
+        super::super::tests::request_line(&mut socket).await;
+        let mut reply =
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+                .to_vec();
+        // Many small frames: one read per frame, as a capture's batches arrive.
+        for _ in 0..64 {
+            reply.extend(frame(1, b"row"));
+        }
+        socket.write_all(&reply).await.unwrap();
+        let mut request = [0; 6];
+        socket.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"q1\nq2\n");
+    });
+    let mut stream = api.attach_inner(&"a".repeat(64)).await.unwrap();
+    let mut output = [0; 3 * 64];
+    stream.read_exact(&mut output).await.unwrap();
+    assert_eq!(stream.guarded(), 0, "a read never runs the daemon guard");
+    stream.write_all(b"q1\n").await.unwrap();
+    let after_one = stream.guarded();
+    assert!(after_one > 0, "a write runs the daemon guard");
+    stream.write_all(b"q2\n").await.unwrap();
+    stream.flush().await.unwrap();
+    assert!(
+        stream.guarded() > after_one,
+        "every later write and flush runs it again"
+    );
+    server.await.unwrap();
+}

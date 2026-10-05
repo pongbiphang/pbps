@@ -18,6 +18,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub struct AttachStream {
     io: FramedIo<TokioIo<hyper::upgrade::Upgraded>>,
     daemon: Option<DaemonLease>,
+    /// How many times the daemon guard ran, so a test can pin where it runs.
+    #[cfg(test)]
+    guarded: usize,
 }
 
 impl LocalApi {
@@ -88,12 +91,25 @@ impl LocalApi {
         Ok(AttachStream {
             io: FramedIo::new(TokioIo::new(upgraded)),
             daemon: self.native_daemon.take(),
+            #[cfg(test)]
+            guarded: 0,
         })
     }
 }
 
 impl AttachStream {
+    /// The daemon still holding its end of this stream, checked before each
+    /// thing pbps sends over it. Reads are not checked: a response is the
+    /// answer to a write that was, and the bulk of a capture arrives in
+    /// thousands of reads, which made a per-read check most of a producer
+    /// run's verification time (DEC-1550.1). Only dockerd can hand its end
+    /// to another process, and dockerd is inside the provisioning trust
+    /// boundary (RESOLVER-RUNTIME).
     fn check(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.guarded += 1;
+        }
         if self
             .daemon
             .as_ref()
@@ -103,6 +119,11 @@ impl AttachStream {
         }
         self.io.check()
     }
+
+    #[cfg(test)]
+    pub(crate) fn guarded(&self) -> usize {
+        self.guarded
+    }
 }
 
 impl AsyncRead for AttachStream {
@@ -111,7 +132,7 @@ impl AsyncRead for AttachStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        self.check()?;
+        // A stream already failed stays failed: `FramedIo` refuses on its own.
         Pin::new(&mut self.io).poll_read(cx, buf)
     }
 }
