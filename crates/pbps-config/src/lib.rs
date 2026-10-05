@@ -275,7 +275,13 @@ pub struct Dev {
 pub struct Config {
     pub dialect: DialectName,
 
+    // The schema carries the lexical half of the #739 rule, so an editor
+    // refuses what `Config::parse` refuses: an empty path, or one made only
+    // of `.` and `..`. Both separators count, as they do on Windows; a
+    // directory really named `.\` elsewhere is not worth a schema that
+    // accepts `..\..`. The filesystem half is the loader's alone.
     #[serde(default = "default_schema_dir")]
+    #[schemars(regex(pattern = r"^(?!(?:\.\.?(?:[/\\]+|$))*$)"))]
     pub schema_dir: PathBuf,
 
     #[serde(default = "default_ids_file")]
