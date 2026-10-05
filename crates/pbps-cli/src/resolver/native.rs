@@ -395,6 +395,26 @@ impl ProcessLease {
         Ok(same)
     }
 
+    /// Whether `other` is the namespace this lease captured, whether or not
+    /// the process is still running. Sound without the liveness check
+    /// [`Self::owns_namespace`] makes, because the lease holds the namespace
+    /// file open: a held namespace is never freed, so its identity cannot be
+    /// reused by a namespace someone else creates. Only for a process whose
+    /// exit is expected, such as a retired forwarder's guard (#1559).
+    pub(crate) fn held_namespace(
+        &self,
+        name: &str,
+        other: &File,
+    ) -> Result<bool, UnqualifiedProcess> {
+        let held = self
+            .namespaces
+            .iter()
+            .find(|(key, _, _)| *key == name)
+            .map(|(_, _, identity)| *identity)
+            .ok_or(UnqualifiedProcess)?;
+        Ok(FileIdentity::of(other)? == held)
+    }
+
     /// Reads one bounded file through the *held* proc directory, so a reused
     /// numeric PID cannot answer for the process this lease captured.
     /// The held handle on `/proc/<pid>/exe`: the executed file object
@@ -1417,9 +1437,15 @@ pub(crate) fn namespace_task_ids(
 /// read. A foreign-occupant lease cannot serve here: a forwarder has its own
 /// PID namespace, and its transient tasks need not yield executables. The
 /// caller decides what an unaccounted task means.
+///
+/// `retired` are PID namespaces of forwarders the caller has finished with
+/// and is tearing down. Their tasks can outlive the session by a moment, and
+/// their guard may already have exited, so they are matched by held identity
+/// alone ([`ProcessLease::held_namespace`]) rather than as live anchors.
 pub(crate) fn foreign_network_tasks(
     net_anchor: &ProcessLease,
     pid_anchors: &[&ProcessLease],
+    retired: &[ProcessLease],
 ) -> Result<Vec<u32>, UnqualifiedProcess> {
     let mut foreign = Vec::new();
     for id in namespace_task_ids(net_anchor, "net")? {
@@ -1439,6 +1465,12 @@ pub(crate) fn foreign_network_tasks(
                 owned = true;
                 break;
             }
+        }
+        for anchor in retired {
+            if owned {
+                break;
+            }
+            owned = anchor.held_namespace("pid", &handle)?;
         }
         if !owned {
             foreign.push(id);

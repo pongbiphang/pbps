@@ -1436,3 +1436,39 @@ check: a restarted process fails its lease, a restarted engine its identity
 query, a replaced connection its cookie or TLS session. Under #1528 the
 measured profiles are the advanced tier, so this cost falls only on users who
 choose them.
+
+<a id="dec-1559-1"></a>
+
+**DEC-1559.1. A forwarder this run retired stays this run's in the network
+census while it leaves, matched by the PID namespace its guard's lease holds
+open.** Within a supplied run, a step finishes with its administrative or
+scratch session and retires it. The connection is dropped at once, but the
+forwarder container is removed only at cleanup, and its tasks leave the
+engine's network namespace when they exit, not when the session ends. The
+census accepted only the live sessions' guards as anchors, so whenever the
+run's next check came before those tasks exited, it read the run's own
+forwarder as a foreign occupant and refused with `Containment(Accounting)`.
+On CI this failed the supplied producer tests intermittently, and for an
+afternoon it failed most runs of `resolver (pg, second)`, `master` included
+(#1559).
+
+Each retired session's guard lease is now kept, and the census accepts a task
+whose PID namespace is one of those leases' namespaces. It is matched by
+identity alone, without the liveness check a live anchor gets, because the
+guard may already have exited. That is still exact:
+- The lease holds the namespace file open, so the namespace is never freed and
+  its identity cannot be given to anyone else's namespace.
+- A PID namespace whose init has exited admits no new process.
+
+The trust argument for live forwarders (#681) carries over unchanged: joining
+a forwarder's PID namespace needs the root daemon, which is outside what this
+profile defends against.
+
+Waiting in the fixtures was rejected, as was having the product retry the
+refusal. The refusal was the product misjudging its own run, the same check a
+user's `plan --db` makes after the same retirement.
+
+`a_retired_forwarder_still_in_the_engines_network_is_this_runs_own` holds a
+retired session's stream open, so its forwarder is certainly present. The test
+checks that the census refuses that forwarder without its retired guard, and
+accepts it with the guard.

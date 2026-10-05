@@ -425,6 +425,10 @@ struct Control {
     /// run-owned container nobody can confirm gone is a recovery name like
     /// the database and the login (finding on #640).
     stale: Vec<Forwarder>,
+    /// The guards of the retired sessions' forwarders, held so that the
+    /// census still knows their PID namespaces while their tasks leave the
+    /// engine's network namespace (#1559).
+    retired: Vec<ProcessLease>,
     /// Forwarder containers already reported unconfirmed.
     unconfirmed: Vec<String>,
     /// Run-local authorization roles this run created on the shared server,
@@ -453,10 +457,12 @@ impl Control {
         let Session {
             connection,
             forwarder,
+            guard,
             ..
         } = session;
         drop(connection);
         self.stale.push(forwarder);
+        self.retired.push(guard);
     }
 }
 
@@ -696,7 +702,7 @@ impl Analysis {
         let session = control.session.as_ref().ok_or(Error::Cancelled)?;
         let mut forwarders = vec![&session.guard];
         forwarders.extend(extra.map(|extra| &extra.guard));
-        self.runtime.check(&forwarders)?;
+        self.runtime.check(&forwarders, &control.retired)?;
         let init = self.runtime.init();
         session.check(init).await?;
         if let Some(extra) = extra {
@@ -849,7 +855,7 @@ impl DedicatedServer {
         )?;
         profile::configuration(&state).map_err(Error::Configuration)?;
         let runtime = ServerRuntime::bind(processes, profile)?;
-        runtime.check(&[])?;
+        runtime.check(&[], &[])?;
         let image = api
             .inspect_image(&pinned.image)
             .await
@@ -938,6 +944,7 @@ impl DedicatedServer {
                 pending: None,
                 in_flight: false,
                 stale: Vec::new(),
+                retired: Vec::new(),
                 unconfirmed: Vec::new(),
                 roles: Vec::new(),
                 admin: None,
@@ -979,7 +986,9 @@ impl DedicatedServer {
             .map_err(|_| Error::Unqualified("the target binding this run was aimed at changed"))
             .and_then(|()| {
                 let session = inner.control.session.as_ref().ok_or(Error::Cancelled)?;
-                analysis.runtime.check(&[&session.guard])?;
+                analysis
+                    .runtime
+                    .check(&[&session.guard], &inner.control.retired)?;
                 session.check_kernel(analysis.runtime.init())
             });
         if let Err(cause) = &outcome {

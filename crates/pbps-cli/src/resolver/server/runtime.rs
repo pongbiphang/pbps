@@ -131,8 +131,14 @@ impl ServerRuntime {
     ///
     /// `forwarders` are this run's own control containers: they share the
     /// engine's network namespace by design and are the only processes
-    /// outside its PID namespace allowed to.
-    pub(crate) fn check(&self, forwarders: &[&ProcessLease]) -> Result<(), Error> {
+    /// outside its PID namespace allowed to. `retired` are the guards of
+    /// this run's forwarders whose session is over and whose removal is
+    /// pending: their tasks are still this run's while they leave (#1559).
+    pub(crate) fn check(
+        &self,
+        forwarders: &[&ProcessLease],
+        retired: &[ProcessLease],
+    ) -> Result<(), Error> {
         self.init.check().map_err(Premise::Resources.named())?;
         self.engine.check().map_err(Premise::Lease.named())?;
         let init = self.init.process();
@@ -151,7 +157,7 @@ impl ServerRuntime {
         })?;
         device_not_engine_writable(init).map_err(Premise::Device.named())?;
         occupants(init, self.profile)?;
-        accounted(init, forwarders)?;
+        accounted(init, forwarders, retired)?;
         self.init.check().map_err(Premise::Resources.named())
     }
 }
@@ -263,7 +269,11 @@ fn occupants(init: &ProcessLease, profile: &ServerProfile) -> Result<(), Error> 
 /// is not in its PID namespace, except this run's own forwarders in the
 /// network namespace. A container joined with `--network container:` would otherwise
 /// be invisible to every other check.
-fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Error> {
+fn accounted(
+    init: &ProcessLease,
+    forwarders: &[&ProcessLease],
+    retired: &[ProcessLease],
+) -> Result<(), Error> {
     // The network namespace is the engine's tasks plus this run's forwarders.
     // A forwarder shares only that namespace, so its own tasks are the one
     // exception, matched by PID namespace: a forwarder's `bash` reaps and
@@ -286,9 +296,18 @@ fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Er
     // as it forwards, so qualifying each occupant would race a legitimate
     // child that is momentarily a zombie with no executable to read (finding
     // on #640).
+    //
+    // A forwarder this run has retired is still this run's: its session is
+    // over, but its container is removed only at cleanup, and its tasks leave
+    // the engine's network namespace when they exit, not when the session
+    // ends. Reading them as foreign refused this run's own next step whenever
+    // the census came first (#1559, DEC-1559.1). Its guard may already be
+    // gone, so it is matched by the namespace the lease holds open, which
+    // nobody else can be given; the trust argument above is unchanged.
     let mut pid_anchors = vec![init];
     pid_anchors.extend(forwarders.iter().copied());
-    let foreign = foreign_network_tasks(init, &pid_anchors).map_err(Premise::Accounting.named())?;
+    let foreign =
+        foreign_network_tasks(init, &pid_anchors, retired).map_err(Premise::Accounting.named())?;
     if !foreign.is_empty() {
         #[cfg(test)]
         eprintln!(
