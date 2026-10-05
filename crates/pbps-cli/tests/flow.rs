@@ -1099,6 +1099,89 @@ fn fmt_normalises_and_check_mode_never_writes() {
     );
 }
 
+/// A project whose declarations directory is its own root, or a directory
+/// above it, is refused by name (#739). That layout read `pbps.yml` itself as
+/// a declaration and failed on its first key, a message that pointed nowhere
+/// near the cause. Every command that loads the project refuses it the same
+/// way, and moving the declarations into a subdirectory is the whole remedy.
+#[test]
+fn a_project_whose_schema_dir_holds_it_is_refused_by_name() {
+    let d = Demo::new("rootschema739");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n");
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\nschema_dir: .\n").unwrap();
+    for args in [&["validate"][..], &["plan"][..]] {
+        let o = d.run(args);
+        assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
+        let err = stderr(&o);
+        assert!(
+            err.contains("`schema_dir`")
+                && err.contains("the project root or a directory above it"),
+            "{args:?}: {err}"
+        );
+        assert!(!err.contains("a declaration file starts with"), "{err}");
+    }
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // A committed revision is read from git's tree, where `a/..` can only be
+    // the project root: the baseline refuses it by the same rule, rather than
+    // listing the whole tree as declarations (review on #1548).
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nschema_dir: \"a/..\"\n",
+    )
+    .unwrap();
+    d.commit();
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    let o = d.run(&["plan"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("`schema_dir`") && err.contains("the project root or a directory above it"),
+        "{err}"
+    );
+}
+
+/// The historical half of the rule above, for a project below the repository
+/// root. A committed `schema_dir: schema/../..` there composes to the
+/// repository root, which is not the project root but holds it, so it is
+/// refused by name too rather than reaching `git ls-tree` as an empty
+/// pathspec, which git rejects (review on #1548). The spelling has a name in
+/// it on purpose: `Config::parse` refuses a bare `..` itself, and would answer
+/// before the baseline's own check is reached.
+#[test]
+fn a_historical_schema_dir_above_a_nested_project_is_refused_by_name() {
+    let d = Demo::new("aboveschema739");
+    let nested = d.dir.join("db");
+    std::fs::create_dir_all(nested.join("schema")).unwrap();
+    std::fs::write(
+        nested.join("schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        nested.join("pbps.yml"),
+        "dialect: mssql\nschema_dir: \"schema/../..\"\n",
+    )
+    .unwrap();
+    d.commit();
+    std::fs::write(nested.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&nested)
+        .arg("plan")
+        .output()
+        .unwrap();
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("`schema_dir`") && err.contains("the project root or a directory above it"),
+        "{err}"
+    );
+    assert!(!err.contains("pathspec"), "{err}");
+}
+
 /// The way a user actually reaches this: two `renamed_from:` annotations name
 /// one column. A copy-paste, a bad merge, a half-finished edit.
 ///

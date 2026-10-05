@@ -138,6 +138,14 @@ schema_dir: schema/
 ids_file: schema.ids.json
 ```
 
+`schema_dir` is a subdirectory of the project, never the project root itself
+and never a directory above it. Every `.yml` beneath it is read as a
+declaration, so a directory that also holds `pbps.yml` (and, in a repository
+root, other tools' YAML) could never load. `schema_dir: .`, `..` and their
+equivalents are refused by name when the project loads, and so is a historical
+config that names one when a baseline is read from git (#739). A sibling such
+as `../shared/schema` is fine.
+
 The `policies:` block selects built-in rules and their severities and records
 suppressions — a rule id, a reason and an optional expiry — with parameters
 that are data (a pattern, a number, a change window) and never code

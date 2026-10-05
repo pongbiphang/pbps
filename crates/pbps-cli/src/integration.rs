@@ -41,7 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 29;
+pub const SCHEMA_VERSION: u32 = 30;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
@@ -298,6 +298,48 @@ pub fn cmd_man(dir: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The config schema and `Config::parse` agree on which `schema_dir`
+    /// spellings name the project root or a directory above it (#739, review
+    /// on #1548). Only the lexical half is the schema's to state: `a/..` is
+    /// judged on disk, where a symlink can lead it elsewhere, so both accept
+    /// it here.
+    #[test]
+    fn config_schema_and_loader_agree_on_a_schema_dir_holding_the_project() {
+        let document = schema(SchemaKind::Config);
+        let validator = jsonschema::validator_for(&document).unwrap();
+        for (dir, valid) in [
+            ("schema", true),
+            ("./schema", true),
+            ("db/tables", true),
+            ("../shared/schema", true),
+            ("a/..", true),
+            ("...", true),
+            (".hidden", true),
+            ("/abs/schema", true),
+            ("", false),
+            (".", false),
+            ("./", false),
+            ("./.", false),
+            ("..", false),
+            ("../..", false),
+            ("./../.", false),
+            (".//..//", false),
+        ] {
+            let config = serde_json::json!({"dialect": "mssql", "schema_dir": dir});
+            assert_eq!(validator.is_valid(&config), valid, "{config}");
+            assert_eq!(
+                pbps_config::Config::parse(&config.to_string(), std::path::Path::new("pbps.yml"))
+                    .is_ok(),
+                valid,
+                "{config}"
+            );
+        }
+        // Windows separates with `\` too, and so does the schema, on every
+        // platform: a config is portable, the platform reading it is not.
+        let config = serde_json::json!({"dialect": "mssql", "schema_dir": "..\\.."});
+        assert!(!validator.is_valid(&config), "{config}");
+    }
 
     #[test]
     fn resolver_profile_schema_and_loader_agree_on_backends_and_policies() {

@@ -52,6 +52,18 @@ pub enum ConfigError {
          keep the one its key is delivered through"
     )]
     AmbiguousFingerprintKey { name: String },
+
+    /// The declarations directory holds the project itself: it is the project
+    /// root or a directory above it (#739). Every `.yml` beneath it is read as
+    /// a declaration, `pbps.yml` included, so such a layout never loaded; it
+    /// is refused here, by name, instead of surfacing as "the YAML in
+    /// `pbps.yml`" is not a declaration.
+    #[error(
+        "`schema_dir` in `{path}` is the project root or a directory above it, so it would \
+         read `pbps.yml` as a declaration; declarations live in a subdirectory of the \
+         project, such as `schema/` (the default)"
+    )]
+    SchemaDirHoldsTheProject { path: PathBuf },
 }
 
 /// The target database dialect.
@@ -263,7 +275,13 @@ pub struct Dev {
 pub struct Config {
     pub dialect: DialectName,
 
+    // The schema carries the lexical half of the #739 rule, so an editor
+    // refuses what `Config::parse` refuses: an empty path, or one made only
+    // of `.` and `..`. Both separators count, as they do on Windows; a
+    // directory really named `.\` elsewhere is not worth a schema that
+    // accepts `..\..`. The filesystem half is the loader's alone.
     #[serde(default = "default_schema_dir")]
+    #[schemars(regex(pattern = r"^(?!(?:\.\.?(?:[/\\]+|$))*$)"))]
     pub schema_dir: PathBuf,
 
     #[serde(default = "default_ids_file")]
@@ -352,8 +370,28 @@ impl Config {
         }) {
             return Err(ConfigError::AmbiguousFingerprintKey { name: name.clone() });
         }
+        if config.schema_dir.is_relative() && only_dot_segments(&config.schema_dir) {
+            return Err(ConfigError::SchemaDirHoldsTheProject {
+                path: path.to_owned(),
+            });
+        }
         Ok(config)
     }
+}
+
+/// Whether a relative path is made only of `.` and `..`: the base itself or
+/// a directory above it, whatever symlinks lie on the way, since `..` from a
+/// real directory is always its physical parent.
+///
+/// Not `a/..`: a name and a `..` cancel only lexically, and when `a` is a
+/// symlink the pair leads somewhere else entirely (review on #1548). Such a
+/// path is judged where it can be, against the filesystem in
+/// [`Project::load`], and lexically only where git's own tree is all there
+/// is (`baseline`, which reads configs from history).
+fn only_dot_segments(path: &Path) -> bool {
+    use std::path::Component;
+    path.components()
+        .all(|c| matches!(c, Component::CurDir | Component::ParentDir))
 }
 
 /// A located project: its root directory plus its configuration.
@@ -389,6 +427,27 @@ impl Project {
         // A config file is always inside some directory; the only way to have no
         // parent is to have been handed an empty path.
         let root = config_path.parent().unwrap_or(Path::new(".")).to_owned();
+        // Any spelling can still reach the root through the filesystem: an
+        // absolute path, `../<project>`, or a symlink. `parse` judges the
+        // spelling alone (it also reads configs from git, where there is no
+        // filesystem); here the directory that exists is compared with the
+        // root itself (review on #1548). One that does not exist yet cannot
+        // be the root, which does.
+        let real = |p: &Path| {
+            std::fs::canonicalize(if p.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                p
+            })
+        };
+        // The root itself, or any directory above it: either holds `pbps.yml`.
+        if let (Ok(dir), Ok(base)) = (real(&root.join(&config.schema_dir)), real(&root))
+            && base.starts_with(&dir)
+        {
+            return Err(ConfigError::SchemaDirHoldsTheProject {
+                path: config_path.to_owned(),
+            });
+        }
         Ok(Self { root, config })
     }
 
@@ -540,6 +599,115 @@ mod tests {
 
     /// `dialect` has no default: guessing wrong produces SQL that is
     /// syntactically valid and semantically wrong.
+    /// #739: the declarations directory is never the project root. Every
+    /// spelling of the root is refused by name, while a subdirectory, a
+    /// sibling and a path that only passes through `..` are not.
+    #[test]
+    fn a_schema_dir_holding_the_project_is_refused() {
+        for root in [".", "./", "", "./.", "..", "../..", "./../."] {
+            let text = format!("dialect: mssql\nschema_dir: \"{root}\"\n");
+            let err = Config::parse(&text, Path::new("pbps.yml")).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::SchemaDirHoldsTheProject { .. }),
+                "{root:?}: {err}"
+            );
+            assert!(err.to_string().contains("schema/"), "{err}");
+        }
+        // `a/..` is not judged by spelling: a symlink can make it lead
+        // elsewhere, so `Project::load` judges it on disk.
+        for fine in [
+            "schema",
+            "./schema",
+            "db/tables",
+            "../shared/schema",
+            "a/../b",
+            "a/..",
+        ] {
+            let text = format!("dialect: mssql\nschema_dir: \"{fine}\"\n");
+            assert!(
+                Config::parse(&text, Path::new("pbps.yml")).is_ok(),
+                "{fine:?}"
+            );
+        }
+        // An absolute path is judged where the file is: the root itself and
+        // a directory above it are refused, a directory inside it is not.
+        // The paths go in single-quoted YAML, which has no escapes: a double-
+        // quoted Windows path reads `\U` in `C:\Users` as a broken escape.
+        let tmp = std::env::temp_dir().join(format!("pbps-cfg739-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("schema")).unwrap();
+        let config = tmp.join("pbps.yml");
+        std::fs::write(
+            &config,
+            format!("dialect: mssql\nschema_dir: '{}'\n", tmp.display()),
+        )
+        .unwrap();
+        let err = Project::load(&config).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SchemaDirHoldsTheProject { .. }),
+            "{err}"
+        );
+        std::fs::write(
+            &config,
+            format!(
+                "dialect: mssql\nschema_dir: '{}'\n",
+                tmp.parent().unwrap().display()
+            ),
+        )
+        .unwrap();
+        let err = Project::load(&config).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SchemaDirHoldsTheProject { .. }),
+            "{err}"
+        );
+        std::fs::write(
+            &config,
+            format!(
+                "dialect: mssql\nschema_dir: '{}'\n",
+                tmp.join("schema").display()
+            ),
+        )
+        .unwrap();
+        assert!(Project::load(&config).is_ok());
+        // A relative spelling that climbs out and back in, and a symlink to
+        // the root, reach the root through the filesystem (review on #1548).
+        let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+        std::fs::write(
+            &config,
+            format!("dialect: mssql\nschema_dir: \"../{name}\"\n"),
+        )
+        .unwrap();
+        let err = Project::load(&config).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SchemaDirHoldsTheProject { .. }),
+            "{err}"
+        );
+        // A real directory and its `..` lead back to the root on disk too.
+        std::fs::create_dir_all(tmp.join("a")).unwrap();
+        std::fs::write(&config, "dialect: mssql\nschema_dir: \"a/..\"\n").unwrap();
+        let err = Project::load(&config).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SchemaDirHoldsTheProject { .. }),
+            "{err}"
+        );
+        #[cfg(unix)]
+        {
+            // But a symlink into a subdirectory makes `alias/..` that
+            // subdirectory's parent, `schema`, a valid declarations directory.
+            std::fs::create_dir_all(tmp.join("schema/nested")).unwrap();
+            std::os::unix::fs::symlink(tmp.join("schema/nested"), tmp.join("alias")).unwrap();
+            std::fs::write(&config, "dialect: mssql\nschema_dir: \"alias/..\"\n").unwrap();
+            assert!(Project::load(&config).is_ok());
+            std::os::unix::fs::symlink(".", tmp.join("here")).unwrap();
+            std::fs::write(&config, "dialect: mssql\nschema_dir: here\n").unwrap();
+            let err = Project::load(&config).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::SchemaDirHoldsTheProject { .. }),
+                "{err}"
+            );
+        }
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
     #[test]
     fn dialect_is_required() {
         assert!(Config::parse("schema_dir: schema\n", Path::new("pbps.yml")).is_err());

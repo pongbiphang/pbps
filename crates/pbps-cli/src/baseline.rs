@@ -181,18 +181,32 @@ fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String)> {
     // `relative_to` answers by running git inside the path's own parent. The
     // project root is the one directory that is always there (DECISIONS 166).
     let prefix = relative_to(root)?;
-    Ok((
-        under(&prefix, &config.schema_dir)?,
-        under(&prefix, &config.ids_file)?,
-    ))
+    let schema = under(&prefix, &config.schema_dir)?;
+    // A historical config is read from git's tree, where a path resolves only
+    // by its spelling, so this is the lexical half of the rule `pbps-config`
+    // applies (#739): the declarations directory may not be the project root
+    // or a directory above it, either of which holds `pbps.yml`. In a
+    // revision `a/..` is the root and `../..` may be the repository root, so
+    // both are refused here; on disk a symlink can lead them elsewhere, which
+    // is why `Config::parse` does not judge them by spelling.
+    let holds =
+        |dir: &str| dir.is_empty() || prefix == dir || prefix.starts_with(&format!("{dir}/"));
+    if holds(&schema) {
+        anyhow::bail!(
+            "`schema_dir` in `{config_rel}` at `{rev}` is the project root or a directory \
+             above it, so it would read `pbps.yml` as a declaration; declarations live in a \
+             subdirectory of the project, such as `schema/` (the default)"
+        );
+    }
+    Ok((schema, under(&prefix, &config.ids_file)?))
 }
 
 /// A path the config states, relative to the project root, as the path git
 /// wants: relative to the repository root, with `/` separators.
 ///
-/// `.` is the project root itself, which is the prefix alone — and at the
-/// repository root that is the empty pathspec, which every caller here already
-/// treats as "everything".
+/// `.` is the project root itself, which is the prefix alone. No config path
+/// can be that any more for the declarations (#739), and an ids file is a
+/// file, so no caller here receives the empty pathspec.
 fn under(prefix: &str, path: &Path) -> anyhow::Result<String> {
     use std::path::Component;
 
@@ -248,21 +262,22 @@ fn tree_paths(root: &Path, rev: &str, rel: &str) -> anyhow::Result<Vec<String>> 
     // root. Without it a project in a subdirectory lists nothing, and — since
     // the identity file is still found — the plan comes back as "no changes"
     // against a baseline that holds no tables at all.
-    let mut args = vec!["ls-tree", "-r", "--full-tree", "--name-only", "-z", rev];
-    // `schema_dir: .` puts the declarations at the repo root, where the
-    // relative path is empty — and an empty pathspec is an error, not
-    // "everything". The whole tree is what "everything" looks like as
-    // arguments.
-    if !rel.is_empty() {
-        args.push("--");
-        args.push(rel);
-    }
-    let listing = git(root, &args).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot read `{}` at `{rev}`: {e}",
-            if rel.is_empty() { "." } else { rel }
-        )
-    })?;
+    // `rel` is never empty, never the project root and never above it: a
+    // historical config that spells one is refused where its paths are
+    // composed above, and a current one by `pbps-config` (#739). The pathspec
+    // always names a directory below the project rather than the whole tree.
+    let args = [
+        "ls-tree",
+        "-r",
+        "--full-tree",
+        "--name-only",
+        "-z",
+        rev,
+        "--",
+        rel,
+    ];
+    let listing =
+        git(root, &args).map_err(|e| anyhow::anyhow!("cannot read `{rel}` at `{rev}`: {e}"))?;
     Ok(listing
         .split('\0')
         .filter(|p| !p.is_empty())
@@ -548,12 +563,11 @@ pub fn schema_at(
 /// `rev-parse --show-prefix` asks git for the same answer in git's own terms, so
 /// only git's notion of the path has to be right.
 fn relative_to(path: &Path) -> anyhow::Result<String> {
-    // A directory can be asked about directly, and has to be: `schema_dir: .`
-    // makes the declarations directory the project root, whose parent is
-    // normally outside the worktree — asking git there would fail on a
-    // perfectly valid configuration. Everything else is resolved through its
-    // parent, because the path itself may not exist yet (a first run has no
-    // identity file).
+    // A directory can be asked about directly, and has to be: the project root
+    // is asked about this way, and its parent is normally outside the worktree,
+    // where asking git would fail on a perfectly valid project. Everything else
+    // is resolved through its parent, because the path itself may not exist yet
+    // (a first run has no identity file).
     if path.is_dir() {
         let prefix = git(path, &["rev-parse", "--show-prefix"])?;
         // At the repo root the prefix is empty, which is the right pathspec for
@@ -604,8 +618,8 @@ mod tests {
             "apps/shared/schema"
         );
         assert_eq!(under("apps/db", "../../schema").unwrap(), "schema");
-        // `schema_dir: .` is the project root, which at the repository root is
-        // the empty pathspec every caller here reads as "everything".
+        // `.` is the prefix alone: the config refuses it as a `schema_dir`
+        // (#739), but the helper still answers it for any other caller.
         assert_eq!(under("apps/db", ".").unwrap(), "apps/db");
         assert_eq!(under("", "schema").unwrap(), "schema");
         assert_eq!(under("", ".").unwrap(), "");
