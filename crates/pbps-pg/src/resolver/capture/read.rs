@@ -421,6 +421,13 @@ mod tests {
     async fn exercise_owned_capture(connection: String, fixture_role: String) {
         let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
         conn.execute("CREATE SCHEMA app; CREATE TABLE app.a(id integer); CREATE VIEW app.v AS SELECT id FROM app.a; SET search_path=app; SET timezone='Pacific/Honolulu'; SET default_transaction_isolation='read committed'").await.unwrap();
+        // A setting for a role in every database is a `pg_db_role_setting`
+        // row with `setdatabase = 0`, which the class's read scope keeps. The
+        // rendering pass must not keep it too: that class has nothing to
+        // render (#1538 review).
+        conn.execute(&format!("ALTER ROLE {fixture_role} SET work_mem = '8MB'"))
+            .await
+            .unwrap();
         let read = owned(&mut conn, &BTreeSet::new(), |catalog, major| {
             // A new catalog property must be noticed even though the
             // SQL projection still names only previously known fields.
