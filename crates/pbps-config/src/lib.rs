@@ -424,23 +424,25 @@ impl Project {
         // A config file is always inside some directory; the only way to have no
         // parent is to have been handed an empty path.
         let root = config_path.parent().unwrap_or(Path::new(".")).to_owned();
-        // An absolute `schema_dir` can name the root too; `parse` cannot tell
-        // without knowing where the file is.
-        if config.schema_dir.is_absolute() {
-            let real = |p: &Path| {
-                std::fs::canonicalize(if p.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    p
-                })
-            };
-            if let (Ok(dir), Ok(base)) = (real(&config.schema_dir), real(&root))
-                && dir == base
-            {
-                return Err(ConfigError::SchemaDirIsProjectRoot {
-                    path: config_path.to_owned(),
-                });
-            }
+        // Any spelling can still reach the root through the filesystem: an
+        // absolute path, `../<project>`, or a symlink. `parse` judges the
+        // spelling alone (it also reads configs from git, where there is no
+        // filesystem); here the directory that exists is compared with the
+        // root itself (review on #1548). One that does not exist yet cannot
+        // be the root, which does.
+        let real = |p: &Path| {
+            std::fs::canonicalize(if p.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                p
+            })
+        };
+        if let (Ok(dir), Ok(base)) = (real(&root.join(&config.schema_dir)), real(&root))
+            && dir == base
+        {
+            return Err(ConfigError::SchemaDirIsProjectRoot {
+                path: config_path.to_owned(),
+            });
         }
         Ok(Self { root, config })
     }
@@ -644,6 +646,29 @@ mod tests {
         )
         .unwrap();
         assert!(Project::load(&config).is_ok());
+        // A relative spelling that climbs out and back in, and a symlink to
+        // the root, reach the root through the filesystem (review on #1548).
+        let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+        std::fs::write(
+            &config,
+            format!("dialect: mssql\nschema_dir: \"../{name}\"\n"),
+        )
+        .unwrap();
+        let err = Project::load(&config).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SchemaDirIsProjectRoot { .. }),
+            "{err}"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(".", tmp.join("here")).unwrap();
+            std::fs::write(&config, "dialect: mssql\nschema_dir: here\n").unwrap();
+            let err = Project::load(&config).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::SchemaDirIsProjectRoot { .. }),
+                "{err}"
+            );
+        }
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
