@@ -52,6 +52,8 @@ The differ sorts every planned change by, in order:
    - role drops by membership, holder before member (`member_depth`,
      DECISIONS 127);
    - a foreign key comes after the key it references;
+   - a partition is created after every other creation of class 7, its
+     parent's included, at (7, 2) (DEC-1170.1);
    - a clustered index comes before the other indexes of its table
      (DEC-1178.1);
    - a replica identity whose target the plan adds, or whose columns become
@@ -255,6 +257,7 @@ and the expression-bearing changes that need a function.
 | Pair | Kind | Order now | Verdict |
 |---|---|---|---|
 | `CreateTable` → rows, keys, foreign keys, modules and grants on it | fixed | class 7 before 11, 13, 14, 16 | ✓ |
+| `CreateTable` of a partitioned parent → `CreateTable` of its partition | fixed | (7, 2) after the rest of class 7 | ✓ DEC-1170.1 |
 | `AddColumn` → rows, constraints, modules naming it | fixed | class 8 before 11, 13, 14 | ✓ |
 | `AddColumn` (input) → generated `AddColumn` reading it | fixed | (9, 2) after class 8 | ✓ DEC-1168.1 |
 | `AlterColumnType` of an existing input → generated `AddColumn` reading it | fixed | (9, 2) after the in-place alterations: a standing generated reader blocks the retype | ✓ DEC-1168.1 |
@@ -299,6 +302,7 @@ one class and the dependents a class cannot see.
 | Foreign key → the key it references | fixed | rank inside class 2 | ✓ |
 | Constraint, index or key drop → `DropColumn`, `RenameColumn` (S) | fixed | class 2 before 3 and 5 | ✓ DECISIONS 474 |
 | Inbound foreign key → `DropTable` | fixed | class 2 before 6 | ✓ |
+| `DropTable` of a partition → `CreateTable` of a partition over its range | fixed | class 6 before 7; the new range's pre-flight count leaves the dropped partition's rows out | ✓ DEC-1171.1 |
 | `SetPrimaryKey { to: None }` → relaxing a key column's nullability | fixed | class 2 before 9 | ✓ DECISIONS 269 |
 | Generated column → its input's drop | fixed | (5, 0); (2, 2) beside a rename | ✓ DEC-1168.1 |
 | S: index, unique or check over a computed column → its drop, and its re-add around an expression change | fixed | dropped in class 2 before (2, 4), re-added in 13 (`recreate_retyped_dependents`) | ✓ DEC-1174.1 |

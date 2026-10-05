@@ -288,7 +288,23 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             Ok(out)
         }
 
-        Change::DropTable { name, .. } => one(format!("DROP TABLE {};", qualified(name)?)),
+        Change::DropTable {
+            name,
+            detach_from: None,
+            ..
+        } => one(format!("DROP TABLE {};", qualified(name)?)),
+        // A partition is PostgreSQL's in this model, refused on this engine
+        // by validation; a plan that carries one anyway is not run (#1171).
+        Change::DropTable {
+            name,
+            detach_from: Some(parent),
+            ..
+        } => Err(DialectError::Invalid {
+            dialect: crate::types::DIALECT,
+            message: format!(
+                "{name} is a partition of {parent}, which SQL Server's model does not hold"
+            ),
+        }),
 
         // Reference data (ADR-0004). The only DML this tool emits, and it
         // reaches here only for a table that declared a `data:` block.
@@ -3349,9 +3365,21 @@ mod tests {
     /// statement early.
     #[test]
     fn identifiers_cannot_break_out_of_their_quoting() {
+        // A partition is PostgreSQL's: a plan carrying one is not run here
+        // (#1171).
+        let refused = emit(
+            &Change::DropTable {
+                uid: uid("t_k7x2mq"),
+                name: TableName::new("dbo", "p1"),
+                detach_from: Some(TableName::new("dbo", "p")),
+            },
+            Strategy::default(),
+        );
+        assert!(refused.is_err(), "{refused:?}");
         let sql = sql_of(&Change::DropTable {
             uid: uid("t_k7x2mq"),
             name: TableName::new("dbo", "x]; DROP TABLE users; --"),
+            detach_from: None,
         });
         assert_eq!(sql, ["DROP TABLE [dbo].[x]]; DROP TABLE users; --];"]);
     }

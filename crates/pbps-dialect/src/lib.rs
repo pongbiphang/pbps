@@ -3835,6 +3835,7 @@ mod tests {
             changes: vec![pbps_model::PlannedChange::new(Change::DropTable {
                 uid: "t_a1b2c3".parse().unwrap(),
                 name: "dbo.customer".parse().unwrap(),
+                detach_from: None,
             })],
         };
         assert!(MinimalDialect.preflight(&changes).probes.is_empty());

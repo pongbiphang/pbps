@@ -858,6 +858,7 @@ mod tests {
             Change::DropTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: u.clone(),
+                detach_from: None,
             },
             Change::DropModule {
                 id: "dbo.v".parse().unwrap(),

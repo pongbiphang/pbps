@@ -9948,6 +9948,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
             pbps_model::Change::DropTable {
                 uid: "t_bbbbbb".parse().unwrap(),
                 name: TableName::new("dbo", "kind"),
+                detach_from: None,
             },
             "nor does a key held by a table this plan drops first",
         ),
@@ -10251,6 +10252,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         pbps_model::PlannedChange::new(pbps_model::Change::DropTable {
             uid: "t_cccccc".parse().unwrap(),
             name: TableName::new("dbo", "kind"),
+            detach_from: None,
         }),
     );
     assert!(

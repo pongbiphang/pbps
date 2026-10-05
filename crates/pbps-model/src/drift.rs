@@ -174,6 +174,7 @@ mod tests {
             .push(PlannedChange::new(Change::DropTable {
                 uid: "t_a1b2c3".parse::<Uid>().unwrap(),
                 name: "dbo.customer".parse().unwrap(),
+                detach_from: None,
             }));
         assert!(r.has_drift());
     }
@@ -195,6 +196,7 @@ mod tests {
             .push(PlannedChange::new(Change::DropTable {
                 uid: "t_a1b2c3".parse::<Uid>().unwrap(),
                 name: "dbo.customer".parse().unwrap(),
+                detach_from: None,
             }));
         r.unmanaged.push("dbo.other_tool".parse().unwrap());
         let back: DriftReport = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();

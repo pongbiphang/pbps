@@ -462,6 +462,7 @@ fn a_change_no_bootstrap_contains_is_refused_by_kind() {
         &[Change::DropTable {
             uid: Uid::generate(UidKind::Table),
             name: TableName::new("app", "t"),
+            detach_from: None,
         }],
     )
     .unwrap_err();

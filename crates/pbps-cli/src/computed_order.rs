@@ -447,6 +447,7 @@ mod tests {
         PlannedChange::new(Change::DropTable {
             uid: "t_000000".parse().unwrap(),
             name: t(name),
+            detach_from: None,
         })
     }
 

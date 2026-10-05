@@ -6558,6 +6558,147 @@ fn a_partition_tree_round_trips_through_the_cli() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+/// A managed partition tree gains and loses partitions through the CLI
+/// (#1171): a partition added in the parent's file applies through a saved
+/// plan, verifies and replans empty; one dropped with `drop-table` is
+/// detached and dropped behind `--allow destructive`, its parent's other rows
+/// kept. A range over rows the DEFAULT partition holds, and a saved plan whose
+/// tree changed by hand after planning, are each refused before the apply's
+/// first statement; with the rows moved and the tree restored, the same saved
+/// plan applies.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn partitions_are_added_and_dropped_through_the_cli() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "parts-1171");
+    let connection = own.connection().to_owned();
+    on_server(&connection, "CREATE SCHEMA app");
+    let d = Demo::new("parts-1171");
+    let path = d.dir.join("schema/app.ev.yml");
+    let tree = |partitions: &str| {
+        std::fs::write(
+            &path,
+            format!(
+                "table: app.ev\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                 ts: {{type: date, nullable: false}}\nprimary_key: [id, ts]\n\
+                 partition_by: [ts]\npartitions:\n{partitions}"
+            ),
+        )
+        .unwrap();
+    };
+    let p2025 = "  ev_2025: {from: [\"2025-01-01\"], to: [\"2026-01-01\"]}\n";
+    let p2026 = "  ev_2026: {from: [\"2026-01-01\"], to: [\"2027-01-01\"]}\n";
+    let rest = "  ev_rest: default\n";
+    tree(&format!("{p2025}{rest}"));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &connection]));
+    on_server(
+        &connection,
+        "INSERT INTO app.ev VALUES (1, '2025-06-01'), (2, '2030-01-01')",
+    );
+
+    // Added, through a saved plan that says what it creates.
+    tree(&format!("{p2025}{p2026}{rest}"));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&o).contains(
+            "+ create table app.ev_2026, a partition of app.ev for rows from (\"2026-01-01\") \
+             to (\"2027-01-01\")"
+        ),
+        "{}",
+        stdout(&o)
+    );
+    succeeds(approved_apply(&d, &connection, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // A range over the row the DEFAULT partition holds: planned, since a
+    // plan reads no rows (SPEC 7.2), and refused by name by the apply's
+    // pre-flight before its first statement.
+    let p2030 = "  ev_2030: {from: [\"2030-01-01\"], to: [\"2031-01-01\"]}\n";
+    tree(&format!("{p2025}{p2026}{p2030}{rest}"));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    let o = approved_apply(&d, &connection, &plan, &[]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("rows of app.ev inside the range of its new partition app.ev_2030"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_class WHERE relname = 'ev_2030'"
+        ),
+        0
+    );
+
+    // The remedy the refusal names: the row moved out of that range. The
+    // same saved plan, replayed after a partition was added by hand, is
+    // refused before its first statement; once that partition is gone it
+    // applies.
+    on_server(&connection, "DELETE FROM app.ev WHERE id = 2");
+    on_server(
+        &connection,
+        "CREATE TABLE app.ev_hand PARTITION OF app.ev \
+             FOR VALUES FROM ('2029-01-01') TO ('2029-06-01')",
+    );
+    let o = approved_apply(&d, &connection, &plan, &[]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("app.ev_hand is a partition of the managed table app.ev"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_class WHERE relname = 'ev_2030'"
+        ),
+        0,
+        "the refused plan ran a statement"
+    );
+    on_server(&connection, "DROP TABLE app.ev_hand");
+    succeeds(approved_apply(&d, &connection, &plan, &[]));
+    on_server(&connection, "INSERT INTO app.ev VALUES (3, '2026-06-01')");
+
+    // Dropped with intent: detached, then dropped, the other rows kept.
+    tree(&format!("{p2026}{p2030}{rest}"));
+    succeeds(d.run(&[
+        "drop-table",
+        "app.ev_2025",
+        "--reason",
+        "archived elsewhere",
+    ]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    let o = approved_apply(&d, &connection, &plan, &[]);
+    assert_ne!(code(&o), 0, "a drop needs its risk allowed: {}", stdout(&o));
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    // The dropped partition's row went with it; the others stayed.
+    assert_eq!(scalar(&connection, "SELECT count(*) FROM app.ev"), 1);
+    assert_eq!(
+        scalar(&connection, "SELECT count(*) FROM app.ev_2026 WHERE id = 3"),
+        1
+    );
+}
+
 /// Index storage parameters go the whole way through the CLI (#1442):
 /// pulled with the index, changed in place by one `ALTER INDEX` that
 /// applies and verifies, after which the next plan is empty.

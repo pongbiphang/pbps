@@ -4938,6 +4938,7 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
                 change: pbps_model::Change::DropTable {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "dbo.t".parse().unwrap(),
+                    detach_from: None,
                 },
                 risks: Default::default(),
                 strategy: Default::default(),

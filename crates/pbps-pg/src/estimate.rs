@@ -413,6 +413,12 @@ fn estimates_with(
             if let Some(source) = source {
                 e.source = source.clone();
             }
+            // A partition created under a parent this plan creates locks
+            // nothing anyone holds (#1171).
+            if matches!(p.change, Change::CreateTable { .. }) && e.source == CatalogSource::Created
+            {
+                return None;
+            }
             if let CatalogSource::Stored {
                 column: stored_column,
                 ..
@@ -736,9 +742,44 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             Lock::AccessExclusive,
         ),
 
+        // A partition is about its parent's rows (#1171, DEC-1171.1):
+        // measured on 16 and 18, creating one locks the parent and scans its
+        // DEFAULT partition, if it has one, for rows in the new range; the
+        // detach that drops one locks the parent and checks each table with a
+        // foreign key to it for rows that reference the partition.
+        Change::CreateTable { name, table, .. } => table.partition_of.as_ref().and_then(|of| {
+            e(
+                format!("creating the partition {name} of {}", of.parent),
+                &of.parent,
+                Rewrite::No,
+                Reads::Unknown(
+                    "the parent's DEFAULT partition, if it has one, is scanned for rows inside \
+                     the new range"
+                        .into(),
+                ),
+                Lock::AccessExclusive,
+            )
+        }),
+        Change::DropTable {
+            name,
+            detach_from: Some(parent),
+            ..
+        } => e(
+            format!("detaching and dropping the partition {name} of {parent}"),
+            parent,
+            Rewrite::No,
+            Reads::Unknown(
+                "each table with a foreign key to the parent is checked for rows that \
+                 reference the partition"
+                    .into(),
+            ),
+            Lock::AccessExclusive,
+        ),
+
         // Not about a table's stored rows, or not about a size at all.
-        Change::CreateTable { .. }
-        | Change::DropTable { .. }
+        Change::DropTable {
+            detach_from: None, ..
+        }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { to: None, .. }
         | Change::DropUnique { .. }

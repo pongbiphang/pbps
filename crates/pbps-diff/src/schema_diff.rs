@@ -306,6 +306,14 @@ fn diff_partial_rebuilding(
             changes.push(Change::DropTable {
                 uid: uid.clone(),
                 name: name.clone(),
+                // A partition is detached from its parent before it goes
+                // (#1171, DEC-1171.1).
+                detach_from: base
+                    .schema
+                    .tables
+                    .get(name)
+                    .and_then(|t| t.partition_of.as_ref())
+                    .map(|of| of.parent.clone()),
             });
         }
     }
@@ -2027,15 +2035,19 @@ fn refuse_partition_changes(
         })
         .collect();
     for change in changes {
-        // A partition is created with its parent, which is how this slice
-        // builds a tree; one added under a parent that already stands is
-        // #1171's to qualify.
-        if let Change::CreateTable { name, table, .. } = change {
-            if let Some(of) = &table.partition_of
-                && !created.contains(&of.parent)
-            {
-                refuse(&of.parent, format!("add the partition {name}"));
-            }
+        // A partition is created with its parent, or under a parent that
+        // already stands (#1171); either way it is a creation, and whether
+        // the parent's rows let it be is the connected probe's question.
+        if matches!(change, Change::CreateTable { .. }) {
+            continue;
+        }
+        // A partition is dropped, detached first, while its parent stands
+        // (#1171). Its parent's own drop is still refused below.
+        if let Change::DropTable {
+            detach_from: Some(_),
+            ..
+        } = change
+        {
             continue;
         }
         let ends_a_table = matches!(
@@ -4742,12 +4754,14 @@ mod tests {
     }
 
     /// A partition tree is created parent first and every partition after
-    /// it, whatever the names' order; any other change to a partitioned table
-    /// or a partition is refused by name until #1171, a partition added under
-    /// a parent that already stands included. A change to another table, even
-    /// one referencing the parent, is not refused (#1170).
+    /// it, whatever the names' order (#1170). A partition is then added under
+    /// the standing parent, or dropped with intent and detached from it first
+    /// (#1171); any other change to a partitioned table or a partition is
+    /// refused by name: its bound, a parent's column, a rename, the parent's
+    /// drop. A change to another table, even one referencing the parent, is
+    /// not refused.
     #[test]
-    fn a_partition_tree_is_created_whole_and_otherwise_refused() {
+    fn a_partition_tree_is_created_then_gains_and_loses_partitions_only() {
         use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionOf};
         let mut parent = table(&[
             ("id", Column::new(ty("int")).not_null()),
@@ -4848,11 +4862,61 @@ mod tests {
             table: "app.z_rest".parse().unwrap(),
             reason: "gone".into(),
         }];
+        // A partition added under the standing parent is its creation.
+        let added = outcome(&tree, &more, &[]).expect("a partition is added");
+        assert_eq!(kinds(&added), ["CreateTable"]);
+        // A partition removed without intent is refused as any table is.
+        let tree_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let silent = crate::resolve(&fewer, &tree_ids, &[], &ctx())
+            .expect_err("a drop without intent is refused");
+        assert!(
+            format!("{silent:?}").contains("DropTableNeedsReason"),
+            "{silent:?}"
+        );
+        // A partition dropped with intent is detached from its parent first.
+        let dropped = outcome(&tree, &fewer, &drop).expect("a partition is dropped");
+        assert!(
+            dropped.changes.iter().any(|p| matches!(
+                &p.change,
+                Change::DropTable { name, detach_from: Some(parent), .. }
+                    if name.to_string() == "app.z_rest" && parent.to_string() == "app.ev"
+            )),
+            "{:?}",
+            dropped.changes
+        );
+        let mut renamed = tree.clone();
+        let moved = renamed
+            .tables
+            .remove(&"app.z_rest".parse::<TableName>().unwrap())
+            .unwrap();
+        renamed.tables.insert("app.z_other".parse().unwrap(), moved);
+        let rename = [Intent::RenameTable {
+            from: "app.z_rest".parse().unwrap(),
+            to: "app.z_other".parse().unwrap(),
+        }];
+        // The whole tree gone: the parent's own drop is still refused.
+        let no_parent = Schema::default();
+        let drop_all = [
+            Intent::DropTable {
+                table: "app.ev".parse().unwrap(),
+                reason: "gone".into(),
+            },
+            Intent::DropTable {
+                table: "app.a_old".parse().unwrap(),
+                reason: "gone".into(),
+            },
+            Intent::DropTable {
+                table: "app.z_rest".parse().unwrap(),
+                reason: "gone".into(),
+            },
+        ];
         for (declared, intents, expected) in [
             (&column, &[][..], "app.ev is a partitioned table"),
             (&bound, &[][..], "change its partitioning"),
-            (&more, &[][..], "add the partition app.m_more"),
-            (&fewer, &drop[..], "app.z_rest is a partitioned table"),
+            (&renamed, &rename[..], "rename table"),
+            (&no_parent, &drop_all[..], "app.ev is a partitioned table"),
         ] {
             let found = refused(&tree, declared, intents);
             assert!(
@@ -13423,6 +13487,7 @@ mod tests {
         let other = PlannedChange::new(Change::DropTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: TableName::new("dbo", "gone"),
+            detach_from: None,
         });
         // As the differ left them: name order, with a table drop in between.
         let mut cs = ChangeSet {

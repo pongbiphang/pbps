@@ -180,6 +180,12 @@ pub enum Change {
     DropTable {
         uid: Uid,
         name: TableName,
+        /// The partitioned table this one is a partition of, which the drop
+        /// detaches it from first (#1171): a partition a foreign key to its
+        /// parent reaches cannot be dropped while attached. `None` for any
+        /// other table, which an older plan's drops all are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detach_from: Option<TableName>,
     },
     RenameTable {
         uid: Uid,

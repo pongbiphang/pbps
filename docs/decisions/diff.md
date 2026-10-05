@@ -2354,3 +2354,77 @@ undeclared-partition refusal; and the unit tests
 `a_partition_tree_is_created_whole_and_otherwise_refused`,
 `partitions_load_as_tables_and_render_back_in_the_parent_file` and
 `a_deparsed_bound_comes_apart_and_nothing_else_does`.
+
+<a id="dec-1171-1"></a>
+
+**DEC-1171.1. A standing partition tree gains a partition or loses one with
+drop intent, which detaches it first. The apply's pre-flight counts the rows
+that would make the engine refuse either, and every other change to a tree
+stays refused by name (#1171).**
+
+Measured on 18.6 and 16.15, identical:
+
+- `CREATE TABLE … PARTITION OF` under a standing parent takes ACCESS EXCLUSIVE
+  on it, and on its DEFAULT partition, which it scans. Rows of the DEFAULT
+  partition inside the new range make the engine refuse the `CREATE` (23514).
+- A partition that a foreign key to its parent reaches cannot be dropped
+  (`cannot drop table … because other objects depend on it`): the key keeps a
+  clone on each referencing table, naming that partition. `DETACH PARTITION`
+  removes the clones, and refuses while referencing rows remain (23503).
+- A detached table keeps engine-chosen names (`p1_pkey`, `p1_v_idx`) and its
+  parent's constraint names, so detaching and keeping the rows is #1544's to
+  design, not this slice's.
+
+**The slice.** Leon chose it on the issue (2026-10-05).
+
+- A partition created under a parent that already stands is a `CreateTable`
+  as #1170 has it. The differ no longer refuses it. Its estimate names the
+  parent's ACCESS EXCLUSIVE lock and the DEFAULT partition's scan, and is
+  left out when the parent is created by the same plan.
+- A dropped partition is a `DropTable` with `detach_from`, its parent, emitted
+  as `ALTER TABLE parent DETACH PARTITION p; DROP TABLE p;` in one statement,
+  so that no apply, staged or not, stops between the two. It needs drop intent
+  like any table and is `destructive`. SQL Server refuses a `detach_from`, as
+  its model holds no partition. Plan version 26 carries the field.
+- The parent's own changes (#1546), detaching with the rows kept (#1544),
+  attaching an existing table (#1545) and moving DEFAULT-partition rows into a
+  new range (#1547) stay refused by name, each with its own issue, all ahead of
+  #1172.
+
+**The pre-flight, not the plan, reads the rows** (SPEC 7.2: a plan reads no
+data). Both counts are one `SELECT` through `query_to_xml`, built from the
+catalog at run time, like the delete probe (DECISIONS 325):
+
+- For a range added under a standing parent, the parent's rows inside the
+  range. A range cannot overlap another partition's, so every such row is in
+  the DEFAULT partition. The predicate compares the key's leading columns up to
+  the first `MINVALUE` or `MAXVALUE` (inclusive below for `MINVALUE`,
+  exclusive for `MAXVALUE`, the reverse above), and a row with a NULL key
+  column, which no range takes, is not counted. Rows of partitions the same
+  plan drops are not counted either, which a range split in one plan needs.
+- For a dropped partition, the rows of every table with a foreign key to the
+  parent that match a row of the partition, a partitioned referencing table
+  with its partitions.
+
+The engine's own refusal inside the transaction stays the backstop.
+
+**`drop_blockers` knows what the detach removes.** It read the referencing
+table's clone as a standing dependent, and the clone's internal owner, the
+foreign key itself, as one too. Every drop of a partition such a key reaches
+was refused, with no row referencing it. The clones are now removals at the
+drop's own position that promote nothing, the way a replaced generation
+expression promotes nothing (DEC-1316.1).
+
+**A saved plan's replay** needs no new check. A partition added by hand under
+a managed parent after planning is reported as inexpressible (DEC-1170.1), and
+a partition dropped or rebound by hand moves the baseline checksum. Either is
+refused before the first statement.
+
+Pinned by the live `range_partitions_are_added_and_dropped_on_populated_trees`
+(on 16 and 18), which fails without the NULL-key guard, the dropped-partition
+exclusion or the `drop_blockers` removal; the CLI
+`partitions_are_added_and_dropped_through_the_cli`; and the unit tests
+`a_partition_tree_is_created_then_gains_and_loses_partitions_only`,
+`a_partition_is_detached_and_dropped_in_one_statement`,
+`a_range_end_compares_the_columns_before_its_first_unbounded_end` and
+`a_partition_change_under_a_standing_parent_is_probed`.

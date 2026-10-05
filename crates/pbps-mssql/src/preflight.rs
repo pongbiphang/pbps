@@ -4180,6 +4180,7 @@ mod tests {
             Change::DropTable {
                 uid: uid("t_aaaaaa"),
                 name: tname("dbo.customer"),
+                detach_from: None,
             },
             Change::DropColumn {
                 uid: uid("c_aaaaaa"),
