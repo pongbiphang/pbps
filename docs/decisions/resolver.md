@@ -1439,36 +1439,54 @@ choose them.
 
 <a id="dec-1559-1"></a>
 
-**DEC-1559.1. A forwarder this run retired stays this run's in the network
-census while it leaves, matched by the PID namespace its guard's lease holds
-open.** Within a supplied run, a step finishes with its administrative or
-scratch session and retires it. The connection is dropped at once, but the
-forwarder container is removed only at cleanup, and its tasks leave the
-engine's network namespace when they exit, not when the session ends. The
-census accepted only the live sessions' guards as anchors, so whenever the
-run's next check came before those tasks exited, it read the run's own
-forwarder as a foreign occupant and refused with `Containment(Accounting)`.
-On CI this failed the supplied producer tests intermittently, and for an
-afternoon it failed most runs of `resolver (pg, second)`, `master` included
-(#1559).
+**DEC-1559.1. What a session this run retired still holds stays this run's
+until it leaves: its forwarder's tasks, matched by the PID namespace its
+guard's lease holds open; its two socket ends; and its engine session row.**
+Within a run, a step finishes with its administrative or scratch session and
+retires it. The connection is dropped at once, but three things go away only
+when the processes holding them exit:
+- the forwarder's tasks in the engine's network namespace (the container
+  itself is removed at cleanup);
+- both ends of the session's socket in the engine's TCP table;
+- the backend in the engine's session list.
 
-Each retired session's guard lease is now kept, and the census accepts a task
-whose PID namespace is one of those leases' namespaces. It is matched by
-identity alone, without the liveness check a live anchor gets, because the
-guard may already have exited. That is still exact:
-- The lease holds the namespace file open, so the namespace is never freed and
-  its identity cannot be given to anyone else's namespace.
-- A PID namespace whose init has exited admits no new process.
+Each check knew only the live sessions. So whenever the run's next check came
+before those processes exited, it read the run's own leftovers as an intruder
+and refused for good. On CI this showed up as `Containment(Accounting)` on the
+supplied producer tests. For an afternoon it failed most runs of
+`resolver (pg, second)`, `master` included (#1559).
 
-The trust argument for live forwarders (#681) carries over unchanged: joining
-a forwarder's PID namespace needs the root daemon, which is outside what this
-profile defends against.
+Retiring now records the session's guard lease, its socket pair and its
+session key. Each check treats them as this run's own:
+- The network census accepts a task whose PID namespace is a retired guard's
+  namespace. It is matched by identity alone, without the liveness check a
+  live anchor gets, because the guard may already have exited. That is still
+  exact. The lease holds the namespace file open, so the namespace is never
+  freed and its identity cannot be given to anyone else's. And a PID
+  namespace whose init has exited admits no new process.
+- The socket census skips a retired pair's inodes. A retired pair is neither
+  foreign nor required, so a live session's missing end is still
+  `MissingChannel`. Socket inodes come from the kernel's running counter and
+  are not reissued within a run's lifetime.
+- The session list must still report every live session. Any further key must
+  be a retired one.
+
+Both the supplied and the container profiles retire this way and record the
+same things. The trust argument for live forwarders (#681) carries over
+unchanged.
 
 Waiting in the fixtures was rejected, as was having the product retry the
 refusal. The refusal was the product misjudging its own run, the same check a
-user's `plan --db` makes after the same retirement.
+user's `plan --db` makes after the same retirement. The accounting part was
+the observed failure. A review of the first fix showed that the socket census
+and the session list are the same race one gate later.
 
-`a_retired_forwarder_still_in_the_engines_network_is_this_runs_own` holds a
-retired session's stream open, so its forwarder is certainly present. The test
-checks that the census refuses that forwarder without its retired guard, and
-accepts it with the guard.
+The tests:
+- `a_retired_session_may_linger_but_never_answers_for_a_live_or_foreign_one`
+  holds the session-list rule.
+- `a_retired_forwarder_still_in_the_engines_network_is_this_runs_own` uses
+  the dedicated-server fixture. It sets a session aside exactly as retiring
+  does, but holds the session's stream open, so everything it holds is
+  certainly present. The test checks that the network census and the socket
+  census each refuse without the retired record, and that the run's whole
+  check passes with it.

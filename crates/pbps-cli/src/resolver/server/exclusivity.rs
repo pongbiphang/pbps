@@ -30,6 +30,22 @@ impl TcpPair {
     }
 }
 
+/// A channel this run has retired. Its connection is dropped, but its two
+/// socket ends and its engine session go away only when the processes holding
+/// them exit, which can be after the run's next check. Until then they are
+/// this run's own, neither foreign nor required (#1559, DEC-1559.1).
+#[derive(Debug, Clone)]
+pub(crate) struct Leaving {
+    pair: TcpPair,
+    key: String,
+}
+
+impl Leaving {
+    pub(crate) fn new(pair: TcpPair, key: String) -> Self {
+        Self { pair, key }
+    }
+}
+
 /// Binds a session just opened through a forwarder to the actual kernel
 /// endpoints: the one established pair to the engine's port whose client end
 /// the forwarder's processes hold. The server end's holder is the engine's
@@ -108,15 +124,25 @@ pub(crate) fn still_bound(
 /// other row is a session: one of ours, or a refusal. A Unix socket of any
 /// kind is a refusal — the recipe gives the engine no Unix listener, so one
 /// is something a process inside the container made.
-pub(crate) fn census(init: &ProcessLease, pairs: &[&TcpPair]) -> Result<(), Error> {
+///
+/// A row belonging to a channel this run retired is skipped, present or not
+/// ([`Leaving`]). Socket inodes come from the kernel's running counter and
+/// are not handed out again within any run's lifetime, so a retired inode
+/// cannot stand for someone else's socket.
+pub(crate) fn census(
+    init: &ProcessLease,
+    pairs: &[&TcpPair],
+    leaving: &[Leaving],
+) -> Result<(), Error> {
     let unreadable = |_| Error::Exclusivity(Signal::Unreadable);
     let ours: BTreeSet<u64> = pairs.iter().flat_map(|pair| pair.inodes()).collect();
+    let retired: BTreeSet<u64> = leaving.iter().flat_map(|gone| gone.pair.inodes()).collect();
     let mut seen = BTreeSet::new();
     for table in ["net/tcp", "net/tcp6"] {
         let text = init.read_proc(table, 8 * 1024 * 1024).map_err(unreadable)?;
         for row in tcp_rows(&text).map_err(unreadable)? {
             let row = row.map_err(unreadable)?;
-            if row.state == "0A" || row.inode == 0 {
+            if row.state == "0A" || row.inode == 0 || retired.contains(&row.inode) {
                 continue;
             }
             if !ours.contains(&row.inode) {
@@ -141,10 +167,18 @@ pub(crate) fn census(init: &ProcessLease, pairs: &[&TcpPair]) -> Result<(), Erro
 ///
 /// The kernel census decides admission; this is the independent second
 /// signal. A server that cannot report every session errors in the engine
-/// adapter rather than reporting an idle server.
-pub(crate) fn only_our_sessions(reported: &[String], ours: &BTreeSet<String>) -> Result<(), Error> {
+/// adapter rather than reporting an idle server. Every live session of this
+/// run must be reported; a retired one may still be, until its backend exits
+/// ([`Leaving`]). Anything else is a session this run did not open.
+pub(crate) fn only_our_sessions(
+    reported: &[String],
+    ours: &BTreeSet<String>,
+    leaving: &[Leaving],
+) -> Result<(), Error> {
     let reported: BTreeSet<_> = reported.iter().cloned().collect();
-    if reported != *ours {
+    let accounted =
+        |key: &String| ours.contains(key) || leaving.iter().any(|gone| &gone.key == key);
+    if !ours.is_subset(&reported) || !reported.iter().all(accounted) {
         return Err(Error::Exclusivity(Signal::SessionList));
     }
     Ok(())
@@ -257,13 +291,57 @@ mod tests {
     #[test]
     fn an_engine_session_this_run_did_not_open_is_never_tolerated() {
         let ours = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
-        only_our_sessions(&["b".to_owned(), "a".to_owned()], &ours).unwrap();
+        only_our_sessions(&["b".to_owned(), "a".to_owned()], &ours, &[]).unwrap();
         assert!(matches!(
-            only_our_sessions(&["a".to_owned()], &ours),
+            only_our_sessions(&["a".to_owned()], &ours, &[]),
             Err(Error::Exclusivity(Signal::SessionList))
         ));
         assert!(matches!(
-            only_our_sessions(&["a".to_owned(), "b".to_owned(), "c".to_owned()], &ours),
+            only_our_sessions(
+                &["a".to_owned(), "b".to_owned(), "c".to_owned()],
+                &ours,
+                &[]
+            ),
+            Err(Error::Exclusivity(Signal::SessionList))
+        ));
+    }
+
+    fn leaving(key: &str) -> Leaving {
+        Leaving::new(
+            TcpPair {
+                client: 1,
+                server: 2,
+                local: String::new(),
+                peer: String::new(),
+            },
+            key.to_owned(),
+        )
+    }
+
+    /// #1559. A session this run retired may still be reported until its
+    /// backend exits, or may already be gone; either is this run's. It never
+    /// stands in for a live session, and nothing else rides on it.
+    #[test]
+    fn a_retired_session_may_linger_but_never_answers_for_a_live_or_foreign_one() {
+        let ours = BTreeSet::from(["a".to_owned()]);
+        let retired = [leaving("r")];
+        only_our_sessions(&["a".to_owned(), "r".to_owned()], &ours, &retired).unwrap();
+        only_our_sessions(&["a".to_owned()], &ours, &retired).unwrap();
+        // The negatives: a live session missing, and a foreign one present.
+        assert!(matches!(
+            only_our_sessions(&["r".to_owned()], &ours, &retired),
+            Err(Error::Exclusivity(Signal::SessionList))
+        ));
+        assert!(matches!(
+            only_our_sessions(
+                &["a".to_owned(), "r".to_owned(), "x".to_owned()],
+                &ours,
+                &retired
+            ),
+            Err(Error::Exclusivity(Signal::SessionList))
+        ));
+        assert!(matches!(
+            only_our_sessions(&["a".to_owned(), "r".to_owned()], &ours, &[]),
             Err(Error::Exclusivity(Signal::SessionList))
         ));
     }

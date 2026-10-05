@@ -528,14 +528,16 @@ async fn a_container_joined_to_the_engines_network_refuses_the_run() {
     target.check().await.unwrap();
 }
 
-/// #1559. A session this run retires is over, but its forwarder container is
-/// removed only at cleanup, and the forwarder's tasks leave the engine's
-/// network namespace when they exit. Until then the census must count them
-/// as this run's, or a step that retires its administrative session refuses
-/// the run's own next check. In CI that showed up as an intermittent
-/// accounting refusal of the supplied producer tests. Here the retired
-/// session's stream is held open, so its forwarder is certainly still there
-/// when the census runs, which the race only sometimes allowed.
+/// #1559. A session this run retires is over, but what it holds leaves only
+/// when its processes exit: the forwarder's tasks in the engine's network
+/// namespace, both socket ends in its TCP table, and the backend in the
+/// engine's session list. The forwarder container itself is removed at
+/// cleanup. Until then all three are this run's, or a step that retires its
+/// administrative session refuses the run's own next check. In CI that
+/// showed up as an intermittent accounting refusal of the supplied producer
+/// tests. Here the retired session is set aside exactly as retiring does it,
+/// but its stream is held open, so everything it holds is certainly still
+/// there when the run checks, which the race only sometimes allowed.
 #[tokio::test]
 #[ignore = "requires a disposable native Linux host and the dedicated-server fixtures"]
 async fn a_retired_forwarder_still_in_the_engines_network_is_this_runs_own() {
@@ -543,25 +545,20 @@ async fn a_retired_forwarder_still_in_the_engines_network_is_this_runs_own() {
     let mut target = native_target().await;
     let mut run = open_when_exclusive(&mut target).await;
     run.admin_session().await.unwrap();
-    let Session {
-        connection,
-        forwarder,
-        guard,
-        ..
-    } = run
+    let admin = run
         .inner
         .control
         .admin
         .take()
         .expect("the administrative session is held");
-    run.inner.control.stale.push(forwarder);
+    let connection = run.inner.control.set_aside(admin);
     {
         let analysis = run.inner.analysis.as_ref().unwrap();
         let control = run.inner.control.session.as_ref().unwrap();
         let scratch = run.scratch.as_ref().unwrap();
-        // The negative: a forwarder's tasks outside every anchor are what the
-        // accounting premise exists to refuse, so a live forwarder this run
-        // no longer names is refused.
+        // The negatives: without the retired session's record, each kernel
+        // gate sees what it exists to refuse. So the record is what lets the
+        // run through below, not an absence.
         assert!(
             matches!(
                 analysis
@@ -571,16 +568,24 @@ async fn a_retired_forwarder_still_in_the_engines_network_is_this_runs_own() {
             ),
             "the census must see the retired forwarder's tasks for this test to mean anything"
         );
-        // Held among the retired guards, the same tasks are this run's.
-        analysis
-            .runtime
-            .check(
-                &[&control.guard, &scratch.guard],
-                std::slice::from_ref(&guard),
-            )
-            .expect("a forwarder this run retired is still its own while it leaves");
+        assert!(
+            matches!(
+                exclusivity::census(
+                    analysis.runtime.init(),
+                    &[&control.pair, &scratch.pair],
+                    &[]
+                ),
+                Err(Error::Exclusivity(super::Signal::ForeignSocket))
+            ),
+            "the socket census must see the retired session's ends for this test to mean anything"
+        );
     }
-    run.inner.control.retired.push(guard);
+    // The whole check the run makes, through the bookkeeping `retire` keeps:
+    // the forwarder's tasks, both socket ends and the engine's session row
+    // are all this run's while they leave.
+    run.check(&mut target)
+        .await
+        .expect("a session this run retired is still its own while it leaves");
     drop(connection);
     run.close().await.unwrap();
     target.check().await.unwrap();
