@@ -109,6 +109,9 @@ pub struct Request<'a> {
     pub assessment: &'a Assessment,
     pub target: &'a crate::db::Target,
     pub project: &'a pbps_config::Project,
+    /// Only a producer reads the target's side, and a host with none refuses
+    /// before it would.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub base: pbps_diff::Side<'a>,
     pub desired: pbps_diff::Side<'a>,
     pub hints: &'a pbps_model::Hints,
