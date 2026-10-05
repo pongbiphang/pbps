@@ -5978,7 +5978,13 @@ pub fn cmd_plan_db(
             ids: &resolved.ids,
         };
         let mut resolver_assessment = None;
-        match crate::resolution::case(resolver_selection.as_ref(), base_side, desired_side, &cs) {
+        match crate::resolution::case(
+            resolver_selection.as_ref(),
+            base_side,
+            desired_side,
+            &cs,
+            dialect.as_ref(),
+        ) {
             crate::resolution::Case::Fallback => {}
             crate::resolution::Case::NotNeeded { assessment } => {
                 resolver_assessment = Some(crate::resolution::ResolverAssessment::not_needed(

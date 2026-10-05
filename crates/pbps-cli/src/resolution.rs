@@ -32,11 +32,12 @@ pub fn case<'a>(
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
     ordinary: &pbps_model::ChangeSet,
+    dialect: &dyn pbps_dialect::Dialect,
 ) -> Case<'a> {
     let Some(selection) = selection else {
         return Case::Fallback;
     };
-    let assessment = pbps_diff::resolver::assess(base, desired, ordinary);
+    let assessment = pbps_diff::resolver::assess(base, desired, ordinary, dialect);
     if assessment.requires_resolution() {
         Case::Required {
             selection,
@@ -316,9 +317,9 @@ mod tests {
             schema: desired,
             ids: &desired_ids,
         };
-        let ordinary =
-            pbps_diff::diff(base, desired, &pbps_pg::Postgres::new(), &Hints::default()).unwrap();
-        case(selection, base, desired, &ordinary)
+        let dialect = pbps_pg::Postgres::new();
+        let ordinary = pbps_diff::diff(base, desired, &dialect, &Hints::default()).unwrap();
+        case(selection, base, desired, &ordinary, &dialect)
     }
 
     /// A view over a table, and the same with a routine arriving beside it:
@@ -371,6 +372,42 @@ mod tests {
                 rebuilt: 0,
             }
         );
+    }
+
+    /// An index named per table moves no lookup on SQL Server, so a plan that
+    /// drops one beside a kept view is not refused for want of a binding
+    /// adapter; on PostgreSQL the same name is a relation's (DECISIONS 453).
+    #[test]
+    fn a_dropped_index_is_a_binding_question_only_where_indexes_are_relations() {
+        let (base, _) = arrival();
+        let selected = selection();
+        let base_ids = ids(&base, &IdsFile::default());
+        let side = pbps_diff::Side {
+            schema: &base,
+            ids: &base_ids,
+        };
+        let ordinary = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::DropIndex {
+                    table: "app.t".parse().unwrap(),
+                    name: "ix_gone".into(),
+                },
+            )],
+        };
+        assert!(matches!(
+            case(Some(&selected), side, side, &ordinary, &pbps_mssql::Mssql),
+            Case::NotNeeded { .. }
+        ));
+        assert!(matches!(
+            case(
+                Some(&selected),
+                side,
+                side,
+                &ordinary,
+                &pbps_pg::Postgres::new()
+            ),
+            Case::Required { .. }
+        ));
     }
 
     #[test]

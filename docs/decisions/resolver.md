@@ -1531,9 +1531,10 @@ surfaces the target holds and the plan keeps.
 - **Rebuild:** a surface the plan recreates from its own declaration.
 - **Unaffected:** every other surface, but only when no change in the plan can
   move a name lookup. Such changes are relations, columns and their types,
-  index names (they share the relation namespace), modules, and schema grants
-  (a lookup skips a schema its role may not use). The list is an exhaustive
-  match, so a new kind of change is classified rather than defaulted.
+  index names where they share the relation namespace (PostgreSQL, not SQL
+  Server: DECISIONS 453), modules, and schema grants (a lookup skips a schema
+  its role may not use). The list is an exhaustive match, so a new kind of
+  change is classified rather than defaulted.
 - **Resolve:** every other surface when some change can.
 
 The maintainer chose this coarse rule (2026-10-05) over narrowing by path,

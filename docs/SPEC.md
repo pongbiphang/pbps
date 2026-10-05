@@ -1389,10 +1389,10 @@ evidence contract, implementation boundaries and acceptance tests.
   generated, CHECK, expression-index and module surfaces the target holds and
   the plan keeps. One the plan recreates from its declaration is proven to
   rebuild. The rest are proven unaffected only when the plan changes nothing a
-  name lookup could reach — no relation, column, index name, module or schema
-  grant arrives, leaves or changes type; otherwise all of them require
-  resolution. ADR-0013's candidate rebuild of an unchanged module is such a
-  question, not its answer (DEC-1515.1).
+  name lookup could reach — no relation, column, relation-namespace index
+  name, module or schema grant arrives, leaves or changes type; otherwise all
+  of them require resolution. ADR-0013's candidate rebuild of an unchanged
+  module is such a question, not its answer (DEC-1515.1).
 - A **selected** resolver that the plan requires but that is unavailable,
   incompatible or inconclusive prevents writing either deployable plan or SQL
   output. Diagnostics name the object, uncertainty and remedy. With no

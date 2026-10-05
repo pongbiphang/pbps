@@ -59,12 +59,33 @@ impl Assessment {
 /// a silent wrong answer, where a wide one costs only a resolver run that the
 /// project asked for by selecting one.
 #[must_use]
-pub fn assess(base: crate::Side<'_>, desired: crate::Side<'_>, ordinary: &ChangeSet) -> Assessment {
+pub fn assess(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    ordinary: &ChangeSet,
+    dialect: &dyn pbps_dialect::Dialect,
+) -> Assessment {
+    assessed_with(
+        base,
+        desired,
+        ordinary,
+        dialect.indexes_share_namespace_with_tables(),
+    )
+}
+
+/// [`assess`], with the one engine fact it reads: whether an index's name is
+/// a relation's (DECISIONS 453).
+fn assessed_with(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    ordinary: &ChangeSet,
+    indexes_are_relations: bool,
+) -> Assessment {
     let after = surfaces(desired.schema);
     let moved = ordinary
         .changes
         .iter()
-        .any(|p| moves_bindings(&p.change, base, desired));
+        .any(|p| moves_bindings(&p.change, base, desired, indexes_are_relations));
     let mut questions = BTreeMap::new();
     for surface in surfaces(base.schema) {
         let kept = forward(&surface, base.ids, desired.ids);
@@ -120,7 +141,12 @@ fn declared_differently(
 /// into a namespace, takes one out, changes a type an overload is chosen by,
 /// or changes who may look in a schema. Listed in full, so a new kind of
 /// change is classified here rather than defaulting either way.
-fn moves_bindings(change: &Change, base: crate::Side<'_>, desired: crate::Side<'_>) -> bool {
+fn moves_bindings(
+    change: &Change,
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    indexes_are_relations: bool,
+) -> bool {
     match change {
         // Relations, their row types and their columns.
         Change::CreateTable { .. }
@@ -132,21 +158,24 @@ fn moves_bindings(change: &Change, base: crate::Side<'_>, desired: crate::Side<'
         | Change::AlterColumnType { .. }
         | Change::AddComputedColumn { .. }
         | Change::DropComputedColumn { .. }
-        // Each creates or drops an index, and an index's name is a relation's
-        // name: an unqualified relation lookup on the path finds it first,
-        // and one that bound it, such as a `regclass` constant, finds
-        // another relation once it is gone.
-        | Change::SetPrimaryKey { .. }
-        | Change::AddUnique { .. }
-        | Change::DropUnique { .. }
-        | Change::AddIndex { .. }
-        | Change::DropIndex { .. }
         // Renames the clones of its parent's indexes and keys to the
         // declaration's names, and its table leaves the parent's inheritance.
+        // Partitions are PostgreSQL's alone, where an index's name is a
+        // relation's.
         | Change::DetachPartition { .. }
         // A routine's identity, a view's columns, a type's existence.
         | Change::CreateModule { .. }
         | Change::DropModule { .. } => true,
+        // Each creates or drops an index. Where an index's name is a
+        // relation's (PostgreSQL), an unqualified relation lookup on the path
+        // finds it first, and one that bound it, such as a `regclass`
+        // constant, finds another relation once it is gone. Where an index
+        // is named per table (SQL Server), no lookup reaches it.
+        Change::SetPrimaryKey { .. }
+        | Change::AddUnique { .. }
+        | Change::DropUnique { .. }
+        | Change::AddIndex { .. }
+        | Change::DropIndex { .. } => indexes_are_relations,
         Change::AlterModule { id, .. } => declared_differently(id, base, desired),
         // A schema the creating role may not use is skipped by the lookup.
         Change::Grant { target, .. } | Change::Revoke { target, .. } => {
@@ -247,10 +276,19 @@ mod tests {
             ids: &desired_ids,
         };
         let ordinary = crate::diff(base, desired, &MinimalDialect, &Hints::default()).unwrap();
-        assess(base, desired, &ordinary)
+        assess(base, desired, &ordinary, &MinimalDialect)
     }
 
+    /// The changes on an engine whose index names are relation names.
     fn with(base: &Schema, changes: Vec<Change>) -> Assessment {
+        with_indexes(base, changes, true)
+    }
+
+    fn with_indexes(
+        base: &Schema,
+        changes: Vec<Change>,
+        indexes_are_relations: bool,
+    ) -> Assessment {
         let base_ids = ids(base, &IdsFile::default());
         let side = crate::Side {
             schema: base,
@@ -259,7 +297,7 @@ mod tests {
         let ordinary = ChangeSet {
             changes: changes.into_iter().map(PlannedChange::new).collect(),
         };
-        assess(side, side, &ordinary)
+        assessed_with(side, side, &ordinary, indexes_are_relations)
     }
 
     fn surface(name: &str) -> Surface {
@@ -444,6 +482,34 @@ mod tests {
         ] {
             assert!(
                 !with(&base, vec![change.clone()]).requires_resolution(),
+                "{change:?}"
+            );
+        }
+    }
+
+    /// Where an index is named per table, as on SQL Server, adding or dropping
+    /// one moves no lookup, so a selected resolver is not asked about it
+    /// (DECISIONS 453; #1526 review).
+    #[test]
+    fn an_index_named_per_table_moves_no_lookup() {
+        let base = bound();
+        let table: pbps_model::TableName = "app.t".parse().unwrap();
+        for change in [
+            Change::DropIndex {
+                table: table.clone(),
+                name: "ix_gone".into(),
+            },
+            Change::DropUnique {
+                table: table.clone(),
+                name: "uq_gone".into(),
+            },
+        ] {
+            assert!(
+                !with_indexes(&base, vec![change.clone()], false).requires_resolution(),
+                "{change:?}"
+            );
+            assert!(
+                with_indexes(&base, vec![change.clone()], true).requires_resolution(),
                 "{change:?}"
             );
         }
