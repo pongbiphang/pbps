@@ -1750,8 +1750,9 @@ is scalar, and an array's equality includes its bounds (`'[0:1]={1,2}'` is not
   leaves one out.
 - A default whose meaning depends on the session is held to the same rule for
   an array of such elements, which is right as it stands.
-- The row and cell paths are not reachable, because `data:` beside an array is
-  refused.
+- The row reader refuses a table with an array column by name, before any
+  query. So does `pull --data`, which reads rows before any `data:` is
+  declared, rather than reading `{1,2}` as a malformed integer.
 - Every other check is behind an array test already: the estimate, the risk
   classification and the probe.
 

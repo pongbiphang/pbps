@@ -6436,6 +6436,16 @@ fn an_array_column_widens_through_the_cli() {
         stderr(&o)
     );
     std::fs::write(&path, &widened).unwrap();
+    // A pull of its rows stops at the array, by name, rather than reading
+    // `{1,NULL,3}` as a malformed integer (#1525 review).
+    let other = Demo::new("arrays-1167-data");
+    let o = other.run(&["pull", "--db", &connection, "--data", "app.t"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`tags`") && stderr(&o).contains("an array"),
+        "{}",
+        stderr(&o)
+    );
     // And rows declared beside an array column.
     std::fs::write(
         &path,
