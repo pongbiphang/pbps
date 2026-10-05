@@ -2460,14 +2460,17 @@ unpartitioned table plans one `DetachPartition` and nothing else. Its base
 holds no columns of its own, so a column-by-column diff would read every one
 as new. The declaration must be its parent's shape:
 
-- the columns, in order;
+- the columns, in order, their types compared in the dialect's spelling as
+  any column's are, so `int` declared is the `integer` read back;
 - a key on the same columns;
 - every unique constraint, foreign key, check and index matched one to one
   with the parent's by definition, names aside;
 - every other field equal: description, settings, `data:`.
 
-Anything else is `DetachedShape`, named, and is a second change to make in a
-later revision. A rename at the same time stays #1170's refusal.
+The parent is read through the plan's renames first, as `diff_constraints`
+reads any table: a foreign key to a table renamed in the same plan is declared
+under the new name. Anything else is `DetachedShape`, named, and is a second
+change to make in a later revision. A rename at the same time stays #1170's refusal.
 
 **The change** carries:
 
@@ -2509,4 +2512,4 @@ name while a sequence holds it; the CLI
 `a_partition_is_detached_and_kept_through_the_cli`, which fails without the
 apply holding the table to its declared shape; and the unit tests
 `a_partition_declared_as_its_parents_shape_is_detached`, which fails without
-the shape check, and `a_detach_renames_what_it_keeps_around_one_batch`.
+the shape check, without the type normalization, or without the renames, and `a_detach_renames_what_it_keeps_around_one_batch`.

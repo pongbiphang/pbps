@@ -451,8 +451,12 @@ fn diff_partial_rebuilding(
                 .tables
                 .get(&of.parent)
                 .ok_or_else(|| vec![format!("its parent {} is not in the base", of.parent)])
-                .and_then(|parent| detached_names(parent, declared_table))
-            {
+                // The parent as this plan leaves it: a foreign key to a
+                // table renamed in the same plan is declared under the new
+                // name, as `diff_constraints` reads it below.
+                .and_then(|parent| {
+                    detached_names(&renames.apply(parent, &of.parent), declared_table, dialect)
+                }) {
                 Ok(names) => changes.push(Change::DetachPartition {
                     uid: uid.clone(),
                     table: declared_name.clone(),
@@ -2046,10 +2050,27 @@ fn refuse_temporal_changes(
 /// declaration from being the shape a detach gives it: the parent's columns
 /// in order, and every key, constraint and index matched one to one by
 /// definition, its name aside (#1544, DEC-1544.1).
-fn detached_names(parent: &Table, declared: &Table) -> Result<Vec<DetachedName>, Vec<String>> {
+fn detached_names(
+    parent: &Table,
+    declared: &Table,
+    dialect: &dyn Dialect,
+) -> Result<Vec<DetachedName>, Vec<String>> {
     let mut names = Vec::new();
     let mut what = Vec::new();
-    if !parent.columns.iter().eq(declared.columns.iter()) {
+    // Types in the engine's spelling, as `diff_columns` compares them: the
+    // parent's base reads `integer` back where its file says `int`.
+    let columns = |t: &Table| -> Vec<(String, pbps_model::Column)> {
+        t.columns
+            .iter()
+            .map(|(name, c)| {
+                let ty = dialect
+                    .normalize_type(&c.ty)
+                    .unwrap_or_else(|_| c.ty.clone());
+                (name.clone(), pbps_model::Column { ty, ..c.clone() })
+            })
+            .collect()
+    };
+    if columns(parent) != columns(declared) {
         what.push("its columns are not its parent's, in its parent's order".to_owned());
     }
     match (&parent.primary_key, &declared.primary_key) {
@@ -4235,6 +4256,62 @@ mod tests {
         .unwrap()
     }
 
+    /// `MinimalDialect`, except that `int` and `integer` are one type, as
+    /// they are to PostgreSQL.
+    struct Aliases;
+
+    impl Dialect for Aliases {
+        fn name(&self) -> &'static str {
+            "aliases"
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(ident)
+        }
+        fn emit(
+            &self,
+            change: &Change,
+            strategy: pbps_model::Strategy,
+        ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
+            MinimalDialect.emit(change, strategy)
+        }
+        fn normalize_type(
+            &self,
+            ty: &pbps_model::ColumnType,
+        ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+            let mut ty = ty.clone();
+            if ty.base == "integer" {
+                ty.base = "int".into();
+            }
+            Ok(ty)
+        }
+        fn type_change_risk(
+            &self,
+            from: &pbps_model::ColumnType,
+            to: &pbps_model::ColumnType,
+        ) -> pbps_dialect::TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(ident)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(
+            &self,
+            name: &pbps_model::TableName,
+            table: &Table,
+        ) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(name, table)
+        }
+        fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing()
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
+    }
+
     /// A dialect whose collation changes take every dependent down, and whose
     /// nullability changes take down the filtered indexes, and on tightening
     /// the indexes and unique constraints over the column, as SQL Server's do
@@ -5123,7 +5200,9 @@ mod tests {
     /// A partition declared as an ordinary table of its parent's shape is
     /// detached, under the names the declaration gives each of its parent's
     /// objects, and nothing else is planned for it (#1544). Any other shape
-    /// is refused by name, and so is a detach and a rename at once.
+    /// is refused by name, and so is a detach and a rename at once. A type in
+    /// another spelling, and a foreign key to a table this plan renames
+    /// declared under the new name, are still the parent's shape.
     #[test]
     fn a_partition_declared_as_its_parents_shape_is_detached() {
         use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
@@ -5158,10 +5237,27 @@ mod tests {
                 storage_parameters: Default::default(),
             },
         );
+        parent.foreign_keys.insert(
+            "ev_n_fk".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["n".into()],
+                references_table: "app.r".parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: pbps_model::ReferentialAction::NoAction,
+                on_update: pbps_model::ReferentialAction::NoAction,
+            },
+        );
         parent.partition_by = Some(PartitionBy {
             columns: vec!["ts".into()],
         });
         let mut tree = schema_of("app.ev", parent.clone());
+        let mut referenced = table(&[("id", Column::new(ty("int")).not_null())]);
+        referenced.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+        });
+        tree.tables.insert("app.r".parse().unwrap(), referenced);
         tree.tables.insert(
             "app.ev_1".parse().unwrap(),
             Table {
@@ -5187,7 +5283,7 @@ mod tests {
             declared.tables.insert("app.ev_1".parse().unwrap(), t);
             declared
         };
-        let outcome = |declared: &Schema, intents: &[Intent]| {
+        let outcome_in = |declared: &Schema, intents: &[Intent], dialect: &dyn Dialect| {
             let base_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
                 .unwrap()
                 .ids;
@@ -5203,10 +5299,12 @@ mod tests {
                     schema: declared,
                     ids: &declared_ids,
                 },
-                &MinimalDialect,
+                dialect,
                 &Hints::default(),
             )
         };
+        let outcome =
+            |declared: &Schema, intents: &[Intent]| outcome_in(declared, intents, &MinimalDialect);
         let planned = outcome(&shape(&|_| {}), &[]).expect("a detach is planned");
         assert_eq!(planned.changes.len(), 1, "{:?}", planned.changes);
         let Change::DetachPartition {
@@ -5228,9 +5326,87 @@ mod tests {
             pairs,
             [
                 (DetachedKind::PrimaryKey, "ev_pk", None),
+                (DetachedKind::ForeignKey, "ev_n_fk", Some("ev_n_fk")),
                 (DetachedKind::Check, "ev_n_ck", Some("arch_ck")),
                 (DetachedKind::Index, "ev_n", Some("arch_n")),
             ]
+        );
+
+        // A type in another spelling is the parent's type, in a dialect that
+        // spells both alike; one that does not tells them apart.
+        let respelled = shape(&|t| t.columns["id"].ty = ty("integer"));
+        let planned = outcome_in(&respelled, &[], &Aliases).expect("an alias is the same type");
+        assert!(
+            matches!(
+                planned.changes.as_slice(),
+                [p] if matches!(p.change, Change::DetachPartition { .. })
+            ),
+            "{:?}",
+            planned.changes
+        );
+        let errors = outcome(&respelled, &[]).expect_err("two types are refused");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("its columns are not its parent's")),
+            "{errors:?}"
+        );
+
+        // A foreign key to a table this plan renames is declared under the
+        // new name, and is still the parent's.
+        let mut moved = shape(&|t| {
+            t.foreign_keys.get_mut("ev_n_fk").unwrap().references_table = "app.r2".parse().unwrap();
+        });
+        let rename_r = |s: &mut Schema| {
+            let r = s
+                .tables
+                .remove(&"app.r".parse::<TableName>().unwrap())
+                .unwrap();
+            s.tables.insert("app.r2".parse().unwrap(), r);
+            s.tables
+                .get_mut(&"app.ev".parse::<TableName>().unwrap())
+                .unwrap()
+                .foreign_keys
+                .get_mut("ev_n_fk")
+                .unwrap()
+                .references_table = "app.r2".parse().unwrap();
+        };
+        rename_r(&mut moved);
+        let planned = outcome(
+            &moved,
+            &[Intent::RenameTable {
+                from: "app.r".parse().unwrap(),
+                to: "app.r2".parse().unwrap(),
+            }],
+        )
+        .expect("a detach beside a rename of what it references");
+        let mut kinds: Vec<&str> = planned
+            .changes
+            .iter()
+            .map(|p| match p.change {
+                Change::DetachPartition { .. } => "detach",
+                Change::RenameTable { .. } => "rename",
+                _ => "other",
+            })
+            .collect();
+        kinds.sort_unstable();
+        assert_eq!(kinds, ["detach", "rename"], "{:?}", planned.changes);
+        // Negative: the old name is no longer the parent's reference.
+        let mut stale = shape(&|_| {});
+        rename_r(&mut stale);
+        let errors = outcome(
+            &stale,
+            &[Intent::RenameTable {
+                from: "app.r".parse().unwrap(),
+                to: "app.r2".parse().unwrap(),
+            }],
+        )
+        .expect_err("a key still naming the old table is not the parent's");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("foreign key `ev_n_fk` is missing")),
+            "{errors:?}"
         );
 
         for (declared, expected) in [
