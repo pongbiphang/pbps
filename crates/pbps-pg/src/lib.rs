@@ -604,6 +604,24 @@ impl Dialect for Postgres {
                 ),
             });
         }
+        // A row's values are scalars, and an array's equality includes its
+        // bounds (`'[0:1]={1,2}'` is not `'{1,2}'`): rows are not held in a
+        // table with an array column until a codec for them is (#1167).
+        if table.data.is_some() {
+            for (column, spec) in &table.columns {
+                if spec.ty.is_array() {
+                    found.push(DialectError::Invalid {
+                        dialect: crate::types::DIALECT,
+                        message: format!(
+                            "`data:` cannot be declared on a table with an array column, and \
+                             `{column}` is `{}`; declare the rows elsewhere, or leave the block \
+                             out",
+                            spec.ty
+                        ),
+                    });
+                }
+            }
+        }
         // SQL Server's (#1176). PostgreSQL has no system-versioned table.
         if table.system_time.is_some() {
             found.push(DialectError::Invalid {
@@ -1228,6 +1246,63 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("computed column") && m.contains("generated:")),
             "{found:?}"
+        );
+    }
+
+    /// `data:` on a table with an array column is refused: a row's values
+    /// are scalars, and an array's equality includes its bounds (#1167). A
+    /// table with arrays and no rows, and rows beside no array, are clean.
+    #[test]
+    fn rows_beside_an_array_column_are_refused() {
+        use pbps_dialect::Dialect;
+        let name: pbps_model::TableName = "app.t".parse().unwrap();
+        let table = |array: bool, rows: bool| {
+            let mut t = pbps_model::Table::default();
+            t.columns.insert(
+                "id".into(),
+                pbps_model::Column::new("integer".parse().unwrap()).not_null(),
+            );
+            let tags = if array { "text[]" } else { "text" };
+            t.columns.insert(
+                "tags".into(),
+                pbps_model::Column::new(tags.parse().unwrap()),
+            );
+            t.primary_key = Some(pbps_model::PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            });
+            if rows {
+                t.data = Some(pbps_model::TableData {
+                    mode: pbps_model::DataMode::Exact,
+                    rows: Default::default(),
+                });
+            }
+            t
+        };
+        let found = |t: &pbps_model::Table| -> Vec<String> {
+            super::Postgres::default()
+                .validate_table(&name, t)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        let refused = found(&table(true, true));
+        assert!(
+            refused
+                .iter()
+                .any(|m| m.contains("array column") && m.contains("`tags`")),
+            "{refused:?}"
+        );
+        assert!(
+            found(&table(true, false)).is_empty(),
+            "{:?}",
+            found(&table(true, false))
+        );
+        assert!(
+            found(&table(false, true)).is_empty(),
+            "{:?}",
+            found(&table(false, true))
         );
     }
 

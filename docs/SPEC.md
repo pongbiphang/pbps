@@ -213,6 +213,14 @@ indexes:
   [ADR-0001](ADR-0001-yaml-crate.md).
 - **`type` uses the dialect's native type string**, and the tool normalizes it
   (`INT` / `int` / `integer` are one type).
+- **A PostgreSQL array column is `T[]`**: the built-in element type and one
+  pair of brackets. Every other spelling (`T[3]`, `T[][]`, `T ARRAY`) is
+  refused, because the engine keeps neither a size nor a dimension count and
+  reads them all back as `T[]`. An element change is taken where every element
+  keeps its value, and rewrites the table. Narrowing an element, or changing
+  between a scalar and an array, is refused. So is `data:` on a table with an
+  array column, and so is an array type on SQL Server. User-defined element
+  types are #1523 (DEC-1167.1).
 - **`deprecated` needs only a reason**; the date comes from git and is not written
   by hand.
 - **`collation` on a SQL Server column names an explicit collation**; absent

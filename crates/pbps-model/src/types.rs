@@ -30,6 +30,14 @@ pub enum TypeParseError {
 
     #[error("the argument position in type `{0}` must be between name words")]
     BadArgumentPosition(String),
+    /// An array spelled other than `T[]`: PostgreSQL keeps neither a size nor
+    /// a dimension count, and reads every spelling back as `T[]` (#1167).
+    #[error(
+        "`{0}` is not an array type pbps can hold: write the element type followed by `[]` \
+         (`integer[]`), with no size and one pair of brackets, which is how PostgreSQL reads \
+         every array back"
+    )]
+    BadArray(String),
 }
 
 /// A type argument.
@@ -74,6 +82,9 @@ pub struct ColumnType {
     // A word boundary, not a byte offset or an engine-specific suffix. Array
     // dimensions can later be represented independently of this modifier.
     args_after_word: Option<usize>,
+    // An array of this type (#1167): a marker, not a rank, since the engine
+    // enforces neither a size nor a dimension count.
+    array: bool,
 }
 
 impl ColumnType {
@@ -82,6 +93,28 @@ impl ColumnType {
             base: base.into().to_ascii_lowercase(),
             args,
             args_after_word: None,
+            array: false,
+        }
+    }
+
+    /// An array of this type, `T[]` (#1167).
+    #[must_use]
+    pub fn into_array(mut self) -> Self {
+        self.array = true;
+        self
+    }
+
+    /// Whether this is an array type, `T[]`.
+    pub fn is_array(&self) -> bool {
+        self.array
+    }
+
+    /// The element type of an array, or the type itself.
+    #[must_use]
+    pub fn element(&self) -> Self {
+        Self {
+            array: false,
+            ..self.clone()
         }
     }
 
@@ -139,6 +172,9 @@ impl fmt::Display for ColumnType {
             f.write_str(")")?;
         }
         f.write_str(after)?;
+        if self.array {
+            f.write_str("[]")?;
+        }
         Ok(())
     }
 }
@@ -150,6 +186,25 @@ impl FromStr for ColumnType {
         let s = s.trim();
         if s.is_empty() {
             return Err(TypeParseError::Empty);
+        }
+        // One trailing `[]` and nothing else of an array's other spellings
+        // (#1167): a size, a second pair, `ARRAY` or the engine's `_T`.
+        if let Some(element) = s.strip_suffix("[]") {
+            let element = element.trim_end();
+            if element.contains(['[', ']'])
+                || element
+                    .split_whitespace()
+                    .any(|w| w.eq_ignore_ascii_case("array"))
+            {
+                return Err(TypeParseError::BadArray(s.to_owned()));
+            }
+            return Ok(element.parse::<ColumnType>()?.into_array());
+        }
+        if s.contains(['[', ']'])
+            || s.split_whitespace()
+                .any(|w| w.eq_ignore_ascii_case("array"))
+        {
+            return Err(TypeParseError::BadArray(s.to_owned()));
         }
 
         let Some(open) = s.find('(') else {
@@ -315,15 +370,59 @@ mod tests {
         }
     }
 
+    /// An array is `T[]` and only that, written back the way PostgreSQL
+    /// reads every array spelling (#1167): the element, with any modifier in
+    /// its place, then one `[]`. Equal elements make equal arrays, and an
+    /// array never equals its element.
     #[test]
-    fn modifiers_need_name_boundaries_and_arrays_remain_unrepresented() {
+    fn an_array_is_its_element_and_one_pair_of_brackets() {
+        for (spelling, written) in [
+            ("text[]", "text[]"),
+            ("INTEGER[]", "integer[]"),
+            ("varchar(10)[]", "varchar(10)[]"),
+            ("numeric(10, 2) []", "numeric(10, 2)[]"),
+            (
+                "timestamp(3) with time zone[]",
+                "timestamp(3) with time zone[]",
+            ),
+        ] {
+            let ty: ColumnType = spelling
+                .parse()
+                .unwrap_or_else(|e| panic!("{spelling}: {e}"));
+            assert!(ty.is_array(), "{spelling}");
+            assert_eq!(ty.to_string(), written, "{spelling}");
+            assert_eq!(written.parse::<ColumnType>().unwrap(), ty, "{spelling}");
+            assert!(!ty.element().is_array());
+            assert_ne!(ty.element(), ty, "{spelling}");
+        }
+        assert_eq!(
+            "timestamp(3) with time zone[]"
+                .parse::<ColumnType>()
+                .unwrap()
+                .element(),
+            "timestamp(3) with time zone".parse::<ColumnType>().unwrap()
+        );
+        // Every other spelling of an array is refused, never read as a scalar.
+        for spelling in [
+            "int[3]",
+            "int[][]",
+            "int [ ]",
+            "integer ARRAY",
+            "integer array[4]",
+            "int]",
+            "[]",
+        ] {
+            assert!(spelling.parse::<ColumnType>().is_err(), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn modifiers_need_name_boundaries() {
         for spelling in [
             "timestamp(3)with time zone",
             "timestamp(3) with time zone;",
             "timestamp(3)(4)",
             "timestamp(3) with (4)",
-            "timestamp(3) with time zone[]",
-            "text[]",
         ] {
             assert!(spelling.parse::<ColumnType>().is_err(), "{spelling}");
         }

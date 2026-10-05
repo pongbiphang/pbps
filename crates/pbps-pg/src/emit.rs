@@ -2182,6 +2182,22 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             // back, so `varchar(10)` unnormalized is a type it does not know
             // and every change from one reads as `Incompatible` — a widening
             // refused for needing a clause it does not need.
+            // An array's element change is supported where the element change
+            // is safe, and nowhere else yet (#1167, DEC-1167.1): narrowing one
+            // needs element-wise probes over NULL arrays, NULL elements,
+            // bounds and shape, which nothing counts today.
+            if (was.is_array() || normalized.is_array())
+                && was.is_array() == normalized.is_array()
+                && types::change_risk(&was, &normalized) != pbps_dialect::TypeChangeRisk::Safe
+            {
+                return Err(invalid(format!(
+                    "column `{}` cannot be changed from `{was}` to `{normalized}`: an array's \
+                     element type is changed only where every element keeps its value, and \
+                     this change narrows or converts them. Add the new column, fill it in a \
+                     declared step, and drop the old one.",
+                    column.name
+                )));
+            }
             if types::change_risk(&was, &normalized) == pbps_dialect::TypeChangeRisk::Incompatible {
                 return Err(invalid(format!(
                     "column `{}` cannot be changed from `{}` to `{normalized}`: this engine \
@@ -3701,6 +3717,51 @@ mod tests {
 
     fn permissions(list: &[Permission]) -> BTreeSet<Permission> {
         list.iter().copied().collect()
+    }
+
+    /// An array's element change is emitted where the element change keeps
+    /// every value, as the scalar's would be; a narrowing one, and a change
+    /// to or from an array, are refused by name rather than emitted with a
+    /// `USING` or left to fail (#1167, DEC-1167.1).
+    #[test]
+    fn an_array_element_change_is_emitted_only_where_it_keeps_every_value() {
+        let pg = Postgres::new();
+        let change = |from: &str, to: &str| Change::AlterColumnType {
+            uid: Uid::generate(UidKind::Column),
+            column: ColumnRef {
+                table: name("app", "t"),
+                name: "c".into(),
+            },
+            from: ty(from),
+            to: ty(to),
+            from_nullable: true,
+            to_nullable: true,
+            from_collation: None,
+            to_collation: None,
+        };
+        for (from, to) in [("int[]", "bigint[]"), ("varchar(10)[]", "varchar(20)[]")] {
+            let sql = sql_of(&pg, &change(from, to)).join("\n");
+            assert!(
+                sql.contains(&format!(
+                    "TYPE {}",
+                    crate::types::normalize(&ty(to)).unwrap()
+                )),
+                "{from} -> {to}: {sql}"
+            );
+            assert!(!sql.contains("USING"), "{sql}");
+        }
+        for (from, to, says) in [
+            ("bigint[]", "int[]", "array's element type"),
+            ("varchar(20)[]", "varchar(10)[]", "array's element type"),
+            ("int", "int[]", "USING"),
+            ("int[]", "int", "USING"),
+        ] {
+            let e = pg
+                .emit(&change(from, to), Strategy::default())
+                .expect_err("refused")
+                .to_string();
+            assert!(e.contains(says), "{from} -> {to}: {e}");
+        }
     }
 
     /// A column collation reaches this emitter only past `validate`; every

@@ -1062,6 +1062,27 @@ indexes:
         }
     }
 
+    /// An array type loads as the element and its marker, renders back as
+    /// written, and another array spelling is a load error (#1167).
+    #[test]
+    fn an_array_type_round_trips_and_other_spellings_are_refused() {
+        let yaml = "table: app.t\ncolumns:\n  tags:\n    type: integer[]\n  stamps:\n    type: timestamp(3) with time zone[]\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        assert!(t.table.columns["tags"].ty.is_array());
+        assert_eq!(
+            t.table.columns["stamps"].ty.to_string(),
+            "timestamp(3) with time zone[]"
+        );
+        for spelling in ["integer[3]", "integer[][]", "integer ARRAY"] {
+            let bad = format!("table: app.t\ncolumns:\n  tags:\n    type: {spelling}\n");
+            assert!(
+                crate::load_table_str(Path::new("t.yml"), &bad).is_err(),
+                "{spelling} should not load"
+            );
+        }
+    }
+
     /// Storage parameters read back in their canonical spelling, whatever
     /// spelling was written, and render to that spelling (#1441).
     #[test]

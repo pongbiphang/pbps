@@ -3552,6 +3552,119 @@ async fn a_foreign_key_cycle_switches_persistence_together() {
     target.drop().await;
 }
 
+/// Array columns of built-in elements round trip, are rebuilt in an empty
+/// database, and take an element widening that keeps every value through a
+/// plan that applies and converges; a narrowing one is refused by name, and an
+/// array of a type pbps cannot name stays out of the pull (#1167). Values
+/// carry NULL elements, an empty array, a nondefault lower bound and two
+/// dimensions, which the widening must keep as they were.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn array_columns_round_trip_and_widen_their_elements() {
+    let s = emit_schema("arr1167");
+    let mut target = TestDb::create("arr1167").await;
+    fresh(&mut target, &s).await;
+    target
+        .execute(&format!(
+            "CREATE TABLE {s}.t (id integer PRIMARY KEY, a int[], b varchar(10)[],
+                 c timestamp(3) with time zone[], d numeric(10,2)[],
+                 e text[] NOT NULL DEFAULT '{{}}');
+             INSERT INTO {s}.t VALUES
+                 (1, '{{1,NULL,3}}', '{{x,y}}', ARRAY['2020-01-01 00:00:00.123+00'::timestamptz],
+                  '{{1.25}}', '[0:1]={{p,q}}'),
+                 (2, NULL, '{{}}', NULL, NULL, '{{{{a,b}},{{c,d}}}}');
+             CREATE TYPE {s}.mood AS ENUM ('ok');
+             CREATE TABLE {s}.u (m {s}.mood[]);"
+        ))
+        .await
+        .expect("the arrays");
+    async fn values(t: &mut TestDb, s: &str) -> String {
+        t.query(&format!(
+            "SELECT string_agg(concat_ws('|', a::text, b::text, c::text, d::text, e::text),
+                               ';' ORDER BY id) AS v FROM {s}.t"
+        ))
+        .await
+        .expect("read the values")[0]
+            .try_get::<&str>("v")
+            .unwrap()
+            .unwrap()
+            .to_owned()
+    }
+    let before = values(&mut target, &s).await;
+    let pulled = ours_only(&pull(&mut target).await, &s);
+    let t = &pulled.tables[&TableName::new(&s, "t")];
+    let types: Vec<String> = t.columns.values().map(|c| c.ty.to_string()).collect();
+    assert_eq!(
+        types,
+        [
+            "integer",
+            "integer[]",
+            "character varying(10)[]",
+            "timestamp(3) with time zone[]",
+            "numeric(10, 2)[]",
+            "text[]"
+        ]
+    );
+    assert!(t.columns["e"].default.is_some());
+    // An array of a type pbps cannot name is left out, not read as a scalar.
+    assert!(!pulled.tables.contains_key(&TableName::new(&s, "u")));
+    let ids = mint_ids(&pulled, &IdsFile::default(), &[]);
+
+    // Rebuilt in an empty database from the declaration alone.
+    let mut empty = TestDb::create("arr1167_empty").await;
+    fresh(&mut empty, &s).await;
+    apply(
+        &mut empty,
+        &Postgres::new(),
+        &plan(&Schema::default(), &IdsFile::default(), &pulled, &ids),
+    )
+    .await;
+    let rebuilt = ours_only(&pull(&mut empty).await, &s);
+    drop_schema(&mut empty, &s).await;
+    empty.drop().await;
+    assert_eq!(rebuilt, pulled);
+
+    // The widenings, on populated rows: applied, every value kept.
+    let mut wanted = pulled.clone();
+    let w = wanted.tables.get_mut(&TableName::new(&s, "t")).unwrap();
+    w.columns.get_mut("a").unwrap().ty = "bigint[]".parse().unwrap();
+    w.columns.get_mut("b").unwrap().ty = "varchar(20)[]".parse().unwrap();
+    let step = plan(&pulled, &ids, &wanted, &ids);
+    apply(&mut target, &Postgres::new(), &step).await;
+    let after = ours_only(&pull(&mut target).await, &s);
+    let kept = values(&mut target, &s).await;
+    assert_eq!(kept, before);
+    assert_eq!(
+        after.tables[&TableName::new(&s, "t")].columns["a"]
+            .ty
+            .to_string(),
+        "bigint[]"
+    );
+    assert!(plan(&after, &ids, &wanted, &ids).is_empty());
+
+    // A narrowing is refused by name, before any statement exists.
+    let mut narrowed = after.clone();
+    narrowed
+        .tables
+        .get_mut(&TableName::new(&s, "t"))
+        .unwrap()
+        .columns
+        .get_mut("a")
+        .unwrap()
+        .ty = "int[]".parse().unwrap();
+    let refused = plan(&after, &ids, &narrowed, &ids);
+    let e = refused
+        .changes
+        .iter()
+        .find_map(|p| Postgres::new().emit(&p.change, Default::default()).err())
+        .expect("the narrowing is refused")
+        .to_string();
+    assert!(e.contains("array's element type"), "{e}");
+
+    drop_schema(&mut target, &s).await;
+    target.drop().await;
+}
+
 /// Emits and executes every change of a plan, in plan order.
 ///
 /// One statement at a time through [`Conn::execute`], which is what `apply`

@@ -310,17 +310,23 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 && p.risks.contains(&RiskClass::Narrowing)
             {
                 let subject = column.table.to_string();
-                out.extend(
-                    live.finding(
-                        Some(&subject),
-                        format!(
-                            "{column}: {from} -> {to} depends on what is already stored; the \
-                             pre-flight probe counts the rows that would not fit before the \
-                             first statement runs"
-                        ),
+                // An array's element change has no probe: it is supported only
+                // where every element keeps its value, and refused when the
+                // plan is written against a database otherwise (#1167).
+                let message = if from.is_array() || to.is_array() {
+                    format!(
+                        "{column}: {from} -> {to} narrows or converts an array's elements, \
+                         which pbps does not do: the plan is refused when it is computed \
+                         against a database"
                     )
-                    .map(|f| (i, f)),
-                );
+                } else {
+                    format!(
+                        "{column}: {from} -> {to} depends on what is already stored; the \
+                         pre-flight probe counts the rows that would not fit before the \
+                         first statement runs"
+                    )
+                };
+                out.extend(live.finding(Some(&subject), message).map(|f| (i, f)));
             }
         }
     }
