@@ -16,9 +16,13 @@ fn request(
     extras: &[String],
 ) -> Result<ScopeRequest, Error> {
     let dialect = pbps_pg::Postgres::with_write_path_extras(extras.to_vec());
-    let ordinary = pbps_diff::diff(base, desired, &dialect, hints).map_err(|errors| {
-        Error::Binding(format!("ordinary typed plan cannot be formed: {errors:?}"))
-    })?;
+    // The same plan `pbps_diff::resolver::plan` starts from: without
+    // ADR-0013's candidate rebuilds, or the scope qualified here and the
+    // grants sealed at the end could describe two different plans.
+    let ordinary =
+        pbps_diff::resolver::ordinary(base, desired, &dialect, hints).map_err(|errors| {
+            Error::Binding(format!("ordinary typed plan cannot be formed: {errors:?}"))
+        })?;
     let planned = scope::planned_schema_grants(&ordinary).map_err(Error::Scope)?;
     let mut schemas = BTreeSet::new();
     for schema in [base.schema, desired.schema] {
@@ -150,10 +154,21 @@ impl ScratchRun {
                     "the existing verified scope does not match the planning request".into(),
                 ));
             }
-        } else if self.qualify(target, &request).await? != Verdict::Verified {
-            let error = Error::Scope("the analysis scope did not verify".into());
-            self.refuse_and_retire(error.clone());
-            return Err(error);
+        } else {
+            // A mismatch was measured and is the finding; an unknown fact
+            // was not, and stays operational (SPEC 9.8).
+            let error = match self.qualify(target, &request).await? {
+                Verdict::Verified => None,
+                Verdict::Mismatch(facts) => Some(Error::Incompatible(facts)),
+                Verdict::Unknown(facts) => Some(Error::Scope(format!(
+                    "the analysis scope could not be established: {}",
+                    facts.join("; ")
+                ))),
+            };
+            if let Some(error) = error {
+                self.refuse_and_retire(error.clone());
+                return Err(error);
+            }
         }
         let outcome = self
             .resolve_with_key(target, binding, Some(&key), Some((base, desired)))

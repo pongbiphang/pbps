@@ -49,6 +49,7 @@ PG16_GENERATION_TEST = "resolver::server::qualified_evidence_tests::the_pg16_pro
 GENERATION_TESTS = [PG18_GENERATION_TEST, PG16_GENERATION_TEST]
 PRODUCER_TESTS = [
     "resolver::server::qualified_evidence_tests::the_container_producer_seals_the_overload_and_default_from_one_fresh_read",
+    "resolver::server::qualified_evidence_tests::an_irrelevant_arrival_leaves_an_unmanaged_dependent_plannable",
     "resolver::server::qualified_evidence_tests::only_recorded_table_and_index_roots_own_their_catalog_columns",
     "resolver::server::qualified_evidence_tests::a_same_named_view_cannot_own_the_declared_table_uid",
     "resolver::server::qualified_evidence_tests::a_same_named_index_on_another_table_cannot_own_the_declared_index",

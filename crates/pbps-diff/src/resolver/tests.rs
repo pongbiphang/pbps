@@ -2121,3 +2121,171 @@ mod generated_surface_coverage {
         freed.proof.validate(&freed.changes).unwrap();
     }
 }
+
+/// A dialect whose candidate test rebuilds every unchanged module whenever
+/// anything arrives, and whose `AlterModule` rebuilds: the shape of
+/// PostgreSQL's ADR-0013 rule at its most conservative. Everything else is
+/// `MinimalDialect`'s.
+struct Candidates;
+
+impl pbps_dialect::Dialect for Candidates {
+    fn name(&self) -> &'static str {
+        "candidates"
+    }
+    fn rebuilds_modules(&self) -> bool {
+        true
+    }
+    fn rebound_modules(
+        &self,
+        declared: &pbps_model::Schema,
+        arriving: &[pbps_model::ModuleId],
+        already_changed: &BTreeSet<pbps_model::ModuleId>,
+    ) -> BTreeSet<pbps_model::ModuleId> {
+        if arriving.is_empty() {
+            return BTreeSet::new();
+        }
+        declared
+            .modules
+            .keys()
+            .filter(|id| !arriving.contains(id) && !already_changed.contains(id))
+            .cloned()
+            .collect()
+    }
+    fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+        pbps_dialect::MinimalDialect.quote_ident(ident)
+    }
+    fn emit(
+        &self,
+        change: &Change,
+        strategy: pbps_model::Strategy,
+    ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
+        pbps_dialect::MinimalDialect.emit(change, strategy)
+    }
+    fn normalize_type(
+        &self,
+        ty: &pbps_model::ColumnType,
+    ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+        pbps_dialect::MinimalDialect.normalize_type(ty)
+    }
+    fn type_change_risk(
+        &self,
+        from: &pbps_model::ColumnType,
+        to: &pbps_model::ColumnType,
+    ) -> pbps_dialect::TypeChangeRisk {
+        pbps_dialect::MinimalDialect.type_change_risk(from, to)
+    }
+    fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+        pbps_dialect::MinimalDialect.fold_ident(ident)
+    }
+    fn lexicon(&self) -> pbps_dialect::Lexicon {
+        pbps_dialect::MinimalDialect.lexicon()
+    }
+    fn validate_table(
+        &self,
+        name: &pbps_model::TableName,
+        table: &pbps_model::Table,
+    ) -> Vec<pbps_dialect::DialectError> {
+        pbps_dialect::MinimalDialect.validate_table(name, table)
+    }
+    fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
+        pbps_dialect::MinimalDialect.transaction_framing()
+    }
+    fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+        pbps_dialect::MinimalDialect.probe_framing()
+    }
+}
+
+/// DEC-1515.1: on the resolver's path the evidence, not the candidate test,
+/// decides which unchanged module an arrival rebuilds. The ordinary plan of
+/// the same pair rebuilds the view; the resolved plan rebuilds it only when
+/// its binding moves.
+#[test]
+fn evidence_replaces_the_candidate_rebuild_of_an_unchanged_module() {
+    use pbps_model::resolver::{Binding, BoundSurface};
+    use pbps_model::{Hints, IdsFile, Module, ModuleKind, Schema};
+    let mut base = Schema::default();
+    base.modules.insert(
+        "app.v".parse().unwrap(),
+        Module {
+            kind: ModuleKind::View,
+            description: None,
+            definition: "SELECT f() AS x".into(),
+        },
+    );
+    let mut desired = base.clone();
+    desired.modules.insert(
+        "app.f()".parse().unwrap(),
+        Module {
+            kind: ModuleKind::Function,
+            description: None,
+            definition: "RETURNS int LANGUAGE sql RETURN 1".into(),
+        },
+    );
+    let old_ids = ids(&base, &IdsFile::default());
+    let new_ids = ids(&desired, &old_ids);
+    let base_side = crate::Side {
+        schema: &base,
+        ids: &old_ids,
+    };
+    let desired_side = crate::Side {
+        schema: &desired,
+        ids: &new_ids,
+    };
+    let view: pbps_model::ModuleId = "app.v".parse().unwrap();
+    let rebuilds = |changes: &ChangeSet| {
+        changes
+            .changes
+            .iter()
+            .any(|p| p.change.module_id() == Some(&view))
+    };
+    let ordinary = crate::diff(base_side, desired_side, &Candidates, &Hints::default()).unwrap();
+    assert!(rebuilds(&ordinary), "the candidate test rebuilds the view");
+    let bound = |target: &str| BoundSurface {
+        object: identity("v"),
+        bindings: vec![Binding {
+            node: "FuncExpr".into(),
+            path: vec!["x".into()],
+            target: identity(target),
+        }],
+        managed_inputs: BTreeSet::new(),
+    };
+    let resolved = |now: &str| {
+        let observations = vec![
+            SurfaceResolution {
+                surface: Surface::Module("app.f()".parse().unwrap()),
+                current: None,
+                desired: Some(BoundSurface {
+                    object: identity("f"),
+                    bindings: vec![],
+                    managed_inputs: BTreeSet::new(),
+                }),
+            },
+            SurfaceResolution {
+                surface: Surface::Module(view.clone()),
+                current: Some(bound("ext.f")),
+                desired: Some(bound(now)),
+            },
+        ];
+        plan(
+            base_side,
+            desired_side,
+            &Hints::default(),
+            &observations,
+            &Candidates,
+        )
+        .unwrap()
+    };
+    let unchanged = resolved("ext.f");
+    assert!(
+        !rebuilds(&unchanged.changes),
+        "an unchanged binding is not rebuilt: {:?}",
+        unchanged.changes
+    );
+    unchanged.proof.validate(&unchanged.changes).unwrap();
+    let moved = resolved("app.f");
+    assert!(
+        rebuilds(&moved.changes),
+        "a moved binding is rebuilt: {:?}",
+        moved.changes
+    );
+}

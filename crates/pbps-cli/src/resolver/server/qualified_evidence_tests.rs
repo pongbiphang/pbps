@@ -713,30 +713,16 @@ async fn positive(profile: Profile) {
         "the changed target binding must rebuild the affected view in the final typed sequence"
     );
     // ADR-0013 conservatively rebuilds lexical callers of an arriving
-    // overload, even when the connected binding proves this call unchanged.
-    // The resolved plan must carry exactly that ordinary rebuild, not an
-    // additional control-view rebuild from its binding evidence.
-    let final_control: Vec<_> = changes
-        .iter()
-        .filter(|step| {
-            matches!(
-                &step.change,
-                Change::DropModule { id, .. }
-                    | Change::CreateModule { id, .. }
-                    | Change::AlterModule { id, .. }
-                    if id == &control_id
-            )
-        })
-        .collect();
-    assert_eq!(final_control.len(), 2);
-    assert!(matches!(
-        &final_control[0].change,
-        Change::DropModule { id, .. } if id == &control_id
-    ));
-    assert!(matches!(
-        &final_control[1].change,
-        Change::CreateModule { id, .. } if id == &control_id
-    ));
+    // overload: the ordinary plan above carries that rebuild. The evidence
+    // proves this call unchanged, and replaces the candidate test on this
+    // path (DEC-1515.1), so the resolved plan does not rebuild the control
+    // view at all: the irrelevant arrival of the motivating pair.
+    assert!(
+        !changes
+            .iter()
+            .any(|step| step.change.module_id() == Some(&control_id)),
+        "an unchanged binding must not be rebuilt on the resolver's path: {changes:#?}"
+    );
 
     let table: pbps_model::TableName = format!("{}.t", cases::SCHEMA).parse().unwrap();
     let default = result
@@ -878,6 +864,54 @@ async fn the_container_producer_seals_the_overload_and_default_from_one_fresh_re
 #[ignore = "requires native supplied PostgreSQL and dedicated-server fixtures"]
 async fn the_supplied_producer_seals_the_overload_and_default_from_one_fresh_read() {
     positive(Profile::Supplied).await;
+}
+
+/// The motivating pair, both halves (ADR-0016, DEC-1515.1). ADR-0013 rebuilds
+/// the control view for the arriving overload, and the unmanaged view reading
+/// it would then refuse every plan (#230). The evidence proves the control
+/// binding unchanged, so the resolved plan leaves it, and its unmanaged
+/// dependent, alone — and still rebuilds the view whose binding moves.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn an_irrelevant_arrival_leaves_an_unmanaged_dependent_plannable() {
+    let mut statements = cases::TARGET_SETUP.to_vec();
+    statements
+        .push("CREATE VIEW pbps_evidence1274.watcher AS SELECT x FROM pbps_evidence1274.control");
+    setup(&statements).await;
+    let mut owned = Some(ObservedContainers::begin());
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let control: pbps_model::ModuleId = format!("{}.control", cases::SCHEMA).parse().unwrap();
+    let affected: pbps_model::ModuleId = format!("{}.v", cases::SCHEMA).parse().unwrap();
+    let rebuilds = |changes: &pbps_model::ChangeSet, id: &pbps_model::ModuleId| {
+        changes
+            .changes
+            .iter()
+            .any(|step| step.change.module_id() == Some(id))
+    };
+    let ordinary = pbps_diff::diff(
+        inputs.base(),
+        inputs.desired(),
+        &pbps_pg::Postgres::with_write_path_extras(vec![]),
+        &inputs.hints,
+    )
+    .unwrap();
+    assert!(
+        rebuilds(&ordinary, &control),
+        "ADR-0013's candidate test rebuilds the control view on the ordinary path"
+    );
+    let result = produced(Profile::Container, &inputs, &key, &mut owned).await;
+    setup(&[]).await;
+    assert!(
+        !rebuilds(&result.changes, &control),
+        "an unchanged binding is not rebuilt: {:#?}",
+        result.changes
+    );
+    assert!(
+        rebuilds(&result.changes, &affected),
+        "a changed binding is: {:#?}",
+        result.changes
+    );
 }
 
 /// The view's real catalog binding proves the undeclared relation is a read

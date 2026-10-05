@@ -55,3 +55,4 @@ DECISIONS 465).
 - `28/` adds a table's `system_time:` (issue #1176).
 - `29/` adds a table's `partition_by:` and `partitions:` (issue #1170).
 - `30/` refuses a `schema_dir` made only of `.` and `..`, or empty: the project root or a directory above it (issue #739).
+- `31/` adds a connected plan's `resolver_assessment` (issue #1515).

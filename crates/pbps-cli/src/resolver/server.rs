@@ -97,6 +97,10 @@ pub enum Error {
     Consumed,
     #[error("the analysis scope could not be qualified or changed under the run: {0}")]
     Scope(String),
+    /// The scope was read in full and differs: an answered incompatibility,
+    /// not a failed read (SPEC 9.8, DEC-1515.1).
+    #[error("the resolver environment is incompatible with the target: {}", .0.join("; "))]
+    Incompatible(Vec<String>),
     #[error("the desired bindings could not be resolved on this run: {0}")]
     Binding(String),
 }

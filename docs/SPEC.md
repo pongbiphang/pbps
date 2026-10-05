@@ -1385,10 +1385,20 @@ evidence contract, implementation boundaries and acceptance tests.
   **requires resolution**. A name match or changed candidate set alone is not
   proof of a changed binding. Conservative extra resolver requests are an
   accepted boundary; implementing PostgreSQL's SQL semantics in the scanner
-  to eliminate them is not the design.
-- A required but unavailable, incompatible or inconclusive resolver prevents
-  writing either deployable plan or SQL output. Diagnostics name the object,
-  uncertainty and remedy. Neither risk approval nor warning suppression can
+  to eliminate them is not the design. The questions are the default,
+  generated, CHECK, expression-index and module surfaces the target holds and
+  the plan keeps. One the plan recreates from its declaration is proven to
+  rebuild. The rest are proven unaffected only when the plan changes nothing a
+  name lookup could reach — no relation, column, index name, module or schema
+  grant arrives, leaves or changes type; otherwise all of them require
+  resolution. ADR-0013's candidate rebuild of an unchanged module is such a
+  question, not its answer (DEC-1515.1).
+- A **selected** resolver that the plan requires but that is unavailable,
+  incompatible or inconclusive prevents writing either deployable plan or SQL
+  output. Diagnostics name the object, uncertainty and remedy. With no
+  resolver selected, nothing is refused for want of one: ADR-0013's candidate
+  rebuild and the unmanaged-dependent gate keep deciding, and the report never
+  presents that as resolver verification (DEC-1515.1). Neither risk approval nor warning suppression can
   waive required resolution. Explicit qualification is a possible declaration
   repair, not an unconditional bypass; it does not disambiguate every overload.
   `depends_on` supplies dependency/order intent, not the engine's binding choice.
@@ -1398,8 +1408,10 @@ evidence contract, implementation boundaries and acceptance tests.
   for this new option. `--resolve-with` requires a target-aware plan and cannot
   turn `--check` or a snapshot preview into a connected operation.
 
-Selection syntax is implemented (#606); acquisition and binding resolution
-remain unimplemented. Existing connected planning checks still apply:
+Selection (#606) and lazy acquisition (#1515) are implemented. A plan that
+needs the selected resolver runs it; publishing the resolver-backed plan waits
+for the fresh pre-publication recheck (#1516). Existing connected planning
+checks still apply:
 
 ```bash
 pbps plan --env prod --resolve-with pg_local \
@@ -1410,10 +1422,14 @@ The profile name refers to an explicitly configured source, not a verified
 runtime. CLI selection overrides the selected environment's `resolve_with`,
 which overrides the project default. Profiles and their acquisition policies
 are data only; selection reads no resolver credentials and contacts no engine
-or registry. The connected summary reports `resolver_selection` with status
-`not_acquired`, outside the saved plan and its checksum. Until acquisition and
-binding support land, the human report names that limitation; selection does
-not replace or waive any existing planning check.
+or registry. A plan the lightweight assessment answers in full opens nothing
+the resolver owns — no fingerprint key, Docker socket or scratch connection —
+and its connected summary reports `resolver_selection` with status
+`not_acquired` and `resolver_assessment` with `need: not_needed`, outside the
+saved plan and its checksum. A plan that requires the resolver reads the key
+first, then runs it. Until #1516, its answer is reported and refused as
+`resolver.publication-unavailable`, writing neither file. Selection does not
+replace or waive any existing planning check.
 
 `pbps.yml` can declare trusted Docker or dedicated-server profiles:
 
@@ -2009,10 +2025,15 @@ policy/edition findings remain in the single JSON report with exit `0`, without
 duplicate human prose on stderr. Operational failures remain `unanswerable`
 and exit `1`. Human output keeps its existing diagnostics.
 
-For the planned resolver (§9.3.2), a known resolution requirement without a
-configured resolver, an observed incompatibility, or a known unsupported
-resolution case is a finding refusal (exit `2`). Connection, metadata-read,
-image-acquisition and startup failures are `unanswerable` (exit `1`). Both
+For a selected resolver (§9.3.2), a required question it leaves unresolved,
+an observed incompatibility or a known unsupported resolution case
+(`resolver.unresolved`), a missing fingerprint key (`resolver.key`) and, until
+#1516, an answer that cannot yet be published
+(`resolver.publication-unavailable`) are finding refusals (exit `2`).
+Connection, metadata-read, image-acquisition and startup failures, and an
+analysis scope that cannot be established, are `unanswerable` (exit `1`). A
+required question with no resolver selected is not refused: the existing
+protection keeps deciding (DEC-1515.1). Both
 preserve existing output files and publish no partial deployment artifacts.
 Offline uncertainty remains advisory, and the same structured evidence and
 remedies appear in human and JSON reports.

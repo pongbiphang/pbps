@@ -41,6 +41,12 @@ fn resolver_selection_is_lazy_and_obeys_cli_environment_project_precedence() {
     resolver_selection::connected(&std::env::var("PBPS_TEST_DB").unwrap(), "mssql");
 }
 
+#[test]
+#[ignore = "needs live mssql"]
+fn a_required_resolver_refuses_by_class_and_keeps_existing_files() {
+    resolver_selection::required(&std::env::var("PBPS_TEST_DB").unwrap(), "mssql");
+}
+
 #[path = "support/resolver_discovery.rs"]
 mod resolver_discovery;
 

@@ -1490,3 +1490,65 @@ The tests:
   certainly present. The test checks that the network census and the socket
   census each refuse without the retired record, and that the run's whole
   check passes with it.
+<a id="dec-1515-1"></a>
+
+**DEC-1515.1. A selected resolver runs only when the lightweight assessment needs it; with none selected, ADR-0013 keeps deciding.**
+
+SPEC 9.3.2 refused deployable output whenever a required resolver was
+"unavailable", which reads as including "not configured". ADR-0016 also says
+existing protections stay until a tested replacement exists. The maintainer
+decided (2026-09-28, on #615) that only a **selected** resolver can refuse a
+plan. Refusing every plan that raises a binding question would refuse almost
+every project with a view the moment a column arrives, for want of a tool it
+never asked for. Connected planning therefore has three cases, separate in
+code (`resolution::Case`), output and tests:
+
+- **Case 1: no resolver selected.** The assessment does not run. ADR-0013's
+  candidate rebuild and the unmanaged-dependent gate decide, the plan stays
+  `PlanAnalysis::Ordinary`, and the report carries no resolver field, so
+  nothing claims a resolver answered.
+- **Case 2: selected, not needed.** The ordinary plan, with nothing the
+  resolver owns opened: no fingerprint key, Docker socket or scratch
+  connection. The summary keeps `resolver_selection.status: not_acquired`
+  and adds `resolver_assessment` with `need: not_needed`.
+- **Case 3: selected and needed.** The key is read first, so a missing one
+  costs no container. Then `resolver::server::produce` runs. The answer
+  splits as DECISIONS 485 and SPEC 9.8 do:
+  - **Findings (exit 2):** an unresolved declared surface, an analysis scope
+    measured incompatible (`Error::Incompatible`, split from an unreadable
+    one), a supplied server measured short of its profile, an engine with no
+    binding adapter (SQL Server, or a host other than Linux), and a missing
+    key.
+  - **Unanswerable (exit 1):** connecting, acquiring, starting, an
+    unreadable scope and an unconfirmed cleanup.
+  - **An answer** is not yet published: `resolver.publication-unavailable`,
+    writing neither file, until #1516 adds the fresh recheck.
+
+**The assessment** is a pure function of the typed plan
+(`pbps_diff::resolver::assess`); it reads no catalog. The questions are the
+surfaces the target holds and the plan keeps.
+
+- **Rebuild:** a surface the plan recreates from its own declaration.
+- **Unaffected:** every other surface, but only when no change in the plan can
+  move a name lookup. Such changes are relations, columns and their types,
+  index names (they share the relation namespace), modules, and schema grants
+  (a lookup skips a schema its role may not use). The list is an exhaustive
+  match, so a new kind of change is classified rather than defaulted.
+- **Resolve:** every other surface when some change can.
+
+The maintainer chose this coarse rule (2026-10-05) over narrowing by path,
+dependency or name. Each narrowing needs reasoning ADR-0016 leaves to the
+engine: a qualified overload call, column notation, a relation-namespace
+arrival. A wrong narrowing is a silent wrong answer; a wide one costs a
+resolver run the project opted into by selecting one.
+
+**ADR-0013's candidate rebuild of an unchanged module is a question, not an
+answer.** Read as proof, it would answer the very question the resolver
+exists to ask. On the resolver's path the differ therefore adds no candidate
+rebuilds (`Rebinding::Evidence`). `pbps_diff::resolver::plan` and the
+producer's scope request share that plan (`resolver::ordinary`). A module is
+rebuilt there only when the evidence shows its binding moving, or a managed
+input being replaced. This is the motivating pair: the irrelevant arrival no
+longer rebuilds the view, so its unmanaged dependent no longer refuses the
+plan, while the view whose binding moves is rebuilt. Ordinary planning keeps
+the candidate rule unchanged.

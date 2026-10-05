@@ -35,6 +35,12 @@ fn resolver_selection_is_lazy_and_obeys_cli_environment_project_precedence() {
     resolver_selection::connected(&server(), "postgres");
 }
 
+#[test]
+#[ignore = "needs live postgres"]
+fn a_required_resolver_refuses_by_class_and_keeps_existing_files() {
+    resolver_selection::required(&server(), "postgres");
+}
+
 #[path = "support/resolver_discovery.rs"]
 mod resolver_discovery;
 
