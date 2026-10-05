@@ -119,6 +119,12 @@ checksum-pinned, and state lives in the database itself.
   approved `ci-gate` is pending and the pull request cannot be queued. The
   merge group, `master` and dispatched runs name no environment and start by
   themselves.
+- An actual PR base edit also starts associated CI on the new merge ref
+  (DEC-1457.1). Refresh the dependent's OPEN/base/head/diff and review evidence,
+  then approve the base-edit run on its current head and require the complete
+  matrix before enqueueing. Ignore metadata-only runs: they create no
+  `ci-gate`, do not cancel qualified CI and run no matrix. Do not select a run
+  merely because it is the newest or green in Actions.
 - Wait for `ci-gate` on the approved run and read the run, not `check-runs`,
   which lists only the jobs created so far. Retry a transient failure with
   `gh run rerun <run-id>`

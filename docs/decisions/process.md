@@ -856,3 +856,49 @@ selection must hide the late-closed control; removing the window distinction
 must turn the older-closed control into a false alarm. #1463's real closeout
 supplies the successfully enumerated empty-dependent all-state control, without
 creating a throwaway production PR.
+
+
+<a id="dec-1457-1"></a>
+
+**DEC-1457.1. A PR base edit starts associated CI on the new merge ref; metadata
+edits neither supersede CI nor publish its required context.** GitHub's default
+`pull_request` activity types are `opened`, `synchronize` and `reopened`.
+Explicitly include `edited`, then admit `changes.base.ref.from` to the ordinary
+approval/full-matrix route. This preserves the reviewed head while checking the
+new combined tree, including when the current PR has no associated required
+check. It does not grant approval: the primary agent refreshes the OPEN/base/head,
+remaining diff and review evidence before approving that associated run.
+
+A title or body edit is a separate concurrency group keyed by run ID, so it
+neither cancels a running qualified-head run nor replaces a pending one. Its
+approval and gate jobs are skipped and its gate is named `ci-metadata`, never
+`ci-gate`: GitHub treats a skipped required job as passing, which could otherwise
+hide missing CI. No full matrix starts. The normal fan-in still waits for every
+job and treats failure, cancellation and unexpected skips as failure.
+
+Older successful runs remain historical evidence on the same head. After an
+actual base change, read the current PR's required checks and the new associated
+run; do not infer qualification from an old green Actions row. Select the base
+edit's run on the current head, verify its PR association and checkout merge ref,
+approve after the existing review gate qualifies, and require its complete
+matrix and `ci-gate` before enqueueing. Ignore metadata-only runs when selecting
+CI evidence. Moving `master` alone still needs no rebase or new source review
+(Decision 502), and the merge group still tests the exact integrated tree.
+
+A transient failure retries the same PR-associated run with `gh run rerun`,
+not `workflow_dispatch`, which cannot supply the PR's check (Decision 206).
+A rerun retains its original event/ref/SHA; it is not a way to manufacture a
+fresh retargeted merge ref. A missing base-edit run is failed admission: retain
+the dependent and inspect its event, workflow and conflicts, rather than
+closing/reopening it, rewriting its head or bypassing the gate.
+
+The retained #1226 recovery runs (36356526170 and 36359397387) have the same
+source head and actual `refs/pull/1226/merge` checkout. The latter was triggered
+by reopening, before the explicit base change; it is historical association
+evidence, not proof of the new edited route. The permanent workflow-expression
+tests use GitHub's pinned parser/evaluator on base-edited and metadata payload
+shapes, including isolated pending groups and absence of a required-check name.
+No throwaway production PR is required. See
+[GitHub's pull-request events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request),
+[rerun identity](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs),
+and [required check results](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/defining-the-mergeability-of-pull-requests/about-protected-branches#require-status-checks-before-merging).

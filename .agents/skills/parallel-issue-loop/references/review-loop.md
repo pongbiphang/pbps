@@ -114,6 +114,16 @@ request, so it goes green in the Actions tab while the required check stays
 unsatisfied (DECISIONS 206, 501). A red CI result requires a fix, push, and
 return to the draft loop.
 
+An actual base edit starts a new PR-associated merge-ref run behind approval
+(DEC-1457.1). Refresh OPEN/base/unchanged head/remaining diff and review evidence,
+then select and approve that base-edit run on the current head. Require its
+complete matrix and `ci-gate` before enqueueing. Metadata-only runs use separate
+concurrency groups, run no matrix and emit no required `ci-gate`; never select
+one as CI evidence. A rerun keeps the original ref/SHA, so it retries a transient
+failure but cannot manufacture a fresh merge-ref run after retargeting. Missing
+base-edit evidence stops admission; it does not permit close/reopen, head
+rewrites, dispatch or a bypass.
+
 `master` moving before merge needs no action: the queue rebuilds the PR against
 current `master` when it is enqueued.
 

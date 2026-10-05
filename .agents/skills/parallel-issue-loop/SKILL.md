@@ -116,7 +116,9 @@ and merge order.
   needed; an open-only scan cannot authorize local cleanup (DEC-1458.1).
   Never rely on automatic retargeting (DEC-1228.1). Refresh each dependent's
   existing review
-  and current-head CI gates before enqueueing. Do not rebase merely for this
+  and current-head CI gates before enqueueing. Select the actual base-edit
+  associated run and require its complete matrix after approval; metadata-only
+  runs create no `ci-gate` and cannot qualify the PR (DEC-1457.1). Do not rebase merely for this
   base change or because `master` moved. Two things do
   need you, and both begin by rebasing onto current `master`, because neither
   reproduces on a branch that predates it: a conflict, which ejects the PR from

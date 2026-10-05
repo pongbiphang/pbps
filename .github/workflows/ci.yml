@@ -37,6 +37,7 @@ name: CI
 # nothing that can clear it.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [master]
   merge_group:
@@ -50,12 +51,15 @@ permissions:
 
 # Keyed on the pull request number where there is one, so that a run on
 # `refs/pull/N/merge` and a later run on the branch do not share a group.
-# Only pull-request runs are cancelled: a `push` or `merge_group` run is the
-# only run its commit will ever get, and cancelling it reports `cancelled`
+# A base edit needs a fresh PR-associated merge-ref run (DEC-1457.1). Other
+# edits get their own group: even a non-cancelling run in the same group could
+# replace the pending approved-head run. They also emit no `ci-gate` check.
+# Only qualifying pull-request runs are cancelled: a `push` or `merge_group`
+# run is the only run its commit will ever get, and cancelling it reports `cancelled`
 # where the gate expects an answer.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.base.ref.from && format('metadata-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base.ref.from) }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -68,6 +72,7 @@ jobs:
   # approval fails it, which skips everything after it and shuts `ci-gate`.
   approve:
     name: approval
+    if: ${{ github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from }}
     runs-on: ubuntu-latest
     environment: ${{ github.event_name == 'pull_request' && 'ci-approval' || '' }}
     steps:
@@ -88,6 +93,10 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: scripts/ci-event-policy-test.sh
       - run: python3 scripts/live_test_runners_test.py
       # Before the toolchain: it needs none, and a duplicate decision
       # identifier from two branches merges without a textual conflict, so this
@@ -602,14 +611,17 @@ jobs:
   # failing gate, cleared by `gh run rerun <run-id>`. Wrongly shut is
   # recoverable; wrongly open is not.
   #
+  # Metadata edits deliberately create no required-check context: a skipped
+  # job named `ci-gate` would count as passing and hide missing CI. The name
+  # and admission condition below keep those runs out of qualification.
   # For the same reason `skipped` and `cancelled` are failures below and not
   # passes. Nothing here is meant to be skipped; if something ever is, the gate
   # should shut rather than open, and a `paths` filter added later cannot
   # quietly qualify a pull request that nothing ran on.
   gate:
-    name: ci-gate
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.base.ref.from && 'ci-metadata' || 'ci-gate' }}
     needs: [approve, lint, quick, windows, live, live-transport-mssql, live-editions, live-pg, dev-rehearsal, resolver, msrv]
-    if: ${{ always() }}
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from) }}
     runs-on: ubuntu-latest
     steps:
       # This job is the one required check and only as strong as its `needs`:
