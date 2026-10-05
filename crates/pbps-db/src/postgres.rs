@@ -197,11 +197,18 @@ impl Conn {
     }
 
     pub(crate) async fn connect_verified(connection_string: &str) -> Result<Self, DbError> {
-        let config: Config = connection_string
+        let mut config: Config = connection_string
             .parse()
             .map_err(|e: tokio_postgres::Error| DbError::BadConnectionString(e.to_string()))?;
+        // A string that names no `sslmode` means verified TLS here as on every
+        // other connection (DECISIONS 543), so a target accepted by connected
+        // planning is accepted by the resolver too (#1514 review).
+        if !names_ssl_mode(connection_string) {
+            config.ssl_mode(tokio_postgres::config::SslMode::Require);
+        }
         // Prefer may accept a server's plaintext refusal of SSLRequest. This
-        // constructor promises peer verification before database authentication.
+        // constructor promises peer verification before database authentication,
+        // so a written insecure mode is refused rather than honoured.
         if config.get_ssl_mode() != tokio_postgres::config::SslMode::Require {
             return Err(DbError::Refused(
                 "peer-verified PostgreSQL connections require sslmode=require".into(),
@@ -963,6 +970,33 @@ mod tests {
             "postgresql://u:p?x@db.example",
         ] {
             assert!(!names_ssl_mode(unnamed), "{unnamed}");
+        }
+    }
+
+    /// A verified connection takes an unwritten `sslmode` as verified TLS,
+    /// as every connection does, and still refuses a written insecure one
+    /// before any socket opens (#1514 review).
+    #[tokio::test]
+    async fn a_verified_connection_takes_an_unwritten_sslmode_as_verified_tls() {
+        for refused in ["sslmode=disable", "sslmode=prefer"] {
+            let error = Conn::connect_verified(&format!("host=localhost port=1 user=u {refused}"))
+                .await
+                .err()
+                .expect("a written insecure mode is refused");
+            assert!(matches!(error, DbError::Refused(_)), "{refused}: {error:?}");
+        }
+        for unwritten in [
+            "host=localhost port=1 user=u connect_timeout=1",
+            "postgres://u@localhost:1/d?connect_timeout=1",
+        ] {
+            let error = Conn::connect_verified(unwritten)
+                .await
+                .err()
+                .expect("nothing listens on port 1");
+            assert!(
+                !matches!(error, DbError::Refused(_)),
+                "{unwritten}: {error:?}"
+            );
         }
     }
 

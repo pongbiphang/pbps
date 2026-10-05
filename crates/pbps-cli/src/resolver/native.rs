@@ -40,6 +40,7 @@ pub(crate) use pseudo::MqueueLease;
 pub(crate) use target::TargetWitness;
 pub use target::{
     CaptureFailure, CapturedTargetInputs, EnvironmentError, NativeTarget, NativeTargetError,
+    TargetConnectError,
 };
 use task_metadata::{read_bytes, read_status, stat_fields};
 
@@ -265,13 +266,8 @@ impl ProcessLease {
             1024 * 1024,
         )
         .map_err(Reading::CaptureStatus.named())?;
-        let namespace_pid = status
-            .lines()
-            .find_map(|line| line.strip_prefix("NSpid:"))
-            .and_then(|pids| pids.split_whitespace().last())
-            .and_then(|pid| pid.parse::<u32>().ok())
-            .filter(|pid| *pid > 0)
-            .ok_or_else(|| Reading::CaptureStatus.refuse())?;
+        let namespace_pid =
+            nspid(&status, Nspid::Innermost).ok_or_else(|| Reading::CaptureStatus.refuse())?;
         let executable_path =
             std::fs::read_link(base.join("exe")).map_err(Reading::CaptureExecutable.named())?;
         let executable =
@@ -475,6 +471,38 @@ impl ProcessLease {
                 .ok_or(UnqualifiedProcess)
         };
         Ok(identity(self)? == identity(other)?)
+    }
+
+    /// This process's PID in the PID namespace of the procfs it was read
+    /// through: the first `NSpid` entry. From the host init's view that is
+    /// the PID this observer captures by, where [`Self::namespace_pid`] is
+    /// the innermost one and names another process here.
+    pub(crate) fn view_pid(&self) -> Result<u32, UnqualifiedProcess> {
+        self.check()?;
+        let status =
+            read_status(self.open_proc("status")?, 1024 * 1024).map_err(|_| UnqualifiedProcess)?;
+        let pid = nspid(&status, Nspid::View).ok_or(UnqualifiedProcess)?;
+        self.check()?;
+        Ok(pid)
+    }
+
+    /// The parent's PID as this observer numbers it. Only an observer lease
+    /// answers: a PID read inside another PID namespace would name another
+    /// process here.
+    pub(crate) fn parent_pid(&self) -> Result<u32, UnqualifiedProcess> {
+        if !matches!(self.source, ProcSource::Observer(_)) {
+            return Err(UnqualifiedProcess);
+        }
+        self.check()?;
+        let stat = read_bytes(self.open_proc("stat")?, 65536).map_err(|_| UnqualifiedProcess)?;
+        let parent = stat_fields(&stat)?
+            .1
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or(UnqualifiedProcess)?;
+        self.check()?;
+        Ok(parent)
     }
 
     pub fn has_same_executable_parent(&self) -> Result<bool, UnqualifiedProcess> {
@@ -1398,6 +1426,98 @@ fn socket_owner(
     Ok((owners.remove(0), inode))
 }
 
+/// Why the engine service behind a connection was not found on this host
+/// (DEC-1514.1). Each is a refusal and never means that no resolver is needed:
+/// the remedies differ, so the cause is named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ServiceDiscovery {
+    #[error(
+        "the target is not reached over this host's loopback: engine-assisted planning observes a \
+         target engine on the same host, connected through localhost"
+    )]
+    NotLocal,
+    #[error("no process on this host holds the target's end of the connection")]
+    Absent,
+    #[error("{0} processes on this host hold the target's end of the connection")]
+    Ambiguous(usize),
+    #[error(
+        "this host's process table could not be read for the target's end of the connection: the \
+         observer needs permission to read the engine's processes"
+    )]
+    Unreadable,
+}
+
+/// The engine service behind one verified connection, found from the
+/// connection itself: the process holding its server end, walked up to the
+/// service root that runs the same executable. Configuration names no PID,
+/// so nothing an operator writes can point the binding at another process;
+/// [`NativeTarget::establish`](target::NativeTarget::establish) still
+/// verifies every premise of the one this returns.
+pub(crate) fn discover_service(connection: &PeerVerifiedConn) -> Result<u32, ServiceDiscovery> {
+    let endpoints = connection.tcp_endpoints();
+    let (local, peer) = (endpoints.local(), endpoints.peer());
+    if !local.ip().is_loopback() || !peer.ip().is_loopback() {
+        return Err(ServiceDiscovery::NotLocal);
+    }
+    let unreadable = |_| ServiceDiscovery::Unreadable;
+    let inode = peer_inode(local, peer).map_err(unreadable)?;
+    // The host's init is the anchor: its PID namespace numbers every process
+    // the way this observer does, so a holder's PID is one to capture here.
+    let anchor = ProcessLease::capture(1).map_err(unreadable)?;
+    let holder = sole_holder(observed_socket_holders(&anchor, inode).map_err(unreadable)?)?;
+    // The holder's own namespace may be a child of the host's while it shares
+    // the host's network; its innermost PID would name another process here.
+    let mut process =
+        ProcessLease::capture(holder.view_pid().map_err(unreadable)?).map_err(unreadable)?;
+    if !process.same_process(&holder).map_err(unreadable)? {
+        return Err(ServiceDiscovery::Unreadable);
+    }
+    // A backend is a child of its service, running the same executable; the
+    // root is the first ancestor whose parent runs something else. The bound
+    // only stops a walk that a changing table could keep alive.
+    for _ in 0..64 {
+        if !process.has_same_executable_parent().map_err(unreadable)? {
+            return process.observer_pid().map_err(unreadable);
+        }
+        let parent = process.parent_pid().map_err(unreadable)?;
+        process = ProcessLease::capture(parent).map_err(unreadable)?;
+    }
+    Err(ServiceDiscovery::Unreadable)
+}
+
+/// Which `NSpid` entry: the first is the PID in the reading procfs's own
+/// namespace, the last the innermost.
+#[derive(Clone, Copy)]
+enum Nspid {
+    View,
+    Innermost,
+}
+
+fn nspid(status: &str, which: Nspid) -> Option<u32> {
+    let mut pids = status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))?
+        .split_whitespace();
+    match which {
+        Nspid::View => pids.next(),
+        Nspid::Innermost => pids.last(),
+    }?
+    .parse::<u32>()
+    .ok()
+    .filter(|pid| *pid > 0)
+}
+
+/// The one process holding the server end. None is a target this host does
+/// not run; more than one leaves the service unidentified, and choosing
+/// either would bind planning to a guess (DEC-1514.1).
+fn sole_holder<T>(mut holders: Vec<T>) -> Result<T, ServiceDiscovery> {
+    match holders.len() {
+        0 => Err(ServiceDiscovery::Absent),
+        1 => Ok(holders.remove(0)),
+        many => Err(ServiceDiscovery::Ambiguous(many)),
+    }
+}
+
 fn start_ticks(base: &Path) -> Result<u64, UnqualifiedProcess> {
     let stat = read_bytes(
         File::open(base.join("stat")).map_err(|_| UnqualifiedProcess)?,
@@ -1824,6 +1944,32 @@ mod tests {
     /// that saw the holder exit, and one that saw a second thread group hold
     /// the same descriptor — and a bare "the owner could not be established"
     /// distinguishes neither (#674).
+    /// A holder in a child PID namespace is reopened by its PID in the view
+    /// it was found through, never by its innermost one (#1514 review).
+    #[test]
+    fn a_discovered_holder_is_reopened_by_its_view_pid() {
+        let status = "Name:\tpostgres\nNSpid:\t4242\t7\nNSpgid:\t4242\t7\n";
+        assert_eq!(super::nspid(status, super::Nspid::View), Some(4242));
+        assert_eq!(super::nspid(status, super::Nspid::Innermost), Some(7));
+        let flat = "NSpid:\t4242\n";
+        assert_eq!(super::nspid(flat, super::Nspid::View), Some(4242));
+        assert_eq!(super::nspid(flat, super::Nspid::Innermost), Some(4242));
+        assert_eq!(super::nspid("Name:\tx\n", super::Nspid::View), None);
+    }
+
+    #[test]
+    fn a_service_is_discovered_only_from_exactly_one_holder() {
+        assert_eq!(super::sole_holder(vec![7]), Ok(7));
+        assert_eq!(
+            super::sole_holder(Vec::<u32>::new()),
+            Err(super::ServiceDiscovery::Absent)
+        );
+        assert_eq!(
+            super::sole_holder(vec![7, 8]),
+            Err(super::ServiceDiscovery::Ambiguous(2))
+        );
+    }
+
     #[test]
     fn a_counted_refusal_reports_the_count_it_counted() {
         assert_eq!(Reading::OwnerCount(0).to_string(), "owner-count(0)");

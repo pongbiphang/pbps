@@ -493,6 +493,120 @@ async fn open(profile: Profile, target: &mut NativeTarget) -> ScratchRun {
     }
 }
 
+/// One run through [`super::producer::produce_with`] with the fixture's
+/// runtime. A supplied server can still be settling into exclusivity from a
+/// previous run, so that one refusal is retried, as [`open`] does.
+async fn produced(
+    profile: Profile,
+    inputs: &Inputs,
+    key: &ProjectKey,
+    owned: &mut Option<ObservedContainers>,
+) -> ResolvedPlan {
+    let connection = std::env::var("PBPS_NATIVE_CONNECTION").unwrap();
+    let (socket, resolver) = match profile {
+        Profile::Container => {
+            assert_eq!(
+                std::env::var("PBPS_NATIVE_FACTORY_FIXTURE").as_deref(),
+                Ok("1")
+            );
+            (
+                PathBuf::from(std::env::var("PBPS_RESOLVER_TEST_SOCKET").unwrap()),
+                ResolverProfile::Docker {
+                    image: std::env::var("PBPS_RESOLVER_TEST_IMAGE").unwrap(),
+                    pull: PullPolicy::Never,
+                },
+            )
+        }
+        Profile::Supplied => {
+            assert_eq!(std::env::var("PBPS_SERVER_FIXTURE").as_deref(), Ok("1"));
+            (
+                PathBuf::from(super::producer::NATIVE_DOCKER_SOCKET),
+                ResolverProfile::Server {
+                    url_env: "PBPS_SERVER_ENDPOINT".into(),
+                },
+            )
+        }
+    };
+    let mut refusals = Vec::new();
+    for _ in 0..60 {
+        let produced = super::producer::produce_with(
+            &socket,
+            pbps_db::Driver::Postgres,
+            &resolver,
+            &connection,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+        match produced {
+            Ok(plan) => {
+                if let Some(owned) = owned {
+                    owned.finish(&[]);
+                }
+                return plan;
+            }
+            Err(ProduceError::Run(
+                cause @ (Error::Exclusivity(_) | Error::Containment(Premise::Occupants)),
+            )) if matches!(profile, Profile::Supplied) => refusals.push(cause),
+            Err(refused) => {
+                let recovery = if let ProduceError::Cleanup(names) = &refused {
+                    names.clone()
+                } else {
+                    Vec::new()
+                };
+                if let Some(owned) = owned {
+                    owned.finish(&recovery);
+                }
+                panic!("the production entry point refused its compatible fixture: {refused}");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    panic!("the supplied native fixture did not become exclusive: {refusals:?}");
+}
+
+/// The production run connects with the driver its caller chose, so a SQL
+/// Server target's string is read as one: its written insecure option is
+/// refused by name, never misread as a PostgreSQL string (#1514 review).
+#[tokio::test]
+async fn the_production_run_connects_with_the_callers_driver() {
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let refused = super::producer::produce_with(
+        Path::new("/nonexistent"),
+        pbps_db::Driver::Mssql,
+        &ResolverProfile::Server {
+            url_env: "PBPS_1514_UNSET".into(),
+        },
+        "Server=localhost,1;User Id=sa;Password=x;Encrypt=false",
+        &inputs.binding(),
+        inputs.base(),
+        inputs.desired(),
+        &inputs.hints,
+        &[],
+        &key.project,
+        Some(ENVIRONMENT),
+    )
+    .await
+    .err()
+    .expect("an unverified SQL Server target is refused");
+    assert!(
+        matches!(
+            refused,
+            ProduceError::Target(crate::resolver::native::TargetConnectError::Unverified(
+                pbps_db::DbError::Refused(_)
+            ))
+        ),
+        "{refused:?}"
+    );
+    assert!(refused.to_string().contains("Encrypt=true"), "{refused}");
+}
+
 async fn close(run: &mut ScratchRun, owned: &mut Option<ObservedContainers>) {
     let closed = run.close().await;
     let recovery = closed
@@ -521,33 +635,12 @@ fn view<'a>(
 async fn positive(profile: Profile) {
     setup(cases::TARGET_SETUP).await;
     let mut owned = matches!(profile, Profile::Container).then(ObservedContainers::begin);
-    let mut target = target().await;
-    let mut run = open(profile, &mut target).await;
     let inputs = Inputs::overload();
     let key = ProjectKey::new(true);
-    let result = run
-        .plan_resolved(
-            &mut target,
-            &inputs.binding(),
-            inputs.base(),
-            inputs.desired(),
-            &inputs.hints,
-            &[],
-            &key.project,
-            Some(ENVIRONMENT),
-        )
-        .await;
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            close(&mut run, &mut owned).await;
-            panic!("the qualified fresh producer refused its compatible fixture: {error}");
-        }
-    };
-    // The producer result is owned data. Release the run before any assertion
-    // can panic, so an oracle failure cannot strand its exact owned container.
-    close(&mut run, &mut owned).await;
-    target.check().await.unwrap();
+    // The production entry point, as `plan --db` runs it: the target's
+    // service is discovered from its connection, and the run is closed
+    // before the result is returned (#1514).
+    let result = produced(profile, &inputs, &key, &mut owned).await;
     setup(&[]).await;
     result.evidence.validate(&result.changes).unwrap();
     pbps_pg::resolver::validate_evidence(&result.evidence)

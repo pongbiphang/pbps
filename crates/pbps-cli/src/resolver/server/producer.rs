@@ -268,3 +268,212 @@ impl ScratchRun {
         Ok(ResolvedPlan { changes, evidence })
     }
 }
+
+#[cfg(test)]
+mod released_tests {
+    use super::{Error, ProduceError, released};
+
+    /// A cleanup that succeeded leaves nothing to name, whatever the refusal
+    /// listed before it ran; a failed one names only what it could not
+    /// confirm (#1514 review).
+    #[test]
+    fn only_unconfirmed_cleanup_is_reported_after_a_refusal() {
+        assert!(matches!(
+            released(Error::Scratch, None),
+            ProduceError::Run(Error::Scratch)
+        ));
+        assert!(matches!(
+            released(Error::Scratch, Some(Vec::new())),
+            ProduceError::Run(Error::Scratch)
+        ));
+        let ProduceError::Cleanup(names) = released(Error::Scratch, Some(vec!["db".into()])) else {
+            panic!("an unconfirmed cleanup is named");
+        };
+        assert_eq!(names, ["db"]);
+    }
+}
+
+/// The native Docker daemon's socket. Only a root-owned socket closed to
+/// other users is admitted (`LocalApi::connect_native`); a rootless or
+/// proxied daemon needs its own measured profile (RESOLVER-RUNTIME).
+pub const NATIVE_DOCKER_SOCKET: &str = "/var/run/docker.sock";
+
+/// What stopped a production run before it returned evidence (#1514).
+#[derive(Debug, thiserror::Error)]
+pub enum ProduceError {
+    #[error(transparent)]
+    Target(#[from] crate::resolver::native::TargetConnectError),
+    #[error("the target's database recipe could not be read: {0}")]
+    Recipe(crate::resolver::native::EnvironmentError),
+    #[error("the resolver profile could not be acquired: {0}")]
+    Acquire(String),
+    /// The run or its admission refused; nothing it owned is left behind.
+    #[error("{0}")]
+    Run(Error),
+    /// Cleanup was not confirmed: these exact names may remain.
+    #[error("the resolver run's cleanup was not confirmed; remove exactly: {}", .0.join(", "))]
+    Cleanup(Vec<String>),
+}
+
+impl From<super::ServerFailure> for ProduceError {
+    fn from(failure: super::ServerFailure) -> Self {
+        if failure.recovery_names.is_empty() {
+            Self::Run(failure.cause)
+        } else {
+            Self::Cleanup(failure.recovery_names)
+        }
+    }
+}
+
+/// One production resolver run for a connected plan (DEC-1514.1), for the
+/// target's driver as the caller chose it. It binds the
+/// selected target to its native service, opens the profile's scratch run,
+/// produces the sealed order and evidence, and closes the run before any
+/// result leaves. Every refusal has already released what the run owned, or
+/// names exactly what it could not confirm.
+#[allow(clippy::too_many_arguments)]
+pub async fn produce(
+    driver: pbps_db::Driver,
+    profile: &pbps_config::resolver::ResolverProfile,
+    target_connection: &str,
+    binding: &BindingRequest<'_>,
+    base: pbps_diff::Side<'_>,
+    desired: pbps_diff::Side<'_>,
+    hints: &Hints,
+    write_path_extras: &[String],
+    project: &pbps_config::Project,
+    environment: Option<&str>,
+) -> Result<ResolvedPlan, ProduceError> {
+    produce_with(
+        std::path::Path::new(NATIVE_DOCKER_SOCKET),
+        driver,
+        profile,
+        target_connection,
+        binding,
+        base,
+        desired,
+        hints,
+        write_path_extras,
+        project,
+        environment,
+    )
+    .await
+}
+
+/// [`produce`] with the Docker socket a fixture supplies.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn produce_with(
+    docker_socket: &std::path::Path,
+    driver: pbps_db::Driver,
+    profile: &pbps_config::resolver::ResolverProfile,
+    target_connection: &str,
+    binding: &BindingRequest<'_>,
+    base: pbps_diff::Side<'_>,
+    desired: pbps_diff::Side<'_>,
+    hints: &Hints,
+    write_path_extras: &[String],
+    project: &pbps_config::Project,
+    environment: Option<&str>,
+) -> Result<ResolvedPlan, ProduceError> {
+    // The caller's driver, chosen where the CLI chooses engines
+    // (`db::driver_for`): this run names none, so an engine without evidence
+    // reaches `plan_resolved`'s named refusal rather than a parse error.
+    let mut target = NativeTarget::connect(driver, target_connection).await?;
+    let recipe = target
+        .database_recipe()
+        .await
+        .map_err(ProduceError::Recipe)?;
+    let mut run = open_run(docker_socket, profile, &mut target, &recipe).await?;
+    let result = run
+        .plan_resolved(
+            &mut target,
+            binding,
+            base,
+            desired,
+            hints,
+            write_path_extras,
+            project,
+            environment,
+        )
+        .await;
+    // The run is released before anything reads the result, so a refusal
+    // after it cannot strand the scratch server or its container.
+    let closed = run.close().await;
+    match (result, closed) {
+        (_, Err(failure)) if !failure.recovery_names.is_empty() => {
+            Err(ProduceError::Cleanup(failure.recovery_names))
+        }
+        (Err(refused), _) => Err(ProduceError::Run(refused)),
+        (Ok(_), Err(failure)) => Err(ProduceError::Run(failure.cause)),
+        (Ok(plan), Ok(())) => Ok(plan),
+    }
+}
+
+/// A refusal after its runtime's cleanup ran. The refusal's own recovery
+/// names were the obligations before that cleanup; only what the cleanup
+/// itself could not confirm may remain, so only those are reported.
+fn released(cause: Error, cleanup: Option<Vec<String>>) -> ProduceError {
+    match cleanup {
+        Some(names) if !names.is_empty() => ProduceError::Cleanup(names),
+        Some(_) | None => ProduceError::Run(cause),
+    }
+}
+
+/// The profile's scratch run. A refusal after the runtime started releases
+/// it before returning, as the run's own close would.
+async fn open_run(
+    docker_socket: &std::path::Path,
+    profile: &pbps_config::resolver::ResolverProfile,
+    target: &mut NativeTarget,
+    recipe: &pbps_db::resolver::environment::DatabaseRecipe,
+) -> Result<ScratchRun, ProduceError> {
+    use pbps_config::resolver::ResolverProfile;
+    match profile {
+        ResolverProfile::Docker { .. } => {
+            let mut api = crate::resolver::docker::LocalApi::connect_native(docker_socket)
+                .await
+                .map_err(|error| ProduceError::Acquire(error.to_string()))?;
+            let image = api
+                .acquire(profile)
+                .await
+                .map_err(|error| ProduceError::Acquire(error.to_string()))?;
+            let mut candidate =
+                crate::resolver::docker::CandidateSession::start(api, image, target)
+                    .await
+                    .map_err(|failure| {
+                        if failure.recovery_names.is_empty() {
+                            ProduceError::Acquire(failure.cause.to_string())
+                        } else {
+                            ProduceError::Cleanup(failure.recovery_names)
+                        }
+                    })?;
+            match candidate.open_scratch(recipe).await {
+                Ok(run) => Ok(run),
+                Err(refused) => Err(released(
+                    refused.cause,
+                    candidate
+                        .close()
+                        .await
+                        .err()
+                        .map(|failure| failure.recovery_names),
+                )),
+            }
+        }
+        ResolverProfile::Server { .. } => {
+            let endpoint =
+                super::ScratchEndpoint::from_profile(profile).map_err(ProduceError::Run)?;
+            let mut server = super::DedicatedServer::admit(endpoint, target).await?;
+            match server.open_scratch(recipe).await {
+                Ok(run) => Ok(run),
+                Err(refused) => Err(released(
+                    refused.cause,
+                    server
+                        .discard()
+                        .await
+                        .err()
+                        .map(|failure| failure.recovery_names),
+                )),
+            }
+        }
+    }
+}

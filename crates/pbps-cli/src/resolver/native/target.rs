@@ -54,6 +54,28 @@ pub enum NativeTargetError {
     Binding(#[from] UnqualifiedProcess),
 }
 
+/// Why a target connection did not become a native target binding (#1514).
+#[derive(Debug, thiserror::Error)]
+pub enum TargetConnectError {
+    /// The connection's own options refused verification before any socket.
+    /// Only this failure carries the TLS remedy, naming both engines since
+    /// the caller chose the driver (#1514 review).
+    #[error(
+        "the target connection must verify its server's certificate and name (PostgreSQL: \
+         `sslmode=require` or no `sslmode`; SQL Server: `Encrypt=true` with certificate \
+         validation): {0}"
+    )]
+    Unverified(pbps_db::DbError),
+    /// Any other failure to connect keeps its own diagnosis: a refused port,
+    /// a timeout or a password says nothing about TLS settings.
+    #[error("the target connection failed: {0}")]
+    Connect(pbps_db::DbError),
+    #[error(transparent)]
+    Discovery(#[from] super::ServiceDiscovery),
+    #[error(transparent)]
+    Target(#[from] NativeTargetError),
+}
+
 struct BoundTarget {
     connection: PeerVerifiedConn,
     lease: Arc<SocketOwnerLease>,
@@ -139,10 +161,40 @@ impl NativeTarget {
             .map(|state| state.lease.service())
             .ok_or(UnqualifiedProcess)
     }
-    /// A configured PID selects the live service and its procfs view. The
+    /// Connects to the selected target and binds it to the engine service
+    /// holding the connection's server end on this host. The service is
+    /// found from the connection, never named by configuration (DEC-1514.1).
+    pub async fn connect(
+        driver: pbps_db::Driver,
+        connection_string: &str,
+    ) -> Result<Self, TargetConnectError> {
+        let connection = PeerVerifiedConn::connect(driver, connection_string)
+            .await
+            .map_err(|error| {
+                // Named rather than wildcarded: a new variant has to be decided
+                // on, since one about the options would need the TLS remedy.
+                match error {
+                    pbps_db::DbError::Refused(_) => TargetConnectError::Unverified(error),
+                    pbps_db::DbError::BadConnectionString(_)
+                    | pbps_db::DbError::Connect { .. }
+                    | pbps_db::DbError::ConnectTimeout { .. }
+                    | pbps_db::DbError::Driver { .. }
+                    | pbps_db::DbError::Context { .. }
+                    | pbps_db::DbError::WrongSession { .. }
+                    | pbps_db::DbError::BadRow(_) => TargetConnectError::Connect(error),
+                }
+            })?;
+        let service = super::discover_service(&connection)?;
+        Ok(Self::establish(connection, service).await?)
+    }
+
+    /// Binds a connection to the service the caller selected, by PID, with
+    /// its procfs view. [`Self::connect`] selects it from the connection;
+    /// fixtures name it directly. The PID selects and asserts nothing: the
     /// observed connected holder must have a positive parent relation to that
-    /// service; a namespace peer or PID label alone cannot qualify a backend.
-    /// Trusted provisioning excludes hostile socket sharing (DECISIONS 533).
+    /// service, and a namespace peer or PID label alone cannot qualify a
+    /// backend. Trusted provisioning excludes hostile socket sharing
+    /// (DECISIONS 533).
     pub async fn establish(
         mut connection: PeerVerifiedConn,
         service_pid: u32,
