@@ -2465,7 +2465,9 @@ as new. The declaration must be its parent's shape:
 - a key on the same columns;
 - every unique constraint, foreign key, check and index matched one to one
   with the parent's by definition, names aside;
-- every other field equal: description, settings, `data:`.
+- every other field equal: settings, `data:`. A description, the table's or a
+  column's, is prose `diff` does not compare and a connected base never holds,
+  so it is free.
 
 The parent is read through the plan's renames first, as `diff_constraints`
 reads any table: a foreign key to a table renamed in the same plan is declared

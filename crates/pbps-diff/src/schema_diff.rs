@@ -2058,7 +2058,9 @@ fn detached_names(
     let mut names = Vec::new();
     let mut what = Vec::new();
     // Types in the engine's spelling, as `diff_columns` compares them: the
-    // parent's base reads `integer` back where its file says `int`.
+    // parent's base reads `integer` back where its file says `int`. A
+    // description is prose `diff` does not compare, and a connected base
+    // never holds one, so it is not compared here either.
     let columns = |t: &Table| -> Vec<(String, pbps_model::Column)> {
         t.columns
             .iter()
@@ -2066,7 +2068,12 @@ fn detached_names(
                 let ty = dialect
                     .normalize_type(&c.ty)
                     .unwrap_or_else(|_| c.ty.clone());
-                (name.clone(), pbps_model::Column { ty, ..c.clone() })
+                let column = pbps_model::Column {
+                    ty,
+                    description: None,
+                    ..c.clone()
+                };
+                (name.clone(), column)
             })
             .collect()
     };
@@ -2156,12 +2163,11 @@ fn detached_names(
         indexes: Default::default(),
         partition_by: None,
         partition_of: None,
+        description: None,
         ..t.clone()
     };
     if rest(parent) != rest(declared) {
-        what.push(
-            "it declares a description, setting or `data:` its parent does not have".to_owned(),
-        );
+        what.push("it declares a setting or `data:` its parent does not have".to_owned());
     }
     if what.is_empty() {
         Ok(names)
@@ -5330,6 +5336,22 @@ mod tests {
                 (DetachedKind::Check, "ev_n_ck", Some("arch_ck")),
                 (DetachedKind::Index, "ev_n", Some("arch_n")),
             ]
+        );
+
+        // A description is prose, and differs from the parent's freely: a
+        // connected base never holds one.
+        let described = shape(&|t| {
+            t.description = Some("last year's events".into());
+            t.columns["n"].description = Some("a count".into());
+        });
+        let planned = outcome(&described, &[]).expect("a description is not shape");
+        assert!(
+            matches!(
+                planned.changes.as_slice(),
+                [p] if matches!(p.change, Change::DetachPartition { .. })
+            ),
+            "{:?}",
+            planned.changes
         );
 
         // A type in another spelling is the parent's type, in a dialect that
