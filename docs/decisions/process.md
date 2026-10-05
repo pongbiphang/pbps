@@ -869,6 +869,18 @@ new combined tree, including when the current PR has no associated required
 check. It does not grant approval: the primary agent refreshes the OPEN/base/head,
 remaining diff and review evidence before approving that associated run.
 
+An edited event can still carry its former base's `GITHUB_SHA`: #1535's
+restored-master run 37273424527 was associated with the right PR/head/base,
+yet its default checkout `b66f67da589c5fc5ba2eb0ffcd5e7a755b61844d`
+had the former base as its first parent. After approval, bootstrap the reviewed
+source and select the live `refs/pull/N/merge` only when complete, stable PR/ref
+snapshots and both commit parents match the event's reviewed head and intended
+base ref. Movement of the same base branch is allowed. Pin the selected SHA as
+an approval output and give every job that exact checkout; association and a
+green matrix alone do not prove the intended tree. Missing, unreadable, changed
+or ambiguous evidence fails the bounded selector instead of accepting an old
+merge. Non-PR events retain their exact event SHA.
+
 A title or body edit is a separate concurrency group keyed by run ID, so it
 neither cancels a running qualified-head run nor replaces a pending one. Its
 `cancel-in-progress` expression explicitly returns a boolean: unlike a job
@@ -890,8 +902,9 @@ CI evidence. Moving `master` alone still needs no rebase or new source review
 
 A transient failure retries the same PR-associated run with `gh run rerun`,
 not `workflow_dispatch`, which cannot supply the PR's check (Decision 206).
-A rerun retains its original event/ref/SHA; it is not a way to manufacture a
-fresh retargeted merge ref. A missing base-edit run is failed admission: retain
+A rerun retains its original event head/base intent. The selector rechecks the
+same intended base, but refuses a newly retargeted base; a rerun cannot create
+that base edit's associated event. A missing base-edit run is failed admission: retain
 the dependent and inspect its event, workflow and conflicts, rather than
 closing/reopening it, rewriting its head or bypassing the gate.
 

@@ -33,13 +33,13 @@ function value(input) {
   return new data.Dictionary(...Object.entries(input).map(([key, item]) => ({ key, value: value(item) })));
 }
 const always = { name: 'always', minArgs: 0, maxArgs: 0, call: () => new data.BooleanData(true) };
-function evaluate(template, github) {
+function evaluate(template, github, needs = {}) {
   const parts = template.split(/(\$\{\{[\s\S]*?\}\})/).filter(Boolean);
   const results = parts.map(part => {
     if (!part.startsWith('${{')) return part;
     const tokens = new Lexer(part.slice(3, -2)).lex().tokens;
-    const expression = new Parser(tokens, ['github'], [always]).parse();
-    return new Evaluator(expression, value({ github }), new Map([['always', always]])).evaluate();
+    const expression = new Parser(tokens, ['github', 'needs'], [always]).parse();
+    return new Evaluator(expression, value({ github, needs }), new Map([['always', always]])).evaluate();
   });
   if (results.length === 1 && typeof results[0] !== 'string') return results[0];
   return new data.StringData(results.map(item => typeof item === 'string' ? item : item.coerceString()).join(''));
@@ -130,6 +130,31 @@ test('failure and cancellation cannot skip the required qualifying gate', () => 
   assert.match(job('gate'), /python3 scripts\/check_gate_needs\.py/);
   for (const [name, block] of [...workflow.split('jobs:\n')[1].matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/gm)].map(match => [match[1], match[2]])) {
     if (name === 'approve' || name === 'gate') continue;
-    assert.match(block, /^    needs: (approve|lint)$/m, `${name} must remain behind approval`);
+    assert.match(block, /^    needs: (approve|\[approve, lint\])$/m, `${name} must remain behind approval`);
+  }
+});
+
+
+test('every job uses one validated intended-base checkout rather than the stale edited-event SHA', () => {
+  const head = 'a'.repeat(40);
+  const staleMerge = 'b'.repeat(40);
+  const currentMerge = 'c'.repeat(40);
+  const edited = context('pull_request', 'edited', { base: { ref: { from: 'parent' } } });
+  edited.sha = staleMerge;
+  edited.event.pull_request.head.sha = head;
+  const approve = job('approve');
+  assert.match(approve, /checkout_sha: \$\{\{ steps\.checkout\.outputs\.checkout_sha \}\}/);
+  assert.match(approve, /python3 scripts\/ci_pr_checkout\.py/);
+  const bootstrap = approve.match(/uses: actions\/checkout@v7\n        with:\n          ref: (.+)/);
+  assert.ok(bootstrap, 'approval bootstraps the reviewed source before selecting its merge ref');
+  assert.equal(evaluate(bootstrap[1], edited).coerceString(), head);
+  for (const [name, block] of [...workflow.split('jobs:\n')[1].matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/gm)].map(match => [match[1], match[2]])) {
+    if (name === 'approve') continue;
+    assert.match(block, /^    needs: (approve|\[[^\]\n]*\bapprove\b[^\]\n]*\])$/m, `${name} directly receives approval outputs`);
+    const checkouts = [...block.matchAll(/uses: actions\/checkout@v7\n        with:\n          ref: (.+)/g)];
+    assert.equal(checkouts.length, 1, `${name} has one explicit checkout`);
+    const selected = evaluate(checkouts[0][1], edited, { approve: { outputs: { checkout_sha: currentMerge } } }).coerceString();
+    assert.equal(selected, currentMerge, `${name} shares the validated merge SHA`);
+    assert.notEqual(selected, staleMerge, 'edited-event GITHUB_SHA cannot select the former base');
   }
 });

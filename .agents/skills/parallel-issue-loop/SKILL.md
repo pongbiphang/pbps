@@ -117,7 +117,9 @@ and merge order.
   Never rely on automatic retargeting (DEC-1228.1). Refresh each dependent's
   existing review
   and current-head CI gates before enqueueing. Select the actual base-edit
-  associated run and require its complete matrix after approval; metadata-only
+  associated run and require its complete matrix after approval. Verify the
+  approval-selected merge SHA has the intended base and reviewed head as its
+  parents and every job uses it; edited-event SHAs can retain the old base. Metadata-only
   runs create no `ci-gate` and cannot qualify the PR (DEC-1457.1). Do not rebase merely for this
   base change or because `master` moved. Two things do
   need you, and both begin by rebasing onto current `master`, because neither

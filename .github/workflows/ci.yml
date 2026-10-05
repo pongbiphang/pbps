@@ -48,6 +48,7 @@ on:
 # calling the API.
 permissions:
   contents: read
+  pull-requests: read
 
 # Keyed on the pull request number where there is one, so that a run on
 # `refs/pull/N/merge` and a later run on the branch do not share a group.
@@ -76,8 +77,18 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from }}
     runs-on: ubuntu-latest
     environment: ${{ github.event_name == 'pull_request' && 'ci-approval' || '' }}
+    outputs:
+      checkout_sha: ${{ steps.checkout.outputs.checkout_sha }}
     steps:
-      - run: echo "approved to run $GITHUB_EVENT_NAME"
+      # Bootstrap the reviewed source, not an edited event's stale merge SHA.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Pin the validated CI tree
+        id: checkout
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_pr_checkout.py
 
   # The fan-in every other job waits on: the short checks, in one job for one
   # toolchain and one cache restore. What it is kept for is that nothing
@@ -91,6 +102,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -98,6 +111,7 @@ jobs:
         with:
           node-version: 24
       - run: scripts/ci-event-policy-test.sh
+      - run: python3 scripts/ci_pr_checkout_test.py
       - run: python3 scripts/live_test_runners_test.py
       # Before the toolchain: it needs none, and a duplicate decision
       # identifier from two branches merges without a textual conflict, so this
@@ -119,10 +133,12 @@ jobs:
 
   quick:
     name: test (ubuntu-latest)
-    needs: lint
+    needs: [approve, lint]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -150,10 +166,12 @@ jobs:
   # platform difference that only show up here.
   windows:
     name: test (windows-latest)
-    needs: lint
+    needs: [approve, lint]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -170,7 +188,7 @@ jobs:
   # apply(plan(A->B)) converges on B). Linux only: the service container needs a
   # Linux docker host.
   live:
-    needs: lint
+    needs: [approve, lint]
     runs-on: ubuntu-latest
     services:
       mssql:
@@ -195,6 +213,8 @@ jobs:
       PBPS_TEST_DB: "Server=localhost,14330;User Id=sa;Password=Pbps!Ci12345;TrustServerCertificate=true"
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # The service has no health check hook here; the loop stands in for one.
@@ -263,10 +283,12 @@ jobs:
   # warn about. Here it has a runner to itself, with no services, so a crash
   # costs this job alone and cannot be mistaken for one of `live`'s (#627).
   live-transport-mssql:
-    needs: lint
+    needs: [approve, lint]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Built before the fixture runs: it points `SSL_CERT_FILE` at its own
@@ -301,7 +323,7 @@ jobs:
   # Here the second starts only once the first answers, and a crash costs this
   # job alone rather than every SQL Server suite.
   live-editions:
-    needs: lint
+    needs: [approve, lint]
     runs-on: ubuntu-latest
     env:
       IMAGE: mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
@@ -309,6 +331,8 @@ jobs:
       PBPS_TEST_EXPRESS_DB: "Server=localhost,14331;User Id=sa;Password=Pbps!Ci12345;TrustServerCertificate=true"
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: start the two SQL Servers, one after the other
@@ -369,7 +393,7 @@ jobs:
   # case in no variant, so a filter that drifts fails `quick` instead of
   # dropping tests.
   live-pg:
-    needs: lint
+    needs: [approve, lint]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -420,6 +444,8 @@ jobs:
       PBPS_TEST_PG_OLD_DB: "host=localhost port=54321 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@stable
       # Keyed by variant: each builds different targets, and under one key
       # the first to finish would save a cache the other three cannot use.
@@ -477,12 +503,14 @@ jobs:
   # as a service container, and a second engine on the same runner is the
   # pressure the startup crashes suggest is worth not adding.
   dev-rehearsal:
-    needs: lint
+    needs: [approve, lint]
     runs-on: ubuntu-latest
     env:
       PBPS_TEST_DEV_IMAGE: mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: plan --dev docker://
@@ -507,7 +535,7 @@ jobs:
   # its own containers and scratch root, so none relies on one before it;
   # what they share is the test binary, which each half builds for itself.
   resolver:
-    needs: lint
+    needs: [approve, lint]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -516,6 +544,8 @@ jobs:
         half: [first, second]
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@stable
       # Keyed by half: the first also builds the test profile its container
       # fixtures run under, and the second does not.
@@ -578,10 +608,12 @@ jobs:
   # The MSRV is set by serde-saphyr (see docs/ADR-0001). It gets its own job so
   # that accidentally using newer syntax is caught here rather than by a user.
   msrv:
-    needs: lint
+    needs: [approve, lint]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
@@ -631,6 +663,8 @@ jobs:
       # would also drop that wait, and an empty `needs` passes the step below
       # (#637).
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
       - run: python3 scripts/check_gate_needs.py
       # Through the environment, not `${{ }}` inside `run:`: interpolation
       # would splice the value into the program text.

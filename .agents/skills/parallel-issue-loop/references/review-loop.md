@@ -117,10 +117,14 @@ return to the draft loop.
 An actual base edit starts a new PR-associated merge-ref run behind approval
 (DEC-1457.1). Refresh OPEN/base/unchanged head/remaining diff and review evidence,
 then select and approve that base-edit run on the current head. Require its
-complete matrix and `ci-gate` before enqueueing. Metadata-only runs use separate
+complete matrix and `ci-gate` before enqueueing. Verify the approval-selected
+merge SHA has the intended base and reviewed head as its parents, and every job
+checks out that same pinned SHA. The edited event itself can retain the former
+base merge SHA even while its run correctly names the new PR base. Metadata-only runs use separate
 concurrency groups, run no matrix and emit no required `ci-gate`; never select
-one as CI evidence. A rerun keeps the original ref/SHA, so it retries a transient
-failure but cannot manufacture a fresh merge-ref run after retargeting. Missing
+one as CI evidence. A rerun retains its original event head/base intent: the
+selector may retry the same intended base, but refuses a newly retargeted base
+and cannot manufacture its associated event. Missing
 base-edit evidence stops admission; it does not permit close/reopen, head
 rewrites, dispatch or a bypass.
 

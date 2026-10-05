@@ -122,7 +122,10 @@ checksum-pinned, and state lives in the database itself.
 - An actual PR base edit also starts associated CI on the new merge ref
   (DEC-1457.1). Refresh the dependent's OPEN/base/head/diff and review evidence,
   then approve the base-edit run on its current head and require the complete
-  matrix before enqueueing. Ignore metadata-only runs: they create no
+  matrix before enqueueing. Verify the approval-selected merge SHA has the
+  intended base and reviewed head as its parents, and that every job checks
+  out that same pinned SHA; an edited event can retain the former base SHA.
+  Ignore metadata-only runs: they create no
   `ci-gate`, do not cancel qualified CI and run no matrix. Do not select a run
   merely because it is the newest or green in Actions.
 - Wait for `ci-gate` on the approved run and read the run, not `check-runs`,
