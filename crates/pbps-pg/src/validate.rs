@@ -222,7 +222,8 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                     continue;
                 };
                 let jsonb = table.columns.get(column).is_some_and(|c| {
-                    crate::types::normalize(&c.ty).is_ok_and(|t| t.base == "jsonb")
+                    // Not `jsonb[]`, whose base is the element's (#1525 review).
+                    crate::types::normalize(&c.ty).is_ok_and(|t| t.base == "jsonb" && !t.is_array())
                 });
                 // A missing column is already named by `key_columns`.
                 if table.columns.contains_key(column) && !jsonb {

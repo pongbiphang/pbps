@@ -3574,7 +3574,9 @@ async fn array_columns_round_trip_and_widen_their_elements() {
                   '{{1.25}}', '[0:1]={{p,q}}'),
                  (2, NULL, '{{}}', NULL, NULL, '{{{{a,b}},{{c,d}}}}');
              CREATE TYPE {s}.mood AS ENUM ('ok');
-             CREATE TABLE {s}.u (m {s}.mood[]);"
+             CREATE TABLE {s}.u (m {s}.mood[]);
+             CREATE TABLE {s}.g (id integer PRIMARY KEY, docs jsonb[]);
+             CREATE INDEX g_docs ON {s}.g USING gin (docs);"
         ))
         .await
         .expect("the arrays");
@@ -3608,6 +3610,11 @@ async fn array_columns_round_trip_and_widen_their_elements() {
     assert!(t.columns["e"].default.is_some());
     // An array of a type pbps cannot name is left out, not read as a scalar.
     assert!(!pulled.tables.contains_key(&TableName::new(&s, "u")));
+    // A GIN index over `jsonb[]` is not one over `jsonb` (#1525 review): left
+    // out, while its table and column are held.
+    let g = &pulled.tables[&TableName::new(&s, "g")];
+    assert_eq!(g.columns["docs"].ty.to_string(), "jsonb[]");
+    assert!(g.indexes.is_empty(), "{:?}", g.indexes);
     let ids = mint_ids(&pulled, &IdsFile::default(), &[]);
 
     // Rebuilt in an empty database from the declaration alone.

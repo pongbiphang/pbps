@@ -485,7 +485,13 @@ fn check_numeric(ty: &ColumnType, p: i64, s: i64) -> Result<(), DialectError> {
 /// Server counterpart, which admits a `decimal` with scale zero — here
 /// `numeric(10,0)` is refused like any other.
 pub fn identity_range(ty: &ColumnType) -> Option<RangeInclusive<i64>> {
-    match normalize(ty).ok()?.base.as_str() {
+    let ty = normalize(ty).ok()?;
+    // An array of integers holds no identity: its base is the element's
+    // (#1167, #1525 review).
+    if ty.is_array() {
+        return None;
+    }
+    match ty.base.as_str() {
         "smallint" => Some(i64::from(i16::MIN)..=i64::from(i16::MAX)),
         "integer" => Some(i64::from(i32::MIN)..=i64::from(i32::MAX)),
         "bigint" => Some(i64::MIN..=i64::MAX),

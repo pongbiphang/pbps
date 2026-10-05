@@ -1249,6 +1249,75 @@ mod tests {
         );
     }
 
+    /// An array is never mistaken for its element where a check reads the
+    /// element's name (#1525 review): an identity on `integer[]`, and a GIN
+    /// index over `jsonb[]`, are refused as on any other type, while the
+    /// scalar `integer` and `jsonb` keep both.
+    #[test]
+    fn an_array_is_not_its_element_for_identity_or_gin() {
+        use pbps_dialect::Dialect;
+        let name: pbps_model::TableName = "app.t".parse().unwrap();
+        let found = |t: &pbps_model::Table| -> Vec<String> {
+            super::Postgres::default()
+                .validate_table(&name, t)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        let identity = |ty: &str| {
+            let mut t = pbps_model::Table::default();
+            let mut c = pbps_model::Column::new(ty.parse().unwrap()).not_null();
+            c.identity = Some(pbps_model::Identity {
+                seed: 1,
+                increment: 1,
+            });
+            t.columns.insert("id".into(), c);
+            t
+        };
+        assert!(
+            found(&identity("integer")).is_empty(),
+            "{:?}",
+            found(&identity("integer"))
+        );
+        let refused = found(&identity("integer[]"));
+        assert!(
+            refused.iter().any(|m| m.contains("identity")),
+            "{refused:?}"
+        );
+
+        let gin = |ty: &str| {
+            let mut t = pbps_model::Table::default();
+            t.columns
+                .insert("doc".into(), pbps_model::Column::new(ty.parse().unwrap()));
+            t.indexes.insert(
+                "ix_doc".into(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        key: pbps_model::IndexKey::Column("doc".into()),
+                        descending: false,
+                        opclass: Some("jsonb_path_ops".into()),
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: pbps_model::IndexMethod::Gin,
+                    storage_parameters: Default::default(),
+                },
+            );
+            t
+        };
+        assert!(
+            found(&gin("jsonb")).is_empty(),
+            "{:?}",
+            found(&gin("jsonb"))
+        );
+        let refused = found(&gin("jsonb[]"));
+        assert!(
+            refused.iter().any(|m| m.contains("GIN only over")),
+            "{refused:?}"
+        );
+    }
+
     /// `data:` on a table with an array column is refused: a row's values
     /// are scalars, and an array's equality includes its bounds (#1167). A
     /// table with arrays and no rows, and rows beside no array, are clean.

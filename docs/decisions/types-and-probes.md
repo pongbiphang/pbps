@@ -1743,3 +1743,15 @@ is scalar, and an array's equality includes its bounds (`'[0:1]={1,2}'` is not
 **SQL Server** refuses an array type by name, rather than reading `int[]` as
 `int`.
 
+**Every check that reads a type's base name was audited for arrays once**
+(#1525 review), because an array's base is its element's.
+- An identity on `integer[]` is refused.
+- So is a GIN index over `jsonb[]`, in validation and in the reader, which
+  leaves one out.
+- A default whose meaning depends on the session is held to the same rule for
+  an array of such elements, which is right as it stands.
+- The row and cell paths are not reachable, because `data:` beside an array is
+  refused.
+- Every other check is behind an array test already: the estimate, the risk
+  classification and the probe.
+
