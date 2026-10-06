@@ -219,40 +219,48 @@ mod producer {
         .await
         .map(|resolved| resolved.changes)
         .map_err(|failure| match failure {
-            ProduceError::Run(error) => match error {
-                // Answered: a declared surface had no sound verdict, or the
-                // environment was measured and differs, or this run's profile
-                // cannot serve the engine.
-                Error::Binding(_) | Error::Incompatible(_) | Error::UnsupportedProfile { .. } => {
-                    unresolved(request, error)
-                }
-                // The supplied server was measured and does not meet the
-                // profile it claims: also an answer.
-                Error::Container(_)
-                | Error::Configuration(_)
-                | Error::EngineExecutable
-                | Error::Containment(_)
-                | Error::Mount(_)
-                | Error::TargetInstance => unresolved(request, error),
-                // Not answered: the run could not establish what it needed.
-                Error::Endpoint
-                | Error::Daemon(_)
-                | Error::Channel(_)
-                | Error::Exclusivity(_)
-                | Error::Unqualified(_)
-                | Error::Identity(_)
-                | Error::Deadline
-                | Error::Cancelled
-                | Error::Scratch
-                | Error::Cleanup
-                | Error::Consumed
-                | Error::Scope(_) => Refused::Unanswerable(error.into()),
-            },
+            ProduceError::Run(error) if answered(&error) => unresolved(request, error),
+            ProduceError::Run(error) => Refused::Unanswerable(error.into()),
             ProduceError::Target(_)
             | ProduceError::Recipe(_)
             | ProduceError::Acquire(_)
             | ProduceError::Cleanup(_) => Refused::Unanswerable(failure.into()),
         })
+    }
+
+    /// Whether a run's failure is an answer: `resolver.unresolved`, exit 2,
+    /// rather than `unanswerable`, exit 1 (SPEC 9.8).
+    pub(super) fn answered(error: &Error) -> bool {
+        match error {
+            // A declared surface had no sound verdict, or the environment was
+            // measured and differs, or this run's profile cannot serve the
+            // engine.
+            Error::Binding(_) | Error::Incompatible(_) | Error::UnsupportedProfile { .. } => true,
+            // The supplied server was measured and does not meet the profile
+            // it claims: also an answer.
+            Error::Container(_)
+            | Error::Configuration(_)
+            | Error::EngineExecutable
+            | Error::Containment(_)
+            | Error::Mount(_)
+            | Error::TargetInstance => true,
+            // Not answered: the run could not establish what it needed. A
+            // catalog read that failed is one of these, however far into the
+            // binding it came (#1575).
+            Error::Endpoint
+            | Error::Daemon(_)
+            | Error::Channel(_)
+            | Error::Exclusivity(_)
+            | Error::Unqualified(_)
+            | Error::Identity(_)
+            | Error::Deadline
+            | Error::Cancelled
+            | Error::Scratch
+            | Error::Cleanup
+            | Error::Consumed
+            | Error::Scope(_)
+            | Error::Read(_) => false,
+        }
     }
 }
 
@@ -279,6 +287,25 @@ mod producer {
 mod tests {
     use super::*;
     use pbps_model::{Column, Hints, IdsFile, Module, ModuleKind, Schema, Table};
+
+    /// #1575: a catalog read that failed part-way through the binding is
+    /// `unanswerable`, exit 1; the binding's own verdict stays
+    /// `resolver.unresolved`, exit 2 (SPEC 9.8).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_catalog_read_is_unanswerable_while_a_binding_verdict_is_answered() {
+        use pbps_cli::resolver::server::Error;
+        assert!(!producer::answered(&Error::Read(
+            "closing the capture".into()
+        )));
+        assert!(producer::answered(&Error::Binding(
+            "no sound verdict".into()
+        )));
+        assert!(!producer::answered(&Error::Scope("not established".into())));
+        assert!(producer::answered(&Error::Incompatible(vec![
+            "differs".into()
+        ])));
+    }
 
     fn selection() -> ResolverSelection {
         ResolverSelection {

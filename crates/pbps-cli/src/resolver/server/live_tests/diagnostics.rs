@@ -31,6 +31,7 @@ impl fmt::Display for SafeFailure<'_> {
             Error::Scope(_) => f.write_str("Scope"),
             Error::Incompatible(_) => f.write_str("Incompatible"),
             Error::Binding(_) => f.write_str("Binding"),
+            Error::Read(_) => f.write_str("Read"),
         }?;
         write!(f, " recovery_names={:?}", self.0.recovery_names)
     }

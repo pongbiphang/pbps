@@ -11,6 +11,8 @@ use pbps_db::resolver::{
 use pbps_db::transport::StreamConn;
 use pbps_db::{DbError, Driver};
 
+use super::Error;
+
 pub(crate) async fn identity(connection: &mut StreamConn) -> Result<InstanceObservation, DbError> {
     match connection.driver() {
         Driver::Postgres => pbps_pg::resolver::instance_identity(connection).await,
@@ -157,20 +159,20 @@ pub(crate) async fn capture_desired(
     base: &Managed,
     desired: &Managed,
     paths: &Paths,
-) -> Result<(CapturedInputs, CaptureScope), String> {
+) -> Result<(CapturedInputs, CaptureScope), Error> {
     use pbps_pg::resolver::capture;
     match connection.driver() {
         Driver::Postgres => {
             let first = capture::capture(connection, &capture::managed_scope(desired))
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(catalog_read_failed)?;
             let scope = capture::scope(&first, &[base, desired], paths);
             let captured = capture::capture(connection, &scope)
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(catalog_read_failed)?;
             Ok((captured, scope))
         }
-        Driver::Mssql => Err(NO_BINDING_ADAPTER.into()),
+        Driver::Mssql => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
     }
 }
 
@@ -189,14 +191,14 @@ pub(crate) async fn capture_desired_sealed(
         CaptureScope,
         pbps_model::resolver::InputManifest,
     ),
-    String,
+    Error,
 > {
     use pbps_pg::resolver::capture;
     match (connection.driver(), principals) {
         (Driver::Postgres, crate::resolver::scope::Principals::Postgres(roles)) => {
             let first = capture::capture(connection, &capture::managed_scope(desired))
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(catalog_read_failed)?;
             let scope = capture::scope(&first, &[base, desired], paths);
             let (captured, manifest) = capture::capture_identifying_sealed_with_roles(
                 connection,
@@ -206,10 +208,10 @@ pub(crate) async fn capture_desired_sealed(
                 roles,
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(catalog_read_failed)?;
             Ok((captured, scope, manifest))
         }
-        _ => Err(NO_BINDING_ADAPTER.into()),
+        _ => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
     }
 }
 
@@ -228,13 +230,13 @@ pub(crate) async fn capture_desired_for_plan(
     reconstruction: &Reconstruction,
     namespaces: &std::collections::BTreeSet<String>,
     dropped_signatures: &std::collections::BTreeSet<pbps_pg::resolver::capture::DroppedSignature>,
-) -> Result<(CompiledCapture, CaptureScope), String> {
+) -> Result<(CompiledCapture, CaptureScope), Error> {
     use pbps_pg::resolver::capture;
     match (connection.driver(), principals) {
         (Driver::Postgres, crate::resolver::scope::Principals::Postgres(roles)) => {
             let first = capture::capture(connection, &capture::managed_scope(desired))
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(catalog_read_failed)?;
             let scope = capture::scope(&first, &[base, desired], paths);
             let routines = recorded
                 .schema
@@ -265,10 +267,41 @@ pub(crate) async fn capture_desired_for_plan(
                 &ownership,
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(catalog_read_failed)?;
             Ok((captured, scope))
         }
-        _ => Err(NO_BINDING_ADAPTER.into()),
+        _ => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
+    }
+}
+
+/// What a failed scratch capture is. Only an answer about the declarations
+/// stays a binding verdict; a read that failed, came back incomplete or was
+/// overtaken by a change answered nothing (SPEC 9.8, #1575).
+pub(super) fn catalog_read_failed(error: pbps_db::resolver::capture::CaptureError) -> Error {
+    use pbps_db::resolver::capture::CaptureError;
+    match error {
+        CaptureError::Unsupported { .. } | CaptureError::Coverage(_) | CaptureError::Version => {
+            Error::Binding(error.to_string())
+        }
+        CaptureError::CallerTransaction
+        | CaptureError::Read
+        | CaptureError::Incomplete
+        | CaptureError::Changed
+        | CaptureError::EnvironmentChanged
+        | CaptureError::Close => Error::Read(error.to_string()),
+    }
+}
+
+/// What a failed target capture is, by the same rule as
+/// [`catalog_read_failed`]. A target without its qualified connection, or one
+/// whose inputs changed under the read, answered nothing either; executable
+/// content that is not qualified did.
+pub(super) fn target_capture_failed(failure: crate::resolver::native::CaptureFailure) -> Error {
+    use crate::resolver::native::CaptureFailure;
+    match failure {
+        CaptureFailure::Catalog(error) => catalog_read_failed(error),
+        CaptureFailure::Binding | CaptureFailure::Changed => Error::Read(failure.to_string()),
+        CaptureFailure::Executables => Error::Binding(failure.to_string()),
     }
 }
 
@@ -297,4 +330,57 @@ pub(super) fn paths(
         })
         .collect();
     Paths::new(extras.to_vec(), effective)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, catalog_read_failed, target_capture_failed};
+    use crate::resolver::native::CaptureFailure;
+    use pbps_db::resolver::capture::{CaptureError, Uncovered};
+
+    /// #1575: a capture that failed to read answered nothing about the
+    /// bindings, and is not reported as their verdict (SPEC 9.8).
+    #[test]
+    fn a_failed_catalog_read_is_a_read_failure_and_an_uncovered_input_a_verdict() {
+        for read in [
+            CaptureError::CallerTransaction,
+            CaptureError::Read,
+            CaptureError::Incomplete,
+            CaptureError::Changed,
+            CaptureError::EnvironmentChanged,
+            CaptureError::Close,
+        ] {
+            assert!(matches!(catalog_read_failed(read), Error::Read(_)));
+        }
+        for verdict in [
+            CaptureError::Unsupported {
+                engine: "SQL Server",
+            },
+            CaptureError::Version,
+            CaptureError::Coverage(Uncovered {
+                class: "pg_proc".into(),
+                object: None,
+                condition: "an uncovered routine",
+            }),
+        ] {
+            assert!(matches!(catalog_read_failed(verdict), Error::Binding(_)));
+        }
+    }
+
+    #[test]
+    fn a_target_capture_that_lost_its_connection_or_input_is_a_read_failure() {
+        for read in [
+            CaptureFailure::Binding,
+            CaptureFailure::Changed,
+            CaptureFailure::Catalog(CaptureError::Close),
+        ] {
+            assert!(matches!(target_capture_failed(read), Error::Read(_)));
+        }
+        for verdict in [
+            CaptureFailure::Executables,
+            CaptureFailure::Catalog(CaptureError::Version),
+        ] {
+            assert!(matches!(target_capture_failed(verdict), Error::Binding(_)));
+        }
+    }
 }
