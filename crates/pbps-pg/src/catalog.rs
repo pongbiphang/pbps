@@ -175,8 +175,9 @@ fn tables_query() -> String {
 /// none of them is in the partitioned table's declaration yet.
 ///
 /// **Each partition**: attached (no detach pending), an ordinary permanent
-/// heap table, the same in all of that, with no grant on it or on a column (a
-/// partition declares none), whose columns are inherited and its parent's in
+/// heap table, the same in all of that, with no grant on a column, which no
+/// table declares (a grant on the partition itself is its own, read as any
+/// table's, #1579), whose columns are inherited and its parent's in
 /// the parent's order with the parent's identities and generations. Its
 /// defaults and NOT NULLs are the parent's or its own (#1578): a default of
 /// its own where the parent's column has one or none, a NOT NULL of its own
@@ -245,7 +246,6 @@ fn partition_tree(root: &str) -> String {
                          AND NOT (ch.relkind = 'r' AND ch.relispartition
                                   AND NOT h.inhdetachpending
                                   AND {child_plain}
-                                  AND ch.relacl IS NULL
                                   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute ca
                                                    WHERE ca.attrelid = ch.oid AND ca.attnum > 0
                                                      AND (ca.attislocal OR ca.attacl IS NOT NULL))

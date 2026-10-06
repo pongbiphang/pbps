@@ -2307,7 +2307,7 @@ Measured on 18.6 and 16.15:
   its own, which #1171 needs to follow a detach or a drop, and occupancy,
   scope and drift treat it as the table it is. Validation refuses a partition
   that declares anything, a grant included (#1532 relaxes that; its own checks
-  and indexes since DEC-1577.1).
+  and indexes since DEC-1577.1, its grants since DEC-1579.1).
 - A bound value is the engine's own text, unquoted. The connected spelling
   check asks the engine for each declared value's reading as its key column's
   type, under the pinned session, and refuses a different one with the
@@ -2798,3 +2798,51 @@ dropped default leaves its tree out; the other partitions declare none),
 `a_created_partitions_own_defaults_and_not_nulls_answer_for_themselves`; the
 CLI's `partitions_are_added_and_dropped_through_the_cli` applies a partition
 whose own default calls a function the same plan creates.
+
+<a id="dec-1579-1"></a>
+
+**DEC-1579.1. A grant on a partition, and one on a partitioned parent, is that
+table's own, declared and read as any table's (#1579).**
+
+The third of #1532's four slices. Nothing new is declared: a role's file names
+a partition as it names any table, `app.ev_2025: [select]`, and the partition
+is a declared table since DEC-1170.1.
+
+Measured on 16.15 and 18.6:
+
+- A grant on the parent lands in the parent's `relacl` alone, whether made
+  before or after its partitions exist, and reaches the partitions only through
+  the parent: `SELECT` on a partition directly is refused to a role granted
+  only on the parent.
+- A grant on a partition lands in the partition's own `relacl`, and a column
+  grant in its `attacl`, as on any table.
+- A table `ATTACH`ed as a partition keeps its own `relacl`.
+
+**What changed.**
+
+- The tree predicate no longer leaves a tree out for a partition's `relacl`.
+  A column grant still does: no table holds one (SPEC §4.7 reports them and
+  leaves them alone), and for a partition that is the tree's named
+  limitation, as before.
+- `check_partitions` no longer refuses a role granted on a partition.
+- The reader takes a grant on a partitioned table (`relkind` `p`) as a grant
+  on that table. Since DEC-1170.1 the model declares one, yet its grant was
+  still reported as on a kind the model does not declare, and so was never
+  held. A partitioned table the pull does not hold has its grant reported as
+  on an object the pull did not record, as an ordinary table's is.
+
+Everything else is the grant model's for any table: a grant on a new
+partition is planned after its `CREATE`, granting and revoking on a standing
+partition plan as on a table (a revoke behind `--allow revoke`), and a dropped
+partition takes its grants with it. PUBLIC's grant on a partition is reported
+as on a table and never compared (ADR-0010 §5).
+
+Pinned on 16 and 18 by the live `range_partition_trees_round_trip_whole_or_not_at_all`
+(a tree with a PUBLIC grant on a partition is held and the grant reported; one
+with a column grant is left out), and on 18 by the CLI's
+`a_partition_tree_round_trips_through_the_cli` (pull, bootstrap, verify and an
+empty replan with a grant on the parent and one on a partition, the parent's
+not reaching the partition; a grant and a revoke on the standing partition)
+and `partitions_are_added_and_dropped_through_the_cli` (a granted partition
+dropped). Also by the units `a_partition_needs_its_parent_and_its_key`'s
+grant case and `a_grant_on_a_relation_kind_this_model_does_not_declare_is_reported`.

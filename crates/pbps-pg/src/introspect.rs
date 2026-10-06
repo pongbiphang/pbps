@@ -1605,8 +1605,11 @@ fn target_named(
     let name = pbps_model::ObjectName::new(schema.to_owned(), object.to_owned());
     match kind {
         // A table or a view: the two the model declares, and the two that
-        // share `GRANT ... ON TABLE`.
-        GrantedKind::Relation('r' | 'v') => Ok(pbps_model::GrantTarget::Object(name)),
+        // share `GRANT ... ON TABLE`. A partitioned table is a table the
+        // model declares since DEC-1170.1, and its grant is its own: measured
+        // on 16 and 18, it does not reach direct access to a partition
+        // (DEC-1579.1).
+        GrantedKind::Relation('r' | 'v' | 'p') => Ok(pbps_model::GrantTarget::Object(name)),
         // ADR-0010 §7, and the other half of why `serial` is refused at load
         // (#77). A `serial` column creates a sequence the declaration never
         // named, and inserting into such a column needs a privilege on it —
@@ -4106,9 +4109,12 @@ mod tests {
             .map(|u| u.what.as_str())
             .collect();
         assert_eq!(what.len(), 4, "{what:?}");
+        // A partitioned table is a table the model declares (DEC-1170.1,
+        // DEC-1579.1): its grant is reported only because this read recorded
+        // no such table, as an ordinary table's would be.
         for named in [
             "a materialized view",
-            "a partitioned table",
+            "`app.parent` is on an object this pull did not record",
             "a foreign table",
             "an aggregate",
         ] {

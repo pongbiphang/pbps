@@ -3763,6 +3763,9 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
              CREATE TABLE {s}.granted (x integer) PARTITION BY RANGE (x);
              CREATE TABLE {s}.granted_1 PARTITION OF {s}.granted FOR VALUES FROM (0) TO (10);
              GRANT SELECT ON {s}.granted_1 TO PUBLIC;
+             CREATE TABLE {s}.colgrant (x integer) PARTITION BY RANGE (x);
+             CREATE TABLE {s}.colgrant_1 PARTITION OF {s}.colgrant FOR VALUES FROM (0) TO (10);
+             GRANT SELECT (x) ON {s}.colgrant_1 TO PUBLIC;
              CREATE TABLE {s}.dropdef (x integer DEFAULT 1) PARTITION BY RANGE (x);
              CREATE TABLE {s}.dropdef_1 PARTITION OF {s}.dropdef FOR VALUES FROM (0) TO (10);
              ALTER TABLE {s}.dropdef_1 ALTER COLUMN x DROP DEFAULT;"
@@ -3930,6 +3933,18 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
         // The foreign key, once: its clones to each partition are the engine's.
         let r = &held.tables[&t(&s, "r")];
         assert_eq!(r.foreign_keys.keys().collect::<Vec<_>>(), ["r_ev"]);
+        // A grant on a partition is its own, as on any table (#1579): the
+        // tree is held, and PUBLIC's is reported as it is on a table. A
+        // column grant, held for no table, still leaves its tree out.
+        assert!(held.tables.contains_key(&t(&s, "granted_1")));
+        assert!(
+            pulled
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("PUBLIC holds SELECT on `{s}.granted_1`"))),
+            "{:?}",
+            pulled.warnings
+        );
         for name in [
             "att",
             "att_1",
@@ -3939,8 +3954,8 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
             "nest",
             "nest_1",
             "lst",
-            "granted",
-            "granted_1",
+            "colgrant",
+            "colgrant_1",
             "dropdef",
             "dropdef_1",
         ] {
@@ -24729,7 +24744,8 @@ async fn every_catalog_that_holds_a_grant_is_read() {
 }
 
 /// The kinds this model does not declare hold real grants, and the pull says
-/// so rather than reporting the role as holding nothing on them.
+/// so rather than reporting the role as holding nothing on them. A
+/// partitioned table is not one of them (DEC-1579.1).
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_grant_on_something_the_declarations_cannot_name_is_reported_not_lost() {
@@ -24762,8 +24778,17 @@ async fn a_grant_on_something_the_declarations_cannot_name_is_reported_not_lost(
     let pulled = pbps_pg::catalog::introspect(&mut db.conn)
         .await
         .expect("introspect");
-    // Only the schema grant is a grant: everything else is on a target no
-    // declaration can name.
+    // The schema grant and the partitioned table's are grants: a partitioned
+    // table is a table the declarations name since DEC-1170.1, and its grant
+    // is its own (DEC-1579.1), filed under the table and not under the
+    // same-named procedure. Everything else is on a target no declaration
+    // can name.
+    assert!(
+        pulled
+            .schema
+            .tables
+            .contains_key(&pbps_model::TableName::new("app", "parent"))
+    );
     assert_eq!(
         pulled
             .schema
@@ -24774,7 +24799,7 @@ async fn a_grant_on_something_the_declarations_cannot_name_is_reported_not_lost(
             .keys()
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
-        ["schema::app"]
+        ["app.parent", "schema::app"]
     );
     let what: Vec<&str> = pulled
         .unexpressible
@@ -24784,7 +24809,6 @@ async fn a_grant_on_something_the_declarations_cannot_name_is_reported_not_lost(
         .collect();
     for named in [
         "a materialized view",
-        "a partitioned table",
         "a type",
         "a procedural language",
         "sequence",
