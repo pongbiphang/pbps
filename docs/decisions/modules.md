@@ -1698,8 +1698,9 @@ ask (#1599 review).
 - **Which spellings of that clause are read** (#1604). Two forms: the one
   `pg_get_functiondef` writes and `pull` therefore declares, one
   single-quoted literal per schema (`SET search_path TO 'a', 'b'`), and a
-  list of plain or double-quoted identifiers. A clause begins at a `SET` no
-  comma precedes. Any other spelling (a dollar-quoted argument, an escape
+  list of plain or double-quoted identifiers. Clauses are read forward,
+  each value list to its end, so an entry named `set` stays an entry and the
+  last clause wins. Any other spelling (a dollar-quoted argument, an escape
   string, `FROM CURRENT`, `"$user"`, a comment inside the clause) is
   unread, and an unread path matches a later relation of that name in any
   schema. That costs a second plan, never a failed apply. Re-implementing

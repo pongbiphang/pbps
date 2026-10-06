@@ -1321,9 +1321,6 @@ struct HeaderWord {
     /// A quoted identifier decoded, the rest folded.
     text: String,
     quoted: bool,
-    /// Whether a comma comes right before it: a list's next entry, which a
-    /// clause's keyword never is (#1604).
-    after_comma: bool,
 }
 
 impl HeaderWord {
@@ -1343,16 +1340,11 @@ fn header_words(definition: &str, dialect: &dyn Dialect) -> Vec<HeaderWord> {
     let word = dialect.lexicon().identifier_continues;
     let mut words: Vec<HeaderWord> = Vec::new();
     let mut depth = 0usize;
-    let mut after_comma = false;
     let mut chars = header.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
         match c {
             '(' => depth += 1,
             ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                after_comma = true;
-                continue;
-            }
             '"' => {
                 let mut name = String::new();
                 let mut end = header.len();
@@ -1374,7 +1366,6 @@ fn header_words(definition: &str, dialect: &dyn Dialect) -> Vec<HeaderWord> {
                         end,
                         text: name,
                         quoted: true,
-                        after_comma,
                     });
                 }
             }
@@ -1396,16 +1387,10 @@ fn header_words(definition: &str, dialect: &dyn Dialect) -> Vec<HeaderWord> {
                         end,
                         text: w,
                         quoted: false,
-                        after_comma,
                     });
                 }
             }
             _ => {}
-        }
-        // A blanked literal or comment is white space; anything else that
-        // is not a comma ends the run the comma began.
-        if !is_input_space(c) {
-            after_comma = false;
         }
     }
     words
@@ -1435,12 +1420,38 @@ fn string_body(definition: &str, dialect: &dyn Dialect) -> Option<String> {
 /// identifiers. Anything else, a dollar-quoted argument, an escape string,
 /// `FROM CURRENT`, `"$user"`, a comment, is unread: it costs a second plan
 /// where the body names a relation the plan makes later, never a failed
-/// apply. A clause starts at a `SET` no comma precedes, so a schema named
-/// `set` is a list entry. The body, a string, is blanked first, so a `SET` inside it is no
+/// apply. The body, a string, is blanked first, so a `SET` inside it is no
 /// clause; so are the parameter and return lists, read at depth zero only.
 /// Measured on 18: the last of two clauses is the one stored, and each
 /// quoted argument is one schema, `TO 'a,b'` the schema `a,b`.
 fn routine_path(definition: &str, dialect: &dyn Dialect) -> Option<Option<Vec<String>>> {
+    // Clauses are read forward, each value list to its end, so an entry
+    // named `set` or `search_path` is consumed as an entry, and the next
+    // clause is looked for only after it. The last clause wins.
+    let mut path = None;
+    let mut from = 0;
+    for pair in header_words(definition, dialect).windows(2) {
+        // A setting's name matches in any case, quoted or not.
+        if pair[0].end > from
+            && pair[0].is("set")
+            && pair[1].text.eq_ignore_ascii_case("search_path")
+        {
+            let (schemas, end) = path_value(definition, pair[1].end, dialect)?;
+            path = Some(schemas);
+            from = end;
+        }
+    }
+    Some(path)
+}
+
+/// The value list of a `SET search_path` clause whose name ends at `after`,
+/// and the offset it ends at; `None` when it is not in a form
+/// [`routine_path`] reads.
+fn path_value(
+    definition: &str,
+    after: usize,
+    dialect: &dyn Dialect,
+) -> Option<(Vec<String>, usize)> {
     // The engine's own lexis throughout (#1599 review): what continues an
     // identifier, how an unquoted one folds, and the white space between
     // tokens, so a name reads here as the engine reads it.
@@ -1448,20 +1459,6 @@ fn routine_path(definition: &str, dialect: &dyn Dialect) -> Option<Option<Vec<St
     fn skip(s: &str) -> &str {
         s.trim_start_matches(is_input_space)
     }
-    let words = header_words(definition, dialect);
-    let Some(after) = words
-        .windows(2)
-        .rev()
-        // A setting's name matches in any case, quoted or not.
-        .find(|pair| {
-            pair[0].is("set")
-                && !pair[0].after_comma
-                && pair[1].text.eq_ignore_ascii_case("search_path")
-        })
-        .map(|pair| pair[1].end)
-    else {
-        return Some(None);
-    };
     let rest = skip(definition.get(after..)?);
     let rest = if let Some(r) = rest.strip_prefix('=') {
         r
@@ -1510,7 +1507,7 @@ fn routine_path(definition: &str, dialect: &dyn Dialect) -> Option<Option<Vec<St
         rest = skip(&rest[len..]);
         match rest.strip_prefix(',') {
             Some(r) => rest = skip(r),
-            None => return Some(Some(schemas)),
+            None => return Some((schemas, definition.len() - rest.len())),
         }
     }
 }
@@ -4459,14 +4456,31 @@ mod tests {
             path("() RETURNS integer LANGUAGE sql SET search_path = app\u{a0} AS $$ SELECT 1 $$"),
             some(&["app\u{a0}"])
         );
-        // #1604: a clause starts at a `SET` no comma precedes, so schemas
-        // named `set` and `search_path` are list entries.
-        assert_eq!(
-            path(
-                "() RETURNS integer LANGUAGE sql SET search_path = other, set, search_path, app AS $$ SELECT 1 $$"
+        // #1604: clauses are read forward, each value list to its end, so
+        // schemas named `set` and `search_path` are list entries wherever
+        // they stand, and a second clause after a quoted list still wins.
+        for (clauses, schemas) in [
+            (
+                "SET search_path = other, set, search_path, app",
+                &["other", "set", "search_path", "app"][..],
             ),
-            some(&["other", "set", "search_path", "app"])
-        );
+            (
+                "SET search_path = set, search_path, other, pg_temp",
+                &["set", "search_path", "other", "pg_temp"][..],
+            ),
+            (
+                "SET search_path TO 'app', 'pg_temp' SET search_path TO 'other', 'pg_temp'",
+                &["other", "pg_temp"][..],
+            ),
+        ] {
+            assert_eq!(
+                path(&format!(
+                    "() RETURNS integer LANGUAGE sql {clauses} AS $$ SELECT 1 $$"
+                )),
+                some(schemas),
+                "{clauses}"
+            );
+        }
         // Not a clause: in the string body, or in an atomic body.
         assert_eq!(
             path("() RETURNS void LANGUAGE plpgsql AS $$ BEGIN SET search_path = x; END $$"),
