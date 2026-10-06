@@ -343,6 +343,7 @@ mod tests {
             partition_of: Some(pbps_model::PartitionOf {
                 parent: t(parent),
                 bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
             }),
             ..Default::default()
         };

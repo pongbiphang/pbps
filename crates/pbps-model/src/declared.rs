@@ -228,6 +228,18 @@ impl Declared {
                         .insert(column.clone(), generated.expression.clone());
                 }
             }
+            // A partition's own default, under the partition and the column, as
+            // a column's is: the partition has no column of its own the two
+            // could collide in (#1578).
+            for (column, own) in table.partition_of.iter().flat_map(|of| &of.columns) {
+                if let Some(default) = &own.default {
+                    d.expressions
+                        .defaults
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(column.clone(), default.clone());
+                }
+            }
             for (computed, spec) in &table.computed {
                 d.expressions
                     .computed
@@ -522,6 +534,14 @@ impl Declared {
                         spec.default = Some(declared.clone());
                     }
                 }
+                // And a partition's own, where the read-back has one (#1578).
+                for (column, own) in table.partition_of.iter_mut().flat_map(|of| &mut of.columns) {
+                    if let Some(declared) = defaults.get(column)
+                        && own.default.is_some()
+                    {
+                        own.default = Some(declared.clone());
+                    }
+                }
             }
             // Presence-compared, as a default is: only over a column the
             // read-back holds as generated (DEC-1168.1).
@@ -594,6 +614,43 @@ mod tests {
     use crate::name::ColumnRef;
     use crate::schema::{CheckConstraint, Column, Index, IndexColumn, Table};
 
+    /// A partition's own default is recorded as declared and put back in
+    /// place of the engine's spelling, under the partition and the column
+    /// (#1578); one the read-back does not have is not conjured back.
+    #[test]
+    fn a_partitions_own_default_is_recorded_and_overlaid() {
+        let partition = |default: Option<&str>| Table {
+            partition_of: Some(crate::PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: crate::PartitionBound::Default,
+                columns: [(
+                    "v".to_owned(),
+                    crate::PartitionColumn {
+                        default: default.map(str::to_owned),
+                        not_null: true,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            ..Table::default()
+        };
+        let name: TableName = "app.p".parse().unwrap();
+        let schema = |t: Table| Schema {
+            tables: [(name.clone(), t)].into_iter().collect(),
+            ..Schema::default()
+        };
+        let declared = Declared::from_schema(&schema(partition(Some("'y'"))));
+        assert_eq!(
+            declared.expressions.defaults[&name]["v"], "'y'",
+            "{declared:?}"
+        );
+        let base = declared.overlay(&schema(partition(Some("'y'::text"))));
+        assert_eq!(base, schema(partition(Some("'y'"))));
+        // Negative: the read-back's NOT NULL alone gains no default.
+        let base = declared.overlay(&schema(partition(None)));
+        assert_eq!(base, schema(partition(None)));
+    }
     fn t() -> TableName {
         "dbo.t".parse().unwrap()
     }

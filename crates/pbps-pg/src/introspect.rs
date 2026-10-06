@@ -769,13 +769,24 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // parent's, which the engine gave it, and the clones of the parent's
         // checks and indexes are too; the reader has already checked that is
         // all it has (#1170).
-        if let Some((parent, bound)) = &raw_table.partition_of {
-            let (Some(parent), Some(bound)) = (lookups.tables.get(parent), parse_bound(bound))
+        if let Some((parent_oid, bound)) = &raw_table.partition_of {
+            let (Some(parent), Some(bound)) = (lookups.tables.get(parent_oid), parse_bound(bound))
             else {
                 // `refuse_partition_trees` left out every partition whose
                 // parent or bound this could not take.
                 continue;
             };
+            // Its own default and NOT NULL, where they are not the parent's
+            // (#1578). The engine copies the parent's defaults into the
+            // partition's own `pg_attrdef` as it creates it, measured on 16
+            // and 18, so a default is the partition's only where its text is
+            // not the parent's. A generation expression is in the same place
+            // and is the parent's, which the reader has already checked; a
+            // generated column's NOT NULL can still be the partition's own.
+            let parent_columns = columns_by_table
+                .get(parent_oid)
+                .map_or(&[][..], Vec::as_slice);
+            let mut own_columns = BTreeMap::new();
             let parts = Parts {
                 name: name.clone(),
                 by_attnum: raw_columns
@@ -783,10 +794,30 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     .map(|c| (c.attnum, c.name.as_str()))
                     .collect(),
             };
+            for column in raw_columns {
+                let Some(theirs) = parent_columns.iter().find(|p| p.name == column.name) else {
+                    continue;
+                };
+                let own = pbps_model::PartitionColumn {
+                    default: column.default.clone().filter(|d| {
+                        column.generated.is_none() && theirs.default.as_ref() != Some(d)
+                    }),
+                    not_null: !column.nullable && theirs.nullable,
+                };
+                // A default of its own may use a sequence, as a column's may;
+                // one equal to the parent's is the parent's, named there.
+                if own.default.is_some() {
+                    sequence_limitations(column, &parts, &mut pulled);
+                }
+                if own != pbps_model::PartitionColumn::default() {
+                    own_columns.insert(column.name.clone(), own);
+                }
+            }
             let mut table = Table {
                 partition_of: Some(pbps_model::PartitionOf {
                     parent: parent.clone(),
                     bound,
+                    columns: own_columns,
                 }),
                 ..Table::default()
             };
@@ -2162,6 +2193,53 @@ fn note_target(pulled: &mut Pulled, target: LimitationTarget, detail: String) {
     pulled.limitations.push(Limitation { target, detail });
 }
 
+/// The sequences a column's default uses, each named as a limitation: the
+/// model holds the default and has nowhere to put a sequence. A table's
+/// column, and a partition's own default (#1578).
+fn sequence_limitations(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) {
+    // A `serial` is not a type (DECISIONS 227): the column is an `integer`
+    // whose default is `nextval(...)`, and the sequence that default needs is a
+    // separate object with nowhere to live in this model. The column is carried
+    // — it is exactly what the model says — and the sequence is named, because
+    // a declaration pulled from here cannot recreate this table in an empty
+    // database.
+    if let Some(sequence) = &raw.owned_sequence {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "column `{}`.`{}` defaults from the sequence `{sequence}`, which it owns — the \
+                 shape `serial` creates. This model holds the default and has nowhere to put the \
+                 sequence, so a declaration pulled from here does not create it, and a rebuild \
+                 of this table can drop it before the default is applied again.",
+                parts.name, raw.name
+            ),
+        );
+    }
+
+    // The other half of that: a default that uses a sequence the column does
+    // **not** own. `pg_depend` records this one from the `pg_attrdef` row, not
+    // from the sequence to the column, so the join that finds a `serial`'s
+    // sequence cannot see it — and the difference matters more, not less: the
+    // sequence is nobody's to recreate, and `nextval` resolves its argument as
+    // a `regclass` at execution, so the table cannot even be created without
+    // it.
+    if let Some(sequences) = &raw.default_sequences {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "column `{}`.`{}` defaults from the sequence {sequences}, which it does not own. \
+                 This model holds the default and has nowhere to put the sequence, so a \
+                 declaration pulled from here creates a table whose default names an object that \
+                 is not there — and `nextval` resolves that name when the table is created, not \
+                 when a row is inserted.",
+                parts.name, raw.name
+            ),
+        );
+    }
+}
+
 /// One column, and everything about it the model has nowhere to put.
 fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
     let ty = match stored_type(&raw.ty) {
@@ -2217,47 +2295,7 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
         }
     };
 
-    // A `serial` is not a type (DECISIONS 227): the column is an `integer`
-    // whose default is `nextval(...)`, and the sequence that default needs is a
-    // separate object with nowhere to live in this model. The column is carried
-    // — it is exactly what the model says — and the sequence is named, because
-    // a declaration pulled from here cannot recreate this table in an empty
-    // database.
-    if let Some(sequence) = &raw.owned_sequence {
-        note(
-            pulled,
-            &parts.name,
-            format!(
-                "column `{}`.`{}` defaults from the sequence `{sequence}`, which it owns — the \
-                 shape `serial` creates. This model holds the default and has nowhere to put the \
-                 sequence, so a declaration pulled from here does not create it, and a rebuild \
-                 of this table can drop it before the default is applied again.",
-                parts.name, raw.name
-            ),
-        );
-    }
-
-    // The other half of that: a default that uses a sequence the column does
-    // **not** own. `pg_depend` records this one from the `pg_attrdef` row, not
-    // from the sequence to the column, so the join that finds a `serial`'s
-    // sequence cannot see it — and the difference matters more, not less: the
-    // sequence is nobody's to recreate, and `nextval` resolves its argument as
-    // a `regclass` at execution, so the table cannot even be created without
-    // it.
-    if let Some(sequences) = &raw.default_sequences {
-        note(
-            pulled,
-            &parts.name,
-            format!(
-                "column `{}`.`{}` defaults from the sequence {sequences}, which it does not own. \
-                 This model holds the default and has nowhere to put the sequence, so a \
-                 declaration pulled from here creates a table whose default names an object that \
-                 is not there — and `nextval` resolves that name when the table is created, not \
-                 when a row is inserted.",
-                parts.name, raw.name
-            ),
-        );
-    }
+    sequence_limitations(raw, parts, pulled);
 
     // A collation decides comparison, ordering and therefore which values a
     // unique key calls equal. Read back as an ordinary column, one collated
@@ -5298,6 +5336,122 @@ mod tests {
         let pulled = assemble(&bare);
         let p1 = &pulled.schema.tables[&TableName::new("app", "p1")];
         assert!(p1.checks.is_empty() && p1.indexes.is_empty(), "{p1:?}");
+    }
+
+    /// A partition's own default and NOT NULL are read where they are not its
+    /// parent's (#1578): the engine copies the parent's defaults into the
+    /// partition, so one equal to the parent's is the parent's, and a NOT NULL
+    /// the parent's column has is the parent's too. A generation expression
+    /// is never an override.
+    #[test]
+    fn a_partition_reads_its_own_defaults_and_not_nulls_and_not_its_parents() {
+        let with = |c: RawColumn, default: Option<&str>, nullable: bool| RawColumn {
+            default: default.map(str::to_owned),
+            nullable,
+            ..c
+        };
+        let mut parent = table(1, "ev");
+        parent.partition_key = Some(vec!["ts".to_owned()]);
+        let mut partition = table(2, "p1");
+        partition.partition_of = Some((1, "DEFAULT".to_owned()));
+        let mut generated = col(1, 5, "g", "integer");
+        generated.default = Some("(v * 2)".to_owned());
+        generated.generated = Some('s');
+        let raw = RawCatalog {
+            tables: vec![parent, partition],
+            columns: vec![
+                with(col(1, 1, "ts", "date"), Some("'2025-01-01'::date"), false),
+                with(col(1, 2, "v", "integer"), None, true),
+                with(col(1, 3, "w", "text"), Some("'x'::text"), true),
+                with(col(1, 4, "n", "integer"), None, true),
+                generated.clone(),
+                // The parent's, copied: no override.
+                with(col(2, 1, "ts", "date"), Some("'2025-01-01'::date"), false),
+                // Its own default and NOT NULL.
+                with(col(2, 2, "v", "integer"), Some("7"), false),
+                // Its own default over the parent's.
+                with(col(2, 3, "w", "text"), Some("'y'::text"), true),
+                // Nothing of its own.
+                with(col(2, 4, "n", "integer"), None, true),
+                // A generated column's NOT NULL of its own, never its
+                // generation expression (#1578 review).
+                RawColumn {
+                    table_oid: 2,
+                    nullable: false,
+                    ..generated
+                },
+            ],
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw);
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        let p1 = &pulled.schema.tables[&TableName::new("app", "p1")];
+        let own = &p1.partition_of.as_ref().unwrap().columns;
+        assert_eq!(own.keys().collect::<Vec<_>>(), ["g", "v", "w"]);
+        assert_eq!(
+            own["g"],
+            pbps_model::PartitionColumn {
+                default: None,
+                not_null: true
+            }
+        );
+        assert_eq!(own["v"].default.as_deref(), Some("7"));
+        assert!(own["v"].not_null);
+        assert_eq!(own["w"].default.as_deref(), Some("'y'::text"));
+        assert!(!own["w"].not_null);
+        assert!(p1.columns.is_empty(), "its columns stay its parent's");
+    }
+
+    /// A partition's own default that uses a sequence names the sequence, as
+    /// a column's does: the declaration holds the default and not the
+    /// sequence (#1578 review). The parent's default copied into the
+    /// partition is named once, for the parent.
+    #[test]
+    fn a_partitions_own_default_from_a_sequence_names_it() {
+        let mut parent = table(1, "ev");
+        parent.partition_key = Some(vec!["k".to_owned()]);
+        let mut partition = table(2, "p1");
+        partition.partition_of = Some((1, "DEFAULT".to_owned()));
+        let sequence = |table_oid: i64, attnum: i32, name: &str, default: &str| RawColumn {
+            default: Some(default.to_owned()),
+            default_sequences: Some("`app.s`".to_owned()),
+            ..col(table_oid, attnum, name, "bigint")
+        };
+        let raw = RawCatalog {
+            tables: vec![parent, partition],
+            columns: vec![
+                col(1, 1, "k", "integer"),
+                sequence(1, 2, "a", "nextval('app.s'::regclass)"),
+                col(1, 3, "b", "bigint"),
+                col(2, 1, "k", "integer"),
+                sequence(2, 2, "a", "nextval('app.s'::regclass)"),
+                sequence(2, 3, "b", "nextval('app.s'::regclass)"),
+            ],
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw);
+        let named: Vec<&str> = pulled
+            .limitations
+            .iter()
+            .map(|l| l.detail.as_str())
+            .filter(|r| r.contains("`app.s`"))
+            .collect();
+        assert_eq!(named.len(), 2, "{:?}", pulled.limitations);
+        assert!(
+            named.iter().any(|r| r.contains("`app.ev`.`a`")),
+            "{named:?}"
+        );
+        assert!(
+            named.iter().any(|r| r.contains("`app.p1`.`b`")),
+            "{named:?}"
+        );
+        let p1 = &pulled.schema.tables[&TableName::new("app", "p1")];
+        assert_eq!(
+            p1.partition_of.as_ref().unwrap().columns["b"]
+                .default
+                .as_deref(),
+            Some("nextval('app.s'::regclass)")
+        );
     }
 
     /// A partition's own GIN index over `jsonb` is read under both classes

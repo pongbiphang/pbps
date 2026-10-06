@@ -431,6 +431,74 @@ macro_rules! session_pins {
     };
 }
 
+/// What this engine makes of a column's declared default: one the applying
+/// session would decide, and a NULL it erases. A table's column, and a
+/// partition's own default on its parent's column (#1578 review).
+fn default_problems(
+    column_name: &str,
+    column: &pbps_model::Column,
+    normalized: &ColumnType,
+    expr: &str,
+) -> Vec<DialectError> {
+    let mut found = Vec::new();
+    // A default whose value the applying session would decide
+    // (ADR-0013 §3). Asked here and not only in the emitter, because
+    // `AlterColumnDefault` carries no type and the emitter therefore
+    // cannot ask it on the one path that changes a default on a column
+    // that is already there. This is where a user is looking at the
+    // declaration, and every command that hands statements to a
+    // database runs these checks (DECISIONS 141).
+    if let Some(e) = emit::refuse_an_unresolved_default(column_name, normalized, expr) {
+        found.push(e);
+    }
+    // A default that is a NULL of the column's own type. **Measured**
+    // on 18.6: `DEFAULT NULL`, `DEFAULT (NULL)` and `DEFAULT NULL::text`
+    // on a `text` column leave the column with no `pg_attrdef` row at
+    // all — to this engine a column with no default *is* a column
+    // whose default is NULL — so the pull reads the column back with
+    // none, every connected plan sets the default again, and the
+    // deploy's check of what came back, which compares whether a
+    // default is there (DECISIONS 185, 186), refuses the column the
+    // plan just wrote. Refused where the user is looking at the
+    // declaration, naming what to declare instead, as `serial` is
+    // (DECISIONS 227, 351). A NULL cast to any *other* type, or to
+    // the column's type where the column carries a modifier —
+    // `NULL::varchar` on `text`, `NULL::varchar(10)` on
+    // `varchar(10)` — is a default the engine keeps and reads back,
+    // and is left alone (DECISIONS 361). The type is the one the
+    // grammar sees, so `NULL::pg_catalog.text` and `NULL::"text"`
+    // are `NULL::text` (DECISIONS 364). SQL Server keeps `(NULL)` as
+    // a default constraint of its own, which is why this rule is this
+    // dialect's.
+    let (core, cast) = rows::unwrapped_with_type(expr);
+    let erased = core.eq_ignore_ascii_case("null")
+        && match cast {
+            None => true,
+            Some(ty) => {
+                column.ty.args.is_empty()
+                    && types::as_the_grammar_spells(&ty)
+                        .and_then(|t| t.parse::<ColumnType>().ok())
+                        .and_then(|t| types::normalize(&t).ok())
+                        .is_some_and(|t| t == *normalized)
+            }
+        };
+    if erased {
+        found.push(DialectError::Invalid {
+            dialect: types::DIALECT,
+            message: format!(
+                "column `{column_name}` declares `default: {expr}`, which this engine \
+                 does not keep: a NULL of the column's own type, bare, cast or in \
+                 parentheses, leaves no default in the catalog at all, and the \
+                 column reads back with none. Every plan would set it again and the \
+                 check of what the apply left behind would refuse the column. A \
+                 column with no default already defaults to NULL here: declare no \
+                 default."
+            ),
+        });
+    }
+    found
+}
+
 impl Dialect for Postgres {
     fn name(&self) -> &'static str {
         "postgres"
@@ -719,6 +787,66 @@ impl Dialect for Postgres {
                 ),
             });
         }
+        // Its own default and NOT NULL, each an override of one of the
+        // parent's columns (#1578). One equal to the parent's is not an
+        // override, and would be planned against a read-back that has none.
+        // Measured on 16 and 18: a generated column refuses a default of the
+        // partition's own, and on 18 an identity column does too.
+        let own = partition
+            .partition_of
+            .as_ref()
+            .map(|of| &of.columns)
+            .into_iter()
+            .flatten();
+        for (column, own) in own {
+            let invalid = |message: String| DialectError::Invalid {
+                dialect: crate::types::DIALECT,
+                message,
+            };
+            let Some(theirs) = parent.columns.get(column) else {
+                found.push(invalid(format!(
+                    "column `{column}` is not a column of its parent, whose columns are the \
+                     partition's"
+                )));
+                continue;
+            };
+            if own.not_null && !theirs.nullable {
+                found.push(invalid(format!(
+                    "column `{column}` is NOT NULL on its parent already, which the partition \
+                     takes; leave out its `nullable: false`"
+                )));
+            }
+            let Some(default) = &own.default else {
+                continue;
+            };
+            if theirs.default.as_ref() == Some(default) {
+                found.push(invalid(format!(
+                    "column `{column}`'s default is its parent's, which the partition takes; \
+                     leave out its `default:`"
+                )));
+            }
+            if theirs.generated.is_some() || theirs.identity.is_some() {
+                found.push(invalid(format!(
+                    "column `{column}` is {} on its parent, and takes no default of the \
+                     partition's own",
+                    if theirs.generated.is_some() {
+                        "generated"
+                    } else {
+                        "an identity column"
+                    }
+                )));
+            }
+            if crate::LEXICON.expression_in(default) == pbps_dialect::Expression::Absent {
+                found.push(invalid(format!(
+                    "column `{column}` has an empty default expression"
+                )));
+            }
+            // As a column's default is held, against the parent's column,
+            // whose type the partition's is.
+            if let Ok(normalized) = types::normalize(&theirs.ty) {
+                found.extend(default_problems(column, theirs, &normalized, default));
+            }
+        }
         found
     }
 
@@ -911,64 +1039,8 @@ impl Dialect for Postgres {
                     continue;
                 }
             };
-            // A default whose value the applying session would decide
-            // (ADR-0013 §3). Asked here and not only in the emitter, because
-            // `AlterColumnDefault` carries no type and the emitter therefore
-            // cannot ask it on the one path that changes a default on a column
-            // that is already there. This is where a user is looking at the
-            // declaration, and every command that hands statements to a
-            // database runs these checks (DECISIONS 141).
-            if let Some(expr) = &column.default
-                && let Some(e) = emit::refuse_an_unresolved_default(column_name, &normalized, expr)
-            {
-                found.push(e);
-            }
-            // A default that is a NULL of the column's own type. **Measured**
-            // on 18.6: `DEFAULT NULL`, `DEFAULT (NULL)` and `DEFAULT NULL::text`
-            // on a `text` column leave the column with no `pg_attrdef` row at
-            // all — to this engine a column with no default *is* a column
-            // whose default is NULL — so the pull reads the column back with
-            // none, every connected plan sets the default again, and the
-            // deploy's check of what came back, which compares whether a
-            // default is there (DECISIONS 185, 186), refuses the column the
-            // plan just wrote. Refused where the user is looking at the
-            // declaration, naming what to declare instead, as `serial` is
-            // (DECISIONS 227, 351). A NULL cast to any *other* type, or to
-            // the column's type where the column carries a modifier —
-            // `NULL::varchar` on `text`, `NULL::varchar(10)` on
-            // `varchar(10)` — is a default the engine keeps and reads back,
-            // and is left alone (DECISIONS 361). The type is the one the
-            // grammar sees, so `NULL::pg_catalog.text` and `NULL::"text"`
-            // are `NULL::text` (DECISIONS 364). SQL Server keeps `(NULL)` as
-            // a default constraint of its own, which is why this rule is this
-            // dialect's.
             if let Some(expr) = &column.default {
-                let (core, cast) = rows::unwrapped_with_type(expr);
-                let erased = core.eq_ignore_ascii_case("null")
-                    && match cast {
-                        None => true,
-                        Some(ty) => {
-                            column.ty.args.is_empty()
-                                && types::as_the_grammar_spells(&ty)
-                                    .and_then(|t| t.parse::<ColumnType>().ok())
-                                    .and_then(|t| types::normalize(&t).ok())
-                                    .is_some_and(|t| t == normalized)
-                        }
-                    };
-                if erased {
-                    found.push(DialectError::Invalid {
-                        dialect: types::DIALECT,
-                        message: format!(
-                            "column `{column_name}` declares `default: {expr}`, which this engine \
-                             does not keep: a NULL of the column's own type, bare, cast or in \
-                             parentheses, leaves no default in the catalog at all, and the \
-                             column reads back with none. Every plan would set it again and the \
-                             check of what the apply left behind would refuse the column. A \
-                             column with no default already defaults to NULL here: declare no \
-                             default."
-                        ),
-                    });
-                }
+                found.extend(default_problems(column_name, column, &normalized, expr));
             }
             found.extend(identity_problems(column_name, column));
             found.extend(generation_problems(column_name, column));
@@ -1397,6 +1469,7 @@ mod tests {
             partition_of: Some(pbps_model::PartitionOf {
                 parent: "app.p".parse().unwrap(),
                 bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
             }),
             ..Default::default()
         };
@@ -1460,6 +1533,108 @@ mod tests {
             assert!(
                 found.iter().any(|p| p.contains(expected)),
                 "{expected}: {found:?}"
+            );
+        }
+    }
+
+    /// A partition's own default and NOT NULL each override a column of its
+    /// parent's (#1578): never one the parent lacks, a NOT NULL the parent's
+    /// column already has, the parent's default again, or a default on a
+    /// generated or identity column, which the engine refuses on a partition
+    /// (measured on 16 and 18, identity on 18).
+    #[test]
+    fn a_partitions_own_column_overrides_answer_to_its_parents_columns() {
+        use pbps_dialect::Dialect;
+        let mut parent = partitioned(&["id", "ts"], &["ts"]);
+        let mut v = pbps_model::Column::new("integer".parse().unwrap());
+        v.default = Some("0".into());
+        parent.columns.insert("v".into(), v);
+        let mut g = pbps_model::Column::new("integer".parse().unwrap());
+        g.generated = Some(pbps_model::Generated {
+            expression: "v * 2".into(),
+            stored: true,
+        });
+        parent.columns.insert("g".into(), g);
+        let mut i = pbps_model::Column::new("integer".parse().unwrap());
+        i.nullable = false;
+        i.identity = Some(pbps_model::Identity {
+            seed: 1,
+            increment: 1,
+        });
+        parent.columns.insert("i".into(), i);
+        parent
+            .columns
+            .insert("d".into(), pbps_model::Column::new("date".parse().unwrap()));
+        let found = |overrides: &[(&str, Option<&str>, bool)]| -> Vec<String> {
+            let partition = pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.t".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: overrides
+                        .iter()
+                        .map(|(c, d, n)| {
+                            (
+                                (*c).to_owned(),
+                                pbps_model::PartitionColumn {
+                                    default: d.map(str::to_owned),
+                                    not_null: *n,
+                                },
+                            )
+                        })
+                        .collect(),
+                }),
+                ..Default::default()
+            };
+            super::Postgres::default()
+                .validate_partition(&"app.p1".parse().unwrap(), &partition, &parent)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert!(found(&[("v", Some("7"), true), ("ts", Some("'2025-01-01'"), false)]).is_empty());
+        // A NULL of another type is one the engine keeps, as for a column.
+        assert!(found(&[("v", Some("NULL::bigint"), false)]).is_empty());
+        for (overrides, expected) in [
+            (
+                vec![("x", Some("1"), false)],
+                "`x` is not a column of its parent",
+            ),
+            (
+                vec![("id", None, true)],
+                "`id` is NOT NULL on its parent already",
+            ),
+            (
+                vec![("v", Some("0"), false)],
+                "`v`'s default is its parent's",
+            ),
+            (
+                vec![("g", Some("1"), false)],
+                "`g` is generated on its parent",
+            ),
+            (
+                vec![("i", Some("1"), false)],
+                "`i` is an identity column on its parent",
+            ),
+            (
+                vec![("v", Some("  "), false)],
+                "`v` has an empty default expression",
+            ),
+            // Held as a column's default is, against the parent's column
+            // type (#1578 review): measured on 16 and 18, a NULL of its type
+            // leaves the partition no default at all.
+            (
+                vec![("v", Some("NULL::integer"), false)],
+                "which this engine does not keep",
+            ),
+            (
+                vec![("d", Some("'01/02/2026'"), false)],
+                "is `date` and its default is the bare literal",
+            ),
+        ] {
+            let got = found(&overrides);
+            assert!(
+                got.iter().any(|p| p.contains(expected)),
+                "{expected}: {got:?}"
             );
         }
     }

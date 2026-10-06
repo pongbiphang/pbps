@@ -207,8 +207,7 @@ fn declared(schema: &Schema, surface: &Surface) -> bool {
         Surface::Default(column) => schema
             .tables
             .get(&column.table)
-            .and_then(|table| table.columns.get(&column.name))
-            .is_some_and(|column| column.default.is_some() || column.generated.is_some()),
+            .is_some_and(|table| table.expression_columns().any(|c| c == column.name)),
         Surface::Check { table, name } => schema
             .tables
             .get(table)

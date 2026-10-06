@@ -198,7 +198,10 @@ use crate::schema::Schema;
 /// created partition's `checks` and `indexes`, which an older build reads
 /// and then does not emit, creating the partition without what the plan
 /// approved.
-pub const CURRENT_VERSION: u32 = 28;
+///
+/// Bumped to 29 for a partition's own column defaults and NOT NULLs
+/// (DEC-1578.1), which an older build cannot read.
+pub const CURRENT_VERSION: u32 = 29;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -657,7 +660,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 28);
+        assert_eq!(CURRENT_VERSION, 29);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

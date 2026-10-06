@@ -234,10 +234,8 @@ impl ResolverEvidence {
                     // Owner transitions cover catalog records, not resolution
                     // membership: every inline binding needs its own observation.
                     let mut surfaces = Vec::new();
-                    for (column, spec) in &table.columns {
-                        if spec.default.is_some() || spec.generated.is_some() {
-                            surfaces.push(super::Surface::Default(name.column(column)));
-                        }
+                    for column in table.expression_columns() {
+                        surfaces.push(super::Surface::Default(name.column(column)));
                     }
                     for check in table.checks.keys() {
                         surfaces.push(super::Surface::Check {

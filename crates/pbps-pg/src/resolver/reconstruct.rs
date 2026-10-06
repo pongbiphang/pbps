@@ -165,6 +165,16 @@ impl Reconstruction {
                             defaults.push((column.clone(), default));
                         }
                     }
+                    // A partition's own default too (#1578). Its parent's,
+                    // set in this same phase and earlier since the parent is
+                    // created first, reaches every partition (measured on 16
+                    // and 18), so the partition's own must come after it.
+                    for (column, own) in bare.partition_of.iter_mut().flat_map(|of| &mut of.columns)
+                    {
+                        if let Some(default) = own.default.take() {
+                            defaults.push((column.clone(), default));
+                        }
+                    }
                     let declaration = format!("table {name}");
                     steps.push(step(
                         dialect,

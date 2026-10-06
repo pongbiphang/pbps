@@ -6476,7 +6476,9 @@ fn an_array_column_widens_through_the_cli() {
 /// is refused with the commands that adopt it, and adopting it that way
 /// leaves nothing to plan. A partition's own check and index go with it
 /// under its entry (#1577); one naming a column its parent lacks is refused
-/// by `validate`, and one added to a standing partition by name (#1581).
+/// by `validate`, and one added to a standing partition by name (#1581). Its
+/// own column default and NOT NULL go with it too, and a changed default is
+/// refused by name (#1578).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_partition_tree_round_trips_through_the_cli() {
@@ -6490,14 +6492,16 @@ fn a_partition_tree_round_trips_through_the_cli() {
     on_server(
         &src,
         "CREATE SCHEMA app; \
-         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, PRIMARY KEY (id, ts)) \
-             PARTITION BY RANGE (ts); \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, note text, \
+             PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts); \
          CREATE INDEX ev_ts ON app.ev (ts); \
          CREATE TABLE app.ev_2025 PARTITION OF app.ev \
              FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
          ALTER TABLE app.ev_2025 ADD CONSTRAINT ev_2025_id_ck CHECK (id > 0); \
          CREATE INDEX ev_2025_id ON app.ev_2025 (id); \
-         CREATE TABLE app.ev_rest PARTITION OF app.ev DEFAULT",
+         CREATE TABLE app.ev_rest PARTITION OF app.ev DEFAULT; \
+         ALTER TABLE app.ev_rest ALTER COLUMN note SET DEFAULT 'rest', \
+             ALTER COLUMN note SET NOT NULL",
     );
     let d = Demo::new("parts-1170");
     succeeds(d.run(&["pull", "--db", &src]));
@@ -6508,7 +6512,8 @@ fn a_partition_tree_round_trips_through_the_cli() {
             "\npartition_by: [ts]\n\npartitions:\n  ev_2025:\n    from: [\"2025-01-01\"]\n    \
              to: [\"2026-01-01\"]\n    checks:\n      ev_2025_id_ck: "
         ) && text.contains(
-            "\n    indexes:\n      ev_2025_id:\n        columns: [id]\n  ev_rest: default\n"
+            "\n    indexes:\n      ev_2025_id:\n        columns: [id]\n  ev_rest:\n    default: \
+             true\n    columns:\n      note: {default: \"'rest'::text\", nullable: false}\n"
         ),
         "{text}"
     );
@@ -6526,12 +6531,27 @@ fn a_partition_tree_round_trips_through_the_cli() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
     on_server(
         &tgt,
-        "INSERT INTO app.ev VALUES (1, '2025-06-01'), (2, '2030-01-01'); \
+        "INSERT INTO app.ev VALUES (1, '2025-06-01', 'a'), (2, '2030-01-01', 'b'); \
          DO $$ BEGIN \
            IF (SELECT string_agg(tableoid::regclass::text, ',' ORDER BY id) FROM app.ev) \
               <> 'app.ev_2025,app.ev_rest' THEN RAISE EXCEPTION 'not routed'; END IF; \
          END $$",
     );
+
+    // Its own default changed on the standing partition, refused by name
+    // until #1581 (#1578).
+    std::fs::write(&path, text.replace("'rest'::text", "'other'::text")).unwrap();
+    d.commit();
+    let o = d.run(&["plan", "--db", &tgt]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("app.ev_rest is a partitioned table or a partition")
+            && stderr(&o).contains("change a column's own default or NOT NULL"),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::write(&path, &text).unwrap();
+    d.commit();
 
     // Its own index on a column its parent lacks, refused by `validate`.
     std::fs::write(
@@ -6616,7 +6636,8 @@ fn a_partition_tree_round_trips_through_the_cli() {
 /// kept. A range over rows the DEFAULT partition holds, and a saved plan whose
 /// tree changed by hand after planning, are each refused before the apply's
 /// first statement; with the rows moved and the tree restored, the same saved
-/// plan applies.
+/// plan applies. The partition added declares its own default calling a
+/// function the same plan creates, and is created after it (#1578).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn partitions_are_added_and_dropped_through_the_cli() {
@@ -6638,7 +6659,10 @@ fn partitions_are_added_and_dropped_through_the_cli() {
         .unwrap();
     };
     let p2025 = "  ev_2025: {from: [\"2025-01-01\"], to: [\"2026-01-01\"]}\n";
-    let p2026 = "  ev_2026: {from: [\"2026-01-01\"], to: [\"2027-01-01\"]}\n";
+    // Its own default calls a function the same plan creates, which the
+    // partition is created after (#1578 review).
+    let p2026 = "  ev_2026:\n    from: [\"2026-01-01\"]\n    to: [\"2027-01-01\"]\n    \
+                 columns:\n      id: {default: app.seven()}\n";
     let rest = "  ev_rest: default\n";
     tree(&format!("{p2025}{rest}"));
     succeeds(d.run(&["plan"]));
@@ -6651,6 +6675,11 @@ fn partitions_are_added_and_dropped_through_the_cli() {
 
     // Added, through a saved plan that says what it creates.
     tree(&format!("{p2025}{p2026}{rest}"));
+    std::fs::write(
+        d.dir.join("schema/app.seven.function.yml"),
+        "function: app.seven()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 7 $$\n",
+    )
+    .unwrap();
     succeeds(d.run(&["plan"]));
     d.commit();
     let plan = d.dir.join("plan.json");
@@ -6667,6 +6696,15 @@ fn partitions_are_added_and_dropped_through_the_cli() {
     succeeds(d.run(&["verify", "--db", &connection]));
     let next = succeeds(d.run(&["plan", "--db", &connection]));
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_attrdef \
+             WHERE adrelid = 'app.ev_2026'::regclass AND adnum = 1 \
+               AND pg_get_expr(adbin, adrelid) = 'app.seven()'"
+        ),
+        1
+    );
 
     // A range over the row the DEFAULT partition holds: planned, since a
     // plan reads no rows (SPEC 7.2), and refused by name by the apply's

@@ -13,12 +13,11 @@ use std::collections::{BTreeMap, BTreeSet};
 fn required(schema: &Schema) -> BTreeSet<Surface> {
     let mut surfaces = BTreeSet::new();
     for (table, definition) in &schema.tables {
-        for (column, spec) in &definition.columns {
-            // Both declarations bind through pg_attrdef; their expressions
-            // remain distinct model fields (DEC-1168.1).
-            if spec.default.is_some() || spec.generated.is_some() {
-                surfaces.insert(Surface::Default(table.column(column)));
-            }
+        // Both declarations bind through pg_attrdef; their expressions
+        // remain distinct model fields (DEC-1168.1). So does a partition's
+        // own default (DEC-1578.1).
+        for column in definition.expression_columns() {
+            surfaces.insert(Surface::Default(table.column(column)));
         }
         for name in definition.checks.keys() {
             surfaces.insert(Surface::Check {

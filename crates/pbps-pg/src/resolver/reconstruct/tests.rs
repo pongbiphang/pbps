@@ -453,6 +453,118 @@ fn a_table_generating_from_a_declared_function_compiles_after_it() {
     );
 }
 
+/// A partition's own default is set on scratch in its own step after its
+/// parent's default, which reaches every partition (measured on 16 and 18),
+/// and so after the declared functions it calls; the partition's table step
+/// keeps its place (#1578 review).
+#[test]
+fn a_partitions_own_default_is_set_after_its_parents_and_its_functions() {
+    use pbps_model::{
+        Column, Module, PartitionBound, PartitionBy, PartitionColumn, PartitionOf, Schema,
+    };
+    let mut schema = Schema::default();
+    let mut parent = Table::default();
+    let mut v = Column::new("integer".parse().unwrap());
+    v.default = Some("0".into());
+    parent.columns.insert("v".into(), v);
+    parent.partition_by = Some(PartitionBy {
+        columns: vec!["v".into()],
+    });
+    schema.tables.insert(TableName::new("app", "ev"), parent);
+    let partition = |bound: PartitionBound, default: &str| Table {
+        partition_of: Some(PartitionOf {
+            parent: TableName::new("app", "ev"),
+            bound,
+            columns: [(
+                "v".to_owned(),
+                PartitionColumn {
+                    default: Some(default.to_owned()),
+                    not_null: false,
+                },
+            )]
+            .into(),
+        }),
+        ..Table::default()
+    };
+    schema.tables.insert(
+        TableName::new("app", "ev_new"),
+        partition(PartitionBound::Default, "app.f(1)"),
+    );
+    schema.tables.insert(
+        TableName::new("app", "ev_plain"),
+        partition(
+            PartitionBound::Range {
+                from: vec![pbps_model::BoundDatum::MinValue],
+                to: vec![pbps_model::BoundDatum::Value("0".into())],
+            },
+            "7",
+        ),
+    );
+    schema.modules.insert(
+        "app.f(integer)".parse().unwrap(),
+        Module {
+            kind: ModuleKind::Function,
+            description: None,
+            definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+        },
+    );
+    let ids = pbps_diff::resolve(
+        &schema,
+        &pbps_model::IdsFile::default(),
+        &[],
+        &pbps_diff::Context {
+            operator: "1578-test".into(),
+            today: "2026-10-06".into(),
+        },
+    )
+    .unwrap()
+    .ids;
+    let bootstrap: Vec<_> = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &Schema::default(),
+            ids: &pbps_model::IdsFile::default(),
+        },
+        pbps_diff::Side {
+            schema: &schema,
+            ids: &ids,
+        },
+        &crate::Postgres::new(),
+        &pbps_model::Hints::default(),
+    )
+    .unwrap()
+    .changes
+    .into_iter()
+    .map(|planned| planned.change)
+    .collect();
+    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap).unwrap();
+    let order: Vec<_> = reconstruction
+        .steps
+        .iter()
+        .map(|step| (step.phase, step.declaration.as_str()))
+        .collect();
+    let at = |declaration: &str| {
+        order
+            .iter()
+            .position(|(_, d)| *d == declaration)
+            .unwrap_or_else(|| panic!("{declaration} missing from {order:?}"))
+    };
+    for table in ["app.ev", "app.ev_new", "app.ev_plain"] {
+        let declaration = format!("table {table}");
+        assert_eq!(order[at(&declaration)].0, Phase::Tables, "{order:?}");
+    }
+    for partition in ["app.ev_new", "app.ev_plain"] {
+        let own = format!("the default of {partition}.v");
+        assert_eq!(order[at(&own)].0, Phase::Expressions, "{order:?}");
+        assert!(at("the default of app.ev.v") < at(&own), "{order:?}");
+        assert!(at("function app.f(integer)") < at(&own), "{order:?}");
+        // Negative: the table step itself no longer carries it.
+        let sql = reconstruction.steps[at(&format!("table {partition}"))]
+            .statements
+            .join("\n");
+        assert!(!sql.contains("SET DEFAULT"), "{sql}");
+    }
+}
+
 /// A plan that drops, renames or alters is not a bootstrap, and building a
 /// namespace from one would reproduce neither side.
 #[test]

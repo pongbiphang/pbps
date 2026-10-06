@@ -2107,6 +2107,22 @@ fn detached_names(
     // detach renames only what it gave the partition, so an own check or
     // index declared under another name, or changed, is a change this plan
     // does not make (#1581).
+    // Its columns are its parent's with what it holds of them otherwise
+    // (#1578): a detach keeps its own defaults and NOT NULLs.
+    let mut parent = parent.clone();
+    if let Some(of) = &partition.partition_of {
+        for (column, own) in &of.columns {
+            if let Some(c) = parent.columns.get_mut(column) {
+                if let Some(default) = &own.default {
+                    c.default = Some(default.clone());
+                }
+                if own.not_null {
+                    c.nullable = false;
+                }
+            }
+        }
+    }
+    let parent = &parent;
     let mut declared = declared.clone();
     for (name, own) in &partition.checks {
         if declared.checks.get(name) == Some(own) {
@@ -2273,11 +2289,26 @@ fn refuse_partition_changes(
         if let (Some(b), Some(d)) = (
             base.schema.tables.get(base_name),
             declared.schema.tables.get(declared_name),
-        ) && (b.partition_by != d.partition_by || b.partition_of != d.partition_of)
+        ) {
             // A partition declared as an ordinary table is detached (#1544).
-            && !(b.partition_of.is_some() && d.partition_of.is_none() && d.partition_by.is_none())
-        {
-            refuse(declared_name, "change its partitioning".to_owned());
+            let detached =
+                b.partition_of.is_some() && d.partition_of.is_none() && d.partition_by.is_none();
+            fn where_(t: &Table) -> Option<(&TableName, &pbps_model::PartitionBound)> {
+                t.partition_of.as_ref().map(|of| (&of.parent, &of.bound))
+            }
+            if (b.partition_by != d.partition_by || where_(b) != where_(d)) && !detached {
+                refuse(declared_name, "change its partitioning".to_owned());
+            }
+            // A partition's own default or NOT NULL, which no change carries
+            // until #1581.
+            if let (Some(b), Some(d)) = (&b.partition_of, &d.partition_of)
+                && b.columns != d.columns
+            {
+                refuse(
+                    declared_name,
+                    "change a column's own default or NOT NULL".to_owned(),
+                );
+            }
         }
     }
     // As for a temporal table: the changes split out of a table this plan
@@ -5096,6 +5127,7 @@ mod tests {
             partition_of: Some(PartitionOf {
                 parent: "app.ev".parse().unwrap(),
                 bound,
+                columns: Default::default(),
             }),
             ..Default::default()
         };
@@ -5340,6 +5372,7 @@ mod tests {
                 partition_of: Some(PartitionOf {
                     parent: "app.ev".parse().unwrap(),
                     bound: PartitionBound::Default,
+                    columns: Default::default(),
                 }),
                 ..Default::default()
             },
@@ -5621,6 +5654,122 @@ mod tests {
         );
     }
 
+    /// A partition's own column defaults and NOT NULLs (#1578) are created
+    /// with it, are refused by name when changed on a standing partition
+    /// (#1581) without reading as a change of its partitioning, and are its
+    /// detached table's columns: a detach keeps them.
+    #[test]
+    fn a_partitions_own_column_overrides_are_its_own_through_a_detach() {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+        let mut parent = table(&[
+            ("ts", Column::new(ty("date")).not_null()),
+            ("n", Column::new(ty("int"))),
+        ]);
+        parent.partition_by = Some(PartitionBy {
+            columns: vec!["ts".into()],
+        });
+        let own = |default: &str| Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: PartitionBound::Default,
+                columns: [(
+                    "n".to_owned(),
+                    PartitionColumn {
+                        default: Some(default.to_owned()),
+                        not_null: true,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            ..Default::default()
+        };
+        let p: TableName = "app.p".parse().unwrap();
+        let mut tree = schema_of("app.ev", parent.clone());
+        tree.tables.insert(p.clone(), own("7"));
+        let outcome = |base: &Schema, declared: &Schema| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+        };
+
+        let created = outcome(&Schema::default(), &tree).expect("a tree is created");
+        assert!(created.changes.iter().any(|c| matches!(
+            &c.change,
+            Change::CreateTable { name, table, .. } if *name == p && **table == own("7")
+        )));
+        assert!(outcome(&tree, &tree).expect("unchanged").changes.is_empty());
+
+        // Changed on a standing partition: refused by name, and not as a
+        // change of its partitioning.
+        let mut changed = tree.clone();
+        changed.tables.insert(p.clone(), own("8"));
+        let errors: Vec<String> = outcome(&tree, &changed)
+            .expect_err("refused")
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            errors.iter().any(
+                |e| e.starts_with("app.p is a partitioned table or a partition")
+                    && e.contains("change a column's own default or NOT NULL")
+                    && !e.contains("change its partitioning")
+            ),
+            "{errors:?}"
+        );
+
+        // Detached: its columns are the parent's with its own default and
+        // NOT NULL.
+        let detached = |n: Column| {
+            let mut t = Table {
+                partition_by: None,
+                ..parent.clone()
+            };
+            t.columns.insert("n".into(), n);
+            let mut declared = tree.clone();
+            declared.tables.insert(p.clone(), t);
+            declared
+        };
+        let mut kept = Column::new(ty("int")).not_null();
+        kept.default = Some("7".into());
+        let planned = outcome(&tree, &detached(kept)).expect("a detach");
+        assert!(
+            matches!(
+                planned.changes.as_slice(),
+                [c] if matches!(c.change, Change::DetachPartition { .. })
+            ),
+            "{:?}",
+            planned.changes
+        );
+        // Negative: declared as the parent's, it is not what the detach keeps.
+        let errors: Vec<String> = outcome(&tree, &detached(Column::new(ty("int"))))
+            .expect_err("not the detached shape")
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("its columns are not its parent's")),
+            "{errors:?}"
+        );
+    }
+
     /// A partition's own checks and indexes (#1577) are created with it, are
     /// refused by name as any change to a standing partition is (#1581), and
     /// stay under their own names through a detach, which renames only the
@@ -5656,6 +5805,7 @@ mod tests {
             partition_of: Some(PartitionOf {
                 parent: "app.ev".parse().unwrap(),
                 bound: PartitionBound::Default,
+                columns: Default::default(),
             }),
             ..Default::default()
         };

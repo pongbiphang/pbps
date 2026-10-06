@@ -451,9 +451,13 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                 crate::dto::BoundValueDto::Text(t) => pbps_model::BoundDatum::declared(&t),
                 crate::dto::BoundValueDto::Int(i) => pbps_model::BoundDatum::Value(i.to_string()),
             };
-            let (bound, own) = match partition {
+            let (bound, own, columns) = match partition {
                 crate::dto::PartitionDto::Default(word) if word.eq_ignore_ascii_case("default") => {
-                    (pbps_model::PartitionBound::Default, Table::default())
+                    (
+                        pbps_model::PartitionBound::Default,
+                        Table::default(),
+                        Default::default(),
+                    )
                 }
                 crate::dto::PartitionDto::Default(word) => {
                     errs.push(LoadError::semantic(
@@ -503,7 +507,44 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                         indexes: convert_indexes(src, e.indexes, &mut errs),
                         ..Default::default()
                     };
-                    (bound, own)
+                    let mut columns = std::collections::BTreeMap::new();
+                    for (column, c) in e.columns {
+                        // The engine refuses a partition dropping a NOT NULL
+                        // its parent's column has, and `nullable: true` is
+                        // otherwise the parent's, which is not an override.
+                        if c.nullable == Some(true) {
+                            errs.push(LoadError::semantic(
+                                src,
+                                to_span(&dto.table.defined),
+                                format!(
+                                    "partition `{child}` column `{column}` is `nullable: true`: \
+                                     a partition takes its parent's nullability or adds NOT \
+                                     NULL, so write `nullable: false` or nothing"
+                                ),
+                                "not a partition column",
+                            ));
+                            continue;
+                        }
+                        let own = pbps_model::PartitionColumn {
+                            default: c.default,
+                            not_null: c.nullable == Some(false),
+                        };
+                        if own == pbps_model::PartitionColumn::default() {
+                            errs.push(LoadError::semantic(
+                                src,
+                                to_span(&dto.table.defined),
+                                format!(
+                                    "partition `{child}` column `{column}` declares nothing of \
+                                     its own: write its `default:` or `nullable: false`, or \
+                                     leave it out"
+                                ),
+                                "not a partition column",
+                            ));
+                            continue;
+                        }
+                        columns.insert(column, own);
+                    }
+                    (bound, own, columns)
                 }
             };
             partitions.push((
@@ -512,6 +553,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                     partition_of: Some(pbps_model::PartitionOf {
                         parent: parent.clone(),
                         bound,
+                        columns,
                     }),
                     ..own
                 },

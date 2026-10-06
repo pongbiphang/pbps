@@ -11,13 +11,20 @@ pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
         // in the column order is; a default is split out (prepare.rs). Either
         // way the step that writes it provides its `pg_attrdef` surface, so a
         // function it calls is ordered first (DEC-1168.1, DEC-1274.2).
+        // A partition's own default is set by its CREATE TABLE's step too
+        // (DEC-1578.1).
         Change::CreateTable { name, table, .. } => std::iter::once(Surface::Table(name.clone()))
-            .chain(table.columns.iter().flat_map(|(n, column)| {
-                std::iter::once(Surface::Column(name.column(n))).chain(
-                    (column.default.is_some() || column.generated.is_some())
-                        .then(|| Surface::Default(name.column(n))),
-                )
-            }))
+            .chain(
+                table
+                    .columns
+                    .keys()
+                    .map(|n| Surface::Column(name.column(n))),
+            )
+            .chain(
+                table
+                    .expression_columns()
+                    .map(|n| Surface::Default(name.column(n))),
+            )
             .collect(),
         Change::AddColumn {
             table,

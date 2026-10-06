@@ -6939,3 +6939,58 @@ mod column_vector_parent {
         }
     }
 }
+
+/// A partition's own default is a surface the qualified catalog must
+/// account for, as a column's is (#1578 review): with no record of it the
+/// resolution is refused, never reported as nothing to resolve. Capturing
+/// it is #1587. A partition with no default of its own needs no record.
+#[test]
+fn a_partitions_own_default_needs_its_catalog_record() {
+    use pbps_pg::resolver::capture::Assessment;
+    let tree = |own: bool| {
+        let mut schema = pbps_model::Schema::default();
+        let mut parent = pbps_model::Table::default();
+        parent.columns.insert(
+            "id".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+        parent.partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["id".into()],
+        });
+        schema.tables.insert("app.ev".parse().unwrap(), parent);
+        let partition = pbps_model::Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: pbps_model::PartitionBound::Default,
+                columns: own
+                    .then(|| {
+                        (
+                            "id".to_owned(),
+                            pbps_model::PartitionColumn {
+                                default: Some("app.f(1)".into()),
+                                not_null: false,
+                            },
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+            }),
+            ..pbps_model::Table::default()
+        };
+        schema.tables.insert("app.ev_1".parse().unwrap(), partition);
+        schema
+    };
+    let empty = pbps_model::Schema::default();
+    let refused =
+        super::resolution::from_records(&empty, &tree(true), &[], &[], &Assessment::default())
+            .expect_err("an own default with no record");
+    let said = refused.to_string();
+    assert!(
+        said.contains("no creation-time record") && said.contains("\"ev_1\""),
+        "{said}"
+    );
+    let resolved =
+        super::resolution::from_records(&empty, &tree(false), &[], &[], &Assessment::default())
+            .unwrap();
+    assert!(resolved.is_empty(), "{resolved:?}");
+}

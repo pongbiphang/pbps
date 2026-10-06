@@ -3960,6 +3960,7 @@ mod tests {
             partition_of: Some(pbps_model::PartitionOf {
                 parent: parent.parse().unwrap(),
                 bound,
+                columns: Default::default(),
             }),
             ..Default::default()
         };

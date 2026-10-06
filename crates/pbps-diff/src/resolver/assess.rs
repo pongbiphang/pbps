@@ -551,6 +551,64 @@ mod tests {
         assert!(!found.requires_resolution());
     }
 
+    /// A partition's own default is a binding surface like a column's
+    /// (#1578 review): a module arriving makes it a question for the engine,
+    /// where reading only the partition's columns, which it has none of,
+    /// found nothing to ask. A partition with no default of its own raises
+    /// none.
+    #[test]
+    fn a_partitions_own_default_is_a_question_when_bindings_move() {
+        let tree = |own: Option<&str>| {
+            let mut schema = Schema::default();
+            let mut parent = Table::default();
+            parent
+                .columns
+                .insert("id".into(), Column::new("int".parse().unwrap()));
+            parent.partition_by = Some(pbps_model::PartitionBy {
+                columns: vec!["id".into()],
+            });
+            schema.tables.insert("app.ev".parse().unwrap(), parent);
+            let partition = Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: own
+                        .map(|default| {
+                            (
+                                "id".to_owned(),
+                                pbps_model::PartitionColumn {
+                                    default: Some(default.to_owned()),
+                                    not_null: false,
+                                },
+                            )
+                        })
+                        .into_iter()
+                        .collect(),
+                }),
+                ..Table::default()
+            };
+            schema.tables.insert("app.ev_1".parse().unwrap(), partition);
+            schema
+        };
+        let arrives = |base: &Schema| {
+            let mut desired = base.clone();
+            desired
+                .modules
+                .insert("app.v".parse().unwrap(), view("SELECT 1 AS n"));
+            assessed(base, &desired)
+        };
+        let base = tree(Some("app.f(1)"));
+        let found = arrives(&base);
+        assert_eq!(
+            found.questions[&Surface::Default("app.ev_1.id".parse().unwrap())],
+            Answer::Resolve,
+            "{found:?}"
+        );
+        assert!(found.requires_resolution());
+        let found = arrives(&tree(None));
+        assert!(found.questions.is_empty(), "{found:?}");
+    }
+
     /// An index's name leaves the relation namespace with it: a surface
     /// that bound it, a `regclass` constant for one, finds another relation
     /// afterwards, and only the engine can say which (#1526 review). A
