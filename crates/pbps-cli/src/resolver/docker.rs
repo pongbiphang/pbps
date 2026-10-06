@@ -22,7 +22,7 @@ mod channel;
 pub(crate) mod forwarder;
 mod lifecycle;
 #[cfg(test)]
-pub(crate) use lifecycle::HOLD_CHECKS;
+pub(crate) use lifecycle::{HELD_CHECKS, HOLD_CHECKS};
 mod profile;
 mod reserved;
 mod session;

@@ -503,14 +503,34 @@ async fn a_check_cancelled_inside_a_forwarders_request_is_still_cleaned_up() {
     let mut target = native_target().await;
     let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
     let hold = &crate::resolver::docker::HOLD_CHECKS;
+    let held = &crate::resolver::docker::HELD_CHECKS;
+    let before = held.load(Ordering::SeqCst);
     hold.store(true, Ordering::SeqCst);
-    let cancelled = tokio::time::timeout(std::time::Duration::from_secs(2), server.check())
+    // Cancel only once the commanded check is inside its request, so the
+    // supervisor's own connection is the one the cancellation drops.
+    let inside = {
+        let check = server.check();
+        tokio::pin!(check);
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut check => return false,
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        if held.load(Ordering::SeqCst) > before {
+                            return true;
+                        }
+                    }
+                }
+            }
+        })
         .await
-        .is_err();
+    };
     hold.store(false, Ordering::SeqCst);
-    assert!(
-        cancelled,
-        "the check must still have been held in a forwarder's request"
+    assert_eq!(
+        inside,
+        Ok(true),
+        "the check must be cancelled while a forwarder's commanded check is held"
     );
     assert!(matches!(server.check().await, Err(Error::Cancelled)));
     server
