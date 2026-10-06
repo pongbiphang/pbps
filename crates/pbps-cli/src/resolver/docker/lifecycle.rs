@@ -323,6 +323,10 @@ async fn check(
     pinned: &Running,
     launch: &Launch,
 ) -> Result<(), Error> {
+    #[cfg(test)]
+    if HOLD_CHECKS.load(std::sync::atomic::Ordering::SeqCst) {
+        api.hold_in_flight(&HOLD_CHECKS).await;
+    }
     let state = inspect(api, &pinned.id)
         .await?
         .ok_or(Error::RuntimeChanged)?;
@@ -503,7 +507,7 @@ async fn cleanup(api: &mut LocalApi, owner: &Owner) -> Result<(), Error> {
     // declarations, and must reach the same immediate peer. Exact ID plus the
     // random ownership marker protects unrelated resources on that runtime.
     let mut janitor = if api.native_daemon.is_some() {
-        api.additional().await
+        api.reconnect_for_cleanup().await
     } else {
         LocalApi::connect_peer(&api.socket_path, api.peer.0).await
     }
@@ -515,6 +519,12 @@ async fn cleanup(api: &mut LocalApi, owner: &Owner) -> Result<(), Error> {
         .await
         .map_err(|_| Error::Cleanup)
 }
+
+/// While set, every supervisor's check holds a request in flight, so a test
+/// can cancel a server check while a forwarder is inside its own (#1591).
+#[cfg(test)]
+pub(crate) static HOLD_CHECKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn report_cleanup_failure(owner: &Owner) {
     eprintln!(

@@ -489,6 +489,43 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
     target.check().await.unwrap();
 }
 
+/// #1591: a server check cancelled while a forwarder's supervisor is inside
+/// its own Docker request drops that request's connection, and the supervisor
+/// cleans up through a fresh one. That reconnection must not depend on the
+/// dropped socket: the container is removed, and `discard` confirms it rather
+/// than naming it for recovery.
+#[tokio::test]
+#[ignore = "requires a disposable native Linux host and the dedicated-server fixtures"]
+async fn a_check_cancelled_inside_a_forwarders_request_is_still_cleaned_up() {
+    use std::sync::atomic::Ordering;
+    fixture();
+    let configured = endpoint("PBPS_SERVER_ENDPOINT");
+    let mut target = native_target().await;
+    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
+    let hold = &crate::resolver::docker::HOLD_CHECKS;
+    hold.store(true, Ordering::SeqCst);
+    let cancelled = tokio::time::timeout(std::time::Duration::from_secs(2), server.check())
+        .await
+        .is_err();
+    hold.store(false, Ordering::SeqCst);
+    assert!(
+        cancelled,
+        "the check must still have been held in a forwarder's request"
+    );
+    assert!(matches!(server.check().await, Err(Error::Cancelled)));
+    server
+        .discard()
+        .await
+        .expect("a forwarder whose request was cancelled is still confirmed removed");
+    let mut admin = session(&configured, maintenance()).await;
+    assert_eq!(
+        exists(&mut admin.connection, "pbps_scratch_").await,
+        (false, false)
+    );
+    admin.close().await;
+    target.check().await.unwrap();
+}
+
 /// A process the engine did not start, sharing its namespaces, is exactly
 /// what a walk of the engine's own descendants never reaches — and a root one
 /// keeps every privilege the profile says the runtime has taken away.

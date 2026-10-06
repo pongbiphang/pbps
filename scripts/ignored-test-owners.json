@@ -820,6 +820,7 @@
         "resolver::server::live_tests::a_server_inside_the_target_instance_is_refused_before_any_scratch_resource",
         "resolver::server::live_tests::a_session_present_at_admission_is_refused_rather_than_counted",
         "resolver::server::live_tests::a_session_this_run_did_not_open_invalidates_it_even_after_it_closed",
+        "resolver::server::live_tests::a_check_cancelled_inside_a_forwarders_request_is_still_cleaned_up",
         "resolver::server::live_tests::a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources",
         "resolver::server::live_tests::admission_recovery::a_cancelled_step_leaves_its_admin_session_to_cleanup",
         "resolver::server::live_tests::admission_recovery::failed_admission_names_every_unconfirmed_forwarder",
