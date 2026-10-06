@@ -1684,6 +1684,17 @@ ask (#1599 review).
   16 and 18), so a routine's string body is read one level in. A PL/pgSQL
   body binds its literals only when it runs; it is read alike, at the cost of
   a second plan where it names a relation created after it (#1599 review).
+- **Where an unqualified name is looked up** is the path its expression is
+  bound under: `pg_catalog`, then the expression's own schema (the write
+  path). A routine's string body is the exception. It is analysed under the
+  routine's own `SET search_path`, which the engine applies before the
+  validator; an atomic body and a view are parsed under the session's path
+  (measured on 16 and 18). The path is walked in order up to the first schema
+  the name binds in: a relation the plan makes earlier binds it there, one it
+  makes later is the reference, and the target is asked about the schemas
+  ahead of it. A path the scan cannot read (`FROM CURRENT`, `"$user"`, an
+  escape string) matches a later relation of that name in any schema
+  (#1599 review).
 - **The relations a change brings:**
   - a table it creates, with the indexes, unique constraints and named
     primary key the create holds;

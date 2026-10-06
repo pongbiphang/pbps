@@ -901,6 +901,15 @@ impl Lexicon {
         self.code_only_inner(definition, !native)
     }
 
+    /// `definition` with every string literal and comment blanked, byte for
+    /// byte, and its quoted identifiers kept: a routine's header with a
+    /// string body out of the way, at the original's offsets, so that a
+    /// clause found in it can be read from `definition` itself.
+    #[must_use]
+    pub fn header(&self, definition: &str) -> String {
+        self.code_only_inner(definition, false)
+    }
+
     /// The contents of every string literal in `text`, decoded: `'…'`,
     /// `E'…'`, `U&'…'` with its `UESCAPE`, a continued literal, and on an
     /// engine with dollar quoting `$tag$…$tag$`. Comments and quoted

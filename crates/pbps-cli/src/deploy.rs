@@ -5396,39 +5396,34 @@ pub fn cmd_bootstrap(
     // And the check `plan --db` runs on that final order (DEC-1576.1): an
     // expression naming, in a literal, a relation created only after it is
     // refused with the two-plan remedy, before any script or DDL, rather
-    // than rolled back by the engine. A qualified name is refused here. An
-    // unqualified one may be `pg_catalog`'s, which only the target can say:
-    // asked of it with `--db`, before any script is written, and refused
-    // without one.
+    // than rolled back by the engine. A qualified name is refused offline.
+    // An unqualified one may be found ahead on its path, which only the
+    // target can say: asked of it with `--db`, before any script is written,
+    // and refused without one. One refusal names them all.
     let later = if dialect.name() == "postgres" {
         crate::dependents::names_a_later_relation(&cs, dialect.as_ref())
     } else {
         Vec::new()
     };
-    let (unqualified, qualified): (Vec<_>, Vec<_>) =
+    let (unqualified, mut refused): (Vec<_>, Vec<_>) =
         later.into_iter().partition(|n| !n.searched.is_empty());
-    let refuse_later = |names: &[crate::dependents::LaterName]| {
-        crate::dependents::later_relation_refusal(names)
-            .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))
-    };
-    refuse_later(&qualified)?;
     match target {
         Some(target) if !unqualified.is_empty() => {
-            let later = db::runtime()?.block_on(async {
+            db::runtime()?.block_on(async {
                 let mut conn = db::connect(target).await?;
-                let mut later = Vec::new();
                 for name in unqualified {
                     if !crate::engine::resolves_now(&mut conn, &name).await? {
-                        later.push(name);
+                        refused.push(name);
                     }
                 }
-                Ok::<_, anyhow::Error>(later)
+                Ok::<_, anyhow::Error>(())
             })?;
-            refuse_later(&later)?;
         }
         Some(_) => {}
-        None => refuse_later(&unqualified)?,
+        None => refused.extend(unqualified),
     }
+    crate::dependents::later_relation_refusal(&refused)
+        .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
 
     if let Some(path) = sql_out {
         let script = crate::render_sql(&cs, dialect.as_ref(), "an empty database")?;

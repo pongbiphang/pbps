@@ -17732,7 +17732,8 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
 /// --db` refuses it (DEC-1576.1, #1599 review): an expression index on
 /// `abs(k)` beside a declared `app.abs()` follows the function, and a
 /// default reading `'app.ix_a'::regclass` would otherwise roll the bootstrap
-/// back. So would a function whose body reads it. The database stays empty,
+/// back. So would a function whose body reads it, through its own
+/// `search_path` from another schema too. The database stays empty,
 /// and the refusal's two-plan remedy deploys it. An unqualified name, which
 /// only the target can settle, is refused before `--sql` writes a script
 /// beside `--db`. Negative: without the literals the same declarations
@@ -17757,7 +17758,11 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
          CREATE INDEX ix_a ON app.a (abs(k)); \
          CREATE TABLE app.z (r text DEFAULT ('app.ix_a'::regclass)::text); \
          CREATE FUNCTION app.reader() RETURNS integer LANGUAGE sql \
-             RETURN ('app.ix_a'::regclass)::oid::integer",
+             RETURN ('app.ix_a'::regclass)::oid::integer; \
+         CREATE SCHEMA other; \
+         CREATE FUNCTION other.across() RETURNS integer LANGUAGE sql \
+             SET search_path = app, pg_temp \
+             AS $$ SELECT ('ix_a'::regclass)::oid::integer $$",
     );
     let d = Demo::new("boot-later");
     succeeds(d.run(&["pull", "--db", &src]));
@@ -17766,6 +17771,8 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
     let declared = std::fs::read_to_string(&z).unwrap();
     let reader = d.dir.join("schema/app.reader%28%29.function.yml");
     let reads = std::fs::read_to_string(&reader).unwrap();
+    let across = d.dir.join("schema/other.across%28%29.function.yml");
+    let reads_across = std::fs::read_to_string(&across).unwrap();
 
     let sql = d.dir.join("boot.sql");
     for args in [
@@ -17777,7 +17784,8 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
         assert!(
             stderr(&o).contains("names a relation this plan creates later")
                 && stderr(&o).contains("app.z.r's default or expression names app.ix_a")
-                && stderr(&o).contains("app.reader() names app.ix_a"),
+                && stderr(&o).contains("app.reader() names app.ix_a")
+                && stderr(&o).contains("other.across() names app.ix_a"),
             "{args:?}: {}",
             stderr(&o)
         );
@@ -17795,11 +17803,13 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
     // The remedy: the expressions in a second plan, once the index stands.
     std::fs::write(&z, "table: app.z\ncolumns:\n  r: {type: text}\n").unwrap();
     std::fs::remove_file(&reader).unwrap();
+    std::fs::remove_file(&across).unwrap();
     d.commit();
-    on_server(&tgt, "CREATE SCHEMA app");
+    on_server(&tgt, "CREATE SCHEMA app; CREATE SCHEMA other");
     succeeds(d.run(&["bootstrap", "--db", &tgt]));
     std::fs::write(&z, &declared).unwrap();
     std::fs::write(&reader, &reads).unwrap();
+    std::fs::write(&across, &reads_across).unwrap();
     d.commit();
     let plan = d.dir.join("second.json");
     succeeds(d.run(&["plan", "--db", &tgt, "--out", plan.to_str().unwrap()]));
@@ -17810,6 +17820,7 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
     // Unqualified, the name may be `pg_catalog`'s: asked of the target,
     // and refused before `--sql` writes a script beside `--db`.
     std::fs::remove_file(&reader).unwrap();
+    std::fs::remove_file(&across).unwrap();
     std::fs::write(
         &z,
         declared.replace("'app.ix_a'::regclass", "'ix_a'::regclass"),
