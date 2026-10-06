@@ -369,6 +369,11 @@ is conservative, so it can never be wrong in the dangerous direction.
   engine would not have, almost always in a plan the earlier positional rule
   also left to fail (DEC-1364.1 names the exception).
 
+- `names_a_later_relation` reads the same texts' literals for a relation the
+  plan creates after them, which PostgreSQL resolves as the expression is
+  created: `'app.ix'::regclass`. It does not move anything; the plan is refused
+  with a two-plan remedy (DEC-1576.1).
+
 What is left to the engine is recorded on #1350, each with a two-plan remedy:
 - an expression change still calling a function the plan rebuilds;
 - a function dropped after its release whose own body reads a column dropped

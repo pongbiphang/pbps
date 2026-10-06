@@ -17286,3 +17286,68 @@ fn a_dropped_table_frees_a_name_a_moved_table_carries_in_applies() {
         "the carried index holds the name the dropped table gave up"
     );
 }
+
+/// #1576: PostgreSQL resolves `'app.ix_new'::regclass` when the default is
+/// set, and the differ sets a default before it creates an index. A connected
+/// plan that does both is refused, writing no artifact, with a two-plan
+/// remedy; the two plans then deploy it.
+#[test]
+#[ignore = "needs a live PostgreSQL; see scripts/live-tests-pg.sh"]
+fn a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_deploy_it() {
+    let own = OwnDatabase::new(&server(), "names_later_index");
+    let connection = own.connection();
+    let columns = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n";
+    let label = |default: &str| format!("  label: {{type: text, default: \"{default}\"}}\n");
+    let index = "indexes:\n  ix_new:\n    columns: [id]\n";
+    let named = "('app.ix_new'::regclass)::text";
+    let d = bootstrapped_demo(
+        connection,
+        "names_later_index",
+        &format!("{columns}{}primary_key: [id]\n", label("''")),
+    );
+
+    d.table(&format!(
+        "{columns}{}primary_key: [id]\n{index}",
+        label(named)
+    ));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let artifact = d.dir.join("refused-plan.json");
+    let refused = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    let why = stderr(&refused);
+    assert!(
+        why.contains("app.t.label's default names app.ix_new"),
+        "{why}"
+    );
+    assert!(why.contains("second plan"), "{why}");
+    assert!(!artifact.exists(), "a refused plan writes no artifact");
+
+    // The remedy: the index alone first, then the default.
+    d.table(&format!(
+        "{columns}{}primary_key: [id]\n{index}",
+        label("''")
+    ));
+    let first = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &first, &[]));
+    d.table(&format!(
+        "{columns}{}primary_key: [id]\n{index}",
+        label(named)
+    ));
+    let second = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &second, &[]));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_attrdef WHERE adrelid = 'app.t'::regclass \
+             AND pg_get_expr(adbin, adrelid) LIKE '%ix_new%'"
+        ),
+        1
+    );
+}

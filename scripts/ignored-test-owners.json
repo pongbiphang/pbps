@@ -1331,7 +1331,8 @@
         "an_array_column_widens_through_the_cli",
         "a_partition_tree_round_trips_through_the_cli",
         "partitions_are_added_and_dropped_through_the_cli",
-        "a_partition_is_detached_and_kept_through_the_cli"
+        "a_partition_is_detached_and_kept_through_the_cli",
+        "a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_deploy_it"
       ]
     },
     {

@@ -1649,3 +1649,44 @@ Pinned by `a_new_table_generating_from_a_new_function_follows_it_whole`
 (`crates/pbps-cli/tests/flow_pg.rs`) and
 `a_table_generating_from_a_declared_function_compiles_on_scratch`
 (`crates/pbps-pg/src/resolver/binding_tests.rs`).
+
+<a id="dec-1576-1"></a>
+
+**DEC-1576.1. A connected PostgreSQL plan whose expression names, in a
+literal, a relation the plan creates only after it is refused with a two-plan
+remedy; it is not reordered (#1576).** The differ sets a default, a check, an
+index's text and a generation expression ahead of the indexes and views a plan
+creates. PostgreSQL resolves an OID-alias literal such as
+`('app.ix_new'::regclass)::text` when the expression is created (measured on
+18: `relation "app.ix_new" does not exist`, and the apply rolled back). So a
+plan that adds `ix_new` and sets that default fails the apply after approval.
+
+Moving the expression after the relation, as DEC-1364.1 does for functions,
+was rejected. The case is rare, the move would have to pass the plan's row
+writes and the checks that judge them, and every such pass has invited its own
+corner cases. A refusal costs the user one more plan: deploy the relation,
+then the expression.
+
+`names_a_later_relation` runs on the final order, after every reordering pass,
+and only on the connected PostgreSQL path; an offline plan is a preview that
+`apply` never accepts.
+- **The relations a change brings:**
+  - a table it creates, with the indexes, unique constraints and named
+    primary key the create holds;
+  - a table renamed to a name;
+  - an index or unique constraint added;
+  - a named primary key set;
+  - a view created.
+- **What counts as naming one:** a literal is read as `regclass` input reads
+  it. The whole literal must be the name: optionally schema-qualified (a
+  catalog before the schema allowed), unquoted parts folded to lower case,
+  quoted parts verbatim. A literal that only contains the name, a name in a
+  comment, or another schema's name is no reference. A literal that is the
+  name but is not cast can be refused; that costs a second plan, where a
+  missed reference costs a failed apply.
+
+Pinned by `an_expression_naming_a_relation_the_plan_creates_later_is_refused`
+and `a_relation_literal_is_read_as_regclass_input_reads_it`
+(`crates/pbps-cli/src/dependents.rs`), and the live
+`a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_deploy_it`
+(`crates/pbps-cli/tests/flow_pg.rs`).
