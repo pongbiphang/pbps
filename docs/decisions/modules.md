@@ -1678,9 +1678,11 @@ and only on the connected PostgreSQL path; an offline plan is a preview that
   - a named primary key set;
   - a view created.
 - **What counts as naming one:** a literal is read as `regclass` input reads
-  it. The whole literal must be the name: optionally schema-qualified (a
-  catalog before the schema allowed), unquoted parts folded to lower case,
-  quoted parts verbatim. A literal that only contains the name, a name in a
+  it (measured on 18). The whole literal must be the name: optionally
+  schema-qualified (a catalog before the schema allowed), with white space
+  allowed around the dot. An unquoted part runs to a dot or white space, and
+  only its ASCII letters fold to lower case; quoted parts are verbatim. An
+  input of digits alone is an OID, not a name. A literal that only contains the name, a name in a
   comment, or another schema's name is no reference. A literal that is the
   name but is not cast can be refused; that costs a second plan, where a
   missed reference costs a failed apply.

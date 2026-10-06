@@ -1279,9 +1279,20 @@ fn expressions_set(change: &Change) -> Vec<(String, String)> {
 
 /// A literal that is wholly a relation's name, as `regclass` input reads one:
 /// its optional schema and its name. `None` for anything else.
+///
+/// Measured on 18 (#1589 review), as the input's identifier splitter reads it:
+/// - an unquoted part runs to a dot or ASCII white space, so `'app.a-b'`
+///   names `"a-b"`;
+/// - only ASCII letters fold, so `'app.ixÄ'` names `"ixÄ"` and not `"ixä"`;
+/// - white space is allowed around the dot;
+/// - an input of ASCII digits alone is an OID, not a name: `'1259'` is
+///   `pg_class`.
 fn relation_literal(contents: &str) -> Option<(Option<String>, String)> {
+    if !contents.is_empty() && contents.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let mut parts = Vec::new();
-    let mut rest = contents.trim();
+    let mut rest = contents.trim_ascii();
     loop {
         let (part, after) = if let Some(quoted) = rest.strip_prefix('"') {
             let mut name = String::new();
@@ -1299,22 +1310,22 @@ fn relation_literal(contents: &str) -> Option<(Option<String>, String)> {
             (name, &quoted[end..])
         } else {
             let end = rest
-                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                .find(|c: char| c == '.' || c.is_ascii_whitespace())
                 .unwrap_or(rest.len());
             if end == 0 {
                 return None;
             }
-            (rest[..end].to_lowercase(), &rest[end..])
+            (rest[..end].to_ascii_lowercase(), &rest[end..])
         };
         if part.is_empty() {
             return None;
         }
         parts.push(part);
-        let after = after.trim_start();
+        let after = after.trim_ascii_start();
         if after.is_empty() {
             break;
         }
-        rest = after.strip_prefix('.')?.trim_start();
+        rest = after.strip_prefix('.')?.trim_ascii_start();
     }
     match parts.len() {
         1 => Some((None, parts.pop()?)),
@@ -3570,6 +3581,9 @@ mod tests {
             ("'ix_new and more'", "ix_new"),
             ("('other.ix_new'::regclass)::text", "ix_new"),
             ("0 /* 'app.ix_new' */", "ix_new"),
+            // An OID, and a non-ASCII letter the input does not fold.
+            ("to_regclass('1259')::text", "1259"),
+            ("to_regclass('app.ixÄ')::text", "ixä"),
         ] {
             assert_eq!(
                 names_a_later_relation(
@@ -3587,6 +3601,17 @@ mod tests {
             ),
             Ok(())
         );
+        // The same non-ASCII letter the plan creates is a reference.
+        assert!(
+            names_a_later_relation(
+                &plan(vec![
+                    default_of("t", "to_regclass('app.ixÄ')::text"),
+                    add_index("ixÄ", None)
+                ]),
+                &*pg()
+            )
+            .is_err()
+        );
     }
 
     /// A literal is a relation's name as `regclass` input reads it: unquoted
@@ -3603,7 +3628,12 @@ mod tests {
             some(Some("App"), "My \"ix")
         );
         assert_eq!(relation_literal("db.app.ix"), some(Some("app"), "ix"));
-        for not_a_name in ["", "a b", "app.", ".ix", "f(1)", "a.b.c.d", "\"open"] {
+        // Measured on 18 (#1589 review): an unquoted part runs to a dot or
+        // white space, only ASCII letters fold, and digits alone are an OID.
+        assert_eq!(relation_literal("app.a-b"), some(Some("app"), "a-b"));
+        assert_eq!(relation_literal("app.IXÄ"), some(Some("app"), "ixÄ"));
+        assert_eq!(relation_literal("\"1259\""), some(None, "1259"));
+        for not_a_name in ["", "a b", "app.", ".ix", "a.b.c.d", "\"open", "1259"] {
             assert_eq!(relation_literal(not_a_name), None, "{not_a_name:?}");
         }
     }
