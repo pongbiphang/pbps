@@ -120,6 +120,13 @@ impl Fixture {
     }
 
     async fn removed(&self) {
+        assert!(
+            self.removal_seen().await,
+            "owned resource must be removed after cancellation or control loss"
+        );
+    }
+
+    async fn removal_seen(&self) -> bool {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if self.seen.lock().unwrap().deletions == 1 {
@@ -129,7 +136,7 @@ impl Fixture {
             }
         })
         .await
-        .expect("owned resource must be removed after cancellation or control loss");
+        .is_ok()
     }
 }
 
@@ -350,28 +357,53 @@ async fn cancelled_creation_is_cleaned_without_starting_the_engine() {
 /// naming the resource whose removal it has not seen, the supervisor removes
 /// it, and the engine is never started. With time to spare the same launch
 /// succeeds.
+///
+/// The scenario needs the create to be in flight when the 50 ms deadline
+/// passes. On a loaded runner the deadline can pass before the supervisor
+/// sends it (#1521). That attempt creates nothing, so nothing is removed, and
+/// it may or may not name the resource for recovery. It is checked for that
+/// and tried again, so the assertions below always see the create in flight.
 #[tokio::test]
 async fn a_launch_past_its_deadline_is_abandoned_named_and_removed() {
-    let fixture = Fixture::new(Observations {
-        delay_create: true,
-        ..Default::default()
-    });
-    let token = format!("{:032x}", rand::random::<u128>());
-    let launch = Launch::new(&candidate(), Driver::Postgres, &token).unwrap();
-    let failure = CandidateRun::start_launch_by(
-        Instant::now() + Duration::from_millis(50),
-        fixture.api().await,
-        candidate(),
-        token.clone(),
-        launch,
-        LIFETIME_SECS,
-    )
-    .await
-    .err()
-    .expect("a create delayed past the deadline must not yield a run");
-    assert!(matches!(failure.cause, Error::Start), "{:?}", failure.cause);
-    assert_eq!(failure.recovery_names, [format!("pbps-resolver-{token}")]);
-    fixture.removed().await;
+    let mut attempts = 0;
+    let (fixture, token, failure, removed_first) = loop {
+        attempts += 1;
+        let fixture = Fixture::new(Observations {
+            delay_create: true,
+            ..Default::default()
+        });
+        let token = format!("{:032x}", rand::random::<u128>());
+        let launch = Launch::new(&candidate(), Driver::Postgres, &token).unwrap();
+        let failure = CandidateRun::start_launch_by(
+            Instant::now() + Duration::from_millis(50),
+            fixture.api().await,
+            candidate(),
+            token.clone(),
+            launch,
+            LIFETIME_SECS,
+        )
+        .await
+        .err()
+        .expect("a create delayed past the deadline must not yield a run");
+        let removed_first = fixture.seen.lock().unwrap().deletions == 1;
+        assert!(matches!(failure.cause, Error::Start), "{:?}", failure.cause);
+        if fixture.removal_seen().await {
+            break (fixture, token, failure, removed_first);
+        }
+        // No removal: only right if nothing was ever asked of the daemon.
+        let requests = fixture.seen.lock().unwrap().requests.clone();
+        assert!(
+            requests.is_empty(),
+            "a create was sent and never removed: {requests:#?}"
+        );
+        assert!(attempts < 20, "the create never beat a 50 ms deadline");
+    };
+    // The supervisor's cleanup can also finish before the caller's timer is
+    // polled, and a removal confirmed by then leaves nothing to recover.
+    // Otherwise the resource is named.
+    if !(removed_first && failure.recovery_names.is_empty()) {
+        assert_eq!(failure.recovery_names, [format!("pbps-resolver-{token}")]);
+    }
     let requests = fixture.seen.lock().unwrap().requests.clone();
     assert!(
         !requests.iter().any(|r| r.contains("/start ")),
