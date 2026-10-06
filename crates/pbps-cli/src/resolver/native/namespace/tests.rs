@@ -445,7 +445,9 @@ fn held_task_exit_does_not_reopen_a_numeric_coordinate() {
         .unwrap();
     let directory = File::open(format!("/proc/{}", child.id())).unwrap();
     let stat = read_stat(&directory).unwrap().unwrap();
-    let (id, _, start) = task_stat(&stat).unwrap();
+    let TaskStat {
+        number: id, start, ..
+    } = task_stat(&stat).unwrap();
     assert!(task_alive(&directory, id, start).unwrap());
     assert!(task_alive(&directory, id + 1, start).is_err());
     assert!(task_alive(&directory, id, start + 1).is_err());
@@ -502,7 +504,15 @@ fn opaque_names_do_not_relax_required_task_identity_fields() {
         bytes
     };
     let valid = record("12", "S", "42");
-    assert_eq!(task_stat(&valid).unwrap(), (12, "S", 42));
+    assert_eq!(
+        task_stat(&valid).unwrap(),
+        TaskStat {
+            number: 12,
+            gone: false,
+            exiting: false,
+            start: 42
+        }
+    );
     for invalid in [
         record("0", "S", "42"),
         record("bad", "S", "42"),
@@ -514,6 +524,121 @@ fn opaque_names_do_not_relax_required_task_identity_fields() {
     ] {
         assert!(matches!(task_stat(&invalid), Err(NamespaceError::Metadata)));
     }
+}
+
+/// A task in `do_exit` keeps reading as running or sleeping until it becomes
+/// a zombie, but its memory and descriptors are already gone. The kernel's
+/// `PF_EXITING` flag says it has departed, as `Z` and `X` do; any other flag,
+/// and any other state, is a live task (#1554).
+#[test]
+fn a_task_the_kernel_marks_exiting_has_departed_while_its_state_still_reads_live() {
+    let record = |state: &str, flags: &str| {
+        let mut fields = vec!["0"; 18];
+        fields[5] = flags;
+        format!("12 (worker) {state} {} 42", fields.join(" ")).into_bytes()
+    };
+    for (state, flags, departed) in [
+        ("R", "4194560", false),
+        ("S", "4194560", false),
+        ("D", "4194560", false),
+        // PF_EXITING alone and among the other flags a worker carries.
+        ("R", "4", true),
+        ("S", "4194564", true),
+        ("D", "4194564", true),
+        ("Z", "4194560", true),
+        ("X", "0", true),
+    ] {
+        let reading = task_stat(&record(state, flags)).unwrap();
+        assert_eq!(
+            (reading.number, reading.departed(), reading.start),
+            (12, departed, 42),
+            "state {state} flags {flags}"
+        );
+    }
+    for unreadable in ["", "-4", "four", "4294967296"] {
+        assert!(
+            matches!(
+                task_stat(&record("S", unreadable)),
+                Err(NamespaceError::Metadata)
+            ),
+            "flags {unreadable:?} is no reading"
+        );
+    }
+}
+
+/// A task still in its group shows the group is visible, whether or not it
+/// is leaving; one in `do_exit` is not inspected. That holds for the last
+/// thread of a single-threaded process and for a multi-threaded group whose
+/// leader is already a zombie while its last worker is still in `do_exit`,
+/// when the group stat counts both. A group whose tasks are all zombies, or
+/// that lists none, still has to prove from its own stat that it has gone
+/// (#1554 review).
+#[test]
+fn a_group_with_a_task_still_leaving_is_visible_and_only_live_tasks_are_inspected() {
+    let root = std::env::temp_dir().join(format!("pbps-group-{}", rand::random::<u64>()));
+    let stat = |id: &str, state: &str, flags: &str, threads: &str| {
+        let mut fields = vec!["0"; 49];
+        fields[0] = state;
+        fields[6] = flags;
+        fields[17] = threads;
+        fields[19] = "42";
+        format!("{id} (worker) {}\n", fields.join(" "))
+    };
+    let exiting = "4194564";
+    let live = "4194560";
+    // Group, its stat (state, flags, threads), and its listed tasks.
+    type Reading<'a> = (&'a str, &'a str, &'a str);
+    let groups: [(&str, Reading, &[Reading]); 4] = [
+        ("8", ("R", exiting, "1"), &[("8", "R", exiting)]),
+        (
+            "12",
+            ("Z", exiting, "2"),
+            &[("12", "Z", exiting), ("13", "R", exiting)],
+        ),
+        ("9", ("R", live, "1"), &[]),
+        ("11", ("S", live, "1"), &[("11", "Z", exiting)]),
+    ];
+    for (group, (state, flags, threads), tasks) in groups {
+        let directory = root.join(group).join("task");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            root.join(group).join("stat"),
+            stat(group, state, flags, threads),
+        )
+        .unwrap();
+        for (task, state, flags) in tasks {
+            std::fs::create_dir_all(directory.join(task)).unwrap();
+            std::fs::write(
+                directory.join(task).join("stat"),
+                stat(task, state, flags, threads),
+            )
+            .unwrap();
+        }
+    }
+    let directory = File::open(&root).unwrap();
+    let handle = Arc::new(File::open(&root).unwrap());
+    let namespace = FileIdentity::of(&handle).unwrap();
+    let visit = |group: &str| {
+        let group_directory = open(&directory, group, OFlags::DIRECTORY).unwrap();
+        match visit_group::<NamespaceError>(
+            &group_directory,
+            group.parse().unwrap(),
+            namespace,
+            &handle,
+            &mut |_| panic!("a task in do_exit is not inspected"),
+        ) {
+            Ok(inspected) => Some(inspected),
+            Err(ScanError::Namespace(NamespaceError::Unreadable)) => None,
+            Err(_) => panic!("group {group}: an unexpected refusal"),
+        }
+    };
+    let outcomes: Vec<_> = ["8", "12", "9", "11"].iter().map(|g| visit(g)).collect();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(
+        outcomes,
+        [Some(false), Some(false), None, None],
+        "leaving groups are visible and uninspected; zombie-only or empty live groups are hidden"
+    );
 }
 
 #[test]

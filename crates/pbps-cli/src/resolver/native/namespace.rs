@@ -271,52 +271,7 @@ impl<'a> NamespaceProcfs<'a> {
                     Err(error) if process_gone(&error) => continue,
                     Err(_) => return Err(NamespaceError::Unreadable.into()),
                 };
-                let tasks = match open(&group, "task", OFlags::DIRECTORY) {
-                    Ok(tasks) => tasks,
-                    Err(_) if group_exited(&group)? => continue,
-                    Err(_) => return Err(NamespaceError::Unreadable.into()),
-                };
-                let mut found = false;
-                for tid in task_ids(&group, &tasks)? {
-                    let directory = match open(&tasks, &tid.to_string(), OFlags::DIRECTORY) {
-                        Ok(directory) => directory,
-                        Err(error) if process_gone(&error) => continue,
-                        Err(_) => return Err(NamespaceError::Unreadable.into()),
-                    };
-                    let stat = match read_stat(&directory)? {
-                        Some(stat) => stat,
-                        None => continue,
-                    };
-                    let (number, state, start_ticks) = task_stat(&stat)?;
-                    if number != tid {
-                        return Err(NamespaceError::Unreadable.into());
-                    }
-                    if matches!(state, "X" | "Z") {
-                        continue;
-                    }
-                    let task = TaskObservation {
-                        directory,
-                        id: NamespaceTaskId {
-                            namespace,
-                            number: tid,
-                            handle: Arc::clone(&self.namespace),
-                        },
-                        group: NamespaceTaskId {
-                            namespace,
-                            number: pid,
-                            handle: Arc::clone(&self.namespace),
-                        },
-                        start_ticks,
-                    };
-                    if let TaskReading::Live(_) = task.status()? {
-                        found = true;
-                        observed = true;
-                        inspect(task).map_err(ScanError::Callback)?;
-                    }
-                }
-                if !found && !group_exited(&group)? {
-                    return Err(NamespaceError::Unreadable.into());
-                }
+                observed |= visit_group(&group, pid, namespace, &self.namespace, &mut inspect)?;
             }
             Ok(observed)
         })();
@@ -337,6 +292,74 @@ impl<'a> NamespaceProcfs<'a> {
         }
         Ok(())
     }
+}
+
+/// One thread group of a namespace scan: inspect its live tasks and say
+/// whether there were any. A group with no task still in it must prove from
+/// its own stat that it has gone; otherwise its tasks are hidden from the
+/// view and the scan refuses.
+fn visit_group<E>(
+    group: &File,
+    pid: u32,
+    namespace: FileIdentity,
+    handle: &Arc<File>,
+    inspect: &mut impl FnMut(TaskObservation) -> Result<(), E>,
+) -> Result<bool, ScanError<E>> {
+    let tasks = match open(group, "task", OFlags::DIRECTORY) {
+        Ok(tasks) => tasks,
+        Err(_) if group_exited(group)? => return Ok(false),
+        Err(_) => return Err(NamespaceError::Unreadable.into()),
+    };
+    let mut found = false;
+    let mut inspected = false;
+    for tid in task_ids(group, &tasks)? {
+        let directory = match open(&tasks, &tid.to_string(), OFlags::DIRECTORY) {
+            Ok(directory) => directory,
+            Err(error) if process_gone(&error) => continue,
+            Err(_) => return Err(NamespaceError::Unreadable.into()),
+        };
+        let stat = match read_stat(&directory)? {
+            Some(stat) => stat,
+            None => continue,
+        };
+        let reading = task_stat(&stat)?;
+        if reading.number != tid {
+            return Err(NamespaceError::Unreadable.into());
+        }
+        if reading.gone {
+            continue;
+        }
+        // A task still in its group is a visible one, leaving or not: the
+        // group is not hidden. One in `do_exit` is not inspected, since it
+        // has already let go of what an inspection reads (#1554).
+        found = true;
+        if reading.exiting {
+            continue;
+        }
+        let start_ticks = reading.start;
+        let task = TaskObservation {
+            directory,
+            id: NamespaceTaskId {
+                namespace,
+                number: tid,
+                handle: Arc::clone(handle),
+            },
+            group: NamespaceTaskId {
+                namespace,
+                number: pid,
+                handle: Arc::clone(handle),
+            },
+            start_ticks,
+        };
+        if let TaskReading::Live(_) = task.status()? {
+            inspected = true;
+            inspect(task).map_err(ScanError::Callback)?;
+        }
+    }
+    if !found && !group_exited(group)? {
+        return Err(NamespaceError::Unreadable.into());
+    }
+    Ok(inspected)
 }
 
 enum ScanError<E> {
@@ -455,23 +478,61 @@ fn task_alive(directory: &File, id: u32, start: u64) -> Result<bool, NamespaceEr
     let Some(stat) = read_stat(directory)? else {
         return Ok(false);
     };
-    let (current_id, state, current_start) = task_stat(&stat)?;
-    if current_id != id || current_start != start {
+    let current = task_stat(&stat)?;
+    if current.number != id || current.start != start {
         return Err(NamespaceError::Replaced);
     }
-    Ok(!matches!(state, "X" | "Z"))
+    Ok(!current.departed())
 }
 
-fn task_stat(stat: &[u8]) -> Result<(u32, &str, u64), NamespaceError> {
+/// `PF_EXITING`, from the kernel's `include/linux/sched.h`.
+const PF_EXITING: u32 = 0x4;
+
+/// One `stat` reading of a task.
+#[derive(Debug, PartialEq, Eq)]
+struct TaskStat {
+    number: u32,
+    /// A zombie or dead task: it is no longer in its group.
+    gone: bool,
+    /// A task the kernel has marked `PF_EXITING`. `do_exit` sets that flag
+    /// before it releases the task's memory and descriptors, and the task
+    /// never returns to user space after it. Its state still reads running
+    /// or sleeping until `exit_notify` makes it a zombie, though, and in that
+    /// interval its `exe` and descriptor reads fail while it still reads as
+    /// live. That refused an unchanged container profile under fork/exit churn
+    /// (#1554).
+    exiting: bool,
+    start: u64,
+}
+
+impl TaskStat {
+    /// Has left or is leaving: nothing it does can matter any more.
+    fn departed(&self) -> bool {
+        self.gone || self.exiting
+    }
+}
+
+fn task_stat(stat: &[u8]) -> Result<TaskStat, NamespaceError> {
     let (number, fields) = super::stat_fields(stat).map_err(|_| NamespaceError::Metadata)?;
-    let mut fields = fields.split_whitespace();
-    let state = fields.next().ok_or(NamespaceError::Metadata)?;
-    let start = fields
-        .nth(18)
+    // proc_pid_stat(5): state is field 3, flags field 9, starttime field 22.
+    let fields: Vec<&str> = fields.split_whitespace().collect();
+    let state = *fields.first().ok_or(NamespaceError::Metadata)?;
+    let flags: u32 = fields
+        .get(6)
         .ok_or(NamespaceError::Metadata)?
         .parse()
         .map_err(|_| NamespaceError::Metadata)?;
-    Ok((number, state, start))
+    let start = fields
+        .get(19)
+        .ok_or(NamespaceError::Metadata)?
+        .parse()
+        .map_err(|_| NamespaceError::Metadata)?;
+    Ok(TaskStat {
+        number,
+        gone: matches!(state, "X" | "Z"),
+        exiting: flags & PF_EXITING != 0,
+        start,
+    })
 }
 
 fn status_id(status: &str, key: &str) -> Result<u32, NamespaceError> {
