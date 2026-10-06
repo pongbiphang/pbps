@@ -151,7 +151,10 @@ END;";
 
 /// `CONVERT(..., 126)` is ISO 8601. The driver is built without the `chrono`
 /// feature — a date library for one column would be a dependency the audit has
-/// to read — so the server formats and the client stores the text.
+/// to read — so the server formats and the client stores the text. Measured:
+/// style 126 leaves out a zero fraction, so `.000` reads `2026-09-23T00:01:13`
+/// and `.001` reads `2026-09-23T00:01:13.001`. Nothing parses the text, so
+/// the two widths are both the contract (#796).
 const SELECT_LATEST: &str = "\
 SELECT TOP (1) id, CONVERT(varchar(23), applied_at, 126) AS applied_at, state_json
   FROM dbo.__pbps_state

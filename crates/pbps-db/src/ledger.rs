@@ -50,6 +50,8 @@ pub struct LedgerEntry {
     pub id: i64,
 
     /// When the server recorded it, ISO 8601 (`2026-08-31T09:14:22.517`).
+    /// SQL Server leaves out a zero fraction (`2026-08-31T09:14:22`), so the
+    /// width is not fixed (#796).
     ///
     /// The **server's** clock, not the client's: a CI runner's clock says
     /// nothing about the environment, and two runners disagreeing would make

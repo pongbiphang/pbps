@@ -1609,6 +1609,7 @@
         "temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables",
         "the_clustered_index_moves_between_objects_and_keeps_the_rows",
         "the_ledger_created_inside_a_callers_transaction_follows_that_transaction",
+        "ledger_and_lock_timestamps_read_back_with_or_without_a_fraction",
         "the_ledger_returns_exactly_what_was_recorded",
         "the_legacy_fallback_batches_past_sql_servers_parameter_ceiling",
         "the_lock_admits_one_holder_at_a_time",

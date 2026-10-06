@@ -4891,9 +4891,10 @@ async fn the_ledger_returns_exactly_what_was_recorded() {
         back.snapshot, first,
         "the snapshot must survive the round trip"
     );
-    // The server's clock, formatted as ISO 8601 by the query.
-    assert_eq!(back.applied_at.len(), 23, "{}", back.applied_at);
-    assert!(back.applied_at.contains('T'), "{}", back.applied_at);
+    // The server's clock, formatted as ISO 8601 by the query. Not a fixed
+    // width: style 126 leaves out a zero fraction, so a clock landing on a
+    // whole second reads 19 characters, not 23 (#796).
+    assert!(is_iso_126(&back.applied_at), "{}", back.applied_at);
 
     // Recording again must append, never overwrite: the ledger is a history.
     let second = snapshot(pbps_model::StateKind::Apply, &Schema::default(), &ids);
@@ -4921,6 +4922,126 @@ async fn the_ledger_returns_exactly_what_was_recorded() {
         history[0].id, second_id,
         "the newest is the one that survives"
     );
+
+    db.drop().await;
+}
+
+/// What `CONVERT(varchar(23), <datetime2(3)>, 126)` produces: a date, `T`, a
+/// time, and a three-digit fraction only when the fraction is not zero.
+fn is_iso_126(text: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let (whole, fraction) = match text.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (text, None),
+    };
+    let Some((date, time)) = whole.split_once('T') else {
+        return false;
+    };
+    let date: Vec<&str> = date.split('-').collect();
+    let time: Vec<&str> = time.split(':').collect();
+    date.len() == 3
+        && [4, 2, 2]
+            .iter()
+            .zip(&date)
+            .all(|(n, part)| part.len() == *n && digits(part))
+        && time.len() == 3
+        && time.iter().all(|part| part.len() == 2 && digits(part))
+        && fraction.is_none_or(|f| f.len() == 3 && digits(f) && f != "000")
+}
+
+/// The helper itself: what the engine renders passes, and nearby shapes do
+/// not, so a test using it cannot pass on a malformed timestamp (#796).
+#[test]
+fn the_iso_126_shape_accepts_both_renderings_and_nothing_near_them() {
+    assert!(is_iso_126("2026-09-23T00:01:13"));
+    assert!(is_iso_126("2026-09-23T00:01:13.001"));
+    for wrong in [
+        "2026-09-23T00:01:13.000",
+        "2026-09-23T00:01:13.01",
+        "2026-09-23 00:01:13",
+        "2026-9-23T00:01:13",
+        "2026-09-23T00:01",
+        "23.09.2026 00:01:13.517",
+        "",
+    ] {
+        assert!(!is_iso_126(wrong), "{wrong}");
+    }
+}
+
+/// #796. The ledger and the lock store `datetime2(3)` and are read through
+/// `CONVERT(..., 126)`, which renders a zero fraction as nothing at all. A
+/// test that assumed 23 characters failed whenever the server's clock landed
+/// on a whole second. Fixed values, written over the server's own, go through
+/// every read path, with and without a fraction and across a year boundary,
+/// and each must read back exactly as the engine renders it.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn ledger_and_lock_timestamps_read_back_with_or_without_a_fraction() {
+    let mut db = TestDb::create("ledgertime").await;
+    let schema = normalized(&rich_schema());
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+    let cases = [
+        ("2026-09-23T00:01:13.000", "2026-09-23T00:01:13"),
+        ("2026-09-23T00:01:13.001", "2026-09-23T00:01:13.001"),
+        ("2026-12-31T23:59:59.999", "2026-12-31T23:59:59.999"),
+        ("2027-01-01T00:00:00.000", "2027-01-01T00:00:00"),
+    ];
+    let mut recorded = Vec::new();
+    for (stored, _) in &cases {
+        let entry = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+        let id = pbps_mssql::state::record(&mut db.conn, &entry)
+            .await
+            .expect("record");
+        db.conn
+            .execute(&format!(
+                "UPDATE dbo.__pbps_state SET applied_at = '{stored}' WHERE id = {id};"
+            ))
+            .await
+            .unwrap();
+        recorded.push((id, entry));
+    }
+    let history = pbps_mssql::state::history(&mut db.conn, 10).await.unwrap();
+    let timeline = pbps_mssql::state::timeline(&mut db.conn, 10).await.unwrap();
+    for ((id, entry), (stored, rendered)) in recorded.iter().zip(&cases) {
+        let read = history
+            .iter()
+            .find(|row| row.id == *id)
+            .unwrap_or_else(|| panic!("entry {id} is in the history"));
+        assert_eq!(read.applied_at, *rendered, "history, stored {stored}");
+        assert_eq!(read.snapshot, *entry, "the snapshot survives beside it");
+        let line = timeline
+            .iter()
+            .find(|row| row.id == *id)
+            .unwrap_or_else(|| panic!("entry {id} is in the timeline"));
+        assert_eq!(line.applied_at, *rendered, "timeline, stored {stored}");
+        assert!(is_iso_126(rendered), "{rendered}");
+    }
+    // `latest` is the newest id, whatever its clock says.
+    let newest = pbps_mssql::state::latest(&mut db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(newest.id, recorded.last().unwrap().0);
+    assert_eq!(newest.applied_at, cases.last().unwrap().1);
+
+    // The lock's time goes through the same conversion.
+    pbps_mssql::state::lock(&mut db.conn, "ledgertime-test")
+        .await
+        .expect("lock");
+    for (stored, rendered) in &cases {
+        db.conn
+            .execute(&format!(
+                "UPDATE dbo.__pbps_lock SET locked_at = '{stored}';"
+            ))
+            .await
+            .unwrap();
+        let held = pbps_mssql::state::lock_holder(&mut db.conn)
+            .await
+            .unwrap()
+            .expect("the lock is held");
+        assert_eq!(held.locked_at, *rendered, "lock, stored {stored}");
+    }
+    assert!(pbps_mssql::state::unlock(&mut db.conn).await.unwrap());
 
     db.drop().await;
 }
