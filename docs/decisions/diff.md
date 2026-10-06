@@ -2511,10 +2511,11 @@ version 27 carries it, and SQL Server refuses it.
    temporary name.
 4. Every temporary name is renamed to its declared one.
 
-The temporary names carry the table's oid, after a prefix no declared name
-starts with. They exist because a declaration may exchange two names, or give
+The temporary names exist because a declaration may exchange two names, or give
 a clone a name a check still holds; renaming straight across would collide
-with a name not yet vacated.
+with a name not yet vacated. How they are chosen, and what happens to a
+declared name something else holds, is DEC-1565.1, which superseded this
+entry's static prefix.
 
 The block runs on the table's schema's path, where a user who may create there
 can add an operator. Measured on 16 and 18, an operator whose arguments match
@@ -2533,3 +2534,54 @@ name while a sequence holds it; the CLI
 apply holding the table to its declared shape; and the unit tests
 `a_partition_declared_as_its_parents_shape_is_detached`, which fails without
 the shape check, without the type normalization, or without the renames, and `a_detach_renames_what_it_keeps_around_one_batch`.
+
+<a id="dec-1565-1"></a>
+
+**DEC-1565.1. A detach chooses its temporary names from the live catalog, and
+refuses by name a declared name something outside the batch holds (#1565;
+supersedes DEC-1544.1's temporaries).**
+
+Review of #1556 found one edge case after another in DEC-1544.1's name moves:
+
+- an exchange of names;
+- a hand-off between two detaches (#1558);
+- a name held by a table the plan drops;
+- a declared name spelling a temporary one;
+- a temporary prefix grown past the 63-byte identifier limit, where the
+  engine truncated every temporary to one name.
+
+Each was a guess made at plan time about a namespace that exists only at apply
+time, so the choices moved into the block, under the parent's lock it already
+takes first:
+
+- **Temporaries.** The `k`th name that moves takes the first `pbps_t<k>_<n>`
+  (`n` from 0) that no relation in the schema, no constraint on the table and
+  no declared name holds. Short and counted, it cannot reach the limit, and
+  nothing at plan time has to be avoided.
+- **Claims.** Once every moving name sits on its temporary, each declared name
+  is checked where the engine would check it. An index's name is checked
+  among the schema's relations, a foreign key's or a check's among the
+  table's constraints, and a key's or unique constraint's in both. A holder
+  left is outside the batch: the block raises `cannot give <table> the name
+  <name>: <holder> already holds it`, naming the holder in full, with a hint
+  to free the name in a plan of its own first, and the transaction rolls
+  back before any declared name is given.
+
+A table dropped in the same plan still frees its names first: detaches sort
+after the drops of their class (DEC-1544.1). A clone of another partition
+detached in the same plan cannot be ordered for from the declarations, since
+its name is the engine's. That case is now this named refusal with a two-plan
+remedy, which is what #1558 asked of the plan short of ordering it.
+
+Every operator in the block keeps to DEC-1544.1's rule: classes are compared as
+`oid`, names are built by `pg_catalog.format`, and the rest are built-ins'
+exact signatures.
+
+Pinned by the live `a_detach_takes_free_temporaries_and_refuses_a_held_name_by_name`
+(on 16 and 18). Its first detach declares the names the first temporaries
+would take, has a sequence squatting on one, and uses two names at the
+identifier limit, one spelled like #1544's prefix; it fails against #1544's
+block. Its second refuses a name held by a sequence and one held by another
+partition's index clone, each naming its holder and changing nothing; it fails
+without the claim check. Also pinned by the unit
+`a_detach_renames_what_it_keeps_around_one_batch`.

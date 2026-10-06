@@ -4673,6 +4673,154 @@ async fn a_detach_calls_no_operator_a_schema_user_could_add() {
     drop_schema(&mut a, &s).await;
 }
 
+/// A detach takes the temporary names the catalog says are free and gives
+/// a declared name only once nothing outside the batch holds it (#1565,
+/// DEC-1565.1). Declared names spelling the temporaries, one at the
+/// identifier limit and a relation squatting on a temporary all apply. A
+/// declared name held by a relation outside the plan, or by another
+/// partition's clone (#1558), is refused by name, saying what holds it, and
+/// the batch leaves everything as it was. On 16 and 18.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_detach_takes_free_temporaries_and_refuses_a_held_name_by_name() {
+    use pbps_model::{DetachedKind as K, DetachedName};
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
+    let named = |kind, parent: &str, name: &str| DetachedName {
+        kind,
+        parent: parent.into(),
+        name: Some(name.into()),
+    };
+    // At the identifier limit, one spelled like this batch's temporaries and
+    // one like #1544's, whose prefix grew past the limit to avoid it.
+    let longest = format!("pbps_t{}", "x".repeat(57));
+    let grown = format!("pbps_detach_{}", "_".repeat(51));
+    assert_eq!(
+        (longest.len(), grown.len()),
+        (63, 63),
+        "the identifier limit"
+    );
+    for connection in [conn_str(), old] {
+        let s = emit_schema("detach_free");
+        let mut a = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+        fresh(&mut a, &s).await;
+        a.execute(&format!(
+            "CREATE TABLE {s}.ev (id integer NOT NULL, ts date NOT NULL,
+                 v text CONSTRAINT ev_v_ck CHECK (v <> ''),
+                 CONSTRAINT ev_id_ck CHECK (id > 0),
+                 CONSTRAINT ev_pk PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+             CREATE INDEX ev_v ON {s}.ev (v);
+             CREATE TABLE {s}.p1 PARTITION OF {s}.ev
+                 FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+             CREATE TABLE {s}.p2 PARTITION OF {s}.ev
+                 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+             CREATE TABLE {s}.p3 PARTITION OF {s}.ev
+                 FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');
+             CREATE SEQUENCE {s}.pbps_t4_0;
+             CREATE SEQUENCE {s}.taken_v;
+             INSERT INTO {s}.ev VALUES (1, '2025-06-01', 'a'), (2, '2026-06-01', 'b');"
+        ))
+        .await
+        .expect("the tree");
+        let emit = |table: &str, names: Vec<DetachedName>| {
+            Postgres::new()
+                .emit(
+                    &pbps_model::Change::DetachPartition {
+                        uid: "t_aaaaaa".parse().unwrap(),
+                        table: TableName::new(&s, table),
+                        parent: TableName::new(&s, "ev"),
+                        names,
+                        shape: Box::default(),
+                    },
+                    Default::default(),
+                )
+                .expect("emit")
+        };
+
+        // The first temporary each name would take is declared, or squatted
+        // on by a sequence, and one name is at the identifier limit: each
+        // move still finds a free temporary, and everything applies.
+        for stmt in emit(
+            "p1",
+            vec![
+                named(K::Index, "ev_v", "pbps_t1_0"),
+                named(K::PrimaryKey, "ev_pk", &longest),
+                named(K::Check, "ev_v_ck", &grown),
+                named(K::Check, "ev_id_ck", "pbps_t2_0"),
+            ],
+        ) {
+            a.execute(&stmt.sql)
+                .await
+                .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
+        }
+        let held = |what: &str| {
+            format!(
+                "SELECT count(*)::int FROM pg_catalog.pg_constraint \
+                 WHERE conrelid = '{s}.p1'::regclass AND conname = '{what}'"
+            )
+        };
+        for what in [longest.as_str(), grown.as_str(), "pbps_t2_0"] {
+            assert_eq!(number(&mut a, &held(what)).await, 1, "{what}");
+        }
+        assert_eq!(
+            number(
+                &mut a,
+                &format!(
+                    "SELECT count(*)::int FROM pg_catalog.pg_class \
+                     WHERE relnamespace = '{s}'::regnamespace AND relname = 'pbps_t1_0' \
+                     AND relkind = 'i'"
+                )
+            )
+            .await,
+            1
+        );
+
+        // A name a relation outside the plan holds, and a name another
+        // partition's clone holds: each refused by name, nothing changed.
+        let before = format!(
+            "SELECT pg_catalog.string_agg(c.relname || ':' || c.relispartition, ',' ORDER BY c.relname) \
+             FROM pg_catalog.pg_class c WHERE c.relnamespace = '{s}'::regnamespace"
+        );
+        let snapshot = |rows: Vec<pbps_db::Row>| -> String {
+            rows[0]
+                .try_get::<&str>("string_agg")
+                .unwrap()
+                .unwrap()
+                .to_owned()
+        };
+        let was = snapshot(a.query(&before).await.expect("the names"));
+        for (claimed, holder) in [
+            ("taken_v", format!("relation {s}.taken_v")),
+            ("p3_v_idx", format!("index {s}.p3_v_idx on {s}.p3")),
+        ] {
+            let stmts = emit(
+                "p2",
+                vec![
+                    named(K::PrimaryKey, "ev_pk", "p2_pk"),
+                    named(K::Index, "ev_v", claimed),
+                ],
+            );
+            let mut refused = None;
+            for stmt in &stmts {
+                if let Err(e) = a.execute(&stmt.sql).await {
+                    refused = Some(e.to_string());
+                    break;
+                }
+            }
+            let said = refused.unwrap_or_else(|| panic!("{claimed} was taken"));
+            assert!(
+                said.contains(&format!("the name {claimed}: {holder} already holds it")),
+                "{said}"
+            );
+            assert_eq!(
+                snapshot(a.query(&before).await.expect("the names")),
+                was,
+                "the refused batch changed nothing"
+            );
+        }
+        drop_schema(&mut a, &s).await;
+    }
+}
+
 /// Emits and executes every change of a plan, in plan order.
 ///
 /// One statement at a time through [`Conn::execute`], which is what `apply`
