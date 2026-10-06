@@ -2349,7 +2349,8 @@ pub async fn account_for_module_dependents(
 
 /// Whether a literal [`crate::dependents::names_a_later_relation`] read as a
 /// later relation already resolves to one on the target, searching its
-/// schemas in order as the write path would (#1589). The literal then binds
+/// schemas in order as the write path would (#1589). A relation of that name
+/// in that schema is what `regclass` input finds, whatever its kind. The literal then binds
 /// that relation, whatever the plan creates, and needs nothing later.
 async fn resolves_now(
     conn: &mut Conn,
@@ -2358,7 +2359,12 @@ async fn resolves_now(
     for schema in &name.searched {
         let rows = conn
             .query_with(
-                "SELECT count(to_regclass(format('%I.%I', $1::text, $2::text)))",
+                // Every name is the catalog's: the session's path may hold
+                // a project's own `format` or `=` (#1589 review).
+                "SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+                 WHERE n.nspname OPERATOR(pg_catalog.=) $1::pg_catalog.name \
+                 AND c.relname OPERATOR(pg_catalog.=) $2::pg_catalog.name",
                 &[pbps_db::Param::Str(schema), pbps_db::Param::Str(&name.name)],
             )
             .await

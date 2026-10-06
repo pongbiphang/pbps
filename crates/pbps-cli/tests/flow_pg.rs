@@ -17304,6 +17304,23 @@ fn a_name_that_already_resolves_on_the_target_is_not_refused() {
         &format!("{columns}{}primary_key: [id]\n", label("''")),
     );
 
+    // A project `format` the lookup must not call: unqualified, it would
+    // beat the catalog's variadic one and answer NULL.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut c = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            c.execute(
+                "CREATE FUNCTION public.format(text, text, text) RETURNS text \
+                 LANGUAGE sql AS 'SELECT NULL::text'",
+            )
+            .await
+            .unwrap();
+        });
     d.table(&format!(
         "{columns}{}primary_key: [id]\nindexes:\n  pg_class:\n    columns: [id]\n",
         label("('pg_class'::regclass)::text")
