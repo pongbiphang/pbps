@@ -1682,7 +1682,10 @@ and only on the connected PostgreSQL path; an offline plan is a preview that
   schema-qualified (a catalog before the schema allowed), with white space
   allowed around the dot. An unquoted part runs to a dot or white space, and
   only its ASCII letters fold to lower case; quoted parts are verbatim. An
-  input of digits alone is an OID, not a name. A literal that only contains the name, a name in a
+  input of digits alone is an OID, not a name, and so is `-` exactly (OID 0).
+  An unqualified name is read in the schema the expression is written in:
+  that schema is the whole write `search_path` the CLI emits (it configures
+  no extras), and `pg_catalog`, searched first, holds nothing a plan creates. A literal that only contains the name, a name in a
   comment, or another schema's name is no reference. A literal that is the
   name but is not cast can be refused; that costs a second plan, where a
   missed reference costs a failed apply.

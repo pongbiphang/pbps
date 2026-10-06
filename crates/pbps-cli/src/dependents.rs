@@ -1146,6 +1146,9 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> R
     }
     let mut found = Vec::new();
     for (i, p) in cs.changes.iter().enumerate() {
+        let Some(scope) = expression_schema(&p.change) else {
+            continue;
+        };
         for (whose, text) in expressions_set(&p.change) {
             for literal in dialect.lexicon().string_literals(&text) {
                 let Some(named) = relation_literal(&literal) else {
@@ -1154,7 +1157,7 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> R
                 if let Some((_, relation)) = arrivals.iter().find(|(at, relation)| {
                     *at > i
                         && named.1 == relation.name
-                        && named.0.as_ref().is_none_or(|s| *s == relation.schema)
+                        && named.0.as_deref().unwrap_or(scope) == relation.schema
                 }) {
                     found.push(format!(
                         "{whose} names {relation}, which the plan creates after it"
@@ -1212,6 +1215,24 @@ fn relations_brought(change: &Change) -> Vec<TableName> {
             vec![name.clone()]
         }
         _ => Vec::new(),
+    }
+}
+
+/// The schema an expression a change creates is written in. Its write
+/// `search_path` is that schema alone: the CLI's dialect configures no extras
+/// (`dialect_for`), and `pg_catalog`, searched first, holds no relation a plan
+/// creates. So an unqualified name can only reach an arrival there
+/// (#1589 review).
+#[allow(clippy::wildcard_enum_match_arm)]
+fn expression_schema(change: &Change) -> Option<&str> {
+    match change {
+        Change::CreateTable { name: table, .. }
+        | Change::AddColumn { table, .. }
+        | Change::AddCheck { table, .. }
+        | Change::AddIndex { table, .. } => Some(&table.schema),
+        Change::AlterColumnDefault { column, .. }
+        | Change::AlterColumnExpression { column, .. } => Some(&column.table.schema),
+        _ => None,
     }
 }
 
@@ -1286,9 +1307,12 @@ fn expressions_set(change: &Change) -> Vec<(String, String)> {
 /// - only ASCII letters fold, so `'app.ixÄ'` names `"ixÄ"` and not `"ixä"`;
 /// - white space is allowed around the dot;
 /// - an input of ASCII digits alone is an OID, not a name: `'1259'` is
-///   `pg_class`.
+///   `pg_class`;
+/// - `'-'` exactly is OID 0, while `' -'` and `'"-"'` are names
+///   (#1589 review).
 fn relation_literal(contents: &str) -> Option<(Option<String>, String)> {
-    if !contents.is_empty() && contents.bytes().all(|b| b.is_ascii_digit()) {
+    // `-` alone, exactly, is the input's spelling of no relation (OID 0).
+    if contents == "-" || (!contents.is_empty() && contents.bytes().all(|b| b.is_ascii_digit())) {
         return None;
     }
     let mut parts = Vec::new();
@@ -3601,6 +3625,27 @@ mod tests {
             ),
             Ok(())
         );
+        // An unqualified name is read in the expression's own schema, the
+        // whole write path: an index of that name elsewhere is no reference.
+        let unqualified = "('ix_new'::regclass)::text";
+        assert!(
+            names_a_later_relation(
+                &plan(vec![
+                    default_of("t", unqualified),
+                    add_index("ix_new", None)
+                ]),
+                &*pg()
+            )
+            .is_err()
+        );
+        let mut elsewhere = add_index("ix_new", None);
+        if let Change::AddIndex { table, .. } = &mut elsewhere {
+            *table = TableName::new("other", "u");
+        }
+        assert_eq!(
+            names_a_later_relation(&plan(vec![default_of("t", unqualified), elsewhere]), &*pg()),
+            Ok(())
+        );
         // The same non-ASCII letter the plan creates is a reference.
         assert!(
             names_a_later_relation(
@@ -3633,7 +3678,10 @@ mod tests {
         assert_eq!(relation_literal("app.a-b"), some(Some("app"), "a-b"));
         assert_eq!(relation_literal("app.IXÄ"), some(Some("app"), "ixÄ"));
         assert_eq!(relation_literal("\"1259\""), some(None, "1259"));
-        for not_a_name in ["", "a b", "app.", ".ix", "a.b.c.d", "\"open", "1259"] {
+        // `-` exactly is OID 0; spaced or quoted, it is a name.
+        assert_eq!(relation_literal(" -"), some(None, "-"));
+        assert_eq!(relation_literal("\"-\""), some(None, "-"));
+        for not_a_name in ["", "a b", "app.", ".ix", "a.b.c.d", "\"open", "1259", "-"] {
             assert_eq!(relation_literal(not_a_name), None, "{not_a_name:?}");
         }
     }
