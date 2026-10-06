@@ -17608,13 +17608,17 @@ fn a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_dep
 /// the reordering passes the table was created first and the whole
 /// bootstrap rolled back on `function … does not exist`. The negative: a
 /// table that calls nothing is created where the differ puts it, before the
-/// functions, so the passes move only what calls one.
+/// functions, so the passes move only what calls one. A partitioned parent
+/// held behind its function takes its partition with it (#1586), and so does
+/// one whose generated column calls a built-in sharing a declared function's
+/// name, through bootstrap and through `plan --db` and `apply` alike.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
     let server = server();
     let source = OwnDatabase::new(&server, "boot-1585");
     let target = OwnDatabase::new(&server, "boot-1585-target");
+    let planned = OwnDatabase::new(&server, "boot-1585-planned");
     let (src, tgt) = (
         source.connection().to_owned(),
         target.connection().to_owned(),
@@ -17627,7 +17631,14 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
              LANGUAGE sql IMMUTABLE RETURN i * 2; \
          CREATE TABLE app.t (id integer, note text DEFAULT app.zz(), \
              g integer GENERATED ALWAYS AS (app.zz_double(id)) STORED); \
-         CREATE TABLE app.a_plain (id integer)",
+         CREATE TABLE app.a_plain (id integer); \
+         CREATE TABLE app.ev (k integer NOT NULL, \
+             g integer GENERATED ALWAYS AS (app.zz_double(k)) STORED) PARTITION BY RANGE (k); \
+         CREATE TABLE app.ev_1 PARTITION OF app.ev FOR VALUES FROM (0) TO (10); \
+         CREATE FUNCTION app.abs() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; \
+         CREATE TABLE app.ab (k integer NOT NULL, \
+             g integer GENERATED ALWAYS AS (abs(k)) STORED) PARTITION BY RANGE (k); \
+         CREATE TABLE app.ab_1 PARTITION OF app.ab FOR VALUES FROM (0) TO (10)",
     );
     let d = Demo::new("boot-1585");
     succeeds(d.run(&["pull", "--db", &src]));
@@ -17653,6 +17664,15 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
         at("CREATE TABLE \"app\".\"a_plain\"") < at("CREATE FUNCTION \"app\".\"zz\"\n"),
         "{script}"
     );
+    // Each parent before its partition (#1586).
+    assert!(
+        at("CREATE TABLE \"app\".\"ev\" (") < at("CREATE TABLE \"app\".\"ev_1\""),
+        "{script}"
+    );
+    assert!(
+        at("CREATE TABLE \"app\".\"ab\" (") < at("CREATE TABLE \"app\".\"ab_1\""),
+        "{script}"
+    );
 
     on_server(&tgt, "CREATE SCHEMA app");
     succeeds(d.run(&["bootstrap", "--db", &tgt]));
@@ -17667,4 +17687,42 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
         ),
         1
     );
+    on_server(&tgt, "INSERT INTO app.ev (k) VALUES (4)");
+    assert_eq!(scalar(&tgt, "SELECT count(*) FROM app.ev_1 WHERE g = 8"), 1);
+
+    // The same tables and functions through `plan --db` and `apply`
+    // (#1586): a project declaring only the unrelated table bootstraps the
+    // database, then gains the rest, which one plan creates. Its own ids
+    // file, minted for what it declares: a bootstrap records every uid it is
+    // given, built or not (#1600).
+    let pln = planned.connection().to_owned();
+    on_server(&pln, "CREATE SCHEMA app");
+    let d = {
+        let later = Demo::new("boot-1585-planned");
+        std::fs::copy(
+            d.dir.join("schema/app.a_plain.yml"),
+            later.dir.join("schema/app.a_plain.yml"),
+        )
+        .unwrap();
+        succeeds(later.run(&["plan"]));
+        later.commit();
+        succeeds(later.run(&["bootstrap", "--db", &pln]));
+        for entry in std::fs::read_dir(d.dir.join("schema")).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::copy(
+                &path,
+                later.dir.join("schema").join(path.file_name().unwrap()),
+            )
+            .unwrap();
+        }
+        succeeds(later.run(&["plan"]));
+        later.commit();
+        later
+    };
+    let plan = d.dir.join("first.json");
+    succeeds(d.run(&["plan", "--db", &pln, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, &pln, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", &pln]));
+    let next = succeeds(d.run(&["plan", "--db", &pln]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }

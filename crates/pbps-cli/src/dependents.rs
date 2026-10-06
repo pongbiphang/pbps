@@ -1743,6 +1743,12 @@ fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
             .iter()
             .flat_map(|of| of.columns.values())
             .any(|own| own.default.as_deref().is_some_and(named))
+        // A partition names its parent, which its `CREATE … PARTITION OF`
+        // needs standing: a held parent takes its partitions with it (#1586).
+        || table
+            .partition_of
+            .as_ref()
+            .is_some_and(|of| &of.parent == made)
         || table.indexes.values().any(|index| {
             index.filter.as_deref().is_some_and(named)
                 || index.columns.iter().any(|column| {
@@ -2801,6 +2807,68 @@ mod tests {
         assert!(function < table_at("app.ev_new"), "{order:?}");
         assert!(table_at("app.ev") < function, "{order:?}");
         assert!(table_at("app.ev_plain") < function, "{order:?}");
+    }
+
+    /// A new partitioned parent held behind the function its generated column
+    /// calls takes its new partitions with it, since `CREATE … PARTITION OF`
+    /// needs the parent standing (#1586): the order is function, parent,
+    /// partition. A partition of a parent that is not held keeps its place.
+    #[test]
+    fn a_held_new_parent_takes_its_new_partitions_with_it() {
+        let parent = |name: &str, generated: Option<&str>| {
+            let mut t = Table::default();
+            t.columns
+                .insert("k".into(), Column::new("integer".parse().unwrap()));
+            if let Some(expression) = generated {
+                let mut g = Column::new("integer".parse().unwrap());
+                g.generated = Some(pbps_model::Generated {
+                    expression: expression.into(),
+                    stored: true,
+                });
+                t.columns.insert("g".into(), g);
+            }
+            t.partition_by = Some(pbps_model::PartitionBy {
+                columns: vec!["k".into()],
+            });
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, name, 0),
+                name: name.parse().unwrap(),
+                table: Box::new(t),
+            }
+        };
+        let partition = |name: &str, of: &str| Change::CreateTable {
+            uid: Uid::derived(UidKind::Table, name, 0),
+            name: name.parse().unwrap(),
+            table: Box::new(Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: of.parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Table::default()
+            }),
+        };
+        let mut cs = plan(vec![
+            parent("app.ev", Some("app.f(k)")),
+            partition("app.ev_1", "app.ev"),
+            parent("app.other", None),
+            partition("app.other_1", "app.other"),
+            routine("app.f(integer)", "SELECT 1"),
+        ]);
+        rebuilds(&mut cs, &BTreeSet::new());
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let table_at = |name: &str| {
+            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.to_string() == name))
+        };
+        let function =
+            at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
+        let order = names(&cs);
+        assert!(function < table_at("app.ev"), "{order:?}");
+        assert!(table_at("app.ev") < table_at("app.ev_1"), "{order:?}");
+        // Negative: the other tree calls nothing and stays ahead.
+        assert!(table_at("app.other_1") < function, "{order:?}");
+        assert!(table_at("app.other") < table_at("app.other_1"), "{order:?}");
     }
 
     /// A new table held back for its generation expression does not drag an
