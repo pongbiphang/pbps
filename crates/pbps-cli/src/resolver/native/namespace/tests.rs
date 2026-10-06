@@ -445,7 +445,9 @@ fn held_task_exit_does_not_reopen_a_numeric_coordinate() {
         .unwrap();
     let directory = File::open(format!("/proc/{}", child.id())).unwrap();
     let stat = read_stat(&directory).unwrap().unwrap();
-    let (id, _, start) = task_stat(&stat).unwrap();
+    let TaskStat {
+        number: id, start, ..
+    } = task_stat(&stat).unwrap();
     assert!(task_alive(&directory, id, start).unwrap());
     assert!(task_alive(&directory, id + 1, start).is_err());
     assert!(task_alive(&directory, id, start + 1).is_err());
@@ -502,7 +504,15 @@ fn opaque_names_do_not_relax_required_task_identity_fields() {
         bytes
     };
     let valid = record("12", "S", "42");
-    assert_eq!(task_stat(&valid).unwrap(), (12, false, 42));
+    assert_eq!(
+        task_stat(&valid).unwrap(),
+        TaskStat {
+            number: 12,
+            gone: false,
+            exiting: false,
+            start: 42
+        }
+    );
     for invalid in [
         record("0", "S", "42"),
         record("bad", "S", "42"),
@@ -538,8 +548,9 @@ fn a_task_the_kernel_marks_exiting_has_departed_while_its_state_still_reads_live
         ("Z", "4194560", true),
         ("X", "0", true),
     ] {
+        let reading = task_stat(&record(state, flags)).unwrap();
         assert_eq!(
-            task_stat(&record(state, flags)).unwrap(),
+            (reading.number, reading.departed(), reading.start),
             (12, departed, 42),
             "state {state} flags {flags}"
         );
@@ -555,13 +566,15 @@ fn a_task_the_kernel_marks_exiting_has_departed_while_its_state_still_reads_live
     }
 }
 
-/// A group whose only thread is in `do_exit` reads `R` with `PF_EXITING`
-/// and one thread in its own stat: it is going, not hidden. The same flag
-/// with a second thread proves nothing, since that thread may be one the
-/// listing passed before it was created. A group that lists no task and
-/// reads live is hidden too (#1554 review).
+/// A task still in its group shows the group is visible, whether or not it
+/// is leaving; one in `do_exit` is not inspected. That holds for the last
+/// thread of a single-threaded process and for a multi-threaded group whose
+/// leader is already a zombie while its last worker is still in `do_exit`,
+/// when the group stat counts both. A group whose tasks are all zombies, or
+/// that lists none, still has to prove from its own stat that it has gone
+/// (#1554 review).
 #[test]
-fn a_group_whose_last_thread_is_exiting_is_going_and_any_other_is_hidden() {
+fn a_group_with_a_task_still_leaving_is_visible_and_only_live_tasks_are_inspected() {
     let root = std::env::temp_dir().join(format!("pbps-group-{}", rand::random::<u64>()));
     let stat = |id: &str, state: &str, flags: &str, threads: &str| {
         let mut fields = vec!["0"; 49];
@@ -571,25 +584,33 @@ fn a_group_whose_last_thread_is_exiting_is_going_and_any_other_is_hidden() {
         fields[19] = "42";
         format!("{id} (worker) {}\n", fields.join(" "))
     };
-    // Group stat, then the single listed task's stat when there is one.
-    for (group, state, flags, threads, task) in [
-        ("8", "R", "4194564", "1", Some(("R", "4194564"))),
-        ("9", "R", "4194560", "1", None),
-        ("10", "R", "4194564", "2", Some(("R", "4194564"))),
-        ("11", "S", "4194560", "1", Some(("S", "4194564"))),
-    ] {
-        let tasks = root.join(group).join("task");
-        std::fs::create_dir_all(&tasks).unwrap();
+    let exiting = "4194564";
+    let live = "4194560";
+    // Group, its stat (state, flags, threads), and its listed tasks.
+    type Reading<'a> = (&'a str, &'a str, &'a str);
+    let groups: [(&str, Reading, &[Reading]); 4] = [
+        ("8", ("R", exiting, "1"), &[("8", "R", exiting)]),
+        (
+            "12",
+            ("Z", exiting, "2"),
+            &[("12", "Z", exiting), ("13", "R", exiting)],
+        ),
+        ("9", ("R", live, "1"), &[]),
+        ("11", ("S", live, "1"), &[("11", "Z", exiting)]),
+    ];
+    for (group, (state, flags, threads), tasks) in groups {
+        let directory = root.join(group).join("task");
+        std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
             root.join(group).join("stat"),
             stat(group, state, flags, threads),
         )
         .unwrap();
-        if let Some((state, flags)) = task {
-            std::fs::create_dir_all(tasks.join(group)).unwrap();
+        for (task, state, flags) in tasks {
+            std::fs::create_dir_all(directory.join(task)).unwrap();
             std::fs::write(
-                tasks.join(group).join("stat"),
-                stat(group, state, flags, threads),
+                directory.join(task).join("stat"),
+                stat(task, state, flags, threads),
             )
             .unwrap();
         }
@@ -599,23 +620,24 @@ fn a_group_whose_last_thread_is_exiting_is_going_and_any_other_is_hidden() {
     let namespace = FileIdentity::of(&handle).unwrap();
     let visit = |group: &str| {
         let group_directory = open(&directory, group, OFlags::DIRECTORY).unwrap();
-        matches!(
-            visit_group::<NamespaceError>(
-                &group_directory,
-                group.parse().unwrap(),
-                namespace,
-                &handle,
-                &mut |_| panic!("no task here is live"),
-            ),
-            Err(ScanError::Namespace(NamespaceError::Unreadable))
-        )
+        match visit_group::<NamespaceError>(
+            &group_directory,
+            group.parse().unwrap(),
+            namespace,
+            &handle,
+            &mut |_| panic!("a task in do_exit is not inspected"),
+        ) {
+            Ok(inspected) => Some(inspected),
+            Err(ScanError::Namespace(NamespaceError::Unreadable)) => None,
+            Err(_) => panic!("group {group}: an unexpected refusal"),
+        }
     };
-    let refused: Vec<bool> = ["8", "9", "10", "11"].iter().map(|g| visit(g)).collect();
+    let outcomes: Vec<_> = ["8", "12", "9", "11"].iter().map(|g| visit(g)).collect();
     std::fs::remove_dir_all(&root).unwrap();
     assert_eq!(
-        refused,
-        [false, true, true, true],
-        "last thread exiting is going; no task, a second thread, or a live group is hidden"
+        outcomes,
+        [Some(false), Some(false), None, None],
+        "leaving groups are visible and uninspected; zombie-only or empty live groups are hidden"
     );
 }
 

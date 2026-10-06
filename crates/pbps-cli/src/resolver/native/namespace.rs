@@ -295,9 +295,9 @@ impl<'a> NamespaceProcfs<'a> {
 }
 
 /// One thread group of a namespace scan: inspect its live tasks and say
-/// whether there were any. A group with none must prove from its own stat
-/// that it has gone or is going; otherwise its tasks are hidden from the view
-/// and the scan refuses.
+/// whether there were any. A group with no task still in it must prove from
+/// its own stat that it has gone; otherwise its tasks are hidden from the
+/// view and the scan refuses.
 fn visit_group<E>(
     group: &File,
     pid: u32,
@@ -311,6 +311,7 @@ fn visit_group<E>(
         Err(_) => return Err(NamespaceError::Unreadable.into()),
     };
     let mut found = false;
+    let mut inspected = false;
     for tid in task_ids(group, &tasks)? {
         let directory = match open(&tasks, &tid.to_string(), OFlags::DIRECTORY) {
             Ok(directory) => directory,
@@ -321,13 +322,21 @@ fn visit_group<E>(
             Some(stat) => stat,
             None => continue,
         };
-        let (number, departed, start_ticks) = task_stat(&stat)?;
-        if number != tid {
+        let reading = task_stat(&stat)?;
+        if reading.number != tid {
             return Err(NamespaceError::Unreadable.into());
         }
-        if departed {
+        if reading.gone {
             continue;
         }
+        // A task still in its group is a visible one, leaving or not: the
+        // group is not hidden. One in `do_exit` is not inspected, since it
+        // has already let go of what an inspection reads (#1554).
+        found = true;
+        if reading.exiting {
+            continue;
+        }
+        let start_ticks = reading.start;
         let task = TaskObservation {
             directory,
             id: NamespaceTaskId {
@@ -343,14 +352,14 @@ fn visit_group<E>(
             start_ticks,
         };
         if let TaskReading::Live(_) = task.status()? {
-            found = true;
+            inspected = true;
             inspect(task).map_err(ScanError::Callback)?;
         }
     }
     if !found && !group_exited(group)? {
         return Err(NamespaceError::Unreadable.into());
     }
-    Ok(found)
+    Ok(inspected)
 }
 
 enum ScanError<E> {
@@ -447,27 +456,11 @@ fn read_stat(directory: &File) -> Result<Option<Vec<u8>>, NamespaceError> {
     }
 }
 
-/// Whether a group has gone, or is going with nothing left behind: its last
-/// thread is a zombie, or is in `do_exit` (#1554). The thread count is the
-/// group's own, so a task seen leaving does not vouch for one created after
-/// the listing passed it; a group with another thread still refuses.
 fn group_exited(directory: &File) -> Result<bool, NamespaceError> {
-    let Some(stat) = read_stat(directory)? else {
-        return Ok(true);
-    };
-    if exited_stat(&stat).map_err(|_| NamespaceError::Metadata)? {
-        return Ok(true);
+    match read_stat(directory)? {
+        Some(stat) => exited_stat(&stat).map_err(|_| NamespaceError::Metadata),
+        None => Ok(true),
     }
-    let (_, departed, _) = task_stat(&stat)?;
-    let threads: u32 = super::stat_fields(&stat)
-        .map_err(|_| NamespaceError::Metadata)?
-        .1
-        .split_whitespace()
-        .nth(17)
-        .ok_or(NamespaceError::Metadata)?
-        .parse()
-        .map_err(|_| NamespaceError::Metadata)?;
-    Ok(departed && threads <= 1)
 }
 
 fn task_ids(group: &File, tasks: &File) -> Result<Vec<u32>, NamespaceError> {
@@ -485,26 +478,41 @@ fn task_alive(directory: &File, id: u32, start: u64) -> Result<bool, NamespaceEr
     let Some(stat) = read_stat(directory)? else {
         return Ok(false);
     };
-    let (current_id, departed, current_start) = task_stat(&stat)?;
-    if current_id != id || current_start != start {
+    let current = task_stat(&stat)?;
+    if current.number != id || current.start != start {
         return Err(NamespaceError::Replaced);
     }
-    Ok(!departed)
+    Ok(!current.departed())
 }
 
 /// `PF_EXITING`, from the kernel's `include/linux/sched.h`.
 const PF_EXITING: u32 = 0x4;
 
-/// A task's number, whether it has departed, and its start time.
-///
-/// Departed is a zombie or dead task, or one the kernel has marked
-/// `PF_EXITING`. `do_exit` sets that flag before it releases the task's
-/// memory and descriptors, and the task never returns to user space after
-/// it. The state still reads running or sleeping until `exit_notify` makes it
-/// a zombie, though. In that interval the task's `exe` and descriptor reads
-/// fail while it still reads as live, which refused an unchanged container
-/// profile under fork/exit churn (#1554).
-fn task_stat(stat: &[u8]) -> Result<(u32, bool, u64), NamespaceError> {
+/// One `stat` reading of a task.
+#[derive(Debug, PartialEq, Eq)]
+struct TaskStat {
+    number: u32,
+    /// A zombie or dead task: it is no longer in its group.
+    gone: bool,
+    /// A task the kernel has marked `PF_EXITING`. `do_exit` sets that flag
+    /// before it releases the task's memory and descriptors, and the task
+    /// never returns to user space after it. Its state still reads running
+    /// or sleeping until `exit_notify` makes it a zombie, though, and in that
+    /// interval its `exe` and descriptor reads fail while it still reads as
+    /// live. That refused an unchanged container profile under fork/exit churn
+    /// (#1554).
+    exiting: bool,
+    start: u64,
+}
+
+impl TaskStat {
+    /// Has left or is leaving: nothing it does can matter any more.
+    fn departed(&self) -> bool {
+        self.gone || self.exiting
+    }
+}
+
+fn task_stat(stat: &[u8]) -> Result<TaskStat, NamespaceError> {
     let (number, fields) = super::stat_fields(stat).map_err(|_| NamespaceError::Metadata)?;
     // proc_pid_stat(5): state is field 3, flags field 9, starttime field 22.
     let fields: Vec<&str> = fields.split_whitespace().collect();
@@ -519,8 +527,12 @@ fn task_stat(stat: &[u8]) -> Result<(u32, bool, u64), NamespaceError> {
         .ok_or(NamespaceError::Metadata)?
         .parse()
         .map_err(|_| NamespaceError::Metadata)?;
-    let departed = matches!(state, "X" | "Z") || flags & PF_EXITING != 0;
-    Ok((number, departed, start))
+    Ok(TaskStat {
+        number,
+        gone: matches!(state, "X" | "Z"),
+        exiting: flags & PF_EXITING != 0,
+        start,
+    })
 }
 
 fn status_id(status: &str, key: &str) -> Result<u32, NamespaceError> {
