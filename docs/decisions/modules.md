@@ -1649,3 +1649,65 @@ Pinned by `a_new_table_generating_from_a_new_function_follows_it_whole`
 (`crates/pbps-cli/tests/flow_pg.rs`) and
 `a_table_generating_from_a_declared_function_compiles_on_scratch`
 (`crates/pbps-pg/src/resolver/binding_tests.rs`).
+
+<a id="dec-1576-1"></a>
+
+**DEC-1576.1. A connected PostgreSQL plan whose expression names, in a
+literal, a relation the plan creates only after it is refused with a two-plan
+remedy; it is not reordered (#1576).** The differ sets a default, a check, an
+index's text and a generation expression ahead of the indexes and views a plan
+creates. PostgreSQL resolves an OID-alias literal such as
+`('app.ix_new'::regclass)::text` when the expression is created (measured on
+18: `relation "app.ix_new" does not exist`, and the apply rolled back). So a
+plan that adds `ix_new` and sets that default fails the apply after approval.
+
+Moving the expression after the relation, as DEC-1364.1 does for functions,
+was rejected. The case is rare, the move would have to pass the plan's row
+writes and the checks that judge them, and every such pass has invited its own
+corner cases. A refusal costs the user one more plan: deploy the relation,
+then the expression.
+
+`names_a_later_relation` runs on the final order, after every reordering pass,
+and only on the connected PostgreSQL path; an offline plan is a preview that
+`apply` never accepts.
+- **The relations a change brings:**
+  - a table it creates, with the indexes, unique constraints and named
+    primary key the create holds;
+  - a table renamed to a name;
+  - an index or unique constraint added;
+  - a named primary key set;
+  - a view created.
+- **What counts as naming one:** a literal is read as `regclass` input reads
+  it (measured on 18). The whole literal must be the name: optionally
+  schema-qualified (a catalog before the schema allowed), with white space
+  allowed around the dot. An unquoted part runs to a dot or white space, and
+  only its ASCII letters fold to lower case; quoted parts are verbatim. An
+  input of digits alone is an OID, not a name, and so is `-` exactly (OID 0).
+  An unqualified name is a candidate only in the schema the expression is
+  written in, the whole write `search_path` the CLI emits (it configures no
+  extras). A literal that only contains the name, a name in a comment, or
+  another schema's name is no reference. A literal that is the name but is
+  not cast can be refused; that costs a second plan, where a missed reference
+  costs a failed apply.
+- **The target settles an unqualified candidate.** `pg_catalog` is searched
+  ahead of the write path, so an unqualified name that resolves there, such
+  as `'pg_class'`, binds the catalog's relation whatever the plan creates. It
+  is asked, and only a name it does not hold is refused. The arrival's own
+  schema is never asked, and a qualified candidate is always refused. A
+  relation of that name there now is one the plan must remove before its
+  create. Removed before the expression, the expression fails; removed after
+  it, the removal does, since the expression depends on what it bound
+  (measured on 18: `cannot drop index app.ix_new because other objects
+  depend on it`). So a plan that rebuilds a relation an expression names is
+  refused like one that adds it (#1589).
+
+Pinned by `an_expression_naming_a_relation_the_plan_creates_later_is_refused`,
+`a_relation_literal_is_read_as_regclass_input_reads_it` and
+`a_later_name_is_looked_up_where_the_write_path_searches`
+(`crates/pbps-cli/src/dependents.rs`), the live
+`a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_deploy_it`,
+`a_name_that_already_resolves_on_the_target_is_not_refused` and
+`a_name_the_plan_rebuilds_is_refused_although_it_exists_now`
+(`crates/pbps-cli/tests/flow_pg.rs`), and the live
+`a_relation_lookup_finds_every_kind_by_its_exact_name`
+(`crates/pbps-pg/tests/live.rs`).

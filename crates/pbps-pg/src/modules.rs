@@ -3068,6 +3068,32 @@ pub async fn definer_path(
     )
 }
 
+/// Whether a relation of this name exists in this schema: what `regclass`
+/// input finds for the qualified name, whatever the relation's kind.
+///
+/// The CLI asks it of an expression's literal that names a relation the plan
+/// creates later (DEC-1576.1): one that already resolves binds that relation.
+/// Every name the query uses is the catalog's. The session's path is not
+/// pinned here, and a project's own `format` or `=` on it would otherwise
+/// answer instead (#1589 review).
+pub async fn relation_exists(conn: &mut Conn, schema: &str, name: &str) -> Result<bool, DbError> {
+    let rows = conn
+        .query_with(
+            "SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+              WHERE n.nspname OPERATOR(pg_catalog.=) $1::pg_catalog.name
+                AND c.relname OPERATOR(pg_catalog.=) $2::pg_catalog.name",
+            &[Param::Str(schema), Param::Str(name)],
+        )
+        .await?;
+    let found = rows
+        .first()
+        .ok_or_else(|| DbError::BadRow("a relation count returned no row".to_owned()))?
+        .try_get_at::<i64>(0)?
+        .ok_or_else(|| DbError::BadRow("a relation count is unexpectedly NULL".to_owned()))?;
+    Ok(found > 0)
+}
+
 /// What [`definer_path`] found.
 ///
 /// `Absent` is its own answer, not a safe one. A staged run asks before the

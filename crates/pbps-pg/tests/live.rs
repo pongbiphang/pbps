@@ -32580,3 +32580,49 @@ async fn an_escape_strings_prefix_carries_to_its_continued_pieces() {
         );
     }
 }
+
+/// DEC-1576.1: whether a literal the plan reads as a later relation already
+/// resolves. Any relation kind counts, the name is exact, and a project's own
+/// `format` on the session's path is not what answers (#1589 review).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn a_relation_lookup_finds_every_kind_by_its_exact_name() {
+    let mut db = TestDb::create("relation_exists1576").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app;
+             CREATE TABLE app.t (id int);
+             CREATE INDEX ix ON app.t (id);
+             CREATE VIEW app.v AS SELECT 1 AS one;
+             CREATE FUNCTION public.format(text, text, text) RETURNS text
+                 LANGUAGE sql AS 'SELECT NULL::text';",
+        )
+        .await
+        .unwrap();
+    for (schema, name) in [
+        ("app", "t"),
+        ("app", "ix"),
+        ("app", "v"),
+        ("pg_catalog", "pg_class"),
+    ] {
+        assert!(
+            pbps_pg::modules::relation_exists(&mut db.conn, schema, name)
+                .await
+                .unwrap(),
+            "{schema}.{name}"
+        );
+    }
+    for (schema, name) in [
+        ("app", "IX"),
+        ("app", "missing"),
+        ("other", "t"),
+        ("app", "pg_class"),
+    ] {
+        assert!(
+            !pbps_pg::modules::relation_exists(&mut db.conn, schema, name)
+                .await
+                .unwrap(),
+            "{schema}.{name}"
+        );
+    }
+}

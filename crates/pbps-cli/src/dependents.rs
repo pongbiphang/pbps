@@ -1180,6 +1180,290 @@ pub(crate) fn after_the_rebuilds(
     Ok(count + after_their_functions(cs, deps)?)
 }
 
+/// The literals in the plan's expressions that may name a relation this plan
+/// brings into being only after them (#1576, DEC-1576.1). PostgreSQL resolves
+/// `'app.ix'::regclass` when the expression is created, so a default, check,
+/// index or generation expression set before that relation's create fails
+/// the apply. The apply rolls back, but the plan was approved.
+///
+/// The planner does not reorder for it: the differ puts expressions ahead of
+/// the indexes and views that are the usual such relations, and a move would
+/// pass rows the plan writes and the checks that judge them. The approver
+/// splits the change instead, which the message says how to do.
+///
+/// A literal is a candidate only when the whole of it reads as the
+/// relation's name, as an OID-alias input reads one ([`relation_literal`]),
+/// in the arrival's schema or, unqualified, in the expression's. A literal
+/// that merely contains the name is none. Each candidate is then looked up
+/// on the target ([`LaterName`]), so one that already resolves is not
+/// refused. One that is the name and is not cast can still be refused; the
+/// remedy then costs a second plan, where missing a reference costs a failed
+/// apply.
+pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> Vec<LaterName> {
+    let mut arrivals: Vec<(usize, TableName)> = Vec::new();
+    for (i, p) in cs.changes.iter().enumerate() {
+        arrivals.extend(relations_brought(&p.change).into_iter().map(|r| (i, r)));
+    }
+    let mut found = Vec::new();
+    for (i, p) in cs.changes.iter().enumerate() {
+        let Some(scope) = expression_schema(&p.change) else {
+            continue;
+        };
+        for (whose, text) in expressions_set(&p.change) {
+            for literal in dialect.lexicon().string_literals(&text) {
+                let Some((schema, name)) = relation_literal(&literal) else {
+                    continue;
+                };
+                if let Some((_, relation)) = arrivals.iter().find(|(at, relation)| {
+                    *at > i
+                        && name == relation.name
+                        && schema.as_deref().unwrap_or(scope) == relation.schema
+                }) {
+                    // Only `pg_catalog`, searched ahead of the write path,
+                    // can answer for an unqualified name; see `LaterName`.
+                    let searched = match schema {
+                        Some(_) => Vec::new(),
+                        None => vec!["pg_catalog".to_owned()],
+                    };
+                    found.push(LaterName {
+                        what: format!("{whose} names {relation}, which the plan creates after it"),
+                        searched,
+                        name,
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// A literal [`names_a_later_relation`] reads as a relation the plan creates
+/// later. An unqualified one may instead resolve to a relation of that name
+/// in `pg_catalog`, which is searched ahead of the write path; the target
+/// says whether it does, and only a name that resolves nowhere is refused
+/// ([`later_relation_refusal`]).
+///
+/// The arrival's own schema is never asked. A relation of that name there
+/// now is one the plan must remove before its create, or the create fails;
+/// removed before the expression, the expression fails, and removed after
+/// it, the removal does, because the expression depends on what it bound
+/// (measured on 18: `cannot drop index app.ix_new because other objects
+/// depend on it`). So finding it there exempts nothing (#1589 review).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LaterName {
+    pub(crate) what: String,
+    /// The schemas ahead of the arrival's that the lookup searches, in order.
+    pub(crate) searched: Vec<String>,
+    pub(crate) name: String,
+}
+
+/// The refusal for the names that resolve nowhere on the target now.
+pub(crate) fn later_relation_refusal(names: &[LaterName]) -> Result<(), String> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let found: Vec<&str> = names.iter().map(|n| n.what.as_str()).collect();
+    Err(format!(
+        "an expression names a relation this plan creates later, and PostgreSQL resolves the \
+         name when the expression is created:\n  {}\nDeploy the relation first: leave the \
+         expression out of this revision, apply it, then add the expression in a second plan",
+        found.join("\n  ")
+    ))
+}
+
+/// The relations a change brings into the namespace, by the name they arrive
+/// under. An index's name is a relation's on PostgreSQL, as is a view's.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn relations_brought(change: &Change) -> Vec<TableName> {
+    let index = |table: &TableName, name: &str| TableName {
+        schema: table.schema.clone(),
+        name: name.to_owned(),
+    };
+    match change {
+        Change::CreateTable { name, table, .. } => {
+            let mut out = vec![name.clone()];
+            out.extend(table.indexes.keys().map(|n| index(name, n)));
+            out.extend(table.unique.keys().map(|n| index(name, n)));
+            out.extend(
+                table
+                    .primary_key
+                    .as_ref()
+                    .and_then(|pk| pk.name.as_deref())
+                    .map(|n| index(name, n)),
+            );
+            out
+        }
+        Change::RenameTable { to, .. } => vec![to.clone()],
+        Change::AddIndex { table, name, .. } | Change::AddUnique { table, name, .. } => {
+            vec![index(table, name)]
+        }
+        Change::SetPrimaryKey {
+            table,
+            to: Some(pk),
+            ..
+        } => pk.name.iter().map(|n| index(table, n)).collect(),
+        Change::CreateModule {
+            id: ModuleId::Named(name),
+            module,
+        } if module.kind == ModuleKind::View => {
+            vec![name.clone()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The schema an expression a change creates is written in. Its write
+/// `search_path` is that schema alone: the CLI's dialect configures no extras
+/// (`dialect_for`), and `pg_catalog`, searched first, holds no relation a plan
+/// creates. So an unqualified name can only reach an arrival there
+/// (#1589 review).
+#[allow(clippy::wildcard_enum_match_arm)]
+fn expression_schema(change: &Change) -> Option<&str> {
+    match change {
+        Change::CreateTable { name: table, .. }
+        | Change::AddColumn { table, .. }
+        | Change::AddCheck { table, .. }
+        | Change::AddIndex { table, .. } => Some(&table.schema),
+        Change::AlterColumnDefault { column, .. }
+        | Change::AlterColumnExpression { column, .. } => Some(&column.table.schema),
+        _ => None,
+    }
+}
+
+/// The expressions a change creates, each with what holds it.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn expressions_set(change: &Change) -> Vec<(String, String)> {
+    let column = |table: &TableName, name: &str, c: &pbps_model::Column| {
+        column_expression(c).map(|e| {
+            (
+                format!("{}'s default or expression", table.column(name)),
+                e.to_owned(),
+            )
+        })
+    };
+    match change {
+        Change::CreateTable { name, table, .. } => {
+            let mut out: Vec<(String, String)> = table
+                .columns
+                .iter()
+                .filter_map(|(n, c)| column(name, n, c))
+                .collect();
+            out.extend(
+                table
+                    .checks
+                    .iter()
+                    .map(|(n, c)| (format!("check {n} on {name}"), c.expression.clone())),
+            );
+            out.extend(
+                table
+                    .indexes
+                    .iter()
+                    .filter(|(_, ix)| ix.holds_expression() || ix.filter.is_some())
+                    .map(|(n, ix)| (format!("index {n} on {name}"), index_text(ix))),
+            );
+            out
+        }
+        Change::AddColumn {
+            table,
+            name,
+            column: c,
+            ..
+        } => column(table, name, c).into_iter().collect(),
+        Change::AlterColumnDefault {
+            column,
+            to: Some(to),
+            ..
+        } => vec![(format!("{column}'s default"), to.clone())],
+        Change::AlterColumnExpression { column, to, .. } => {
+            vec![(format!("{column}'s generation expression"), to.clone())]
+        }
+        Change::AddCheck {
+            table,
+            name,
+            constraint,
+        } => vec![(
+            format!("check {name} on {table}"),
+            constraint.expression.clone(),
+        )],
+        Change::AddIndex {
+            table, name, index, ..
+        } => vec![(format!("index {name} on {table}"), index_text(index))],
+        _ => Vec::new(),
+    }
+}
+
+/// The white space `regclass` input skips: the scanner's six, vertical tab
+/// among them, which `char::is_ascii_whitespace` leaves out. Measured on 18:
+/// `E'pg_class\013'` is `pg_class`, and a no-break space is part of the name
+/// (#1589 review).
+fn is_input_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
+}
+
+/// A literal that is wholly a relation's name, as `regclass` input reads one:
+/// its optional schema and its name. `None` for anything else.
+///
+/// Measured on 18 (#1589 review), as the input's identifier splitter reads it:
+/// - an unquoted part runs to a dot or ASCII white space, so `'app.a-b'`
+///   names `"a-b"`;
+/// - only ASCII letters fold, so `'app.ixÄ'` names `"ixÄ"` and not `"ixä"`;
+/// - white space, [`is_input_space`], is allowed around the dot;
+/// - an input of ASCII digits alone is an OID, not a name: `'1259'` is
+///   `pg_class`;
+/// - `'-'` exactly is OID 0, while `' -'` and `'"-"'` are names
+///   (#1589 review).
+fn relation_literal(contents: &str) -> Option<(Option<String>, String)> {
+    // `-` alone, exactly, is the input's spelling of no relation (OID 0).
+    if contents == "-" || (!contents.is_empty() && contents.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut rest = contents.trim_matches(is_input_space);
+    loop {
+        let (part, after) = if let Some(quoted) = rest.strip_prefix('"') {
+            let mut name = String::new();
+            let mut chars = quoted.char_indices();
+            let end = loop {
+                match chars.next()? {
+                    (at, '"') if quoted[at + 1..].starts_with('"') => {
+                        name.push('"');
+                        chars.next();
+                    }
+                    (at, '"') => break at + 1,
+                    (_, ch) => name.push(ch),
+                }
+            };
+            (name, &quoted[end..])
+        } else {
+            let end = rest
+                .find(|c: char| c == '.' || is_input_space(c))
+                .unwrap_or(rest.len());
+            if end == 0 {
+                return None;
+            }
+            (rest[..end].to_ascii_lowercase(), &rest[end..])
+        };
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part);
+        let after = after.trim_start_matches(is_input_space);
+        if after.is_empty() {
+            break;
+        }
+        rest = after.strip_prefix('.')?.trim_start_matches(is_input_space);
+    }
+    match parts.len() {
+        1 => Some((None, parts.pop()?)),
+        // A catalog's name before the schema is the current database's.
+        2 | 3 => {
+            let name = parts.pop()?;
+            Some((parts.pop(), name))
+        }
+        _ => None,
+    }
+}
+
 /// Places a column this plan adds whose default or generation expression
 /// names a function the plan creates or rebuilds after that function's
 /// create, and whatever may need the column after the column (DEC-1364.1).
@@ -3583,5 +3867,151 @@ mod tests {
             other => panic!("expected the moved removal first, got {other:?}"),
         }
         assert!(unaccounted(&cs, &found).is_empty());
+    }
+
+    /// The check with nothing already on the target: every candidate stands.
+    fn refusal_of(cs: &ChangeSet, dialect: &dyn Dialect) -> Result<(), String> {
+        later_relation_refusal(&names_a_later_relation(cs, dialect))
+    }
+
+    /// A candidate says where the target is asked: an unqualified name in
+    /// `pg_catalog`, searched first; a qualified one nowhere, since its
+    /// schema is the arrival's (#1589).
+    #[test]
+    fn a_later_name_is_looked_up_where_the_write_path_searches() {
+        let searched = |default: &str| -> Vec<Vec<String>> {
+            names_a_later_relation(
+                &plan(vec![default_of("t", default), add_index("ix_new", None)]),
+                &*pg(),
+            )
+            .into_iter()
+            .map(|n| n.searched)
+            .collect()
+        };
+        assert_eq!(searched("('ix_new'::regclass)::text"), [["pg_catalog"]]);
+        assert_eq!(
+            searched("('app.ix_new'::regclass)::text"),
+            [Vec::<String>::new()]
+        );
+        assert!(searched("('other.ix_new'::regclass)::text").is_empty());
+    }
+
+    /// #1576: PostgreSQL resolves `'app.ix'::regclass` when the expression is
+    /// created, so a default set before the index it names fails the apply.
+    /// The plan is refused with the two-plan remedy; set after the index, or
+    /// naming anything the plan does not create later, it stands.
+    #[test]
+    fn an_expression_naming_a_relation_the_plan_creates_later_is_refused() {
+        let named = "('app.ix_new'::regclass)::text";
+        let refused = refusal_of(
+            &plan(vec![default_of("t", named), add_index("ix_new", None)]),
+            &*pg(),
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("app.t.n's default names app.ix_new"),
+            "{refused}"
+        );
+        assert!(refused.contains("second plan"), "{refused}");
+        // A check, and an index filter, are created the same way.
+        let check = Change::AddCheck {
+            table: TableName::new("app", "t"),
+            name: "ck".into(),
+            constraint: CheckConstraint {
+                expression: "'app.ix_new'::regclass IS NOT NULL".into(),
+            },
+        };
+        assert!(refusal_of(&plan(vec![check, add_index("ix_new", None)]), &*pg()).is_err());
+        // Negative: the index first, a name the plan does not create, a
+        // literal that only contains the name, another schema, and a name in
+        // a comment.
+        for (default, created) in [
+            (named, "ix_other"),
+            ("'ix_new and more'", "ix_new"),
+            ("('other.ix_new'::regclass)::text", "ix_new"),
+            ("0 /* 'app.ix_new' */", "ix_new"),
+            // An OID, and a non-ASCII letter the input does not fold.
+            ("to_regclass('1259')::text", "1259"),
+            ("to_regclass('app.ixÄ')::text", "ixä"),
+        ] {
+            assert_eq!(
+                refusal_of(
+                    &plan(vec![default_of("t", default), add_index(created, None)]),
+                    &*pg()
+                ),
+                Ok(()),
+                "{default} / {created}"
+            );
+        }
+        assert_eq!(
+            refusal_of(
+                &plan(vec![add_index("ix_new", None), default_of("t", named)]),
+                &*pg()
+            ),
+            Ok(())
+        );
+        // An unqualified name is read in the expression's own schema, the
+        // whole write path: an index of that name elsewhere is no reference.
+        let unqualified = "('ix_new'::regclass)::text";
+        assert!(
+            refusal_of(
+                &plan(vec![
+                    default_of("t", unqualified),
+                    add_index("ix_new", None)
+                ]),
+                &*pg()
+            )
+            .is_err()
+        );
+        let mut elsewhere = add_index("ix_new", None);
+        if let Change::AddIndex { table, .. } = &mut elsewhere {
+            *table = TableName::new("other", "u");
+        }
+        assert_eq!(
+            refusal_of(&plan(vec![default_of("t", unqualified), elsewhere]), &*pg()),
+            Ok(())
+        );
+        // The same non-ASCII letter the plan creates is a reference.
+        assert!(
+            refusal_of(
+                &plan(vec![
+                    default_of("t", "to_regclass('app.ixÄ')::text"),
+                    add_index("ixÄ", None)
+                ]),
+                &*pg()
+            )
+            .is_err()
+        );
+    }
+
+    /// A literal is a relation's name as `regclass` input reads it: unquoted
+    /// parts fold to lower case, quoted ones are verbatim, and a catalog
+    /// before the schema is allowed. Anything more is no name.
+    #[test]
+    fn a_relation_literal_is_read_as_regclass_input_reads_it() {
+        let some =
+            |schema: Option<&str>, name: &str| Some((schema.map(Into::into), name.to_owned()));
+        assert_eq!(relation_literal("ix"), some(None, "ix"));
+        assert_eq!(relation_literal(" App . IX "), some(Some("app"), "ix"));
+        assert_eq!(
+            relation_literal("\"App\".\"My \"\"ix\""),
+            some(Some("App"), "My \"ix")
+        );
+        assert_eq!(relation_literal("db.app.ix"), some(Some("app"), "ix"));
+        // Measured on 18 (#1589 review): an unquoted part runs to a dot or
+        // white space, only ASCII letters fold, and digits alone are an OID.
+        assert_eq!(relation_literal("app.a-b"), some(Some("app"), "a-b"));
+        assert_eq!(relation_literal("app.IXÄ"), some(Some("app"), "ixÄ"));
+        assert_eq!(relation_literal("\"1259\""), some(None, "1259"));
+        // `-` exactly is OID 0; spaced or quoted, it is a name.
+        assert_eq!(relation_literal(" -"), some(None, "-"));
+        // A vertical tab is white space to the input; a no-break space is not.
+        assert_eq!(relation_literal("pg_class\x0b"), some(None, "pg_class"));
+        assert_eq!(relation_literal("app\x0b.\x0bix"), some(Some("app"), "ix"));
+        assert_eq!(relation_literal("ix\u{a0}"), some(None, "ix\u{a0}"));
+        assert_eq!(relation_literal("\"-\""), some(None, "-"));
+        for not_a_name in ["", "a b", "app.", ".ix", "a.b.c.d", "\"open", "1259", "-"] {
+            assert_eq!(relation_literal(not_a_name), None, "{not_a_name:?}");
+        }
     }
 }

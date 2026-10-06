@@ -2317,6 +2317,16 @@ pub async fn account_for_module_dependents(
     let released = crate::dependents::released(changes, &found);
     let moved = crate::dependents::after_the_rebuilds(changes, &released, deps)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
+    // On the final order: every pass above may move what an expression
+    // names, or the expression (#1576).
+    let mut later = Vec::new();
+    for name in crate::dependents::names_a_later_relation(changes, dialect) {
+        if !resolves_now(conn, &name).await? {
+            later.push(name);
+        }
+    }
+    crate::dependents::later_relation_refusal(&later)
+        .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     crate::dependents::settle_public_execution(changes, decisions);
     let left = crate::dependents::unaccounted(changes, &found);
     if !left.is_empty() {
@@ -2336,6 +2346,24 @@ pub async fn account_for_module_dependents(
             found.len()
         ),
     })
+}
+
+/// Whether a literal [`crate::dependents::names_a_later_relation`] read as a
+/// later relation already resolves to one on the target, searching its
+/// schemas in order as the write path would (#1589).
+async fn resolves_now(
+    conn: &mut Conn,
+    name: &crate::dependents::LaterName,
+) -> anyhow::Result<bool> {
+    for schema in &name.searched {
+        if pbps_pg::modules::relation_exists(conn, schema, &name.name)
+            .await
+            .map_err(|e| anyhow::anyhow!("looking up {schema}.{} on the target: {e}", name.name))?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The apply's half of #314: the saved plan must still remove, before each

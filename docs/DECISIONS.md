@@ -630,3 +630,4 @@ other numbers before landing. Some records still mention them as proposals.
 | DEC-1550.1 | [resolver](decisions/resolver.md#dec-1550-1) | A native run checks the attach stream before each write, the target's sole holder once per check, and the scope once per resolution. |
 | DEC-1515.1 | [resolver](decisions/resolver.md#dec-1515-1) | A selected resolver runs only when the coarse typed-plan assessment needs it; with none selected ADR-0013 decides; evidence replaces the candidate rebuild. |
 | DEC-1274.2 | [modules](decisions/modules.md#dec-1274-2) | A new table whose generated column calls a function the plan creates follows that create whole, in the plan and on scratch. |
+| DEC-1576.1 | [modules](decisions/modules.md#dec-1576-1) | A connected PostgreSQL plan whose expression names, in a literal, a relation the plan creates later is refused with a two-plan remedy, not reordered. |
