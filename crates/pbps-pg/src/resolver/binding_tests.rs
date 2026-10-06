@@ -2578,3 +2578,82 @@ async fn a_managed_index_does_not_account_for_a_same_named_type() {
         );
     }
 }
+
+/// #1597: a compile statement the server rejects is a verdict on its
+/// declaration; one whose backend is terminated under it is not, whether by
+/// an administrator or by `transaction_timeout` (17 and later). An event
+/// trigger on scratch does each inside the same `CREATE VIEW`, so the cases
+/// differ only in what failed it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_scratch_backend_terminated_mid_statement_is_no_compile_verdict() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let desired = Declared::default().view("app.v", "SELECT 1 AS x");
+        for (tag, body) in [
+            ("killed", "PERFORM pg_terminate_backend(pg_backend_pid())"),
+            ("timed", "PERFORM pg_sleep(5)"),
+            ("raised", "RAISE EXCEPTION 'refused by the scratch trigger'"),
+        ] {
+            let mut databases = Databases {
+                server: server.clone(),
+                names: Vec::new(),
+            };
+            let name = format!("pbps_bind1597_{tag}_{}", std::process::id());
+            let mut admin = databases.create(name.clone(), &["app"]).await;
+            admin
+                .execute(&format!(
+                    "CREATE FUNCTION public.stop() RETURNS event_trigger LANGUAGE plpgsql \
+                     AS $$ BEGIN {body}; END $$; \
+                     CREATE EVENT TRIGGER stop ON ddl_command_start \
+                     WHEN TAG IN ('CREATE VIEW') EXECUTE FUNCTION public.stop();"
+                ))
+                .await
+                .unwrap();
+            if tag == "timed" {
+                let version = admin
+                    .query("SELECT current_setting('server_version_num')::integer")
+                    .await
+                    .unwrap()[0]
+                    .try_get_at::<i32>(0)
+                    .unwrap()
+                    .unwrap();
+                if version < 170_000 {
+                    databases.drop().await;
+                    continue;
+                }
+                admin
+                    .execute(&format!(
+                        "ALTER DATABASE {name} SET transaction_timeout = '500ms'"
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let pg = dialect(&[]);
+            let mut reconstruction = Reconstruction::new(&pg, &bootstrap(&desired.schema, &[]))
+                .expect("a view is reconstructible");
+            let mut scratch = databases.stream(&name).await;
+            let compiled = reconstruction.compile(&pg, &mut scratch).await;
+            drop(scratch);
+            databases.drop().await;
+            match tag {
+                "killed" | "timed" => assert!(
+                    matches!(
+                        &compiled,
+                        Err(reconstruct::ReconstructError::Interrupted { declaration, .. })
+                            if declaration.contains("app.v")
+                    ),
+                    "{variable}: {compiled:?}"
+                ),
+                _ => assert!(
+                    matches!(
+                        &compiled,
+                        Err(reconstruct::ReconstructError::Compile { reason, .. })
+                            if reason.contains("refused by the scratch trigger")
+                    ),
+                    "{variable}: {compiled:?}"
+                ),
+            }
+        }
+    }
+}

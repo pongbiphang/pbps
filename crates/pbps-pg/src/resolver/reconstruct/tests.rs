@@ -723,3 +723,40 @@ fn a_held_table_naming_another_held_table_follows_it() {
     );
     assert!(at("table app.a") < at("table app.b"), "{order:?}");
 }
+
+/// #1597: only the server's judgement of a statement is a verdict on its
+/// declaration. A terminated backend (`57P01`, measured), a lost connection
+/// (no code), and the other classes about the server's state are not.
+#[test]
+fn a_compile_failure_is_a_verdict_only_when_the_server_judged_the_statement() {
+    let failed = |code: Option<&str>| pbps_db::DbError::Driver {
+        message: "failed".into(),
+        code: code.map(Into::into),
+    };
+    for code in [
+        "42P01", "42883", "42601", "0A000", "22023", "2BP01", "P0001", "25001",
+    ] {
+        assert!(judged_the_statement(&failed(Some(code))), "{code}");
+    }
+    for code in [
+        None,
+        Some("57P01"),
+        Some("57014"),
+        Some("25P03"),
+        Some("25P04"),
+        Some("08006"),
+        Some("40P01"),
+        Some("53200"),
+        Some("58030"),
+        Some("XX000"),
+    ] {
+        assert!(!judged_the_statement(&failed(code)), "{code:?}");
+    }
+    // A code wrapped in this tool's own context is still the server's.
+    assert!(judged_the_statement(
+        &failed(Some("42P01")).context("compiling app.t")
+    ));
+    assert!(!judged_the_statement(&pbps_db::DbError::Refused(
+        "refused".into()
+    )));
+}

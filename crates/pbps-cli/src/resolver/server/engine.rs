@@ -153,14 +153,15 @@ pub(crate) async fn compile(
 }
 
 /// What a failed scratch compilation is. A declaration that did not compile
-/// is the binding's verdict; a catalog read around it, or a transaction that
-/// would not open or commit, answered nothing (SPEC 9.8, #1575).
+/// is the binding's verdict; a catalog read around it, a transaction that
+/// would not open or commit, or a statement the connection or server
+/// interrupted, answered nothing (SPEC 9.8, #1575, #1597).
 pub(super) fn compile_failed(error: pbps_pg::resolver::reconstruct::ReconstructError) -> Error {
     use pbps_pg::resolver::reconstruct::ReconstructError;
     match error {
-        ReconstructError::Read { .. } | ReconstructError::Transaction(_) => {
-            Error::Read(error.to_string())
-        }
+        ReconstructError::Read { .. }
+        | ReconstructError::Interrupted { .. }
+        | ReconstructError::Transaction(_) => Error::Read(error.to_string()),
         ReconstructError::Unsupported(_)
         | ReconstructError::Emit { .. }
         | ReconstructError::Compile { .. }
@@ -399,6 +400,13 @@ mod tests {
         ));
         assert!(matches!(
             compile_failed(ReconstructError::Transaction("commit")),
+            Error::Read(_)
+        ));
+        assert!(matches!(
+            compile_failed(ReconstructError::Interrupted {
+                declaration: "app.t".into(),
+                reason: "terminating connection due to administrator command".into(),
+            }),
             Error::Read(_)
         ));
         for verdict in [
