@@ -2830,6 +2830,10 @@ Measured on 16.15 and 18.6:
   still reported as on a kind the model does not declare, and so was never
   held. A partitioned table the pull does not hold has its grant reported as
   on an object the pull did not record, as an ordinary table's is.
+- `doctor`'s two grant questions, the deployer's authority over a recorded
+  grant and over a target's existing ACL, ask of a partitioned table too.
+  Asking of tables and views alone, they found a recorded grant on a parent
+  absent and refused readiness after a clean bootstrap.
 
 Everything else is the grant model's for any table: a grant on a new
 partition is planned after its `CREATE`, granting and revoking on a standing
@@ -2842,7 +2846,8 @@ Pinned on 16 and 18 by the live `range_partition_trees_round_trip_whole_or_not_a
 with a column grant is left out), and on 18 by the CLI's
 `a_partition_tree_round_trips_through_the_cli` (pull, bootstrap, verify and an
 empty replan with a grant on the parent and one on a partition, the parent's
-not reaching the partition; a grant and a revoke on the standing partition)
+not reaching the partition; `doctor` clean after it; a grant and a revoke
+on the standing partition)
 and `partitions_are_added_and_dropped_through_the_cli` (a granted partition
 dropped). Also by the units `a_partition_needs_its_parent_and_its_key`'s
 grant case and `a_grant_on_a_relation_kind_this_model_does_not_declare_is_reported`.

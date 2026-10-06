@@ -327,7 +327,7 @@ fn question(target: &GrantTarget, right: Permission) -> (Securable, String, Vec<
                     pg_catalog.has_schema_privilege(n.oid, 'USAGE') AS usage_ok
                FROM pg_catalog.pg_class c
                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-              WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'v')"
+              WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'v', 'p')"
                 .to_owned(),
             vec![Param::Str(&o.schema), Param::Str(&o.name)],
         ),
@@ -359,7 +359,7 @@ fn catalog_question(values: &str) -> String {
                    pg_catalog.has_schema_privilege(n.oid, 'USAGE') AS usage_ok
               FROM pg_catalog.pg_class c
               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-             WHERE c.relkind IN ('r', 'v')
+             WHERE c.relkind IN ('r', 'v', 'p')
             UNION ALL
             SELECT n.nspname, p.proname, 'routine',
                    COALESCE((SELECT pg_catalog.string_agg(pg_catalog.format_type(u.ty, NULL), ', ' ORDER BY u.pos)

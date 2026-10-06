@@ -6571,6 +6571,10 @@ fn a_partition_tree_round_trips_through_the_cli() {
     // Measured: the parent's grant does not reach direct access to a
     // partition, so none was made there.
     assert_eq!(privilege("app.ev_rest", "SELECT"), 0);
+    // The readiness check finds the grants it recorded, the parent's
+    // included (#1579 review).
+    let o = d.run(&["doctor", "--db", &tgt]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 
     // Granted on the standing partition, as on any table.
     std::fs::write(
