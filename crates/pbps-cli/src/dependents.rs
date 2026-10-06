@@ -1443,7 +1443,8 @@ struct RoutineHeader {
 ///
 /// Each `SET` clause's value list is consumed to its end, so a schema or a
 /// value named `set`, `begin` or `return` is an entry, never a clause or a
-/// body. The body starts at `AS` (a string), `RETURN` or `BEGIN ATOMIC`.
+/// body. The body is the string after `AS`, which clauses may follow, or
+/// starts at `RETURN` or `BEGIN ATOMIC`, which comes last.
 fn routine_header(definition: &str, dialect: &dyn Dialect) -> RoutineHeader {
     let words = header_words(definition, dialect);
     let mut header = RoutineHeader {
@@ -1458,11 +1459,16 @@ fn routine_header(definition: &str, dialect: &dyn Dialect) -> RoutineHeader {
         if w.end <= from {
             continue;
         }
+        // Clauses may follow a string body, `SET search_path` among them,
+        // and the engine applies them all; the body itself is blanked, so
+        // the walk goes on past it (#1599 review).
         if w.is("as") {
-            header.body = definition
-                .get(w.end..)
-                .and_then(|rest| dialect.lexicon().string_literals(rest).into_iter().next());
-            break;
+            if header.body.is_none() {
+                header.body = definition
+                    .get(w.end..)
+                    .and_then(|rest| dialect.lexicon().string_literals(rest).into_iter().next());
+            }
+            continue;
         }
         if w.is("return") || (w.is("begin") && words.get(k).is_some_and(|n| n.is("atomic"))) {
             break;
@@ -4596,6 +4602,14 @@ mod tests {
                 "() RETURNS integer LANGUAGE sql SET work_mem = '64MB' SET statement_timeout = 0 SET search_path = other AS $$ SELECT 1 $$"
             ),
             some(&["other"])
+        );
+        // A clause after the string body still applies, and the body is
+        // still the string after `AS`.
+        let late = "() RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql SET search_path TO 'other', 'pg_temp'";
+        assert_eq!(path(late), some(&["other", "pg_temp"]));
+        assert_eq!(
+            routine_header(late, &*pg()).body.as_deref(),
+            Some(" SELECT 1 ")
         );
         // Not a clause: in the string body, or in an atomic body.
         assert_eq!(
