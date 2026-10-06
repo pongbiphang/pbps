@@ -17850,3 +17850,51 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
     on_server(&p, "CREATE SCHEMA app");
     succeeds(d.run(&["bootstrap", "--db", &p]));
 }
+/// #1604: a routine's own `SET search_path`, in the form `pull` declares
+/// (`SET search_path TO 'other', 'pg_temp'`), is where its string body's
+/// unqualified name is looked up. `app.reads()` names `'k'`, which is
+/// `other.k`; the bootstrap's reordering moves an index `app.k` after it,
+/// which the routine never names, so the plan is not refused and deploys.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_bootstrap_reads_a_routines_own_search_path_as_pulled() {
+    let server = server();
+    let source = OwnDatabase::new(&server, "boot-own-path");
+    let target = OwnDatabase::new(&server, "boot-own-path-target");
+    let (src, tgt) = (
+        source.connection().to_owned(),
+        target.connection().to_owned(),
+    );
+    on_server(
+        &src,
+        "CREATE SCHEMA other; \
+         CREATE TABLE other.k (id integer); \
+         CREATE SCHEMA app; \
+         CREATE FUNCTION app.abs() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; \
+         CREATE TABLE app.a (k integer); \
+         CREATE INDEX k ON app.a (abs(k)); \
+         CREATE FUNCTION app.reads() RETURNS integer LANGUAGE sql \
+             SET search_path = other, pg_temp \
+             AS $$ SELECT ('k'::regclass)::oid::integer $$",
+    );
+    let d = Demo::new("boot-own-path");
+    succeeds(d.run(&["pull", "--db", &src]));
+    d.commit();
+    let declared =
+        std::fs::read_to_string(d.dir.join("schema/app.reads%28%29.function.yml")).unwrap();
+    assert!(
+        declared.contains("SET search_path TO 'other', 'pg_temp'"),
+        "{declared}"
+    );
+    on_server(&tgt, "CREATE SCHEMA app; CREATE SCHEMA other");
+    succeeds(d.run(&["bootstrap", "--db", &tgt]));
+    assert_eq!(
+        scalar(
+            &tgt,
+            "SELECT count(*) FROM (SELECT 1) AS one \
+             WHERE app.reads() = 'other.k'::regclass::oid::integer"
+        ),
+        1,
+        "the body reads other.k"
+    );
+}

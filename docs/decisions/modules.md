@@ -1692,8 +1692,20 @@ ask (#1599 review).
   routine's own `SET search_path`, which the engine applies before the
   validator; an atomic body and a view are parsed under the session's path
   (measured on 16 and 18). The clause is read from the header at depth zero,
-  past the parameter and return lists, the last of two winning and each
-  quoted argument one schema, as the engine stores them (measured on 18). The path is walked in order up to the first schema
+  past the parameter and return lists, in the engine's own lexis, the last of
+  two winning and each quoted argument one schema, as the engine stores them
+  (measured on 18).
+- **Which spellings of that clause are read** (#1604). Two forms: the one
+  `pg_get_functiondef` writes and `pull` therefore declares, one
+  single-quoted literal per schema (`SET search_path TO 'a', 'b'`), and a
+  list of plain or double-quoted identifiers. A clause begins at a `SET` no
+  comma precedes. Any other spelling (a dollar-quoted argument, an escape
+  string, `FROM CURRENT`, `"$user"`, a comment inside the clause) is
+  unread, and an unread path matches a later relation of that name in any
+  schema. That costs a second plan, never a failed apply. Re-implementing
+  the rest of the grammar was the alternative; five review rounds on #1599
+  each found the next slice it lacked, so the contract is the readable
+  forms, not the grammar. The path is walked in order up to the first schema
   the name binds in: a relation the plan makes earlier binds it there, one it
   makes later is the reference, and the target is asked about the schemas
   ahead of it. A path the scan cannot read (`FROM CURRENT`, `"$user"`, an

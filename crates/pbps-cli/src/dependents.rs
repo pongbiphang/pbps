@@ -1314,14 +1314,22 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
     found
 }
 
-/// A word of a routine's header: the offset it ends at, its text (a quoted
-/// identifier decoded, the rest folded), and whether it was quoted.
-struct HeaderWord(usize, String, bool);
+/// A word of a routine's header.
+struct HeaderWord {
+    /// The offset it ends at, which is the definition's.
+    end: usize,
+    /// A quoted identifier decoded, the rest folded.
+    text: String,
+    quoted: bool,
+    /// Whether a comma comes right before it: a list's next entry, which a
+    /// clause's keyword never is (#1604).
+    after_comma: bool,
+}
 
 impl HeaderWord {
     /// Whether this is the keyword `kw`, which a quoted identifier never is.
     fn is(&self, kw: &str) -> bool {
-        !self.2 && self.1 == kw
+        !self.quoted && self.text == kw
     }
 }
 
@@ -1335,11 +1343,16 @@ fn header_words(definition: &str, dialect: &dyn Dialect) -> Vec<HeaderWord> {
     let word = dialect.lexicon().identifier_continues;
     let mut words: Vec<HeaderWord> = Vec::new();
     let mut depth = 0usize;
+    let mut after_comma = false;
     let mut chars = header.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
         match c {
             '(' => depth += 1,
             ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                after_comma = true;
+                continue;
+            }
             '"' => {
                 let mut name = String::new();
                 let mut end = header.len();
@@ -1357,7 +1370,12 @@ fn header_words(definition: &str, dialect: &dyn Dialect) -> Vec<HeaderWord> {
                     }
                 }
                 if depth == 0 {
-                    words.push(HeaderWord(end, name, true));
+                    words.push(HeaderWord {
+                        end,
+                        text: name,
+                        quoted: true,
+                        after_comma,
+                    });
                 }
             }
             c if word(c) => {
@@ -1374,10 +1392,20 @@ fn header_words(definition: &str, dialect: &dyn Dialect) -> Vec<HeaderWord> {
                     if w == "return" || w == "begin" {
                         break;
                     }
-                    words.push(HeaderWord(end, w, false));
+                    words.push(HeaderWord {
+                        end,
+                        text: w,
+                        quoted: false,
+                        after_comma,
+                    });
                 }
             }
             _ => {}
+        }
+        // A blanked literal or comment is white space; anything else that
+        // is not a comma ends the run the comma began.
+        if !is_input_space(c) {
+            after_comma = false;
         }
     }
     words
@@ -1390,7 +1418,7 @@ fn string_body(definition: &str, dialect: &dyn Dialect) -> Option<String> {
     let after = header_words(definition, dialect)
         .into_iter()
         .find(|w| w.is("as"))?
-        .0;
+        .end;
     dialect
         .lexicon()
         .string_literals(definition.get(after..)?)
@@ -1400,9 +1428,15 @@ fn string_body(definition: &str, dialect: &dyn Dialect) -> Option<String> {
 
 /// A routine's own `SET search_path`, as its definition's header spells it:
 /// `Some(None)` when it sets none, `Some(Some(schemas))` in order, and `None`
-/// when the clause is there but not in a form this scan reads (`FROM
-/// CURRENT`, an escape string, `"$user"`), which the caller reads as any
-/// schema. The body, a string, is blanked first, so a `SET` inside it is no
+/// when the clause is there but not in a form this scan reads, which the
+/// caller reads as any schema (#1604). Two forms are read: the one
+/// `pg_get_functiondef` writes, and so `pull` declares, one single-quoted
+/// literal per schema (`TO 'a', 'b'`); and plain or double-quoted
+/// identifiers. Anything else, a dollar-quoted argument, an escape string,
+/// `FROM CURRENT`, `"$user"`, a comment, is unread: it costs a second plan
+/// where the body names a relation the plan makes later, never a failed
+/// apply. A clause starts at a `SET` no comma precedes, so a schema named
+/// `set` is a list entry. The body, a string, is blanked first, so a `SET` inside it is no
 /// clause; so are the parameter and return lists, read at depth zero only.
 /// Measured on 18: the last of two clauses is the one stored, and each
 /// quoted argument is one schema, `TO 'a,b'` the schema `a,b`.
@@ -1419,8 +1453,12 @@ fn routine_path(definition: &str, dialect: &dyn Dialect) -> Option<Option<Vec<St
         .windows(2)
         .rev()
         // A setting's name matches in any case, quoted or not.
-        .find(|pair| pair[0].is("set") && pair[1].1.eq_ignore_ascii_case("search_path"))
-        .map(|pair| pair[1].0)
+        .find(|pair| {
+            pair[0].is("set")
+                && !pair[0].after_comma
+                && pair[1].text.eq_ignore_ascii_case("search_path")
+        })
+        .map(|pair| pair[1].end)
     else {
         return Some(None);
     };
@@ -1451,7 +1489,15 @@ fn routine_path(definition: &str, dialect: &dyn Dialect) -> Option<Option<Vec<St
                 .chars()
                 .next()
                 .is_some_and(|c| !is_input_space(c) && c != ',');
-            if len == 0 || w == "from" || w == "default" || glued {
+            // A plain identifier only: one starting with a digit or holding
+            // a `$`, a dollar-quoted `$$other$$` among them, is a form this
+            // scan does not read (#1604).
+            let plain = rest[..len]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_' || !c.is_ascii())
+                && !rest[..len].contains('$');
+            if !plain || w == "from" || w == "default" || glued {
                 return None;
             }
             (w, len)
@@ -4413,6 +4459,14 @@ mod tests {
             path("() RETURNS integer LANGUAGE sql SET search_path = app\u{a0} AS $$ SELECT 1 $$"),
             some(&["app\u{a0}"])
         );
+        // #1604: a clause starts at a `SET` no comma precedes, so schemas
+        // named `set` and `search_path` are list entries.
+        assert_eq!(
+            path(
+                "() RETURNS integer LANGUAGE sql SET search_path = other, set, search_path, app AS $$ SELECT 1 $$"
+            ),
+            some(&["other", "set", "search_path", "app"])
+        );
         // Not a clause: in the string body, or in an atomic body.
         assert_eq!(
             path("() RETURNS void LANGUAGE plpgsql AS $$ BEGIN SET search_path = x; END $$"),
@@ -4435,6 +4489,9 @@ mod tests {
             "SET search_path = \"$user\", public",
             "SET search_path = E'app'",
             "SET search_path /* c */ = app",
+            // #1604: a dollar-quoted argument, and an unquoted `$user`.
+            "SET search_path = $$other$$, app",
+            "SET search_path = $user, app",
         ] {
             assert_eq!(
                 path(&format!(
