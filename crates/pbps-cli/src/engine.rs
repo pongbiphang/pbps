@@ -2312,7 +2312,8 @@ pub async fn account_for_module_dependents(
     let decisions = crate::dependents::take_public_execution(changes);
     let added = crate::dependents::weave(changes, &found, declared, ids, dialect)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
-    let split = crate::dependents::split_new_tables(changes, ids, dialect);
+    let split = crate::dependents::split_new_tables(changes, ids, dialect)
+        .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     let released = crate::dependents::released(changes, &found);
     let moved = crate::dependents::after_the_rebuilds(changes, &released, deps)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;

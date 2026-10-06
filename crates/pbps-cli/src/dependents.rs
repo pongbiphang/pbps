@@ -389,6 +389,35 @@ fn as_declared(changes: &[PlannedChange], d: &Dependent) -> Dependent {
     }
 }
 
+/// A declared partition's default, its own or the copy of its parent's the
+/// engine gives every partition, named as what it is: the partition declares
+/// no column, so `managed` cannot find it, yet the declarations hold it. A
+/// rebuild cannot take it off and put it back until a change sets a
+/// partition's default, which #1588 brings (DEC-1578.1).
+fn partition_default(d: &Dependent, changes: &[PlannedChange], declared: &Schema) -> Dependent {
+    let Holds::TablePart {
+        table,
+        part: Part::Default(_),
+    } = &as_declared(changes, d).holds
+    else {
+        return d.clone();
+    };
+    if declared
+        .tables
+        .get(table)
+        .is_none_or(|t| t.partition_of.is_none())
+    {
+        return d.clone();
+    }
+    Dependent {
+        described: d.described.clone(),
+        holds: Holds::Unrepresentable(format!(
+            "a default of the partition {table}, its own or its parent's copy, which a rebuild \
+             cannot yet take off and put back (#1588)"
+        )),
+    }
+}
+
 /// The change that removes a dependent the plan does not remove yet.
 fn removal_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Result<Change, String> {
     match &d.holds {
@@ -526,7 +555,7 @@ pub(crate) fn weave(
                 matches!(d.holds, Holds::Unrepresentable(_))
                     || (!as_declared(&cs.changes, d).managed(declared) && !accounted)
             })
-            .cloned()
+            .map(|d| partition_default(d, &cs.changes, declared))
             .collect();
         if let Some(why) = pbps_pg::modules::unmanaged_refusal(root, &blocked, &Schema::default()) {
             refused.push(why);
@@ -850,16 +879,37 @@ fn column_expression(column: &pbps_model::Column) -> Option<&str> {
 /// as a default's may, but the engine has no way to give an existing column
 /// one, and taken out of the table as a column of its own it would change the
 /// table's column order (DEC-1168.1, DEC-1364.1).
+///
+/// A partitioned table's default is refused by name, with the two-plan
+/// remedy, when a new partition declares its own default on that column: the
+/// parent's `SET DEFAULT` reaches every partition, measured on 16 and 18, so
+/// set after the partition it would overwrite the partition's own. Putting
+/// the partition's own back after it takes a change for a partition's
+/// default, which #1588 brings (DEC-1578.1).
 // The complement is every change that writes no rows.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn split_new_tables(
     cs: &mut ChangeSet,
     ids: &[&IdsFile],
     dialect: &dyn Dialect,
-) -> usize {
+) -> Result<usize, String> {
     let Some(last) = last_function_create(cs) else {
-        return 0;
+        return Ok(0);
     };
+    let overridden: BTreeSet<ColumnRef> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::CreateTable { table, .. } => table.partition_of.as_ref(),
+            _ => None,
+        })
+        .flat_map(|of| {
+            of.columns
+                .iter()
+                .filter(|(_, own)| own.default.is_some())
+                .map(|(column, _)| ColumnRef::new(of.parent.clone(), column.clone()))
+        })
+        .collect();
     let taken = defaults_taken_by_rows(cs);
     let functions = function_creates(cs);
     let calls = |text: &str| calls_one_of(text, &functions);
@@ -912,6 +962,14 @@ pub(crate) fn split_new_tables(
             let Some(uid) = ids.iter().find_map(|ids| ids.column_uid(&column_ref)) else {
                 continue;
             };
+            if spec.default.as_deref().is_some_and(calls) && overridden.contains(&column_ref) {
+                return Err(format!(
+                    "{column_ref}'s default calls a function this plan creates or rebuilds, so \
+                     it is set after the function, and a new partition of {name} declares its \
+                     own default on `{column}`, which the parent's would overwrite. Plan the \
+                     function first and the table in the next plan, or wait for #1588"
+                ));
+            }
             if spec.default.as_deref().is_some_and(calls)
                 && let Some(to) = spec.default.take()
             {
@@ -935,7 +993,7 @@ pub(crate) fn split_new_tables(
             cs.changes.insert(i + 1 + k, planned(part, dialect));
         }
     }
-    added
+    Ok(added)
 }
 
 /// Takes the plan's `PUBLIC` decisions out, so that the passes below reorder
@@ -2076,7 +2134,7 @@ mod tests {
         };
 
         let mut cs = plan(vec![create.clone(), alter(&s, "app.f(integer)")]);
-        assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), 3);
+        assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), Ok(3));
         let left = table_of(&cs);
         assert!(left.checks.is_empty());
         assert_eq!(left.indexes.keys().collect::<Vec<_>>(), ["ix_u"]);
@@ -2092,6 +2150,57 @@ mod tests {
             ]
         );
 
+        // As a partitioned parent with a new partition declaring its own
+        // default on `v`: the parent's, set after the function, would
+        // overwrite it, so the plan is refused by name until #1588 (#1578
+        // review). One overriding another column is no reason to refuse.
+        let partitioned = |column: &str| {
+            let mut parent = t.clone();
+            parent.partition_by = Some(pbps_model::PartitionBy {
+                columns: vec!["id".into()],
+            });
+            let partition = Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: n.clone(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: [(
+                        column.to_owned(),
+                        pbps_model::PartitionColumn {
+                            default: Some("7".into()),
+                            not_null: false,
+                        },
+                    )]
+                    .into(),
+                }),
+                ..Table::default()
+            };
+            plan(vec![
+                Change::CreateTable {
+                    uid: Uid::derived(UidKind::Table, "app.n", 0),
+                    name: n.clone(),
+                    table: Box::new(parent),
+                },
+                Change::CreateTable {
+                    uid: Uid::derived(UidKind::Table, "app.n_1", 0),
+                    name: TableName::new("app", "n_1"),
+                    table: Box::new(partition),
+                },
+                alter(&s, "app.f(integer)"),
+            ])
+        };
+        let refused = split_new_tables(&mut partitioned("v"), &[&ids], pg().as_ref())
+            .expect_err("the partition's own default would be overwritten");
+        assert!(
+            refused.contains("app.n.v's default calls a function this plan creates or rebuilds")
+                && refused.contains("a new partition of app.n declares its own default on `v`")
+                && refused.contains("#1588"),
+            "{refused}"
+        );
+        assert_eq!(
+            split_new_tables(&mut partitioned("id"), &[&ids], pg().as_ref()),
+            Ok(3)
+        );
+
         // A row that omits `v` takes its default: the default stays for it.
         let insert = Change::InsertRow {
             table: n.clone(),
@@ -2103,7 +2212,7 @@ mod tests {
             types: BTreeMap::new(),
         };
         let mut cs = plan(vec![create.clone(), insert, alter(&s, "app.f(integer)")]);
-        assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), 2);
+        assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), Ok(2));
         assert_eq!(
             table_of(&cs).columns["v"].default.as_deref(),
             Some("app.f(1)")
@@ -2111,7 +2220,7 @@ mod tests {
 
         // No function rebuilt: the table is left as the differ wrote it.
         let mut cs = plan(vec![create]);
-        assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), 0);
+        assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), Ok(0));
         assert_eq!(table_of(&cs), t);
     }
 
@@ -2258,7 +2367,7 @@ mod tests {
             },
             alter(&s, "app.f(integer)"),
         ]);
-        assert_eq!(split_new_tables(&mut cs, &[], pg().as_ref()), 1);
+        assert_eq!(split_new_tables(&mut cs, &[], pg().as_ref()), Ok(1));
         #[allow(clippy::wildcard_enum_match_arm)]
         match &cs.changes[0].change {
             Change::CreateTable { table, .. } => {
@@ -3106,6 +3215,56 @@ mod tests {
         let found = BTreeMap::from([(id("app.v0"), vec![odd])]);
         let e = weave(&mut rebuild(), &found, &s, &[&ids], pg().as_ref()).unwrap_err();
         assert!(e.contains("index ix on table app.t"), "{e}");
+
+        // A declared partition's default, its own or its parent's copy: the
+        // declarations hold it, so it is not "not declared", but nothing can
+        // release it around a rebuild yet (#1578 review, #1588). A default on
+        // a table that is no partition and not declared still reads as such.
+        let mut with_partition = s.clone();
+        with_partition.tables.insert(
+            TableName::new("app", "t_1"),
+            Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: TableName::new("app", "t"),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Table::default()
+            },
+        );
+        let default_on = |table: &str| Dependent {
+            described: format!("default value for column v of table app.{table}"),
+            holds: Holds::TablePart {
+                table: TableName::new("app", table),
+                part: Part::Default("v".into()),
+            },
+        };
+        let found = BTreeMap::from([(id("app.v0"), vec![default_on("t_1")])]);
+        let e = weave(
+            &mut rebuild(),
+            &found,
+            &with_partition,
+            &[&ids],
+            pg().as_ref(),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("column v of table app.t_1")
+                && e.contains("a default of the partition app.t_1")
+                && e.contains("#1588")
+                && !e.contains("does not declare it"),
+            "{e}"
+        );
+        let found = BTreeMap::from([(id("app.v0"), vec![default_on("other")])]);
+        let e = weave(
+            &mut rebuild(),
+            &found,
+            &with_partition,
+            &[&ids],
+            pg().as_ref(),
+        )
+        .unwrap_err();
+        assert!(e.contains("does not declare it"), "{e}");
 
         let mut gone = plan(vec![Change::DropModule {
             id: id("app.f(integer)"),

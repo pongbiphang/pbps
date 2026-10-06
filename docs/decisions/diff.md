@@ -2690,6 +2690,10 @@ Measured on 16.15 and 18.6:
 - A row written through the parent takes the parent's defaults, not the
   partition's: a partition's own default is what a row written to it directly
   gets.
+- The parent's `ALTER COLUMN … SET DEFAULT` reaches every partition and
+  overwrites a partition's own default; with `ONLY` it does not. Every
+  partition's default, its own or its copy of the parent's, depends on the
+  functions it calls.
 
 **The shape.** `PartitionOf::columns` maps a column to `PartitionColumn {
 default, not_null }`, each an override, so a table that is not a partition
@@ -2716,18 +2720,35 @@ partition's own checks and indexes. Measured, it gives what the same words in
 the `CREATE` give, the NOT NULL row on 18 under the same engine name.
 
 **Ordering.** That statement is part of the partition's `CreateTable`, which
-sorts ahead of the modules. A default of its own that calls a function the
-plan creates therefore holds the whole partition after that function, as a
-generated column holds its table (DEC-1364.1), in the ordinary plan and in
-scratch reconstruction. It is not split out into an `AlterColumnDefault` as a
-table column's default is: the partition has no column, and no column uid, of
-its own. A new partition whose own default names a held new table follows it
-too. Bootstrap does not run these passes for any table (#1585).
+sorts ahead of the modules. In the ordinary plan, a default of its own that
+calls a function the plan creates therefore holds the whole partition after
+that function, as a generated column holds its table (DEC-1364.1). It is not
+split out into an `AlterColumnDefault` as a table column's default is: the
+partition has no column, and no column uid, of its own. A new partition whose
+own default names a held new table follows it too. Scratch reconstruction
+sets every table's defaults in its expressions phase, after the modules; a
+partition's own default is set there too, after its parent's, which would
+otherwise overwrite it. Bootstrap does not run the ordering passes for any
+table (#1585).
+
+**A parent's default after its partitions.** Two places would set a parent's
+default after a partition with its own on that column exists, or take a
+partition's default off around a function rebuild. Each needs a change that
+sets one partition's default, which #1581 brings, and both are #1588. Until
+then each is refused by name: a new parent's default split out after a new
+function (DEC-942.1) while a new partition overrides that column, with the
+two-plan remedy; and a function rebuild under any partition's default, its
+own or its parent's copy, which `weave` now names as a partition's default
+rather than as one the project does not declare. The copy's refusal predates
+this entry (#1170).
 
 **What is validated.** `validate_partition` refuses an override of a column
 the parent lacks, a NOT NULL the parent's column already has, the parent's own
 default again, a default on a generated or identity column, and an empty
-default. The comparison with the parent's default is of declared text: an
+default. It also holds the default as a column's is, against the parent's
+column type: a NULL the engine erases (measured on 16 and 18, a NULL of the
+column's type leaves the partition no default at all, even its copy of the
+parent's) and a setting-sensitive bare literal. The comparison with the parent's default is of declared text: an
 override the engine spells as the parent's reads back as none, and is then a
 change the plan refuses by name.
 
@@ -2761,7 +2782,9 @@ dropped default leaves its tree out; the other partitions declare none),
 `a_partitions_own_default_from_a_sequence_names_it`,
 `a_new_partitions_own_default_calling_a_new_function_follows_it_whole`,
 `a_held_new_table_leaves_unrelated_new_tables_free`,
-`a_partitions_own_default_calling_a_declared_function_compiles_after_it` and
+`a_partitions_own_default_is_set_after_its_parents_and_its_functions`,
+`a_new_tables_expressions_are_split_out_to_follow_a_rebuilt_function`,
+`a_dependent_the_plan_cannot_account_for_refuses_it_by_name` and
 `a_created_partitions_own_defaults_and_not_nulls_answer_for_themselves`; the
 CLI's `partitions_are_added_and_dropped_through_the_cli` applies a partition
 whose own default calls a function the same plan creates.

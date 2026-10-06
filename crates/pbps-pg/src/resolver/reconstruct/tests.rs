@@ -453,20 +453,20 @@ fn a_table_generating_from_a_declared_function_compiles_after_it() {
     );
 }
 
-/// A partition whose own default calls a declared function follows that
-/// function on scratch with its table step, as a generated column's table
-/// does (#1578, DEC-1364.1); a partition whose own default calls nothing
-/// declared, and the parent, keep their places.
+/// A partition's own default is set on scratch in its own step after its
+/// parent's default, which reaches every partition (measured on 16 and 18),
+/// and so after the declared functions it calls; the partition's table step
+/// keeps its place (#1578 review).
 #[test]
-fn a_partitions_own_default_calling_a_declared_function_compiles_after_it() {
+fn a_partitions_own_default_is_set_after_its_parents_and_its_functions() {
     use pbps_model::{
         Column, Module, PartitionBound, PartitionBy, PartitionColumn, PartitionOf, Schema,
     };
     let mut schema = Schema::default();
     let mut parent = Table::default();
-    parent
-        .columns
-        .insert("v".into(), Column::new("integer".parse().unwrap()));
+    let mut v = Column::new("integer".parse().unwrap());
+    v.default = Some("0".into());
+    parent.columns.insert("v".into(), v);
     parent.partition_by = Some(PartitionBy {
         columns: vec!["v".into()],
     });
@@ -548,15 +548,21 @@ fn a_partitions_own_default_calling_a_declared_function_compiles_after_it() {
             .position(|(_, d)| *d == declaration)
             .unwrap_or_else(|| panic!("{declaration} missing from {order:?}"))
     };
-    assert!(
-        at("function app.f(integer)") < at("table app.ev_new"),
-        "{order:?}"
-    );
-    assert_eq!(order[at("table app.ev")], (Phase::Tables, "table app.ev"));
-    assert_eq!(
-        order[at("table app.ev_plain")],
-        (Phase::Tables, "table app.ev_plain")
-    );
+    for table in ["app.ev", "app.ev_new", "app.ev_plain"] {
+        let declaration = format!("table {table}");
+        assert_eq!(order[at(&declaration)].0, Phase::Tables, "{order:?}");
+    }
+    for partition in ["app.ev_new", "app.ev_plain"] {
+        let own = format!("the default of {partition}.v");
+        assert_eq!(order[at(&own)].0, Phase::Expressions, "{order:?}");
+        assert!(at("the default of app.ev.v") < at(&own), "{order:?}");
+        assert!(at("function app.f(integer)") < at(&own), "{order:?}");
+        // Negative: the table step itself no longer carries it.
+        let sql = reconstruction.steps[at(&format!("table {partition}"))]
+            .statements
+            .join("\n");
+        assert!(!sql.contains("SET DEFAULT"), "{sql}");
+    }
 }
 
 /// A plan that drops, renames or alters is not a bootstrap, and building a

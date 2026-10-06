@@ -142,20 +142,10 @@ impl Reconstruction {
             match change {
                 Change::CreateTable { uid, name, table } => {
                     let first = steps.len();
-                    // And a partition's own default, which stays in its
-                    // table's step, there being no column of its own to
-                    // split it into (#1578).
                     let generated: Vec<String> = table
                         .columns
                         .values()
                         .filter_map(|c| c.generated.as_ref().map(|g| g.expression.clone()))
-                        .chain(
-                            table
-                                .partition_of
-                                .iter()
-                                .flat_map(|of| of.columns.values())
-                                .filter_map(|c| c.default.clone()),
-                        )
                         .collect();
                     let mut bare = (**table).clone();
                     let checks = std::mem::take(&mut bare.checks);
@@ -172,6 +162,16 @@ impl Reconstruction {
                     let mut defaults = Vec::new();
                     for (column, spec) in &mut bare.columns {
                         if let Some(default) = spec.default.take() {
+                            defaults.push((column.clone(), default));
+                        }
+                    }
+                    // A partition's own default too (#1578). Its parent's,
+                    // set in this same phase and earlier since the parent is
+                    // created first, reaches every partition (measured on 16
+                    // and 18), so the partition's own must come after it.
+                    for (column, own) in bare.partition_of.iter_mut().flat_map(|of| &mut of.columns)
+                    {
+                        if let Some(default) = own.default.take() {
                             defaults.push((column.clone(), default));
                         }
                     }

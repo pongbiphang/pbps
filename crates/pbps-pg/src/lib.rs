@@ -431,6 +431,74 @@ macro_rules! session_pins {
     };
 }
 
+/// What this engine makes of a column's declared default: one the applying
+/// session would decide, and a NULL it erases. A table's column, and a
+/// partition's own default on its parent's column (#1578 review).
+fn default_problems(
+    column_name: &str,
+    column: &pbps_model::Column,
+    normalized: &ColumnType,
+    expr: &str,
+) -> Vec<DialectError> {
+    let mut found = Vec::new();
+    // A default whose value the applying session would decide
+    // (ADR-0013 §3). Asked here and not only in the emitter, because
+    // `AlterColumnDefault` carries no type and the emitter therefore
+    // cannot ask it on the one path that changes a default on a column
+    // that is already there. This is where a user is looking at the
+    // declaration, and every command that hands statements to a
+    // database runs these checks (DECISIONS 141).
+    if let Some(e) = emit::refuse_an_unresolved_default(column_name, normalized, expr) {
+        found.push(e);
+    }
+    // A default that is a NULL of the column's own type. **Measured**
+    // on 18.6: `DEFAULT NULL`, `DEFAULT (NULL)` and `DEFAULT NULL::text`
+    // on a `text` column leave the column with no `pg_attrdef` row at
+    // all — to this engine a column with no default *is* a column
+    // whose default is NULL — so the pull reads the column back with
+    // none, every connected plan sets the default again, and the
+    // deploy's check of what came back, which compares whether a
+    // default is there (DECISIONS 185, 186), refuses the column the
+    // plan just wrote. Refused where the user is looking at the
+    // declaration, naming what to declare instead, as `serial` is
+    // (DECISIONS 227, 351). A NULL cast to any *other* type, or to
+    // the column's type where the column carries a modifier —
+    // `NULL::varchar` on `text`, `NULL::varchar(10)` on
+    // `varchar(10)` — is a default the engine keeps and reads back,
+    // and is left alone (DECISIONS 361). The type is the one the
+    // grammar sees, so `NULL::pg_catalog.text` and `NULL::"text"`
+    // are `NULL::text` (DECISIONS 364). SQL Server keeps `(NULL)` as
+    // a default constraint of its own, which is why this rule is this
+    // dialect's.
+    let (core, cast) = rows::unwrapped_with_type(expr);
+    let erased = core.eq_ignore_ascii_case("null")
+        && match cast {
+            None => true,
+            Some(ty) => {
+                column.ty.args.is_empty()
+                    && types::as_the_grammar_spells(&ty)
+                        .and_then(|t| t.parse::<ColumnType>().ok())
+                        .and_then(|t| types::normalize(&t).ok())
+                        .is_some_and(|t| t == *normalized)
+            }
+        };
+    if erased {
+        found.push(DialectError::Invalid {
+            dialect: types::DIALECT,
+            message: format!(
+                "column `{column_name}` declares `default: {expr}`, which this engine \
+                 does not keep: a NULL of the column's own type, bare, cast or in \
+                 parentheses, leaves no default in the catalog at all, and the \
+                 column reads back with none. Every plan would set it again and the \
+                 check of what the apply left behind would refuse the column. A \
+                 column with no default already defaults to NULL here: declare no \
+                 default."
+            ),
+        });
+    }
+    found
+}
+
 impl Dialect for Postgres {
     fn name(&self) -> &'static str {
         "postgres"
@@ -773,6 +841,11 @@ impl Dialect for Postgres {
                     "column `{column}` has an empty default expression"
                 )));
             }
+            // As a column's default is held, against the parent's column,
+            // whose type the partition's is.
+            if let Ok(normalized) = types::normalize(&theirs.ty) {
+                found.extend(default_problems(column, theirs, &normalized, default));
+            }
         }
         found
     }
@@ -966,64 +1039,8 @@ impl Dialect for Postgres {
                     continue;
                 }
             };
-            // A default whose value the applying session would decide
-            // (ADR-0013 §3). Asked here and not only in the emitter, because
-            // `AlterColumnDefault` carries no type and the emitter therefore
-            // cannot ask it on the one path that changes a default on a column
-            // that is already there. This is where a user is looking at the
-            // declaration, and every command that hands statements to a
-            // database runs these checks (DECISIONS 141).
-            if let Some(expr) = &column.default
-                && let Some(e) = emit::refuse_an_unresolved_default(column_name, &normalized, expr)
-            {
-                found.push(e);
-            }
-            // A default that is a NULL of the column's own type. **Measured**
-            // on 18.6: `DEFAULT NULL`, `DEFAULT (NULL)` and `DEFAULT NULL::text`
-            // on a `text` column leave the column with no `pg_attrdef` row at
-            // all — to this engine a column with no default *is* a column
-            // whose default is NULL — so the pull reads the column back with
-            // none, every connected plan sets the default again, and the
-            // deploy's check of what came back, which compares whether a
-            // default is there (DECISIONS 185, 186), refuses the column the
-            // plan just wrote. Refused where the user is looking at the
-            // declaration, naming what to declare instead, as `serial` is
-            // (DECISIONS 227, 351). A NULL cast to any *other* type, or to
-            // the column's type where the column carries a modifier —
-            // `NULL::varchar` on `text`, `NULL::varchar(10)` on
-            // `varchar(10)` — is a default the engine keeps and reads back,
-            // and is left alone (DECISIONS 361). The type is the one the
-            // grammar sees, so `NULL::pg_catalog.text` and `NULL::"text"`
-            // are `NULL::text` (DECISIONS 364). SQL Server keeps `(NULL)` as
-            // a default constraint of its own, which is why this rule is this
-            // dialect's.
             if let Some(expr) = &column.default {
-                let (core, cast) = rows::unwrapped_with_type(expr);
-                let erased = core.eq_ignore_ascii_case("null")
-                    && match cast {
-                        None => true,
-                        Some(ty) => {
-                            column.ty.args.is_empty()
-                                && types::as_the_grammar_spells(&ty)
-                                    .and_then(|t| t.parse::<ColumnType>().ok())
-                                    .and_then(|t| types::normalize(&t).ok())
-                                    .is_some_and(|t| t == normalized)
-                        }
-                    };
-                if erased {
-                    found.push(DialectError::Invalid {
-                        dialect: types::DIALECT,
-                        message: format!(
-                            "column `{column_name}` declares `default: {expr}`, which this engine \
-                             does not keep: a NULL of the column's own type, bare, cast or in \
-                             parentheses, leaves no default in the catalog at all, and the \
-                             column reads back with none. Every plan would set it again and the \
-                             check of what the apply left behind would refuse the column. A \
-                             column with no default already defaults to NULL here: declare no \
-                             default."
-                        ),
-                    });
-                }
+                found.extend(default_problems(column_name, column, &normalized, expr));
             }
             found.extend(identity_problems(column_name, column));
             found.extend(generation_problems(column_name, column));
@@ -1545,6 +1562,9 @@ mod tests {
             increment: 1,
         });
         parent.columns.insert("i".into(), i);
+        parent
+            .columns
+            .insert("d".into(), pbps_model::Column::new("date".parse().unwrap()));
         let found = |overrides: &[(&str, Option<&str>, bool)]| -> Vec<String> {
             let partition = pbps_model::Table {
                 partition_of: Some(pbps_model::PartitionOf {
@@ -1572,6 +1592,8 @@ mod tests {
                 .collect()
         };
         assert!(found(&[("v", Some("7"), true), ("ts", Some("'2025-01-01'"), false)]).is_empty());
+        // A NULL of another type is one the engine keeps, as for a column.
+        assert!(found(&[("v", Some("NULL::bigint"), false)]).is_empty());
         for (overrides, expected) in [
             (
                 vec![("x", Some("1"), false)],
@@ -1596,6 +1618,17 @@ mod tests {
             (
                 vec![("v", Some("  "), false)],
                 "`v` has an empty default expression",
+            ),
+            // Held as a column's default is, against the parent's column
+            // type (#1578 review): measured on 16 and 18, a NULL of its type
+            // leaves the partition no default at all.
+            (
+                vec![("v", Some("NULL::integer"), false)],
+                "which this engine does not keep",
+            ),
+            (
+                vec![("d", Some("'01/02/2026'"), false)],
+                "is `date` and its default is the bare literal",
             ),
         ] {
             let got = found(&overrides);
