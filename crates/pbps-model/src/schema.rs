@@ -491,6 +491,27 @@ pub struct PartitionBy {
 pub struct PartitionOf {
     pub parent: TableName,
     pub bound: PartitionBound,
+    /// What the partition holds of its parent's columns otherwise than its
+    /// parent does, by column: a default of its own, or a NOT NULL the
+    /// parent's column does not have (#1578). Here and not in the table's
+    /// `columns`, which a partition never has: its columns, types included,
+    /// are its parent's, and only a partition can hold one of these.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub columns: BTreeMap<String, PartitionColumn>,
+}
+
+/// One column's own default and NOT NULL on a partition (#1578). Each is an
+/// override of what the parent's column has, so neither repeats the parent's:
+/// `None` and `false` are the parent's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionColumn {
+    /// The partition's own default, where it differs from the parent's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// NOT NULL on the partition where the parent's column is nullable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_null: bool,
 }
 
 /// What a RANGE partition takes: every row no other partition does, or a

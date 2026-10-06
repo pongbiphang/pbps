@@ -3610,6 +3610,27 @@ fn refuse_unplanned_movement(
                     ));
                 }
             }
+            // A partition's own defaults and NOT NULLs (#1578), as a column's:
+            // NOT NULL exactly, a default by presence, the engine respelling
+            // its text. One read back that the plan does not declare is
+            // somebody else's too.
+            let own = |t: &pbps_model::Table| {
+                t.partition_of
+                    .as_ref()
+                    .map(|of| {
+                        of.columns
+                            .iter()
+                            .map(|(n, c)| (n.clone(), (c.default.is_some(), c.not_null)))
+                            .collect::<BTreeMap<_, _>>()
+                    })
+                    .unwrap_or_default()
+            };
+            if settled.whole() && own(declared) != own(now) {
+                moved.push(format!(
+                    "{now_name}'s own column defaults or NOT NULLs are not the ones this plan's \
+                     `CREATE TABLE` declares"
+                ));
+            }
             // A computed column is held to its persistence, and to NOT NULL
             // where it declares one; its expression comes back respelled, as
             // a check's does (DEC-1174.1).
@@ -12613,6 +12634,82 @@ mod tests {
         ] {
             let e = check(&read(edit)).expect_err(what).to_string();
             assert!(e.contains("computed column"), "{what}: {e}");
+        }
+    }
+
+    /// A created partition's own defaults and NOT NULLs answer for
+    /// themselves, as a column's do (#1578, SPEC 7.6): one another session
+    /// adds, drops or loosens after the `CREATE` is movement, and a default
+    /// the engine respelled is not.
+    #[test]
+    fn a_created_partitions_own_defaults_and_not_nulls_answer_for_themselves() {
+        use pbps_model::{Change, PartitionColumn, PartitionOf, PlannedChange, Table};
+        let name = TableName::new("app", "p");
+        let own = |default: Option<&str>, not_null: bool| PartitionColumn {
+            default: default.map(str::to_owned),
+            not_null,
+        };
+        let created = Table {
+            partition_of: Some(PartitionOf {
+                parent: TableName::new("app", "ev"),
+                bound: pbps_model::PartitionBound::Default,
+                columns: [("v".to_owned(), own(Some("'y'"), true))].into(),
+            }),
+            ..Table::default()
+        };
+        let changes = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(created.clone()),
+            })],
+        };
+        let read = |edit: &dyn Fn(&mut std::collections::BTreeMap<String, PartitionColumn>)| {
+            let mut t = created.clone();
+            edit(&mut t.partition_of.as_mut().unwrap().columns);
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let check = |after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                &changes,
+                &Schema::default(),
+                after,
+                "test",
+                Settled::Whole,
+            )
+        };
+        check(&read(&|_| {})).expect("as this plan creates it");
+        check(&read(&|c| {
+            c.insert("v".into(), own(Some("'y'::text"), true));
+        }))
+        .expect("the engine's spelling of the same default");
+        for (what, edit) in [
+            (
+                "dropped",
+                &(|c: &mut std::collections::BTreeMap<String, PartitionColumn>| {
+                    c.clear();
+                })
+                    as &dyn Fn(&mut std::collections::BTreeMap<String, PartitionColumn>),
+            ),
+            ("added", &|c| {
+                c.insert("w".into(), own(None, true));
+            }),
+            ("loosened", &|c| {
+                c.insert("v".into(), own(Some("'y'"), false));
+            }),
+            ("default dropped", &|c| {
+                c.insert("v".into(), own(None, true));
+            }),
+        ] {
+            let e = check(&read(edit)).expect_err(what).to_string();
+            assert!(
+                e.contains("own column defaults or NOT NULLs"),
+                "{what}: {e}"
+            );
         }
     }
 

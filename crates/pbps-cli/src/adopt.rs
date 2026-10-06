@@ -563,6 +563,7 @@ mod tests {
                     partition_of: Some(pbps_model::PartitionOf {
                         parent: TableName::new(of.0, of.1),
                         bound: pbps_model::PartitionBound::Default,
+                        columns: Default::default(),
                     }),
                     ..Default::default()
                 },
@@ -615,6 +616,7 @@ mod tests {
                 partition_of: Some(pbps_model::PartitionOf {
                     parent: TableName::new("app", of),
                     bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
                 }),
                 ..Default::default()
             };

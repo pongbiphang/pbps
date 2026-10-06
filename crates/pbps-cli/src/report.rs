@@ -1004,6 +1004,7 @@ mod tests {
                 partition_of: bound.map(|bound| pbps_model::PartitionOf {
                     parent: "app.ev".parse().unwrap(),
                     bound,
+                    columns: Default::default(),
                 }),
                 ..Default::default()
             }),

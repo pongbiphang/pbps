@@ -719,6 +719,61 @@ impl Dialect for Postgres {
                 ),
             });
         }
+        // Its own default and NOT NULL, each an override of one of the
+        // parent's columns (#1578). One equal to the parent's is not an
+        // override, and would be planned against a read-back that has none.
+        // Measured on 16 and 18: a generated column refuses a default of the
+        // partition's own, and on 18 an identity column does too.
+        let own = partition
+            .partition_of
+            .as_ref()
+            .map(|of| &of.columns)
+            .into_iter()
+            .flatten();
+        for (column, own) in own {
+            let invalid = |message: String| DialectError::Invalid {
+                dialect: crate::types::DIALECT,
+                message,
+            };
+            let Some(theirs) = parent.columns.get(column) else {
+                found.push(invalid(format!(
+                    "column `{column}` is not a column of its parent, whose columns are the \
+                     partition's"
+                )));
+                continue;
+            };
+            if own.not_null && !theirs.nullable {
+                found.push(invalid(format!(
+                    "column `{column}` is NOT NULL on its parent already, which the partition \
+                     takes; leave out its `nullable: false`"
+                )));
+            }
+            let Some(default) = &own.default else {
+                continue;
+            };
+            if theirs.default.as_ref() == Some(default) {
+                found.push(invalid(format!(
+                    "column `{column}`'s default is its parent's, which the partition takes; \
+                     leave out its `default:`"
+                )));
+            }
+            if theirs.generated.is_some() || theirs.identity.is_some() {
+                found.push(invalid(format!(
+                    "column `{column}` is {} on its parent, and takes no default of the \
+                     partition's own",
+                    if theirs.generated.is_some() {
+                        "generated"
+                    } else {
+                        "an identity column"
+                    }
+                )));
+            }
+            if crate::LEXICON.expression_in(default) == pbps_dialect::Expression::Absent {
+                found.push(invalid(format!(
+                    "column `{column}` has an empty default expression"
+                )));
+            }
+        }
         found
     }
 
@@ -1397,6 +1452,7 @@ mod tests {
             partition_of: Some(pbps_model::PartitionOf {
                 parent: "app.p".parse().unwrap(),
                 bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
             }),
             ..Default::default()
         };
@@ -1460,6 +1516,92 @@ mod tests {
             assert!(
                 found.iter().any(|p| p.contains(expected)),
                 "{expected}: {found:?}"
+            );
+        }
+    }
+
+    /// A partition's own default and NOT NULL each override a column of its
+    /// parent's (#1578): never one the parent lacks, a NOT NULL the parent's
+    /// column already has, the parent's default again, or a default on a
+    /// generated or identity column, which the engine refuses on a partition
+    /// (measured on 16 and 18, identity on 18).
+    #[test]
+    fn a_partitions_own_column_overrides_answer_to_its_parents_columns() {
+        use pbps_dialect::Dialect;
+        let mut parent = partitioned(&["id", "ts"], &["ts"]);
+        let mut v = pbps_model::Column::new("integer".parse().unwrap());
+        v.default = Some("0".into());
+        parent.columns.insert("v".into(), v);
+        let mut g = pbps_model::Column::new("integer".parse().unwrap());
+        g.generated = Some(pbps_model::Generated {
+            expression: "v * 2".into(),
+            stored: true,
+        });
+        parent.columns.insert("g".into(), g);
+        let mut i = pbps_model::Column::new("integer".parse().unwrap());
+        i.nullable = false;
+        i.identity = Some(pbps_model::Identity {
+            seed: 1,
+            increment: 1,
+        });
+        parent.columns.insert("i".into(), i);
+        let found = |overrides: &[(&str, Option<&str>, bool)]| -> Vec<String> {
+            let partition = pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.t".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: overrides
+                        .iter()
+                        .map(|(c, d, n)| {
+                            (
+                                (*c).to_owned(),
+                                pbps_model::PartitionColumn {
+                                    default: d.map(str::to_owned),
+                                    not_null: *n,
+                                },
+                            )
+                        })
+                        .collect(),
+                }),
+                ..Default::default()
+            };
+            super::Postgres::default()
+                .validate_partition(&"app.p1".parse().unwrap(), &partition, &parent)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert!(found(&[("v", Some("7"), true), ("ts", Some("'2025-01-01'"), false)]).is_empty());
+        for (overrides, expected) in [
+            (
+                vec![("x", Some("1"), false)],
+                "`x` is not a column of its parent",
+            ),
+            (
+                vec![("id", None, true)],
+                "`id` is NOT NULL on its parent already",
+            ),
+            (
+                vec![("v", Some("0"), false)],
+                "`v`'s default is its parent's",
+            ),
+            (
+                vec![("g", Some("1"), false)],
+                "`g` is generated on its parent",
+            ),
+            (
+                vec![("i", Some("1"), false)],
+                "`i` is an identity column on its parent",
+            ),
+            (
+                vec![("v", Some("  "), false)],
+                "`v` has an empty default expression",
+            ),
+        ] {
+            let got = found(&overrides);
+            assert!(
+                got.iter().any(|p| p.contains(expected)),
+                "{expected}: {got:?}"
             );
         }
     }

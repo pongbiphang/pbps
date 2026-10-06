@@ -2662,3 +2662,86 @@ without the validation wiring). Also by the units
 `a_partitions_own_checks_and_indexes_round_trip_under_its_entry`,
 `a_partition_entry_is_one_bound_and_only_what_a_partition_owns` and
 `declaration_schema_and_loader_agree_on_a_partition_entry`.
+
+<a id="dec-1578-1"></a>
+
+**DEC-1578.1. A partition declares its own column defaults and NOT NULLs under
+its entry's `columns:`, held on `PartitionOf` and never as columns of its own;
+the reader reads one only where it is not the parent's (#1578).**
+
+The second of #1532's four slices: read back and create, the declaration in
+the parent's file. Changing one on a standing partition stays refused by name
+until #1581.
+
+Measured on 16.15 and 18.6:
+
+- The engine copies the parent's defaults into the partition's own
+  `pg_attrdef` as it creates it, with the parent's text. A default of the
+  partition's own is therefore one whose text is not the parent's.
+- A NOT NULL of the partition's own, where the parent's column is nullable, is
+  `attnotnull`. On 18 it is also a constraint row, local and inherited from
+  nowhere, named `<partition>_<column>_not_null` by the engine whether it was
+  written in `PARTITION OF (…)` or by `ALTER` after. The model holds no NOT
+  NULL constraint name, for a table or a partition.
+- A partition can `DROP DEFAULT` a default its parent's column has.
+- A default on a partition's generated column is refused on both; on an
+  identity column it is refused on 18. On 16 the partition's column does not
+  carry the identity at all, which DEC-1170.1's comparison already leaves out.
+- A row written through the parent takes the parent's defaults, not the
+  partition's: a partition's own default is what a row written to it directly
+  gets.
+
+**The shape.** `PartitionOf::columns` maps a column to `PartitionColumn {
+default, not_null }`, each an override, so a table that is not a partition
+cannot hold one and a partition still declares no column, type included. In
+the file, a block entry's `columns:` holds `{default: …}`, `{nullable:
+false}`, or both, after the bound. `nullable: true` is refused, since a
+partition cannot drop its parent's NOT NULL, and so is an entry with neither.
+
+**What is read.** The tree predicate stops comparing NOT NULL and plain
+defaults in its column list, keeping the generation expression, and instead
+refuses a partition column whose parent's is NOT NULL and its own is not, or
+whose parent's has a default and its own has none: a dropped default still
+leaves the tree out, named. On 18 it admits a validated NOT NULL row of the
+partition's own. The partition then reads a default whose text differs from
+the parent's, and a NOT NULL the parent's column lacks.
+
+**What is created.** One `ALTER TABLE … ALTER COLUMN … SET DEFAULT …, ALTER
+COLUMN … SET NOT NULL` after `CREATE TABLE … PARTITION OF`, before the
+partition's own checks and indexes. Measured, it gives what the same words in
+the `CREATE` give, the NOT NULL row on 18 under the same engine name.
+
+**What is validated.** `validate_partition` refuses an override of a column
+the parent lacks, a NOT NULL the parent's column already has, the parent's own
+default again, a default on a generated or identity column, and an empty
+default. The comparison with the parent's default is of declared text: an
+override the engine spells as the parent's reads back as none, and is then a
+change the plan refuses by name.
+
+**The declared record.** A partition's own default is recorded under the
+partition and the column in `DeclaredExpressions::defaults`, as a column's
+is, and overlaid on the read-back, so the engine's spelling of it plans
+nothing. No new field, so the record's shape is unchanged.
+
+**A detach keeps them.** DEC-1544.1's shape check compares the detached
+table's columns with the parent's as the partition holds them: its own default
+and NOT NULL applied.
+
+**Verification.** A created partition's own defaults and NOT NULLs are
+verified as a column's are: NOT NULL exactly, a default by presence.
+
+**Versions.** Plan version 29 and state version 21: `PartitionOf` gains a
+field an older build refuses to read, so each says so by its version rather
+than failing to parse.
+
+Pinned on 16 and 18 by the live `range_partition_trees_round_trip_whole_or_not_at_all`
+(own default and NOT NULL read and rebuilt, the direct insert taking them; a
+dropped default leaves its tree out; the other partitions declare none),
+`a_partition_is_detached_and_kept_under_its_declared_names`, and the CLI's
+`a_partition_tree_round_trips_through_the_cli`. Also by the units
+`a_partition_reads_its_own_defaults_and_not_nulls_and_not_its_parents`,
+`a_partitions_own_column_overrides_answer_to_its_parents_columns`,
+`a_partitions_own_column_overrides_are_its_own_through_a_detach`,
+`a_partitions_own_default_is_recorded_and_overlaid`,
+`a_partitions_own_column_defaults_and_not_nulls_round_trip_under_its_entry`
+and `declaration_schema_and_loader_agree_on_a_partition_entry`.

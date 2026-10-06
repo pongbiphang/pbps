@@ -71,8 +71,8 @@ pub use role::{GrantTarget, Permission, Role};
 pub use schema::{
     BoundDatum, CheckConstraint, Clustered, Collation, Column, ComputedColumn, ForeignKey,
     Generated, Identity, Index, IndexColumn, IndexKey, IndexMethod, PartitionBound, PartitionBy,
-    PartitionOf, PrimaryKey, ReferentialAction, ReplicaIdentity, Retention, RetentionUnit, Schema,
-    SystemTime, SystemVersioning, Table, UniqueConstraint,
+    PartitionColumn, PartitionOf, PrimaryKey, ReferentialAction, ReplicaIdentity, Retention,
+    RetentionUnit, Schema, SystemTime, SystemVersioning, Table, UniqueConstraint,
 };
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};

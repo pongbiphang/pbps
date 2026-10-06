@@ -253,9 +253,14 @@ pub fn render_partitioned(
                         .join(", ")
                 };
                 let bound = t.partition_of.as_ref().map(|p| &p.bound);
+                let own_columns = t.partition_of.as_ref().map(|p| &p.columns);
                 // On one line while the partition is its bound alone; a block
-                // once it has checks or indexes of its own (#1577).
-                if t.checks.is_empty() && t.indexes.is_empty() {
+                // once it has checks, indexes (#1577) or columns (#1578) of
+                // its own.
+                if t.checks.is_empty()
+                    && t.indexes.is_empty()
+                    && own_columns.is_none_or(std::collections::BTreeMap::is_empty)
+                {
                     let bound = match bound {
                         Some(pbps_model::PartitionBound::Range { from, to }) => {
                             format!("{{from: [{}], to: [{}]}}", list(from), list(to))
@@ -272,6 +277,22 @@ pub fn render_partitioned(
                         }
                         Some(pbps_model::PartitionBound::Default) | None => {
                             s.push_str("    default: true\n");
+                        }
+                    }
+                    // After the bound, before what names them, as a table's
+                    // columns come first.
+                    if let Some(columns) = own_columns.filter(|c| !c.is_empty()) {
+                        s.push_str("    columns:\n");
+                        for (column, own) in columns {
+                            let mut fields = Vec::new();
+                            if let Some(d) = &own.default {
+                                fields.push(format!("default: {}", scalar(d)));
+                            }
+                            if own.not_null {
+                                fields.push("nullable: false".to_owned());
+                            }
+                            let _ =
+                                writeln!(s, "      {}: {{{}}}", scalar(column), fields.join(", "));
                         }
                     }
                     render_checks_and_indexes(&mut s, t, "    ", "");
@@ -1201,6 +1222,63 @@ indexes:
         );
     }
 
+    /// A partition's own column defaults and NOT NULLs are written under its
+    /// entry's `columns:`, after the bound, and read back as its own; the
+    /// parent's columns stay the parent's (#1578).
+    #[test]
+    fn a_partitions_own_column_defaults_and_not_nulls_round_trip_under_its_entry() {
+        let yaml = "table: app.ev\ncolumns:\n  ts: {type: date, nullable: false}\n  v: {type: int}\n  w: {type: text, default: \"'x'\"}\n\npartition_by: [ts]\n\npartitions:\n  ev_old:\n    from: [MINVALUE]\n    to: [\"2025-01-01\"]\n    columns:\n      v: {default: \"7\", nullable: false}\n      w: {default: \"'y'::text\"}\n    checks:\n      old_ck: v < 100\n  ev_rest:\n    default: true\n    columns:\n      v: {nullable: false}\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        let own = |n: &str| {
+            t.partitions
+                .iter()
+                .find(|(name, _)| name.name == n)
+                .and_then(|(_, p)| p.partition_of.clone())
+                .unwrap_or_else(|| panic!("{n}"))
+                .columns
+        };
+        let old = own("ev_old");
+        assert_eq!(old.keys().collect::<Vec<_>>(), ["v", "w"]);
+        assert_eq!(old["v"].default.as_deref(), Some("7"));
+        assert!(old["v"].not_null);
+        assert_eq!(old["w"].default.as_deref(), Some("'y'::text"));
+        assert!(!old["w"].not_null);
+        let rest = own("ev_rest");
+        assert_eq!(rest["v"].default, None);
+        assert!(rest["v"].not_null);
+        // The partition declares no column of its own.
+        assert!(t.partitions.iter().all(|(_, p)| p.columns.is_empty()));
+        let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
+        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None);
+        assert!(
+            out.contains("\n    to: [\"2025-01-01\"]\n    columns:\n      v: {default: \"7\", nullable: false}\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "\n  ev_rest:\n    default: true\n    columns:\n      v: {nullable: false}\n"
+            ),
+            "{out}"
+        );
+        // Negative: a column with nothing of its own, `nullable: true`, or a
+        // type, is refused by name.
+        let parent = "table: app.ev\ncolumns:\n  ts: {type: date, nullable: false}\n  v: {type: int}\npartition_by: [ts]\npartitions:\n  p:\n    default: true\n    columns:\n";
+        for (column, expected) in [
+            ("      v: {}\n", "declares nothing of its own"),
+            ("      v: {default: }\n", "declares nothing of its own"),
+            ("      v: {nullable: true}\n", "is `nullable: true`"),
+            ("      v: {type: int}\n", "unknown field"),
+        ] {
+            let yaml = format!("{parent}{column}");
+            let err = crate::load_table_str(Path::new("t.yml"), &yaml)
+                .err()
+                .unwrap_or_else(|| panic!("{column} loaded"));
+            let text = format!("{err:?}");
+            assert!(text.contains(expected), "{column}: {text}");
+        }
+    }
+
     /// Negative: an entry is one bound, `from:` and `to:` both or `default:
     /// true` alone, and nothing a partition cannot have of its own.
     #[test]
@@ -1325,6 +1403,7 @@ indexes:
                         from: vec![value(v)],
                         to: vec![D::MaxValue],
                     },
+                    columns: Default::default(),
                 }),
                 ..Default::default()
             };

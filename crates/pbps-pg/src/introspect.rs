@@ -769,13 +769,38 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // parent's, which the engine gave it, and the clones of the parent's
         // checks and indexes are too; the reader has already checked that is
         // all it has (#1170).
-        if let Some((parent, bound)) = &raw_table.partition_of {
-            let (Some(parent), Some(bound)) = (lookups.tables.get(parent), parse_bound(bound))
+        if let Some((parent_oid, bound)) = &raw_table.partition_of {
+            let (Some(parent), Some(bound)) = (lookups.tables.get(parent_oid), parse_bound(bound))
             else {
                 // `refuse_partition_trees` left out every partition whose
                 // parent or bound this could not take.
                 continue;
             };
+            // Its own default and NOT NULL, where they are not the parent's
+            // (#1578). The engine copies the parent's defaults into the
+            // partition's own `pg_attrdef` as it creates it, measured on 16
+            // and 18, so a default is the partition's only where its text is
+            // not the parent's. A generation expression is in the same place
+            // and is the parent's, which the reader has already checked.
+            let parent_columns = columns_by_table
+                .get(parent_oid)
+                .map_or(&[][..], Vec::as_slice);
+            let mut own_columns = BTreeMap::new();
+            for column in raw_columns.iter().filter(|c| c.generated.is_none()) {
+                let Some(theirs) = parent_columns.iter().find(|p| p.name == column.name) else {
+                    continue;
+                };
+                let own = pbps_model::PartitionColumn {
+                    default: column
+                        .default
+                        .clone()
+                        .filter(|d| theirs.default.as_ref() != Some(d)),
+                    not_null: !column.nullable && theirs.nullable,
+                };
+                if own != pbps_model::PartitionColumn::default() {
+                    own_columns.insert(column.name.clone(), own);
+                }
+            }
             let parts = Parts {
                 name: name.clone(),
                 by_attnum: raw_columns
@@ -787,6 +812,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 partition_of: Some(pbps_model::PartitionOf {
                     parent: parent.clone(),
                     bound,
+                    columns: own_columns,
                 }),
                 ..Table::default()
             };
@@ -5298,6 +5324,60 @@ mod tests {
         let pulled = assemble(&bare);
         let p1 = &pulled.schema.tables[&TableName::new("app", "p1")];
         assert!(p1.checks.is_empty() && p1.indexes.is_empty(), "{p1:?}");
+    }
+
+    /// A partition's own default and NOT NULL are read where they are not its
+    /// parent's (#1578): the engine copies the parent's defaults into the
+    /// partition, so one equal to the parent's is the parent's, and a NOT NULL
+    /// the parent's column has is the parent's too. A generation expression
+    /// is never an override.
+    #[test]
+    fn a_partition_reads_its_own_defaults_and_not_nulls_and_not_its_parents() {
+        let with = |c: RawColumn, default: Option<&str>, nullable: bool| RawColumn {
+            default: default.map(str::to_owned),
+            nullable,
+            ..c
+        };
+        let mut parent = table(1, "ev");
+        parent.partition_key = Some(vec!["ts".to_owned()]);
+        let mut partition = table(2, "p1");
+        partition.partition_of = Some((1, "DEFAULT".to_owned()));
+        let mut generated = col(1, 5, "g", "integer");
+        generated.default = Some("(v * 2)".to_owned());
+        generated.generated = Some('s');
+        let raw = RawCatalog {
+            tables: vec![parent, partition],
+            columns: vec![
+                with(col(1, 1, "ts", "date"), Some("'2025-01-01'::date"), false),
+                with(col(1, 2, "v", "integer"), None, true),
+                with(col(1, 3, "w", "text"), Some("'x'::text"), true),
+                with(col(1, 4, "n", "integer"), None, true),
+                generated.clone(),
+                // The parent's, copied: no override.
+                with(col(2, 1, "ts", "date"), Some("'2025-01-01'::date"), false),
+                // Its own default and NOT NULL.
+                with(col(2, 2, "v", "integer"), Some("7"), false),
+                // Its own default over the parent's.
+                with(col(2, 3, "w", "text"), Some("'y'::text"), true),
+                // Nothing of its own.
+                with(col(2, 4, "n", "integer"), None, true),
+                RawColumn {
+                    table_oid: 2,
+                    ..generated
+                },
+            ],
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw);
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        let p1 = &pulled.schema.tables[&TableName::new("app", "p1")];
+        let own = &p1.partition_of.as_ref().unwrap().columns;
+        assert_eq!(own.keys().collect::<Vec<_>>(), ["v", "w"]);
+        assert_eq!(own["v"].default.as_deref(), Some("7"));
+        assert!(own["v"].not_null);
+        assert_eq!(own["w"].default.as_deref(), Some("'y'::text"));
+        assert!(!own["w"].not_null);
+        assert!(p1.columns.is_empty(), "its columns stay its parent's");
     }
 
     /// A partition's own GIN index over `jsonb` is read under both classes

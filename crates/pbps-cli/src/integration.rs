@@ -41,12 +41,13 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 32;
+pub const SCHEMA_VERSION: u32 = 33;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
 // 31: a connected plan's `resolver_assessment` (issue #1515).
 // 32: a partition's own `checks:` and `indexes:` under `partitions:` (issue #1577).
+// 33: a partition's own `columns:` defaults and NOT NULLs under `partitions:` (issue #1578).
 // 26: index, key and unique-constraint `storage_parameters` (issue #1442).
 // 25: a table's `storage_parameters:` (issue #1441).
 // 24: a table's `replica_identity:` (issue #1444).
@@ -808,7 +809,52 @@ mod tests {
                 serde_json::json!({"from": [1], "to": [2], "default": true}),
                 false,
             ),
-            (serde_json::json!({"default": true, "columns": {}}), false),
+            (serde_json::json!({"default": true, "columns": {}}), true),
+            // A partition's own columns (#1578): a default, NOT NULL, or both,
+            // and never a type or `nullable: true`.
+            (
+                serde_json::json!({"default": true, "columns": {"ts": {"default": "0"}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"default": true, "columns": {"ts": {"nullable": false}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"default": true,
+                    "columns": {"ts": {"default": "0", "nullable": false}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"default": true,
+                    "columns": {"ts": {"default": "0", "nullable": null}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"default": true,
+                    "columns": {"ts": {"default": null, "nullable": false}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"default": true, "columns": {"ts": {}}}),
+                false,
+            ),
+            (
+                serde_json::json!({"default": true, "columns": {"ts": {"default": null}}}),
+                false,
+            ),
+            (
+                serde_json::json!({"default": true, "columns": {"ts": {"nullable": null}}}),
+                false,
+            ),
+            (
+                serde_json::json!({"default": true, "columns": {"ts": {"nullable": true}}}),
+                false,
+            ),
+            (
+                serde_json::json!({"default": true, "columns": {"ts": {"type": "int"}}}),
+                false,
+            ),
         ] {
             let table = serde_json::json!({
                 "table": "app.ev",

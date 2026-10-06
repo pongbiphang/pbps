@@ -3149,6 +3149,29 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
                 bound_clause(&of.bound)
             ),
         )?];
+        // Its own defaults and NOT NULLs (#1578), one statement: measured on
+        // 16 and 18, set after the `CREATE` they are what the same words in it
+        // give, the NOT NULL row on 18 under the same engine name.
+        let mut own = Vec::new();
+        for (column, c) in &of.columns {
+            if let Some(default) = &c.default {
+                own.push(format!(
+                    "ALTER COLUMN {} SET DEFAULT {}",
+                    quote(column)?,
+                    verbatim(default)
+                ));
+            }
+            if c.not_null {
+                own.push(format!("ALTER COLUMN {} SET NOT NULL", quote(column)?));
+            }
+        }
+        if !own.is_empty() {
+            out.push(on(
+                pg,
+                name,
+                &format!("ALTER TABLE {q} {};", own.join(", ")),
+            )?);
+        }
         for (n, c) in &table.checks {
             out.push(on(
                 pg,
@@ -4215,6 +4238,7 @@ mod tests {
                     from: vec![pbps_model::BoundDatum::MinValue],
                     to: vec![pbps_model::BoundDatum::Value("it's".into())],
                 },
+                columns: Default::default(),
             }),
             ..Default::default()
         };
@@ -4259,6 +4283,34 @@ mod tests {
                 && sql[2].contains("\"ts\" DESC"),
             "{sql:?}"
         );
+        // Its own defaults and NOT NULLs, in one statement after the
+        // `CREATE` and before its checks (#1578).
+        let mut columns = own.clone();
+        let of = columns.partition_of.as_mut().unwrap();
+        of.columns.insert(
+            "v".into(),
+            pbps_model::PartitionColumn {
+                default: Some("7".into()),
+                not_null: true,
+            },
+        );
+        of.columns.insert(
+            "w".into(),
+            pbps_model::PartitionColumn {
+                default: None,
+                not_null: true,
+            },
+        );
+        let sql = create("app.ev_old", &columns);
+        assert_eq!(sql.len(), 4, "{sql:?}");
+        assert!(
+            sql[1].contains(
+                "ALTER TABLE \"app\".\"ev_old\" ALTER COLUMN \"v\" SET DEFAULT 7\n, ALTER \
+                 COLUMN \"v\" SET NOT NULL, ALTER COLUMN \"w\" SET NOT NULL;"
+            ),
+            "{sql:?}"
+        );
+        assert!(sql[2].contains("ADD CONSTRAINT \"old_ck\""), "{sql:?}");
         assert!(
             sql[0].contains(
                 "CREATE TABLE \"app\".\"ev_old\" PARTITION OF \"app\".\"ev\" FOR VALUES FROM \
@@ -4270,6 +4322,7 @@ mod tests {
             partition_of: Some(pbps_model::PartitionOf {
                 parent: "app.ev".parse().unwrap(),
                 bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
             }),
             ..Default::default()
         };

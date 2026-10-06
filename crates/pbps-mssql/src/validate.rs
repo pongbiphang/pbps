@@ -1297,6 +1297,7 @@ mod tests {
             partition_of: Some(pbps_model::PartitionOf {
                 parent: "dbo.p".parse().unwrap(),
                 bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
             }),
             ..Default::default()
         };

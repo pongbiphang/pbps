@@ -177,23 +177,31 @@ fn tables_query() -> String {
 /// **Each partition**: attached (no detach pending), an ordinary permanent
 /// heap table, the same in all of that, with no grant on it or on a column (a
 /// partition declares none), whose columns are inherited and its parent's in
-/// the parent's order with the
-/// parent's defaults, NOT NULLs, identities and generations. Measured on 16 and
-/// 18: a table `ATTACH`ed as a partition keeps its own column order and has
-/// none of the parent's defaults, which `PARTITION OF` would give it, so
-/// `attislocal` alone does not say so. Every constraint a clone
+/// the parent's order with the parent's identities and generations. Its
+/// defaults and NOT NULLs are the parent's or its own (#1578): a default of
+/// its own where the parent's column has one or none, a NOT NULL of its own
+/// where the parent's is nullable, but never a default dropped where the
+/// parent's has one. Measured on 16 and 18: a table `ATTACH`ed as a partition
+/// keeps its own column order and has none of the parent's defaults, which
+/// `PARTITION OF` would give it, so `attislocal` alone does not say so. Every constraint a clone
 /// (`conparentid`, the keys and foreign keys), inherited and not local (a
-/// CHECK, and on 18 a NOT NULL row), or a CHECK of its own, local and
-/// inherited from nowhere (#1577). An index is a clone of the parent's or the
+/// CHECK, and on 18 a NOT NULL row), a CHECK of its own, local and
+/// inherited from nowhere (#1577), or on 18 a validated NOT NULL row of its
+/// own (#1578). An index is a clone of the parent's or the
 /// partition's own (#1577); one backing a constraint of its own is left out
 /// with that constraint. Anything else in any partition leaves the whole tree
 /// out, named.
 fn partition_tree(root: &str) -> String {
+    // NOT NULL and a plain default are compared below, where a partition may
+    // hold its own (#1578); a generation expression is in `pg_attrdef` too,
+    // and is compared here, where it must be the parent's.
     let columns = |rel: &str| {
         format!(
             "(SELECT pg_catalog.array_agg(ROW(a.attname, a.atttypid, a.atttypmod, a.attcollation,
-                                               a.attnotnull, a.attidentity, a.attgenerated,
-                                               pg_catalog.pg_get_expr(d.adbin, d.adrelid))::text
+                                               a.attidentity, a.attgenerated,
+                                               CASE WHEN a.attgenerated <> ''
+                                                    THEN pg_catalog.pg_get_expr(d.adbin, d.adrelid)
+                                               END)::text
                                            ORDER BY a.attnum)
                 FROM pg_catalog.pg_attribute a
                 LEFT JOIN pg_catalog.pg_attrdef d
@@ -248,12 +256,25 @@ fn partition_tree(root: &str) -> String {
                                                      AND tc.reloptions IS NOT NULL)
                                   AND {child_columns} IS NOT DISTINCT FROM {parent_columns}
                                   AND NOT EXISTS (
+                                    SELECT 1 FROM pg_catalog.pg_attribute ca
+                                      JOIN pg_catalog.pg_attribute pa
+                                        ON pa.attrelid = pc.oid AND pa.attname = ca.attname
+                                      LEFT JOIN pg_catalog.pg_attrdef cd
+                                        ON cd.adrelid = ca.attrelid AND cd.adnum = ca.attnum
+                                      LEFT JOIN pg_catalog.pg_attrdef pd
+                                        ON pd.adrelid = pa.attrelid AND pd.adnum = pa.attnum
+                                     WHERE ca.attrelid = ch.oid AND ca.attnum > 0
+                                       AND NOT ca.attisdropped
+                                       AND ((pa.attnotnull AND NOT ca.attnotnull)
+                                            OR (pd.oid IS NOT NULL AND cd.oid IS NULL)))
+                                  AND NOT EXISTS (
                                     SELECT 1 FROM pg_catalog.pg_constraint k
                                      WHERE k.conrelid = ch.oid
                                        AND k.conparentid = 0
                                        AND NOT (k.contype IN ('c', 'n') AND NOT k.conislocal)
                                        AND NOT (k.contype = 'c' AND k.conislocal
-                                                AND k.coninhcount = 0)))))"
+                                                AND k.coninhcount = 0)
+                                       AND NOT (k.contype = 'n' AND k.convalidated)))))"
     )
 }
 

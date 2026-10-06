@@ -4186,6 +4186,7 @@ mod tests {
                 partition_of: Some(PartitionOf {
                     parent: "app.ev".parse().unwrap(),
                     bound,
+                    columns: Default::default(),
                 }),
                 ..Default::default()
             }),

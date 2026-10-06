@@ -638,6 +638,34 @@ pub struct PartitionEntryDto {
     /// written here.
     #[serde(default)]
     pub indexes: BTreeMap<String, IndexDto>,
+    /// What the partition holds of its parent's columns otherwise than its
+    /// parent: a default, a NOT NULL (#1578). Never a type, which is the
+    /// parent's.
+    #[serde(default)]
+    pub columns: BTreeMap<String, PartitionColumnDto>,
+}
+
+/// One of a partition's columns, where it is not as its parent's (#1578):
+/// `default:` of its own, `nullable: false` where the parent's is nullable.
+/// `nullable: true` would undo a NOT NULL the parent's column has, which the
+/// engine does not let a partition do, so the schema takes `false` alone.
+// A `default:` that is text or `nullable: false`, as the loader takes them: a
+// key YAML leaves empty reads as absent, so `{default: null}` declares
+// nothing and `minProperties` alone would bless it.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("anyOf" = [
+    serde_json::json!({"required": ["default"], "properties": {"default": {"type": "string"}}}),
+    serde_json::json!({"required": ["nullable"], "properties": {"nullable": {"const": false}}}),
+]))]
+pub struct PartitionColumnDto {
+    /// The default-value expression, kept verbatim, where it is not the
+    /// parent's.
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    #[schemars(extend("enum" = [false, null]))]
+    pub nullable: Option<bool>,
 }
 
 impl<'de> serde::Deserialize<'de> for PartitionDto {

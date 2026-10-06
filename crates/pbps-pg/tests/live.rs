@@ -3677,8 +3677,10 @@ async fn array_columns_round_trip_and_widen_their_elements() {
 /// and routes rows as it did; a tree with anything else in any table is left
 /// out whole and named (#1170). A partition's own checks and indexes are read
 /// as its own and the parent's clones are not, by catalog parentage (#1577).
-/// On 16 and 18, whose catalogs differ in NOT NULL rows and in the names of a
-/// foreign key's clones.
+/// Its own column defaults and NOT NULLs are read where they are not the
+/// parent's, and a default it dropped leaves its tree out (#1578). On 16 and
+/// 18, whose catalogs differ in NOT NULL rows and in the names of a foreign
+/// key's clones.
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn range_partition_trees_round_trip_whole_or_not_at_all() {
@@ -3734,7 +3736,9 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
              CREATE TABLE {s}.doc (k integer NOT NULL, d jsonb) PARTITION BY RANGE (k);
              CREATE TABLE {s}.doc_1 PARTITION OF {s}.doc FOR VALUES FROM (0) TO (10);
              CREATE INDEX doc_1_d ON {s}.doc_1 USING gin (d);
-             CREATE INDEX doc_1_p ON {s}.doc_1 USING gin (d jsonb_path_ops);"
+             CREATE INDEX doc_1_p ON {s}.doc_1 USING gin (d jsonb_path_ops);
+             ALTER TABLE {s}.ev_old ALTER COLUMN v SET DEFAULT 'old',
+                 ALTER COLUMN v SET NOT NULL, ALTER COLUMN ts SET DEFAULT '2024-01-01';"
         );
         conn.execute(&trees).await.expect("the held trees");
         // Each of these is a tree pbps does not hold, for one reason each.
@@ -3754,7 +3758,10 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
              CREATE TABLE {s}.lst (x integer) PARTITION BY LIST (x);
              CREATE TABLE {s}.granted (x integer) PARTITION BY RANGE (x);
              CREATE TABLE {s}.granted_1 PARTITION OF {s}.granted FOR VALUES FROM (0) TO (10);
-             GRANT SELECT ON {s}.granted_1 TO PUBLIC;"
+             GRANT SELECT ON {s}.granted_1 TO PUBLIC;
+             CREATE TABLE {s}.dropdef (x integer DEFAULT 1) PARTITION BY RANGE (x);
+             CREATE TABLE {s}.dropdef_1 PARTITION OF {s}.dropdef FOR VALUES FROM (0) TO (10);
+             ALTER TABLE {s}.dropdef_1 ALTER COLUMN x DROP DEFAULT;"
         ))
         .await
         .expect("the trees left out");
@@ -3781,6 +3788,7 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
             partition_of: Some(PartitionOf {
                 parent: parent.clone(),
                 bound,
+                columns: Default::default(),
             }),
             ..Default::default()
         };
@@ -3815,13 +3823,31 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
             ..partition
         };
         for (name, expected) in [
-            (
-                t(&s, "ev_old"),
-                partition(
+            (t(&s, "ev_old"), {
+                // Its own default and NOT NULL, as the engine spells the
+                // default, and the parent's `id` NOT NULL not again
+                // (#1578).
+                let mut p = partition(
                     &ev_name,
                     range(vec![BoundDatum::MinValue], vec![value("2025-01-01")]),
-                ),
-            ),
+                );
+                let of = p.partition_of.as_mut().unwrap();
+                of.columns.insert(
+                    "v".to_owned(),
+                    pbps_model::PartitionColumn {
+                        default: Some("'old'::text".to_owned()),
+                        not_null: true,
+                    },
+                );
+                of.columns.insert(
+                    "ts".to_owned(),
+                    pbps_model::PartitionColumn {
+                        default: Some("'2024-01-01'::date".to_owned()),
+                        not_null: false,
+                    },
+                );
+                p
+            }),
             (
                 t(&s, "ev_2025"),
                 with_own(
@@ -3894,6 +3920,8 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
             "lst",
             "granted",
             "granted_1",
+            "dropdef",
+            "dropdef_1",
         ] {
             assert!(!held.tables.contains_key(&t(&s, name)), "{name} is held");
             assert!(
@@ -3968,8 +3996,8 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
         assert_eq!(back, held);
         assert!(plan(&back, &ids, &held, &ids).is_empty());
         conn.execute(&format!(
-            "INSERT INTO {s}.ev (id, ts) VALUES (1, '2024-06-01'), (2, '2026-06-01'),
-                 (3, '2030-01-01')"
+            "INSERT INTO {s}.ev (id, ts, v) VALUES (1, '2024-06-01', 'a'), (2, '2026-06-01', 'b'),
+                 (3, '2030-01-01', 'c')"
         ))
         .await
         .expect("route the rows");
@@ -3984,6 +4012,19 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
             .unwrap()
             .to_owned();
         assert_eq!(routed, format!("{s}.ev_old,{x}.ev_2026,{s}.ev_rest"));
+        // The rebuilt partition's own defaults, where a row is written to it
+        // directly; through the parent, the parent's apply (#1578).
+        let own = conn
+            .query(&format!(
+                "INSERT INTO {s}.ev_old (id) VALUES (4) RETURNING ts::text || ',' || v AS r"
+            ))
+            .await
+            .expect("its own defaults")[0]
+            .try_get::<&str>("r")
+            .unwrap()
+            .unwrap()
+            .to_owned();
+        assert_eq!(own, "2024-01-01,old");
 
         drop(conn);
         admin
@@ -4057,6 +4098,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             partition_of: Some(PartitionOf {
                 parent: t(parent),
                 bound,
+                columns: Default::default(),
             }),
             ..Default::default()
         };
@@ -4354,8 +4396,8 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
 /// detached under the declared names (#1544): its rows stay with it and
 /// leave the parent, it reads back as declared, and nothing is left to plan.
 /// Names may be exchanged, and a key left unnamed keeps the engine's name
-/// for it. A partition's own check and index keep their names (#1577). On 16
-/// and 18.
+/// for it. A partition's own check and index keep their names (#1577), and
+/// its own default and NOT NULL stay its columns' (#1578). On 16 and 18.
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn a_partition_is_detached_and_kept_under_its_declared_names() {
@@ -4396,6 +4438,7 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
              CREATE TABLE {s}.ev_2027 PARTITION OF {s}.ev
                  FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');
              ALTER TABLE {s}.ev_2025 ADD CONSTRAINT ev25_own_ck CHECK (id < 100);
+             ALTER TABLE {s}.ev_2025 ALTER COLUMN v SET DEFAULT 'z', ALTER COLUMN v SET NOT NULL;
              CREATE INDEX ev25_own ON {s}.ev_2025 (v DESC);
              INSERT INTO {s}.r VALUES (1);
              INSERT INTO {s}.ev VALUES (1, '2025-06-01', 'a', 1), (2, '2026-06-01', 'b', 1),
@@ -4437,6 +4480,13 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
         assert_eq!(ev_2025.indexes.keys().collect::<Vec<_>>(), ["ev25_own"]);
         archived.checks.extend(ev_2025.checks.clone());
         archived.indexes.extend(ev_2025.indexes.clone());
+        // And its own default and NOT NULL, which are its columns' once it is
+        // a table of its own (#1578).
+        let own_v = &ev_2025.partition_of.as_ref().unwrap().columns["v"];
+        assert!(own_v.not_null && own_v.default.is_some(), "{own_v:?}");
+        let v = archived.columns.get_mut("v").unwrap();
+        v.default.clone_from(&own_v.default);
+        v.nullable = false;
         let mut declared = base.clone();
         declared.tables.insert(t("ev_2025"), archived.clone());
         let declared_ids = mint_ids(&declared, &ids, &[]);
