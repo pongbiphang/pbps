@@ -2368,9 +2368,18 @@ mod tests {
     /// socket, the remembered number no longer answers, and neither does the
     /// owner's table. The child holds the socket on descriptor 3 until it
     /// reads a line from it, then closes it and lives on.
+    ///
+    /// The child says on stdout when each step is done, and the test reads
+    /// that before it asserts. It reads with `read -u 3`, not `read <&3`: a
+    /// redirection on the builtin dups the socket back onto descriptor 0 for
+    /// as long as `read` blocks. A first scan that ran before the move then
+    /// remembered 0, which went on holding the socket, so the number never
+    /// became 3, and a polling loop converged only if it caught the instant
+    /// between the move and `read`. On a loaded CI runner it often did not
+    /// (#1571).
     #[test]
     fn an_owner_that_closed_its_descriptor_no_longer_holds_the_socket() {
-        use std::io::Write as _;
+        use std::io::{BufRead as _, Write as _};
         use std::os::fd::OwnedFd;
         let (held, mut other) = std::os::unix::net::UnixStream::pair().unwrap();
         let inode = std::fs::metadata(format!("/proc/self/fd/{}", held.as_raw_fd()))
@@ -2380,29 +2389,36 @@ mod tests {
         command
             .args([
                 "-c",
-                "exec 3<&0 </dev/null; read -r _ <&3; exec 3<&-; sleep 30; exit 0",
+                "exec 3<&0 </dev/null; echo moved; read -r -u 3 _; exec 3<&-; echo closed; \
+                 sleep 30; exit 0",
             ])
             .stdin(Stdio::from(OwnedFd::from(held)))
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let mut child = spawned_and_execed(&mut command, "bash");
+        let mut said = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut step = |expected: &str| {
+            let mut line = String::new();
+            said.read_line(&mut line).unwrap();
+            assert_eq!(line.trim_end(), expected);
+        };
         let lease = ProcessLease::capture(child.id()).unwrap();
         let remembered = AtomicI32::new(-1);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while remembered.load(Ordering::Relaxed) != 3 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the child moves the socket to 3"
-            );
-            owns_socket(&lease, inode, &remembered).unwrap();
-        }
+        step("moved");
+        assert!(owns_socket(&lease, inode, &remembered).unwrap());
+        assert_eq!(
+            remembered.load(Ordering::Relaxed),
+            3,
+            "the socket is on descriptor 3 alone, so the scan remembers 3"
+        );
+        // Answered by the remembered descriptor itself, the witness's fast path.
         assert!(owns_socket(&lease, inode, &remembered).unwrap());
         other.write_all(b"close\n").unwrap();
-        let mut closed = false;
-        while !closed && std::time::Instant::now() < deadline {
-            closed = !owns_socket(&lease, inode, &remembered).unwrap();
-        }
-        assert!(closed, "a closed descriptor is not a holder");
+        step("closed");
+        assert!(
+            !owns_socket(&lease, inode, &remembered).unwrap(),
+            "a closed descriptor is not a holder"
+        );
         lease.check().expect("the owner itself lives on");
         child.kill().unwrap();
         child.wait().unwrap();
