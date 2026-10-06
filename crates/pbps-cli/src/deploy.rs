@@ -5372,6 +5372,27 @@ pub fn cmd_bootstrap(
         }
         anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
     })?;
+    // What a new table calls goes ahead of it, by the reordering passes
+    // `plan --db` runs on PostgreSQL (#1585, DEC-942.1, DEC-1364.1): a
+    // default or generated column calling a declared function. They read no
+    // catalog, so the `--sql` script gets them too. Into an empty database
+    // nothing is dropped or rebuilt, so no column is released and `weave`
+    // has nothing to add; SQL Server needs none, as
+    // `engine::account_for_module_dependents` says.
+    let mut cs = cs;
+    if dialect.name() == "postgres" {
+        let decisions = crate::dependents::take_public_execution(&mut cs);
+        let ordered = crate::dependents::split_new_tables(&mut cs, &[&ids], dialect.as_ref())
+            .and_then(|_| {
+                crate::dependents::after_the_rebuilds(
+                    &mut cs,
+                    &BTreeSet::new(),
+                    &loaded.hints.module_deps,
+                )
+            });
+        ordered.map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
+        crate::dependents::settle_public_execution(&mut cs, decisions);
+    }
 
     if let Some(path) = sql_out {
         let script = crate::render_sql(&cs, dialect.as_ref(), "an empty database")?;

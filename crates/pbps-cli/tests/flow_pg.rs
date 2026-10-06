@@ -17601,3 +17601,70 @@ fn a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_dep
         1
     );
 }
+
+/// A bootstrap orders what a new table calls ahead of it, as `plan --db`
+/// does (#1585): a column default and a generated column calling declared
+/// functions bootstrap an empty database, verify and replan empty. Without
+/// the reordering passes the table was created first and the whole
+/// bootstrap rolled back on `function … does not exist`. The negative: a
+/// table that calls nothing is created where the differ puts it, before the
+/// functions, so the passes move only what calls one.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
+    let server = server();
+    let source = OwnDatabase::new(&server, "boot-1585");
+    let target = OwnDatabase::new(&server, "boot-1585-target");
+    let (src, tgt) = (
+        source.connection().to_owned(),
+        target.connection().to_owned(),
+    );
+    on_server(
+        &src,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.zz() RETURNS text LANGUAGE sql IMMUTABLE RETURN 'x'; \
+         CREATE FUNCTION app.zz_double(i integer) RETURNS integer \
+             LANGUAGE sql IMMUTABLE RETURN i * 2; \
+         CREATE TABLE app.t (id integer, note text DEFAULT app.zz(), \
+             g integer GENERATED ALWAYS AS (app.zz_double(id)) STORED); \
+         CREATE TABLE app.a_plain (id integer)",
+    );
+    let d = Demo::new("boot-1585");
+    succeeds(d.run(&["pull", "--db", &src]));
+    d.commit();
+
+    // The script orders each function ahead of the table that calls it,
+    // and leaves the table that calls nothing ahead of both.
+    let sql = d.dir.join("boot.sql");
+    succeeds(d.run(&["bootstrap", "--sql", sql.to_str().unwrap()]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} is not in:\n{script}"))
+    };
+    let table = at("CREATE TABLE \"app\".\"t\"");
+    assert!(at("CREATE FUNCTION \"app\".\"zz\"\n") < table, "{script}");
+    assert!(
+        at("CREATE FUNCTION \"app\".\"zz_double\"") < table,
+        "{script}"
+    );
+    assert!(
+        at("CREATE TABLE \"app\".\"a_plain\"") < at("CREATE FUNCTION \"app\".\"zz\"\n"),
+        "{script}"
+    );
+
+    on_server(&tgt, "CREATE SCHEMA app");
+    succeeds(d.run(&["bootstrap", "--db", &tgt]));
+    succeeds(d.run(&["verify", "--db", &tgt]));
+    let next = succeeds(d.run(&["plan", "--db", &tgt]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    on_server(&tgt, "INSERT INTO app.t (id) VALUES (3)");
+    assert_eq!(
+        scalar(
+            &tgt,
+            "SELECT count(*) FROM app.t WHERE note = 'x' AND g = 6"
+        ),
+        1
+    );
+}
