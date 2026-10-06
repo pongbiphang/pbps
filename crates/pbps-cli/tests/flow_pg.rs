@@ -6474,7 +6474,9 @@ fn an_array_column_widens_through_the_cli() {
 /// same tree, verifies and leaves nothing to plan. A bound the engine spells
 /// otherwise is refused with the engine's spelling; a partition added by hand
 /// is refused with the commands that adopt it, and adopting it that way
-/// leaves nothing to plan.
+/// leaves nothing to plan. A partition's own check and index go with it
+/// under its entry (#1577); one naming a column its parent lacks is refused
+/// by `validate`, and one added to a standing partition by name (#1581).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_partition_tree_round_trips_through_the_cli() {
@@ -6490,8 +6492,11 @@ fn a_partition_tree_round_trips_through_the_cli() {
         "CREATE SCHEMA app; \
          CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, PRIMARY KEY (id, ts)) \
              PARTITION BY RANGE (ts); \
+         CREATE INDEX ev_ts ON app.ev (ts); \
          CREATE TABLE app.ev_2025 PARTITION OF app.ev \
              FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
+         ALTER TABLE app.ev_2025 ADD CONSTRAINT ev_2025_id_ck CHECK (id > 0); \
+         CREATE INDEX ev_2025_id ON app.ev_2025 (id); \
          CREATE TABLE app.ev_rest PARTITION OF app.ev DEFAULT",
     );
     let d = Demo::new("parts-1170");
@@ -6500,11 +6505,15 @@ fn a_partition_tree_round_trips_through_the_cli() {
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(
         text.contains(
-            "\npartition_by: [ts]\n\npartitions:\n  ev_2025: {from: [\"2025-01-01\"], to: \
-             [\"2026-01-01\"]}\n  ev_rest: default\n"
+            "\npartition_by: [ts]\n\npartitions:\n  ev_2025:\n    from: [\"2025-01-01\"]\n    \
+             to: [\"2026-01-01\"]\n    checks:\n      ev_2025_id_ck: "
+        ) && text.contains(
+            "\n    indexes:\n      ev_2025_id:\n        columns: [id]\n  ev_rest: default\n"
         ),
         "{text}"
     );
+    // The clones of the parent's index are the engine's, not the partition's.
+    assert!(!text.contains("ev_2025_ts_idx"), "{text}");
     // A partition has no file of its own.
     assert!(!d.dir.join("schema/app.ev_2025.yml").exists());
     succeeds(d.run(&["fmt", "--check"]));
@@ -6523,6 +6532,41 @@ fn a_partition_tree_round_trips_through_the_cli() {
               <> 'app.ev_2025,app.ev_rest' THEN RAISE EXCEPTION 'not routed'; END IF; \
          END $$",
     );
+
+    // Its own index on a column its parent lacks, refused by `validate`.
+    std::fs::write(
+        &path,
+        text.replace("        columns: [id]\n", "        columns: [nope]\n"),
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        said.contains("app.ev_2025")
+            && said.contains("index `ev_2025_id` references `nope`, which is not a column"),
+        "{said}"
+    );
+    // One added to the standing partition, refused by name until #1581.
+    std::fs::write(
+        &path,
+        text.replace(
+            "        columns: [id]\n",
+            "        columns: [id]\n      ev_2025_ts:\n        columns: [ts]\n",
+        ),
+    )
+    .unwrap();
+    d.commit();
+    let o = d.run(&["plan", "--db", &tgt]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("app.ev_2025 is a partitioned table or a partition")
+            && stderr(&o).contains("add index"),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::write(&path, &text).unwrap();
+    d.commit();
 
     // A bound spelled otherwise than the engine does, refused with its
     // spelling before a plan exists.

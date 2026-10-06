@@ -56,6 +56,29 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
             why.join("; ")
         ));
     }
+    // A partition whose own checks or indexes `validate` refuses takes its
+    // whole tree: a tree is read whole or not at all (#1170), and a parent
+    // written without one of its partitions would refuse that partition as
+    // undeclared on the next plan (#1577).
+    let refused_partitions: Vec<_> = schema
+        .tables
+        .iter()
+        .filter_map(|(name, table)| {
+            let of = table.partition_of.as_ref()?;
+            let parent = schema.tables.get(&of.parent)?;
+            let why = rendered(dialect.validate_partition(name, table, parent));
+            (!why.is_empty()).then(|| (name.clone(), of.parent.clone(), why))
+        })
+        .collect();
+    for (name, parent, why) in refused_partitions {
+        if schema.tables.remove(&parent).is_some() {
+            pulled.warnings.push(format!(
+                "table `{parent}` was left out with its partitions: `pbps validate` refuses its \
+                 partition `{name}` — {}",
+                why.join("; ")
+            ));
+        }
+    }
     // A partition goes with its parent (#1170): written alone it would name
     // a parent the declarations do not have, which the whole-schema check
     // refuses for the whole write.
@@ -553,6 +576,68 @@ mod tests {
         let warned = pulled.warnings.join("\n");
         assert!(
             warned.contains("table `app.p_rest` was left out: it is a partition of `$user.p`"),
+            "{warned}"
+        );
+    }
+
+    /// A partition whose own checks or indexes validation refuses takes its
+    /// whole tree out, named, as a tree is read whole or not at all (#1577);
+    /// a tree whose partitions' own are accepted stays as read.
+    #[test]
+    fn a_partition_whose_own_index_is_refused_takes_its_tree_out() {
+        let mut pulled = Pulled::default();
+        let s = &mut pulled.schema;
+        let mut parent = table("integer", None);
+        parent.partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["id".into()],
+        });
+        s.tables
+            .insert(TableName::new("app", "bad"), parent.clone());
+        s.tables.insert(TableName::new("app", "good"), parent);
+        let index = |column: &str| pbps_model::Index {
+            columns: vec![pbps_model::IndexColumn {
+                key: pbps_model::IndexKey::Column(column.into()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
+        for (name, of, column) in [
+            ("bad_1", "bad", "nope"),
+            ("bad_2", "bad", "id"),
+            ("good_1", "good", "id"),
+        ] {
+            let mut partition = pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: TableName::new("app", of),
+                    bound: pbps_model::PartitionBound::Default,
+                }),
+                ..Default::default()
+            };
+            partition
+                .indexes
+                .insert(format!("{name}_ix"), index(column));
+            s.tables.insert(TableName::new("app", name), partition);
+        }
+
+        leave_out_what_validate_refuses(&mut pulled, pg().as_ref());
+
+        let kept: Vec<String> = pulled.schema.tables.keys().map(|n| n.to_string()).collect();
+        assert_eq!(kept, ["app.good", "app.good_1"]);
+        let warned = pulled.warnings.join("\n");
+        assert!(
+            warned.contains(
+                "table `app.bad` was left out with its partitions: `pbps validate` refuses its \
+                 partition `app.bad_1`"
+            ) && warned.contains("`nope`"),
+            "{warned}"
+        );
+        assert!(
+            warned.contains("table `app.bad_2` was left out: it is a partition of `app.bad`"),
             "{warned}"
         );
     }

@@ -245,6 +245,10 @@ pub struct RawConstraint {
     /// `ALTER TABLE ... DISABLE TRIGGER` stops them without touching
     /// `convalidated` or `conenforced`.
     pub triggers_not_ordinary: bool,
+    /// Not the table's own: inherited from a parent (`coninhcount`), or not
+    /// defined locally at all. A partition's clone of its parent's CHECK, which
+    /// is its parent's to declare (#1577).
+    pub inherited: bool,
 }
 
 /// One row of `pg_index`, joined to what it needs from `pg_class` and `pg_am`.
@@ -290,6 +294,9 @@ pub struct RawIndex {
     /// The index's `reloptions`, each `name=value` as the engine keeps it
     /// (#1442).
     pub reloptions: Vec<String>,
+    /// Attached to an index of a parent (`pg_inherits`): a partition's clone
+    /// of its parent's index, which is the parent's to declare (#1577).
+    pub attached: bool,
 }
 
 /// Everything one pull read, before any of it is interpreted.
@@ -757,9 +764,11 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         if refused.contains(&raw_table.oid) {
             continue;
         }
-        // A partition is its bound and its parent, nothing else: its columns,
-        // keys and indexes are the parent's, which the engine gave it, and
-        // the reader has already checked that is all it has (#1170).
+        // A partition is its bound and its parent, and what it has of its own:
+        // its checks and indexes (#1577). Its columns and keys are the
+        // parent's, which the engine gave it, and the clones of the parent's
+        // checks and indexes are too; the reader has already checked that is
+        // all it has (#1170).
         if let Some((parent, bound)) = &raw_table.partition_of {
             let (Some(parent), Some(bound)) = (lookups.tables.get(parent), parse_bound(bound))
             else {
@@ -767,16 +776,52 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 // parent or bound this could not take.
                 continue;
             };
-            pulled.schema.tables.insert(
-                name,
-                Table {
-                    partition_of: Some(pbps_model::PartitionOf {
-                        parent: parent.clone(),
-                        bound,
-                    }),
-                    ..Table::default()
-                },
-            );
+            let parts = Parts {
+                name: name.clone(),
+                by_attnum: raw_columns
+                    .iter()
+                    .map(|c| (c.attnum, c.name.as_str()))
+                    .collect(),
+            };
+            let mut table = Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: parent.clone(),
+                    bound,
+                }),
+                ..Table::default()
+            };
+            for constraint in constraints_by_table
+                .get(&raw_table.oid)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter(|c| c.kind == 'c' && !c.inherited)
+            {
+                add_constraint(constraint, &parts, &lookups, &mut table, &mut pulled);
+            }
+            let mut unread = Vec::new();
+            for index in indexes_by_table
+                .get(&raw_table.oid)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter(|i| !i.attached && !constraint_indexes.contains(&i.oid))
+            {
+                if add_index(index, &parts, &mut table, &mut pulled) {
+                    surviving.insert(index.oid);
+                    if let Some(declared) = table.indexes.get_mut(&index.name) {
+                        let what = format!("index `{}`", index.name);
+                        declared.storage_parameters = index_parameters(
+                            declared.method,
+                            &index.reloptions,
+                            &what,
+                            &mut unread,
+                        );
+                    }
+                }
+            }
+            for detail in unread {
+                note(&mut pulled, &name, detail);
+            }
+            pulled.schema.tables.insert(name, table);
             continue;
         }
         let parts = Parts {
@@ -4654,6 +4699,7 @@ mod tests {
             period: false,
             no_inherit: false,
             triggers_not_ordinary: false,
+            inherited: false,
         }
     }
 
@@ -4676,6 +4722,7 @@ mod tests {
             key_classes: vec![String::new()],
             key_texts: vec![String::new()],
             nondefault_collation: false,
+            attached: false,
             reloptions: Vec::new(),
         }
     }
@@ -5170,6 +5217,77 @@ mod tests {
 
     /// The three verbatim expressions arrive as the engine respelled them, and
     /// this half must not tidy any of them (ADR-0009 §2, ADR-0013 §4).
+    /// A partition reads back its own checks and indexes and none of its
+    /// clones, told apart by catalog parentage and never by name (#1577): a
+    /// clone named as an own one would be, and an own one named as a clone,
+    /// read as what they are.
+    #[test]
+    fn a_partition_reads_its_own_checks_and_indexes_and_no_clone() {
+        let check = |table_oid: i64, name: &str, inherited: bool| {
+            let mut c = constraint(table_oid, name, 'c');
+            c.definition = "CHECK ((v > 0))".to_owned();
+            c.expression = Some("(v > 0)".to_owned());
+            c.inherited = inherited;
+            c
+        };
+        let ix = |oid: i64, table_oid: i64, name: &str, attached: bool| {
+            let mut i = index(oid, table_oid, name);
+            i.columns = vec![2];
+            i.attached = attached;
+            i
+        };
+        let mut parent = table(1, "ev");
+        parent.partition_key = Some(vec!["ts".to_owned()]);
+        let mut partition = table(2, "p1");
+        partition.partition_of = Some((
+            1,
+            "FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')".to_owned(),
+        ));
+        let raw = RawCatalog {
+            tables: vec![parent, partition],
+            columns: vec![
+                col(1, 1, "ts", "date"),
+                col(1, 2, "v", "integer"),
+                col(2, 1, "ts", "date"),
+                col(2, 2, "v", "integer"),
+            ],
+            constraints: vec![
+                check(1, "ev_ck", false),
+                // The parent's, cloned: inherited.
+                check(2, "ev_ck", true),
+                // Its own, named as a clone of an index would be.
+                check(2, "p1_v_idx", false),
+            ],
+            indexes: vec![
+                ix(10, 1, "ev_v", false),
+                // The parent's, cloned: attached.
+                ix(11, 2, "p1_v_idx", true),
+                // Its own, named as the parent's.
+                ix(12, 2, "ev_v_own", false),
+            ],
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw);
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        let p1 = &pulled.schema.tables[&TableName::new("app", "p1")];
+        assert_eq!(p1.checks.keys().collect::<Vec<_>>(), ["p1_v_idx"]);
+        assert_eq!(p1.checks["p1_v_idx"].expression, "(v > 0)");
+        assert_eq!(p1.indexes.keys().collect::<Vec<_>>(), ["ev_v_own"]);
+        assert!(p1.columns.is_empty(), "its columns are its parent's");
+        let ev = &pulled.schema.tables[&TableName::new("app", "ev")];
+        assert_eq!(ev.checks.keys().collect::<Vec<_>>(), ["ev_ck"]);
+        assert_eq!(ev.indexes.keys().collect::<Vec<_>>(), ["ev_v"]);
+        // Negative: with nothing of its own, it reads as its bound alone.
+        let bare = RawCatalog {
+            constraints: raw.constraints[..2].to_vec(),
+            indexes: raw.indexes[..2].to_vec(),
+            ..raw.clone()
+        };
+        let pulled = assemble(&bare);
+        let p1 = &pulled.schema.tables[&TableName::new("app", "p1")];
+        assert!(p1.checks.is_empty() && p1.indexes.is_empty(), "{p1:?}");
+    }
+
     #[test]
     fn the_respelled_expressions_are_carried_through_untouched() {
         let mut column = col(1, 1, "amount", "numeric(10,2)");

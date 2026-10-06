@@ -278,8 +278,10 @@ indexes:
   file: `name: {from: [...], to: [...]}` with one value per key column, each a
   quoted value, `MINVALUE` or `MAXVALUE`, or `name: default`. A partition in
   another schema is named qualified. A partition is a table of its own, with
-  an identity, and declares nothing else: its columns, keys and indexes are its
-  parent's. A bound value is written as the engine prints it, and a connected
+  an identity. Its columns and keys are its parent's, and so are the clones of
+  its parent's checks and indexes. It may declare checks and indexes of its
+  own: its entry is then a block of `from:` and `to:`, or `default: true`, with
+  `checks:` and `indexes:` written as a table's (DEC-1577.1). A bound value is written as the engine prints it, and a connected
   command refuses any other spelling with the engine's. A tree is created
   whole, parent first. A partition the database has and the declarations do not is refused with the
   commands that adopt it. `data:` beside a tree, and partitioning on SQL Server,
@@ -292,7 +294,8 @@ indexes:
   and kept with its rows, `destructive` since they leave the parent; any other
   shape is refused, to be changed in a later revision (DEC-1544.1). Every other
   change stays refused by name: the parent's own changes until #1546, attaching
-  an existing table until #1545.
+  an existing table until #1545, a partition's own checks and indexes until
+  #1581.
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

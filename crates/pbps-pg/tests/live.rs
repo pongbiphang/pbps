@@ -3672,11 +3672,13 @@ async fn array_columns_round_trip_and_widen_their_elements() {
     target.drop().await;
 }
 
-/// A RANGE partition tree whose partitions are its parent's and nothing else
-/// is read with them, rebuilt from the declaration alone, and routes rows as
-/// it did; a tree with anything else in any table is left out whole and
-/// named (#1170). On 16 and 18, whose catalogs differ in NOT NULL rows and in
-/// the names of a foreign key's clones.
+/// A RANGE partition tree whose partitions are its parent's and their own
+/// checks and indexes is read with them, rebuilt from the declaration alone,
+/// and routes rows as it did; a tree with anything else in any table is left
+/// out whole and named (#1170). A partition's own checks and indexes are read
+/// as its own and the parent's clones are not, by catalog parentage (#1577).
+/// On 16 and 18, whose catalogs differ in NOT NULL rows and in the names of a
+/// foreign key's clones.
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn range_partition_trees_round_trip_whole_or_not_at_all() {
@@ -3725,7 +3727,10 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
              CREATE TABLE {s}.m_mid PARTITION OF {s}.m
                  FOR VALUES FROM (-5, 0) TO (10, MAXVALUE);
              CREATE TABLE {s}.r (id integer PRIMARY KEY, ev_id integer, ev_ts date,
-                 CONSTRAINT r_ev FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.ev (id, ts));"
+                 CONSTRAINT r_ev FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.ev (id, ts));
+             ALTER TABLE {s}.ev_2025 ADD CONSTRAINT ev_2025_id_ck CHECK (id > 0);
+             CREATE INDEX ev_2025_id ON {s}.ev_2025 (id DESC) WHERE id > 5;
+             CREATE UNIQUE INDEX ev_rest_id ON {s}.ev_rest (id);"
         );
         conn.execute(&trees).await.expect("the held trees");
         // Each of these is a tree pbps does not hold, for one reason each.
@@ -3738,7 +3743,7 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
              CREATE TABLE {s}.ex (x integer) PARTITION BY RANGE ((x + 1));
              CREATE TABLE {s}.own (x integer) PARTITION BY RANGE (x);
              CREATE TABLE {s}.own_1 PARTITION OF {s}.own FOR VALUES FROM (0) TO (10);
-             CREATE INDEX own_1_x ON {s}.own_1 (x);
+             ALTER TABLE {s}.own_1 ADD CONSTRAINT own_1_u UNIQUE (x);
              CREATE TABLE {s}.nest (x integer, y integer) PARTITION BY RANGE (x);
              CREATE TABLE {s}.nest_1 PARTITION OF {s}.nest
                  FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (y);
@@ -3778,6 +3783,22 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
         let value = |v: &str| BoundDatum::Value(v.to_owned());
         let range = |from: Vec<BoundDatum>, to: Vec<BoundDatum>| PartitionBound::Range { from, to };
         let (ev_name, m_name) = (t(&s, "ev"), t(&s, "m"));
+        // Their own, and not the clones of the parent's check and index that
+        // every partition has (#1577).
+        let ev_2025 = &held.tables[&t(&s, "ev_2025")];
+        assert_eq!(ev_2025.checks.keys().collect::<Vec<_>>(), ["ev_2025_id_ck"]);
+        assert_eq!(ev_2025.indexes.keys().collect::<Vec<_>>(), ["ev_2025_id"]);
+        let own_index = &ev_2025.indexes["ev_2025_id"];
+        assert!(own_index.columns[0].descending && own_index.filter.is_some());
+        let ev_rest = &held.tables[&t(&s, "ev_rest")];
+        assert!(ev_rest.checks.is_empty());
+        assert_eq!(ev_rest.indexes.keys().collect::<Vec<_>>(), ["ev_rest_id"]);
+        assert!(ev_rest.indexes["ev_rest_id"].unique);
+        let with_own = |partition: pbps_model::Table, from: &pbps_model::Table| pbps_model::Table {
+            checks: from.checks.clone(),
+            indexes: from.indexes.clone(),
+            ..partition
+        };
         for (name, expected) in [
             (
                 t(&s, "ev_old"),
@@ -3788,9 +3809,12 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
             ),
             (
                 t(&s, "ev_2025"),
-                partition(
-                    &ev_name,
-                    range(vec![value("2025-01-01")], vec![value("2026-01-01")]),
+                with_own(
+                    partition(
+                        &ev_name,
+                        range(vec![value("2025-01-01")], vec![value("2026-01-01")]),
+                    ),
+                    ev_2025,
                 ),
             ),
             (
@@ -3802,7 +3826,7 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
             ),
             (
                 t(&s, "ev_rest"),
-                partition(&ev_name, PartitionBound::Default),
+                with_own(partition(&ev_name, PartitionBound::Default), ev_rest),
             ),
             (
                 t(&s, "m_low"),
@@ -4315,7 +4339,8 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
 /// detached under the declared names (#1544): its rows stay with it and
 /// leave the parent, it reads back as declared, and nothing is left to plan.
 /// Names may be exchanged, and a key left unnamed keeps the engine's name
-/// for it. On 16 and 18.
+/// for it. A partition's own check and index keep their names (#1577). On 16
+/// and 18.
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn a_partition_is_detached_and_kept_under_its_declared_names() {
@@ -4355,6 +4380,8 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
              CREATE SEQUENCE {s}.ev_2027_pkey;
              CREATE TABLE {s}.ev_2027 PARTITION OF {s}.ev
                  FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');
+             ALTER TABLE {s}.ev_2025 ADD CONSTRAINT ev25_own_ck CHECK (id < 100);
+             CREATE INDEX ev25_own ON {s}.ev_2025 (v DESC);
              INSERT INTO {s}.r VALUES (1);
              INSERT INTO {s}.ev VALUES (1, '2025-06-01', 'a', 1), (2, '2026-06-01', 'b', 1),
                  (3, '2025-07-01', 'c', NULL);"
@@ -4388,6 +4415,13 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
         rename(&mut archived.foreign_keys, "ev_rid_fk", "arch_rid_fk");
         rename(&mut archived.checks, "ev_v_ck", "arch_v_ck");
         rename(&mut archived.indexes, "ev_rid", "arch_rid");
+        // And its own, under their own names, which the detach leaves alone
+        // (#1577).
+        let ev_2025 = &base.tables[&t("ev_2025")];
+        assert_eq!(ev_2025.checks.keys().collect::<Vec<_>>(), ["ev25_own_ck"]);
+        assert_eq!(ev_2025.indexes.keys().collect::<Vec<_>>(), ["ev25_own"]);
+        archived.checks.extend(ev_2025.checks.clone());
+        archived.indexes.extend(ev_2025.indexes.clone());
         let mut declared = base.clone();
         declared.tables.insert(t("ev_2025"), archived.clone());
         let declared_ids = mint_ids(&declared, &ids, &[]);

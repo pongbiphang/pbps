@@ -3133,18 +3133,42 @@ fn bound_clause(bound: &pbps_model::PartitionBound) -> String {
 fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
     // A partition is its parent's columns, keys and indexes, which the
     // engine gives it as it is created (#1170): one statement, after the
-    // parent's.
+    // parent's. Then its own checks and indexes (#1577), added as a table's
+    // are rather than in the `CREATE`: measured on 16 and 18, a check written
+    // there under one of the parent's check names, with its expression, is
+    // merged into the inherited one with a notice, where `ADD CONSTRAINT`
+    // refuses it by name.
     if let Some(of) = &table.partition_of {
-        return Ok(vec![on(
+        let q = qualified(name)?;
+        let mut out = vec![on(
             pg,
             name,
             &format!(
-                "CREATE TABLE {} PARTITION OF {} {} USING heap;",
-                qualified(name)?,
+                "CREATE TABLE {q} PARTITION OF {} {} USING heap;",
                 qualified(&of.parent)?,
                 bound_clause(&of.bound)
             ),
-        )?]);
+        )?];
+        for (n, c) in &table.checks {
+            out.push(on(
+                pg,
+                name,
+                &format!(
+                    "ALTER TABLE {q} ADD CONSTRAINT {} CHECK ({});",
+                    quote(n)?,
+                    verbatim(&c.expression)
+                ),
+            )?);
+        }
+        for (n, idx) in &table.indexes {
+            // Not online, for the reason a new table's are not: it is empty.
+            out.push(on(
+                pg,
+                name,
+                &create_index(name, n, idx, Strategy::default())?,
+            )?);
+        }
+        return Ok(out);
     }
     if table.columns.is_empty() {
         return Err(invalid(format!("table `{name}` has no columns")));
@@ -4196,6 +4220,45 @@ mod tests {
         };
         let sql = create("app.ev_old", &partition);
         assert_eq!(sql.len(), 1, "{sql:?}");
+        // Its own checks and indexes follow its creation, as a table's do
+        // (#1577); the parent's are the engine's to give it.
+        let mut own = partition.clone();
+        own.checks.insert(
+            "old_ck".into(),
+            pbps_model::CheckConstraint {
+                expression: "ts > '2000-01-01'".into(),
+            },
+        );
+        own.indexes.insert(
+            "old_ts".into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Column("ts".into()),
+                    descending: true,
+                    opclass: None,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            },
+        );
+        let sql = create("app.ev_old", &own);
+        assert_eq!(sql.len(), 3, "{sql:?}");
+        assert!(sql[0].contains("PARTITION OF \"app\".\"ev\""), "{sql:?}");
+        assert!(
+            sql[1].contains(
+                "ALTER TABLE \"app\".\"ev_old\" ADD CONSTRAINT \"old_ck\" CHECK (ts > \
+                 '2000-01-01'\n);"
+            ),
+            "{sql:?}"
+        );
+        assert!(
+            sql[2].contains("INDEX \"old_ts\" ON \"app\".\"ev_old\"")
+                && sql[2].contains("\"ts\" DESC"),
+            "{sql:?}"
+        );
         assert!(
             sql[0].contains(
                 "CREATE TABLE \"app\".\"ev_old\" PARTITION OF \"app\".\"ev\" FOR VALUES FROM \

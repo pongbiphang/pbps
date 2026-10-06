@@ -588,21 +588,56 @@ macro_rules! list_or_spec {
 // `list_or_spec!` is: buffered first, a bound value would be matched as
 // whatever YAML type it buffered as, and the error would name no variant.
 
-/// A RANGE partition's bound: `default`, or `{from: [...], to: [...]}` with one
-/// value per key column.
+/// A RANGE partition: `default`, or a mapping of its bound, `{from: [...], to:
+/// [...]}` with one value per key column or `default: true`, and what it has of
+/// its own beside its parent's: `checks:` and `indexes:`, written as a table's
+/// (#1577).
 #[derive(Debug, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum PartitionDto {
     /// `default`.
     Default(String),
-    Range(PartitionRangeDto),
+    Entry(PartitionEntryDto),
 }
 
+// One bound or the other, as the loader takes them: `from:` and `to:` both, or
+// `default: true` alone. Optional fields alone would bless `{}` and `{from:
+// [1]}`, which `convert` refuses; written out as `ModuleDto`'s exclusions are,
+// with `null` for a key YAML leaves empty, which serde reads as absent.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct PartitionRangeDto {
-    pub from: Vec<BoundValueDto>,
-    pub to: Vec<BoundValueDto>,
+#[schemars(extend("oneOf" = [
+    serde_json::json!({
+        "required": ["from", "to"],
+        "properties": {
+            "from": {"type": "array"}, "to": {"type": "array"},
+            "default": {"const": false},
+        },
+    }),
+    serde_json::json!({
+        "required": ["default"],
+        "properties": {
+            "default": {"const": true},
+            "from": {"type": "null"}, "to": {"type": "null"},
+        },
+    }),
+]))]
+pub struct PartitionEntryDto {
+    #[serde(default)]
+    pub from: Option<Vec<BoundValueDto>>,
+    #[serde(default)]
+    pub to: Option<Vec<BoundValueDto>>,
+    /// The DEFAULT partition, written as a mapping so that it can carry what
+    /// it has of its own.
+    #[serde(default)]
+    pub default: bool,
+    /// Constraint name to check expression, the partition's own.
+    #[serde(default)]
+    pub checks: BTreeMap<String, String>,
+    /// The partition's own indexes; the parent's reach it without being
+    /// written here.
+    #[serde(default)]
+    pub indexes: BTreeMap<String, IndexDto>,
 }
 
 impl<'de> serde::Deserialize<'de> for PartitionDto {
@@ -611,7 +646,7 @@ impl<'de> serde::Deserialize<'de> for PartitionDto {
         impl<'de> serde::de::Visitor<'de> for V {
             type Value = PartitionDto;
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("`default`, or a mapping of `from:` and `to:`")
+                f.write_str("`default`, or a mapping of `from:` and `to:` or `default: true`")
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PartitionDto, E> {
                 Ok(PartitionDto::Default(v.to_owned()))
@@ -621,7 +656,7 @@ impl<'de> serde::Deserialize<'de> for PartitionDto {
                 map: A,
             ) -> Result<PartitionDto, A::Error> {
                 serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
-                    .map(PartitionDto::Range)
+                    .map(PartitionDto::Entry)
             }
         }
         d.deserialize_any(V)

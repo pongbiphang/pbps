@@ -2420,6 +2420,22 @@ pub trait Dialect {
     /// everything that needs fixing in one pass.
     fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError>;
 
+    /// Checks what a partition declares of its own against its parent's
+    /// columns, which it has and does not declare (#1577): an index or a check
+    /// on a partition names the parent's columns. [`validate_table`] sees the
+    /// partition alone and so cannot. A dialect without partitions has none to
+    /// check.
+    ///
+    /// [`validate_table`]: Dialect::validate_table
+    fn validate_partition(
+        &self,
+        _name: &TableName,
+        _partition: &Table,
+        _parent: &Table,
+    ) -> Vec<DialectError> {
+        Vec::new()
+    }
+
     /// Renders one change as statements.
     ///
     /// Returning a `Vec` is necessary because one change is not always one
@@ -2643,7 +2659,7 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
 /// which the engine also enforces.
 pub fn check_partitions(schema: &Schema) -> Vec<String> {
     let mut problems = Vec::new();
-    // A partition declares nothing of its own, grants included, until #1532.
+    // A partition takes no grant of its own until #1579.
     for (role, declared) in &schema.roles {
         for target in declared.grants.keys() {
             if let pbps_model::GrantTarget::Object(name) = target
