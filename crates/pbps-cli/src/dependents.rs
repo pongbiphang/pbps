@@ -1332,7 +1332,7 @@ impl HeaderWord {
 /// its statements is no clause.
 fn header_words(definition: &str, dialect: &dyn Dialect) -> Vec<HeaderWord> {
     let header = dialect.lexicon().header(definition);
-    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let word = dialect.lexicon().identifier_continues;
     let mut words: Vec<HeaderWord> = Vec::new();
     let mut depth = 0usize;
     let mut chars = header.char_indices().peekable();
@@ -1370,7 +1370,7 @@ fn header_words(definition: &str, dialect: &dyn Dialect) -> Vec<HeaderWord> {
                     chars.next();
                 }
                 if depth == 0 {
-                    let w = header[at..end].to_lowercase();
+                    let w = dialect.fold_ident(&header[at..end]).into_owned();
                     if w == "return" || w == "begin" {
                         break;
                     }
@@ -1407,17 +1407,24 @@ fn string_body(definition: &str, dialect: &dyn Dialect) -> Option<String> {
 /// Measured on 18: the last of two clauses is the one stored, and each
 /// quoted argument is one schema, `TO 'a,b'` the schema `a,b`.
 fn routine_path(definition: &str, dialect: &dyn Dialect) -> Option<Option<Vec<String>>> {
-    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    // The engine's own lexis throughout (#1599 review): what continues an
+    // identifier, how an unquoted one folds, and the white space between
+    // tokens, so a name reads here as the engine reads it.
+    let word = dialect.lexicon().identifier_continues;
+    fn skip(s: &str) -> &str {
+        s.trim_start_matches(is_input_space)
+    }
     let words = header_words(definition, dialect);
     let Some(after) = words
         .windows(2)
         .rev()
-        .find(|pair| pair[0].is("set") && pair[1].1 == "search_path")
+        // A setting's name matches in any case, quoted or not.
+        .find(|pair| pair[0].is("set") && pair[1].1.eq_ignore_ascii_case("search_path"))
         .map(|pair| pair[1].0)
     else {
         return Some(None);
     };
-    let rest = definition.get(after..)?.trim_start();
+    let rest = skip(definition.get(after..)?);
     let rest = if let Some(r) = rest.strip_prefix('=') {
         r
     } else if rest.get(..2).is_some_and(|w| w.eq_ignore_ascii_case("to"))
@@ -1428,7 +1435,7 @@ fn routine_path(definition: &str, dialect: &dyn Dialect) -> Option<Option<Vec<St
         return None;
     };
     let mut schemas = Vec::new();
-    let mut rest = rest.trim_start();
+    let mut rest = skip(rest);
     loop {
         // Each part, and the bytes it takes.
         let (schema, len) = if let Some(r) = rest.strip_prefix('\'') {
@@ -1437,13 +1444,13 @@ fn routine_path(definition: &str, dialect: &dyn Dialect) -> Option<Option<Vec<St
             quoted_part(r, '"').map(|(v, n)| (v, n + 1))?
         } else {
             let len = rest.find(|c: char| !word(c)).unwrap_or(rest.len());
-            let w = rest[..len].to_lowercase();
+            let w = dialect.fold_ident(&rest[..len]).into_owned();
             // A word glued to anything but a separator is a form this scan
             // does not read: `E'…'`, `U&"…"`.
             let glued = rest[len..]
                 .chars()
                 .next()
-                .is_some_and(|c| !c.is_whitespace() && c != ',');
+                .is_some_and(|c| !is_input_space(c) && c != ',');
             if len == 0 || w == "from" || w == "default" || glued {
                 return None;
             }
@@ -1454,9 +1461,9 @@ fn routine_path(definition: &str, dialect: &dyn Dialect) -> Option<Option<Vec<St
             return None;
         }
         schemas.push(schema);
-        rest = rest[len..].trim_start();
+        rest = skip(&rest[len..]);
         match rest.strip_prefix(',') {
-            Some(r) => rest = r.trim_start(),
+            Some(r) => rest = skip(r),
             None => return Some(Some(schemas)),
         }
     }
@@ -4389,6 +4396,22 @@ mod tests {
                 "() RETURNS integer LANGUAGE sql SET search_path = \"Other\", Third AS $$ SELECT 1 $$"
             ),
             some(&["Other", "third"])
+        );
+        // The engine's lexis (#1599 review): a setting's name in any case,
+        // quoted or not; an unquoted non-ASCII letter kept as written, since
+        // only ASCII folds; and a no-break space part of the name, since only
+        // the scanner's six characters separate.
+        assert_eq!(
+            path("() RETURNS integer LANGUAGE sql SET \"SEARCH_PATH\" = other AS $$ SELECT 1 $$"),
+            some(&["other"])
+        );
+        assert_eq!(
+            path("() RETURNS integer LANGUAGE sql SET search_path = ÄPP AS $$ SELECT 1 $$"),
+            some(&["Äpp"])
+        );
+        assert_eq!(
+            path("() RETURNS integer LANGUAGE sql SET search_path = app\u{a0} AS $$ SELECT 1 $$"),
+            some(&["app\u{a0}"])
         );
         // Not a clause: in the string body, or in an atomic body.
         assert_eq!(
