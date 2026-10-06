@@ -39,6 +39,11 @@ pub enum ReconstructError {
     Emit { declaration: String, reason: String },
     #[error("scratch compilation of {declaration} failed: {reason}")]
     Compile { declaration: String, reason: String },
+    /// A catalog read around a step failed: nothing was learned about the
+    /// declaration, so it is not a [`ReconstructError::Compile`] verdict
+    /// (SPEC 9.8, #1575).
+    #[error("reading back what compiling {declaration} made failed: {reason}")]
+    Read { declaration: String, reason: String },
     #[error("scratch compilation could not {0} its transaction")]
     Transaction(&'static str),
     #[error(
@@ -485,6 +490,10 @@ impl Reconstruction {
                 declaration: step.declaration.clone(),
                 reason,
             };
+            let unread = |reason: String| ReconstructError::Read {
+                declaration: step.declaration.clone(),
+                reason,
+            };
             let routine = match &step.module {
                 Some(id @ ModuleId::Routine(_)) => {
                     Some((id.schema().to_owned(), id.name().to_owned()))
@@ -492,7 +501,7 @@ impl Reconstruction {
                 Some(ModuleId::Named(_) | ModuleId::Trigger { .. }) | None => None,
             };
             let before = match &routine {
-                Some((schema, name)) => routines(conn, schema, name).await.map_err(failed)?,
+                Some((schema, name)) => routines(conn, schema, name).await.map_err(unread)?,
                 None => Vec::new(),
             };
             for statement in &step.statements {
@@ -507,12 +516,12 @@ impl Reconstruction {
                 .map(|(_, schema, name)| (schema.clone(), name.clone()));
             if let Some((schema, name)) = relation
                 && let Some((array_schema, array)) =
-                    array_type(conn, &schema, &name).await.map_err(failed)?
+                    array_type(conn, &schema, &name).await.map_err(unread)?
             {
                 step.names.push((Nameable::Type, array_schema, array));
             }
             if let Some((schema, name)) = &routine {
-                let mut after = routines(conn, schema, name).await.map_err(failed)?;
+                let mut after = routines(conn, schema, name).await.map_err(unread)?;
                 after.retain(|created| !before.contains(created));
                 let [created] = after.as_slice() else {
                     return Err(failed(

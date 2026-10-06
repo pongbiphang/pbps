@@ -103,6 +103,11 @@ pub enum Error {
     Incompatible(Vec<String>),
     #[error("the desired bindings could not be resolved on this run: {0}")]
     Binding(String),
+    /// A catalog read during resolution failed or was cut short: nothing was
+    /// answered about the bindings, so it is not a [`Error::Binding`] verdict
+    /// (SPEC 9.8, #1575).
+    #[error("a catalog read during resolution failed: {0}")]
+    Read(String),
 }
 
 /// Which premise of the named profile a refusal is about.
@@ -2154,7 +2159,7 @@ impl ScratchRun {
         self.in_flight = true;
         let compiled = engine::compile(reconstruction, extras, scratch.connection_mut()).await;
         self.in_flight = false;
-        compiled.map_err(Error::Binding)?;
+        compiled?;
         self.check_held(target).await?;
         // Scratch is read through an administrative session: the capture
         // reads settings a least-privilege deployer need not see, and which
@@ -2185,7 +2190,7 @@ impl ScratchRun {
             engine::CaptureScope,
             Option<InputManifest>,
         );
-        let captured: Result<DesiredCapture, String> = match (key, planning) {
+        let captured: Result<DesiredCapture, Error> = match (key, planning) {
             (Some(key), Some((_, wanted))) => engine::capture_desired_for_plan(
                 admin,
                 &base,
@@ -2210,11 +2215,12 @@ impl ScratchRun {
             (None, None) => engine::capture_desired(admin, &base, &desired, &paths)
                 .await
                 .map(|(captured, scope)| (None, Some(captured), scope, None)),
-            (None, Some(_)) => Err("qualified planning requires the environment key".into()),
+            (None, Some(_)) => Err(Error::Binding(
+                "qualified planning requires the environment key".into(),
+            )),
         };
         self.retire_admin();
-        let (compiled_qualified, compiled, scope, compiled_manifest) =
-            captured.map_err(Error::Binding)?;
+        let (compiled_qualified, compiled, scope, compiled_manifest) = captured?;
         self.check_held(target).await?;
         let signatures = dropped.iter().filter_map(|(_, s)| s.clone()).collect();
         let (current, opening_manifest, opening_build) = match (key, planning) {
@@ -2257,7 +2263,7 @@ impl ScratchRun {
                 .map(|captured| (captured, None, None)),
             (None, Some(_)) => unreachable!("planned branch requires the key"),
         }
-        .map_err(|error| Error::Binding(error.to_string()))?;
+        .map_err(engine::target_capture_failed)?;
         self.check_inner(target).await?;
         let identified = current.catalog().dropped();
         reconstruction.identified(
