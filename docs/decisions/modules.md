@@ -1683,15 +1683,24 @@ and only on the connected PostgreSQL path; an offline plan is a preview that
   allowed around the dot. An unquoted part runs to a dot or white space, and
   only its ASCII letters fold to lower case; quoted parts are verbatim. An
   input of digits alone is an OID, not a name, and so is `-` exactly (OID 0).
-  An unqualified name is read in the schema the expression is written in:
-  that schema is the whole write `search_path` the CLI emits (it configures
-  no extras), and `pg_catalog`, searched first, holds nothing a plan creates. A literal that only contains the name, a name in a
-  comment, or another schema's name is no reference. A literal that is the
-  name but is not cast can be refused; that costs a second plan, where a
-  missed reference costs a failed apply.
+  An unqualified name is a candidate only in the schema the expression is
+  written in, the whole write `search_path` the CLI emits (it configures no
+  extras). A literal that only contains the name, a name in a comment, or
+  another schema's name is no reference. A literal that is the name but is
+  not cast can be refused; that costs a second plan, where a missed reference
+  costs a failed apply.
+- **The target settles each candidate.** It is refused only if the name
+  resolves to no relation there now, looked up where the write path searches:
+  `pg_catalog` first, then the expression's schema, for an unqualified name,
+  and the named schema for a qualified one. A name that already resolves
+  binds what it resolves to, such as `'pg_class'` to the catalog's relation,
+  whatever the plan creates. Asking the engine replaced predicting each of its
+  lookup rules, which took a review round apiece (#1589).
 
-Pinned by `an_expression_naming_a_relation_the_plan_creates_later_is_refused`
-and `a_relation_literal_is_read_as_regclass_input_reads_it`
+Pinned by `an_expression_naming_a_relation_the_plan_creates_later_is_refused`,
+`a_relation_literal_is_read_as_regclass_input_reads_it` and
+`a_later_name_is_looked_up_where_the_write_path_searches`
 (`crates/pbps-cli/src/dependents.rs`), and the live
 `a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_deploy_it`
+and `a_name_that_already_resolves_on_the_target_is_not_refused`
 (`crates/pbps-cli/tests/flow_pg.rs`).

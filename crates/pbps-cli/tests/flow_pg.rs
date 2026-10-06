@@ -17287,6 +17287,46 @@ fn a_dropped_table_frees_a_name_a_moved_table_carries_in_applies() {
     );
 }
 
+/// #1589 review: an unqualified name the plan also creates later may already
+/// resolve, and then binds what it resolves to. `pg_catalog` is searched ahead
+/// of the write path, so `'pg_class'::regclass` is the catalog's whatever the
+/// plan names an index; the target is asked, and the plan deploys in one.
+#[test]
+#[ignore = "needs a live PostgreSQL; see scripts/live-tests-pg.sh"]
+fn a_name_that_already_resolves_on_the_target_is_not_refused() {
+    let own = OwnDatabase::new(&server(), "names_existing_relation");
+    let connection = own.connection();
+    let columns = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n";
+    let label = |default: &str| format!("  label: {{type: text, default: \"{default}\"}}\n");
+    let d = bootstrapped_demo(
+        connection,
+        "names_existing_relation",
+        &format!("{columns}{}primary_key: [id]\n", label("''")),
+    );
+
+    d.table(&format!(
+        "{columns}{}primary_key: [id]\nindexes:\n  pg_class:\n    columns: [id]\n",
+        label("('pg_class'::regclass)::text")
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_attrdef WHERE adrelid = 'app.t'::regclass \
+             AND pg_get_expr(adbin, adrelid) LIKE '%pg_class%'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class WHERE oid = 'app.pg_class'::regclass"
+        ),
+        1
+    );
+}
+
 /// #1576: PostgreSQL resolves `'app.ix_new'::regclass` when the default is
 /// set, and the differ sets a default before it creates an index. A connected
 /// plan that does both is refused, writing no artifact, with a two-plan

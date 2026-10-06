@@ -2318,7 +2318,13 @@ pub async fn account_for_module_dependents(
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     // On the final order: every pass above may move what an expression
     // names, or the expression (#1576).
-    crate::dependents::names_a_later_relation(changes, dialect)
+    let mut later = Vec::new();
+    for name in crate::dependents::names_a_later_relation(changes, dialect) {
+        if !resolves_now(conn, &name).await? {
+            later.push(name);
+        }
+    }
+    crate::dependents::later_relation_refusal(&later)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     crate::dependents::settle_public_execution(changes, decisions);
     let left = crate::dependents::unaccounted(changes, &found);
@@ -2339,6 +2345,33 @@ pub async fn account_for_module_dependents(
             found.len()
         ),
     })
+}
+
+/// Whether a literal [`crate::dependents::names_a_later_relation`] read as a
+/// later relation already resolves to one on the target, searching its
+/// schemas in order as the write path would (#1589). The literal then binds
+/// that relation, whatever the plan creates, and needs nothing later.
+async fn resolves_now(
+    conn: &mut Conn,
+    name: &crate::dependents::LaterName,
+) -> anyhow::Result<bool> {
+    for schema in &name.searched {
+        let rows = conn
+            .query_with(
+                "SELECT count(to_regclass(format('%I.%I', $1::text, $2::text)))",
+                &[pbps_db::Param::Str(schema), pbps_db::Param::Str(&name.name)],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("looking up {schema}.{} on the target: {e}", name.name))?;
+        let found = rows
+            .first()
+            .and_then(|row| row.try_get_at::<i64>(0).ok().flatten())
+            .ok_or_else(|| anyhow::anyhow!("looking up {schema}.{}: no answer", name.name))?;
+        if found == 1 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The apply's half of #314: the saved plan must still remove, before each

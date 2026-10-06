@@ -1122,8 +1122,8 @@ pub(crate) fn after_the_rebuilds(
     Ok(count + after_their_functions(cs, deps)?)
 }
 
-/// Refuses an expression that names, in a literal, a relation this plan
-/// brings into being only after it (#1576, DEC-1576.1). PostgreSQL resolves
+/// The literals in the plan's expressions that may name a relation this plan
+/// brings into being only after them (#1576, DEC-1576.1). PostgreSQL resolves
 /// `'app.ix'::regclass` when the expression is created, so a default, check,
 /// index or generation expression set before that relation's create fails
 /// the apply. The apply rolls back, but the plan was approved.
@@ -1133,13 +1133,15 @@ pub(crate) fn after_the_rebuilds(
 /// pass rows the plan writes and the checks that judge them. The approver
 /// splits the change instead, which the message says how to do.
 ///
-/// A literal counts only when the whole of it is the relation's name, as an
-/// OID-alias input reads one: optionally schema-qualified, quoted parts
-/// verbatim, unquoted ones folded to lower case. A literal that merely
-/// contains the name is no reference. One that is the name and is not cast
-/// can still be refused; the remedy then costs a second plan, where missing
-/// a reference costs a failed apply.
-pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> Result<(), String> {
+/// A literal is a candidate only when the whole of it reads as the
+/// relation's name, as an OID-alias input reads one ([`relation_literal`]),
+/// in the arrival's schema or, unqualified, in the expression's. A literal
+/// that merely contains the name is none. Each candidate is then looked up
+/// on the target ([`LaterName`]), so one that already resolves is not
+/// refused. One that is the name and is not cast can still be refused; the
+/// remedy then costs a second plan, where missing a reference costs a failed
+/// apply.
+pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> Vec<LaterName> {
     let mut arrivals: Vec<(usize, TableName)> = Vec::new();
     for (i, p) in cs.changes.iter().enumerate() {
         arrivals.extend(relations_brought(&p.change).into_iter().map(|r| (i, r)));
@@ -1151,24 +1153,52 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> R
         };
         for (whose, text) in expressions_set(&p.change) {
             for literal in dialect.lexicon().string_literals(&text) {
-                let Some(named) = relation_literal(&literal) else {
+                let Some((schema, name)) = relation_literal(&literal) else {
                     continue;
                 };
                 if let Some((_, relation)) = arrivals.iter().find(|(at, relation)| {
                     *at > i
-                        && named.1 == relation.name
-                        && named.0.as_deref().unwrap_or(scope) == relation.schema
+                        && name == relation.name
+                        && schema.as_deref().unwrap_or(scope) == relation.schema
                 }) {
-                    found.push(format!(
-                        "{whose} names {relation}, which the plan creates after it"
-                    ));
+                    // `pg_catalog` is searched ahead of the write path.
+                    let searched = match schema {
+                        Some(schema) => vec![schema],
+                        None => vec!["pg_catalog".to_owned(), scope.to_owned()],
+                    };
+                    found.push(LaterName {
+                        what: format!("{whose} names {relation}, which the plan creates after it"),
+                        searched,
+                        name,
+                    });
                 }
             }
         }
     }
-    if found.is_empty() {
+    found
+}
+
+/// A literal [`names_a_later_relation`] reads as a relation the plan creates
+/// later. Whether it is one is the target's to say: the same name may resolve
+/// to a relation that already exists, in `pg_catalog`, which is searched first,
+/// or in the expression's own schema. Only one that resolves nowhere now is
+/// refused ([`later_relation_refusal`]). Asking the engine settles every
+/// lookup rule at once, where predicting them took a review round each
+/// (#1589).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LaterName {
+    pub(crate) what: String,
+    /// The schemas the lookup searches, in order.
+    pub(crate) searched: Vec<String>,
+    pub(crate) name: String,
+}
+
+/// The refusal for the names that resolve nowhere on the target now.
+pub(crate) fn later_relation_refusal(names: &[LaterName]) -> Result<(), String> {
+    if names.is_empty() {
         return Ok(());
     }
+    let found: Vec<&str> = names.iter().map(|n| n.what.as_str()).collect();
     Err(format!(
         "an expression names a relation this plan creates later, and PostgreSQL resolves the \
          name when the expression is created:\n  {}\nDeploy the relation first: leave the \
@@ -3569,6 +3599,33 @@ mod tests {
         assert!(unaccounted(&cs, &found).is_empty());
     }
 
+    /// The check with nothing already on the target: every candidate stands.
+    fn refusal_of(cs: &ChangeSet, dialect: &dyn Dialect) -> Result<(), String> {
+        later_relation_refusal(&names_a_later_relation(cs, dialect))
+    }
+
+    /// A candidate says where the target is asked: an unqualified name in
+    /// `pg_catalog`, searched first, then the expression's schema; a
+    /// qualified one in its own schema alone (#1589).
+    #[test]
+    fn a_later_name_is_looked_up_where_the_write_path_searches() {
+        let searched = |default: &str| -> Vec<Vec<String>> {
+            names_a_later_relation(
+                &plan(vec![default_of("t", default), add_index("ix_new", None)]),
+                &*pg(),
+            )
+            .into_iter()
+            .map(|n| n.searched)
+            .collect()
+        };
+        assert_eq!(
+            searched("('ix_new'::regclass)::text"),
+            [["pg_catalog", "app"]]
+        );
+        assert_eq!(searched("('app.ix_new'::regclass)::text"), [["app"]]);
+        assert!(searched("('other.ix_new'::regclass)::text").is_empty());
+    }
+
     /// #1576: PostgreSQL resolves `'app.ix'::regclass` when the expression is
     /// created, so a default set before the index it names fails the apply.
     /// The plan is refused with the two-plan remedy; set after the index, or
@@ -3576,7 +3633,7 @@ mod tests {
     #[test]
     fn an_expression_naming_a_relation_the_plan_creates_later_is_refused() {
         let named = "('app.ix_new'::regclass)::text";
-        let refused = names_a_later_relation(
+        let refused = refusal_of(
             &plan(vec![default_of("t", named), add_index("ix_new", None)]),
             &*pg(),
         )
@@ -3594,9 +3651,7 @@ mod tests {
                 expression: "'app.ix_new'::regclass IS NOT NULL".into(),
             },
         };
-        assert!(
-            names_a_later_relation(&plan(vec![check, add_index("ix_new", None)]), &*pg()).is_err()
-        );
+        assert!(refusal_of(&plan(vec![check, add_index("ix_new", None)]), &*pg()).is_err());
         // Negative: the index first, a name the plan does not create, a
         // literal that only contains the name, another schema, and a name in
         // a comment.
@@ -3610,7 +3665,7 @@ mod tests {
             ("to_regclass('app.ixÄ')::text", "ixä"),
         ] {
             assert_eq!(
-                names_a_later_relation(
+                refusal_of(
                     &plan(vec![default_of("t", default), add_index(created, None)]),
                     &*pg()
                 ),
@@ -3619,7 +3674,7 @@ mod tests {
             );
         }
         assert_eq!(
-            names_a_later_relation(
+            refusal_of(
                 &plan(vec![add_index("ix_new", None), default_of("t", named)]),
                 &*pg()
             ),
@@ -3629,7 +3684,7 @@ mod tests {
         // whole write path: an index of that name elsewhere is no reference.
         let unqualified = "('ix_new'::regclass)::text";
         assert!(
-            names_a_later_relation(
+            refusal_of(
                 &plan(vec![
                     default_of("t", unqualified),
                     add_index("ix_new", None)
@@ -3643,12 +3698,12 @@ mod tests {
             *table = TableName::new("other", "u");
         }
         assert_eq!(
-            names_a_later_relation(&plan(vec![default_of("t", unqualified), elsewhere]), &*pg()),
+            refusal_of(&plan(vec![default_of("t", unqualified), elsewhere]), &*pg()),
             Ok(())
         );
         // The same non-ASCII letter the plan creates is a reference.
         assert!(
-            names_a_later_relation(
+            refusal_of(
                 &plan(vec![
                     default_of("t", "to_regclass('app.ixÄ')::text"),
                     add_index("ixÄ", None)
