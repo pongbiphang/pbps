@@ -41,11 +41,12 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 31;
+pub const SCHEMA_VERSION: u32 = 32;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
 // 31: a connected plan's `resolver_assessment` (issue #1515).
+// 32: a partition's own `checks:` and `indexes:` under `partitions:` (issue #1577).
 // 26: index, key and unique-constraint `storage_parameters` (issue #1442).
 // 25: a table's `storage_parameters:` (issue #1441).
 // 24: a table's `replica_identity:` (issue #1444).
@@ -764,6 +765,64 @@ mod tests {
                 defs[name]["additionalProperties"],
                 serde_json::json!(false),
                 "{name} must refuse unknown fields: {v}"
+            );
+        }
+    }
+
+    /// The declaration schema and the loader agree on a `partitions:` entry
+    /// (#1577): `from:` and `to:` both, or `default: true` alone, beside what a
+    /// partition has of its own. Optional fields alone blessed `{}`.
+    #[test]
+    fn declaration_schema_and_loader_agree_on_a_partition_entry() {
+        let document = schema(SchemaKind::Declaration);
+        let validator = jsonschema::validator_for(&document).unwrap();
+        for (entry, valid) in [
+            (serde_json::json!("default"), true),
+            (
+                serde_json::json!({"from": ["MINVALUE"], "to": ["2025-01-01"]}),
+                true,
+            ),
+            (
+                serde_json::json!({"from": [1], "to": [2], "default": false,
+                    "checks": {"c": "ts > 0"},
+                    "indexes": {"i": {"columns": ["ts"]}}}),
+                true,
+            ),
+            (serde_json::json!({"default": true}), true),
+            (
+                serde_json::json!({"default": true, "from": null, "indexes": {"i": {"columns": ["ts"]}}}),
+                true,
+            ),
+            (serde_json::json!({}), false),
+            (serde_json::json!({"from": [1]}), false),
+            (serde_json::json!({"to": [1]}), false),
+            (serde_json::json!({"from": null, "to": [1]}), false),
+            (serde_json::json!({"default": false}), false),
+            (serde_json::json!({"checks": {"c": "ts > 0"}}), false),
+            (
+                serde_json::json!({"default": true, "from": [1], "to": [2]}),
+                false,
+            ),
+            (serde_json::json!({"default": true, "to": [2]}), false),
+            (
+                serde_json::json!({"from": [1], "to": [2], "default": true}),
+                false,
+            ),
+            (serde_json::json!({"default": true, "columns": {}}), false),
+        ] {
+            let table = serde_json::json!({
+                "table": "app.ev",
+                "columns": {"ts": {"type": "int", "nullable": false}},
+                "partition_by": ["ts"],
+                "partitions": {"p": entry},
+            });
+            assert_eq!(validator.is_valid(&table), valid, "schema: {entry}");
+            // JSON is YAML: the same document, read by the loader.
+            assert_eq!(
+                pbps_load::load_table_str(std::path::Path::new("t.yml"), &table.to_string())
+                    .is_ok(),
+                valid,
+                "loader: {entry}"
             );
         }
     }

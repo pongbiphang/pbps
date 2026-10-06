@@ -174,9 +174,9 @@ fn generation_problems(column: &str, declared: &pbps_model::Column) -> Vec<Diale
 /// What a RANGE-partitioned parent and its partitions must be (#1170,
 /// DEC-1170.1): a key over declared columns, which every key and UNIQUE
 /// constraint includes (the engine refuses one that does not); a partition
-/// that declares nothing of its own, since it inherits all of it and the
-/// first slice holds no partition-level extra (#1532); and no `data:` on
-/// either, whose rows the engine routes by bound.
+/// that declares nothing of its own but checks and indexes (#1577), since it
+/// inherits the rest and the other partition-level extras are not held yet
+/// (#1532); and no `data:` on either, whose rows the engine routes by bound.
 fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
     let invalid = |message: String| DialectError::Invalid {
         dialect: crate::types::DIALECT,
@@ -227,14 +227,14 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
             }
         }
     }
+    // A partition's own checks and indexes are its to declare (#1577); its
+    // columns and keys are its parent's, and the rest is not held yet (#1532).
     if table.partition_of.is_some() {
         let own = !table.columns.is_empty()
             || !table.computed.is_empty()
             || table.primary_key.is_some()
             || !table.unique.is_empty()
             || !table.foreign_keys.is_empty()
-            || !table.checks.is_empty()
-            || !table.indexes.is_empty()
             || table.clustered.is_some()
             || table.replica_identity.is_some()
             || !table.storage_parameters.is_empty()
@@ -243,8 +243,8 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
             || table.partition_by.is_some();
         if own {
             found.push(invalid(
-                "a partition declares nothing of its own: its columns, keys and indexes are \
-                 its parent's"
+                "a partition declares only its own checks and indexes: its columns and keys \
+                 are its parent's, and the rest is not held yet"
                     .to_owned(),
             ));
         }
@@ -667,6 +667,61 @@ impl Dialect for Postgres {
         quote(ident)
     }
 
+    /// A partition's own checks and indexes, held to its parent's columns as
+    /// a table's are to its own (#1577): the same structure, method and class
+    /// rules, over the columns the partition has without declaring them.
+    ///
+    /// And an own check is not named as one of the parent's checks or foreign
+    /// keys, whose clones on the partition keep the parent's names: measured on
+    /// 16 and 18, `ADD CONSTRAINT` under one of them is `constraint … already
+    /// exists`. The names the engine chooses for the other clones (an index's,
+    /// a key's, and on 18 a NOT NULL's) are the engine's to choose and are not
+    /// guessed at here; one an own name takes is refused the same way, and the
+    /// transaction with it (DEC-1577.1).
+    fn validate_partition(
+        &self,
+        _name: &TableName,
+        partition: &Table,
+        parent: &Table,
+    ) -> Vec<DialectError> {
+        // The parent's columns as names and types only: what the parent
+        // declares of them is its own validation's to report, once.
+        let columns = parent
+            .columns
+            .iter()
+            .map(|(name, column)| {
+                let column = pbps_model::Column {
+                    collation: None,
+                    ..column.clone()
+                };
+                (name.clone(), column)
+            })
+            .collect();
+        let mut found = validate::table_structure(&Table {
+            columns,
+            checks: partition.checks.clone(),
+            indexes: partition.indexes.clone(),
+            ..Table::default()
+        });
+        for name in partition.checks.keys() {
+            let kind = if parent.checks.contains_key(name) {
+                "check"
+            } else if parent.foreign_keys.contains_key(name) {
+                "foreign key"
+            } else {
+                continue;
+            };
+            found.push(DialectError::Invalid {
+                dialect: crate::types::DIALECT,
+                message: format!(
+                    "check `{name}` is named as its parent's {kind}, which the partition already \
+                     has under that name; name it otherwise"
+                ),
+            });
+        }
+        found
+    }
+
     /// Every column's type, through the catalogue.
     ///
     /// A `serial` is refused **by name** here rather than by the same message
@@ -678,7 +733,11 @@ impl Dialect for Postgres {
     /// unspellable columns should need one pass, not three.
     fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError> {
         let mut found = Vec::new();
-        found.extend(validate::table_structure(table));
+        // A partition's columns are its parent's, which it does not declare:
+        // its checks and indexes are held to them by `validate_partition`.
+        if table.partition_of.is_none() {
+            found.extend(validate::table_structure(table));
+        }
         // SQL Server's computed columns (#1174). PostgreSQL's are generated
         // columns, which declare their type (DEC-1168.1).
         for computed in table.computed.keys() {
@@ -1366,17 +1425,132 @@ mod tests {
             "x".into(),
             pbps_model::Column::new("integer".parse().unwrap()),
         );
-        cases.push(("declares nothing of its own", own));
+        cases.push(("declares only its own checks and indexes", own));
         let mut nested = partition.clone();
         nested.partition_by = Some(pbps_model::PartitionBy {
             columns: vec!["x".into()],
         });
-        cases.push(("declares nothing of its own", nested));
+        cases.push(("declares only its own checks and indexes", nested));
+        // Negative: its own checks and indexes are a partition's to declare.
+        let mut extras = partition.clone();
+        extras.checks.insert(
+            "p_ck".into(),
+            pbps_model::CheckConstraint {
+                expression: "id > 0".into(),
+            },
+        );
+        extras.indexes.insert(
+            "p_ix".into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Column("id".into()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            },
+        );
+        assert!(problems(&extras).is_empty(), "{:?}", problems(&extras));
         for (expected, table) in cases {
             let found = problems(&table);
             assert!(
                 found.iter().any(|p| p.contains(expected)),
                 "{expected}: {found:?}"
+            );
+        }
+    }
+
+    /// A partition's own checks and indexes are held to the columns it has
+    /// from its parent, by the rules a table's are (#1577); and an own check
+    /// takes no name the parent's checks and foreign keys give their clones,
+    /// which the engine refuses as already existing, measured on 16 and 18.
+    #[test]
+    fn a_partitions_own_checks_and_indexes_answer_to_its_parents_columns() {
+        use pbps_dialect::Dialect;
+        let mut parent = partitioned(&["id", "ts"], &["ts"]);
+        parent.checks.insert(
+            "ev_ck".into(),
+            pbps_model::CheckConstraint {
+                expression: "id > 0".into(),
+            },
+        );
+        parent.foreign_keys.insert(
+            "ev_fk".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["id".into()],
+                references_table: "app.r".parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        let index = |column: &str| pbps_model::Index {
+            columns: vec![pbps_model::IndexColumn {
+                key: pbps_model::IndexKey::Column(column.into()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
+        let check = |expression: &str| pbps_model::CheckConstraint {
+            expression: expression.into(),
+        };
+        let found = |partition: &pbps_model::Table| -> Vec<String> {
+            super::Postgres::default()
+                .validate_partition(&"app.p1".parse().unwrap(), partition, &parent)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        let mut ok = pbps_model::Table::default();
+        ok.checks.insert("p1_ck".into(), check("ts > 0"));
+        ok.indexes.insert("p1_id".into(), index("id"));
+        assert!(found(&ok).is_empty(), "{:?}", found(&ok));
+        // What the parent declares of its columns is the parent's to answer
+        // for, once: not again under each partition.
+        let mut collated = parent.clone();
+        collated.columns.get_mut("id").unwrap().collation = Some(pbps_model::Collation::new("C"));
+        assert!(
+            super::Postgres::default()
+                .validate_partition(&"app.p1".parse().unwrap(), &ok, &collated)
+                .is_empty()
+        );
+        // Negative: a column the parent does not have, by name.
+        let mut missing = ok.clone();
+        missing.indexes.insert("p1_x".into(), index("x"));
+        let got = found(&missing);
+        assert!(
+            got.iter()
+                .any(|p| p.contains("index `p1_x` references `x`, which is not a column")),
+            "{got:?}"
+        );
+        // Negative: an empty check is refused as a table's is.
+        let mut empty = ok.clone();
+        empty.checks.insert("p1_empty".into(), check("  "));
+        assert!(
+            found(&empty)
+                .iter()
+                .any(|p| p.contains("`p1_empty` has an empty expression")),
+            "{:?}",
+            found(&empty)
+        );
+        // Negative: the names the parent's clones keep.
+        for (name, kind) in [("ev_ck", "check"), ("ev_fk", "foreign key")] {
+            let mut taken = ok.clone();
+            taken.checks.insert(name.into(), check("ts > 1"));
+            let got = found(&taken);
+            assert!(
+                got.iter()
+                    .any(|p| p.contains(&format!("check `{name}` is named as its parent's {kind}"))),
+                "{got:?}"
             );
         }
     }

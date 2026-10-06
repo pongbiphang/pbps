@@ -344,62 +344,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
         .map(|(k, expression)| (k, CheckConstraint { expression }))
         .collect();
 
-    let mut indexes = std::collections::BTreeMap::new();
-    for (k, ix) in dto.indexes {
-        let mut cols = Vec::with_capacity(ix.columns.len() + ix.keys.len());
-        let mut ok = true;
-        // One list or the other (DEC-1169.2): two would leave the order of
-        // their keys unsaid, and the order is the index.
-        if !ix.columns.is_empty() && !ix.keys.is_empty() {
-            errs.push(LoadError::semantic(
-                src,
-                to_span(&ix.keys[0].defined),
-                format!("index `{k}` names its keys under both `columns:` and `keys:`"),
-                "one list or the other",
-            ));
-            ok = false;
-        }
-        for c in &ix.columns {
-            match parse_index_column(src, c) {
-                Ok(v) => cols.push(v),
-                Err(e) => {
-                    errs.push(e);
-                    ok = false;
-                }
-            }
-        }
-        for c in &ix.keys {
-            match parse_index_key(src, c) {
-                Ok(v) => cols.push(v),
-                Err(e) => {
-                    errs.push(e);
-                    ok = false;
-                }
-            }
-        }
-        let method = ix.method;
-        let storage_parameters = storage_parameters_of(
-            src,
-            &ix.storage_parameters,
-            &|n, v| pbps_model::storage::canonical_index(method, n, v),
-            "a B-tree index takes `fillfactor` and `deduplicate_items`, a GIN index \
-             `fastupdate` and `gin_pending_list_limit`",
-            &mut errs,
-        );
-        if ok {
-            indexes.insert(
-                k,
-                Index {
-                    columns: cols,
-                    include: ix.include,
-                    unique: ix.unique,
-                    filter: ix.filter,
-                    method,
-                    storage_parameters,
-                },
-            );
-        }
-    }
+    let indexes = convert_indexes(src, dto.indexes, &mut errs);
 
     let data = match dto.data {
         Some(d) => match convert_data(src, d) {
@@ -506,9 +451,9 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                 crate::dto::BoundValueDto::Text(t) => pbps_model::BoundDatum::declared(&t),
                 crate::dto::BoundValueDto::Int(i) => pbps_model::BoundDatum::Value(i.to_string()),
             };
-            let bound = match partition {
+            let (bound, own) = match partition {
                 crate::dto::PartitionDto::Default(word) if word.eq_ignore_ascii_case("default") => {
-                    pbps_model::PartitionBound::Default
+                    (pbps_model::PartitionBound::Default, Table::default())
                 }
                 crate::dto::PartitionDto::Default(word) => {
                     errs.push(LoadError::semantic(
@@ -522,10 +467,44 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                     ));
                     continue;
                 }
-                crate::dto::PartitionDto::Range(r) => pbps_model::PartitionBound::Range {
-                    from: r.from.into_iter().map(datum).collect(),
-                    to: r.to.into_iter().map(datum).collect(),
-                },
+                crate::dto::PartitionDto::Entry(e) => {
+                    let bound = match (e.default, e.from, e.to) {
+                        (false, Some(from), Some(to)) => pbps_model::PartitionBound::Range {
+                            from: from.into_iter().map(datum).collect(),
+                            to: to.into_iter().map(datum).collect(),
+                        },
+                        (true, None, None) => pbps_model::PartitionBound::Default,
+                        (default, ..) => {
+                            errs.push(LoadError::semantic(
+                                src,
+                                to_span(&dto.table.defined),
+                                if default {
+                                    format!(
+                                        "partition `{child}` is `default: true` and also has \
+                                         `from:` or `to:`"
+                                    )
+                                } else {
+                                    format!(
+                                        "partition `{child}` needs both `from:` and `to:`, or \
+                                         `default: true`"
+                                    )
+                                },
+                                "not a partition bound",
+                            ));
+                            continue;
+                        }
+                    };
+                    let own = Table {
+                        checks: e
+                            .checks
+                            .into_iter()
+                            .map(|(k, expression)| (k, CheckConstraint { expression }))
+                            .collect(),
+                        indexes: convert_indexes(src, e.indexes, &mut errs),
+                        ..Default::default()
+                    };
+                    (bound, own)
+                }
             };
             partitions.push((
                 child_name,
@@ -534,7 +513,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                         parent: parent.clone(),
                         bound,
                     }),
-                    ..Default::default()
+                    ..own
                 },
             ));
         }
@@ -707,6 +686,72 @@ fn parse_reference(
         columns.push(c.to_owned());
     }
     Ok((table, columns))
+}
+
+/// A table's or a partition's `indexes:` (#1577), each error pushed to `errs`
+/// and its index left out.
+fn convert_indexes(
+    src: &SourceFile,
+    dtos: std::collections::BTreeMap<String, crate::dto::IndexDto>,
+    errs: &mut Vec<LoadError>,
+) -> std::collections::BTreeMap<String, Index> {
+    let mut indexes = std::collections::BTreeMap::new();
+    for (k, ix) in dtos {
+        let mut cols = Vec::with_capacity(ix.columns.len() + ix.keys.len());
+        let mut ok = true;
+        // One list or the other (DEC-1169.2): two would leave the order of
+        // their keys unsaid, and the order is the index.
+        if !ix.columns.is_empty() && !ix.keys.is_empty() {
+            errs.push(LoadError::semantic(
+                src,
+                to_span(&ix.keys[0].defined),
+                format!("index `{k}` names its keys under both `columns:` and `keys:`"),
+                "one list or the other",
+            ));
+            ok = false;
+        }
+        for c in &ix.columns {
+            match parse_index_column(src, c) {
+                Ok(v) => cols.push(v),
+                Err(e) => {
+                    errs.push(e);
+                    ok = false;
+                }
+            }
+        }
+        for c in &ix.keys {
+            match parse_index_key(src, c) {
+                Ok(v) => cols.push(v),
+                Err(e) => {
+                    errs.push(e);
+                    ok = false;
+                }
+            }
+        }
+        let method = ix.method;
+        let storage_parameters = storage_parameters_of(
+            src,
+            &ix.storage_parameters,
+            &|n, v| pbps_model::storage::canonical_index(method, n, v),
+            "a B-tree index takes `fillfactor` and `deduplicate_items`, a GIN index \
+             `fastupdate` and `gin_pending_list_limit`",
+            errs,
+        );
+        if ok {
+            indexes.insert(
+                k,
+                Index {
+                    columns: cols,
+                    include: ix.include,
+                    unique: ix.unique,
+                    filter: ix.filter,
+                    method,
+                    storage_parameters,
+                },
+            );
+        }
+    }
+    indexes
 }
 
 /// `created_at`, `created_at desc`, `body jsonb_path_ops`, or all three

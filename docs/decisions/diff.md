@@ -2306,7 +2306,8 @@ Measured on 18.6 and 16.15:
   `partition_of: {parent, bound}` and nothing else. It therefore has a uid of
   its own, which #1171 needs to follow a detach or a drop, and occupancy,
   scope and drift treat it as the table it is. Validation refuses a partition
-  that declares anything, a grant included (#1532 relaxes that).
+  that declares anything, a grant included (#1532 relaxes that; its own checks
+  and indexes since DEC-1577.1).
 - A bound value is the engine's own text, unquoted. The connected spelling
   check asks the engine for each declared value's reading as its key column's
   type, under the pinned session, and refuses a different one with the
@@ -2585,3 +2586,79 @@ block. Its second refuses a name held by a sequence and one held by another
 partition's index clone, each naming its holder and changing nothing; it fails
 without the claim check. Also pinned by the unit
 `a_detach_renames_what_it_keeps_around_one_batch`.
+
+<a id="dec-1577-1"></a>
+
+**DEC-1577.1. A partition declares its own checks and indexes under its entry
+in the parent's file, and the reader reads them as its own by catalog
+parentage; the parent's clones stay the parent's (#1577).**
+
+Leon chose the slice on #1532: read back and create, with the declaration in
+the parent's file. Changing them on a standing partition stays refused by name
+until #1581.
+
+Measured on 16.15 and 18.6:
+
+- An own CHECK added to a partition is `conislocal` with `coninhcount = 0` and
+  `conparentid = 0`. The clone of the parent's is not local and has
+  `coninhcount = 1`. One written `CREATE TABLE … PARTITION OF … (CONSTRAINT ck
+  CHECK (…))` under a parent check's name, with its expression, is merged into
+  the inherited one with a notice and ends `conislocal = f`. One added with
+  `ALTER TABLE … ADD CONSTRAINT` under that name is refused, `constraint "ck"
+  for relation "p1" already exists`.
+- An own index has no `pg_inherits` row; a clone of the parent's has one. A
+  unique own index is allowed.
+- Clones keep the parent's names for a CHECK and a foreign key (and, on 18, a
+  NOT NULL row). The engine chooses names for the clones of an index and of a
+  key (`p1_v_idx`, `p1_pkey`). An own index under a name a clone took is
+  `relation "p1_v_idx" already exists`.
+
+**The shape.** A `partitions:` entry stays `{from, to}` or `default` while the
+partition has nothing of its own. Once it has, the entry is a block: `from:` and
+`to:`, or `default: true`, then `checks:` and `indexes:` written as a table's.
+The schema states the bound as one alternative or the other, as the loader
+takes it, so an editor does not bless `{}`.
+
+**What is read.** The tree predicate admits a CHECK that is local and
+inherited from nowhere, and any index; an own key, unique constraint, foreign
+key, exclusion constraint or NOT NULL row still leaves the tree out. The
+partition then takes its CHECK rows that are not inherited, and its indexes
+that are neither attached nor behind a constraint. A clone is never told apart
+by name.
+
+**What is created.** After `CREATE TABLE … PARTITION OF`, each own check by
+`ALTER TABLE … ADD CONSTRAINT` and each own index by `CREATE INDEX`, as for a
+new table. Not in the `CREATE`: a check written there under a parent check's
+name would be merged without a word, where the `ALTER` refuses it.
+
+**What is validated.** A partition declares no columns, so its own items are
+held to its parent's by `Dialect::validate_partition`, with the rules a table's
+are held to. A check named as one of the parent's checks or foreign keys is
+refused offline, since its clone keeps that name. The names the engine chooses
+for the other clones are the engine's to choose and are not guessed. An own
+name one of them took fails the apply on the engine's `already exists`, and the
+transaction with it; the remedy is another name. A pull whose partition fails
+validation leaves the whole tree out, since a tree is read whole or not at all.
+
+**Plan version 28.** An older build reads a created partition's `checks` and
+`indexes`, which `Table` always had, and emits the partition without them, so
+a saved plan carrying them is version 28 and refused by an older build.
+
+**A detach keeps them.** DEC-1544.1's shape check matches the partition's own
+checks and indexes by name and definition before the parent's by definition.
+An own one declared under another name, or changed, is a change the detach
+does not make, and is refused by name.
+
+Pinned on 16 and 18 by the live `range_partition_trees_round_trip_whole_or_not_at_all`
+(own check and index, a unique own index on the DEFAULT partition, rebuilt from
+the declaration; an own unique constraint still leaves its tree out; it fails
+without the predicate change), `a_partition_is_detached_and_kept_under_its_declared_names`
+and the CLI's `a_partition_tree_round_trips_through_the_cli` (which fails
+without the validation wiring). Also by the units
+`a_partition_reads_its_own_checks_and_indexes_and_no_clone`,
+`a_partitions_own_checks_and_indexes_answer_to_its_parents_columns`,
+`a_partitions_own_checks_and_indexes_are_its_own_through_a_detach`,
+`a_partition_whose_own_index_is_refused_takes_its_tree_out`,
+`a_partitions_own_checks_and_indexes_round_trip_under_its_entry`,
+`a_partition_entry_is_one_bound_and_only_what_a_partition_owns` and
+`declaration_schema_and_loader_agree_on_a_partition_entry`.

@@ -199,74 +199,7 @@ pub fn render_partitioned(
         }
     }
 
-    if !table.checks.is_empty() {
-        s.push_str("\nchecks:\n");
-        for (n, c) in &table.checks {
-            let _ = writeln!(s, "  {}: {}", scalar(n), scalar(&c.expression));
-        }
-    }
-
-    if !table.indexes.is_empty() {
-        s.push_str("\nindexes:\n");
-        for (n, ix) in &table.indexes {
-            let _ = writeln!(s, "  {}:", scalar(n));
-            if !ix.method.is_btree() {
-                let _ = writeln!(s, "    method: {}", ix.method.as_str());
-            }
-            if !ix.storage_parameters.is_empty() {
-                let _ = writeln!(
-                    s,
-                    "    storage_parameters: {}",
-                    flow(&ix.storage_parameters)
-                );
-            }
-            // `columns:` while every key is a column, as every index was
-            // written before expressions; `keys:`, one mapping each, once any
-            // is an expression (DEC-1169.2).
-            if ix.columns.iter().all(|c| c.key.column().is_some()) {
-                let cols: Vec<String> = ix
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        let mut spelled = c.key.text().to_owned();
-                        if let Some(class) = &c.opclass {
-                            spelled = format!("{spelled} {class}");
-                        }
-                        if c.descending {
-                            spelled.push_str(" desc");
-                        }
-                        spelled
-                    })
-                    .collect();
-                let _ = writeln!(s, "    columns: {}", seq(&cols));
-            } else {
-                s.push_str("    keys:\n");
-                for c in &ix.columns {
-                    let (field, text) = match &c.key {
-                        pbps_model::IndexKey::Column(name) => ("column", name),
-                        pbps_model::IndexKey::Expression(text) => ("expression", text),
-                    };
-                    let _ = write!(s, "      - {field}: {}", scalar(text));
-                    if let Some(class) = &c.opclass {
-                        let _ = write!(s, "\n        opclass: {}", scalar(class));
-                    }
-                    if c.descending {
-                        s.push_str("\n        order: desc");
-                    }
-                    s.push('\n');
-                }
-            }
-            if !ix.include.is_empty() {
-                let _ = writeln!(s, "    include: {}", seq(&ix.include));
-            }
-            if ix.unique {
-                s.push_str("    unique: true\n");
-            }
-            if let Some(f) = &ix.filter {
-                let _ = writeln!(s, "    where: {}", scalar(f));
-            }
-        }
-    }
+    render_checks_and_indexes(&mut s, table, "", "\n");
 
     // After the indexes it may name, and on one line: a layout is a single
     // choice, not a block.
@@ -309,23 +242,40 @@ pub fn render_partitioned(
                 } else {
                     child.to_string()
                 };
-                let bound = match t.partition_of.as_ref().map(|p| &p.bound) {
-                    Some(pbps_model::PartitionBound::Range { from, to }) => {
-                        let list = |d: &[pbps_model::BoundDatum]| {
-                            d.iter()
-                                .map(|v| match v {
-                                    pbps_model::BoundDatum::Value(text) => bound_value(text),
-                                    end @ (pbps_model::BoundDatum::MinValue
-                                    | pbps_model::BoundDatum::MaxValue) => end.to_string(),
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        };
-                        format!("{{from: [{}], to: [{}]}}", list(from), list(to))
-                    }
-                    Some(pbps_model::PartitionBound::Default) | None => "default".to_owned(),
+                let list = |d: &[pbps_model::BoundDatum]| {
+                    d.iter()
+                        .map(|v| match v {
+                            pbps_model::BoundDatum::Value(text) => bound_value(text),
+                            end @ (pbps_model::BoundDatum::MinValue
+                            | pbps_model::BoundDatum::MaxValue) => end.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 };
-                let _ = writeln!(s, "  {}: {bound}", scalar(&label));
+                let bound = t.partition_of.as_ref().map(|p| &p.bound);
+                // On one line while the partition is its bound alone; a block
+                // once it has checks or indexes of its own (#1577).
+                if t.checks.is_empty() && t.indexes.is_empty() {
+                    let bound = match bound {
+                        Some(pbps_model::PartitionBound::Range { from, to }) => {
+                            format!("{{from: [{}], to: [{}]}}", list(from), list(to))
+                        }
+                        Some(pbps_model::PartitionBound::Default) | None => "default".to_owned(),
+                    };
+                    let _ = writeln!(s, "  {}: {bound}", scalar(&label));
+                } else {
+                    let _ = writeln!(s, "  {}:", scalar(&label));
+                    match bound {
+                        Some(pbps_model::PartitionBound::Range { from, to }) => {
+                            let _ =
+                                writeln!(s, "    from: [{}]\n    to: [{}]", list(from), list(to));
+                        }
+                        Some(pbps_model::PartitionBound::Default) | None => {
+                            s.push_str("    default: true\n");
+                        }
+                    }
+                    render_checks_and_indexes(&mut s, t, "    ", "");
+                }
             }
         }
     }
@@ -574,6 +524,81 @@ fn needs_quotes(s: &str) -> bool {
         s.chars().next(),
         Some('-' | '?' | '&' | '*' | '!' | '|' | '>' | '%' | '@' | '`')
     )
+}
+
+/// A table's `checks:` and `indexes:`, each line under `pad`: the top level
+/// of a table's file, or a partition's entry under its parent's `partitions:`
+/// (#1577). `lead` goes before each section's first line, the blank line
+/// between top-level sections.
+fn render_checks_and_indexes(s: &mut String, table: &Table, pad: &str, lead: &str) {
+    if !table.checks.is_empty() {
+        let _ = writeln!(s, "{lead}{pad}checks:");
+        for (n, c) in &table.checks {
+            let _ = writeln!(s, "{pad}  {}: {}", scalar(n), scalar(&c.expression));
+        }
+    }
+
+    if !table.indexes.is_empty() {
+        let _ = writeln!(s, "{lead}{pad}indexes:");
+        for (n, ix) in &table.indexes {
+            let _ = writeln!(s, "{pad}  {}:", scalar(n));
+            if !ix.method.is_btree() {
+                let _ = writeln!(s, "{pad}    method: {}", ix.method.as_str());
+            }
+            if !ix.storage_parameters.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "{pad}    storage_parameters: {}",
+                    flow(&ix.storage_parameters)
+                );
+            }
+            // `columns:` while every key is a column, as every index was
+            // written before expressions; `keys:`, one mapping each, once any
+            // is an expression (DEC-1169.2).
+            if ix.columns.iter().all(|c| c.key.column().is_some()) {
+                let cols: Vec<String> = ix
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        let mut spelled = c.key.text().to_owned();
+                        if let Some(class) = &c.opclass {
+                            spelled = format!("{spelled} {class}");
+                        }
+                        if c.descending {
+                            spelled.push_str(" desc");
+                        }
+                        spelled
+                    })
+                    .collect();
+                let _ = writeln!(s, "{pad}    columns: {}", seq(&cols));
+            } else {
+                let _ = writeln!(s, "{pad}    keys:");
+                for c in &ix.columns {
+                    let (field, text) = match &c.key {
+                        pbps_model::IndexKey::Column(name) => ("column", name),
+                        pbps_model::IndexKey::Expression(text) => ("expression", text),
+                    };
+                    let _ = write!(s, "{pad}      - {field}: {}", scalar(text));
+                    if let Some(class) = &c.opclass {
+                        let _ = write!(s, "\n{pad}        opclass: {}", scalar(class));
+                    }
+                    if c.descending {
+                        let _ = write!(s, "\n{pad}        order: desc");
+                    }
+                    s.push('\n');
+                }
+            }
+            if !ix.include.is_empty() {
+                let _ = writeln!(s, "{pad}    include: {}", seq(&ix.include));
+            }
+            if ix.unique {
+                let _ = writeln!(s, "{pad}    unique: true");
+            }
+            if let Some(f) = &ix.filter {
+                let _ = writeln!(s, "{pad}    where: {}", scalar(f));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1134,6 +1159,83 @@ indexes:
                 crate::load_table_str(Path::new("t.yml"), &yaml).is_err(),
                 "{block} should not load"
             );
+        }
+    }
+
+    /// A partition's own checks and indexes are written under its entry, which
+    /// becomes a block beside its bound, and read back as its own: the range
+    /// and the DEFAULT partition alike (#1577). The parent's stay the parent's.
+    #[test]
+    fn a_partitions_own_checks_and_indexes_round_trip_under_its_entry() {
+        let yaml = "table: app.ev\ncolumns:\n  id: {type: int, nullable: false}\n  ts: {type: date, nullable: false}\n  v: {type: int}\n\nchecks:\n  ev_ck: v > 0\n\nindexes:\n  ev_v:\n    columns: [v]\n\npartition_by: [ts]\n\npartitions:\n  ev_old:\n    from: [MINVALUE]\n    to: [\"2025-01-01\"]\n    checks:\n      old_ck: v < 100\n    indexes:\n      old_v:\n        columns: [v desc]\n        where: v > 1\n  ev_plain: {from: [\"2025-01-01\"], to: [MAXVALUE]}\n  ev_rest:\n    default: true\n    indexes:\n      rest_id:\n        columns: [id]\n        unique: true\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        let own = |n: &str| {
+            &t.partitions
+                .iter()
+                .find(|(name, _)| name.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+                .1
+        };
+        assert_eq!(own("ev_old").checks.keys().collect::<Vec<_>>(), ["old_ck"]);
+        assert_eq!(own("ev_old").indexes.keys().collect::<Vec<_>>(), ["old_v"]);
+        assert!(own("ev_plain").checks.is_empty() && own("ev_plain").indexes.is_empty());
+        assert_eq!(
+            own("ev_rest").partition_of.as_ref().map(|p| &p.bound),
+            Some(&pbps_model::PartitionBound::Default)
+        );
+        assert!(own("ev_rest").indexes["rest_id"].unique);
+        // The parent's stay on the parent.
+        assert_eq!(t.table.checks.keys().collect::<Vec<_>>(), ["ev_ck"]);
+        assert_eq!(t.table.indexes.keys().collect::<Vec<_>>(), ["ev_v"]);
+        // A partition with nothing of its own stays on one line.
+        let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
+        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None);
+        assert!(
+            out.contains("\n  ev_plain: {from: [\"2025-01-01\"], to: [MAXVALUE]}\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\n  ev_rest:\n    default: true\n    indexes:\n      rest_id:\n"),
+            "{out}"
+        );
+    }
+
+    /// Negative: an entry is one bound, `from:` and `to:` both or `default:
+    /// true` alone, and nothing a partition cannot have of its own.
+    #[test]
+    fn a_partition_entry_is_one_bound_and_only_what_a_partition_owns() {
+        let parent = "table: app.ev\ncolumns:\n  ts: {type: date, nullable: false}\npartition_by: [ts]\npartitions:\n";
+        for (entry, expected) in [
+            (
+                "  p: {from: [\"2025-01-01\"]}\n",
+                "needs both `from:` and `to:`",
+            ),
+            ("  p: {to: [MAXVALUE]}\n", "needs both `from:` and `to:`"),
+            (
+                "  p: {checks: {c: ts > '2000-01-01'}}\n",
+                "needs both `from:` and `to:`",
+            ),
+            ("  p: {default: false}\n", "needs both `from:` and `to:`"),
+            (
+                "  p: {default: true, from: [MINVALUE], to: [MAXVALUE]}\n",
+                "is `default: true` and also has",
+            ),
+            (
+                "  p: {default: true, columns: {x: {type: int}}}\n",
+                "unknown field",
+            ),
+            (
+                "  p: {from: [MINVALUE], to: [MAXVALUE], unique: {u: [ts]}}\n",
+                "unknown field",
+            ),
+        ] {
+            let yaml = format!("{parent}{entry}");
+            let err = crate::load_table_str(Path::new("t.yml"), &yaml)
+                .err()
+                .unwrap_or_else(|| panic!("{entry} loaded"));
+            let text = format!("{err:?}");
+            assert!(text.contains(expected), "{entry}: {text}");
         }
     }
 

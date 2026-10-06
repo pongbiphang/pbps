@@ -182,9 +182,12 @@ fn tables_query() -> String {
 /// 18: a table `ATTACH`ed as a partition keeps its own column order and has
 /// none of the parent's defaults, which `PARTITION OF` would give it, so
 /// `attislocal` alone does not say so. Every constraint a clone
-/// (`conparentid`, the keys and foreign keys) or inherited and not local (a
-/// CHECK, and on 18 a NOT NULL row); every index attached to one of the
-/// parent's. Anything else in any partition leaves the whole tree out, named.
+/// (`conparentid`, the keys and foreign keys), inherited and not local (a
+/// CHECK, and on 18 a NOT NULL row), or a CHECK of its own, local and
+/// inherited from nowhere (#1577). An index is a clone of the parent's or the
+/// partition's own (#1577); one backing a constraint of its own is left out
+/// with that constraint. Anything else in any partition leaves the whole tree
+/// out, named.
 fn partition_tree(root: &str) -> String {
     let columns = |rel: &str| {
         format!(
@@ -248,12 +251,9 @@ fn partition_tree(root: &str) -> String {
                                     SELECT 1 FROM pg_catalog.pg_constraint k
                                      WHERE k.conrelid = ch.oid
                                        AND k.conparentid = 0
-                                       AND NOT (k.contype IN ('c', 'n') AND NOT k.conislocal))
-                                  AND NOT EXISTS (
-                                    SELECT 1 FROM pg_catalog.pg_index i
-                                     WHERE i.indrelid = ch.oid
-                                       AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits ih
-                                                        WHERE ih.inhrelid = i.indexrelid)))))"
+                                       AND NOT (k.contype IN ('c', 'n') AND NOT k.conislocal)
+                                       AND NOT (k.contype = 'c' AND k.conislocal
+                                                AND k.coninhcount = 0)))))"
     )
 }
 
@@ -701,6 +701,7 @@ fn constraints_query() -> String {
             COALESCE((to_jsonb(con)->>'conenforced')::boolean, true) AS enforced,
             COALESCE((to_jsonb(con)->>'conperiod')::boolean, false) AS period,
             con.connoinherit AS no_inherit,
+            NOT con.conislocal OR con.coninhcount > 0 AS inherited,
             EXISTS (SELECT 1 FROM pg_catalog.pg_trigger tg
                      WHERE tg.tgconstraint = con.oid AND tg.tgenabled <> 'O')
               AS triggers_not_ordinary
@@ -760,6 +761,8 @@ fn indexes_query() -> String {
             replace(i.indoption::text, ' ', ',') AS options,
             pg_catalog.pg_get_expr(i.indpred, i.indrelid) AS filter,
             i.indexprs IS NOT NULL AS has_expressions,
+            EXISTS (SELECT 1 FROM pg_catalog.pg_inherits h WHERE h.inhrelid = i.indexrelid)
+              AS attached,
             am.amname AS method,
             COALESCE(ic.reloptions, '{{}}'::text[]) AS reloptions,
             (SELECT COALESCE(pg_catalog.json_agg(
@@ -1249,6 +1252,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             period: flag(row, "period")?,
             no_inherit: flag(row, "no_inherit")?,
             triggers_not_ordinary: flag(row, "triggers_not_ordinary")?,
+            inherited: flag(row, "inherited")?,
         });
     }
     for row in batch.get("indexes").ok_or_else(|| missing("indexes"))? {
@@ -1270,6 +1274,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             key_classes: strings(row, "key_classes")?,
             key_texts: strings(row, "key_texts")?,
             nondefault_collation: flag(row, "nondefault_collation")?,
+            attached: flag(row, "attached")?,
             reloptions: strings(row, "reloptions")?,
         });
     }
@@ -3026,7 +3031,7 @@ mod tests {
             "expression": null, "match_type": " ",
             "delete_set_columns": null, "index_oid": 0,
             "enforced": true, "period": false, "no_inherit": false,
-            "triggers_not_ordinary": false,
+            "triggers_not_ordinary": false, "inherited": false,
         });
         if let Some(def) = definition {
             row["definition"] = match def {

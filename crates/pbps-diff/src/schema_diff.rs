@@ -486,7 +486,12 @@ fn diff_partial_rebuilding(
                 // table renamed in the same plan is declared under the new
                 // name, as `diff_constraints` reads it below.
                 .and_then(|parent| {
-                    detached_names(&renames.apply(parent, &of.parent), declared_table, dialect)
+                    detached_names(
+                        &renames.apply(parent, &of.parent),
+                        base_table,
+                        declared_table,
+                        dialect,
+                    )
                 }) {
                 Ok(names) => changes.push(Change::DetachPartition {
                     uid: uid.clone(),
@@ -2086,15 +2091,42 @@ fn refuse_temporal_changes(
 /// What each of `parent`'s keys, constraints and indexes is called on the
 /// partition declared as `declared` once detached, or what keeps the
 /// declaration from being the shape a detach gives it: the parent's columns
-/// in order, and every key, constraint and index matched one to one by
-/// definition, its name aside (#1544, DEC-1544.1).
+/// in order, every key, constraint and index matched one to one by
+/// definition, its name aside (#1544, DEC-1544.1), and the checks and indexes
+/// `partition` has of its own, which a detach leaves as they are, under their
+/// own names (#1577).
 fn detached_names(
     parent: &Table,
+    partition: &Table,
     declared: &Table,
     dialect: &dyn Dialect,
 ) -> Result<Vec<DetachedName>, Vec<String>> {
     let mut names = Vec::new();
     let mut what = Vec::new();
+    // Its own are matched by name before the parent's by definition: a
+    // detach renames only what it gave the partition, so an own check or
+    // index declared under another name, or changed, is a change this plan
+    // does not make (#1581).
+    let mut declared = declared.clone();
+    for (name, own) in &partition.checks {
+        if declared.checks.get(name) == Some(own) {
+            declared.checks.remove(name);
+        } else {
+            what.push(format!(
+                "its own check `{name}` is not declared as it stands"
+            ));
+        }
+    }
+    for (name, own) in &partition.indexes {
+        if declared.indexes.get(name) == Some(own) {
+            declared.indexes.remove(name);
+        } else {
+            what.push(format!(
+                "its own index `{name}` is not declared as it stands"
+            ));
+        }
+    }
+    let declared = &declared;
     // Types in the engine's spelling, as `diff_columns` compares them: the
     // parent's base reads `integer` back where its file says `int`. A
     // description is prose `diff` does not compare, and a connected base
@@ -5587,6 +5619,183 @@ mod tests {
                 .any(|e| matches!(e, DiffError::PartitionedTableChange { .. })),
             "{errors:?}"
         );
+    }
+
+    /// A partition's own checks and indexes (#1577) are created with it, are
+    /// refused by name as any change to a standing partition is (#1581), and
+    /// stay under their own names through a detach, which renames only the
+    /// parent's clones: an own one declared otherwise is a change the detach
+    /// does not make, and is refused by name.
+    #[test]
+    fn a_partitions_own_checks_and_indexes_are_its_own_through_a_detach() {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+        let index = |column: &str| Index {
+            columns: vec![pbps_model::IndexColumn {
+                key: pbps_model::IndexKey::Column(column.to_owned()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
+        let check = |expression: &str| pbps_model::CheckConstraint {
+            expression: expression.into(),
+        };
+        let mut parent = table(&[
+            ("ts", Column::new(ty("date")).not_null()),
+            ("n", Column::new(ty("int"))),
+        ]);
+        parent.indexes.insert("ev_n".into(), index("n"));
+        parent.partition_by = Some(PartitionBy {
+            columns: vec!["ts".into()],
+        });
+        let mut own = Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: PartitionBound::Default,
+            }),
+            ..Default::default()
+        };
+        own.checks.insert("p_ck".into(), check("n < 10"));
+        own.indexes.insert("p_ts".into(), index("ts"));
+        let p: TableName = "app.p".parse().unwrap();
+        let mut tree = schema_of("app.ev", parent.clone());
+        tree.tables.insert(p.clone(), own.clone());
+        let outcome = |base: &Schema, declared: &Schema| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+        };
+        let said = |errors: Vec<DiffError>| -> Vec<String> {
+            errors.iter().map(ToString::to_string).collect()
+        };
+
+        // Created with its own, in the one change that creates it.
+        let created = outcome(&Schema::default(), &tree).expect("a tree is created");
+        let made = created
+            .changes
+            .iter()
+            .find_map(|c| match &c.change {
+                Change::CreateTable { name, table, .. } if *name == p => Some(table),
+                _ => None,
+            })
+            .expect("the partition is created");
+        assert_eq!(**made, own);
+        assert!(
+            !created.changes.iter().any(|c| matches!(
+                c.change,
+                Change::AddCheck { .. } | Change::AddIndex { .. }
+            ) && c.change.table() == Some(&p)),
+            "{:?}",
+            created.changes
+        );
+
+        // An own one added, dropped or changed on a standing partition is
+        // refused by name (#1581).
+        for (edit, expected) in [
+            (
+                &(|t: &mut Table| {
+                    t.indexes.insert("p_n".into(), index("n"));
+                }) as &dyn Fn(&mut Table),
+                "would add index",
+            ),
+            (
+                &|t: &mut Table| {
+                    t.checks.clear();
+                },
+                "would drop check",
+            ),
+            (
+                &|t: &mut Table| {
+                    t.indexes.insert("p_ts".into(), index("n"));
+                },
+                "index",
+            ),
+        ] {
+            let mut declared = tree.clone();
+            edit(declared.tables.get_mut(&p).unwrap());
+            let errors = said(outcome(&tree, &declared).expect_err("refused"));
+            assert!(
+                errors.iter().any(
+                    |e| e.starts_with("app.p is a partitioned table or a partition")
+                        && e.contains(expected)
+                ),
+                "{errors:?}"
+            );
+        }
+
+        // Detached: the parent's index renamed to the declared name, its own
+        // left alone under theirs.
+        let shape = |f: &dyn Fn(&mut Table)| {
+            let mut t = Table {
+                partition_by: None,
+                ..parent.clone()
+            };
+            let clone = t.indexes.remove("ev_n").unwrap();
+            t.indexes.insert("arch_n".into(), clone);
+            t.checks.insert("p_ck".into(), check("n < 10"));
+            t.indexes.insert("p_ts".into(), index("ts"));
+            f(&mut t);
+            let mut declared = tree.clone();
+            declared.tables.insert(p.clone(), t);
+            declared
+        };
+        let planned = outcome(&tree, &shape(&|_| {})).expect("a detach");
+        let [planned] = planned.changes.as_slice() else {
+            panic!("{:?}", planned.changes)
+        };
+        let Change::DetachPartition { names, .. } = &planned.change else {
+            panic!("{planned:?}")
+        };
+        let pairs: Vec<(&str, Option<&str>)> = names
+            .iter()
+            .map(|n| (n.parent.as_str(), n.name.as_deref()))
+            .collect();
+        assert_eq!(pairs, [("ev_n", Some("arch_n"))]);
+
+        // Negative: an own one gone, renamed or changed in the declaration.
+        for (edit, expected) in [
+            (
+                &(|t: &mut Table| {
+                    t.indexes.remove("p_ts");
+                }) as &dyn Fn(&mut Table),
+                "its own index `p_ts` is not declared as it stands",
+            ),
+            (
+                &|t: &mut Table| {
+                    let i = t.indexes.remove("p_ts").unwrap();
+                    t.indexes.insert("p_ts2".into(), i);
+                },
+                "its own index `p_ts` is not declared as it stands",
+            ),
+            (
+                &|t: &mut Table| {
+                    t.checks.insert("p_ck".into(), check("n < 11"));
+                },
+                "its own check `p_ck` is not declared as it stands",
+            ),
+        ] {
+            let errors = said(outcome(&tree, &shape(edit)).expect_err(expected));
+            assert!(errors.iter().any(|e| e.contains(expected)), "{errors:?}");
+        }
     }
 
     /// A table with `system_time` is created whole, and every change to it

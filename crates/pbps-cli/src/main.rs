@@ -1635,6 +1635,17 @@ pub(crate) fn declaration_problems(
         for e in dialect.validate_table(name, table) {
             out.push(("dialect.rejected", format!("{name}: {e}")));
         }
+        // A partition's own checks and indexes, against the columns it has
+        // from its parent (#1577). A missing parent is `check_partitions`'s.
+        if let Some(parent) = table
+            .partition_of
+            .as_ref()
+            .and_then(|of| schema.tables.get(&of.parent))
+        {
+            for e in dialect.validate_partition(name, table, parent) {
+                out.push(("dialect.rejected", format!("{name}: {e}")));
+            }
+        }
     }
     for (name, module) in &schema.modules {
         for e in dialect.validate_module(name, module) {
