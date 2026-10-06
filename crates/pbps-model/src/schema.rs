@@ -134,6 +134,26 @@ impl Schema {
 }
 
 impl Table {
+    /// The columns whose `pg_attrdef` row this declaration holds an
+    /// expression for: a column's default or generation expression, and a
+    /// partition's own default on its parent's column (#1578). One list, so
+    /// that every inventory of binding surfaces sees the same rows; a
+    /// partition declares no column, and an inventory reading `columns`
+    /// alone read its own defaults as nothing there.
+    pub fn expression_columns(&self) -> impl Iterator<Item = &str> {
+        self.columns
+            .iter()
+            .filter(|(_, c)| c.default.is_some() || c.generated.is_some())
+            .map(|(name, _)| name.as_str())
+            .chain(
+                self.partition_of
+                    .iter()
+                    .flat_map(|of| &of.columns)
+                    .filter(|(_, own)| own.default.is_some())
+                    .map(|(name, _)| name.as_str()),
+            )
+    }
+
     /// Reused declared names across this table's constraint kinds.
     ///
     /// Separate maps cannot enforce this shared rule. Indexes are excluded:
@@ -1827,5 +1847,52 @@ mod tests {
     fn empty_collections_are_omitted() {
         let json = serde_json::to_string(&Table::default()).unwrap();
         assert_eq!(json, r#"{"columns":{}}"#);
+    }
+
+    /// Every `pg_attrdef` row a declaration holds an expression for: a
+    /// column's default and generation expression, and a partition's own
+    /// default, which is no column of the partition's (#1578 review). A
+    /// column with neither, and a partition's own NOT NULL alone, hold none.
+    #[test]
+    fn expression_columns_include_a_partitions_own_defaults() {
+        let mut table = Table::default();
+        let mut d = Column::new("int".parse().unwrap());
+        d.default = Some("0".into());
+        table.columns.insert("d".into(), d);
+        let mut g = Column::new("int".parse().unwrap());
+        g.generated = Some(Generated {
+            expression: "d * 2".into(),
+            stored: true,
+        });
+        table.columns.insert("g".into(), g);
+        table
+            .columns
+            .insert("plain".into(), Column::new("int".parse().unwrap()));
+        assert_eq!(table.expression_columns().collect::<Vec<_>>(), ["d", "g"]);
+        let partition = Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.t".parse().unwrap(),
+                bound: PartitionBound::Default,
+                columns: [
+                    (
+                        "d".to_owned(),
+                        PartitionColumn {
+                            default: Some("1".into()),
+                            not_null: false,
+                        },
+                    ),
+                    (
+                        "plain".to_owned(),
+                        PartitionColumn {
+                            default: None,
+                            not_null: true,
+                        },
+                    ),
+                ]
+                .into(),
+            }),
+            ..Table::default()
+        };
+        assert_eq!(partition.expression_columns().collect::<Vec<_>>(), ["d"]);
     }
 }

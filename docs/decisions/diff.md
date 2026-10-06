@@ -2761,6 +2761,16 @@ nothing. No new field, so the record's shape is unchanged.
 table's columns with the parent's as the partition holds them: its own default
 and NOT NULL applied.
 
+**The resolver.** A partition's own default is a `pg_attrdef` binding
+surface, as a column's default is. `Table::expression_columns` lists both, and
+every inventory of binding surfaces reads it: the assessment's, the
+qualified catalog's required set, the ordering graph's, the evidence's, and
+the owner transitions'. Read from `columns` alone, a partition, which has
+none, held nothing, and a plan whose only bound expression was a partition's
+own default was assessed as needing no resolver. Capturing that row on
+scratch is #1587. Until then a resolver run that needs it is refused, since
+the qualified catalog has no record of the surface.
+
 **Verification.** A created partition's own defaults and NOT NULLs are
 verified as a column's are: NOT NULL exactly, a default by presence.
 
