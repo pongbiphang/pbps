@@ -12713,6 +12713,77 @@ mod tests {
         }
     }
 
+    /// A created partition's persistence and storage parameters answer for
+    /// themselves, as a table's do, from the first read that finds it
+    /// (#1580, SPEC 7.6): set in the `CREATE`, either changed by another
+    /// session is movement.
+    #[test]
+    fn a_created_partitions_persistence_and_storage_answer_for_themselves() {
+        use pbps_model::{Change, PartitionOf, PlannedChange, Table};
+        let name = TableName::new("app", "p");
+        let created = Table {
+            partition_of: Some(PartitionOf {
+                parent: TableName::new("app", "ev"),
+                bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            unlogged: true,
+            storage_parameters: [("fillfactor".to_owned(), "70".to_owned())].into(),
+            ..Table::default()
+        };
+        let changes = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(created.clone()),
+            })],
+        };
+        let read = |edit: &dyn Fn(&mut Table)| {
+            let mut t = created.clone();
+            edit(&mut t);
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        for settled in [Settled::Whole, Settled::SoFar] {
+            let check = |after: &Schema| {
+                refuse_unplanned_movement(
+                    &pbps_pg::Postgres::new(),
+                    &changes,
+                    &Schema::default(),
+                    after,
+                    "test",
+                    settled,
+                )
+            };
+            check(&read(&|_| {})).expect("as this plan creates it");
+            for (what, edit, expected) in [
+                (
+                    "logged",
+                    &(|t: &mut Table| t.unlogged = false) as &dyn Fn(&mut Table),
+                    "is not unlogged",
+                ),
+                (
+                    "reset",
+                    &|t: &mut Table| t.storage_parameters.clear(),
+                    "storage parameters are not",
+                ),
+                (
+                    "changed",
+                    &|t: &mut Table| {
+                        t.storage_parameters
+                            .insert("fillfactor".into(), "80".into());
+                    },
+                    "storage parameters are not",
+                ),
+            ] {
+                let e = check(&read(edit)).expect_err(what).to_string();
+                assert!(e.contains(expected), "{what}: {e}");
+            }
+        }
+    }
+
     /// An index split out of a created table's payload (#1027) answers for
     /// its whole structure, not only its name: another session's same-named
     /// index of another shape is movement, at every read (#1056 review).

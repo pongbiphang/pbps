@@ -6480,7 +6480,8 @@ fn an_array_column_widens_through_the_cli() {
 /// own column default and NOT NULL go with it too, and a changed default is
 /// refused by name (#1578). A grant on it and one on its parent are each
 /// their own, created by the bootstrap, and granted and revoked on the
-/// standing partition as on any table (#1579).
+/// standing partition as on any table (#1579). Its persistence and storage
+/// parameters go with it, and a change to either is refused by name (#1580).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_partition_tree_round_trips_through_the_cli() {
@@ -6514,7 +6515,9 @@ fn a_partition_tree_round_trips_through_the_cli() {
          CREATE INDEX ev_2025_id ON app.ev_2025 (id); \
          CREATE TABLE app.ev_rest PARTITION OF app.ev DEFAULT; \
          ALTER TABLE app.ev_rest ALTER COLUMN note SET DEFAULT 'rest', \
-             ALTER COLUMN note SET NOT NULL",
+             ALTER COLUMN note SET NOT NULL; \
+         ALTER TABLE app.ev_rest SET UNLOGGED; \
+         ALTER TABLE app.ev_rest SET (fillfactor = 70)",
     );
     // A grant on the parent and one on a partition, each its own (#1579).
     on_server(
@@ -6535,7 +6538,8 @@ fn a_partition_tree_round_trips_through_the_cli() {
              to: [\"2026-01-01\"]\n    checks:\n      ev_2025_id_ck: "
         ) && text.contains(
             "\n    indexes:\n      ev_2025_id:\n        columns: [id]\n  ev_rest:\n    default: \
-             true\n    columns:\n      note: {default: \"'rest'::text\", nullable: false}\n"
+             true\n    columns:\n      note: {default: \"'rest'::text\", nullable: false}\n    \
+             unlogged: true\n    storage_parameters:\n      fillfactor: 70\n"
         ),
         "{text}"
     );
@@ -6571,6 +6575,20 @@ fn a_partition_tree_round_trips_through_the_cli() {
     // Measured: the parent's grant does not reach direct access to a
     // partition, so none was made there.
     assert_eq!(privilege("app.ev_rest", "SELECT"), 0);
+    // Its own persistence and storage parameters, and none on the other
+    // partition (#1580).
+    let stored = |table: &str| {
+        scalar(
+            &tgt,
+            &format!(
+                "SELECT (CASE relpersistence WHEN 'u' THEN 10 ELSE 0 END \
+                         + CASE WHEN reloptions = '{{fillfactor=70}}' THEN 1 ELSE 0 END)::int8 \
+                   FROM pg_class WHERE oid = '{table}'::regclass"
+            ),
+        )
+    };
+    assert_eq!(stored("app.ev_rest"), 11);
+    assert_eq!(stored("app.ev_2025"), 0);
     // The readiness check finds the grants it recorded, the parent's
     // included (#1579 review).
     let o = d.run(&["doctor", "--db", &tgt]);
@@ -6622,6 +6640,30 @@ fn a_partition_tree_round_trips_through_the_cli() {
         "{}",
         stderr(&o)
     );
+    std::fs::write(&path, &text).unwrap();
+    d.commit();
+
+    // Its persistence or storage parameters changed on the standing
+    // partition, refused by name until #1581 (#1580).
+    for (from, to, expected) in [
+        ("    unlogged: true\n", "", "set table persistence"),
+        (
+            "      fillfactor: 70\n",
+            "      fillfactor: 80\n",
+            "set storage parameters",
+        ),
+    ] {
+        std::fs::write(&path, text.replace(from, to)).unwrap();
+        d.commit();
+        let o = d.run(&["plan", "--db", &tgt]);
+        assert_ne!(code(&o), 0, "{}", stdout(&o));
+        assert!(
+            stderr(&o).contains("app.ev_rest is a partitioned table or a partition")
+                && stderr(&o).contains(expected),
+            "{}",
+            stderr(&o)
+        );
+    }
     std::fs::write(&path, &text).unwrap();
     d.commit();
 

@@ -3144,9 +3144,18 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
             pg,
             name,
             &format!(
-                "CREATE TABLE {q} PARTITION OF {} {} USING heap;",
+                "CREATE {}TABLE {q} PARTITION OF {} {} USING heap{};",
+                // Its persistence and storage parameters are its own, in the
+                // `CREATE` as a table's are (#1580): measured on 16 and 18,
+                // the parent has neither to give it.
+                if table.unlogged { "UNLOGGED " } else { "" },
                 qualified(&of.parent)?,
-                bound_clause(&of.bound)
+                bound_clause(&of.bound),
+                if table.storage_parameters.is_empty() {
+                    String::new()
+                } else {
+                    format!(" WITH ({})", storage_list(&table.storage_parameters)?)
+                }
             ),
         )?];
         // Its own defaults and NOT NULLs (#1578), one statement: measured on
@@ -4329,6 +4338,22 @@ mod tests {
         assert!(
             create("app.ev_rest", &default)[0]
                 .contains("PARTITION OF \"app\".\"ev\" DEFAULT USING heap;")
+        );
+        // Its persistence and storage parameters, in the `CREATE` (#1580).
+        let mut stored = default.clone();
+        stored.unlogged = true;
+        stored.storage_parameters = [
+            ("fillfactor".to_owned(), "70".to_owned()),
+            ("autovacuum_enabled".to_owned(), "false".to_owned()),
+        ]
+        .into();
+        let sql = create("app.ev_rest", &stored);
+        assert!(
+            sql[0].contains(
+                "CREATE UNLOGGED TABLE \"app\".\"ev_rest\" PARTITION OF \"app\".\"ev\" \
+                 DEFAULT USING heap WITH (autovacuum_enabled = 'false', fillfactor = '70');"
+            ),
+            "{sql:?}"
         );
         // Negative: an ordinary table keeps `USING heap` and no key.
         parent.partition_by = None;

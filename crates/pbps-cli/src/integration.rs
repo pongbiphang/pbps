@@ -41,7 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 33;
+pub const SCHEMA_VERSION: u32 = 34;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).

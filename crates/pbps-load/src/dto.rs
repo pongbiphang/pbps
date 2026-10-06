@@ -643,6 +643,15 @@ pub struct PartitionEntryDto {
     /// parent's.
     #[serde(default)]
     pub columns: BTreeMap<String, PartitionColumnDto>,
+    /// The partition's own persistence, as a table's (#1580): the parent
+    /// has none to give it.
+    #[serde(default)]
+    pub unlogged: bool,
+    /// The partition's own heap storage parameters, as a table's (#1580):
+    /// the parent takes none.
+    #[serde(default)]
+    #[schemars(with = "BTreeMap<String, StorageValueDto>")]
+    pub storage_parameters: BTreeMap<String, Spanned<StorageValueDto>>,
 }
 
 /// One of a partition's columns, where it is not as its parent's (#1578):

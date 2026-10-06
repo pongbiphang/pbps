@@ -505,6 +505,17 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                             .map(|(k, expression)| (k, CheckConstraint { expression }))
                             .collect(),
                         indexes: convert_indexes(src, e.indexes, &mut errs),
+                        // Its own, as a table's, spelled by the same rule
+                        // (#1580).
+                        storage_parameters: storage_parameters_of(
+                            src,
+                            &e.storage_parameters,
+                            &|n, v| pbps_model::storage::canonical(n, v),
+                            "a PostgreSQL heap storage parameter such as `fillfactor: 70` or \
+                             `autovacuum_enabled: false`; `toast.*` parameters are not declared",
+                            &mut errs,
+                        ),
+                        unlogged: e.unlogged,
                         ..Default::default()
                     };
                     let mut columns = std::collections::BTreeMap::new();

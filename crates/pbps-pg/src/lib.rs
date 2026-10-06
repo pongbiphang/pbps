@@ -227,8 +227,9 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
             }
         }
     }
-    // A partition's own checks and indexes are its to declare (#1577); its
-    // columns and keys are its parent's, and the rest is not held yet (#1532).
+    // A partition's own checks and indexes are its to declare (#1577), and
+    // its persistence and storage parameters (#1580); its columns and keys
+    // are its parent's, and the rest is not held yet (#1532).
     if table.partition_of.is_some() {
         let own = !table.columns.is_empty()
             || !table.computed.is_empty()
@@ -237,14 +238,13 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
             || !table.foreign_keys.is_empty()
             || table.clustered.is_some()
             || table.replica_identity.is_some()
-            || !table.storage_parameters.is_empty()
-            || table.unlogged
             || table.system_time.is_some()
             || table.partition_by.is_some();
         if own {
             found.push(invalid(
-                "a partition declares only its own checks and indexes: its columns and keys \
-                 are its parent's, and the rest is not held yet"
+                "a partition declares only its own checks, indexes, `unlogged` and \
+                 `storage_parameters`: its columns and keys are its parent's, and the rest is \
+                 not held yet"
                     .to_owned(),
             ));
         }
@@ -769,6 +769,7 @@ impl Dialect for Postgres {
             columns,
             checks: partition.checks.clone(),
             indexes: partition.indexes.clone(),
+            storage_parameters: partition.storage_parameters.clone(),
             ..Table::default()
         });
         for name in partition.checks.keys() {
@@ -1454,8 +1455,8 @@ mod tests {
 
     /// A partitioned parent and its partitions hold what the reader reads
     /// back and nothing more (#1170): a key over declared columns that every
-    /// key includes, a partition that declares nothing, and no `data:` or
-    /// setting the reader would leave the tree out over.
+    /// key includes, a partition that declares only what is its own, and no
+    /// `data:` or setting the reader would leave the tree out over.
     #[test]
     fn a_partition_tree_declares_only_what_is_read_back() {
         let mut ok = partitioned(&["id", "ts"], &["ts"]);
@@ -1498,12 +1499,12 @@ mod tests {
             "x".into(),
             pbps_model::Column::new("integer".parse().unwrap()),
         );
-        cases.push(("declares only its own checks and indexes", own));
+        cases.push(("declares only its own checks, indexes", own));
         let mut nested = partition.clone();
         nested.partition_by = Some(pbps_model::PartitionBy {
             columns: vec!["x".into()],
         });
-        cases.push(("declares only its own checks and indexes", nested));
+        cases.push(("declares only its own checks, indexes", nested));
         // Negative: its own checks and indexes are a partition's to declare.
         let mut extras = partition.clone();
         extras.checks.insert(
@@ -1527,6 +1528,11 @@ mod tests {
                 storage_parameters: Default::default(),
             },
         );
+        // And its persistence and storage parameters (#1580).
+        extras.unlogged = true;
+        extras
+            .storage_parameters
+            .insert("fillfactor".into(), "70".into());
         assert!(problems(&extras).is_empty(), "{:?}", problems(&extras));
         for (expected, table) in cases {
             let found = problems(&table);
@@ -1707,6 +1713,22 @@ mod tests {
                 .any(|p| p.contains("index `p1_x` references `x`, which is not a column")),
             "{got:?}"
         );
+        // Its storage parameters are held as a table's (#1580): one the
+        // engine spells otherwise, or does not have, is refused.
+        let mut stored = ok.clone();
+        stored
+            .storage_parameters
+            .insert("fillfactor".into(), "70".into());
+        assert!(found(&stored).is_empty(), "{:?}", found(&stored));
+        for (value, name, expected) in [
+            ("0070", "fillfactor", "spelled `56`"),
+            ("1", "bogus", "`bogus`"),
+        ] {
+            let mut wrong = ok.clone();
+            wrong.storage_parameters.insert(name.into(), value.into());
+            let got = found(&wrong);
+            assert!(got.iter().any(|p| p.contains(expected)), "{got:?}");
+        }
         // Negative: an empty check is refused as a table's is.
         let mut empty = ok.clone();
         empty.checks.insert("p1_empty".into(), check("  "));
