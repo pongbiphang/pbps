@@ -2307,7 +2307,8 @@ Measured on 18.6 and 16.15:
   its own, which #1171 needs to follow a detach or a drop, and occupancy,
   scope and drift treat it as the table it is. Validation refuses a partition
   that declares anything, a grant included (#1532 relaxes that; its own checks
-  and indexes since DEC-1577.1, its grants since DEC-1579.1).
+  and indexes since DEC-1577.1, its grants since DEC-1579.1, its persistence
+  and storage parameters since DEC-1580.1).
 - A bound value is the engine's own text, unquoted. The connected spelling
   check asks the engine for each declared value's reading as its key column's
   type, under the pinned session, and refuses a different one with the
@@ -2851,3 +2852,63 @@ on the standing partition)
 and `partitions_are_added_and_dropped_through_the_cli` (a granted partition
 dropped). Also by the units `a_partition_needs_its_parent_and_its_key`'s
 grant case and `a_grant_on_a_relation_kind_this_model_does_not_declare_is_reported`.
+
+<a id="dec-1580-1"></a>
+
+**DEC-1580.1. A partition's persistence and storage parameters are its own,
+declared under its entry as a table's and created in its `CREATE TABLE … PARTITION OF`
+(#1580).**
+
+The last of #1532's four slices: read back and create. Changing either on a
+standing partition stays refused by name until #1581.
+
+Measured on 16.15 and 18.6:
+
+- A partition is `UNLOGGED`, and carries heap storage parameters, `toast.*`
+  among them, of its own, set in `CREATE … PARTITION OF … USING heap WITH (…)`
+  or by `ALTER TABLE` after; the two read the same.
+- The parent gives it neither. A partitioned table refuses storage
+  parameters, and on 18 refuses `UNLOGGED`; 16 takes an `UNLOGGED` parent and
+  creates its partitions permanent all the same.
+- A table `ATTACH`ed as a partition keeps both.
+- A permanent table's foreign key to a partitioned parent with an `UNLOGGED`
+  partition is accepted, whichever is made first.
+
+**The shape.** A `partitions:` entry takes `unlogged: true` and
+`storage_parameters:`, written and spelled as a table's, after its checks and
+indexes; with either the entry is a block. `toast.*` is refused as on a table:
+a table without a TOAST relation drops it, so it could never read back.
+
+**What is read.** The tree predicate admits a partition that is `UNLOGGED` or
+has storage parameters, and reads both as the partition's, through the
+table's reader. The parent must still be permanent with none, so 16's
+`UNLOGGED` parent still leaves its tree out. A partition's TOAST parameters
+still leave the tree out, named, as they leave a table out.
+
+**What is created and checked.** Both go in the partition's `CREATE`, as a
+table's do, so the post-apply check holds them from the first read that finds
+it, as a table's. `validate_partition` holds the parameters to the table's
+spelling rules.
+
+**A detach keeps them.** DEC-1544.1's shape check compares the detached table
+with its parent's settings overlaid by the partition's own persistence and
+storage parameters. Declared otherwise, it is refused by name, since the
+detach does not change them.
+
+**Plan version 30, schema set 34.** An older build reads a created
+partition's `unlogged` and `storage_parameters`, which `Table` always had, and
+emits the partition permanent and without them. The state needs no new
+version: `Table` already carries both.
+
+Pinned on 16 and 18 by the live `range_partition_trees_round_trip_whole_or_not_at_all`
+(an `UNLOGGED` partition with two parameters read and rebuilt; a TOAST
+parameter leaves its tree out), and on 18 by the CLI's
+`a_partition_tree_round_trips_through_the_cli` (pulled under the entry,
+bootstrapped as declared, the other partition permanent with none, a change
+to either refused by name). Also by the units
+`a_partition_reads_its_own_persistence_and_storage_parameters`,
+`a_partitions_own_persistence_and_storage_round_trip_under_its_entry`,
+`a_partition_tree_is_created_parent_then_partition`,
+`a_partitions_own_checks_and_indexes_answer_to_its_parents_columns`,
+`a_partitions_own_persistence_and_storage_are_its_own_through_a_detach` and
+`a_created_partitions_persistence_and_storage_answer_for_themselves`.

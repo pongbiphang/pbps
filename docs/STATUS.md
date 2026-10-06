@@ -68,8 +68,9 @@ DEC-1177.1).
 A PostgreSQL table declares `partition_by:` and its RANGE partitions under
 `partitions:`, in its own file. `pull` reads a tree whose partitions are their
 parent's and their own checks, indexes (#1577, DEC-1577.1), column defaults
-and NOT NULLs (#1578, DEC-1578.1), and grants on the parent and on each
-partition, each its own (#1579, DEC-1579.1), and leaves any other tree out
+and NOT NULLs (#1578, DEC-1578.1), grants on the parent and on each
+partition, each its own (#1579, DEC-1579.1), and persistence and storage
+parameters (#1580, DEC-1580.1), and leaves any other tree out
 whole, by name. A
 tree is created whole, and a partition nobody declared is refused with the
 commands that adopt it (#1170, DEC-1170.1). A partition is then added under its

@@ -174,8 +174,9 @@ fn tables_query() -> String {
 /// identity, no access method of its own, no row security, rules or triggers:
 /// none of them is in the partitioned table's declaration yet.
 ///
-/// **Each partition**: attached (no detach pending), an ordinary permanent
-/// heap table, the same in all of that, with no grant on a column, which no
+/// **Each partition**: attached (no detach pending), an ordinary heap
+/// table, the same in all of that but its persistence and storage
+/// parameters, which are its own (#1580), with no grant on a column, which no
 /// table declares (a grant on the partition itself is its own, read as any
 /// table's, #1579), whose columns are inherited and its parent's in
 /// the parent's order with the parent's identities and generations. Its
@@ -214,7 +215,6 @@ fn partition_tree(root: &str) -> String {
         format!(
             "NOT {rel}.relrowsecurity AND NOT {rel}.relforcerowsecurity
              AND NOT {rel}.relhasrules AND {rel}.reloftype = 0
-             AND {rel}.relpersistence = 'p' AND {rel}.reloptions IS NULL
              AND {rel}.relreplident = 'd'
              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol
                               WHERE pol.polrelid = {rel}.oid)
@@ -222,8 +222,16 @@ fn partition_tree(root: &str) -> String {
                               WHERE tg.tgrelid = {rel}.oid AND NOT tg.tgisinternal)"
         )
     };
-    let parent_plain = plain("pc");
-    let child_plain = plain("ch");
+    // A partition's persistence and storage parameters are its own (#1580),
+    // measured on 16 and 18: neither is taken from the parent, which has no
+    // storage and refuses parameters, and 16's UNLOGGED parent gives its
+    // partitions nothing. Its TOAST table's are not held, as a table's are
+    // not, and leave the tree out below.
+    let parent_plain = format!(
+        "{} AND pc.relpersistence = 'p' AND pc.reloptions IS NULL",
+        plain("pc")
+    );
+    let child_plain = format!("{} AND ch.relpersistence IN ('p', 'u')", plain("ch"));
     let parent_columns = columns("pc.oid");
     let child_columns = columns("ch.oid");
     format!(

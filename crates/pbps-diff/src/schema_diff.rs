@@ -2108,8 +2108,14 @@ fn detached_names(
     // index declared under another name, or changed, is a change this plan
     // does not make (#1581).
     // Its columns are its parent's with what it holds of them otherwise
-    // (#1578): a detach keeps its own defaults and NOT NULLs.
+    // (#1578): a detach keeps its own defaults and NOT NULLs. Its persistence
+    // and storage parameters are its own, the parent having none (#1580),
+    // and a detach keeps them too.
     let mut parent = parent.clone();
+    parent.unlogged = partition.unlogged;
+    parent
+        .storage_parameters
+        .clone_from(&partition.storage_parameters);
     if let Some(of) = &partition.partition_of {
         for (column, own) in &of.columns {
             if let Some(c) = parent.columns.get_mut(column) {
@@ -2253,7 +2259,9 @@ fn detached_names(
         ..t.clone()
     };
     if rest(parent) != rest(declared) {
-        what.push("it declares a setting or `data:` its parent does not have".to_owned());
+        what.push(
+            "it declares a setting or `data:` that is neither its parent's nor its own".to_owned(),
+        );
     }
     if what.is_empty() {
         Ok(names)
@@ -5619,7 +5627,7 @@ mod tests {
                         rows: Default::default(),
                     });
                 }),
-                "`data:` its parent does not have",
+                "neither its parent's nor its own",
             ),
         ] {
             let errors = outcome(&declared, &[]).expect_err(expected);
@@ -5946,6 +5954,132 @@ mod tests {
             let errors = said(outcome(&tree, &shape(edit)).expect_err(expected));
             assert!(errors.iter().any(|e| e.contains(expected)), "{errors:?}");
         }
+    }
+
+    /// A partition's persistence and storage parameters (#1580) are created
+    /// with it, in the one change that creates it; changed on a standing
+    /// partition they are refused by name (#1581); and a detach keeps them,
+    /// so the table it leaves is declared with them or the plan is refused.
+    #[test]
+    fn a_partitions_own_persistence_and_storage_are_its_own_through_a_detach() {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+        let mut parent = table(&[("ts", Column::new(ty("date")).not_null())]);
+        parent.partition_by = Some(PartitionBy {
+            columns: vec!["ts".into()],
+        });
+        let own = Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            unlogged: true,
+            storage_parameters: [("fillfactor".to_owned(), "70".to_owned())].into(),
+            ..Default::default()
+        };
+        let p: TableName = "app.p".parse().unwrap();
+        let mut tree = schema_of("app.ev", parent.clone());
+        tree.tables.insert(p.clone(), own.clone());
+        let outcome = |base: &Schema, declared: &Schema| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+        };
+        let said = |errors: Vec<DiffError>| -> Vec<String> {
+            errors.iter().map(ToString::to_string).collect()
+        };
+
+        let created = outcome(&Schema::default(), &tree).expect("a tree is created");
+        let made = created
+            .changes
+            .iter()
+            .find_map(|c| match &c.change {
+                Change::CreateTable { name, table, .. } if *name == p => Some(table),
+                _ => None,
+            })
+            .expect("the partition is created");
+        assert_eq!(**made, own);
+        assert!(
+            !created.changes.iter().any(|c| matches!(
+                c.change,
+                Change::SetTablePersistence { .. } | Change::SetStorageParameters { .. }
+            )),
+            "{:?}",
+            created.changes
+        );
+
+        // Changed on a standing partition: refused by name (#1581).
+        for (edit, expected) in [
+            (
+                &(|t: &mut Table| t.unlogged = false) as &dyn Fn(&mut Table),
+                "set table persistence",
+            ),
+            (
+                &|t: &mut Table| {
+                    t.storage_parameters
+                        .insert("fillfactor".into(), "80".into());
+                },
+                "set storage parameters",
+            ),
+        ] {
+            let mut declared = tree.clone();
+            edit(declared.tables.get_mut(&p).unwrap());
+            let errors = said(outcome(&tree, &declared).expect_err("refused"));
+            assert!(
+                errors.iter().any(
+                    |e| e.starts_with("app.p is a partitioned table or a partition")
+                        && e.contains(expected)
+                ),
+                "{errors:?}"
+            );
+        }
+
+        // Detached and declared with them: the detach alone.
+        let detached = |unlogged: bool| {
+            let mut declared = tree.clone();
+            declared.tables.insert(
+                p.clone(),
+                Table {
+                    partition_by: None,
+                    unlogged,
+                    storage_parameters: own.storage_parameters.clone(),
+                    ..parent.clone()
+                },
+            );
+            declared
+        };
+        let planned = outcome(&tree, &detached(true)).expect("a detach");
+        assert!(
+            matches!(
+                planned.changes.as_slice(),
+                [c] if matches!(c.change, Change::DetachPartition { .. })
+            ),
+            "{:?}",
+            planned.changes
+        );
+        // Negative: declared permanent, which the detach does not make it.
+        let errors = said(outcome(&tree, &detached(false)).expect_err("refused"));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("app.p is detached") && e.contains("nor its own")),
+            "{errors:?}"
+        );
     }
 
     /// A table with `system_time` is created whole, and every change to it

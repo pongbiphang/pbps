@@ -3678,9 +3678,10 @@ async fn array_columns_round_trip_and_widen_their_elements() {
 /// out whole and named (#1170). A partition's own checks and indexes are read
 /// as its own and the parent's clones are not, by catalog parentage (#1577).
 /// Its own column defaults and NOT NULLs are read where they are not the
-/// parent's, and a default it dropped leaves its tree out (#1578). On 16 and
-/// 18, whose catalogs differ in NOT NULL rows and in the names of a foreign
-/// key's clones.
+/// parent's, and a default it dropped leaves its tree out (#1578). Its
+/// persistence and storage parameters are its own, and a TOAST parameter
+/// still leaves its tree out (#1580). On 16 and 18, whose catalogs differ in
+/// NOT NULL rows and in the names of a foreign key's clones.
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn range_partition_trees_round_trip_whole_or_not_at_all() {
@@ -3726,8 +3727,9 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
                  PARTITION BY RANGE (a, b);
              CREATE TABLE {s}.m_low PARTITION OF {s}.m
                  FOR VALUES FROM (MINVALUE, MINVALUE) TO (-5, 0);
-             CREATE TABLE {s}.m_mid PARTITION OF {s}.m
-                 FOR VALUES FROM (-5, 0) TO (10, MAXVALUE);
+             CREATE UNLOGGED TABLE {s}.m_mid PARTITION OF {s}.m
+                 FOR VALUES FROM (-5, 0) TO (10, MAXVALUE)
+                 WITH (fillfactor = 70, autovacuum_vacuum_scale_factor = 0.05);
              CREATE TABLE {s}.r (id integer PRIMARY KEY, ev_id integer, ev_ts date,
                  CONSTRAINT r_ev FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.ev (id, ts));
              ALTER TABLE {s}.ev_2025 ADD CONSTRAINT ev_2025_id_ck CHECK (id > 0);
@@ -3768,7 +3770,10 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
              GRANT SELECT (x) ON {s}.colgrant_1 TO PUBLIC;
              CREATE TABLE {s}.dropdef (x integer DEFAULT 1) PARTITION BY RANGE (x);
              CREATE TABLE {s}.dropdef_1 PARTITION OF {s}.dropdef FOR VALUES FROM (0) TO (10);
-             ALTER TABLE {s}.dropdef_1 ALTER COLUMN x DROP DEFAULT;"
+             ALTER TABLE {s}.dropdef_1 ALTER COLUMN x DROP DEFAULT;
+             CREATE TABLE {s}.toasty (x integer, t text) PARTITION BY RANGE (x);
+             CREATE TABLE {s}.toasty_1 PARTITION OF {s}.toasty FOR VALUES FROM (0) TO (10)
+                 WITH (toast.autovacuum_enabled = false);"
         ))
         .await
         .expect("the trees left out");
@@ -3905,13 +3910,25 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
             ),
             (
                 t(&s, "m_mid"),
-                partition(
-                    &m_name,
-                    range(
-                        vec![value("-5"), value("0")],
-                        vec![value("10"), BoundDatum::MaxValue],
-                    ),
-                ),
+                // Its own persistence and storage parameters (#1580).
+                pbps_model::Table {
+                    unlogged: true,
+                    storage_parameters: [
+                        (
+                            "autovacuum_vacuum_scale_factor".to_owned(),
+                            "0.05".to_owned(),
+                        ),
+                        ("fillfactor".to_owned(), "70".to_owned()),
+                    ]
+                    .into(),
+                    ..partition(
+                        &m_name,
+                        range(
+                            vec![value("-5"), value("0")],
+                            vec![value("10"), BoundDatum::MaxValue],
+                        ),
+                    )
+                },
             ),
         ] {
             assert_eq!(held.tables.get(&name), Some(&expected), "{name}");
@@ -3958,6 +3975,8 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
             "colgrant_1",
             "dropdef",
             "dropdef_1",
+            "toasty",
+            "toasty_1",
         ] {
             assert!(!held.tables.contains_key(&t(&s, name)), "{name} is held");
             assert!(

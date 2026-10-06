@@ -58,3 +58,4 @@ DECISIONS 465).
 - `31/` adds a connected plan's `resolver_assessment` (issue #1515).
 - `32/` adds a partition's own `checks:` and `indexes:`, and `default: true`, to a `partitions:` entry (issue #1577).
 - `33/` adds a partition's own `columns:`, each a `default:` or `nullable: false`, to a `partitions:` entry (issue #1578).
+- `34/` adds a partition's own `unlogged:` and `storage_parameters:` to a `partitions:` entry (issue #1580).

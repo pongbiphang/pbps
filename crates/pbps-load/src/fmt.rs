@@ -255,11 +255,13 @@ pub fn render_partitioned(
                 let bound = t.partition_of.as_ref().map(|p| &p.bound);
                 let own_columns = t.partition_of.as_ref().map(|p| &p.columns);
                 // On one line while the partition is its bound alone; a block
-                // once it has checks, indexes (#1577) or columns (#1578) of
-                // its own.
+                // once it has checks, indexes (#1577), columns (#1578), a
+                // persistence or storage parameters (#1580) of its own.
                 if t.checks.is_empty()
                     && t.indexes.is_empty()
                     && own_columns.is_none_or(std::collections::BTreeMap::is_empty)
+                    && !t.unlogged
+                    && t.storage_parameters.is_empty()
                 {
                     let bound = match bound {
                         Some(pbps_model::PartitionBound::Range { from, to }) => {
@@ -296,6 +298,16 @@ pub fn render_partitioned(
                         }
                     }
                     render_checks_and_indexes(&mut s, t, "    ", "");
+                    // As a table's, last (#1580).
+                    if t.unlogged {
+                        s.push_str("    unlogged: true\n");
+                    }
+                    if !t.storage_parameters.is_empty() {
+                        s.push_str("    storage_parameters:\n");
+                        for (name, value) in &t.storage_parameters {
+                            let _ = writeln!(s, "      {}: {value}", scalar(name));
+                        }
+                    }
                 }
             }
         }
@@ -1220,6 +1232,50 @@ indexes:
             out.contains("\n  ev_rest:\n    default: true\n    indexes:\n      rest_id:\n"),
             "{out}"
         );
+    }
+
+    /// A partition's persistence and storage parameters are written under
+    /// its entry, last, and read back as its own, spelled as a table's
+    /// (#1580). One with neither stays on one line.
+    #[test]
+    fn a_partitions_own_persistence_and_storage_round_trip_under_its_entry() {
+        let yaml = "table: app.ev\ncolumns:\n  ts: {type: date, nullable: false}\n\npartition_by: [ts]\n\npartitions:\n  ev_old:\n    from: [MINVALUE]\n    to: [\"2025-01-01\"]\n    unlogged: true\n    storage_parameters:\n      autovacuum_vacuum_scale_factor: 0.05\n      fillfactor: 70\n  ev_plain: {from: [\"2025-01-01\"], to: [MAXVALUE]}\n  ev_rest:\n    default: true\n    unlogged: true\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        let own = |n: &str| {
+            &t.partitions
+                .iter()
+                .find(|(name, _)| name.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+                .1
+        };
+        assert!(own("ev_old").unlogged);
+        assert_eq!(own("ev_old").storage_parameters["fillfactor"], "70");
+        assert!(own("ev_rest").unlogged && own("ev_rest").storage_parameters.is_empty());
+        // Negative: the parent and a partition with neither declare none.
+        assert!(!own("ev_plain").unlogged && own("ev_plain").storage_parameters.is_empty());
+        assert!(!t.table.unlogged && t.table.storage_parameters.is_empty());
+        let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
+        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None);
+        assert!(
+            out.contains("\n  ev_plain: {from: [\"2025-01-01\"], to: [MAXVALUE]}\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\n  ev_rest:\n    default: true\n    unlogged: true\n"),
+            "{out}"
+        );
+        // Negative: a TOAST parameter, or a value the engine would refuse,
+        // is refused as on a table.
+        for bad in ["toast.autovacuum_enabled: false", "fillfactor: '08'"] {
+            let yaml = format!(
+                "table: app.ev\ncolumns:\n  ts: {{type: date}}\n\npartition_by: [ts]\n\npartitions:\n  p:\n    default: true\n    storage_parameters:\n      {bad}\n"
+            );
+            assert!(
+                crate::load_table_str(Path::new("t.yml"), &yaml).is_err(),
+                "{bad} should not load"
+            );
+        }
     }
 
     /// A partition's own column defaults and NOT NULLs are written under its

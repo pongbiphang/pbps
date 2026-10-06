@@ -861,6 +861,12 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 }
             }
             table.columns.clear();
+            // Its persistence and storage parameters are its own, as a
+            // table's, and never its parent's, which has none (#1580).
+            let (parameters, unreadable) = storage_parameters(raw_table);
+            table.storage_parameters = parameters;
+            table.unlogged = raw_table.unlogged;
+            unread.extend(unreadable);
             for detail in unread {
                 note(&mut pulled, &name, detail);
             }
@@ -5406,6 +5412,56 @@ mod tests {
         assert_eq!(own["w"].default.as_deref(), Some("'y'::text"));
         assert!(!own["w"].not_null);
         assert!(p1.columns.is_empty(), "its columns stay its parent's");
+    }
+
+    /// A partition's persistence and storage parameters are its own, read
+    /// as a table's (#1580); one with neither declares neither, and a TOAST
+    /// parameter is named as a table's is.
+    #[test]
+    fn a_partition_reads_its_own_persistence_and_storage_parameters() {
+        let mut parent = table(1, "ev");
+        parent.partition_key = Some(vec!["k".to_owned()]);
+        let mut p1 = table(2, "p1");
+        p1.partition_of = Some((1, "FOR VALUES FROM (0) TO (10)".to_owned()));
+        p1.unlogged = true;
+        p1.reloptions = vec![
+            "fillfactor=70".to_owned(),
+            "autovacuum_enabled=false".to_owned(),
+        ];
+        let mut p2 = table(3, "p2");
+        p2.partition_of = Some((1, "DEFAULT".to_owned()));
+        let mut p3 = table(4, "p3");
+        p3.partition_of = Some((1, "FOR VALUES FROM (10) TO (20)".to_owned()));
+        p3.toast_reloptions = vec!["autovacuum_enabled=false".to_owned()];
+        let raw = RawCatalog {
+            tables: vec![parent, p1, p2, p3],
+            columns: (1..=4).map(|t| col(t, 1, "k", "integer")).collect(),
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw);
+        let get = |n: &str| &pulled.schema.tables[&TableName::new("app", n)];
+        assert!(get("p1").unlogged);
+        assert_eq!(
+            get("p1").storage_parameters,
+            [
+                ("autovacuum_enabled".to_owned(), "false".to_owned()),
+                ("fillfactor".to_owned(), "70".to_owned()),
+            ]
+            .into()
+        );
+        // Negative: the parent and a partition without either declare none.
+        for n in ["ev", "p2"] {
+            assert!(!get(n).unlogged, "{n}");
+            assert!(get(n).storage_parameters.is_empty(), "{n}");
+        }
+        assert_eq!(pulled.limitations.len(), 1, "{:?}", pulled.limitations);
+        assert!(
+            pulled.limitations[0]
+                .detail
+                .contains("toast.autovacuum_enabled"),
+            "{:?}",
+            pulled.limitations
+        );
     }
 
     /// A partition's own default that uses a sequence names the sequence, as
