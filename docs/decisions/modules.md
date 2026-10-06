@@ -1694,7 +1694,17 @@ ask (#1599 review).
   (measured on 16 and 18). The clause is read from the header at depth zero,
   past the parameter and return lists, in the engine's own lexis, the last of
   two winning and each quoted argument one schema, as the engine stores them
-  (measured on 18).
+  (measured on 18). The header is read clause by clause, each `SET` value
+  list to its end, so an entry named `begin` or `return` never starts a
+  body; a clause it cannot read leaves where the body is unknown, and every
+  literal is then read one level in.
+- **A string body's literal binds nothing.** It is only checked as the
+  routine is created, so any schema on the routine's path that holds the
+  name by then satisfies it: it is refused only when none does and one will
+  later, and the target is asked about every schema the plan does not fill
+  later. A default, a view and an atomic body bind the relation their name
+  first finds, so for them the path is walked in order and the first later
+  relation is the reference (#1599 review).
 - **Which spellings of that clause are read** (#1604). Two forms: the one
   `pg_get_functiondef` writes and `pull` therefore declares, one
   single-quoted literal per schema (`SET search_path TO 'a', 'b'`), and a
