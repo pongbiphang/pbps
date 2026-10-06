@@ -69,23 +69,34 @@ pub fn assess(
         base,
         desired,
         ordinary,
-        dialect.indexes_share_namespace_with_tables(),
+        &Engine {
+            indexes_are_relations: dialect.indexes_share_namespace_with_tables(),
+            normalize: &|definition| dialect.normalize_definition(definition),
+        },
     )
 }
 
-/// [`assess`], with the one engine fact it reads: whether an index's name is
-/// a relation's (DECISIONS 453).
+/// The engine facts the assessment reads.
+struct Engine<'a> {
+    /// Whether an index's name is a relation's (DECISIONS 453).
+    indexes_are_relations: bool,
+    /// The comparison form of a module definition, as the differ compares
+    /// one (SPEC §8.2).
+    normalize: &'a dyn Fn(&str) -> String,
+}
+
+/// [`assess`], with the engine facts it reads.
 fn assessed_with(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
     ordinary: &ChangeSet,
-    indexes_are_relations: bool,
+    engine: &Engine<'_>,
 ) -> Assessment {
     let after = surfaces(desired.schema);
     let moved = ordinary
         .changes
         .iter()
-        .any(|p| moves_bindings(&p.change, base, desired, indexes_are_relations));
+        .any(|p| moves_bindings(&p.change, base, desired, engine));
     let mut questions = BTreeMap::new();
     for surface in surfaces(base.schema) {
         let kept = forward(&surface, base.ids, desired.ids);
@@ -96,7 +107,7 @@ fn assessed_with(
             || ordinary
                 .changes
                 .iter()
-                .any(|p| recreates(&p.change, &surface, &kept, base, desired))
+                .any(|p| recreates(&p.change, &surface, &kept, base, desired, engine))
         {
             Answer::Rebuild
         } else if moved {
@@ -138,22 +149,31 @@ fn recreates(
     kept: &Surface,
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
+    engine: &Engine<'_>,
 ) -> bool {
     if let (Change::AlterModule { id, .. }, Surface::Module(m)) = (change, kept) {
-        return id == m && declared_differently(id, base, desired);
+        return id == m && declared_differently(id, base, desired, engine);
     }
     // A change names a surface by whichever spelling it acts under; a kept
     // surface has one of each only across a rename.
     invalidates(change, surface) || invalidates(change, kept)
 }
 
+/// Whether the declaration of a module differs, as the differ decides it:
+/// after the dialect's normalization. A layout-only edit is no change there,
+/// so the rebuild an arrival makes of that module is still the candidate
+/// one, a question for the engine (#1526 review).
 fn declared_differently(
     id: &pbps_model::ModuleId,
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
+    engine: &Engine<'_>,
 ) -> bool {
     match (base.schema.modules.get(id), desired.schema.modules.get(id)) {
-        (Some(was), Some(now)) => was.kind != now.kind || was.definition != now.definition,
+        (Some(was), Some(now)) => {
+            was.kind != now.kind
+                || (engine.normalize)(&was.definition) != (engine.normalize)(&now.definition)
+        }
         _ => true,
     }
 }
@@ -166,7 +186,7 @@ fn moves_bindings(
     change: &Change,
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
-    indexes_are_relations: bool,
+    engine: &Engine<'_>,
 ) -> bool {
     match change {
         // Relations, their row types and their columns.
@@ -196,8 +216,8 @@ fn moves_bindings(
         | Change::AddUnique { .. }
         | Change::DropUnique { .. }
         | Change::AddIndex { .. }
-        | Change::DropIndex { .. } => indexes_are_relations,
-        Change::AlterModule { id, .. } => declared_differently(id, base, desired),
+        | Change::DropIndex { .. } => engine.indexes_are_relations,
+        Change::AlterModule { id, .. } => declared_differently(id, base, desired, engine),
         // A schema the creating role may not use is skipped by the lookup.
         Change::Grant { target, .. } | Change::Revoke { target, .. } => {
             matches!(target, GrantTarget::Schema(_))
@@ -232,7 +252,7 @@ fn moves_bindings(
 #[allow(clippy::wildcard_enum_match_arm)]
 mod tests {
     use super::*;
-    use pbps_dialect::MinimalDialect;
+    use pbps_dialect::{Dialect as _, MinimalDialect};
     use pbps_model::{
         CheckConstraint, Column, Hints, IdsFile, Module, ModuleKind, Permission, PlannedChange,
         Schema, Table,
@@ -300,6 +320,17 @@ mod tests {
         assess(base, desired, &ordinary, &MinimalDialect)
     }
 
+    fn minimal(definition: &str) -> String {
+        MinimalDialect.normalize_definition(definition)
+    }
+
+    fn engine(indexes_are_relations: bool) -> Engine<'static> {
+        Engine {
+            indexes_are_relations,
+            normalize: &minimal,
+        }
+    }
+
     /// The changes on an engine whose index names are relation names.
     fn with(base: &Schema, changes: Vec<Change>) -> Assessment {
         with_indexes(base, changes, true)
@@ -318,7 +349,7 @@ mod tests {
         let ordinary = ChangeSet {
             changes: changes.into_iter().map(PlannedChange::new).collect(),
         };
-        assessed_with(side, side, &ordinary, indexes_are_relations)
+        assessed_with(side, side, &ordinary, &engine(indexes_are_relations))
     }
 
     fn surface(name: &str) -> Surface {
@@ -432,6 +463,58 @@ mod tests {
                 .questions
                 .contains_key(&Surface::Module("app.f()".parse().unwrap()))
         );
+    }
+
+    /// A layout-only edit is no declared change to the differ, which compares
+    /// definitions normalized: the rebuild an arrival makes of that module
+    /// is still the candidate one, and a question. Read bytewise, it would
+    /// answer the question and skip the selected resolver (#1526 review). A
+    /// real edit is still a declared rebuild.
+    #[test]
+    fn a_layout_only_edit_leaves_a_candidate_rebuild_a_question() {
+        let base = bound();
+        let answer = |definition: &str| {
+            let mut desired = base.clone();
+            desired
+                .modules
+                .insert("app.v".parse().unwrap(), view(definition));
+            let base_ids = ids(&base, &IdsFile::default());
+            let desired_ids = ids(&desired, &base_ids);
+            let ordinary = ChangeSet {
+                changes: [
+                    Change::CreateModule {
+                        id: "app.f()".parse().unwrap(),
+                        module: Box::new(Module {
+                            kind: ModuleKind::Function,
+                            description: None,
+                            definition: "RETURNS int LANGUAGE sql RETURN 1".into(),
+                        }),
+                    },
+                    Change::AlterModule {
+                        id: "app.v".parse().unwrap(),
+                        module: Box::new(view(definition)),
+                    },
+                ]
+                .into_iter()
+                .map(PlannedChange::new)
+                .collect(),
+            };
+            assessed_with(
+                crate::Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                crate::Side {
+                    schema: &desired,
+                    ids: &desired_ids,
+                },
+                &ordinary,
+                &engine(true),
+            )
+            .questions[&surface("view")]
+        };
+        assert_eq!(answer("SELECT  id\n    FROM app.t"), Answer::Resolve);
+        assert_eq!(answer("SELECT id, n FROM app.t"), Answer::Rebuild);
     }
 
     #[test]
@@ -558,7 +641,7 @@ mod tests {
                 ids: &desired_ids,
             },
             &ordinary,
-            true,
+            &engine(true),
         );
         assert!(!assessment.requires_resolution(), "{assessment:?}");
         // The same surfaces kept under their recorded UIDs are questions.
@@ -572,7 +655,7 @@ mod tests {
                 ids: &base_ids,
             },
             &ordinary,
-            true,
+            &engine(true),
         );
         assert!(kept.requires_resolution(), "{kept:?}");
     }
