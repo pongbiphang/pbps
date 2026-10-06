@@ -2053,6 +2053,7 @@
         "the_pre_delete_probe_counts_a_foreign_key_this_engine_never_stopped_enforcing",
         "the_pull_does_not_move_when_the_sessions_search_path_does",
         "the_pull_keeps_project_ledger_names_beside_the_real_ledger",
+        "a_relation_lookup_finds_every_kind_by_its_exact_name",
         "the_read_back_savepoint_is_read_only_and_gives_the_transaction_back_writable",
         "the_schemas_the_reader_skips_are_the_ones_a_declaration_may_not_name",
         "the_settings_a_staged_run_depends_on_reach_a_connection_that_opens_no_transaction",
