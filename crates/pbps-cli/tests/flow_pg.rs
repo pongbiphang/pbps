@@ -6636,7 +6636,8 @@ fn a_partition_tree_round_trips_through_the_cli() {
 /// kept. A range over rows the DEFAULT partition holds, and a saved plan whose
 /// tree changed by hand after planning, are each refused before the apply's
 /// first statement; with the rows moved and the tree restored, the same saved
-/// plan applies.
+/// plan applies. The partition added declares its own default calling a
+/// function the same plan creates, and is created after it (#1578).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn partitions_are_added_and_dropped_through_the_cli() {
@@ -6658,7 +6659,10 @@ fn partitions_are_added_and_dropped_through_the_cli() {
         .unwrap();
     };
     let p2025 = "  ev_2025: {from: [\"2025-01-01\"], to: [\"2026-01-01\"]}\n";
-    let p2026 = "  ev_2026: {from: [\"2026-01-01\"], to: [\"2027-01-01\"]}\n";
+    // Its own default calls a function the same plan creates, which the
+    // partition is created after (#1578 review).
+    let p2026 = "  ev_2026:\n    from: [\"2026-01-01\"]\n    to: [\"2027-01-01\"]\n    \
+                 columns:\n      id: {default: app.seven()}\n";
     let rest = "  ev_rest: default\n";
     tree(&format!("{p2025}{rest}"));
     succeeds(d.run(&["plan"]));
@@ -6671,6 +6675,11 @@ fn partitions_are_added_and_dropped_through_the_cli() {
 
     // Added, through a saved plan that says what it creates.
     tree(&format!("{p2025}{p2026}{rest}"));
+    std::fs::write(
+        d.dir.join("schema/app.seven.function.yml"),
+        "function: app.seven()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 7 $$\n",
+    )
+    .unwrap();
     succeeds(d.run(&["plan"]));
     d.commit();
     let plan = d.dir.join("plan.json");
@@ -6687,6 +6696,15 @@ fn partitions_are_added_and_dropped_through_the_cli() {
     succeeds(d.run(&["verify", "--db", &connection]));
     let next = succeeds(d.run(&["plan", "--db", &connection]));
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_attrdef \
+             WHERE adrelid = 'app.ev_2026'::regclass AND adnum = 1 \
+               AND pg_get_expr(adbin, adrelid) = 'app.seven()'"
+        ),
+        1
+    );
 
     // A range over the row the DEFAULT partition holds: planned, since a
     // plan reads no rows (SPEC 7.2), and refused by name by the apply's

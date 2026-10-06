@@ -1157,13 +1157,22 @@ fn after_their_functions(cs: &mut ChangeSet, deps: &ModuleDeps) -> Result<usize,
     for (i, p) in cs.changes[..last].iter().enumerate() {
         // A new table's generated column stays in its CREATE TABLE, where
         // its place in the column order is (DEC-1364.1), so the whole table
-        // waits instead.
+        // waits instead. So does a new partition's own default (#1578),
+        // which has no column of its own to split into an
+        // `AlterColumnDefault`.
         let texts: Vec<&str> = match &p.change {
             Change::AddColumn { column, .. } => column_expression(column).into_iter().collect(),
             Change::CreateTable { table, .. } => table
                 .columns
                 .values()
                 .filter_map(|c| c.generated.as_ref().map(|g| g.expression.as_str()))
+                .chain(
+                    table
+                        .partition_of
+                        .iter()
+                        .flat_map(|of| of.columns.values())
+                        .filter_map(|c| c.default.as_deref()),
+                )
                 .collect(),
             _ => Vec::new(),
         };
@@ -1386,6 +1395,12 @@ fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
         .values()
         .any(|key| &key.references_table == made)
         || table.checks.values().any(|check| named(&check.expression))
+        // A partition's own default, as a column's (#1578).
+        || table
+            .partition_of
+            .iter()
+            .flat_map(|of| of.columns.values())
+            .any(|own| own.default.as_deref().is_some_and(named))
         || table.indexes.values().any(|index| {
             index.filter.as_deref().is_some_and(named)
                 || index.columns.iter().any(|column| {
@@ -2335,6 +2350,66 @@ mod tests {
         }
     }
 
+    /// A new partition's own default calling a new function holds the whole
+    /// partition after that function, as a generated column holds its table
+    /// (#1578, DEC-1364.1): the partition has no column of its own to split
+    /// the default into. A partition whose own default calls nothing new, and
+    /// its parent, keep their places.
+    #[test]
+    fn a_new_partitions_own_default_calling_a_new_function_follows_it_whole() {
+        let partition = |name: &str, default: &str| {
+            let t = Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: [(
+                        "v".to_owned(),
+                        pbps_model::PartitionColumn {
+                            default: Some(default.to_owned()),
+                            not_null: false,
+                        },
+                    )]
+                    .into(),
+                }),
+                ..Table::default()
+            };
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, name, 0),
+                name: name.parse().unwrap(),
+                table: Box::new(t),
+            }
+        };
+        let mut parent = Table::default();
+        parent
+            .columns
+            .insert("v".into(), Column::new("integer".parse().unwrap()));
+        parent.partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["v".into()],
+        });
+        let mut cs = plan(vec![
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, "app.ev", 0),
+                name: "app.ev".parse().unwrap(),
+                table: Box::new(parent),
+            },
+            partition("app.ev_new", "app.f(1)"),
+            partition("app.ev_plain", "7"),
+            routine("app.f(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let table_at = |name: &str| {
+            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.to_string() == name))
+        };
+        let function =
+            at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
+        let order = names(&cs);
+        assert!(function < table_at("app.ev_new"), "{order:?}");
+        assert!(table_at("app.ev") < function, "{order:?}");
+        assert!(table_at("app.ev_plain") < function, "{order:?}");
+    }
+
     /// A new table held back for its generation expression does not drag an
     /// unrelated new table behind it: when the function it calls reads that
     /// other table, the order other table, function, generated table exists
@@ -2381,11 +2456,32 @@ mod tests {
                 table: Box::new(t),
             }
         };
+        // And a new partition naming it only in its own default (#1578).
+        let literal_partition = || Change::CreateTable {
+            uid: Uid::derived(UidKind::Table, "app.part", 0),
+            name: "app.part".parse().unwrap(),
+            table: Box::new(Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.other".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: [(
+                        "id".to_owned(),
+                        pbps_model::PartitionColumn {
+                            default: Some("'app.n'::regclass::oid::integer".into()),
+                            not_null: false,
+                        },
+                    )]
+                    .into(),
+                }),
+                ..Table::default()
+            }),
+        };
         let mut cs = plan(vec![
             new_table("app.n", &[("id", None), ("g", Some("app.f(id)"))], None),
             new_table("app.other", &[("id", None)], None),
             new_table("app.child", &[("id", None)], Some("app.n")),
             literal_table(),
+            literal_partition(),
             routine("app.f(integer)", "SELECT count(*)::integer FROM app.other"),
         ]);
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
@@ -2400,6 +2496,7 @@ mod tests {
         assert!(created < table_at("app.n"), "{order:?}");
         assert!(table_at("app.n") < table_at("app.child"), "{order:?}");
         assert!(table_at("app.n") < table_at("app.literal"), "{order:?}");
+        assert!(table_at("app.n") < table_at("app.part"), "{order:?}");
 
         // Two tables held behind different functions keep their own order:
         // app.b waits for the earlier function but names app.a, which waits

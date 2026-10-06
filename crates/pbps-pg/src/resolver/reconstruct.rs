@@ -142,10 +142,20 @@ impl Reconstruction {
             match change {
                 Change::CreateTable { uid, name, table } => {
                     let first = steps.len();
+                    // And a partition's own default, which stays in its
+                    // table's step, there being no column of its own to
+                    // split it into (#1578).
                     let generated: Vec<String> = table
                         .columns
                         .values()
                         .filter_map(|c| c.generated.as_ref().map(|g| g.expression.clone()))
+                        .chain(
+                            table
+                                .partition_of
+                                .iter()
+                                .flat_map(|of| of.columns.values())
+                                .filter_map(|c| c.default.clone()),
+                        )
                         .collect();
                     let mut bare = (**table).clone();
                     let checks = std::mem::take(&mut bare.checks);

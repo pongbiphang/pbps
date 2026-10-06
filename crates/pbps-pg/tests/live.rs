@@ -3738,7 +3738,11 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
              CREATE INDEX doc_1_d ON {s}.doc_1 USING gin (d);
              CREATE INDEX doc_1_p ON {s}.doc_1 USING gin (d jsonb_path_ops);
              ALTER TABLE {s}.ev_old ALTER COLUMN v SET DEFAULT 'old',
-                 ALTER COLUMN v SET NOT NULL, ALTER COLUMN ts SET DEFAULT '2024-01-01';"
+                 ALTER COLUMN v SET NOT NULL, ALTER COLUMN ts SET DEFAULT '2024-01-01';
+             CREATE TABLE {s}.gen (k integer NOT NULL, v integer,
+                 g integer GENERATED ALWAYS AS (v * 2) STORED) PARTITION BY RANGE (k);
+             CREATE TABLE {s}.gen_1 PARTITION OF {s}.gen FOR VALUES FROM (0) TO (10);
+             ALTER TABLE {s}.gen_1 ALTER COLUMN g SET NOT NULL;"
         );
         conn.execute(&trees).await.expect("the held trees");
         // Each of these is a tree pbps does not hold, for one reason each.
@@ -3797,6 +3801,23 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
         let (ev_name, m_name) = (t(&s, "ev"), t(&s, "m"));
         // Their own, and not the clones of the parent's check and index that
         // every partition has (#1577).
+        // A generated column's NOT NULL of its own is read as its own
+        // (#1578 review).
+        assert_eq!(
+            held.tables[&t(&s, "gen_1")]
+                .partition_of
+                .as_ref()
+                .unwrap()
+                .columns,
+            [(
+                "g".to_owned(),
+                pbps_model::PartitionColumn {
+                    default: None,
+                    not_null: true
+                }
+            )]
+            .into()
+        );
         let ev_2025 = &held.tables[&t(&s, "ev_2025")];
         assert_eq!(ev_2025.checks.keys().collect::<Vec<_>>(), ["ev_2025_id_ck"]);
         assert_eq!(ev_2025.indexes.keys().collect::<Vec<_>>(), ["ev_2025_id"]);

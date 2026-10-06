@@ -2704,12 +2704,25 @@ refuses a partition column whose parent's is NOT NULL and its own is not, or
 whose parent's has a default and its own has none: a dropped default still
 leaves the tree out, named. On 18 it admits a validated NOT NULL row of the
 partition's own. The partition then reads a default whose text differs from
-the parent's, and a NOT NULL the parent's column lacks.
+the parent's, and a NOT NULL the parent's column lacks, a generated column's
+included: measured on 16 and 18, `SET NOT NULL` on a partition's generated
+column is its own, and on 18 a local row as above. A default of its own that
+uses a sequence names the sequence as a column's does, since the declaration
+holds the default and not the sequence.
 
 **What is created.** One `ALTER TABLE … ALTER COLUMN … SET DEFAULT …, ALTER
 COLUMN … SET NOT NULL` after `CREATE TABLE … PARTITION OF`, before the
 partition's own checks and indexes. Measured, it gives what the same words in
 the `CREATE` give, the NOT NULL row on 18 under the same engine name.
+
+**Ordering.** That statement is part of the partition's `CreateTable`, which
+sorts ahead of the modules. A default of its own that calls a function the
+plan creates therefore holds the whole partition after that function, as a
+generated column holds its table (DEC-1364.1), in the ordinary plan and in
+scratch reconstruction. It is not split out into an `AlterColumnDefault` as a
+table column's default is: the partition has no column, and no column uid, of
+its own. A new partition whose own default names a held new table follows it
+too. Bootstrap does not run these passes for any table (#1585).
 
 **What is validated.** `validate_partition` refuses an override of a column
 the parent lacks, a NOT NULL the parent's column already has, the parent's own
@@ -2743,5 +2756,12 @@ dropped default leaves its tree out; the other partitions declare none),
 `a_partitions_own_column_overrides_answer_to_its_parents_columns`,
 `a_partitions_own_column_overrides_are_its_own_through_a_detach`,
 `a_partitions_own_default_is_recorded_and_overlaid`,
-`a_partitions_own_column_defaults_and_not_nulls_round_trip_under_its_entry`
-and `declaration_schema_and_loader_agree_on_a_partition_entry`.
+`a_partitions_own_column_defaults_and_not_nulls_round_trip_under_its_entry`,
+`declaration_schema_and_loader_agree_on_a_partition_entry`,
+`a_partitions_own_default_from_a_sequence_names_it`,
+`a_new_partitions_own_default_calling_a_new_function_follows_it_whole`,
+`a_held_new_table_leaves_unrelated_new_tables_free`,
+`a_partitions_own_default_calling_a_declared_function_compiles_after_it` and
+`a_created_partitions_own_defaults_and_not_nulls_answer_for_themselves`; the
+CLI's `partitions_are_added_and_dropped_through_the_cli` applies a partition
+whose own default calls a function the same plan creates.
