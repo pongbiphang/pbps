@@ -734,7 +734,7 @@ fn a_compile_failure_is_a_verdict_only_when_the_server_judged_the_statement() {
         code: code.map(Into::into),
     };
     for code in [
-        "42P01", "42883", "42601", "0A000", "22023", "2BP01", "P0001",
+        "42P01", "42883", "42601", "0A000", "22023", "2BP01", "P0001", "25001",
     ] {
         assert!(judged_the_statement(&failed(Some(code))), "{code}");
     }
@@ -742,6 +742,8 @@ fn a_compile_failure_is_a_verdict_only_when_the_server_judged_the_statement() {
         None,
         Some("57P01"),
         Some("57014"),
+        Some("25P03"),
+        Some("25P04"),
         Some("08006"),
         Some("40P01"),
         Some("53200"),

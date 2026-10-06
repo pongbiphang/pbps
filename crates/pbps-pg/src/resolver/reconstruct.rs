@@ -559,15 +559,21 @@ impl Reconstruction {
 ///   (PostgreSQL's SQLSTATE appendix): `08` connection exception, `40`
 ///   transaction rollback, `53` insufficient resources, `57` operator
 ///   intervention, `58` system error, and `XX` internal error.
+/// - So do the two session timeouts that end the connection: `25P03`
+///   idle-in-transaction and `25P04` transaction timeout (measured on 18:
+///   `terminating connection due to transaction timeout`, mid-statement).
+///   The rest of class `25`, such as `25001` for a statement that cannot
+///   run in a transaction block, is the statement's.
 ///
 /// Every other class, such as `42` syntax or access rule, `0A` not
 /// supported or `22` data exception, is the statement's.
 pub(crate) fn judged_the_statement(error: &pbps_db::DbError) -> bool {
     error.server_error_code().is_some_and(|code| {
-        !matches!(
-            code.get(..2),
-            Some("08" | "40" | "53" | "57" | "58" | "XX") | None
-        )
+        !matches!(code.as_str(), "25P03" | "25P04")
+            && !matches!(
+                code.get(..2),
+                Some("08" | "40" | "53" | "57" | "58" | "XX") | None
+            )
     })
 }
 
