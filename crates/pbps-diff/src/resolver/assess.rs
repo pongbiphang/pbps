@@ -605,6 +605,34 @@ mod tests {
         }
     }
 
+    /// A detach renames its partition's index clones to the declaration's
+    /// names, which are relation names: the engine is asked, as for any
+    /// index that arrives or leaves. A grant on the same table moves nothing.
+    #[test]
+    fn a_detached_partition_moves_lookups() {
+        let base = bound();
+        let table: pbps_model::TableName = "app.t_2026".parse().unwrap();
+        let detach = Change::DetachPartition {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+            table: table.clone(),
+            parent: "app.t".parse().unwrap(),
+            names: vec![pbps_model::DetachedName {
+                kind: pbps_model::DetachedKind::Index,
+                parent: "ix_t".into(),
+                name: Some("ix_t_2026".into()),
+            }],
+            shape: Box::new(base.tables[&"app.t".parse().unwrap()].clone()),
+        };
+        let found = with(&base, vec![detach]);
+        assert!(found.requires_resolution(), "{found:?}");
+        let grant = Change::Grant {
+            role: "reader".into(),
+            target: GrantTarget::Object(table),
+            permissions: BTreeSet::from([Permission::Select]),
+        };
+        assert!(!with(&base, vec![grant]).requires_resolution());
+    }
+
     /// The lookup skips a schema its role may not use, so who may use one is
     /// part of what it finds. Who may read a table is not.
     #[test]
