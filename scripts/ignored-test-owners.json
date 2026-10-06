@@ -1686,6 +1686,7 @@
         "resolver::binding_tests::an_sql_value_functions_type_is_no_named_candidate",
         "resolver::binding_tests::an_unreadable_dropped_signature_is_refused_not_absent",
         "resolver::binding_tests::an_unrelated_arriving_routine_leaves_a_view_and_a_capturing_one_rebuilds_it",
+        "resolver::binding_tests::a_scratch_backend_terminated_mid_statement_is_no_compile_verdict",
         "resolver::binding_tests::bindings_compare_logical_names_never_object_numbers",
         "resolver::binding_tests::candidates_earlier_on_the_path_capture_and_other_overloads_and_qualified_names_do_not",
         "resolver::binding_tests::every_covered_expression_surface_gets_the_engines_answer",

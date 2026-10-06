@@ -44,6 +44,11 @@ pub enum ReconstructError {
     /// (SPEC 9.8, #1575).
     #[error("reading back what compiling {declaration} made failed: {reason}")]
     Read { declaration: String, reason: String },
+    /// A compile statement failed for a reason about the server or the
+    /// connection rather than the statement ([`judged_the_statement`]): no
+    /// verdict on the declaration either (SPEC 9.8, #1597).
+    #[error("scratch compilation of {declaration} was interrupted: {reason}")]
+    Interrupted { declaration: String, reason: String },
     #[error("scratch compilation could not {0} its transaction")]
     Transaction(&'static str),
     #[error(
@@ -494,6 +499,10 @@ impl Reconstruction {
                 declaration: step.declaration.clone(),
                 reason,
             };
+            let interrupted = |reason: String| ReconstructError::Interrupted {
+                declaration: step.declaration.clone(),
+                reason,
+            };
             let routine = match &step.module {
                 Some(id @ ModuleId::Routine(_)) => {
                     Some((id.schema().to_owned(), id.name().to_owned()))
@@ -505,9 +514,13 @@ impl Reconstruction {
                 None => Vec::new(),
             };
             for statement in &step.statements {
-                conn.execute(statement)
-                    .await
-                    .map_err(|error| failed(error.to_string()))?;
+                conn.execute(statement).await.map_err(|error| {
+                    if judged_the_statement(&error) {
+                        failed(error.to_string())
+                    } else {
+                        interrupted(error.to_string())
+                    }
+                })?;
             }
             let relation = step
                 .names
@@ -533,6 +546,29 @@ impl Reconstruction {
         }
         Ok(())
     }
+}
+
+/// Whether a failed compile statement is the server's verdict on it, and so
+/// on its declaration (#1597).
+///
+/// Measured on 18: a backend terminated mid-statement fails it with `57P01`,
+/// and every later statement on that connection fails with no code at all
+/// (`connection closed`).
+/// - A failure with no SQLSTATE never reached the server's judgement.
+/// - These classes describe the server's state, not the statement
+///   (PostgreSQL's SQLSTATE appendix): `08` connection exception, `40`
+///   transaction rollback, `53` insufficient resources, `57` operator
+///   intervention, `58` system error, and `XX` internal error.
+///
+/// Every other class, such as `42` syntax or access rule, `0A` not
+/// supported or `22` data exception, is the statement's.
+pub(crate) fn judged_the_statement(error: &pbps_db::DbError) -> bool {
+    error.server_error_code().is_some_and(|code| {
+        !matches!(
+            code.get(..2),
+            Some("08" | "40" | "53" | "57" | "58" | "XX") | None
+        )
+    })
 }
 
 /// A dropped routine's declared signature, spelled as the plan's `DROP` spells
