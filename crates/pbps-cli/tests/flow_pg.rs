@@ -6478,11 +6478,24 @@ fn an_array_column_widens_through_the_cli() {
 /// under its entry (#1577); one naming a column its parent lacks is refused
 /// by `validate`, and one added to a standing partition by name (#1581). Its
 /// own column default and NOT NULL go with it too, and a changed default is
-/// refused by name (#1578).
+/// refused by name (#1578). A grant on it and one on its parent are each
+/// their own, created by the bootstrap, and granted and revoked on the
+/// standing partition as on any table (#1579).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_partition_tree_round_trips_through_the_cli() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
     let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_parts_1579_{}", std::process::id()),
+    );
+    let r = role.1.as_str();
     let source = OwnDatabase::new(&server, "parts-1170");
     let target = OwnDatabase::new(&server, "parts-1170-target");
     let (src, tgt) = (
@@ -6503,6 +6516,15 @@ fn a_partition_tree_round_trips_through_the_cli() {
          ALTER TABLE app.ev_rest ALTER COLUMN note SET DEFAULT 'rest', \
              ALTER COLUMN note SET NOT NULL",
     );
+    // A grant on the parent and one on a partition, each its own (#1579).
+    on_server(
+        &src,
+        &format!(
+            "DROP ROLE IF EXISTS {r}; CREATE ROLE {r} NOSUPERUSER; \
+             GRANT USAGE ON SCHEMA app TO {r}; GRANT SELECT ON app.ev TO {r}; \
+             GRANT INSERT, SELECT ON app.ev_2025 TO {r}"
+        ),
+    );
     let d = Demo::new("parts-1170");
     succeeds(d.run(&["pull", "--db", &src]));
     let path = d.dir.join("schema/app.ev.yml");
@@ -6521,12 +6543,62 @@ fn a_partition_tree_round_trips_through_the_cli() {
     assert!(!text.contains("ev_2025_ts_idx"), "{text}");
     // A partition has no file of its own.
     assert!(!d.dir.join("schema/app.ev_2025.yml").exists());
+    // Its grant is written as on any table; the parent's is the parent's,
+    // and not read as one on its partitions.
+    let role_path = d.dir.join(format!("schema/roles/{r}.yml"));
+    let granted = std::fs::read_to_string(&role_path).unwrap();
+    assert!(
+        granted.contains("  app.ev: [select]\n")
+            && granted.contains("  app.ev_2025: [select, insert]\n")
+            && !granted.contains("app.ev_rest"),
+        "{granted}"
+    );
     succeeds(d.run(&["fmt", "--check"]));
     d.commit();
 
     on_server(&tgt, "CREATE SCHEMA app");
     succeeds(d.run(&["bootstrap", "--db", &tgt]));
     succeeds(d.run(&["verify", "--db", &tgt]));
+    let next = succeeds(d.run(&["plan", "--db", &tgt]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    let privilege = |table: &str, privilege: &str| {
+        scalar(
+            &tgt,
+            &format!("SELECT has_table_privilege('{r}', '{table}', '{privilege}')::int::int8"),
+        )
+    };
+    assert_eq!(privilege("app.ev_2025", "INSERT"), 1);
+    // Measured: the parent's grant does not reach direct access to a
+    // partition, so none was made there.
+    assert_eq!(privilege("app.ev_rest", "SELECT"), 0);
+    // The readiness check finds the grants it recorded, the parent's
+    // included (#1579 review).
+    let o = d.run(&["doctor", "--db", &tgt]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // Granted on the standing partition, as on any table.
+    std::fs::write(
+        &role_path,
+        granted.replace(
+            "  app.ev_2025: [select, insert]\n",
+            "  app.ev_2025: [select, insert]\n  app.ev_rest: [select]\n",
+        ),
+    )
+    .unwrap();
+    d.commit();
+    let plan = d.dir.join("grant.json");
+    let o = succeeds(d.run(&["plan", "--db", &tgt, "--out", plan.to_str().unwrap()]));
+    assert!(stdout(&o).contains("app.ev_rest"), "{}", stdout(&o));
+    succeeds(approved_apply(&d, &tgt, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", &tgt]));
+    assert_eq!(privilege("app.ev_rest", "SELECT"), 1);
+    std::fs::write(&role_path, &granted).unwrap();
+    d.commit();
+    let plan = d.dir.join("revoke.json");
+    let o = succeeds(d.run(&["plan", "--db", &tgt, "--out", plan.to_str().unwrap()]));
+    assert!(stdout(&o).contains("app.ev_rest"), "{}", stdout(&o));
+    succeeds(approved_apply(&d, &tgt, &plan, &["--allow", "revoke"]));
+    assert_eq!(privilege("app.ev_rest", "SELECT"), 0);
     let next = succeeds(d.run(&["plan", "--db", &tgt]));
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
     on_server(
@@ -6631,9 +6703,9 @@ fn a_partition_tree_round_trips_through_the_cli() {
 
 /// A managed partition tree gains and loses partitions through the CLI
 /// (#1171): a partition added in the parent's file applies through a saved
-/// plan, verifies and replans empty; one dropped with `drop-table` is
-/// detached and dropped behind `--allow destructive`, its parent's other rows
-/// kept. A range over rows the DEFAULT partition holds, and a saved plan whose
+/// plan, verifies and replans empty; one dropped with `drop-table`, its grant
+/// with it (#1579), is detached and dropped behind `--allow destructive`, its
+/// parent's other rows kept. A range over rows the DEFAULT partition holds, and a saved plan whose
 /// tree changed by hand after planning, are each refused before the apply's
 /// first statement; with the rows moved and the tree restored, the same saved
 /// plan applies. The partition added declares its own default calling a
@@ -6641,11 +6713,43 @@ fn a_partition_tree_round_trips_through_the_cli() {
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn partitions_are_added_and_dropped_through_the_cli() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
     let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_parts_1171_{}", std::process::id()),
+    );
+    let r = role.1.as_str();
     let own = OwnDatabase::new(&server, "parts-1171");
     let connection = own.connection().to_owned();
-    on_server(&connection, "CREATE SCHEMA app");
+    on_server(
+        &connection,
+        &format!("CREATE SCHEMA app; DROP ROLE IF EXISTS {r}; CREATE ROLE {r} NOSUPERUSER"),
+    );
     let d = Demo::new("parts-1171");
+    // A grant on the partition the test drops later (#1579).
+    let role_path = d.dir.join(format!("schema/roles/{r}.yml"));
+    std::fs::create_dir_all(role_path.parent().unwrap()).unwrap();
+    let grants = |on_2025: bool| {
+        std::fs::write(
+            &role_path,
+            format!(
+                "role: {r}\n\ngrants:\n{}  \"schema::app\": [usage]\n",
+                if on_2025 {
+                    "  app.ev_2025: [select]\n"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .unwrap();
+    };
+    grants(true);
     let path = d.dir.join("schema/app.ev.yml");
     let tree = |partitions: &str| {
         std::fs::write(
@@ -6758,8 +6862,18 @@ fn partitions_are_added_and_dropped_through_the_cli() {
     succeeds(approved_apply(&d, &connection, &plan, &[]));
     on_server(&connection, "INSERT INTO app.ev VALUES (3, '2026-06-01')");
 
-    // Dropped with intent: detached, then dropped, the other rows kept.
+    assert_eq!(
+        scalar(
+            &connection,
+            &format!("SELECT has_table_privilege('{r}', 'app.ev_2025', 'SELECT')::int::int8")
+        ),
+        1
+    );
+
+    // Dropped with intent: detached, then dropped, the other rows kept, and
+    // its grant with it.
     tree(&format!("{p2026}{p2030}{rest}"));
+    grants(false);
     succeeds(d.run(&[
         "drop-table",
         "app.ev_2025",

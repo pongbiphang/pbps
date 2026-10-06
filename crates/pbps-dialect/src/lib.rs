@@ -2659,22 +2659,6 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
 /// which the engine also enforces.
 pub fn check_partitions(schema: &Schema) -> Vec<String> {
     let mut problems = Vec::new();
-    // A partition takes no grant of its own until #1579.
-    for (role, declared) in &schema.roles {
-        for target in declared.grants.keys() {
-            if let pbps_model::GrantTarget::Object(name) = target
-                && schema
-                    .tables
-                    .get(name)
-                    .is_some_and(|t| t.partition_of.is_some())
-            {
-                problems.push(format!(
-                    "role `{role}` is granted on `{name}`, a partition, which takes no grant of \
-                     its own"
-                ));
-            }
-        }
-    }
     let mut defaults: BTreeMap<&TableName, &TableName> = BTreeMap::new();
     for (child, table) in &schema.tables {
         let Some(of) = &table.partition_of else {
@@ -4015,14 +3999,6 @@ mod tests {
             .tables
             .insert("app.p3".parse().unwrap(), of("app.p", B::Default));
         cases.push(("both the default partition", defaults));
-        let mut granted = ok.clone();
-        let mut role = pbps_model::Role::default();
-        role.grants.insert(
-            pbps_model::GrantTarget::Object("app.p1".parse().unwrap()),
-            Default::default(),
-        );
-        granted.roles.insert("reader".into(), role);
-        cases.push(("takes no grant of its own", granted));
         for (expected, schema) in cases {
             let found = check_partitions(&schema);
             assert!(
@@ -4030,15 +4006,18 @@ mod tests {
                 "{expected}: {found:?}"
             );
         }
-        // Negative: a grant on the parent is the parent's own.
-        let mut on_parent = ok.clone();
+        // A grant on the parent and one on a partition are each their own,
+        // as on any table (#1579).
+        let mut granted = ok.clone();
         let mut role = pbps_model::Role::default();
-        role.grants.insert(
-            pbps_model::GrantTarget::Object("app.p".parse().unwrap()),
-            Default::default(),
-        );
-        on_parent.roles.insert("reader".into(), role);
-        assert!(check_partitions(&on_parent).is_empty());
+        for target in ["app.p", "app.p1"] {
+            role.grants.insert(
+                pbps_model::GrantTarget::Object(target.parse().unwrap()),
+                Default::default(),
+            );
+        }
+        granted.roles.insert("reader".into(), role);
+        assert!(check_partitions(&granted).is_empty());
     }
 
     /// A history table takes a name in the schema's namespace although no
