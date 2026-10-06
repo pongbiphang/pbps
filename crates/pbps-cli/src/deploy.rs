@@ -5398,7 +5398,8 @@ pub fn cmd_bootstrap(
     // refused with the two-plan remedy, before any script or DDL, rather
     // than rolled back by the engine. A qualified name is refused here. An
     // unqualified one may be `pg_catalog`'s, which only the target can say:
-    // asked below with `--db`, refused without one.
+    // asked of it with `--db`, before any script is written, and refused
+    // without one.
     let later = if dialect.name() == "postgres" {
         crate::dependents::names_a_later_relation(&cs, dialect.as_ref())
     } else {
@@ -5411,8 +5412,22 @@ pub fn cmd_bootstrap(
             .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))
     };
     refuse_later(&qualified)?;
-    if target.is_none() {
-        refuse_later(&unqualified)?;
+    match target {
+        Some(target) if !unqualified.is_empty() => {
+            let later = db::runtime()?.block_on(async {
+                let mut conn = db::connect(target).await?;
+                let mut later = Vec::new();
+                for name in unqualified {
+                    if !crate::engine::resolves_now(&mut conn, &name).await? {
+                        later.push(name);
+                    }
+                }
+                Ok::<_, anyhow::Error>(later)
+            })?;
+            refuse_later(&later)?;
+        }
+        Some(_) => {}
+        None => refuse_later(&unqualified)?,
     }
 
     if let Some(path) = sql_out {
@@ -5437,13 +5452,6 @@ pub fn cmd_bootstrap(
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-        let mut later = Vec::new();
-        for name in unqualified {
-            if !crate::engine::resolves_now(&mut conn, &name).await? {
-                later.push(name);
-            }
-        }
-        refuse_later(&later)?;
         // A collation the server lacks is refused here, by name, rather than
         // by the `CREATE TABLE` that names it after the ones before it ran
         // (#1175).

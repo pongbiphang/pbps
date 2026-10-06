@@ -17732,8 +17732,11 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
 /// --db` refuses it (DEC-1576.1, #1599 review): an expression index on
 /// `abs(k)` beside a declared `app.abs()` follows the function, and a
 /// default reading `'app.ix_a'::regclass` would otherwise roll the bootstrap
-/// back. The database stays empty, and the refusal's two-plan remedy deploys
-/// it. Negative: without the literal the same declarations bootstrap.
+/// back. So would a function whose body reads it. The database stays empty,
+/// and the refusal's two-plan remedy deploys it. An unqualified name, which
+/// only the target can settle, is refused before `--sql` writes a script
+/// beside `--db`. Negative: without the literals the same declarations
+/// bootstrap.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
@@ -17741,6 +17744,7 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
     let source = OwnDatabase::new(&server, "boot-later");
     let target = OwnDatabase::new(&server, "boot-later-target");
     let plain = OwnDatabase::new(&server, "boot-later-plain");
+    let both = OwnDatabase::new(&server, "boot-later-both");
     let (src, tgt) = (
         source.connection().to_owned(),
         target.connection().to_owned(),
@@ -17751,13 +17755,17 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
          CREATE FUNCTION app.abs() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; \
          CREATE TABLE app.a (k integer); \
          CREATE INDEX ix_a ON app.a (abs(k)); \
-         CREATE TABLE app.z (r text DEFAULT ('app.ix_a'::regclass)::text)",
+         CREATE TABLE app.z (r text DEFAULT ('app.ix_a'::regclass)::text); \
+         CREATE FUNCTION app.reader() RETURNS integer LANGUAGE sql \
+             RETURN ('app.ix_a'::regclass)::oid::integer",
     );
     let d = Demo::new("boot-later");
     succeeds(d.run(&["pull", "--db", &src]));
     d.commit();
     let z = d.dir.join("schema/app.z.yml");
     let declared = std::fs::read_to_string(&z).unwrap();
+    let reader = d.dir.join("schema/app.reader%28%29.function.yml");
+    let reads = std::fs::read_to_string(&reader).unwrap();
 
     let sql = d.dir.join("boot.sql");
     for args in [
@@ -17768,7 +17776,8 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
         assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
         assert!(
             stderr(&o).contains("names a relation this plan creates later")
-                && stderr(&o).contains("app.ix_a"),
+                && stderr(&o).contains("app.z.r's default or expression names app.ix_a")
+                && stderr(&o).contains("app.reader() names app.ix_a"),
             "{args:?}: {}",
             stderr(&o)
         );
@@ -17783,18 +17792,41 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
         "nothing was built"
     );
 
-    // The remedy: the expression in a second plan, once the index stands.
+    // The remedy: the expressions in a second plan, once the index stands.
     std::fs::write(&z, "table: app.z\ncolumns:\n  r: {type: text}\n").unwrap();
+    std::fs::remove_file(&reader).unwrap();
     d.commit();
     on_server(&tgt, "CREATE SCHEMA app");
     succeeds(d.run(&["bootstrap", "--db", &tgt]));
     std::fs::write(&z, &declared).unwrap();
+    std::fs::write(&reader, &reads).unwrap();
     d.commit();
     let plan = d.dir.join("second.json");
     succeeds(d.run(&["plan", "--db", &tgt, "--out", plan.to_str().unwrap()]));
     succeeds(approved_apply(&d, &tgt, &plan, &[]));
     let next = succeeds(d.run(&["plan", "--db", &tgt]));
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // Unqualified, the name may be `pg_catalog`'s: asked of the target,
+    // and refused before `--sql` writes a script beside `--db`.
+    std::fs::remove_file(&reader).unwrap();
+    std::fs::write(
+        &z,
+        declared.replace("'app.ix_a'::regclass", "'ix_a'::regclass"),
+    )
+    .unwrap();
+    d.commit();
+    let b = both.connection().to_owned();
+    on_server(&b, "CREATE SCHEMA app");
+    let script = d.dir.join("both.sql");
+    let o = d.run(&["bootstrap", "--sql", script.to_str().unwrap(), "--db", &b]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("app.z.r's default or expression names app.ix_a"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!script.exists(), "no script is written");
 
     // Negative: no literal, nothing refused.
     let p = plain.connection().to_owned();

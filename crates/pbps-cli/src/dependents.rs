@@ -1209,8 +1209,27 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
         let Some(scope) = expression_schema(&p.change) else {
             continue;
         };
+        let module = matches!(
+            p.change,
+            Change::CreateModule { .. } | Change::AlterModule { .. }
+        );
         for (whose, text) in expressions_set(&p.change) {
-            for literal in dialect.lexicon().string_literals(&text) {
+            let mut literals = dialect.lexicon().string_literals(&text);
+            // A routine's string body is itself a literal, and its own
+            // literals are bound as it is created: measured on 16 and 18,
+            // under the `check_function_bodies = on` the framing pins, a SQL
+            // body is analysed then, as an atomic body and a view are. So
+            // they are read one level in. A PL/pgSQL body binds them only
+            // when it runs, and is read alike: a refusal there costs a second
+            // plan, a missed one a failed apply (#1599 review).
+            if module {
+                let inner: Vec<String> = literals
+                    .iter()
+                    .flat_map(|body| dialect.lexicon().string_literals(body))
+                    .collect();
+                literals.extend(inner);
+            }
+            for literal in literals {
                 let Some((schema, name)) = relation_literal(&literal) else {
                     continue;
                 };
@@ -1326,6 +1345,10 @@ fn expression_schema(change: &Change) -> Option<&str> {
         | Change::AddIndex { table, .. } => Some(&table.schema),
         Change::AlterColumnDefault { column, .. }
         | Change::AlterColumnExpression { column, .. } => Some(&column.table.schema),
+        // A module's body is written in its own schema, and a literal in it
+        // that the engine casts as it creates the module, an atomic body's or
+        // a view's, is bound then (#1599 review).
+        Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => Some(id.schema()),
         _ => None,
     }
 }
@@ -1361,6 +1384,18 @@ fn expressions_set(change: &Change) -> Vec<(String, String)> {
                     .filter(|(_, ix)| ix.holds_expression() || ix.filter.is_some())
                     .map(|(n, ix)| (format!("index {n} on {name}"), index_text(ix))),
             );
+            // A partition's own defaults, as a column's (#1578).
+            out.extend(
+                table
+                    .partition_of
+                    .iter()
+                    .flat_map(|of| of.columns.iter())
+                    .filter_map(|(n, own)| {
+                        own.default
+                            .clone()
+                            .map(|d| (format!("{}'s own default", name.column(n)), d))
+                    }),
+            );
             out
         }
         Change::AddColumn {
@@ -1388,6 +1423,9 @@ fn expressions_set(change: &Change) -> Vec<(String, String)> {
         Change::AddIndex {
             table, name, index, ..
         } => vec![(format!("index {name} on {table}"), index_text(index))],
+        Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
+            vec![(format!("{id}"), module.definition.clone())]
+        }
         _ => Vec::new(),
     }
 }
@@ -4049,7 +4087,50 @@ mod tests {
                 &*pg()
             )
             .is_err()
+        ); // A module's body, cast as the engine creates it, and a partition's
+        // own default are read the same way (#1599 review); a module created
+        // after the index stands.
+        let reader = routine("app.f()", "SELECT ('app.ix_new'::regclass)::oid::integer");
+        let refused = refusal_of(
+            &plan(vec![reader.clone(), add_index("ix_new", None)]),
+            &*pg(),
+        )
+        .unwrap_err();
+        assert!(refused.contains("app.f() names app.ix_new"), "{refused}");
+        assert_eq!(
+            refusal_of(&plan(vec![add_index("ix_new", None), reader]), &*pg()),
+            Ok(())
         );
+        let atomic = Change::CreateModule {
+            id: id("app.g()"),
+            module: Box::new(module(
+                ModuleKind::Function,
+                "() RETURNS integer LANGUAGE sql RETURN ('app.ix_new'::regclass)::oid::integer",
+            )),
+        };
+        assert!(refusal_of(&plan(vec![atomic, add_index("ix_new", None)]), &*pg()).is_err());
+        let partition = Change::CreateTable {
+            uid: Uid::derived(UidKind::Table, "app.p", 0),
+            name: "app.p".parse().unwrap(),
+            table: Box::new(Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: [(
+                        "n".to_owned(),
+                        pbps_model::PartitionColumn {
+                            default: Some(named.to_owned()),
+                            not_null: false,
+                        },
+                    )]
+                    .into(),
+                }),
+                ..Table::default()
+            }),
+        };
+        let refused =
+            refusal_of(&plan(vec![partition, add_index("ix_new", None)]), &*pg()).unwrap_err();
+        assert!(refused.contains("app.p.n's own default"), "{refused}");
     }
 
     /// A literal is a relation's name as `regclass` input reads it: unquoted

@@ -1674,8 +1674,16 @@ read no catalog since #1585, so it inherits the case: an index split out of a
 new table and moved after a function of the same name, a match DEC-1364.1
 makes by name alone, can follow a default that names it. It is refused before
 any script is written or DDL runs. A qualified name is refused offline; an
-unqualified one is asked of the target with `--db`, and refused with `--sql`
-alone, which has no target to ask (#1599 review).
+unqualified one is asked of the target with `--db`, before a `--sql` script
+beside it is written, and refused with `--sql` alone, which has no target to
+ask (#1599 review).
+- **The expressions read** are a default, a partition's own default, a check,
+  an index's text and a generation expression, and a module's definition. A
+  view and an atomic body bind a literal as they are created, and so does a
+  SQL string body under the pinned `check_function_bodies = on` (measured on
+  16 and 18), so a routine's string body is read one level in. A PL/pgSQL
+  body binds its literals only when it runs; it is read alike, at the cost of
+  a second plan where it names a relation created after it (#1599 review).
 - **The relations a change brings:**
   - a table it creates, with the indexes, unique constraints and named
     primary key the create holds;
