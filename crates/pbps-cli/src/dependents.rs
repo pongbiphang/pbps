@@ -1224,8 +1224,11 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
         // search_path`, which the engine applies before the validator runs;
         // an atomic body and a view are parsed under the session's, the write
         // path. Measured on 16 and 18 (#1599 review).
+        // Only a routine's body is a string the engine analyses: a view's
+        // or a trigger's literals are data, read once (#1599 review).
         let own = if let Change::CreateModule { module, .. } | Change::AlterModule { module, .. } =
             &p.change
+            && matches!(module.kind, ModuleKind::Function | ModuleKind::Procedure)
         {
             Some(match routine_path(&module.definition, dialect) {
                 Some(Some(path)) => searched(path),
@@ -1244,12 +1247,14 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
             // read one level in. A PL/pgSQL body binds them only when it
             // runs, and is read alike: a refusal there costs a second plan, a
             // missed one a failed apply (#1599 review).
-            let inner: Vec<String> = match own {
-                Some(_) => outer
-                    .iter()
-                    .flat_map(|body| dialect.lexicon().string_literals(body))
-                    .collect(),
-                None => Vec::new(),
+            let inner: Vec<String> = match (&own, &p.change) {
+                (
+                    Some(_),
+                    Change::CreateModule { module, .. } | Change::AlterModule { module, .. },
+                ) => string_body(&module.definition, dialect)
+                    .map(|body| dialect.lexicon().string_literals(&body))
+                    .unwrap_or_default(),
+                _ => Vec::new(),
             };
             let literals = outer.into_iter().map(|l| (l, &written)).chain(
                 inner
@@ -1309,53 +1314,113 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
     found
 }
 
-/// A routine's own `SET search_path`, as its definition's header spells it:
-/// `Some(None)` when it sets none, `Some(Some(schemas))` in order, and `None`
-/// when the clause is there but not in a form this scan reads (`FROM
-/// CURRENT`, an escape string, a word it does not know), which the caller
-/// reads as any schema. The body, a string, is blanked first, so a `SET`
-/// inside it is no clause.
-fn routine_path(definition: &str, dialect: &dyn Dialect) -> Option<Option<Vec<String>>> {
+/// A word of a routine's header: the offset it ends at, its text (a quoted
+/// identifier decoded, the rest folded), and whether it was quoted.
+struct HeaderWord(usize, String, bool);
+
+impl HeaderWord {
+    /// Whether this is the keyword `kw`, which a quoted identifier never is.
+    fn is(&self, kw: &str) -> bool {
+        !self.2 && self.1 == kw
+    }
+}
+
+/// A routine header's depth-zero words, with the offsets they end at, which
+/// are the definition's: `header` blanks byte for byte. A parameter or a
+/// return column is at depth one. They stop at an atomic body (`RETURN`,
+/// `BEGIN ATOMIC`), which comes last and is code, so a `SET search_path` among
+/// its statements is no clause.
+fn header_words(definition: &str, dialect: &dyn Dialect) -> Vec<HeaderWord> {
     let header = dialect.lexicon().header(definition);
     let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
-    // The header's words with their offsets, which are the definition's:
-    // `header` blanks byte for byte. They stop at an atomic body (`RETURN`,
-    // `BEGIN ATOMIC`), which comes last and is code, so a `SET search_path`
-    // in its statements is no clause.
-    let mut words: Vec<(usize, String)> = Vec::new();
-    let mut start = None;
-    let mut quoted = false;
-    for (at, c) in header.char_indices().chain([(header.len(), ' ')]) {
-        // A quoted identifier, a parameter's name, holds no keyword.
-        if c == '"' {
-            quoted = !quoted;
-        }
-        if quoted || c == '"' {
-            continue;
-        }
-        match (word(c), start) {
-            (true, None) => start = Some(at),
-            (false, Some(from)) => {
-                let w = header[from..at].to_lowercase();
-                if w == "return" || w == "begin" {
-                    break;
+    let mut words: Vec<HeaderWord> = Vec::new();
+    let mut depth = 0usize;
+    let mut chars = header.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '"' => {
+                let mut name = String::new();
+                let mut end = header.len();
+                while let Some((i, c)) = chars.next() {
+                    if c == '"' {
+                        if chars.peek().map(|(_, n)| *n) == Some('"') {
+                            name.push('"');
+                            chars.next();
+                        } else {
+                            end = i + 1;
+                            break;
+                        }
+                    } else {
+                        name.push(c);
+                    }
                 }
-                words.push((from, w));
-                start = None;
+                if depth == 0 {
+                    words.push(HeaderWord(end, name, true));
+                }
+            }
+            c if word(c) => {
+                let mut end = at + c.len_utf8();
+                while let Some((i, c)) = chars.peek().copied() {
+                    if !word(c) {
+                        break;
+                    }
+                    end = i + c.len_utf8();
+                    chars.next();
+                }
+                if depth == 0 {
+                    let w = header[at..end].to_lowercase();
+                    if w == "return" || w == "begin" {
+                        break;
+                    }
+                    words.push(HeaderWord(end, w, false));
+                }
             }
             _ => {}
         }
     }
-    let Some(after) = words.windows(2).find_map(|pair| {
-        (pair[0].1 == "set" && pair[1].1 == "search_path").then(|| pair[1].0 + pair[1].1.len())
-    }) else {
+    words
+}
+
+/// A routine's string body, the literal after its depth-zero `AS`: the only
+/// literal of a routine whose own literals the engine analyses as it creates
+/// it. An atomic body has none.
+fn string_body(definition: &str, dialect: &dyn Dialect) -> Option<String> {
+    let after = header_words(definition, dialect)
+        .into_iter()
+        .find(|w| w.is("as"))?
+        .0;
+    dialect
+        .lexicon()
+        .string_literals(definition.get(after..)?)
+        .into_iter()
+        .next()
+}
+
+/// A routine's own `SET search_path`, as its definition's header spells it:
+/// `Some(None)` when it sets none, `Some(Some(schemas))` in order, and `None`
+/// when the clause is there but not in a form this scan reads (`FROM
+/// CURRENT`, an escape string, `"$user"`), which the caller reads as any
+/// schema. The body, a string, is blanked first, so a `SET` inside it is no
+/// clause; so are the parameter and return lists, read at depth zero only.
+/// Measured on 18: the last of two clauses is the one stored, and each
+/// quoted argument is one schema, `TO 'a,b'` the schema `a,b`.
+fn routine_path(definition: &str, dialect: &dyn Dialect) -> Option<Option<Vec<String>>> {
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let words = header_words(definition, dialect);
+    let Some(after) = words
+        .windows(2)
+        .rev()
+        .find(|pair| pair[0].is("set") && pair[1].1 == "search_path")
+        .map(|pair| pair[1].0)
+    else {
         return Some(None);
     };
     let rest = definition.get(after..)?.trim_start();
     let rest = if let Some(r) = rest.strip_prefix('=') {
         r
-    } else if rest.len() >= 2
-        && rest[..2].eq_ignore_ascii_case("to")
+    } else if rest.get(..2).is_some_and(|w| w.eq_ignore_ascii_case("to"))
         && !rest[2..].starts_with(word)
     {
         &rest[2..]
@@ -1365,35 +1430,14 @@ fn routine_path(definition: &str, dialect: &dyn Dialect) -> Option<Option<Vec<St
     let mut schemas = Vec::new();
     let mut rest = rest.trim_start();
     loop {
-        if let Some(r) = rest.strip_prefix('\'') {
-            let mut value = String::new();
-            let mut chars = r.char_indices().peekable();
-            let mut end = None;
-            while let Some((at, c)) = chars.next() {
-                if c == '\'' {
-                    if chars.peek().map(|(_, n)| *n) == Some('\'') {
-                        value.push('\'');
-                        chars.next();
-                    } else {
-                        end = Some(at + 1);
-                        break;
-                    }
-                } else {
-                    value.push(c);
-                }
-            }
-            schemas.extend(pbps_pg::modules::path_entries(&value));
-            rest = &r[end?..];
+        // Each part, and the bytes it takes.
+        let (schema, len) = if let Some(r) = rest.strip_prefix('\'') {
+            quoted_part(r, '\'').map(|(v, n)| (v, n + 1))?
         } else if let Some(r) = rest.strip_prefix('"') {
-            let close = r.find('"')?;
-            if r[close + 1..].starts_with('"') {
-                return None;
-            }
-            schemas.push(r[..close].to_owned());
-            rest = &r[close + 1..];
+            quoted_part(r, '"').map(|(v, n)| (v, n + 1))?
         } else {
             let len = rest.find(|c: char| !word(c)).unwrap_or(rest.len());
-            let w = rest[..len].to_ascii_lowercase();
+            let w = rest[..len].to_lowercase();
             // A word glued to anything but a separator is a form this scan
             // does not read: `E'…'`, `U&"…"`.
             let glued = rest[len..]
@@ -1403,17 +1447,38 @@ fn routine_path(definition: &str, dialect: &dyn Dialect) -> Option<Option<Vec<St
             if len == 0 || w == "from" || w == "default" || glued {
                 return None;
             }
-            schemas.push(w);
-            rest = &rest[len..];
+            (w, len)
+        };
+        // `$user` is a schema named for whichever role runs the body.
+        if schema == "$user" {
+            return None;
         }
-        rest = rest.trim_start();
+        schemas.push(schema);
+        rest = rest[len..].trim_start();
         match rest.strip_prefix(',') {
             Some(r) => rest = r.trim_start(),
-            // `$user` is a schema named for whichever role runs the body.
-            None if schemas.iter().any(|s| s == "$user") => return None,
             None => return Some(Some(schemas)),
         }
     }
+}
+
+/// The contents of a part quoted with `quote`, a doubled quote standing for
+/// itself, and the byte length of the part after its opening quote; `None`
+/// when it never closes.
+fn quoted_part(after_open: &str, quote: char) -> Option<(String, usize)> {
+    let mut value = String::new();
+    let mut chars = after_open.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if c != quote {
+            value.push(c);
+        } else if chars.peek().map(|(_, n)| *n) == Some(quote) {
+            value.push(quote);
+            chars.next();
+        } else {
+            return Some((value, at + 1));
+        }
+    }
+    None
 }
 
 /// A literal [`names_a_later_relation`] reads as a relation the plan creates
@@ -4240,6 +4305,36 @@ mod tests {
         );
         // Negative: no path of its own is the write path.
         assert!(searched(vec![with_path("app.f()", "", reads), index_in("other")]).is_empty());
+        // Negative: a literal holding quotes is data in a view and in an
+        // atomic body; only a string body is read one level in.
+        let data = |kind: ModuleKind, definition: &str| Change::CreateModule {
+            id: id("app.d()"),
+            module: Box::new(module(kind, definition)),
+        };
+        for (kind, definition) in [
+            (ModuleKind::View, "SELECT '''app.ix_new'''::text AS s"),
+            (
+                ModuleKind::Function,
+                "() RETURNS text LANGUAGE sql RETURN '''app.ix_new'''::text",
+            ),
+        ] {
+            assert!(
+                searched(vec![data(kind, definition), index_in("app")]).is_empty(),
+                "{definition}"
+            );
+        }
+        // The same quotes inside a string body are the literal it analyses.
+        assert_eq!(
+            searched(vec![
+                data(
+                    ModuleKind::Function,
+                    "() RETURNS integer LANGUAGE sql AS 'SELECT (''app.ix_new''::regclass)::oid::integer'"
+                ),
+                index_in("app")
+            ])
+            .len(),
+            1
+        );
     }
 
     /// The routine's own path as its header spells it, in either form the
@@ -4266,11 +4361,28 @@ mod tests {
             ),
             some(&["other", "pg_temp"])
         );
+        // Each quoted argument is one schema, commas and all (measured on
+        // 18); the last of two clauses is the one stored.
+        assert_eq!(
+            path("() RETURNS integer LANGUAGE sql SET search_path TO 'a,b' AS $$ SELECT 1 $$"),
+            some(&["a,b"])
+        );
         assert_eq!(
             path(
-                "() RETURNS integer LANGUAGE sql SET search_path = 'a, \"B c\"' AS $$ SELECT 1 $$"
+                "() RETURNS integer LANGUAGE sql SET search_path = app SET search_path = other AS $$ SELECT 1 $$"
             ),
-            some(&["a", "B c"])
+            some(&["other"])
+        );
+        // A quoted setting name, and a parameter named like a body's start.
+        assert_eq!(
+            path("() RETURNS integer LANGUAGE sql SET \"search_path\" = other AS $$ SELECT 1 $$"),
+            some(&["other"])
+        );
+        assert_eq!(
+            path(
+                "(begin integer) RETURNS TABLE (return integer) LANGUAGE sql SET search_path = other AS $$ SELECT 1 $$"
+            ),
+            some(&["other"])
         );
         assert_eq!(
             path(

@@ -1681,7 +1681,9 @@ ask (#1599 review).
   an index's text and a generation expression, and a module's definition. A
   view and an atomic body bind a literal as they are created, and so does a
   SQL string body under the pinned `check_function_bodies = on` (measured on
-  16 and 18), so a routine's string body is read one level in. A PL/pgSQL
+  16 and 18), so a routine's string body, the literal after its `AS`, is read
+  one level in. A view's or an atomic body's literals are data and are read
+  once. A PL/pgSQL
   body binds its literals only when it runs; it is read alike, at the cost of
   a second plan where it names a relation created after it (#1599 review).
 - **Where an unqualified name is looked up** is the path its expression is
@@ -1689,7 +1691,9 @@ ask (#1599 review).
   path). A routine's string body is the exception. It is analysed under the
   routine's own `SET search_path`, which the engine applies before the
   validator; an atomic body and a view are parsed under the session's path
-  (measured on 16 and 18). The path is walked in order up to the first schema
+  (measured on 16 and 18). The clause is read from the header at depth zero,
+  past the parameter and return lists, the last of two winning and each
+  quoted argument one schema, as the engine stores them (measured on 18). The path is walked in order up to the first schema
   the name binds in: a relation the plan makes earlier binds it there, one it
   makes later is the reference, and the target is asked about the schemas
   ahead of it. A path the scan cannot read (`FROM CURRENT`, `"$user"`, an
