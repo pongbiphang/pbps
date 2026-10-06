@@ -263,7 +263,30 @@ pub fn diff_rebuilding(
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
 ) -> Result<ChangeSet, Vec<DiffError>> {
-    let d = diff_partial_rebuilding(base, declared, dialect, hints, also);
+    rebuilding_by(base, declared, dialect, hints, also, Rebinding::Candidates)
+}
+
+/// Who decides which unchanged modules a plan's arrivals rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rebinding {
+    /// ADR-0013's candidate test, through `Dialect::rebound_modules`: the
+    /// conservative rule ordinary planning keeps (DECISIONS 422).
+    Candidates,
+    /// The resolver's binding evidence, which the caller passes as `also`.
+    /// A candidate is a reason to resolve, not proof that a rebuild is
+    /// needed (ADR-0016 §1, DEC-1515.1), so the differ adds none of its own.
+    Evidence,
+}
+
+pub(crate) fn rebuilding_by(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &dyn Dialect,
+    hints: &Hints,
+    also: &BTreeSet<ModuleId>,
+    rebinding: Rebinding,
+) -> Result<ChangeSet, Vec<DiffError>> {
+    let d = diff_partial_rebuilding(base, declared, dialect, hints, also, rebinding);
     if d.errors.is_empty() {
         Ok(d.changes)
     } else {
@@ -290,7 +313,14 @@ pub fn diff_partial(
     dialect: &dyn Dialect,
     hints: &Hints,
 ) -> Diffed {
-    diff_partial_rebuilding(base, declared, dialect, hints, &BTreeSet::new())
+    diff_partial_rebuilding(
+        base,
+        declared,
+        dialect,
+        hints,
+        &BTreeSet::new(),
+        Rebinding::Candidates,
+    )
 }
 
 fn diff_partial_rebuilding(
@@ -299,6 +329,7 @@ fn diff_partial_rebuilding(
     dialect: &dyn Dialect,
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
+    rebinding: Rebinding,
 ) -> Diffed {
     let mut changes = Vec::new();
     let mut errs = Vec::new();
@@ -637,11 +668,11 @@ fn diff_partial_rebuilding(
         .collect();
     // One set, so a module both the dialect and the caller ask for is rebuilt
     // once.
-    let rebound: BTreeSet<ModuleId> = dialect
-        .rebound_modules(declared.schema, &arriving, &changed)
-        .into_iter()
-        .chain(also.iter().cloned())
-        .collect();
+    let candidates = match rebinding {
+        Rebinding::Candidates => dialect.rebound_modules(declared.schema, &arriving, &changed),
+        Rebinding::Evidence => BTreeSet::new(),
+    };
+    let rebound: BTreeSet<ModuleId> = candidates.into_iter().chain(also.iter().cloned()).collect();
     for id in rebound {
         if !changed.contains(&id)
             && base.schema.modules.contains_key(&id)
@@ -9098,6 +9129,7 @@ mod tests {
             &MinimalDialect,
             &Hints::default(),
             &BTreeSet::new(),
+            Rebinding::Candidates,
         )
     }
 

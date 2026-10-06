@@ -1,8 +1,11 @@
 //! Pure resolution planning. Engine adapters supply observed identities; this
 //! module adds typed rebuilds and orders the resulting graph. No SQL or I/O.
 
+mod assess;
 mod graph;
 mod prepare;
+
+pub use assess::{Answer, Assessment, assess};
 
 use pbps_dialect::Dialect;
 use pbps_model::ChangeSet;
@@ -45,9 +48,33 @@ pub struct Ordered {
     pub proof: OrderingProof,
 }
 
+/// The typed plan resolver planning starts from: [`crate::diff`] without
+/// ADR-0013's candidate rebuilds, which the resolver's evidence replaces
+/// (DEC-1515.1). Every step that derives from the ordinary plan on this path
+/// uses it, so the scope a run qualifies and the plan it seals agree.
+pub fn ordinary(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    dialect: &dyn Dialect,
+    hints: &pbps_model::Hints,
+) -> Result<ChangeSet, Vec<crate::DiffError>> {
+    crate::schema_diff::rebuilding_by(
+        base,
+        desired,
+        dialect,
+        hints,
+        &BTreeSet::new(),
+        crate::schema_diff::Rebinding::Evidence,
+    )
+}
+
 /// Derive ordinary changes (including their existing grant and PUBLIC restore
 /// obligations), add the engine-proven expression rebuilds, then order them.
 /// Ordinary planning never calls this path and keeps its existing order.
+///
+/// A module ADR-0013's candidate test would rebuild is rebuilt here only
+/// when the evidence says its binding changes or one of its managed inputs
+/// is replaced (DEC-1515.1).
 #[allow(clippy::wildcard_enum_match_arm)]
 pub fn plan(
     base: crate::Side<'_>,
@@ -57,7 +84,7 @@ pub fn plan(
     dialect: &dyn Dialect,
 ) -> Result<Ordered, Error> {
     prepare::coverage(base, desired, resolution)?;
-    let ordinary = crate::diff(base, desired, dialect, hints)
+    let ordinary = ordinary(base, desired, dialect, hints)
         .map_err(|e| Error::Diff(e.into_iter().map(|e| e.to_string()).collect()))?;
     let rebuilds = prepare::rebuilds(
         &ordinary,
@@ -73,8 +100,15 @@ pub fn plan(
             _ => None,
         })
         .collect();
-    let ordinary = crate::diff_rebuilding(base, desired, dialect, hints, &modules)
-        .map_err(|e| Error::Diff(e.into_iter().map(|e| e.to_string()).collect()))?;
+    let ordinary = crate::schema_diff::rebuilding_by(
+        base,
+        desired,
+        dialect,
+        hints,
+        &modules,
+        crate::schema_diff::Rebinding::Evidence,
+    )
+    .map_err(|e| Error::Diff(e.into_iter().map(|e| e.to_string()).collect()))?;
     let (changes, ordinary) = prepare::changes(
         &ordinary,
         base.schema,

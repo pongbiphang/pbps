@@ -5736,15 +5736,7 @@ pub fn cmd_plan_db(
         bail!("{message}");
     }
 
-    let (
-        cs,
-        (baseline_checksum, baseline_collation),
-        baseline_description,
-        connected_checks,
-        findings,
-        cost,
-        routine_pins,
-    ) = db::runtime()?.block_on(async {
+    let connected = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
         let mut findings = Vec::new();
 
@@ -5973,6 +5965,60 @@ pub fn cmd_plan_db(
             }
             anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
         })?;
+
+        // DEC-1515.1's three cases, decided from this ordinary plan before any
+        // pass asks the catalog about it: case 2 then opens nothing a
+        // resolver owns, and case 3 hands the resolver the plan it re-derives.
+        let base_side = pbps_diff::Side {
+            schema: &base,
+            ids: &recorded_ids,
+        };
+        let desired_side = pbps_diff::Side {
+            schema: &declared,
+            ids: &resolved.ids,
+        };
+        let mut resolver_assessment = None;
+        match crate::resolution::case(
+            resolver_selection.as_ref(),
+            base_side,
+            desired_side,
+            &cs,
+            dialect.as_ref(),
+        ) {
+            crate::resolution::Case::Fallback => {}
+            crate::resolution::Case::NotNeeded { assessment } => {
+                resolver_assessment = Some(crate::resolution::ResolverAssessment::not_needed(
+                    &assessment,
+                ));
+            }
+            crate::resolution::Case::Required {
+                selection,
+                assessment,
+            } => {
+                let request = crate::resolution::Request {
+                    selection,
+                    assessment: &assessment,
+                    target,
+                    project,
+                    base: base_side,
+                    desired: desired_side,
+                    hints: &hints,
+                };
+                let asked = crate::resolution::named(&assessment);
+                return match crate::resolution::resolve(&request).await {
+                    Ok(changes) => Ok(Connected::Resolved {
+                        changes,
+                        baseline: format!("{} as queried (entry #{})", target.label, entry.id),
+                        asked,
+                        findings,
+                    }),
+                    Err(crate::resolution::Refused::Finding(finding)) => {
+                        Ok(Connected::Refused { finding, findings })
+                    }
+                    Err(crate::resolution::Refused::Unanswerable(error)) => Err(error),
+                };
+            }
+        }
 
         // Before anything is checked against the plan: a name it creates that
         // the database already uses, outside what this project records, is a
@@ -6237,7 +6283,7 @@ pub fn cmd_plan_db(
             &managed_modules(Some(&entry.snapshot), Some(&loaded.schema)),
         )
         .await?;
-        Ok((
+        Ok(Connected::Ordinary(Box::new((
             cs,
             (baseline, managed.database_collation.clone()),
             format!("{} as queried (entry #{})", target.label, entry.id),
@@ -6255,8 +6301,66 @@ pub fn cmd_plan_db(
             findings,
             cost,
             routine_pins,
-        ))
+            resolver_assessment,
+        ))))
     })?;
+    let (
+        cs,
+        (baseline_checksum, baseline_collation),
+        baseline_description,
+        connected_checks,
+        findings,
+        cost,
+        routine_pins,
+        resolver_assessment,
+    ) = match connected {
+        Connected::Ordinary(planned) => *planned,
+        Connected::Resolved {
+            changes,
+            baseline,
+            asked,
+            mut findings,
+        } => {
+            // Case 3 answered. Withheld, not written: publication waits for
+            // the recheck that confirms the target still holds what the
+            // evidence describes (#1516, DEC-1515.1).
+            let name = resolver_selection
+                .as_ref()
+                .map_or("", |selection| selection.name.as_str());
+            let finding = crate::output::Finding::error(
+                "resolver.publication-unavailable",
+                format!(
+                    "the selected resolver `{name}` answered the binding questions of {asked}; \
+                     its plan has {} change(s).\n\
+                     Publishing a resolver-backed plan needs the fresh pre-publication recheck, \
+                     which is not implemented yet (#1516), so neither a plan nor SQL was written.",
+                    changes.changes.len()
+                ),
+            );
+            if json {
+                findings.push(finding);
+                return crate::output::Report::plain("plan", findings).emit_json();
+            }
+            println!("Baseline: {baseline}");
+            println!("Resolver profile: {name}; it answered the binding questions of {asked}.");
+            print!("{}", crate::report::plan(&changes));
+            let report = crate::output::Report::plain("plan", vec![finding]);
+            eprint!("{}", crate::output::human(&report.findings));
+            return report.outcome();
+        }
+        Connected::Refused {
+            finding,
+            mut findings,
+        } => {
+            if json {
+                findings.push(finding);
+                return crate::output::Report::plain("plan", findings).emit_json();
+            }
+            let report = crate::output::Report::plain("plan", vec![finding]);
+            eprint!("{}", crate::output::human(&report.findings));
+            return report.outcome();
+        }
+    };
 
     let statements = crate::statements(&cs, dialect.as_ref())?;
     if staged {
@@ -6293,13 +6397,18 @@ pub fn cmd_plan_db(
         connected_checks,
         cost: Some(cost),
         resolver_selection,
+        resolver_assessment,
     };
     if !json {
         println!("Baseline: {baseline_description}");
-        if let Some(selection) = &data.resolver_selection {
+        // Only case 2 reaches here with a selection: case 3 returned above,
+        // and case 1 has none to report and claims no verification.
+        if let (Some(selection), Some(assessment)) =
+            (&data.resolver_selection, &data.resolver_assessment)
+        {
             println!(
-                "Resolver profile: {} ({:?}); not acquired. Resolver qualification and binding resolution are not implemented; existing planning checks remain in force.",
-                selection.name, selection.source,
+                "Resolver profile: {} ({:?}); not needed, so not acquired: this plan moves no name a kept binding could reach ({} unaffected, {} rebuilt from their declarations).",
+                selection.name, selection.source, assessment.unaffected, assessment.rebuilt,
             );
         }
         print!("{}", crate::report::plan(&cs));
@@ -6370,6 +6479,24 @@ pub fn cmd_plan_db(
         return crate::output::Report::new("plan", findings, Some(data)).emit_json();
     }
     Ok(())
+}
+
+/// What the connected half of `plan` ended with (DEC-1515.1).
+enum Connected<T> {
+    /// Cases 1 and 2: the ordinary plan and everything checked against it.
+    Ordinary(Box<T>),
+    /// Case 3, answered: the resolver's plan, withheld from publication.
+    Resolved {
+        changes: pbps_model::ChangeSet,
+        baseline: String,
+        asked: String,
+        findings: Vec<crate::output::Finding>,
+    },
+    /// Case 3, refused by an answer: unresolved, or measured incompatible.
+    Refused {
+        finding: crate::output::Finding,
+        findings: Vec<crate::output::Finding>,
+    },
 }
 
 /// What the operator asked `apply` to do, as typed.

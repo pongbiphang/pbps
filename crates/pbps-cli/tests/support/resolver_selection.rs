@@ -2,8 +2,17 @@ use super::*;
 
 fn configure(d: &Demo, dialect: &str) {
     std::fs::write(d.dir.join("pbps.yml"), format!(
-        "dialect: {dialect}\nresolve_with: local\nresolvers:\n  local:\n    kind: docker\n    image: registry.invalid/team/engine:preloaded\n  internal:\n    kind: docker\n    image: registry.invalid/team/engine:approved\n    pull: if_missing\n  scratch:\n    kind: server\n    url_env: PBPS_RESOLVER_UNSET_606\nenvironments:\n  prod:\n    url_env: PBPS_TARGET_606\n    resolve_with: scratch\n  stage:\n    url_env: PBPS_TARGET_606\n"
+        "dialect: {dialect}\nresolve_with: local\nresolvers:\n  local:\n    kind: docker\n    image: registry.invalid/team/engine:preloaded\n  internal:\n    kind: docker\n    image: registry.invalid/team/engine:approved\n    pull: if_missing\n  scratch:\n    kind: server\n    url_env: PBPS_RESOLVER_UNSET_606\nenvironments:\n  prod:\n    url_env: PBPS_TARGET_606\n    resolve_with: scratch\n    fingerprint_key_file: {}\n  stage:\n    url_env: PBPS_TARGET_606\n",
+        key_file(d).display()
     )).unwrap();
+}
+
+/// The environment's key file. Absent while case 2 plans: a plan that read
+/// it would be refused, so a passing plan never opened it (DEC-1515.1's
+/// negative control). `doctor` validates configured keys, so it is created
+/// before `doctor` runs.
+fn key_file(d: &Demo) -> std::path::PathBuf {
+    d.dir.join("never-read-1515.key")
 }
 
 fn run(d: &Demo, args: &[&str], target: Option<&str>) -> Output {
@@ -233,6 +242,12 @@ pub fn connected(server: &str, dialect: &str) {
         assert_eq!(selected["name"], expected_name, "{value}");
         assert_eq!(selected["source"], expected_source, "{value}");
         assert_eq!(selected["status"], "not_acquired", "{value}");
+        // Case 2: selected, and the plan adds a column to a table nothing
+        // binds, so nothing resolver-only is opened (DEC-1515.1).
+        let assessed = &value["data"]["resolver_assessment"];
+        assert_eq!(assessed["need"], "not_needed", "{value}");
+        assert_eq!(assessed["unaffected"], 0, "{value}");
+        assert!(!key_file(&d).exists());
         assert_eq!(selected["profile"]["kind"], kind, "{value}");
         assert_eq!(selected["profile"]["pull"].as_str(), pull, "{value}");
         let saved: serde_json::Value =
@@ -246,10 +261,16 @@ pub fn connected(server: &str, dialect: &str) {
         Some(connection),
     )));
     assert!(
-        human.contains("Resolver profile: scratch") && human.contains("not acquired"),
+        human.contains("Resolver profile: scratch")
+            && human.contains("not needed, so not acquired"),
         "{human}"
     );
-    assert!(human.contains("not implemented"), "{human}");
+    assert!(!key_file(&d).exists());
+    successful(run(
+        &d,
+        &["key", "generate", "--out", key_file(&d).to_str().unwrap()],
+        None,
+    ));
     successful(run(&d, &["doctor", "--env", "prod"], Some(connection)));
     successful(run(
         &d,
@@ -295,4 +316,117 @@ pub fn connected(server: &str, dialect: &str) {
         ],
         None,
     ));
+}
+
+/// DEC-1515.1's case 1 and case 3 refusals, through the binary. A view the
+/// target holds is a binding question once a column arrives on its table.
+/// No resolver here can answer: the bare target names no key, the
+/// environment's key is absent, and the measured profile it selects cannot
+/// verify a plaintext target. Each refuses with the right class, and
+/// existing files stay byte-identical.
+pub fn required(server: &str, dialect: &str) {
+    let own = OwnDatabase::new(server, "resolver1515");
+    let connection = own.connection();
+    let schema = if dialect == "postgres" { "app" } else { "dbo" };
+    if dialect == "postgres" {
+        on_server(connection, "CREATE SCHEMA app");
+    }
+    let d = Demo::new("resolver1515required");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/v.yml"),
+        format!("view: {schema}.v\ndefinition: SELECT id FROM {schema}.t\n"),
+    )
+    .unwrap();
+    successful(run(&d, &["plan"], None));
+    d.commit();
+    successful(run(&d, &["bootstrap", "--db", connection], None));
+    d.table(&ONE_COLUMN.replace("  id:", "  label: {type: varchar(50)}\n  id:"));
+    successful(run(&d, &["plan"], None));
+    d.commit();
+
+    // Case 1: nothing selected. ADR-0013 decides; nothing claims a resolver
+    // answered, and nothing was assessed.
+    let value = report(successful(run(
+        &d,
+        &["plan", "--db", connection, "--format", "json"],
+        None,
+    )));
+    assert!(value["data"].get("resolver_selection").is_none(), "{value}");
+    assert!(
+        value["data"].get("resolver_assessment").is_none(),
+        "{value}"
+    );
+
+    configure(&d, dialect);
+    let artifact = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    std::fs::write(&artifact, "prior plan 1515").unwrap();
+    std::fs::write(&sql, "prior sql 1515").unwrap();
+    let unchanged = || {
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"prior plan 1515");
+        assert_eq!(std::fs::read(&sql).unwrap(), b"prior sql 1515");
+    };
+    let refused = |target: &[&str], expected_code: i32| {
+        let mut args = vec!["plan"];
+        args.extend(target);
+        args.extend([
+            "--out",
+            artifact.to_str().unwrap(),
+            "--sql",
+            sql.to_str().unwrap(),
+            "--format",
+            "json",
+        ]);
+        let output = run(&d, &args, Some(connection));
+        assert_eq!(
+            code(&output),
+            expected_code,
+            "{}{}",
+            stdout(&output),
+            stderr(&output)
+        );
+        unchanged();
+        report(output)
+    };
+    // SQL Server has no binding adapter: an answered refusal, before any key
+    // or resource is looked for.
+    let unsupported = if dialect == "postgres" {
+        None
+    } else {
+        Some("resolver.unresolved")
+    };
+    let value = refused(&["--db", connection], 2);
+    assert_eq!(
+        value["findings"][0]["id"],
+        unsupported.unwrap_or("resolver.key"),
+        "{value}"
+    );
+    let value = refused(&["--env", "prod"], 2);
+    assert_eq!(
+        value["findings"][0]["id"],
+        unsupported.unwrap_or("resolver.key"),
+        "{value}"
+    );
+    if let Some(id) = unsupported {
+        assert!(
+            value["findings"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("{schema}.v")),
+            "the refusal names the declaration: {value}"
+        );
+        assert_eq!(value["findings"][0]["id"], id);
+        return;
+    }
+    // With the key present the run starts, and the measured profile cannot
+    // verify the plaintext target (DEC-1514.1): an operational failure, not
+    // a finding (SPEC 9.8).
+    successful(run(
+        &d,
+        &["key", "generate", "--out", key_file(&d).to_str().unwrap()],
+        None,
+    ));
+    let value = refused(&["--env", "prod"], 1);
+    assert_eq!(value["result"], "unanswerable", "{value}");
 }

@@ -628,4 +628,5 @@ other numbers before landing. Some records still mention them as proposals.
 | DEC-1514.1 | [resolver](decisions/resolver.md#dec-1514-1) | A connected plan finds the target's engine service from its own connection; no PID is configured. |
 | DEC-1540.1 | [resolver](decisions/resolver.md#dec-1540-1) | The daemon socket check reads the descriptor that held the socket last time first; only its still naming the socket answers yes. |
 | DEC-1550.1 | [resolver](decisions/resolver.md#dec-1550-1) | A native run checks the attach stream before each write, the target's sole holder once per check, and the scope once per resolution. |
+| DEC-1515.1 | [resolver](decisions/resolver.md#dec-1515-1) | A selected resolver runs only when the coarse typed-plan assessment needs it; with none selected ADR-0013 decides; evidence replaces the candidate rebuild. |
 | DEC-1274.2 | [modules](decisions/modules.md#dec-1274-2) | A new table whose generated column calls a function the plan creates follows that create whole, in the plan and on scratch. |

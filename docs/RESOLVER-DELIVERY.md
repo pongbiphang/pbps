@@ -45,7 +45,9 @@ environment then project default. Tagged Docker/server profiles carry explicit
 trusted image/pull policy or a separate credential-variable reference. Selection
 looks up no credentials, acquires no resources and certifies no compatibility.
 The connected summary reports the selected policy as `not_acquired`; it never
-enters the saved deployment artifact. Offline/check/explain and doctor keep
+enters the saved deployment artifact. Since #1515 a plan the lightweight
+assessment answers reports `resolver_assessment` and opens nothing the
+resolver owns, and one that needs the resolver runs it (DEC-1515.1). Offline/check/explain and doctor keep
 their no-acquisition behavior; existing planning protections remain in force.
 This delivers the policy portion of ADR case 6, not the lifecycle or binding
 path. See SPEC §9.3.2 for configuration and the current limitation.

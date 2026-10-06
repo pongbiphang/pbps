@@ -182,7 +182,9 @@ the existing SQL Server `--dev` rehearsal. Target planning accepts
 Profiles carry a trusted Docker image and pull policy (default `never`), or a
 separate scratch credential-variable reference. Selection looks up no credentials
 and acquires no resources; connected summaries report `not_acquired` outside
-the saved artifact. Existing planning checks remain in force.
+the saved artifact. A plan that needs the selected resolver runs it (#1515);
+its resolver-backed plan is not yet published (#1516). Existing planning
+checks remain in force.
 Connected `doctor` reports an advisory target
 environment inventory and known official image-family suggestions for both
 engines, without acquisition. It names unknown qualification requirements;

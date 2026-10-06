@@ -21,6 +21,7 @@ mod output;
 mod pins;
 mod prompt;
 mod report;
+mod resolution;
 mod saved_plan;
 mod state_list;
 mod status;
@@ -2431,6 +2432,10 @@ pub struct PlanData {
     /// Selected policy only, outside the saved artifact and its evidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
+    /// Why a selected resolver was not needed (DEC-1515.1). Absent when none
+    /// is selected: that plan was never assessed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolver_assessment: Option<resolution::ResolverAssessment>,
 }
 
 /// What an offline `plan` was asked to do.
@@ -2905,6 +2910,7 @@ fn cmd_plan(
                 connected_checks: Vec::new(),
                 cost: None,
                 resolver_selection: None,
+                resolver_assessment: None,
             }),
         );
         // A non-converging rehearsal is an error finding, so `outcome` exits 2

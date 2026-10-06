@@ -59,8 +59,15 @@ facts. A heuristic can widen the suspect set, but cannot prove safety by absence
 of a guessed grammar pattern. Ordinary table changes are not categorically
 exempt: defaults, checks and index predicates can have bindings too.
 
-When required, run the configured resolver lazily. Without adequate evidence,
-refuse deployable output and identify the affected declaration and remedy.
+When required, run the selected resolver lazily. Without adequate evidence from
+a selected resolver, refuse deployable output and identify the affected
+declaration and remedy. With no resolver selected, ADR-0013's candidate
+rebuild and the unmanaged-dependent gate remain the protection; nothing is
+refused for want of a resolver, and that protection is never reported as
+evidence (DEC-1515.1). The implemented assessment is deliberately coarse:
+a kept surface is proven unaffected only when the plan changes no name any
+lookup could reach, and on the resolver's path the evidence replaces the
+candidate rebuild.
 Conservative extra resolver requests are an accepted usability cost, not a
 promise that every safe change is decidable without an engine. Do not turn an
 uncertain case into an unconditional rebuild merely to avoid that boundary.
