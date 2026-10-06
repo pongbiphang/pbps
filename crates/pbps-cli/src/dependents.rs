@@ -1328,6 +1328,14 @@ fn expressions_set(change: &Change) -> Vec<(String, String)> {
     }
 }
 
+/// The white space `regclass` input skips: the scanner's six, vertical tab
+/// among them, which `char::is_ascii_whitespace` leaves out. Measured on 18:
+/// `E'pg_class\013'` is `pg_class`, and a no-break space is part of the name
+/// (#1589 review).
+fn is_input_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
+}
+
 /// A literal that is wholly a relation's name, as `regclass` input reads one:
 /// its optional schema and its name. `None` for anything else.
 ///
@@ -1335,7 +1343,7 @@ fn expressions_set(change: &Change) -> Vec<(String, String)> {
 /// - an unquoted part runs to a dot or ASCII white space, so `'app.a-b'`
 ///   names `"a-b"`;
 /// - only ASCII letters fold, so `'app.ixÄ'` names `"ixÄ"` and not `"ixä"`;
-/// - white space is allowed around the dot;
+/// - white space, [`is_input_space`], is allowed around the dot;
 /// - an input of ASCII digits alone is an OID, not a name: `'1259'` is
 ///   `pg_class`;
 /// - `'-'` exactly is OID 0, while `' -'` and `'"-"'` are names
@@ -1346,7 +1354,7 @@ fn relation_literal(contents: &str) -> Option<(Option<String>, String)> {
         return None;
     }
     let mut parts = Vec::new();
-    let mut rest = contents.trim_ascii();
+    let mut rest = contents.trim_matches(is_input_space);
     loop {
         let (part, after) = if let Some(quoted) = rest.strip_prefix('"') {
             let mut name = String::new();
@@ -1364,7 +1372,7 @@ fn relation_literal(contents: &str) -> Option<(Option<String>, String)> {
             (name, &quoted[end..])
         } else {
             let end = rest
-                .find(|c: char| c == '.' || c.is_ascii_whitespace())
+                .find(|c: char| c == '.' || is_input_space(c))
                 .unwrap_or(rest.len());
             if end == 0 {
                 return None;
@@ -1375,11 +1383,11 @@ fn relation_literal(contents: &str) -> Option<(Option<String>, String)> {
             return None;
         }
         parts.push(part);
-        let after = after.trim_ascii_start();
+        let after = after.trim_start_matches(is_input_space);
         if after.is_empty() {
             break;
         }
-        rest = after.strip_prefix('.')?.trim_ascii_start();
+        rest = after.strip_prefix('.')?.trim_start_matches(is_input_space);
     }
     match parts.len() {
         1 => Some((None, parts.pop()?)),
@@ -3735,6 +3743,10 @@ mod tests {
         assert_eq!(relation_literal("\"1259\""), some(None, "1259"));
         // `-` exactly is OID 0; spaced or quoted, it is a name.
         assert_eq!(relation_literal(" -"), some(None, "-"));
+        // A vertical tab is white space to the input; a no-break space is not.
+        assert_eq!(relation_literal("pg_class\x0b"), some(None, "pg_class"));
+        assert_eq!(relation_literal("app\x0b.\x0bix"), some(Some("app"), "ix"));
+        assert_eq!(relation_literal("ix\u{a0}"), some(None, "ix\u{a0}"));
         assert_eq!(relation_literal("\"-\""), some(None, "-"));
         for not_a_name in ["", "a b", "app.", ".ix", "a.b.c.d", "\"open", "1259", "-"] {
             assert_eq!(relation_literal(not_a_name), None, "{not_a_name:?}");
