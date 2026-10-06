@@ -139,7 +139,7 @@ pub(crate) async fn compile(
     reconstruction: &mut Reconstruction,
     extras: &[String],
     connection: &mut StreamConn,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     match connection.driver() {
         Driver::Postgres => reconstruction
             .compile(
@@ -147,8 +147,24 @@ pub(crate) async fn compile(
                 connection,
             )
             .await
-            .map_err(|error| error.to_string()),
-        Driver::Mssql => Err(NO_BINDING_ADAPTER.into()),
+            .map_err(compile_failed),
+        Driver::Mssql => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
+    }
+}
+
+/// What a failed scratch compilation is. A declaration that did not compile
+/// is the binding's verdict; a catalog read around it, or a transaction that
+/// would not open or commit, answered nothing (SPEC 9.8, #1575).
+pub(super) fn compile_failed(error: pbps_pg::resolver::reconstruct::ReconstructError) -> Error {
+    use pbps_pg::resolver::reconstruct::ReconstructError;
+    match error {
+        ReconstructError::Read { .. } | ReconstructError::Transaction(_) => {
+            Error::Read(error.to_string())
+        }
+        ReconstructError::Unsupported(_)
+        | ReconstructError::Emit { .. }
+        | ReconstructError::Compile { .. }
+        | ReconstructError::Cycle(_) => Error::Binding(error.to_string()),
     }
 }
 
@@ -334,9 +350,10 @@ pub(super) fn paths(
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, catalog_read_failed, target_capture_failed};
+    use super::{Error, catalog_read_failed, compile_failed, target_capture_failed};
     use crate::resolver::native::CaptureFailure;
     use pbps_db::resolver::capture::{CaptureError, Uncovered};
+    use pbps_pg::resolver::reconstruct::ReconstructError;
 
     /// #1575: a capture that failed to read answered nothing about the
     /// bindings, and is not reported as their verdict (SPEC 9.8).
@@ -364,6 +381,35 @@ mod tests {
             }),
         ] {
             assert!(matches!(catalog_read_failed(verdict), Error::Binding(_)));
+        }
+    }
+
+    /// The security review of #1596: compilation reads the catalog back
+    /// around each step, and that read failing is not the declaration's
+    /// verdict either.
+    #[test]
+    fn a_failed_read_around_compilation_is_a_read_failure_and_a_failed_statement_a_verdict() {
+        let read = |reason: &str| ReconstructError::Read {
+            declaration: "app.f()".into(),
+            reason: reason.into(),
+        };
+        assert!(matches!(
+            compile_failed(read("connection closed")),
+            Error::Read(_)
+        ));
+        assert!(matches!(
+            compile_failed(ReconstructError::Transaction("commit")),
+            Error::Read(_)
+        ));
+        for verdict in [
+            ReconstructError::Compile {
+                declaration: "app.f()".into(),
+                reason: "function app.g() does not exist".into(),
+            },
+            ReconstructError::Unsupported("DropColumn".into()),
+            ReconstructError::Cycle("app.t".into()),
+        ] {
+            assert!(matches!(compile_failed(verdict), Error::Binding(_)));
         }
     }
 

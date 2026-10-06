@@ -2159,7 +2159,7 @@ impl ScratchRun {
         self.in_flight = true;
         let compiled = engine::compile(reconstruction, extras, scratch.connection_mut()).await;
         self.in_flight = false;
-        compiled.map_err(Error::Binding)?;
+        compiled?;
         self.check_held(target).await?;
         // Scratch is read through an administrative session: the capture
         // reads settings a least-privilege deployer need not see, and which
