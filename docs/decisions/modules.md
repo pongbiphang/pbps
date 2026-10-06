@@ -1668,8 +1668,14 @@ corner cases. A refusal costs the user one more plan: deploy the relation,
 then the expression.
 
 `names_a_later_relation` runs on the final order, after every reordering pass,
-and only on the connected PostgreSQL path; an offline plan is a preview that
-`apply` never accepts.
+on the connected PostgreSQL path and on `bootstrap`; an offline plan is a
+preview that `apply` never accepts. Bootstrap runs the reordering passes that
+read no catalog since #1585, so it inherits the case: an index split out of a
+new table and moved after a function of the same name, a match DEC-1364.1
+makes by name alone, can follow a default that names it. It is refused before
+any script is written or DDL runs. A qualified name is refused offline; an
+unqualified one is asked of the target with `--db`, and refused with `--sql`
+alone, which has no target to ask (#1599 review).
 - **The relations a change brings:**
   - a table it creates, with the indexes, unique constraints and named
     primary key the create holds;

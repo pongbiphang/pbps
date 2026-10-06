@@ -17726,3 +17726,84 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
     let next = succeeds(d.run(&["plan", "--db", &pln]));
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
+
+/// A bootstrap whose reordering moves a relation after an expression naming
+/// it in a literal is refused by name before any script or DDL, as `plan
+/// --db` refuses it (DEC-1576.1, #1599 review): an expression index on
+/// `abs(k)` beside a declared `app.abs()` follows the function, and a
+/// default reading `'app.ix_a'::regclass` would otherwise roll the bootstrap
+/// back. The database stays empty, and the refusal's two-plan remedy deploys
+/// it. Negative: without the literal the same declarations bootstrap.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
+    let server = server();
+    let source = OwnDatabase::new(&server, "boot-later");
+    let target = OwnDatabase::new(&server, "boot-later-target");
+    let plain = OwnDatabase::new(&server, "boot-later-plain");
+    let (src, tgt) = (
+        source.connection().to_owned(),
+        target.connection().to_owned(),
+    );
+    on_server(
+        &src,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.abs() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; \
+         CREATE TABLE app.a (k integer); \
+         CREATE INDEX ix_a ON app.a (abs(k)); \
+         CREATE TABLE app.z (r text DEFAULT ('app.ix_a'::regclass)::text)",
+    );
+    let d = Demo::new("boot-later");
+    succeeds(d.run(&["pull", "--db", &src]));
+    d.commit();
+    let z = d.dir.join("schema/app.z.yml");
+    let declared = std::fs::read_to_string(&z).unwrap();
+
+    let sql = d.dir.join("boot.sql");
+    for args in [
+        vec!["bootstrap", "--sql", sql.to_str().unwrap()],
+        vec!["bootstrap", "--db", &tgt],
+    ] {
+        let o = d.run(&args);
+        assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
+        assert!(
+            stderr(&o).contains("names a relation this plan creates later")
+                && stderr(&o).contains("app.ix_a"),
+            "{args:?}: {}",
+            stderr(&o)
+        );
+    }
+    assert!(!sql.exists(), "no script is written");
+    assert_eq!(
+        scalar(
+            &tgt,
+            "SELECT count(*) FROM pg_namespace WHERE nspname = 'app'"
+        ),
+        0,
+        "nothing was built"
+    );
+
+    // The remedy: the expression in a second plan, once the index stands.
+    std::fs::write(&z, "table: app.z\ncolumns:\n  r: {type: text}\n").unwrap();
+    d.commit();
+    on_server(&tgt, "CREATE SCHEMA app");
+    succeeds(d.run(&["bootstrap", "--db", &tgt]));
+    std::fs::write(&z, &declared).unwrap();
+    d.commit();
+    let plan = d.dir.join("second.json");
+    succeeds(d.run(&["plan", "--db", &tgt, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, &tgt, &plan, &[]));
+    let next = succeeds(d.run(&["plan", "--db", &tgt]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // Negative: no literal, nothing refused.
+    let p = plain.connection().to_owned();
+    std::fs::write(
+        &z,
+        "table: app.z\ncolumns:\n  r: {type: text, default: \"'x'\"}\n",
+    )
+    .unwrap();
+    d.commit();
+    on_server(&p, "CREATE SCHEMA app");
+    succeeds(d.run(&["bootstrap", "--db", &p]));
+}
