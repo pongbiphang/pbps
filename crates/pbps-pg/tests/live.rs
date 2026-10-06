@@ -3730,7 +3730,11 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
                  CONSTRAINT r_ev FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.ev (id, ts));
              ALTER TABLE {s}.ev_2025 ADD CONSTRAINT ev_2025_id_ck CHECK (id > 0);
              CREATE INDEX ev_2025_id ON {s}.ev_2025 (id DESC) WHERE id > 5;
-             CREATE UNIQUE INDEX ev_rest_id ON {s}.ev_rest (id);"
+             CREATE UNIQUE INDEX ev_rest_id ON {s}.ev_rest (id);
+             CREATE TABLE {s}.doc (k integer NOT NULL, d jsonb) PARTITION BY RANGE (k);
+             CREATE TABLE {s}.doc_1 PARTITION OF {s}.doc FOR VALUES FROM (0) TO (10);
+             CREATE INDEX doc_1_d ON {s}.doc_1 USING gin (d);
+             CREATE INDEX doc_1_p ON {s}.doc_1 USING gin (d jsonb_path_ops);"
         );
         conn.execute(&trees).await.expect("the held trees");
         // Each of these is a tree pbps does not hold, for one reason each.
@@ -3794,6 +3798,17 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
         assert!(ev_rest.checks.is_empty());
         assert_eq!(ev_rest.indexes.keys().collect::<Vec<_>>(), ["ev_rest_id"]);
         assert!(ev_rest.indexes["ev_rest_id"].unique);
+        // A GIN over `jsonb` is judged by the column the partition has from
+        // its parent, under both classes the model holds.
+        let doc_1 = &held.tables[&t(&s, "doc_1")];
+        assert_eq!(
+            doc_1.indexes.keys().collect::<Vec<_>>(),
+            ["doc_1_d", "doc_1_p"]
+        );
+        assert_eq!(
+            doc_1.indexes["doc_1_p"].columns[0].opclass.as_deref(),
+            Some("jsonb_path_ops")
+        );
         let with_own = |partition: pbps_model::Table, from: &pbps_model::Table| pbps_model::Table {
             checks: from.checks.clone(),
             indexes: from.indexes.clone(),

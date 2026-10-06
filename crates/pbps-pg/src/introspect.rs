@@ -799,6 +799,17 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 add_constraint(constraint, &parts, &lookups, &mut table, &mut pulled);
             }
             let mut unread = Vec::new();
+            // An index's key class is judged by its column's type (a GIN over
+            // `jsonb`), and a partition's columns are its parent's, which it
+            // does not declare: they are lent for the read and taken back
+            // (#1577 review).
+            table.columns = raw_columns
+                .iter()
+                .map(|c| {
+                    let ty = stored_type(&c.ty).unwrap_or_else(|opaque| opaque);
+                    (c.name.clone(), pbps_model::Column::new(ty))
+                })
+                .collect();
             for index in indexes_by_table
                 .get(&raw_table.oid)
                 .map_or(&[][..], Vec::as_slice)
@@ -818,6 +829,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     }
                 }
             }
+            table.columns.clear();
             for detail in unread {
                 note(&mut pulled, &name, detail);
             }
@@ -5286,6 +5298,66 @@ mod tests {
         let pulled = assemble(&bare);
         let p1 = &pulled.schema.tables[&TableName::new("app", "p1")];
         assert!(p1.checks.is_empty() && p1.indexes.is_empty(), "{p1:?}");
+    }
+
+    /// A partition's own GIN index over `jsonb` is read under both classes
+    /// the model holds: its key's type is the inherited column's, which the
+    /// partition does not declare (#1577 review). A GIN over another type is
+    /// still left out by name.
+    #[test]
+    fn a_partitions_own_gin_index_is_judged_by_its_inherited_column() {
+        let gin = |oid: i64, name: &str, attnum: i32, class: &str| {
+            let mut i = index(oid, 2, name);
+            i.method = "gin".to_owned();
+            i.columns = vec![attnum];
+            i.key_classes = vec![class.to_owned()];
+            i
+        };
+        let mut parent = table(1, "doc");
+        parent.partition_key = Some(vec!["k".to_owned()]);
+        let mut partition = table(2, "doc_1");
+        partition.partition_of = Some((1, "FOR VALUES FROM (0) TO (10)".to_owned()));
+        let raw = RawCatalog {
+            tables: vec![parent, partition],
+            columns: vec![
+                col(1, 1, "k", "integer"),
+                col(1, 2, "d", "jsonb"),
+                col(2, 1, "k", "integer"),
+                col(2, 2, "d", "jsonb"),
+            ],
+            indexes: vec![
+                gin(10, "doc_1_d", 2, ""),
+                gin(11, "doc_1_p", 2, "pg_catalog.jsonb_path_ops"),
+            ],
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw);
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        let doc_1 = &pulled.schema.tables[&TableName::new("app", "doc_1")];
+        assert_eq!(
+            doc_1.indexes.keys().collect::<Vec<_>>(),
+            ["doc_1_d", "doc_1_p"]
+        );
+        assert_eq!(doc_1.indexes["doc_1_d"].columns[0].opclass, None);
+        assert_eq!(
+            doc_1.indexes["doc_1_p"].columns[0].opclass.as_deref(),
+            Some("jsonb_path_ops")
+        );
+        assert!(doc_1.columns.is_empty(), "its columns stay its parent's");
+        // Negative: a GIN over an integer is still left out, by name.
+        let over_int = RawCatalog {
+            indexes: vec![gin(12, "doc_1_k", 1, "")],
+            ..raw.clone()
+        };
+        let pulled = assemble(&over_int);
+        assert!(
+            pulled
+                .warnings
+                .iter()
+                .any(|w| w.contains("doc_1_k") && w.contains("GIN only over `jsonb`")),
+            "{:?}",
+            pulled.warnings
+        );
     }
 
     #[test]
