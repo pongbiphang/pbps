@@ -96,6 +96,17 @@ impl DaemonLease {
         other.check()?;
         self.process.same_process(&other.process)
     }
+
+    /// [`Self::same_process`] for a lease whose own connection is gone.
+    ///
+    /// A cancelled request drops its connection, so this lease's socket can no
+    /// longer be checked. Its daemon process still can, and `other`'s socket
+    /// is checked in full: the new connection is bound to the daemon, and the
+    /// daemon is the one the dropped connection was bound to (#1591).
+    pub(crate) fn same_daemon(&self, other: &Self) -> Result<bool, UnqualifiedProcess> {
+        other.check()?;
+        self.process.same_process(&other.process)
+    }
 }
 
 struct UnixPeer {

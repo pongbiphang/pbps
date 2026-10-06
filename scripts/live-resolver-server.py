@@ -64,6 +64,7 @@ TESTS = [
     # Runs with the exposed control started; see below.
     "resolver::server::live_tests::an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name",
     "resolver::server::live_tests::a_session_this_run_did_not_open_invalidates_it_even_after_it_closed",
+    "resolver::server::live_tests::a_check_cancelled_inside_a_forwarders_request_is_still_cleaned_up",
     "resolver::server::live_tests::a_retired_forwarder_still_in_the_engines_network_is_this_runs_own",
     "resolver::server::live_tests::a_session_present_at_admission_is_refused_rather_than_counted",
     "resolver::server::live_tests::a_removed_statistics_row_cannot_pay_for_an_intruding_session",

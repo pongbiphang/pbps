@@ -503,7 +503,7 @@ async fn cleanup(api: &mut LocalApi, owner: &Owner) -> Result<(), Error> {
     // declarations, and must reach the same immediate peer. Exact ID plus the
     // random ownership marker protects unrelated resources on that runtime.
     let mut janitor = if api.native_daemon.is_some() {
-        api.additional().await
+        api.reconnect_for_cleanup().await
     } else {
         LocalApi::connect_peer(&api.socket_path, api.peer.0).await
     }
@@ -514,6 +514,35 @@ async fn cleanup(api: &mut LocalApi, owner: &Owner) -> Result<(), Error> {
     cleanup_with(&mut janitor, owner)
         .await
         .map_err(|_| Error::Cleanup)
+}
+
+/// While set, a check a caller commands holds a request in flight, so a test
+/// can cancel a server check while a forwarder is inside its own (#1591). The
+/// periodic check is never held: one held there would leave the commanded
+/// check queued, and cancelling it would poison nothing.
+#[cfg(test)]
+pub(crate) static HOLD_CHECKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// How many commanded checks have entered the hold, so a test cancels only
+/// once one is inside its request.
+#[cfg(test)]
+pub(crate) static HELD_CHECKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The check a caller commanded: [`check`], behind the test hold.
+async fn commanded_check(
+    api: &mut LocalApi,
+    owner: &Owner,
+    pinned: &Running,
+    launch: &Launch,
+) -> Result<(), Error> {
+    #[cfg(test)]
+    if HOLD_CHECKS.load(std::sync::atomic::Ordering::SeqCst) {
+        HELD_CHECKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        api.hold_in_flight(&HOLD_CHECKS).await;
+    }
+    check(api, owner, pinned, launch).await
 }
 
 fn report_cleanup_failure(owner: &Owner) {
@@ -580,7 +609,7 @@ async fn supervise(
                     let result = tokio::select! {
                         biased;
                         _ = reply.closed() => break None,
-                        result = check(&mut api, &owner, &pinned, &launch) => result,
+                        result = commanded_check(&mut api, &owner, &pinned, &launch) => result,
                     };
                     let failed = result.is_err();
                     if reply.send(result).is_err() || failed { break None; }

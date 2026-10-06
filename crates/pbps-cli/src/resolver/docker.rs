@@ -21,6 +21,8 @@ use tokio::net::UnixStream;
 mod channel;
 pub(crate) mod forwarder;
 mod lifecycle;
+#[cfg(test)]
+pub(crate) use lifecycle::{HELD_CHECKS, HOLD_CHECKS};
 mod profile;
 mod reserved;
 mod session;
@@ -315,6 +317,28 @@ impl LocalApi {
         }
         Ok(other)
     }
+    /// A cleanup-only connection to the daemon this handle was bound to,
+    /// after its own connection was lost.
+    ///
+    /// [`Self::additional`] checks this handle's socket first, and a request
+    /// cancelled in flight has already dropped that socket (`RequestGuard`).
+    /// So a supervisor whose check was cancelled could never reconnect: it
+    /// reported a container it had in fact removed as unconfirmed (#1591).
+    /// This requires the same peer and the same daemon process instead, with
+    /// the new connection's own socket checked in full.
+    pub(crate) async fn reconnect_for_cleanup(&self) -> Result<Self, Error> {
+        let lease = self.native_daemon.as_ref().ok_or(Error::NativeDaemon)?;
+        let other = Self::connect_native(&self.socket_path).await?;
+        if self.peer != other.peer
+            || !lease
+                .same_daemon(other.native_daemon.as_ref().ok_or(Error::NativeDaemon)?)
+                .map_err(|_| Error::NativeDaemon)?
+        {
+            return Err(Error::NativeDaemon);
+        }
+        Ok(other)
+    }
+
     pub async fn connect(socket_path: &Path) -> Result<Self, Error> {
         if !socket_path.is_absolute() {
             return Err(Error::SocketPath);
@@ -390,6 +414,20 @@ impl LocalApi {
             peer: (peer.uid(), peer.pid().ok_or(Error::Peer)?),
             native_daemon,
         })
+    }
+
+    /// Holds a request in flight while `hold` is set, as a slow daemon reply
+    /// would, so a test can cancel a caller exactly mid-request.
+    #[cfg(test)]
+    pub(crate) async fn hold_in_flight(&mut self, hold: &std::sync::atomic::AtomicBool) {
+        let mut guard = RequestGuard {
+            api: self,
+            completed: false,
+        };
+        while hold.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        guard.completed = true;
     }
 
     async fn request(&mut self, method: Method, path: &str) -> Result<(StatusCode, Bytes), Error> {
