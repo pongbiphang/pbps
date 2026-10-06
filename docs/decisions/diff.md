@@ -2640,6 +2640,10 @@ name one of them took fails the apply on the engine's `already exists`, and the
 transaction with it; the remedy is another name. A pull whose partition fails
 validation leaves the whole tree out, since a tree is read whole or not at all.
 
+**Plan version 28.** An older build reads a created partition's `checks` and
+`indexes`, which `Table` always had, and emits the partition without them, so
+a saved plan carrying them is version 28 and refused by an older build.
+
 **A detach keeps them.** DEC-1544.1's shape check matches the partition's own
 checks and indexes by name and definition before the parent's by definition.
 An own one declared under another name, or changed, is a change the detach
