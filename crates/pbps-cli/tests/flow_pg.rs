@@ -17287,6 +17287,47 @@ fn a_dropped_table_frees_a_name_a_moved_table_carries_in_applies() {
     );
 }
 
+/// #1589 review: a relation of the name in its own schema now exempts
+/// nothing. A plan that rebuilds `app.ix_new` drops it before the default is
+/// set, so the default would find nothing; it is refused like a new one.
+#[test]
+#[ignore = "needs a live PostgreSQL; see scripts/live-tests-pg.sh"]
+fn a_name_the_plan_rebuilds_is_refused_although_it_exists_now() {
+    let own = OwnDatabase::new(&server(), "names_rebuilt_index");
+    let connection = own.connection();
+    let columns =
+        "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  k: {type: integer}\n";
+    let label = |default: &str| format!("  label: {{type: text, default: \"{default}\"}}\n");
+    let index = |column: &str| format!("indexes:\n  ix_new:\n    columns: [{column}]\n");
+    let d = bootstrapped_demo(
+        connection,
+        "names_rebuilt_index",
+        &format!("{columns}{}primary_key: [id]\n{}", label("''"), index("id")),
+    );
+
+    d.table(&format!(
+        "{columns}{}primary_key: [id]\n{}",
+        label("('app.ix_new'::regclass)::text"),
+        index("k")
+    ));
+    d.commit();
+    let artifact = d.dir.join("refused-plan.json");
+    let refused = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    let why = stderr(&refused);
+    assert!(
+        why.contains("app.t.label's default names app.ix_new"),
+        "{why}"
+    );
+    assert!(!artifact.exists(), "a refused plan writes no artifact");
+}
+
 /// #1589 review: an unqualified name the plan also creates later may already
 /// resolve, and then binds what it resolves to. `pg_catalog` is searched ahead
 /// of the write path, so `'pg_class'::regclass` is the catalog's whatever the

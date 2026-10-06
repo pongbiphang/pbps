@@ -1689,18 +1689,25 @@ and only on the connected PostgreSQL path; an offline plan is a preview that
   another schema's name is no reference. A literal that is the name but is
   not cast can be refused; that costs a second plan, where a missed reference
   costs a failed apply.
-- **The target settles each candidate.** It is refused only if the name
-  resolves to no relation there now, looked up where the write path searches:
-  `pg_catalog` first, then the expression's schema, for an unqualified name,
-  and the named schema for a qualified one. A name that already resolves
-  binds what it resolves to, such as `'pg_class'` to the catalog's relation,
-  whatever the plan creates. Asking the engine replaced predicting each of its
-  lookup rules, which took a review round apiece (#1589).
+- **The target settles an unqualified candidate.** `pg_catalog` is searched
+  ahead of the write path, so an unqualified name that resolves there, such
+  as `'pg_class'`, binds the catalog's relation whatever the plan creates. It
+  is asked, and only a name it does not hold is refused. The arrival's own
+  schema is never asked, and a qualified candidate is always refused. A
+  relation of that name there now is one the plan must remove before its
+  create. Removed before the expression, the expression fails; removed after
+  it, the removal does, since the expression depends on what it bound
+  (measured on 18: `cannot drop index app.ix_new because other objects
+  depend on it`). So a plan that rebuilds a relation an expression names is
+  refused like one that adds it (#1589).
 
 Pinned by `an_expression_naming_a_relation_the_plan_creates_later_is_refused`,
 `a_relation_literal_is_read_as_regclass_input_reads_it` and
 `a_later_name_is_looked_up_where_the_write_path_searches`
-(`crates/pbps-cli/src/dependents.rs`), and the live
-`a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_deploy_it`
-and `a_name_that_already_resolves_on_the_target_is_not_refused`
-(`crates/pbps-cli/tests/flow_pg.rs`).
+(`crates/pbps-cli/src/dependents.rs`), the live
+`a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_deploy_it`,
+`a_name_that_already_resolves_on_the_target_is_not_refused` and
+`a_name_the_plan_rebuilds_is_refused_although_it_exists_now`
+(`crates/pbps-cli/tests/flow_pg.rs`), and the live
+`a_relation_lookup_finds_every_kind_by_its_exact_name`
+(`crates/pbps-pg/tests/live.rs`).

@@ -1161,10 +1161,11 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
                         && name == relation.name
                         && schema.as_deref().unwrap_or(scope) == relation.schema
                 }) {
-                    // `pg_catalog` is searched ahead of the write path.
+                    // Only `pg_catalog`, searched ahead of the write path,
+                    // can answer for an unqualified name; see `LaterName`.
                     let searched = match schema {
-                        Some(schema) => vec![schema],
-                        None => vec!["pg_catalog".to_owned(), scope.to_owned()],
+                        Some(_) => Vec::new(),
+                        None => vec!["pg_catalog".to_owned()],
                     };
                     found.push(LaterName {
                         what: format!("{whose} names {relation}, which the plan creates after it"),
@@ -1179,16 +1180,21 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
 }
 
 /// A literal [`names_a_later_relation`] reads as a relation the plan creates
-/// later. Whether it is one is the target's to say: the same name may resolve
-/// to a relation that already exists, in `pg_catalog`, which is searched first,
-/// or in the expression's own schema. Only one that resolves nowhere now is
-/// refused ([`later_relation_refusal`]). Asking the engine settles every
-/// lookup rule at once, where predicting them took a review round each
-/// (#1589).
+/// later. An unqualified one may instead resolve to a relation of that name
+/// in `pg_catalog`, which is searched ahead of the write path; the target
+/// says whether it does, and only a name that resolves nowhere is refused
+/// ([`later_relation_refusal`]).
+///
+/// The arrival's own schema is never asked. A relation of that name there
+/// now is one the plan must remove before its create, or the create fails;
+/// removed before the expression, the expression fails, and removed after
+/// it, the removal does, because the expression depends on what it bound
+/// (measured on 18: `cannot drop index app.ix_new because other objects
+/// depend on it`). So finding it there exempts nothing (#1589 review).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LaterName {
     pub(crate) what: String,
-    /// The schemas the lookup searches, in order.
+    /// The schemas ahead of the arrival's that the lookup searches, in order.
     pub(crate) searched: Vec<String>,
     pub(crate) name: String,
 }
@@ -3613,8 +3619,8 @@ mod tests {
     }
 
     /// A candidate says where the target is asked: an unqualified name in
-    /// `pg_catalog`, searched first, then the expression's schema; a
-    /// qualified one in its own schema alone (#1589).
+    /// `pg_catalog`, searched first; a qualified one nowhere, since its
+    /// schema is the arrival's (#1589).
     #[test]
     fn a_later_name_is_looked_up_where_the_write_path_searches() {
         let searched = |default: &str| -> Vec<Vec<String>> {
@@ -3626,11 +3632,11 @@ mod tests {
             .map(|n| n.searched)
             .collect()
         };
+        assert_eq!(searched("('ix_new'::regclass)::text"), [["pg_catalog"]]);
         assert_eq!(
-            searched("('ix_new'::regclass)::text"),
-            [["pg_catalog", "app"]]
+            searched("('app.ix_new'::regclass)::text"),
+            [Vec::<String>::new()]
         );
-        assert_eq!(searched("('app.ix_new'::regclass)::text"), [["app"]]);
         assert!(searched("('other.ix_new'::regclass)::text").is_empty());
     }
 
