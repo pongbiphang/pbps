@@ -2872,7 +2872,8 @@ Measured on 16.15 and 18.6:
   creates its partitions permanent all the same.
 - A table `ATTACH`ed as a partition keeps both.
 - A permanent table's foreign key to a partitioned parent with an `UNLOGGED`
-  partition is accepted, whichever is made first.
+  partition is accepted, whichever is made first, though the same key naming
+  the `UNLOGGED` table itself is refused.
 
 **The shape.** A `partitions:` entry takes `unlogged: true` and
 `storage_parameters:`, written and spelled as a table's, after its checks and
@@ -2889,6 +2890,16 @@ still leave the tree out, named, as they leave a table out.
 table's do, so the post-apply check holds them from the first read that finds
 it, as a table's. `validate_partition` holds the parameters to the table's
 spelling rules.
+
+**A permanent key through the parent is refused.** The engine's acceptance
+above is a hole in its own rule: a crash empties the `UNLOGGED` partition and
+leaves the referencing rows pointing at nothing. The differ therefore extends
+its refusal of a permanent table's key to an unlogged one (#1443) to a key
+whose target is a partitioned table with a declared `UNLOGGED` partition, as
+`PermanentReferencesUnloggedPartition`, naming the partition, whether the key
+or the partition comes first. A database already in that state pulls into
+declarations the plan refuses by name; the remedy is the one the message
+gives. A referencing table pbps does not manage is not seen (#1595).
 
 **A detach keeps them.** DEC-1544.1's shape check compares the detached table
 with its parent's settings overlaid by the partition's own persistence and

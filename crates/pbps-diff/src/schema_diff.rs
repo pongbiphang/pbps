@@ -107,6 +107,25 @@ pub enum DiffError {
         target: TableName,
     },
 
+    /// A permanent table whose foreign key references a partitioned table
+    /// with an unlogged partition (#1580, DEC-1580.1). PostgreSQL accepts
+    /// it, measured on 16 and 18, whichever is made first: it refuses only a
+    /// key naming the unlogged table itself. A crash empties the partition
+    /// and leaves the referencing rows pointing at nothing, which is what
+    /// the direct refusal exists to prevent.
+    #[error(
+        "{table}: its foreign key `{key}` references {target}, whose partition {partition} \
+         is unlogged; a crash would empty {partition} and leave rows of {table} referencing \
+         nothing, which PostgreSQL does not refuse through a partitioned table. Make \
+         {partition} permanent, or {table} unlogged."
+    )]
+    PermanentReferencesUnloggedPartition {
+        table: TableName,
+        key: String,
+        target: TableName,
+        partition: TableName,
+    },
+
     /// A change to a table with `system_time`, on either side, other than
     /// creating it or adding a nullable column (#1176, #1177, DEC-1177.1).
     /// The engine refuses some (dropping the table, 13552; altering the
@@ -435,6 +454,21 @@ fn diff_partial_rebuilding(
                     table: name.clone(),
                     key: key.clone(),
                     target: fk.references_table.clone(),
+                });
+            }
+            // Through a partitioned table, which the engine lets pass: the
+            // key reaches each of its partitions (#1580).
+            for (partition, _) in declared.schema.tables.iter().filter(|(_, t)| {
+                t.unlogged
+                    && t.partition_of
+                        .as_ref()
+                        .is_some_and(|of| of.parent == fk.references_table)
+            }) {
+                errs.push(DiffError::PermanentReferencesUnloggedPartition {
+                    table: name.clone(),
+                    key: key.clone(),
+                    target: fk.references_table.clone(),
+                    partition: partition.clone(),
                 });
             }
         }
@@ -6022,6 +6056,48 @@ mod tests {
             "{:?}",
             created.changes
         );
+
+        // A permanent table's key to the parent reaches the unlogged
+        // partition, which the engine does not refuse: refused here, created
+        // with the tree or added under a standing one (#1580 review).
+        let r: TableName = "app.r".parse().unwrap();
+        let referencing = |unlogged: bool| {
+            let mut t = table(&[("ts", Column::new(ty("date")))]);
+            t.foreign_keys.insert(
+                "r_ev".into(),
+                ForeignKey {
+                    columns: vec!["ts".into()],
+                    references_table: "app.ev".parse().unwrap(),
+                    references_columns: vec!["ts".into()],
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+            t.unlogged = unlogged;
+            t
+        };
+        let mut keyed = tree.clone();
+        keyed.tables.insert(r.clone(), referencing(false));
+        let mut standing = keyed.clone();
+        standing.tables.remove(&p);
+        for base in [Schema::default(), standing] {
+            let errors = outcome(&base, &keyed).expect_err("refused");
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    DiffError::PermanentReferencesUnloggedPartition { table, partition, .. }
+                        if *table == r && *partition == p
+                )),
+                "{errors:?}"
+            );
+        }
+        // Negative: an unlogged referencing table, or a permanent partition.
+        let mut unlogged_ref = tree.clone();
+        unlogged_ref.tables.insert(r.clone(), referencing(true));
+        outcome(&Schema::default(), &unlogged_ref).expect("an unlogged table may reference it");
+        let mut permanent = keyed.clone();
+        permanent.tables.get_mut(&p).unwrap().unlogged = false;
+        outcome(&Schema::default(), &permanent).expect("every partition permanent");
 
         // Changed on a standing partition: refused by name (#1581).
         for (edit, expected) in [
