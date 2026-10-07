@@ -135,6 +135,9 @@ async fn the_actual_private_backend_and_controls_remain_bound_during_compilation
             .is_err(),
         "another database on this runtime cannot be a separate target"
     );
+    crate::resolver::fixture_on_public(&mut connection)
+        .await
+        .unwrap();
     connection
         .execute("CREATE TABLE pbps_kernel_table (id integer NOT NULL)")
         .await

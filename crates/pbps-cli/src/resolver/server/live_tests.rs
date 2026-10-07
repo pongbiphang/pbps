@@ -251,6 +251,9 @@ async fn a_supported_dedicated_server_compiles_declarations_and_removes_only_its
         Some(database.as_str()),
         "compilation must happen in the run's own database"
     );
+    crate::resolver::fixture_on_public(connection)
+        .await
+        .unwrap();
     connection
         .execute("CREATE TABLE pbps_server_table (id integer)")
         .await
@@ -369,6 +372,9 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
         let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
         server.check().await.expect("an untouched run stays valid");
         let mut other = session(&configured, maintenance()).await;
+        crate::resolver::fixture_on_public(&mut other.connection)
+            .await
+            .unwrap();
         other
             .connection
             .execute("CREATE TABLE pbps_restored (id integer)")

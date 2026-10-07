@@ -69,6 +69,7 @@ async fn host_information_cannot_enter_either_private_runtime_view() {
                 guarded_tasks(&guard, FORWARDER_PRIVILEGES).map_err(|_| "forwarder guard check".to_owned())?;
             }
         }
+        crate::resolver::fixture_on_public(&mut state.connection).await.map_err(|error| error.to_string())?;
         state.connection.execute("CREATE TABLE pbps_host_file_table (id integer)").await.map_err(|error| error.to_string())?;
         state.connection.execute("CREATE VIEW pbps_host_file_view AS SELECT id FROM pbps_host_file_table").await.map_err(|error| error.to_string())?;
         assert_eq!(state.connection.query("SELECT COUNT(*) FROM pbps_host_file_view").await.map_err(|error| error.to_string())?.len(), 1);

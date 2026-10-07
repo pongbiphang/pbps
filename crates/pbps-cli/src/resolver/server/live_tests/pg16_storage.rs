@@ -194,6 +194,7 @@ async fn the_supplied_storage_layout_admits_its_observed_major_and_survives_live
         if rows.len() != 1 { return Err("the scratch session did not return one identity row".into()); }
         let database = text(&rows[0], "name")?;
         let login = text(&rows[0], "login")?;
+        crate::resolver::fixture_on_public(connection).await.map_err(|error| error.to_string())?;
         connection.execute("CREATE TABLE pbps_profile_probe (id integer)").await
             .map_err(|error| error.to_string())?;
         connection.execute("CREATE VIEW pbps_profile_view AS SELECT id FROM pbps_profile_probe").await

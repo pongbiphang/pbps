@@ -70,6 +70,9 @@ async fn native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_co
             state.control.container_id().to_owned(),
             state.workload.container_id().to_owned(),
         ];
+        crate::resolver::fixture_on_public(&mut state.connection)
+            .await
+            .unwrap();
         state
             .connection
             .execute("CREATE TABLE pbps_native_factory_table (id integer)")

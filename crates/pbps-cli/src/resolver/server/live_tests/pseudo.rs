@@ -36,6 +36,9 @@ async fn foreign_pseudo_roots_refuse_admission_and_discard_live_analysis() {
         changed.restore();
         let mut run = open_when_exclusive(&mut target).await;
         let connection = &mut run.scratch.as_mut().unwrap().connection;
+        crate::resolver::fixture_on_public(connection)
+            .await
+            .unwrap();
         connection
             .execute("CREATE TABLE pbps_pseudo_table (id integer)")
             .await
