@@ -2793,6 +2793,40 @@ pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String
     problems
 }
 
+/// A foreign key whose referenced table is another table's declared history
+/// (#1513). A history has no key to reference: SQL Server refuses a primary
+/// key, a UNIQUE constraint or a unique index on one (13558, 13583, 13741),
+/// and refuses the foreign key itself (13565, measured on 17.0). The referenced
+/// table is declared nowhere, which a foreign key may otherwise do, so without
+/// this the engine refuses `ADD FOREIGN KEY` mid-apply.
+pub fn check_history_references(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+    let histories: BTreeMap<&TableName, &TableName> = schema
+        .tables
+        .iter()
+        .filter_map(|(name, t)| {
+            t.system_time
+                .as_ref()
+                .and_then(|st| st.versioning.as_ref())
+                .map(|v| (&v.history, name))
+        })
+        .collect();
+    let mut problems = Vec::new();
+    for (table_name, table) in &schema.tables {
+        for (fk_name, fk) in &table.foreign_keys {
+            if let Some(versioned) = histories.get(&fk.references_table) {
+                problems.push(format!(
+                    "foreign key `{fk_name}` on `{table_name}` references `{}`, the history \
+                     table of `{versioned}`; a history table has no key a foreign key can \
+                     reference, and {} refuses one there",
+                    fk.references_table,
+                    dialect.name()
+                ));
+            }
+        }
+    }
+    problems
+}
+
 /// An `INSTEAD OF` trigger declared on a system-versioned table (#1176):
 /// SQL Server refuses one there (13569), and takes an `AFTER` trigger, or
 /// either kind on a table with a period alone (measured on 17.0). The
@@ -4097,6 +4131,61 @@ mod tests {
                 "{history}: {problems:?}"
             );
         }
+    }
+
+    /// A foreign key to another table's declared history is refused, naming
+    /// both tables, and one to an ordinary undeclared table, or to the
+    /// versioned table itself, is not (#1513).
+    #[test]
+    fn a_foreign_key_to_a_declared_history_is_refused() {
+        let mut versioned = Table {
+            system_time: Some(pbps_model::SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: false,
+                versioning: Some(pbps_model::SystemVersioning {
+                    history: "hist.a_history".parse().unwrap(),
+                    retention: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        let fk = |to: &str| pbps_model::ForeignKey {
+            columns: vec!["a_id".into()],
+            references_table: to.parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        };
+        let with = |to: &str| {
+            let mut schema = Schema::default();
+            schema
+                .tables
+                .insert("app.a".parse().unwrap(), versioned.clone());
+            let mut child = Table::default();
+            child.foreign_keys.insert("fk_child_a".into(), fk(to));
+            schema.tables.insert("app.child".parse().unwrap(), child);
+            schema
+        };
+        for to in ["app.a", "app.elsewhere", "hist.other_history"] {
+            let problems = check_history_references(&with(to), &MinimalDialect);
+            assert!(problems.is_empty(), "{to}: {problems:?}");
+        }
+        let problems = check_history_references(&with("hist.a_history"), &MinimalDialect);
+        assert!(
+            problems.len() == 1
+                && problems[0].contains("`fk_child_a` on `app.child`")
+                && problems[0].contains("`hist.a_history`, the history table of `app.a`")
+                && problems[0].contains("no key a foreign key can reference"),
+            "{problems:?}"
+        );
+        // A versioned table's own key to its history is refused the same way.
+        versioned
+            .foreign_keys
+            .insert("fk_self".into(), fk("hist.a_history"));
+        let mut schema = Schema::default();
+        schema.tables.insert("app.a".parse().unwrap(), versioned);
+        assert_eq!(check_history_references(&schema, &MinimalDialect).len(), 1);
     }
 
     /// An INSTEAD OF trigger is refused on a versioned table, by its timing

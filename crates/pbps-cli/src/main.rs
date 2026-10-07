@@ -1671,6 +1671,10 @@ pub(crate) fn declaration_problems(
     for problem in pbps_dialect::check_history_names(schema, dialect) {
         out.push(("schema.name-collision", problem));
     }
+    // And a foreign key to a history, which has no key to reference (#1513).
+    for problem in pbps_dialect::check_history_references(schema, dialect) {
+        out.push(("dialect.rejected", problem));
+    }
     // And a partition's parent and bound (#1170).
     for problem in pbps_dialect::check_partitions(schema) {
         out.push(("dialect.rejected", problem));
@@ -3393,6 +3397,43 @@ mod tests {
         );
         assert_eq!(fk(&load("    collation: Latin1_General_CS_AS\n")), 1);
         assert_eq!(fk(&load("    collation: latin1_general_ci_as\n")), 0);
+    }
+
+    /// The declaration pass refuses a foreign key to a declared history
+    /// before any plan is made, and leaves one to the versioned table alone
+    /// (#1513).
+    #[test]
+    fn declaration_problems_refuse_a_foreign_key_to_a_history() {
+        let load = |references: &str| {
+            let versioned = pbps_load::load_table_str(
+                std::path::Path::new("t.yml"),
+                "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  vf: {type: datetime2(7), nullable: false}\n  vt: {type: datetime2(7), nullable: false}\n\nprimary_key: [id]\n\nsystem_time:\n  period: [vf, vt]\n  versioning:\n    history: dbo.t_history\n",
+            )
+            .unwrap();
+            let child = pbps_load::load_table_str(
+                std::path::Path::new("c.yml"),
+                &format!(
+                    "table: dbo.c\ncolumns:\n  t_id: {{type: int, nullable: false}}\nforeign_keys:\n  fk_c_t:\n    columns: [t_id]\n    references: {references}(id)\n"
+                ),
+            )
+            .unwrap();
+            let mut schema = pbps_model::Schema::default();
+            schema.tables.insert(versioned.name, versioned.table);
+            schema.tables.insert(child.name, child.table);
+            pbps_load::Loaded {
+                schema,
+                intents: Vec::new(),
+                hints: Default::default(),
+            }
+        };
+        let refused = |l: &pbps_load::Loaded| {
+            declaration_problems(l, &pbps_mssql::Mssql)
+                .into_iter()
+                .filter(|(id, m)| *id == "dialect.rejected" && m.contains("no key a foreign key"))
+                .count()
+        };
+        assert_eq!(refused(&load("dbo.t_history")), 1);
+        assert_eq!(refused(&load("dbo.t")), 0);
     }
 
     /// #1203: a printed resume fills `--allow "<approved-risk-classes>"`

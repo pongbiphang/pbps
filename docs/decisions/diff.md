@@ -2086,6 +2086,7 @@ review):
 | Period columns of two precisions (an omitted one is 7) | refused (13513) | validation refuses it |
 | A history name over 124 characters | its `ix_` index name is cut at 127 | validation refuses it |
 | An INSTEAD OF trigger on a versioned table | refused (13569) | validation refuses it |
+| A foreign key to a history table (which takes no key: 13558, 13583, 13741) | refused (13565) | validation refuses it (#1513) |
 | An AFTER trigger on it, or either kind with a period alone | accepted | held |
 | A cascading foreign key from or to a versioned table | accepted | held; the restriction was 2016's (#1502) |
 | A computed, identity, `xml`, `(max)` or `ntext` column | accepted | held as for any table |
