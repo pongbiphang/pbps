@@ -5372,6 +5372,58 @@ pub fn cmd_bootstrap(
         }
         anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
     })?;
+    // What a new table calls goes ahead of it, by the reordering passes
+    // `plan --db` runs on PostgreSQL (#1585, DEC-942.1, DEC-1364.1): a
+    // default or generated column calling a declared function. They read no
+    // catalog, so the `--sql` script gets them too. Into an empty database
+    // nothing is dropped or rebuilt, so no column is released and `weave`
+    // has nothing to add; SQL Server needs none, as
+    // `engine::account_for_module_dependents` says.
+    let mut cs = cs;
+    if dialect.name() == "postgres" {
+        let decisions = crate::dependents::take_public_execution(&mut cs);
+        let ordered = crate::dependents::split_new_tables(&mut cs, &[&ids], dialect.as_ref())
+            .and_then(|_| {
+                crate::dependents::after_the_rebuilds(
+                    &mut cs,
+                    &BTreeSet::new(),
+                    &loaded.hints.module_deps,
+                )
+            });
+        ordered.map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
+        crate::dependents::settle_public_execution(&mut cs, decisions);
+    }
+    // And the check `plan --db` runs on that final order (DEC-1576.1): an
+    // expression naming, in a literal, a relation created only after it is
+    // refused with the two-plan remedy, before any script or DDL, rather
+    // than rolled back by the engine. A qualified name is refused offline.
+    // An unqualified one may be found ahead on its path, which only the
+    // target can say: asked of it with `--db`, before any script is written,
+    // and refused without one. One refusal names them all.
+    let later = if dialect.name() == "postgres" {
+        crate::dependents::names_a_later_relation(&cs, dialect.as_ref())
+    } else {
+        Vec::new()
+    };
+    let (unqualified, mut refused): (Vec<_>, Vec<_>) =
+        later.into_iter().partition(|n| !n.searched.is_empty());
+    match target {
+        Some(target) if !unqualified.is_empty() => {
+            db::runtime()?.block_on(async {
+                let mut conn = db::connect(target).await?;
+                for name in unqualified {
+                    if !crate::engine::resolves_now(&mut conn, &name).await? {
+                        refused.push(name);
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
+        Some(_) => {}
+        None => refused.extend(unqualified),
+    }
+    crate::dependents::later_relation_refusal(&refused)
+        .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
 
     if let Some(path) = sql_out {
         let script = crate::render_sql(&cs, dialect.as_ref(), "an empty database")?;

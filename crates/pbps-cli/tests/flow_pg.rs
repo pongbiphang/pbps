@@ -17643,3 +17643,300 @@ fn a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_dep
         1
     );
 }
+
+/// A bootstrap orders what a new table calls ahead of it, as `plan --db`
+/// does (#1585): a column default and a generated column calling declared
+/// functions bootstrap an empty database, verify and replan empty. Without
+/// the reordering passes the table was created first and the whole
+/// bootstrap rolled back on `function … does not exist`. The negative: a
+/// table that calls nothing is created where the differ puts it, before the
+/// functions, so the passes move only what calls one. A partitioned parent
+/// held behind its function takes its partition with it (#1586), and so does
+/// one whose generated column calls a built-in sharing a declared function's
+/// name, through bootstrap and through `plan --db` and `apply` alike.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
+    let server = server();
+    let source = OwnDatabase::new(&server, "boot-1585");
+    let target = OwnDatabase::new(&server, "boot-1585-target");
+    let planned = OwnDatabase::new(&server, "boot-1585-planned");
+    let (src, tgt) = (
+        source.connection().to_owned(),
+        target.connection().to_owned(),
+    );
+    on_server(
+        &src,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.zz() RETURNS text LANGUAGE sql IMMUTABLE RETURN 'x'; \
+         CREATE FUNCTION app.zz_double(i integer) RETURNS integer \
+             LANGUAGE sql IMMUTABLE RETURN i * 2; \
+         CREATE TABLE app.t (id integer, note text DEFAULT app.zz(), \
+             g integer GENERATED ALWAYS AS (app.zz_double(id)) STORED); \
+         CREATE TABLE app.a_plain (id integer); \
+         CREATE TABLE app.ev (k integer NOT NULL, \
+             g integer GENERATED ALWAYS AS (app.zz_double(k)) STORED) PARTITION BY RANGE (k); \
+         CREATE TABLE app.ev_1 PARTITION OF app.ev FOR VALUES FROM (0) TO (10); \
+         CREATE FUNCTION app.abs() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; \
+         CREATE TABLE app.ab (k integer NOT NULL, \
+             g integer GENERATED ALWAYS AS (abs(k)) STORED) PARTITION BY RANGE (k); \
+         CREATE TABLE app.ab_1 PARTITION OF app.ab FOR VALUES FROM (0) TO (10)",
+    );
+    let d = Demo::new("boot-1585");
+    succeeds(d.run(&["pull", "--db", &src]));
+    d.commit();
+
+    // The script orders each function ahead of the table that calls it,
+    // and leaves the table that calls nothing ahead of both.
+    let sql = d.dir.join("boot.sql");
+    succeeds(d.run(&["bootstrap", "--sql", sql.to_str().unwrap()]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} is not in:\n{script}"))
+    };
+    let table = at("CREATE TABLE \"app\".\"t\"");
+    assert!(at("CREATE FUNCTION \"app\".\"zz\"\n") < table, "{script}");
+    assert!(
+        at("CREATE FUNCTION \"app\".\"zz_double\"") < table,
+        "{script}"
+    );
+    assert!(
+        at("CREATE TABLE \"app\".\"a_plain\"") < at("CREATE FUNCTION \"app\".\"zz\"\n"),
+        "{script}"
+    );
+    // Each parent before its partition (#1586).
+    assert!(
+        at("CREATE TABLE \"app\".\"ev\" (") < at("CREATE TABLE \"app\".\"ev_1\""),
+        "{script}"
+    );
+    assert!(
+        at("CREATE TABLE \"app\".\"ab\" (") < at("CREATE TABLE \"app\".\"ab_1\""),
+        "{script}"
+    );
+
+    on_server(&tgt, "CREATE SCHEMA app");
+    succeeds(d.run(&["bootstrap", "--db", &tgt]));
+    succeeds(d.run(&["verify", "--db", &tgt]));
+    let next = succeeds(d.run(&["plan", "--db", &tgt]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    on_server(&tgt, "INSERT INTO app.t (id) VALUES (3)");
+    assert_eq!(
+        scalar(
+            &tgt,
+            "SELECT count(*) FROM app.t WHERE note = 'x' AND g = 6"
+        ),
+        1
+    );
+    on_server(&tgt, "INSERT INTO app.ev (k) VALUES (4)");
+    assert_eq!(scalar(&tgt, "SELECT count(*) FROM app.ev_1 WHERE g = 8"), 1);
+
+    // The same tables and functions through `plan --db` and `apply`
+    // (#1586): a project declaring only the unrelated table bootstraps the
+    // database, then gains the rest, which one plan creates. Its own ids
+    // file, minted for what it declares: a bootstrap records every uid it is
+    // given, built or not (#1600).
+    let pln = planned.connection().to_owned();
+    on_server(&pln, "CREATE SCHEMA app");
+    let d = {
+        let later = Demo::new("boot-1585-planned");
+        std::fs::copy(
+            d.dir.join("schema/app.a_plain.yml"),
+            later.dir.join("schema/app.a_plain.yml"),
+        )
+        .unwrap();
+        succeeds(later.run(&["plan"]));
+        later.commit();
+        succeeds(later.run(&["bootstrap", "--db", &pln]));
+        for entry in std::fs::read_dir(d.dir.join("schema")).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::copy(
+                &path,
+                later.dir.join("schema").join(path.file_name().unwrap()),
+            )
+            .unwrap();
+        }
+        succeeds(later.run(&["plan"]));
+        later.commit();
+        later
+    };
+    let plan = d.dir.join("first.json");
+    succeeds(d.run(&["plan", "--db", &pln, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, &pln, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", &pln]));
+    let next = succeeds(d.run(&["plan", "--db", &pln]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+/// A bootstrap whose reordering moves a relation after an expression naming
+/// it in a literal is refused by name before any script or DDL, as `plan
+/// --db` refuses it (DEC-1576.1, #1599 review): an expression index on
+/// `abs(k)` beside a declared `app.abs()` follows the function, and a
+/// default reading `'app.ix_a'::regclass` would otherwise roll the bootstrap
+/// back. So would a function whose body reads it, through its own
+/// `search_path` from another schema too. The database stays empty,
+/// and the refusal's two-plan remedy deploys it. An unqualified name, which
+/// only the target can settle, is refused before `--sql` writes a script
+/// beside `--db`. Negative: without the literals the same declarations
+/// bootstrap.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
+    let server = server();
+    let source = OwnDatabase::new(&server, "boot-later");
+    let target = OwnDatabase::new(&server, "boot-later-target");
+    let plain = OwnDatabase::new(&server, "boot-later-plain");
+    let both = OwnDatabase::new(&server, "boot-later-both");
+    let (src, tgt) = (
+        source.connection().to_owned(),
+        target.connection().to_owned(),
+    );
+    on_server(
+        &src,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.abs() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; \
+         CREATE TABLE app.a (k integer); \
+         CREATE INDEX ix_a ON app.a (abs(k)); \
+         CREATE TABLE app.z (r text DEFAULT ('app.ix_a'::regclass)::text); \
+         CREATE FUNCTION app.reader() RETURNS integer LANGUAGE sql \
+             RETURN ('app.ix_a'::regclass)::oid::integer; \
+         CREATE SCHEMA other; \
+         CREATE FUNCTION other.across() RETURNS integer LANGUAGE sql \
+             SET search_path = app, pg_temp \
+             AS $$ SELECT ('ix_a'::regclass)::oid::integer $$",
+    );
+    let d = Demo::new("boot-later");
+    succeeds(d.run(&["pull", "--db", &src]));
+    d.commit();
+    let z = d.dir.join("schema/app.z.yml");
+    let declared = std::fs::read_to_string(&z).unwrap();
+    let reader = d.dir.join("schema/app.reader%28%29.function.yml");
+    let reads = std::fs::read_to_string(&reader).unwrap();
+    let across = d.dir.join("schema/other.across%28%29.function.yml");
+    let reads_across = std::fs::read_to_string(&across).unwrap();
+
+    let sql = d.dir.join("boot.sql");
+    for args in [
+        vec!["bootstrap", "--sql", sql.to_str().unwrap()],
+        vec!["bootstrap", "--db", &tgt],
+    ] {
+        let o = d.run(&args);
+        assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
+        assert!(
+            stderr(&o).contains("names a relation this plan creates later")
+                && stderr(&o).contains("app.z.r's default or expression names app.ix_a")
+                && stderr(&o).contains("app.reader() names app.ix_a")
+                && stderr(&o).contains("other.across() names app.ix_a"),
+            "{args:?}: {}",
+            stderr(&o)
+        );
+    }
+    assert!(!sql.exists(), "no script is written");
+    assert_eq!(
+        scalar(
+            &tgt,
+            "SELECT count(*) FROM pg_namespace WHERE nspname = 'app'"
+        ),
+        0,
+        "nothing was built"
+    );
+
+    // The remedy: the expressions in a second plan, once the index stands.
+    std::fs::write(&z, "table: app.z\ncolumns:\n  r: {type: text}\n").unwrap();
+    std::fs::remove_file(&reader).unwrap();
+    std::fs::remove_file(&across).unwrap();
+    d.commit();
+    on_server(&tgt, "CREATE SCHEMA app; CREATE SCHEMA other");
+    succeeds(d.run(&["bootstrap", "--db", &tgt]));
+    std::fs::write(&z, &declared).unwrap();
+    std::fs::write(&reader, &reads).unwrap();
+    std::fs::write(&across, &reads_across).unwrap();
+    d.commit();
+    let plan = d.dir.join("second.json");
+    succeeds(d.run(&["plan", "--db", &tgt, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, &tgt, &plan, &[]));
+    let next = succeeds(d.run(&["plan", "--db", &tgt]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // Unqualified, the name may be `pg_catalog`'s: asked of the target,
+    // and refused before `--sql` writes a script beside `--db`.
+    std::fs::remove_file(&reader).unwrap();
+    std::fs::remove_file(&across).unwrap();
+    std::fs::write(
+        &z,
+        declared.replace("'app.ix_a'::regclass", "'ix_a'::regclass"),
+    )
+    .unwrap();
+    d.commit();
+    let b = both.connection().to_owned();
+    on_server(&b, "CREATE SCHEMA app");
+    let script = d.dir.join("both.sql");
+    let o = d.run(&["bootstrap", "--sql", script.to_str().unwrap(), "--db", &b]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("app.z.r's default or expression names app.ix_a"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!script.exists(), "no script is written");
+
+    // Negative: no literal, nothing refused.
+    let p = plain.connection().to_owned();
+    std::fs::write(
+        &z,
+        "table: app.z\ncolumns:\n  r: {type: text, default: \"'x'\"}\n",
+    )
+    .unwrap();
+    d.commit();
+    on_server(&p, "CREATE SCHEMA app");
+    succeeds(d.run(&["bootstrap", "--db", &p]));
+}
+/// #1604: a routine's own `SET search_path`, in the form `pull` declares
+/// (`SET search_path TO 'other', 'pg_temp'`), is where its string body's
+/// unqualified name is looked up. `app.reads()` names `'k'`, which is
+/// `other.k`; the bootstrap's reordering moves an index `app.k` after it,
+/// which the routine never names, so the plan is not refused and deploys.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_bootstrap_reads_a_routines_own_search_path_as_pulled() {
+    let server = server();
+    let source = OwnDatabase::new(&server, "boot-own-path");
+    let target = OwnDatabase::new(&server, "boot-own-path-target");
+    let (src, tgt) = (
+        source.connection().to_owned(),
+        target.connection().to_owned(),
+    );
+    on_server(
+        &src,
+        "CREATE SCHEMA other; \
+         CREATE TABLE other.k (id integer); \
+         CREATE SCHEMA app; \
+         CREATE FUNCTION app.abs() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; \
+         CREATE TABLE app.a (k integer); \
+         CREATE INDEX k ON app.a (abs(k)); \
+         CREATE FUNCTION app.reads() RETURNS integer LANGUAGE sql \
+             SET search_path = other, pg_temp \
+             AS $$ SELECT ('k'::regclass)::oid::integer $$",
+    );
+    let d = Demo::new("boot-own-path");
+    succeeds(d.run(&["pull", "--db", &src]));
+    d.commit();
+    let declared =
+        std::fs::read_to_string(d.dir.join("schema/app.reads%28%29.function.yml")).unwrap();
+    assert!(
+        declared.contains("SET search_path TO 'other', 'pg_temp'"),
+        "{declared}"
+    );
+    on_server(&tgt, "CREATE SCHEMA app; CREATE SCHEMA other");
+    succeeds(d.run(&["bootstrap", "--db", &tgt]));
+    assert_eq!(
+        scalar(
+            &tgt,
+            "SELECT count(*) FROM (SELECT 1) AS one \
+             WHERE app.reads() = 'other.k'::regclass::oid::integer"
+        ),
+        1,
+        "the body reads other.k"
+    );
+}

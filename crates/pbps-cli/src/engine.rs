@@ -2351,7 +2351,7 @@ pub async fn account_for_module_dependents(
 /// Whether a literal [`crate::dependents::names_a_later_relation`] read as a
 /// later relation already resolves to one on the target, searching its
 /// schemas in order as the write path would (#1589).
-async fn resolves_now(
+pub(crate) async fn resolves_now(
     conn: &mut Conn,
     name: &crate::dependents::LaterName,
 ) -> anyhow::Result<bool> {

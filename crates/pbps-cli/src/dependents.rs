@@ -1209,22 +1209,122 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
         let Some(scope) = expression_schema(&p.change) else {
             continue;
         };
+        // Where an unqualified name is looked up, in order: `pg_catalog`
+        // ahead of the write path, the expression's own schema (`None` is a
+        // path the scan cannot read).
+        let searched = |path: Vec<String>| {
+            let mut path: Vec<String> = path.into_iter().filter(|s| s != "pg_temp").collect();
+            if !path.iter().any(|s| s == "pg_catalog") {
+                path.insert(0, "pg_catalog".to_owned());
+            }
+            Some(path)
+        };
+        let written = searched(vec![scope.to_owned()]);
+        // A routine's string body is analysed under its own `SET
+        // search_path`, which the engine applies before the validator runs;
+        // an atomic body and a view are parsed under the session's, the write
+        // path. Measured on 16 and 18 (#1599 review).
+        // Only a routine's body is a string the engine analyses: a view's
+        // or a trigger's literals are data, read once (#1599 review).
+        let header = if let Change::CreateModule { module, .. } | Change::AlterModule { module, .. } =
+            &p.change
+            && matches!(module.kind, ModuleKind::Function | ModuleKind::Procedure)
+        {
+            Some(routine_header(&module.definition, dialect))
+        } else {
+            None
+        };
+        let own = header.as_ref().map(|h| match &h.path {
+            Some(Some(path)) => searched(path.clone()),
+            Some(None) => written.clone(),
+            None => None,
+        });
         for (whose, text) in expressions_set(&p.change) {
-            for literal in dialect.lexicon().string_literals(&text) {
+            let outer = dialect.lexicon().string_literals(&text);
+            // A routine's string body is itself a literal, and its own
+            // literals are bound as it is created: under the
+            // `check_function_bodies = on` the framing pins, a SQL body is
+            // analysed then, as an atomic body and a view are. So they are
+            // read one level in. A PL/pgSQL body binds them only when it
+            // runs, and is read alike: a refusal there costs a second plan, a
+            // missed one a failed apply (#1599 review).
+            // A header the scan could not read to its end may hold its body
+            // in any literal, so every one is read one level in.
+            let inner: Vec<String> = match &header {
+                Some(RoutineHeader {
+                    body: Some(body), ..
+                }) => dialect.lexicon().string_literals(body),
+                Some(RoutineHeader { unsure: true, .. }) => outer
+                    .iter()
+                    .flat_map(|l| dialect.lexicon().string_literals(l))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            // A string body's literals are only checked as it is created, so
+            // they bind nothing: any schema on the path that holds the name
+            // then satisfies them. Every other literal is bound where it is
+            // first found (#1599 review).
+            let literals = outer.into_iter().map(|l| (l, &written, false)).chain(
+                inner
+                    .into_iter()
+                    .map(|l| (l, own.as_ref().unwrap_or(&written), true)),
+            );
+            for (literal, path, checked_only) in literals {
                 let Some((schema, name)) = relation_literal(&literal) else {
                     continue;
                 };
-                if let Some((_, relation)) = arrivals.iter().find(|(at, relation)| {
-                    *at > i
-                        && name == relation.name
-                        && schema.as_deref().unwrap_or(scope) == relation.schema
-                }) {
-                    // Only `pg_catalog`, searched ahead of the write path,
-                    // can answer for an unqualified name; see `LaterName`.
-                    let searched = match schema {
-                        Some(_) => Vec::new(),
-                        None => vec!["pg_catalog".to_owned()],
-                    };
+                let later = |s: &str| {
+                    arrivals
+                        .iter()
+                        .find(|(at, r)| *at > i && r.name == name && r.schema == s)
+                        .map(|(_, r)| r)
+                };
+                let reference = match (&schema, path) {
+                    (Some(s), _) => later(s).map(|r| (r, Vec::new())),
+                    // The path, in order, up to the first schema the name
+                    // binds in: a relation the plan made before the
+                    // expression binds it there, one made after is a
+                    // reference, and the schemas ahead of it are the
+                    // target's to answer for (see `LaterName`).
+                    // Checked only: refused when no schema on the path holds
+                    // the name by then, and one will later. The target is
+                    // asked about every schema the plan does not fill later.
+                    (None, Some(path)) if checked_only => {
+                        let earlier = path.iter().any(|s| {
+                            arrivals
+                                .iter()
+                                .any(|(at, r)| *at <= i && r.name == name && r.schema == *s)
+                        });
+                        let first = path.iter().find_map(|s| later(s));
+                        first.filter(|_| !earlier).map(|r| {
+                            let asked = path.iter().filter(|s| later(s).is_none()).cloned();
+                            (r, asked.collect())
+                        })
+                    }
+                    (None, Some(path)) => {
+                        let mut hit = None;
+                        for (k, s) in path.iter().enumerate() {
+                            if arrivals
+                                .iter()
+                                .any(|(at, r)| *at <= i && r.name == name && r.schema == *s)
+                            {
+                                break;
+                            }
+                            if let Some(r) = later(s) {
+                                hit = Some((r, path[..k].to_vec()));
+                                break;
+                            }
+                        }
+                        hit
+                    }
+                    // A path the scan cannot read: an arrival of that name
+                    // in any schema may be the one, so it is read as one.
+                    (None, None) => arrivals
+                        .iter()
+                        .find(|(at, r)| *at > i && r.name == name)
+                        .map(|(_, r)| (r, vec!["pg_catalog".to_owned()])),
+                };
+                if let Some((relation, searched)) = reference {
                     found.push(LaterName {
                         what: format!("{whose} names {relation}, which the plan creates after it"),
                         searched,
@@ -1235,6 +1335,275 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
         }
     }
     found
+}
+
+/// A word of a routine's header.
+struct HeaderWord {
+    /// The offset it ends at, which is the definition's.
+    end: usize,
+    /// A quoted identifier decoded, the rest folded.
+    text: String,
+    quoted: bool,
+}
+
+impl HeaderWord {
+    /// Whether this is the keyword `kw`, which a quoted identifier never is.
+    fn is(&self, kw: &str) -> bool {
+        !self.quoted && self.text == kw
+    }
+}
+
+/// A routine header's depth-zero words, with the offsets they end at, which
+/// are the definition's: `header` blanks byte for byte. A parameter or a
+/// return column is at depth one. Where the header ends is
+/// [`routine_header`]'s to say.
+fn header_words(definition: &str, dialect: &dyn Dialect) -> Vec<HeaderWord> {
+    let header = dialect.lexicon().header(definition);
+    let word = dialect.lexicon().identifier_continues;
+    let mut words: Vec<HeaderWord> = Vec::new();
+    let mut depth = 0usize;
+    let mut chars = header.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '"' => {
+                let mut name = String::new();
+                let mut end = header.len();
+                while let Some((i, c)) = chars.next() {
+                    if c == '"' {
+                        if chars.peek().map(|(_, n)| *n) == Some('"') {
+                            name.push('"');
+                            chars.next();
+                        } else {
+                            end = i + 1;
+                            break;
+                        }
+                    } else {
+                        name.push(c);
+                    }
+                }
+                if depth == 0 {
+                    words.push(HeaderWord {
+                        end,
+                        text: name,
+                        quoted: true,
+                    });
+                }
+            }
+            c if word(c) => {
+                let mut end = at + c.len_utf8();
+                while let Some((i, c)) = chars.peek().copied() {
+                    if !word(c) {
+                        break;
+                    }
+                    end = i + c.len_utf8();
+                    chars.next();
+                }
+                if depth == 0 {
+                    let w = dialect.fold_ident(&header[at..end]).into_owned();
+                    words.push(HeaderWord {
+                        end,
+                        text: w,
+                        quoted: false,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    words
+}
+
+/// What [`names_a_later_relation`] reads from a routine's header.
+struct RoutineHeader {
+    /// Its own `SET search_path`: `Some(None)` when it sets none,
+    /// `Some(Some(schemas))` in order, and `None` when the clause is not in a
+    /// form the scan reads, which the caller reads as any schema (#1604).
+    path: Option<Option<Vec<String>>>,
+    /// Its string body, the literal after its `AS`: the only literal whose
+    /// own literals the engine analyses as it creates the routine. An atomic
+    /// body has none.
+    body: Option<String>,
+    /// Whether a clause could not be read, so that where the header ends,
+    /// and so which literal is the body, is not known.
+    unsure: bool,
+}
+
+/// A routine's header, read clause by clause from the start (#1604).
+///
+/// Two spellings of `SET search_path` are read: the one
+/// `pg_get_functiondef` writes, and so `pull` declares, one single-quoted
+/// literal per schema (`TO 'a', 'b'`); and plain or double-quoted
+/// identifiers. Anything else, a dollar-quoted argument, an escape string,
+/// `FROM CURRENT`, `"$user"`, a comment, is unread: it costs a second plan
+/// where the body names a relation the plan makes later, never a failed
+/// apply. Measured on 18: the last of two clauses is the one stored, and each
+/// quoted argument is one schema, `TO 'a,b'` the schema `a,b`.
+///
+/// Each `SET` clause's value list is consumed to its end, so a schema or a
+/// value named `set`, `begin` or `return` is an entry, never a clause or a
+/// body. The body is the string after `AS`, which clauses may follow, or
+/// starts at `RETURN` or `BEGIN ATOMIC`, which comes last.
+fn routine_header(definition: &str, dialect: &dyn Dialect) -> RoutineHeader {
+    let words = header_words(definition, dialect);
+    let mut header = RoutineHeader {
+        path: Some(None),
+        body: None,
+        unsure: false,
+    };
+    let mut from = 0;
+    let mut k = 0;
+    while let Some(w) = words.get(k) {
+        k += 1;
+        if w.end <= from {
+            continue;
+        }
+        // Clauses may follow a string body, `SET search_path` among them,
+        // and the engine applies them all; the body itself is blanked, so
+        // the walk goes on past it (#1599 review).
+        if w.is("as") {
+            if header.body.is_none() {
+                header.body = definition
+                    .get(w.end..)
+                    .and_then(|rest| dialect.lexicon().string_literals(rest).into_iter().next());
+            }
+            continue;
+        }
+        if w.is("return") || (w.is("begin") && words.get(k).is_some_and(|n| n.is("atomic"))) {
+            break;
+        }
+        if !w.is("set") {
+            continue;
+        }
+        let Some(name) = words.get(k) else {
+            break;
+        };
+        k += 1;
+        // A setting's name matches in any case, quoted or not.
+        let search = name.text.eq_ignore_ascii_case("search_path");
+        match setting_value(definition, name.end, dialect, search) {
+            Some((values, end)) => {
+                if search {
+                    header.path = Some(Some(values));
+                }
+                from = end;
+            }
+            None => {
+                if search {
+                    header.path = None;
+                }
+                header.unsure = true;
+                from = name.end;
+            }
+        }
+    }
+    header
+}
+
+/// The value list of a `SET` clause whose name ends at `after`, and the
+/// offset it ends at; `None` when it is not in a form [`routine_header`]
+/// reads. A `search_path` list holds schemas, folded as the engine folds
+/// them; any other setting's entries are only stepped over.
+fn setting_value(
+    definition: &str,
+    after: usize,
+    dialect: &dyn Dialect,
+    search: bool,
+) -> Option<(Vec<String>, usize)> {
+    // The engine's own lexis throughout (#1599 review): what continues an
+    // identifier, how an unquoted one folds, and the white space between
+    // tokens, so a name reads here as the engine reads it.
+    let word = dialect.lexicon().identifier_continues;
+    fn skip(s: &str) -> &str {
+        s.trim_start_matches(is_input_space)
+    }
+    let rest = skip(definition.get(after..)?);
+    let rest = if let Some(r) = rest.strip_prefix('=') {
+        r
+    } else if rest.get(..2).is_some_and(|w| w.eq_ignore_ascii_case("to"))
+        && !rest[2..].starts_with(word)
+    {
+        &rest[2..]
+    } else {
+        return None;
+    };
+    let mut values = Vec::new();
+    let mut rest = skip(rest);
+    loop {
+        // Each part, and the bytes it takes.
+        let (value, len) = if let Some(r) = rest.strip_prefix('\'') {
+            quoted_part(r, '\'').map(|(v, n)| (v, n + 1))?
+        } else if let Some(r) = rest.strip_prefix('"') {
+            quoted_part(r, '"').map(|(v, n)| (v, n + 1))?
+        } else if !search {
+            // Another setting's bare value (`64MB`, `-1`, `on`) runs to a
+            // separator.
+            let len = rest
+                .find(|c: char| is_input_space(c) || c == ',')
+                .unwrap_or(rest.len());
+            if len == 0 {
+                return None;
+            }
+            (rest[..len].to_owned(), len)
+        } else {
+            let len = rest.find(|c: char| !word(c)).unwrap_or(rest.len());
+            let w = dialect.fold_ident(&rest[..len]).into_owned();
+            // A word glued to anything but a separator is a form this scan
+            // does not read: `E'…'`, `U&"…"`.
+            let glued = rest[len..]
+                .chars()
+                .next()
+                .is_some_and(|c| !is_input_space(c) && c != ',');
+            // A plain identifier only: one starting with a digit or holding
+            // a `$`, a dollar-quoted `$$other$$` among them, is a form this
+            // scan does not read (#1604).
+            let plain = rest[..len]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_' || !c.is_ascii())
+                && !rest[..len].contains('$');
+            if !plain || w == "from" || w == "default" || glued {
+                return None;
+            }
+            (w, len)
+        };
+        // `$user` is a schema named for whichever role runs the body.
+        if search && value == "$user" {
+            return None;
+        }
+        values.push(value);
+        rest = skip(&rest[len..]);
+        match rest.strip_prefix(',') {
+            Some(r) => rest = skip(r),
+            // The list ends at the header's end or at the next clause's
+            // keyword. Anything else, a comment among them, is a form this
+            // scan does not read, never the end of a shorter list.
+            None if rest.is_empty() || rest.starts_with(word) => {
+                return Some((values, definition.len() - rest.len()));
+            }
+            None => return None,
+        }
+    }
+}
+
+/// The contents of a part quoted with `quote`, a doubled quote standing for
+/// itself, and the byte length of the part after its opening quote; `None`
+/// when it never closes.
+fn quoted_part(after_open: &str, quote: char) -> Option<(String, usize)> {
+    let mut value = String::new();
+    let mut chars = after_open.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if c != quote {
+            value.push(c);
+        } else if chars.peek().map(|(_, n)| *n) == Some(quote) {
+            value.push(quote);
+            chars.next();
+        } else {
+            return Some((value, at + 1));
+        }
+    }
+    None
 }
 
 /// A literal [`names_a_later_relation`] reads as a relation the plan creates
@@ -1326,6 +1695,10 @@ fn expression_schema(change: &Change) -> Option<&str> {
         | Change::AddIndex { table, .. } => Some(&table.schema),
         Change::AlterColumnDefault { column, .. }
         | Change::AlterColumnExpression { column, .. } => Some(&column.table.schema),
+        // A module's body is written in its own schema, and a literal in it
+        // that the engine casts as it creates the module, an atomic body's or
+        // a view's, is bound then (#1599 review).
+        Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => Some(id.schema()),
         _ => None,
     }
 }
@@ -1361,6 +1734,18 @@ fn expressions_set(change: &Change) -> Vec<(String, String)> {
                     .filter(|(_, ix)| ix.holds_expression() || ix.filter.is_some())
                     .map(|(n, ix)| (format!("index {n} on {name}"), index_text(ix))),
             );
+            // A partition's own defaults, as a column's (#1578).
+            out.extend(
+                table
+                    .partition_of
+                    .iter()
+                    .flat_map(|of| of.columns.iter())
+                    .filter_map(|(n, own)| {
+                        own.default
+                            .clone()
+                            .map(|d| (format!("{}'s own default", name.column(n)), d))
+                    }),
+            );
             out
         }
         Change::AddColumn {
@@ -1388,6 +1773,9 @@ fn expressions_set(change: &Change) -> Vec<(String, String)> {
         Change::AddIndex {
             table, name, index, ..
         } => vec![(format!("index {name} on {table}"), index_text(index))],
+        Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
+            vec![(format!("{id}"), module.definition.clone())]
+        }
         _ => Vec::new(),
     }
 }
@@ -1743,6 +2131,12 @@ fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
             .iter()
             .flat_map(|of| of.columns.values())
             .any(|own| own.default.as_deref().is_some_and(named))
+        // A partition names its parent, which its `CREATE … PARTITION OF`
+        // needs standing: a held parent takes its partitions with it (#1586).
+        || table
+            .partition_of
+            .as_ref()
+            .is_some_and(|of| &of.parent == made)
         || table.indexes.values().any(|index| {
             index.filter.as_deref().is_some_and(named)
                 || index.columns.iter().any(|column| {
@@ -2801,6 +3195,68 @@ mod tests {
         assert!(function < table_at("app.ev_new"), "{order:?}");
         assert!(table_at("app.ev") < function, "{order:?}");
         assert!(table_at("app.ev_plain") < function, "{order:?}");
+    }
+
+    /// A new partitioned parent held behind the function its generated column
+    /// calls takes its new partitions with it, since `CREATE … PARTITION OF`
+    /// needs the parent standing (#1586): the order is function, parent,
+    /// partition. A partition of a parent that is not held keeps its place.
+    #[test]
+    fn a_held_new_parent_takes_its_new_partitions_with_it() {
+        let parent = |name: &str, generated: Option<&str>| {
+            let mut t = Table::default();
+            t.columns
+                .insert("k".into(), Column::new("integer".parse().unwrap()));
+            if let Some(expression) = generated {
+                let mut g = Column::new("integer".parse().unwrap());
+                g.generated = Some(pbps_model::Generated {
+                    expression: expression.into(),
+                    stored: true,
+                });
+                t.columns.insert("g".into(), g);
+            }
+            t.partition_by = Some(pbps_model::PartitionBy {
+                columns: vec!["k".into()],
+            });
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, name, 0),
+                name: name.parse().unwrap(),
+                table: Box::new(t),
+            }
+        };
+        let partition = |name: &str, of: &str| Change::CreateTable {
+            uid: Uid::derived(UidKind::Table, name, 0),
+            name: name.parse().unwrap(),
+            table: Box::new(Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: of.parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Table::default()
+            }),
+        };
+        let mut cs = plan(vec![
+            parent("app.ev", Some("app.f(k)")),
+            partition("app.ev_1", "app.ev"),
+            parent("app.other", None),
+            partition("app.other_1", "app.other"),
+            routine("app.f(integer)", "SELECT 1"),
+        ]);
+        rebuilds(&mut cs, &BTreeSet::new());
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let table_at = |name: &str| {
+            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.to_string() == name))
+        };
+        let function =
+            at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
+        let order = names(&cs);
+        assert!(function < table_at("app.ev"), "{order:?}");
+        assert!(table_at("app.ev") < table_at("app.ev_1"), "{order:?}");
+        // Negative: the other tree calls nothing and stays ahead.
+        assert!(table_at("app.other_1") < function, "{order:?}");
+        assert!(table_at("app.other") < table_at("app.other_1"), "{order:?}");
     }
 
     /// A new table held back for its generation expression does not drag an
@@ -3896,6 +4352,303 @@ mod tests {
         assert!(searched("('other.ix_new'::regclass)::text").is_empty());
     }
 
+    /// A routine's string body is analysed under its own `SET search_path`,
+    /// an atomic body under the write path (measured on 16 and 18, #1599
+    /// review). An unqualified name in the string body is looked up along
+    /// the routine's path, up to the first schema it binds in: ahead of that
+    /// schema the target answers, and a relation the plan makes earlier on
+    /// the path binds it. A path the scan cannot read takes any schema.
+    #[test]
+    fn a_routine_body_reads_a_name_along_its_own_search_path() {
+        let with_path = |name: &str, path: &str, body: &str| Change::CreateModule {
+            id: id(name),
+            module: Box::new(module(
+                ModuleKind::Function,
+                &format!("() RETURNS integer LANGUAGE sql {path} AS $$ {body} $$"),
+            )),
+        };
+        let index_in = |schema: &str| {
+            let mut ix = add_index("ix_new", None);
+            if let Change::AddIndex { table, .. } = &mut ix {
+                *table = TableName::new(schema, "u");
+            }
+            ix
+        };
+        let reads = "SELECT ('ix_new'::regclass)::oid::integer";
+        let searched = |changes: Vec<Change>| -> Vec<(String, Vec<String>)> {
+            names_a_later_relation(&plan(changes), &*pg())
+                .into_iter()
+                .map(|n| (n.what, n.searched))
+                .collect()
+        };
+        // In `app`, reading through `other`: an index made in `app` later
+        // is not the one it names; one made in `other` later is.
+        let own = "SET search_path = other, pg_temp";
+        assert!(searched(vec![with_path("app.f()", own, reads), index_in("app")]).is_empty());
+        let found = searched(vec![with_path("app.f()", own, reads), index_in("other")]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].0.contains("names other.ix_new"), "{found:?}");
+        assert_eq!(found[0].1, ["pg_catalog"]);
+        // In `other`, reading through `app`: the routine's schema is not
+        // where the name is looked up (the adversarial case).
+        let back = "SET search_path TO 'app', 'pg_temp'";
+        let found = searched(vec![with_path("other.f()", back, reads), index_in("app")]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        // Ahead of the schema it binds in, the target answers; a relation
+        // the plan made earlier on the path binds it there.
+        let two = "SET search_path = other, app";
+        let found = searched(vec![with_path("app.f()", two, reads), index_in("app")]);
+        assert_eq!(found[0].1, ["pg_catalog", "other"], "{found:?}");
+        assert!(
+            searched(vec![
+                index_in("other"),
+                with_path("app.f()", two, reads),
+                index_in("app")
+            ])
+            .is_empty()
+        );
+        // A string body's literal is only checked as it is created: an
+        // earlier schema on its path holding the name satisfies it though a
+        // later relation of that name arrives first on the path, and the
+        // target is asked about every schema the plan does not fill later.
+        let first_app = "SET search_path = app, other, pg_temp";
+        assert!(
+            searched(vec![
+                index_in("other"),
+                with_path("app.f()", first_app, reads),
+                index_in("app")
+            ])
+            .is_empty()
+        );
+        let found = searched(vec![
+            with_path("app.f()", first_app, reads),
+            index_in("app"),
+        ]);
+        assert_eq!(found[0].1, ["pg_catalog", "other"], "{found:?}");
+        // Path entries named like a body's start are entries, and the body
+        // after them is still read.
+        for entries in ["begin, app", "return, app"] {
+            let path = format!("SET search_path = {entries}");
+            assert_eq!(
+                searched(vec![with_path("app.f()", &path, reads), index_in("app")]).len(),
+                1,
+                "{entries}"
+            );
+        }
+        // An unread clause hides where the header ends: every literal is
+        // then read one level in, in any schema.
+        let hidden = Change::CreateModule {
+            id: id("app.h()"),
+            module: Box::new(module(
+                ModuleKind::Function,
+                &format!(
+                    "() RETURNS integer LANGUAGE sql SET search_path = $$x$$, return AS $$ {reads} $$"
+                ),
+            )),
+        };
+        assert_eq!(searched(vec![hidden, index_in("third")]).len(), 1);
+        // An atomic body is parsed under the write path, whatever the
+        // routine sets.
+        let atomic = Change::CreateModule {
+            id: id("app.g()"),
+            module: Box::new(module(
+                ModuleKind::Function,
+                "() RETURNS integer LANGUAGE sql SET search_path = other \
+                 RETURN ('ix_new'::regclass)::oid::integer",
+            )),
+        };
+        assert_eq!(searched(vec![atomic, index_in("app")]).len(), 1);
+        // A path the scan cannot read takes any schema.
+        let current = "SET search_path FROM CURRENT";
+        assert_eq!(
+            searched(vec![
+                with_path("app.f()", current, reads),
+                index_in("third")
+            ])
+            .len(),
+            1
+        );
+        // Negative: no path of its own is the write path.
+        assert!(searched(vec![with_path("app.f()", "", reads), index_in("other")]).is_empty());
+        // Negative: a literal holding quotes is data in a view and in an
+        // atomic body; only a string body is read one level in.
+        let data = |kind: ModuleKind, definition: &str| Change::CreateModule {
+            id: id("app.d()"),
+            module: Box::new(module(kind, definition)),
+        };
+        for (kind, definition) in [
+            (ModuleKind::View, "SELECT '''app.ix_new'''::text AS s"),
+            (
+                ModuleKind::Function,
+                "() RETURNS text LANGUAGE sql RETURN '''app.ix_new'''::text",
+            ),
+        ] {
+            assert!(
+                searched(vec![data(kind, definition), index_in("app")]).is_empty(),
+                "{definition}"
+            );
+        }
+        // The same quotes inside a string body are the literal it analyses.
+        assert_eq!(
+            searched(vec![
+                data(
+                    ModuleKind::Function,
+                    "() RETURNS integer LANGUAGE sql AS 'SELECT (''app.ix_new''::regclass)::oid::integer'"
+                ),
+                index_in("app")
+            ])
+            .len(),
+            1
+        );
+    }
+
+    /// The routine's own path as its header spells it, in either form the
+    /// engine accepts and `pg_get_functiondef` writes; a body's `SET` and an
+    /// atomic body's statements are no clause, and a form the scan does not
+    /// read says so rather than reading as no path.
+    #[test]
+    fn a_routine_path_is_read_from_the_header_alone() {
+        let path = |definition: &str| routine_header(definition, &*pg()).path;
+        let some = |schemas: &[&str]| Some(Some(schemas.iter().map(|s| (*s).to_owned()).collect()));
+        assert_eq!(
+            path("() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$"),
+            Some(None)
+        );
+        assert_eq!(
+            path(
+                "() RETURNS integer LANGUAGE sql SET search_path = other, pg_temp AS $$ SELECT 1 $$"
+            ),
+            some(&["other", "pg_temp"])
+        );
+        assert_eq!(
+            path(
+                "() RETURNS integer LANGUAGE sql\n SET search_path TO 'other', 'pg_temp'\nAS $$ SELECT 1 $$"
+            ),
+            some(&["other", "pg_temp"])
+        );
+        // Each quoted argument is one schema, commas and all (measured on
+        // 18); the last of two clauses is the one stored.
+        assert_eq!(
+            path("() RETURNS integer LANGUAGE sql SET search_path TO 'a,b' AS $$ SELECT 1 $$"),
+            some(&["a,b"])
+        );
+        assert_eq!(
+            path(
+                "() RETURNS integer LANGUAGE sql SET search_path = app SET search_path = other AS $$ SELECT 1 $$"
+            ),
+            some(&["other"])
+        );
+        // A quoted setting name, and a parameter named like a body's start.
+        assert_eq!(
+            path("() RETURNS integer LANGUAGE sql SET \"search_path\" = other AS $$ SELECT 1 $$"),
+            some(&["other"])
+        );
+        assert_eq!(
+            path(
+                "(begin integer) RETURNS TABLE (return integer) LANGUAGE sql SET search_path = other AS $$ SELECT 1 $$"
+            ),
+            some(&["other"])
+        );
+        assert_eq!(
+            path(
+                "() RETURNS integer LANGUAGE sql SET search_path = \"Other\", Third AS $$ SELECT 1 $$"
+            ),
+            some(&["Other", "third"])
+        );
+        // The engine's lexis (#1599 review): a setting's name in any case,
+        // quoted or not; an unquoted non-ASCII letter kept as written, since
+        // only ASCII folds; and a no-break space part of the name, since only
+        // the scanner's six characters separate.
+        assert_eq!(
+            path("() RETURNS integer LANGUAGE sql SET \"SEARCH_PATH\" = other AS $$ SELECT 1 $$"),
+            some(&["other"])
+        );
+        assert_eq!(
+            path("() RETURNS integer LANGUAGE sql SET search_path = ÄPP AS $$ SELECT 1 $$"),
+            some(&["Äpp"])
+        );
+        assert_eq!(
+            path("() RETURNS integer LANGUAGE sql SET search_path = app\u{a0} AS $$ SELECT 1 $$"),
+            some(&["app\u{a0}"])
+        );
+        // #1604: clauses are read forward, each value list to its end, so
+        // schemas named `set` and `search_path` are list entries wherever
+        // they stand, and a second clause after a quoted list still wins.
+        for (clauses, schemas) in [
+            (
+                "SET search_path = other, set, search_path, app",
+                &["other", "set", "search_path", "app"][..],
+            ),
+            (
+                "SET search_path = set, search_path, other, pg_temp",
+                &["set", "search_path", "other", "pg_temp"][..],
+            ),
+            (
+                "SET search_path TO 'app', 'pg_temp' SET search_path TO 'other', 'pg_temp'",
+                &["other", "pg_temp"][..],
+            ),
+        ] {
+            assert_eq!(
+                path(&format!(
+                    "() RETURNS integer LANGUAGE sql {clauses} AS $$ SELECT 1 $$"
+                )),
+                some(schemas),
+                "{clauses}"
+            );
+        }
+        // Another setting's list is stepped over, quoted or bare.
+        assert_eq!(
+            path(
+                "() RETURNS integer LANGUAGE sql SET work_mem = '64MB' SET statement_timeout = 0 SET search_path = other AS $$ SELECT 1 $$"
+            ),
+            some(&["other"])
+        );
+        // A clause after the string body still applies, and the body is
+        // still the string after `AS`.
+        let late = "() RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql SET search_path TO 'other', 'pg_temp'";
+        assert_eq!(path(late), some(&["other", "pg_temp"]));
+        assert_eq!(
+            routine_header(late, &*pg()).body.as_deref(),
+            Some(" SELECT 1 ")
+        );
+        // Not a clause: in the string body, or in an atomic body.
+        assert_eq!(
+            path("() RETURNS void LANGUAGE plpgsql AS $$ BEGIN SET search_path = x; END $$"),
+            Some(None)
+        );
+        assert_eq!(
+            path(
+                "(\"begin\" integer) RETURNS void LANGUAGE sql SET search_path = x BEGIN ATOMIC UPDATE app.t SET search_path = 1; END"
+            ),
+            some(&["x"])
+        );
+        assert_eq!(
+            path("() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE app.t SET search_path = 1; END"),
+            Some(None)
+        );
+        // Forms the scan does not read.
+        for unread in [
+            "SET search_path FROM CURRENT",
+            "SET search_path TO DEFAULT",
+            "SET search_path = \"$user\", public",
+            "SET search_path = E'app'",
+            "SET search_path /* c */ = app",
+            // #1604: a dollar-quoted argument, and an unquoted `$user`.
+            "SET search_path = $$other$$, app",
+            "SET search_path = $user, app",
+            // A comment inside the list: unread, never a shorter list.
+            "SET search_path TO 'app' /* note */, 'other'",
+        ] {
+            assert_eq!(
+                path(&format!(
+                    "() RETURNS integer LANGUAGE sql {unread} AS $$ SELECT 1 $$"
+                )),
+                None,
+                "{unread}"
+            );
+        }
+    }
+
     /// #1576: PostgreSQL resolves `'app.ix'::regclass` when the expression is
     /// created, so a default set before the index it names fails the apply.
     /// The plan is refused with the two-plan remedy; set after the index, or
@@ -3981,7 +4734,50 @@ mod tests {
                 &*pg()
             )
             .is_err()
+        ); // A module's body, cast as the engine creates it, and a partition's
+        // own default are read the same way (#1599 review); a module created
+        // after the index stands.
+        let reader = routine("app.f()", "SELECT ('app.ix_new'::regclass)::oid::integer");
+        let refused = refusal_of(
+            &plan(vec![reader.clone(), add_index("ix_new", None)]),
+            &*pg(),
+        )
+        .unwrap_err();
+        assert!(refused.contains("app.f() names app.ix_new"), "{refused}");
+        assert_eq!(
+            refusal_of(&plan(vec![add_index("ix_new", None), reader]), &*pg()),
+            Ok(())
         );
+        let atomic = Change::CreateModule {
+            id: id("app.g()"),
+            module: Box::new(module(
+                ModuleKind::Function,
+                "() RETURNS integer LANGUAGE sql RETURN ('app.ix_new'::regclass)::oid::integer",
+            )),
+        };
+        assert!(refusal_of(&plan(vec![atomic, add_index("ix_new", None)]), &*pg()).is_err());
+        let partition = Change::CreateTable {
+            uid: Uid::derived(UidKind::Table, "app.p", 0),
+            name: "app.p".parse().unwrap(),
+            table: Box::new(Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: [(
+                        "n".to_owned(),
+                        pbps_model::PartitionColumn {
+                            default: Some(named.to_owned()),
+                            not_null: false,
+                        },
+                    )]
+                    .into(),
+                }),
+                ..Table::default()
+            }),
+        };
+        let refused =
+            refusal_of(&plan(vec![partition, add_index("ix_new", None)]), &*pg()).unwrap_err();
+        assert!(refused.contains("app.p.n's own default"), "{refused}");
     }
 
     /// A literal is a relation's name as `regclass` input reads it: unquoted

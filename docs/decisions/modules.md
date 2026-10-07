@@ -1668,8 +1668,60 @@ corner cases. A refusal costs the user one more plan: deploy the relation,
 then the expression.
 
 `names_a_later_relation` runs on the final order, after every reordering pass,
-and only on the connected PostgreSQL path; an offline plan is a preview that
-`apply` never accepts.
+on the connected PostgreSQL path and on `bootstrap`; an offline plan is a
+preview that `apply` never accepts. Bootstrap runs the reordering passes that
+read no catalog since #1585, so it inherits the case: an index split out of a
+new table and moved after a function of the same name, a match DEC-1364.1
+makes by name alone, can follow a default that names it. It is refused before
+any script is written or DDL runs. A qualified name is refused offline; an
+unqualified one is asked of the target with `--db`, before a `--sql` script
+beside it is written, and refused with `--sql` alone, which has no target to
+ask (#1599 review).
+- **The expressions read** are a default, a partition's own default, a check,
+  an index's text and a generation expression, and a module's definition. A
+  view and an atomic body bind a literal as they are created, and so does a
+  SQL string body under the pinned `check_function_bodies = on` (measured on
+  16 and 18), so a routine's string body, the literal after its `AS`, is read
+  one level in. A view's or an atomic body's literals are data and are read
+  once. A PL/pgSQL
+  body binds its literals only when it runs; it is read alike, at the cost of
+  a second plan where it names a relation created after it (#1599 review).
+- **Where an unqualified name is looked up** is the path its expression is
+  bound under: `pg_catalog`, then the expression's own schema (the write
+  path). A routine's string body is the exception. It is analysed under the
+  routine's own `SET search_path`, which the engine applies before the
+  validator; an atomic body and a view are parsed under the session's path
+  (measured on 16 and 18). The clause is read from the header at depth zero,
+  past the parameter and return lists, in the engine's own lexis, the last of
+  two winning and each quoted argument one schema, as the engine stores them
+  (measured on 18). The header is read clause by clause, each `SET` value
+  list to its end, so an entry named `begin` or `return` never starts a
+  body; a clause it cannot read leaves where the body is unknown, and every
+  literal is then read one level in.
+- **A string body's literal binds nothing.** It is only checked as the
+  routine is created, so any schema on the routine's path that holds the
+  name by then satisfies it: it is refused only when none does and one will
+  later, and the target is asked about every schema the plan does not fill
+  later. A default, a view and an atomic body bind the relation their name
+  first finds, so for them the path is walked in order and the first later
+  relation is the reference (#1599 review).
+- **Which spellings of that clause are read** (#1604). Two forms: the one
+  `pg_get_functiondef` writes and `pull` therefore declares, one
+  single-quoted literal per schema (`SET search_path TO 'a', 'b'`), and a
+  list of plain or double-quoted identifiers. Clauses are read forward,
+  each value list to its end, so an entry named `set` stays an entry and the
+  last clause wins. Any other spelling (a dollar-quoted argument, an escape
+  string, `FROM CURRENT`, `"$user"`, a comment inside the clause) is
+  unread, and an unread path matches a later relation of that name in any
+  schema. That costs a second plan, never a failed apply. Re-implementing
+  the rest of the grammar was the alternative; five review rounds on #1599
+  each found the next slice it lacked, so the contract is the readable
+  forms, not the grammar. The path is walked in order up to the first schema
+  the name binds in: a relation the plan makes earlier binds it there, one it
+  makes later is the reference, and the target is asked about the schemas
+  ahead of it. A path the scan cannot read (`FROM CURRENT`, `"$user"`, an
+  escape string) matches a later relation of that name in any schema
+  (#1599 review).
 - **The relations a change brings:**
   - a table it creates, with the indexes, unique constraints and named
     primary key the create holds;

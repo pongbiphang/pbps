@@ -3142,7 +3142,7 @@ fn definer_path_problem(search_path: Option<&str>) -> Option<String> {
 /// space names a different schema, so the real `pg_temp` stays implicit and
 /// is searched first (#1009, measured on 18.6). Trimming it away read that
 /// path as safe.
-fn path_entries(path: &str) -> Vec<String> {
+pub fn path_entries(path: &str) -> Vec<String> {
     // Each character with whether it came from inside quotes, so that the
     // trim below can tell a separator's space from a name's.
     let mut entries: Vec<Vec<(char, bool)>> = Vec::new();
