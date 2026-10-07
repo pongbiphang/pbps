@@ -3105,14 +3105,18 @@ empties too, is not. A leaf attached with a key of its own keeps that key's
 name (measured on 16 and 18), so each copy is followed up `conparentid` to
 the key its partitioned table declares, and named through it.
 
-**What is not a referencer.** A key the plan takes away before the
-partition's `CREATE`: a table it drops or makes unlogged, or a key it drops,
-matched against the leaf's copy or the key its table declares, and compared
-under the catalog's name when the plan also renames the table. Only one that
-runs before: a staged apply commits between statements, and the persistence
-switch sorts after table creation, so making the referencing table unlogged
-takes a plan of its own first. A declared permanent referencer is refused
-before planning (DEC-1580.1) and is not read again.
+**What is not a referencer.** A key the plan takes away: a table it drops or
+makes unlogged, or a key it drops, matched against the leaf's copy or the key
+its table declares. Each is compared under the catalog's name: a persistence
+switch through its table's rename by uid, a dropped key under the name the
+rename leaves, and a dropped table as it stands, since a rename may take the
+name it frees. In a transactional plan the removal may sit anywhere, since
+both commit or neither does. In a staged plan only one that runs before the
+partition's `CREATE` counts: a staged apply commits between statements, and
+the persistence switch sorts after table creation, so there making the
+referencing table unlogged takes a plan of its own first. A declared
+permanent referencer is refused before planning (DEC-1580.1) and is not read
+again.
 
 **Why not a probe.** A preflight `Probe` returns a count, and the message has
 to name the referencing table and key. A probe that cannot run is also

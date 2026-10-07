@@ -579,6 +579,7 @@ pub async fn refuse_created_name_occupants(
 pub async fn refuse_unlogged_partition_referencers(
     conn: &mut Conn,
     cs: &ChangeSet,
+    staged: bool,
 ) -> anyhow::Result<()> {
     if conn.driver() != Driver::Postgres {
         return Ok(());
@@ -600,7 +601,7 @@ pub async fn refuse_unlogged_partition_referencers(
                  partition to",
             )
         })?;
-    crate::deploy::refuse_permanent_referencers(cs, &referencers)
+    crate::deploy::refuse_permanent_referencers(cs, &referencers, staged)
 }
 
 /// Orders a SQL Server plan's function drops after the computed columns that
