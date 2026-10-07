@@ -3169,11 +3169,16 @@ and the engine refused it at apply (3729).
 | `db_owner`, with the same schema `DENY` | the edge's row | present: the owner's override |
 
 **Decision.** Before the edges are read, `prove_referrers_visible` asks for
-database `VIEW DEFINITION`, the grant without which the view answers nothing,
-and then for an edge onto one of the objects the pass reads whose referencing
-object `sys.objects` does not show. Either refuses the plan by name: "a
-referrer of `dbo.f` is hidden from this login". A `db_owner` member sees
-through the `DENY` and passes, as the engine lets it.
+database `VIEW DEFINITION`, the grant without which the view answers nothing.
+It then looks for an edge whose referencing object `sys.objects` does not
+show, onto what a hidden referrer could block: a function the plan alters or
+drops, which a computed column anywhere may call, and a computed column the
+plan drops, matched by that column, which a schema-bound module may read.
+Either refuses the plan by name: "a referrer of `dbo.f` is hidden from this
+login". A column change or a computed column added is judged by the computed
+columns of its own table, which are visible with it, so a hidden view over
+another column of that table refuses nothing. A `db_owner` member sees through
+the `DENY` and passes, as the engine lets it.
 
 **Why not a permission check alone.** DEC-1192.1's schema-level proof answers
 for the schemas a plan creates names in; a referrer can be in any schema. A
@@ -3185,4 +3190,6 @@ the object that has a hidden referrer.
 Pinned by the live `a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge`
 (`crates/pbps-cli/tests/flow.rs`): the login denied `VIEW DEFINITION` on the
 referrer's schema is refused by name; as `sa`, and as the login once the
-`DENY` is revoked, the edge itself refuses the alter.
+`DENY` is revoked, the edge itself refuses the alter. A hidden schema-bound
+view over `dbo.k.c` refuses that column's drop by name, and a computed column
+added beside it plans.

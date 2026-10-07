@@ -3206,7 +3206,10 @@ fn computed_function_drops_follow_the_catalogs_edges() {
 /// not see `hidden.t`, whose computed column calls `dbo.f`, so its plan to
 /// alter `dbo.f` is refused by name rather than read as free to run. The same
 /// plan as `sa`, and as the login once the `DENY` is gone, is refused by the
-/// edge itself, as the engine would refuse the alter (3729).
+/// edge itself, as the engine would refuse the alter (3729). A hidden
+/// schema-bound view reading `dbo.k.c` refuses that column's drop, by name,
+/// and not a computed column added beside it, which it cannot block (#1643
+/// review).
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
@@ -3226,6 +3229,10 @@ fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
     on_server(
         own.connection(),
         "CREATE FUNCTION dbo.f (@x int) RETURNS int AS BEGIN RETURN @x * 3 END;",
+    );
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.k (id int NOT NULL CONSTRAINT pk_k PRIMARY KEY, c AS (id * 2));",
     );
     let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
     let d = Demo::new("edges1462-hidden");
@@ -3283,6 +3290,46 @@ fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
         &format!("REVOKE VIEW DEFINITION ON SCHEMA::hidden TO [{login}];"),
     );
     refused_by_edge(&d.run(&["plan", "--db", &as_login]));
+
+    // A hidden schema-bound view over `dbo.k.c`, with `dbo.f` declared as it
+    // stands again.
+    std::fs::write(&module, &text).unwrap();
+    on_server(
+        own.connection(),
+        &format!(
+            "EXEC(N'CREATE VIEW hidden.v WITH SCHEMABINDING AS SELECT c FROM dbo.k;'); \
+             DENY VIEW DEFINITION ON SCHEMA::hidden TO [{login}];"
+        ),
+    );
+    let table = d.dir.join("schema/dbo.k.yml");
+    let pulled = std::fs::read_to_string(&table).unwrap();
+    let line = pulled
+        .lines()
+        .find(|l| l.starts_with("  c: {expression:"))
+        .unwrap_or_else(|| panic!("the computed column's entry: {pulled}"))
+        .to_owned();
+    // A column added beside it: the view cannot block that, and the login
+    // plans it.
+    let added = line.replacen("  c: ", "  d: ", 1).replacen('2', "3", 1);
+    std::fs::write(
+        &table,
+        pulled.replacen(&line, &format!("{line}\n{added}"), 1),
+    )
+    .unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", &as_login]));
+    // The column itself dropped: the view could block it, unseen.
+    std::fs::write(&table, pulled.replacen(&format!("{line}\n"), "", 1)).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &as_login]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("a referrer of `dbo.k.c` is hidden from this login"),
+        "{}",
+        stderr(&o)
+    );
     on_server(&server, &format!("DROP LOGIN [{login}];"));
 }
 

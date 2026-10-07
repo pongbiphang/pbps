@@ -868,26 +868,35 @@ pub async fn expression_edges(
     Ok(out)
 }
 
-/// Proves that no referrer of `objects` is hidden from this login before
-/// [`expression_edges`] is read as complete (#1462). An empty read is
-/// otherwise "no edge" whether there is none or this login cannot see it, and
-/// the connected pass of DEC-1431.1 would neither refuse an alter or drop of a
-/// function a hidden computed column calls nor move it (3729 at apply).
+/// What a hidden referrer can keep the connected pass of DEC-1431.1 from
+/// deciding (#1462, #1643 review): a function the plan alters or drops, which
+/// a computed column anywhere may call, and a computed column the plan drops,
+/// which a schema-bound module anywhere may read. A column change is judged
+/// by the computed columns of its own table, which are visible with it, so a
+/// hidden referrer elsewhere decides nothing there.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReferrerTargets {
+    pub functions: Vec<TableName>,
+    pub computed_columns: Vec<(TableName, String)>,
+}
+
+/// Proves the connected pass may read [`expression_edges`] as complete
+/// before it does (#1462). An empty read is otherwise "no edge" whether there
+/// is none or this login cannot see it, and the pass would neither refuse an
+/// alter or drop of a function a hidden computed column calls nor move it
+/// (3729 at apply).
 ///
 /// Measured on 17.0 (DEC-1462.1): `sys.sql_expression_dependencies` returns
-/// no row at all without database `VIEW DEFINITION`, and with it returns the
-/// edge from a table hidden by a schema or object `DENY`, whose referencing
-/// object `sys.objects` does not show. So the proof is the database grant,
-/// then the engine's own edges onto `objects` against the referencing objects
-/// this login can see. A `db_owner` member's override of a `DENY` shows the
-/// object, and passes.
+/// no row at all without database `VIEW DEFINITION`, so that grant is asked
+/// whenever the edges are read. With it, the edge from an object hidden by a
+/// schema or object `DENY` stays, and only its referencing object is missing
+/// from `sys.objects`: such an edge onto one of `targets` refuses the plan,
+/// naming the target. A `db_owner` member's override shows the object, and
+/// passes.
 pub async fn prove_referrers_visible(
     conn: &mut Conn,
-    objects: &[TableName],
+    targets: &ReferrerTargets,
 ) -> Result<(), DbError> {
-    if objects.is_empty() {
-        return Ok(());
-    }
     let granted = conn
         .query("SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION') AS granted;")
         .await?;
@@ -905,15 +914,20 @@ pub async fn prove_referrers_visible(
                 .into(),
         ));
     }
+    let Some(sql) = hidden_referrers_query(targets) else {
+        return Ok(());
+    };
     let hidden: Vec<String> = conn
-        .query(&hidden_referrers_query(objects))
+        .query(&sql)
         .await?
         .iter()
         .map(|row| {
-            Ok(format!(
-                "`{}`",
-                TableName::new(get::<&str>(row, "to_schema")?, get::<&str>(row, "to_name")?)
-            ))
+            let object =
+                TableName::new(get::<&str>(row, "to_schema")?, get::<&str>(row, "to_name")?);
+            Ok(match opt::<&str>(row, "to_column")? {
+                Some(column) => format!("`{object}.{column}`"),
+                None => format!("`{object}`"),
+            })
         })
         .collect::<Result<_, DbError>>()?;
     if !hidden.is_empty() {
@@ -927,33 +941,49 @@ pub async fn prove_referrers_visible(
     Ok(())
 }
 
-/// The objects among `objects` that an edge this login cannot attribute
-/// refers to: the engine's row is there, and `sys.objects` does not show its
-/// referencing object.
-fn hidden_referrers_query(objects: &[TableName]) -> String {
-    let values = objects
+/// The targets an edge this login cannot attribute refers to: the engine's
+/// row is there, and `sys.objects` does not show its referencing object. A
+/// function is matched whole; a computed column only by an edge naming it.
+fn hidden_referrers_query(targets: &ReferrerTargets) -> Option<String> {
+    let lit = crate::ident::literal;
+    let values = targets
+        .functions
         .iter()
         .map(|n| {
             format!(
-                "({}, {})",
-                crate::ident::literal(&n.schema),
-                crate::ident::literal(&n.name)
+                "({}, {}, CONVERT(sysname, NULL))",
+                lit(&n.schema),
+                lit(&n.name)
             )
         })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "SELECT DISTINCT es.name AS to_schema, eo.name AS to_name
+        .chain(targets.computed_columns.iter().map(|(n, c)| {
+            format!(
+                "({}, {}, CONVERT(sysname, {}))",
+                lit(&n.schema),
+                lit(&n.name),
+                lit(c)
+            )
+        }))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "SELECT DISTINCT es.name AS to_schema, eo.name AS to_name, w.column_name AS to_column
            FROM sys.sql_expression_dependencies d
            JOIN sys.objects eo ON eo.object_id = d.referenced_id
            JOIN sys.schemas es ON es.schema_id = eo.schema_id
+           JOIN (VALUES {}) AS w(schema_name, object_name, column_name)
+             ON w.schema_name = es.name COLLATE CATALOG_DEFAULT
+            AND w.object_name = eo.name COLLATE CATALOG_DEFAULT
+            AND (w.column_name IS NULL
+                 OR w.column_name = COL_NAME(d.referenced_id, d.referenced_minor_id)
+                                    COLLATE CATALOG_DEFAULT)
           WHERE d.referencing_class = 1 AND d.referenced_class = 1
             AND NOT EXISTS (SELECT 1 FROM sys.objects ro WHERE ro.object_id = d.referencing_id)
-            AND EXISTS (SELECT 1 FROM (VALUES {values}) AS w(schema_name, object_name)
-                         WHERE w.schema_name = es.name COLLATE CATALOG_DEFAULT
-                           AND w.object_name = eo.name COLLATE CATALOG_DEFAULT)
-          ORDER BY es.name, eo.name;"
-    )
+          ORDER BY to_schema, to_name, to_column;",
+        values.join(", ")
+    ))
 }
 
 /// An object at a name a plan creates (#1077). SQL Server keeps tables,
