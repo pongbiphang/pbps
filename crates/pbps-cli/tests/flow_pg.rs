@@ -5866,6 +5866,43 @@ fn postgres_rehearsals_refuse_before_connecting_or_starting_a_container() {
 /// PostgreSQL keeps a check or foreign-key name per table (issue #496,
 /// measured on 18.6), so the two tables SQL Server refuses in `flow.rs`'s
 /// `two_tables_with_one_constraint_name_are_refused` validate here.
+/// #1614: an offline plan said `strategy: online` was "emitted unverified:
+/// online index operations are Enterprise-only" on PostgreSQL too. This engine
+/// has one edition and always takes `CONCURRENTLY`, so there is nothing for a
+/// connection to verify: the statement is emitted, and the note is not. Its
+/// SQL Server counterpart, which keeps the note, is
+/// `an_online_strategy_reaches_the_emitted_sql_and_says_it_is_unverified`.
+#[test]
+fn an_offline_postgres_plan_does_not_call_an_online_index_unverified() {
+    let d = Demo::new("plan-sql-online");
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+
+    d.table(
+        "table: app.t\nstrategy:\n  online: true\ncolumns:\n  id: {type: bigint, nullable: false}\n\
+         primary_key: {name: pk_t, columns: [id]}\nindexes:\n  ix_t_id:\n    columns: [id]\n",
+    );
+    let sql_path = d.dir.join("preview.sql");
+    let o = succeeds(d.run(&["plan", "--sql", sql_path.to_str().unwrap()]));
+    let script = std::fs::read_to_string(&sql_path).unwrap();
+    assert!(script.contains("CREATE INDEX CONCURRENTLY"), "{script}");
+    for word in ["unverified", "Enterprise", "edition"] {
+        assert!(!stdout(&o).contains(word), "{word}: {}", stdout(&o));
+    }
+    let o = d.run(&["plan", "--format", "json"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert!(
+        json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["id"] != "strategy.online-unverified"),
+        "{json}"
+    );
+    assert!(!json.to_string().contains("Enterprise"), "{json}");
+}
+
 #[test]
 fn two_tables_with_one_check_name_are_accepted() {
     let d = Demo::new("check-namespace");

@@ -1983,6 +1983,23 @@ pub fn read_remedies(driver: Driver) -> ReadRemedies {
     }
 }
 
+/// Whether `strategy: online` depends on something only a connection can read.
+///
+/// On SQL Server it does: online index operations are an Enterprise-edition
+/// feature, so an offline plan emits `ONLINE = ON` without knowing whether the
+/// target accepts it, and says so (ADR-0003). PostgreSQL has one edition and
+/// builds every index this tool emits `CONCURRENTLY` on every release it speaks
+/// to ([`capabilities`] reads nothing there for the same reason), so an
+/// offline plan's online statements are already what the target will run.
+/// Telling a PostgreSQL user their plan was unverified because of an edition
+/// question their engine does not have was the defect (#1614).
+pub const fn online_depends_on_the_edition(driver: Driver) -> bool {
+    match driver {
+        Driver::Mssql => true,
+        Driver::Postgres => false,
+    }
+}
+
 /// What `doctor` says when it could not read what this server can do, in this
 /// engine's words. The cause is the read's own error and goes in as it is.
 ///

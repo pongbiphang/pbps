@@ -2741,15 +2741,19 @@ fn cmd_plan(
     // ADR-0003 decision 3: whether ONLINE exists is an edition question, and an
     // offline plan has no edition to ask. Saying so is the honest form of a
     // preview — the alternative is a plan.sql that reads as verified and turns
-    // out to be Enterprise-only at the deployment gate.
-    if cs.changes.iter().any(|c| c.strategy.online) && json {
+    // out to be Enterprise-only at the deployment gate. Only where the engine
+    // has that question (#1614).
+    let online_unverified =
+        crate::engine::online_depends_on_the_edition(crate::db::driver_for(project.config.dialect))
+            && cs.changes.iter().any(|c| c.strategy.online);
+    if online_unverified && json {
         findings.push(output::Finding::note(
             "strategy.online-unverified",
             "`strategy: online` is emitted unverified: online index operations are Enterprise-only, \
              and only `pbps plan --db` can read the target's edition",
         ));
     }
-    if cs.changes.iter().any(|c| c.strategy.online) && !json {
+    if online_unverified && !json {
         println!(
             "\n  `strategy: online` is emitted here unverified: online index operations are \n  \
              Enterprise-only, and only `pbps plan --db` can read the target's edition."
