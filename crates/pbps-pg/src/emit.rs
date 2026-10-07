@@ -6635,10 +6635,7 @@ mod tests {
         // The `DO` body is dollar-quoted, so that literal needs one level of
         // doubling and not two — and the tag is chosen so the body cannot end
         // it early.
-        assert!(
-            block.starts_with("DO $pbps$\n"),
-            "{block}"
-        );
+        assert!(block.starts_with("DO $pbps$\n"), "{block}");
     }
 
     /// A name carrying the tag would close the block and put the rest of it on

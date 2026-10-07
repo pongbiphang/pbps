@@ -158,6 +158,25 @@ async fn a_misspelled_columns_hint_never_reaches_the_message() {
     assert_eq!(error.server_error_code().as_deref(), Some("42703"));
 }
 
+/// Every session opens on an empty `search_path`, so nothing a schema user
+/// created is reachable from pbps's own SQL (DEC-1564.1). And it is a `SET`,
+/// not the server's default: `RESET` gives the role's path back, which is
+/// why the emitter's scopes end on the empty path instead.
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn every_session_opens_on_an_empty_search_path() {
+    let mut conn = connect().await;
+    let path = |rows: Vec<pbps_db::Row>| rows[0].try_get::<&str>("p").unwrap().unwrap().to_owned();
+    let schemas = "SELECT pg_catalog.array_to_string(pg_catalog.current_schemas(false), ',') AS p";
+    assert_eq!(path(conn.query(schemas).await.unwrap()), "");
+    conn.execute("RESET search_path").await.unwrap();
+    assert_ne!(
+        path(conn.query(schemas).await.unwrap()),
+        "",
+        "the server's default path names a schema"
+    );
+}
+
 /// `where_()` never reaches the message, exercised first for the safe-looking
 /// shape — a bare call stack, `"PL/pgSQL function f() line N at RAISE"`, with
 /// no embedded statement text at all — to prove the redaction is
@@ -174,7 +193,8 @@ async fn a_misspelled_columns_hint_never_reaches_the_message() {
 #[ignore = "needs live PostgreSQL"]
 async fn an_exceptions_call_stack_never_reaches_the_message() {
     let mut conn = connect().await;
-    let function = format!("issue167_ctx_{}", std::process::id());
+    // Qualified: every session opens on an empty path (DEC-1564.1).
+    let function = format!("public.issue167_ctx_{}", std::process::id());
     conn.execute(&format!(
         "CREATE OR REPLACE FUNCTION {function}() RETURNS void LANGUAGE plpgsql AS $$
          BEGIN

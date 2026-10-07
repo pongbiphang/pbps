@@ -128,6 +128,15 @@ async fn connect() -> Conn {
         .expect("connect to the live server")
 }
 
+/// For a fixture that names what it creates unqualified, in `public`: every
+/// session opens on an empty path, where an unqualified `CREATE` has no
+/// schema to go to (DEC-1564.1).
+async fn on_public(conn: &mut Conn) {
+    conn.execute("SET search_path = public")
+        .await
+        .expect("the fixture's path");
+}
+
 fn conn_str() -> String {
     std::env::var("PBPS_TEST_PG_DB")
         .expect("PBPS_TEST_PG_DB is not set; see scripts/live-tests-pg.sh")
@@ -509,6 +518,7 @@ async fn the_engine_and_the_scanner_agree_on_what_is_data_in_a_definition() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_serial_column_reads_back_as_an_integer_with_a_sequence_it_owns() {
     let mut conn = connect().await;
+    on_public(&mut conn).await;
     let table = format!("pbps_serial_{}", std::process::id());
     conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
         .await
@@ -577,6 +587,7 @@ async fn a_serial_column_reads_back_as_an_integer_with_a_sequence_it_owns() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn the_engine_and_the_dialect_agree_on_what_a_name_becomes() {
     let mut conn = connect().await;
+    on_public(&mut conn).await;
     let pid = std::process::id();
 
     // Case folding is ASCII-only: the server downcases byte by byte and leaves
@@ -703,6 +714,7 @@ async fn a_session_the_connection_string_excludes_is_refused() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn every_spelling_the_catalogue_admits_reads_back_as_the_dialect_says() {
     let mut conn = connect().await;
+    on_public(&mut conn).await;
     let table = format!("pbps_types_{}", std::process::id());
 
     // Each declared spelling, and nothing else: the dialect's answer is not
@@ -825,6 +837,7 @@ async fn every_spelling_the_catalogue_admits_reads_back_as_the_dialect_says() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn the_engine_and_the_dialect_agree_on_which_type_changes_are_impossible() {
     let mut conn = connect().await;
+    on_public(&mut conn).await;
     let table = format!("pbps_risk_{}", std::process::id());
     let types = [
         "smallint",
@@ -895,6 +908,7 @@ async fn the_engine_and_the_dialect_agree_on_which_type_changes_are_impossible()
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_dropped_column_keeps_its_slot_and_its_type_is_not_readable() {
     let mut conn = connect().await;
+    on_public(&mut conn).await;
     let table = format!("pbps_dropped_{}", std::process::id());
     conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
         .await
@@ -966,6 +980,7 @@ async fn a_dropped_column_keeps_its_slot_and_its_type_is_not_readable() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_interval_precision_the_engine_would_quietly_reduce_is_refused() {
     let mut conn = connect().await;
+    on_public(&mut conn).await;
     let table = format!("pbps_interval_{}", std::process::id());
     conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
         .await
@@ -1067,6 +1082,7 @@ async fn temporal_modifiers_keep_the_engine_bounds_and_do_not_shorten_the_calend
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_change_the_dialect_calls_safe_neither_fails_nor_alters_a_value() {
     let mut conn = connect().await;
+    on_public(&mut conn).await;
     let table = format!("pbps_safe_{}", std::process::id());
 
     // (from, to, a value at the edge of `from`).
@@ -1288,6 +1304,7 @@ async fn an_exact_decimal_that_a_float_cannot_hold_is_not_a_safe_change() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn the_engine_and_the_dialect_agree_on_what_can_carry_an_identity() {
     let mut conn = connect().await;
+    on_public(&mut conn).await;
     let table = "pbps_live_identity";
     conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
         .await
@@ -7873,6 +7890,7 @@ struct TestDb {
 #[ignore = "needs live PostgreSQL"]
 async fn an_owner_trigger_permission_failure_does_not_claim_missing_ownership() {
     let mut db = TestDb::create("migration_trigger455").await;
+    on_public(&mut db.conn).await;
     state::ensure_tables(&mut db.conn).await.unwrap();
     db.conn
         .execute("ALTER TABLE public.__pbps_state DROP COLUMN state_version;")
@@ -7907,6 +7925,7 @@ async fn an_owner_trigger_permission_failure_does_not_claim_missing_ownership() 
 #[ignore = "needs live PostgreSQL"]
 async fn an_authorized_migration_connection_failure_does_not_claim_missing_rights() {
     let mut db = TestDb::create("migration_disconnect445").await;
+    on_public(&mut db.conn).await;
     state::ensure_tables(&mut db.conn).await.unwrap();
     db.conn
         .execute("ALTER TABLE public.__pbps_state DROP COLUMN state_version;")
@@ -24460,6 +24479,7 @@ async fn maintain_is_taken_at_seventeen_and_up_and_refused_below_it() {
 
     // This server, which the suite pins at 18.6.
     let mut db = TestDb::create("maintain").await;
+    on_public(&mut db.conn).await;
     let role = least_privilege_role(&mut db, "maintain").await;
     for sql in [
         "CREATE SCHEMA app".to_owned(),
@@ -24487,6 +24507,7 @@ async fn maintain_is_taken_at_seventeen_and_up_and_refused_below_it() {
     let mut old_conn = Conn::connect(Driver::Postgres, &old)
         .await
         .expect("connect to the pre-17 server");
+    on_public(&mut old_conn).await;
     let then = pbps_pg::roles::server_version_num(&mut old_conn)
         .await
         .expect("read the old server's version");
@@ -32495,6 +32516,7 @@ async fn an_owner_with_select_on_every_column_has_no_managed_table_gap() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn timestamp_precision_narrowing_rounds_past_the_upper_bound_without_refusing() {
     let mut db = TestDb::create("timestamp419").await;
+    on_public(&mut db.conn).await;
     db.conn.execute("SET TimeZone = 'UTC'").await.unwrap();
     // The fractional second at which rounding to `p` digits carries into the
     // next second, and the microsecond just below it.
