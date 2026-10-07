@@ -17792,6 +17792,47 @@ fn a_new_tables_default_naming_its_own_index_is_refused_and_two_plans_deploy_it(
     );
 }
 
+/// #1593: `regclass` input cuts a name part to 63 bytes, silently, so a
+/// default naming 64 `a`s names the 63-`a` index the plan creates later. The
+/// connected plan is refused, writing no artifact, though the two spellings
+/// differ.
+#[test]
+#[ignore = "needs a live PostgreSQL; see scripts/live-tests-pg.sh"]
+fn a_default_naming_a_later_index_past_the_identifier_limit_is_refused() {
+    let own = OwnDatabase::new(&server(), "names_long_index");
+    let connection = own.connection();
+    let columns = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n";
+    let label = |default: &str| format!("  label: {{type: text, default: \"{default}\"}}\n");
+    let index = format!("indexes:\n  {}:\n    columns: [id]\n", "a".repeat(63));
+    let d = bootstrapped_demo(
+        connection,
+        "names_long_index",
+        &format!("{columns}{}primary_key: [id]\n", label("''")),
+    );
+    let named = format!("('app.{}'::regclass)::text", "a".repeat(64));
+    d.table(&format!(
+        "{columns}{}primary_key: [id]\n{index}",
+        label(&named)
+    ));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let artifact = d.dir.join("refused-plan.json");
+    let refused = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    let why = stderr(&refused);
+    assert!(
+        why.contains(&format!("names app.{}", "a".repeat(63))),
+        "{why}"
+    );
+    assert!(!artifact.exists(), "a refused plan writes no artifact");
+}
+
 /// #1576: PostgreSQL resolves `'app.ix_new'::regclass` when the default is
 /// set, and the differ sets a default before it creates an index. A connected
 /// plan that does both is refused, writing no artifact, with a two-plan

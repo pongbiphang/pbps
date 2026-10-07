@@ -1751,6 +1751,9 @@ ask (#1599 review).
   allowed around the dot. An unquoted part runs to a dot or white space, and
   only its ASCII letters fold to lower case; quoted parts are verbatim. An
   input of digits alone is an OID, not a name, and so is `-` exactly (OID 0).
+  Each part, quoted or not, is cut silently to the 63-byte identifier limit
+  at a character boundary, as the input's splitter cuts it, so a literal of
+  64 `a`s names the 63-`a` relation (#1593).
   An unqualified name is a candidate only in the schema the expression is
   written in, the whole write `search_path` the CLI emits (it configures no
   extras). A literal that only contains the name, a name in a comment, or
@@ -1777,8 +1780,9 @@ Pinned by `an_expression_naming_a_relation_the_plan_creates_later_is_refused`,
 (`crates/pbps-cli/src/dependents.rs`), the live
 `a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_deploy_it`,
 `a_new_tables_default_naming_its_own_index_is_refused_and_two_plans_deploy_it`,
-`a_name_that_already_resolves_on_the_target_is_not_refused` and
-`a_name_the_plan_rebuilds_is_refused_although_it_exists_now`
+`a_name_that_already_resolves_on_the_target_is_not_refused`,
+`a_name_the_plan_rebuilds_is_refused_although_it_exists_now` and
+`a_default_naming_a_later_index_past_the_identifier_limit_is_refused`
 (`crates/pbps-cli/tests/flow_pg.rs`), and the live
 `a_relation_lookup_finds_every_kind_by_its_exact_name`
 (`crates/pbps-pg/tests/live.rs`).
