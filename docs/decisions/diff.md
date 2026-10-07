@@ -3474,7 +3474,9 @@ Measured on 16.15 and 18.6:
 plan. The table must hold:
 
 - its parent's columns, by name and in order, with the same types (in the
-  dialect's spelling), collations, identities and generations;
+  dialect's spelling), collations, identities and generations; a description
+  and a deprecation are annotations the catalog does not hold, and are not
+  compared;
 - NOT NULL wherever its parent's columns are;
 - no primary key, or one on the parent's key columns;
 - no unique constraint or foreign key that is not one of the parent's,
@@ -3495,7 +3497,9 @@ it after the attach:
 - the indexes the parent's do not match, storage parameters aside, and the
   checks that are not the parent's;
 - its persistence and storage parameters;
-- a default whose text is not its parent's;
+- a default whose text is not its parent's, or any default when the table is
+  in another schema than its parent, where the same unqualified text may name
+  another schema's object;
 - a NOT NULL its parent's column does not have.
 
 The table's kinds and `SetPartitionDefault`/`SetPartitionNotNull` then bring it
@@ -3538,8 +3542,10 @@ transactional apply changes nothing, and the `constraint` risk names the
 hazard before approval.
 
 **The apply's hold.** Once the table reads back as a partition, it is held to
-the declared shape, as a created table is. A staged read taken before the
-attach has run compares it as the ordinary table it was. An attach the plan
+the declared shape, as a created table is, and to the parent and range the
+plan declares, which another session could change by detaching and attaching
+it again. A staged read taken before the attach has run compares it as the
+ordinary table it was. An attach the plan
 leaves `UNLOGGED` is a new unlogged partition under the parent's referencing
 keys, refused as a created one is (DEC-1595.1).
 
@@ -3568,6 +3574,7 @@ engine's own refusal, and by these unit tests:
 
 - `an_ordinary_table_declared_as_a_partition_is_attached`;
 - `an_attached_table_is_held_to_its_shape_once_it_is_a_partition`;
+- `an_attached_table_keeps_the_records_of_what_stays_its_own`;
 - `a_table_is_attached_in_one_unscoped_statement`;
 - `a_partition_change_under_a_standing_parent_is_probed`;
 - `an_unlogged_partition_under_a_permanent_key_is_refused_by_name`.

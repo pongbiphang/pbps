@@ -3813,6 +3813,19 @@ fn refuse_unplanned_movement(
                     })
                     .unwrap_or_default()
             };
+            // An attached table's parent and range, which no other part of
+            // the shape names: another session can detach it and attach it
+            // elsewhere between two reads (#1545).
+            let place = |t: &pbps_model::Table| {
+                t.partition_of
+                    .as_ref()
+                    .map(|of| (of.parent.clone(), of.bound.clone()))
+            };
+            if attached.contains(now_name) && place(declared) != place(now) {
+                moved.push(format!(
+                    "{now_name} is not attached to the parent and range this plan declares"
+                ));
+            }
             if settled.whole() && own(declared) != own(now) {
                 moved.push(format!(
                     "{now_name}'s own column defaults or NOT NULLs are not the ones this plan's \
@@ -10070,6 +10083,17 @@ mod tests {
         };
         held(&before, Settled::SoFar).expect("not attached yet");
         held(&schema(&shape), Settled::Whole).expect("attached as declared");
+        // Negative: attached somewhere else than the plan says.
+        let mut elsewhere = shape.clone();
+        elsewhere.partition_of.as_mut().unwrap().bound = PartitionBound::Range {
+            from: vec![pbps_model::BoundDatum::MinValue],
+            to: vec![pbps_model::BoundDatum::MaxValue],
+        };
+        let e = held(&schema(&elsewhere), Settled::SoFar).expect_err("another range");
+        assert!(
+            e.contains("app.t is not attached to the parent and range this plan declares"),
+            "{e}"
+        );
         // Negative: an index another session adds, after the attach and
         // before it.
         let index = pbps_model::Index {

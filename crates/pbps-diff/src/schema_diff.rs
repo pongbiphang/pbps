@@ -2542,11 +2542,14 @@ fn attached(
                 let ty = dialect
                     .normalize_type(&c.ty)
                     .unwrap_or_else(|_| c.ty.clone());
+                // A deprecation is an annotation the catalog does not
+                // hold, as a description is.
                 let column = pbps_model::Column {
                     ty,
                     nullable: true,
                     default: None,
                     description: None,
+                    deprecated: None,
                     ..c.clone()
                 };
                 (name.clone(), column)
@@ -2589,8 +2592,14 @@ fn attached(
         }
         let own = pbps_model::PartitionColumn {
             // The same text as the parent's is the parent's, as the reader
-            // reads it back.
-            default: c.default.clone().filter(|d| Some(d) != p.default.as_ref()),
+            // reads it back, but only in the parent's schema: elsewhere an
+            // unqualified name in it may be another schema's object, so it
+            // is the table's own, and taking the parent's back sets the
+            // parent's under the parent's path (DEC-1581.1).
+            default: c
+                .default
+                .clone()
+                .filter(|d| base_name.schema != of.parent.schema || Some(d) != p.default.as_ref()),
             not_null: !c.nullable && p.nullable,
         };
         if c.default.is_none() && p.default.is_some() {
@@ -6217,6 +6226,11 @@ mod tests {
                 [("fillfactor".to_owned(), "60".to_owned())].into();
         });
         let adopted = outcome(&tuned, &declared, &[]).2.expect("adopted");
+        // A deprecation is an annotation, not the column's shape.
+        let annotated = ordinary(&|t| t.columns["n"].deprecated = Some("old".into()));
+        outcome(&annotated, &declared, &[])
+            .2
+            .expect("a deprecated column attaches");
         assert_eq!(
             kinds(&adopted),
             ["DropIndex", "AttachPartition", "SetPartitionDefault"]
@@ -6403,6 +6417,40 @@ mod tests {
                 "{expected}: {found:?}"
             );
         }
+
+        // In another schema, a default of the parent's text may name another
+        // schema's object: it is the table's own, and the parent's is set
+        // back, under the parent's path.
+        let elsewhere = |schema: &Schema| {
+            let mut moved = schema.clone();
+            let t = moved
+                .tables
+                .remove(&"app.t".parse::<TableName>().unwrap())
+                .unwrap();
+            moved.tables.insert("x.t".parse().unwrap(), t);
+            moved
+        };
+        let other = elsewhere(&ordinary(&|t| t.columns["n"].default = Some("0".into())));
+        let other_declared = elsewhere(&declared);
+        let set_back = outcome(&other, &other_declared, &[]).2.expect("attached");
+        assert!(
+            set_back.changes.iter().any(|p| matches!(
+                &p.change,
+                Change::SetPartitionDefault { table, column, from: Some(f), to: None, .. }
+                    if table.to_string() == "x.t" && column == "n" && f == "0"
+            )),
+            "{:?}",
+            set_back.changes
+        );
+        // Negative: in the parent's schema the same text is the parent's.
+        let same = outcome(
+            &ordinary(&|t| t.columns["n"].default = Some("0".into())),
+            &declared,
+            &[],
+        )
+        .2
+        .expect("attached");
+        assert_eq!(kinds(&same), ["DropIndex", "AttachPartition"]);
 
         // Negative: an ordinary table that stays one keeps its column uids,
         // and plans nothing.

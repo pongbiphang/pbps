@@ -377,6 +377,7 @@ impl Declared {
                     self.expressions.defaults.extend(fresh.expressions.defaults);
                     self.expressions.checks.extend(fresh.expressions.checks);
                     self.expressions.filters.extend(fresh.expressions.filters);
+                    self.expressions.keys.extend(fresh.expressions.keys);
                 }
                 Change::RenameTable { from, to, .. } => {
                     rekey_table(&mut self.expressions.defaults, from, to);
@@ -876,6 +877,88 @@ mod tests {
                 .get(&u)
                 .is_none_or(|m| m.is_empty())
         );
+    }
+
+    /// A table attached as a partition keeps the records of what it keeps of
+    /// its own (#1545): a check, an expression index's keys and a default the
+    /// shape still holds, each with its binding, and loses the records of
+    /// what it no longer holds as its own, its adopted index's filter among
+    /// them.
+    #[test]
+    fn an_attached_table_keeps_the_records_of_what_stays_its_own() {
+        use crate::IndexKey;
+        let mut ordinary = schema();
+        let expression_index = Index {
+            columns: vec![IndexColumn {
+                key: IndexKey::Expression("n+m".to_owned()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
+        ordinary
+            .tables
+            .get_mut(&t())
+            .unwrap()
+            .indexes
+            .insert("ix_expr".to_owned(), expression_index.clone());
+        let mut d = Declared::from_schema(&ordinary);
+        let bound = || Binding {
+            candidates: [("f".to_owned(), ["dbo.f".to_owned()].into_iter().collect())]
+                .into_iter()
+                .collect(),
+        };
+        d.bindings
+            .defaults
+            .insert(t(), [("n".to_owned(), bound())].into_iter().collect());
+        d.bindings
+            .checks
+            .insert(t(), [("ck_n".to_owned(), bound())].into_iter().collect());
+        d.bindings
+            .filters
+            .insert(t(), [("ix_n".to_owned(), bound())].into_iter().collect());
+        let shape = Table {
+            checks: table().checks,
+            indexes: [("ix_expr".to_owned(), expression_index)]
+                .into_iter()
+                .collect(),
+            partition_of: Some(crate::PartitionOf {
+                parent: "dbo.p".parse().unwrap(),
+                bound: crate::PartitionBound::Default,
+                columns: [(
+                    "n".to_owned(),
+                    crate::PartitionColumn {
+                        default: Some("0".to_owned()),
+                        not_null: false,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            ..Table::default()
+        };
+        d.advance(&changes(vec![Change::AttachPartition {
+            uid: "t_a1b2c3".parse().unwrap(),
+            table: t(),
+            parent: "dbo.p".parse().unwrap(),
+            bound: crate::PartitionBound::Default,
+            shape: Box::new(shape),
+        }]));
+        assert_eq!(
+            d.expressions.keys[&t()]["ix_expr"],
+            [Some("n+m".to_owned())]
+        );
+        assert_eq!(d.expressions.checks[&t()]["ck_n"], "n > 0");
+        assert_eq!(d.expressions.defaults[&t()]["n"], "0");
+        assert!(d.bindings.defaults[&t()].contains_key("n"));
+        assert!(d.bindings.checks[&t()].contains_key("ck_n"));
+        // Negative: the adopted index's filter and its binding are gone.
+        assert!(d.expressions.filters.get(&t()).is_none_or(|m| m.is_empty()));
+        assert!(!d.bindings.filters.contains_key(&t()));
     }
 
     /// A generation expression is recorded as declared, overlaid on the
