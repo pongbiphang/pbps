@@ -479,6 +479,67 @@ pub async fn server_version(conn: &mut Conn) -> Result<Version, DbError> {
     })
 }
 
+/// Why this role cannot read the deployment lock, as the catalog shows it
+/// (#822). Asked on a session of its own, after the lock read failed.
+///
+/// The schema first, and the table only when the schema is usable: without
+/// `USAGE` the lookup is refused before the table is found or missed
+/// (measured on 18.6), so a table gap behind it is not the next thing to fix,
+/// and on a never-initialized database there is no table at all. Both names
+/// are bound, and the table is matched by the schema's oid, not by a
+/// qualified name the role may not be allowed to resolve. `pg_namespace` and
+/// `pg_class` are readable without `USAGE` on the schema (measured on 18.6).
+pub async fn lock_read_gap(conn: &mut Conn) -> Result<pbps_db::doctor::LockReadGap, DbError> {
+    use pbps_db::doctor::LockReadGap;
+    let rows = conn
+        .query_with(
+            "SELECT n.oid::bigint AS schema_oid,
+                    pg_catalog.has_schema_privilege(n.oid, 'USAGE') AS usage_ok
+               FROM (VALUES ($1::name)) AS w(schema_name)
+               LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = w.schema_name",
+            &[Param::Str(LEDGER_SCHEMA)],
+        )
+        .await?;
+    let row = rows
+        .first()
+        .ok_or_else(|| DbError::BadRow("the schema question returned no row".into()))?;
+    // An absent schema is not a gap this role can be granted out of, and a
+    // NULL answer is not a "no".
+    let (Some(schema_oid), Some(usage)) = (
+        row.try_get::<i64>("schema_oid")?,
+        optional_flag(row, "usage_ok")?,
+    ) else {
+        return Ok(LockReadGap::Unexplained);
+    };
+    if !usage {
+        return Ok(LockReadGap::SchemaUsage);
+    }
+    let rows = conn
+        .query_with(
+            "SELECT c.oid IS NOT NULL AS present,
+                    pg_catalog.has_table_privilege(c.oid, 'SELECT') AS select_ok
+               FROM (VALUES ($1::name)) AS w(table_name)
+               LEFT JOIN pg_catalog.pg_class c
+                 ON c.relname = w.table_name
+                AND c.relnamespace = $2::bigint::oid
+                AND c.relkind = 'r'",
+            &[
+                Param::Str(pbps_db::ledger::LOCK_TABLE_NAME),
+                Param::I64(schema_oid),
+            ],
+        )
+        .await?;
+    let row = rows
+        .first()
+        .ok_or_else(|| DbError::BadRow("the table question returned no row".into()))?;
+    Ok(
+        match (flag(row, "present")?, optional_flag(row, "select_ok")?) {
+            (true, Some(false)) => LockReadGap::TableSelect,
+            _ => LockReadGap::Unexplained,
+        },
+    )
+}
+
 /// The schema question, for one list of schemas.
 ///
 /// The names are **bound**, not pasted, and the rows are matched back in Rust:

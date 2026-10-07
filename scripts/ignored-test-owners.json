@@ -1070,6 +1070,7 @@
         "doctor_against_a_real_server_reads_its_edition_and_permissions",
         "doctor_and_explain_see_a_lock_that_outlived_its_state_table",
         "doctor_asks_about_a_column_under_the_name_a_pending_rename_has_not_changed_yet",
+        "doctor_mssql_lock_recovery_executes_the_emitted_statement",
         "doctor_asks_for_the_dml_a_declared_data_block_needs",
         "doctor_demands_a_moved_childs_destination_only_while_its_key_survives",
         "doctor_does_not_report_ready_while_the_lock_is_held",

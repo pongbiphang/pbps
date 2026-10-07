@@ -2654,6 +2654,36 @@ pub fn supports_create_or_alter(product_version: &str, edition_raw: &str) -> boo
 }
 
 /// The server's own version banner, for the report.
+/// Why this user cannot read the deployment lock, as the catalog shows it
+/// (#822). Asked on a session of its own, after the lock read failed.
+///
+/// Measured on 2025 RTM: a user with no permission on `dbo.__pbps_lock` gets
+/// `NULL` from `OBJECT_ID` for it, exactly as for a table that does not exist,
+/// and `HAS_PERMS_BY_NAME` answers 0 for both. So a hidden table is reported
+/// as hidden, never as absent and never as a `SELECT` gap: once the user can
+/// see it, the next run of `doctor` can tell which it is. A visible table
+/// this user may not read is the one case with a single grant to name.
+pub async fn lock_read_gap(conn: &mut Conn) -> Result<pbps_db::doctor::LockReadGap, DbError> {
+    use pbps_db::doctor::LockReadGap;
+    let rows = conn
+        .query_with(
+            "SELECT OBJECT_ID(@P1, N'U') AS object_id, \
+                    HAS_PERMS_BY_NAME(@P1, N'OBJECT', N'SELECT') AS select_ok;",
+            &[Param::Str(crate::state::LOCK_TABLE)],
+        )
+        .await?;
+    let row = rows
+        .first()
+        .ok_or_else(|| DbError::BadRow("the lock question returned no row".into()))?;
+    if row.try_get::<i32>("object_id")?.is_none() {
+        return Ok(LockReadGap::Hidden);
+    }
+    Ok(match row.try_get::<i32>("select_ok")? {
+        Some(0) => LockReadGap::TableSelect,
+        _ => LockReadGap::Unexplained,
+    })
+}
+
 pub async fn server_version(conn: &mut Conn) -> Result<String, DbError> {
     let rows = conn
         .query(

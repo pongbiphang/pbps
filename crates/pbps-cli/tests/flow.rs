@@ -6779,6 +6779,157 @@ fn doctor_asks_about_a_column_under_the_name_a_pending_rename_has_not_changed_ye
     drop(db);
 }
 
+/// #822: a user that cannot read the deployment lock is told, in SQL Server's
+/// words, the one statement that repairs what its own catalog shows, and
+/// running exactly that statement repairs it. With no permission at all the
+/// table is invisible to the user (measured on 2025 RTM: `OBJECT_ID` is NULL,
+/// as for a table that is not there), so the first statement is
+/// `VIEW DEFINITION`; once the table is visible, a fresh `doctor` names its
+/// `SELECT`. The user's name holds a `]`, so each statement is run with its
+/// placeholder replaced by the bracket-quoted name and nothing else changed.
+/// Then the negative: a `DENY` through a role overrides the grant the remedy
+/// names, the message says so, and running it leaves the finding in place.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+fn doctor_mssql_lock_recovery_executes_the_emitted_statement() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB");
+    let db = OwnDatabase::new(&server, "doctorlock822");
+    let login = format!("pbps]lock822_{}", std::process::id());
+    let quoted = format!("[{}]", login.replace(']', "]]"));
+    let password = "pbpsLeastPrivilege!1";
+    on_server(
+        &server,
+        &format!("CREATE LOGIN {quoted} WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"),
+    );
+    let project = Demo::new("doctorlock822");
+    let var = format!("PBPS_DOCTOR_LOCK822_{}", std::process::id());
+    std::fs::write(
+        project.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+    on_server(db.connection(), "EXEC(N'CREATE SCHEMA app;');");
+    project.table(
+        "table: app.t\ncolumns:\n  code: {type: int, nullable: false}\nprimary_key: [code]\n",
+    );
+    let ok = |o: std::process::Output| {
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    };
+    ok(project.run(&["plan"]));
+    project.commit();
+    ok(project.run(&["bootstrap", "--db", db.connection()]));
+    on_server(
+        db.connection(),
+        &format!("CREATE USER {quoted} FOR LOGIN {quoted};"),
+    );
+    let base = db
+        .connection()
+        .split(';')
+        .filter(|part| {
+            let key = part.split('=').next().unwrap_or("").trim();
+            !["user id", "uid", "password", "pwd"]
+                .iter()
+                .any(|credential| key.eq_ignore_ascii_case(credential))
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = with_key(&with_key(&base, "User Id", &login), "Password", password);
+    let reads_lock = || try_on_server(&as_login, "SELECT COUNT(*) FROM dbo.__pbps_lock;");
+    let diagnose = || {
+        let output = Command::new(BIN)
+            .arg("--project")
+            .arg(&project.dir)
+            .args(["doctor", "--format", "json"])
+            .env(&var, &as_login)
+            .output()
+            .unwrap();
+        assert!(
+            !stdout(&output).contains(password) && !stderr(&output).contains(password),
+            "the password leaked"
+        );
+        let value: serde_json::Value = serde_json::from_str(&stdout(&output))
+            .unwrap_or_else(|e| panic!("{e}: {}", stdout(&output)));
+        let found: Vec<serde_json::Value> = value["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{value}"))
+            .iter()
+            .filter(|f| f["id"] == "state.lock-unknown")
+            .cloned()
+            .collect();
+        assert!(found.len() <= 1, "{value}");
+        (value.clone(), found.into_iter().next())
+    };
+    // The placeholder, quotes included, replaced by the name quoted as an
+    // identifier, as the message says; every other byte as emitted.
+    let run_remedy = |finding: &serde_json::Value| {
+        let message = finding["message"].as_str().unwrap();
+        assert!(message.contains("quotes included"), "{message}");
+        let remedy = finding["remedy"].as_str().unwrap();
+        assert_eq!(remedy.matches("\"<database user>\"").count(), 1, "{remedy}");
+        on_server(
+            db.connection(),
+            &remedy.replace("\"<database user>\"", &quoted),
+        );
+    };
+
+    let denied = reads_lock().expect_err("the user cannot read the lock");
+    assert!(denied.contains("SELECT permission was denied"), "{denied}");
+    let (report, first) = diagnose();
+    let first = first.unwrap_or_else(|| panic!("no lock finding: {report}"));
+    assert_eq!(first["severity"], "error", "{report}");
+    assert_eq!(
+        first["remedy"], "GRANT VIEW DEFINITION TO \"<database user>\";",
+        "an invisible table first: {report}"
+    );
+    for foreign in ["public.", "USAGE", "pg_catalog"] {
+        assert!(
+            !first.to_string().contains(foreign),
+            "{foreign:?} in {first}"
+        );
+    }
+    run_remedy(&first);
+    reads_lock().expect_err("visibility is not SELECT");
+
+    let (report, second) = diagnose();
+    let second = second.unwrap_or_else(|| panic!("the table gap remains: {report}"));
+    assert_eq!(
+        second["remedy"], "GRANT SELECT ON OBJECT::dbo.__pbps_lock TO \"<database user>\";",
+        "then the table: {report}"
+    );
+    run_remedy(&second);
+    reads_lock().expect("the user reads the lock itself");
+    let (report, cleared) = diagnose();
+    assert!(cleared.is_none(), "{report}");
+
+    // The negative: a DENY through a role beats the grant. The remedy still
+    // names the table's SELECT, the message says a role's DENY overrides it,
+    // and running it changes nothing.
+    on_server(
+        db.connection(),
+        &format!(
+            "CREATE ROLE pbps_lock822_deny; ALTER ROLE pbps_lock822_deny ADD MEMBER {quoted};
+             DENY SELECT ON OBJECT::dbo.__pbps_lock TO pbps_lock822_deny;"
+        ),
+    );
+    reads_lock().expect_err("the role's DENY wins");
+    let (report, denied) = diagnose();
+    let denied = denied.unwrap_or_else(|| panic!("no lock finding: {report}"));
+    assert_eq!(denied["remedy"], second["remedy"], "{report}");
+    assert!(
+        denied["message"].as_str().unwrap().contains("DENY"),
+        "{report}"
+    );
+    run_remedy(&denied);
+    reads_lock().expect_err("a grant does not override a role's DENY");
+    assert!(
+        diagnose().1.is_some(),
+        "the finding stays while the DENY does"
+    );
+
+    after_test_on_server(&server, &format!("DROP LOGIN {quoted};"));
+    drop(db);
+}
+
 /// The managed-table list must reach the SQL Server readiness query, including
 /// for a declaration with no data block. Schema grants cannot answer whether
 /// a narrower object/column grant or denial authorizes the actual probe.

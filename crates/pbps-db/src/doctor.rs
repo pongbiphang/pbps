@@ -266,3 +266,33 @@ mod tests {
         assert!(!exact.inserts() && !exact.corrects() && exact.removes());
     }
 }
+
+/// Why a session that could not read the deployment lock cannot, as far as a
+/// session with the same identity can see from the catalog (#822).
+///
+/// Asked only after the lock read has already failed, and only to choose
+/// `doctor`'s remedy: a complete statement for the one gap the catalog shows,
+/// or nothing to emit. It never changes the diagnosis. Each variant is a fact
+/// that session observed, not one inferred from the failed read's error: a
+/// denied lookup does not say whether the table exists, and on SQL Server a
+/// table this user may not see reads exactly like one that is not there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockReadGap {
+    /// PostgreSQL: the ledger's schema exists and this role may not use it.
+    /// Nothing about the table is asked: without the schema it cannot be the
+    /// next gap, and a never-initialized database has no table to grant on.
+    SchemaUsage,
+    /// SQL Server: this user cannot see the lock table at all — no metadata
+    /// visibility, so whether it exists is not something this session can
+    /// learn. Absent and hidden are the same answer here, and neither is
+    /// taken as absent.
+    Hidden,
+    /// The lock table exists, this session can see it, and it may not
+    /// `SELECT` from it.
+    TableSelect,
+    /// Nothing this session can see explains the failure: the privileges it
+    /// would need are held, the table is not where the catalog would show it,
+    /// or the question itself could not be asked. Never a reason to invent a
+    /// grant.
+    Unexplained,
+}
