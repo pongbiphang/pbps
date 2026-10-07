@@ -5649,7 +5649,8 @@ pub fn cmd_bootstrap(
     // expression naming, in a literal, a relation created only after it is
     // refused with the two-plan remedy, before any script or DDL, rather
     // than rolled back by the engine. A qualified name is refused offline.
-    // An unqualified one may be found ahead on its path, which only the
+    // An unqualified one may be found ahead on its path, and an unnamed
+    // key's generated index name may be held now (#1619), which only the
     // target can say: asked of it with `--db`, before any script is written,
     // and refused without one. One refusal names them all.
     let later = if dialect.name() == "postgres" {
