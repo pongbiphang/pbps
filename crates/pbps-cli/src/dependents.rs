@@ -1822,7 +1822,8 @@ pub(crate) fn later_relation_refusal(names: &[LaterName]) -> Result<(), String> 
 }
 
 /// Where in its change's statements a relation arrives or an expression is
-/// set (#1592). Every change but a new table is one step.
+/// set (#1592). Every change but a new table and an added index is one step;
+/// an added index arrives after its own expression.
 ///
 /// A new table follows the PostgreSQL emitter (`create_table`), measured on
 /// 18:
@@ -1877,9 +1878,12 @@ fn relations_brought(change: &Change) -> Vec<(Step, TableName)> {
             return out;
         }
         Change::RenameTable { to, .. } => vec![to.clone()],
-        Change::AddIndex { table, name, .. } | Change::AddUnique { table, name, .. } => {
-            vec![index(table, name)]
-        }
+        // An index arrives only once its own expression and filter are
+        // resolved, as one a new table holds does: measured on 18, a filter
+        // or expression naming the index itself fails its `CREATE INDEX`
+        // (#1617 review).
+        Change::AddIndex { table, name, .. } => return vec![(AT_CREATE + 1, index(table, name))],
+        Change::AddUnique { table, name, .. } => vec![index(table, name)],
         Change::SetPrimaryKey {
             table,
             to: Some(pk),
@@ -5286,6 +5290,31 @@ mod tests {
         ] {
             assert_eq!(refusal_of(&cs, &*pg()), Ok(()), "{cs:?}");
         }
+    }
+
+    /// An added index arrives after its own expression and filter, as a new
+    /// table's does: one naming the index itself is refused, whether it is
+    /// added alone or split out of a new table (#1617 review). Another index
+    /// it names that already arrived is not.
+    #[test]
+    fn an_added_index_naming_itself_is_refused() {
+        let own = "('app.ix_self'::regclass)::oid > 0";
+        assert!(refusal_of(&plan(vec![add_index("ix_self", Some(own))]), &*pg()).is_err());
+        let mut expression = add_index("ix_self", None);
+        if let Change::AddIndex { index, .. } = &mut expression {
+            index.columns[0].key = pbps_model::IndexKey::Expression(format!("({own})::int"));
+        }
+        assert!(refusal_of(&plan(vec![expression]), &*pg()).is_err());
+        assert_eq!(
+            refusal_of(
+                &plan(vec![
+                    add_index("ix_other", None),
+                    add_index("ix_self", Some("('app.ix_other'::regclass)::oid > 0")),
+                ]),
+                &*pg()
+            ),
+            Ok(())
+        );
     }
 
     /// A literal is a relation's name as `regclass` input reads it: unquoted
