@@ -1273,6 +1273,7 @@
         "doctor_json_follows_recorded_table_and_column_ids_before_pending_renames",
         "doctor_json_reports_external_schema_absence_before_grant_authority",
         "doctor_reports_an_adopted_routine_grant_whatever_the_argument_spelling",
+        "doctor_repairs_schema_access_before_an_absent_lock_table",
         "doctor_reports_data_and_role_grant_gaps_from_the_declarations",
         "doctor_names_the_recorded_state_read_when_its_select_is_denied",
         "doctor_resolver_discovery_is_advisory_and_never_acquires_an_engine",
