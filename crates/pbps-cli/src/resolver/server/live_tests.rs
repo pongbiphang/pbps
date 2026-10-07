@@ -914,7 +914,7 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
                 "CREATE SCHEMA pbps_extra_688",
             ],
             drift: (
-                "CREATE EXTENSION IF NOT EXISTS pgcrypto",
+                "CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public",
                 "extensions",
                 "DROP EXTENSION pgcrypto",
             ),

@@ -80,6 +80,13 @@ async fn the_private_channel_compiles_declarations_and_control_loss_discards_the
             .find_map(|entry| entry.strip_prefix(prefix))
             .unwrap();
         let compile = async {
+            // The fixture names its objects unqualified, in `public`: every
+            // session opens on an empty path (DEC-1564.1). Left there,
+            // `dblink_connect` would fail as an unknown function and read as
+            // a refused network.
+            if driver == Driver::Postgres {
+                state.connection.execute("SET search_path = public").await?;
+            }
             state
                 .connection
                 .execute("CREATE TABLE pbps_channel_table (id integer NOT NULL)")

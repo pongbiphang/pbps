@@ -172,7 +172,7 @@ async fn a_qualified_run_resolves_desired_bindings_against_the_target() {
             .expect("qualify runs");
         assert_eq!(verdict, Verdict::Verified, "{verdict:?}");
         setup
-            .query("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+            .query("CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public")
             .await
             .unwrap();
         let refused = run
