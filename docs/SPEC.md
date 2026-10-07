@@ -298,10 +298,12 @@ indexes:
   partition moved out of `partitions:` into a file of its own, declared with its
   parent's columns, keys, constraints and indexes under any names, is detached
   and kept with its rows, `destructive` since they leave the parent; any other
-  shape is refused, to be changed in a later revision (DEC-1544.1). Every other
-  change stays refused by name: the parent's own changes until #1546, attaching
-  an existing table until #1545, a partition's own checks, indexes, column
-  defaults and NOT NULLs until #1581.
+  shape is refused, to be changed in a later revision (DEC-1544.1). A standing
+  partition's own indexes, checks, column defaults, NOT NULLs, storage
+  parameters and persistence are changed on it alone; a parent's default the
+  plan sets is followed by each partition's own (DEC-1581.1). Every other
+  change stays refused by name: the parent's own changes until #1546, and
+  attaching an existing table until #1545.
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

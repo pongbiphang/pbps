@@ -226,6 +226,7 @@ fn moves_bindings(
         // brings no name anywhere. A check's or foreign key's name is a
         // constraint's, which no lookup in an expression reaches.
         Change::AlterColumnDefault { .. }
+        | Change::SetPartitionDefault { .. }
         | Change::AlterColumnExpression { .. }
         | Change::AddCheck { .. }
         | Change::DropCheck { .. }
@@ -237,6 +238,7 @@ fn moves_bindings(
         | Change::SetStorageParameters { .. }
         | Change::SetTablePersistence { .. }
         | Change::SetIndexStorageParameters { .. }
+        | Change::SetPartitionNotNull { .. }
         | Change::InsertRow { .. }
         | Change::UpdateRow { .. }
         | Change::DeleteRow { .. }

@@ -4213,6 +4213,8 @@ fn refuse_unplanned_movement(
                         | pbps_model::Change::PublicExecution { .. }
                         | pbps_model::Change::SetIndexStorageParameters { .. }
                         | pbps_model::Change::SetTablePersistence { .. }
+                        | pbps_model::Change::SetPartitionDefault { .. }
+                        | pbps_model::Change::SetPartitionNotNull { .. }
                         | pbps_model::Change::SetStorageParameters { .. }
                         | pbps_model::Change::SetReplicaIdentity { .. } => {}
                     }
@@ -5396,6 +5398,14 @@ pub fn cmd_bootstrap(
                     &mut cs,
                     &BTreeSet::new(),
                     &loaded.hints.module_deps,
+                )
+            })
+            .and_then(|_| {
+                crate::dependents::after_their_parents_defaults(
+                    &mut cs,
+                    &loaded.schema,
+                    &[&ids],
+                    dialect.as_ref(),
                 )
             });
         ordered.map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;

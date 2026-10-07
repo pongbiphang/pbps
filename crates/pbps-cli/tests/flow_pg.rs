@@ -958,6 +958,8 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::SetPrimaryKey { .. }
             | change @ pbps_model::Change::SetIndexStorageParameters { .. }
             | change @ pbps_model::Change::SetTablePersistence { .. }
+            | change @ pbps_model::Change::SetPartitionDefault { .. }
+            | change @ pbps_model::Change::SetPartitionNotNull { .. }
             | change @ pbps_model::Change::SetStorageParameters { .. }
             | change @ pbps_model::Change::SetReplicaIdentity { .. }
             | change @ pbps_model::Change::AddUnique { .. }
@@ -6476,12 +6478,12 @@ fn an_array_column_widens_through_the_cli() {
 /// is refused with the commands that adopt it, and adopting it that way
 /// leaves nothing to plan. A partition's own check and index go with it
 /// under its entry (#1577); one naming a column its parent lacks is refused
-/// by `validate`, and one added to a standing partition by name (#1581). Its
-/// own column default and NOT NULL go with it too, and a changed default is
-/// refused by name (#1578). A grant on it and one on its parent are each
-/// their own, created by the bootstrap, and granted and revoked on the
-/// standing partition as on any table (#1579). Its persistence and storage
-/// parameters go with it, and a change to either is refused by name (#1580).
+/// by `validate`. Its own column default and NOT NULL go with it too
+/// (#1578). A grant on it and one on its parent are each their own, created
+/// by the bootstrap, and granted and revoked on the standing partition as on
+/// any table (#1579). Its persistence and storage parameters go with it
+/// (#1580). Changing its own on a standing partition is
+/// `a_standing_partitions_own_properties_change_through_the_cli` (#1581).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_partition_tree_round_trips_through_the_cli() {
@@ -6628,45 +6630,6 @@ fn a_partition_tree_round_trips_through_the_cli() {
          END $$",
     );
 
-    // Its own default changed on the standing partition, refused by name
-    // until #1581 (#1578).
-    std::fs::write(&path, text.replace("'rest'::text", "'other'::text")).unwrap();
-    d.commit();
-    let o = d.run(&["plan", "--db", &tgt]);
-    assert_ne!(code(&o), 0, "{}", stdout(&o));
-    assert!(
-        stderr(&o).contains("app.ev_rest is a partitioned table or a partition")
-            && stderr(&o).contains("change a column's own default or NOT NULL"),
-        "{}",
-        stderr(&o)
-    );
-    std::fs::write(&path, &text).unwrap();
-    d.commit();
-
-    // Its persistence or storage parameters changed on the standing
-    // partition, refused by name until #1581 (#1580).
-    for (from, to, expected) in [
-        ("    unlogged: true\n", "", "set table persistence"),
-        (
-            "      fillfactor: 70\n",
-            "      fillfactor: 80\n",
-            "set storage parameters",
-        ),
-    ] {
-        std::fs::write(&path, text.replace(from, to)).unwrap();
-        d.commit();
-        let o = d.run(&["plan", "--db", &tgt]);
-        assert_ne!(code(&o), 0, "{}", stdout(&o));
-        assert!(
-            stderr(&o).contains("app.ev_rest is a partitioned table or a partition")
-                && stderr(&o).contains(expected),
-            "{}",
-            stderr(&o)
-        );
-    }
-    std::fs::write(&path, &text).unwrap();
-    d.commit();
-
     // Its own index on a column its parent lacks, refused by `validate`.
     std::fs::write(
         &path,
@@ -6681,27 +6644,6 @@ fn a_partition_tree_round_trips_through_the_cli() {
             && said.contains("index `ev_2025_id` references `nope`, which is not a column"),
         "{said}"
     );
-    // One added to the standing partition, refused by name until #1581.
-    std::fs::write(
-        &path,
-        text.replace(
-            "        columns: [id]\n",
-            "        columns: [id]\n      ev_2025_ts:\n        columns: [ts]\n",
-        ),
-    )
-    .unwrap();
-    d.commit();
-    let o = d.run(&["plan", "--db", &tgt]);
-    assert_ne!(code(&o), 0, "{}", stdout(&o));
-    assert!(
-        stderr(&o).contains("app.ev_2025 is a partitioned table or a partition")
-            && stderr(&o).contains("add index"),
-        "{}",
-        stderr(&o)
-    );
-    std::fs::write(&path, &text).unwrap();
-    d.commit();
-
     // A bound spelled otherwise than the engine does, refused with its
     // spelling before a plan exists.
     std::fs::write(&path, text.replace("[\"2026-01-01\"]", "[\"2026-1-1\"]")).unwrap();
@@ -18036,4 +17978,327 @@ fn a_table_bootstrap_did_not_build_is_created_by_the_next_plan() {
     succeeds(d.run(&["verify", "--db", &whole]));
     let next = succeeds(d.run(&["plan", "--db", &whole]));
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+/// A standing partition's own properties change through the CLI, each on a
+/// partition holding rows (#1581): its own index and CHECK added and
+/// dropped, its own default changed and then dropped back to its parent's,
+/// its own NOT NULL added and dropped, and its persistence and storage
+/// parameters switched. Each saved plan applies, verifies and replans empty.
+/// A NOT NULL over a NULL the partition holds is refused before the apply's
+/// first statement, and an index added to the parent stays refused by name
+/// (#1546).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_standing_partitions_own_properties_change_through_the_cli() {
+    let server = server();
+    let db = OwnDatabase::new(&server, "parts-1581");
+    let conn = db.connection().to_owned();
+    on_server(
+        &conn,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, \
+             note text DEFAULT 'p', k integer) PARTITION BY RANGE (ts); \
+         CREATE TABLE app.ev_2025 PARTITION OF app.ev \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
+         CREATE TABLE app.ev_rest PARTITION OF app.ev DEFAULT; \
+         ALTER TABLE app.ev_rest ALTER COLUMN note SET DEFAULT 'rest', \
+             ALTER COLUMN note SET NOT NULL; \
+         ALTER TABLE app.ev_rest SET UNLOGGED; \
+         ALTER TABLE app.ev_rest SET (fillfactor = 70); \
+         INSERT INTO app.ev VALUES (1, '2025-06-01', 'a', 1), (2, '2025-07-01', 'b', 2), \
+             (3, '2030-01-01', 'c', NULL)",
+    );
+    let d = Demo::new("parts-1581");
+    succeeds(d.run(&["pull", "--db", &conn]));
+    let path = d.dir.join("schema/app.ev.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let pulled = "partitions:\n  ev_2025: {from: [\"2025-01-01\"], to: [\"2026-01-01\"]}\n  \
+                  ev_rest:\n    default: true\n    columns:\n      \
+                  note: {default: \"'rest'::text\", nullable: false}\n    unlogged: true\n    \
+                  storage_parameters:\n      fillfactor: 70\n";
+    assert!(text.ends_with(pulled), "{text}");
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+    let declare = |partitions: &str| {
+        std::fs::write(&path, text.replace(pulled, partitions)).unwrap();
+        d.commit();
+    };
+    let applied = |name: &str, allow: &[&str]| {
+        let plan = d.dir.join(name);
+        let o = succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+        let planned = stdout(&o);
+        succeeds(approved_apply(&d, &conn, &plan, allow));
+        succeeds(d.run(&["verify", "--db", &conn]));
+        let next = succeeds(d.run(&["plan", "--db", &conn]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        planned
+    };
+    let holds = |sql: &str| scalar(&conn, &format!("SELECT ({sql})::int::int8"));
+    let not_null = |table: &str, column: &str| {
+        holds(&format!(
+            "SELECT attnotnull FROM pg_attribute \
+              WHERE attrelid = '{table}'::regclass AND attname = '{column}'"
+        ))
+    };
+    let default_of = |table: &str| {
+        format!(
+            "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef d JOIN pg_attribute a \
+               ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
+              WHERE d.adrelid = '{table}'::regclass AND a.attname = 'note'"
+        )
+    };
+
+    // Added and changed: an index, a CHECK and a NOT NULL of its own on the
+    // range partition; a new default of its own, logged and new storage
+    // parameters on the DEFAULT one.
+    declare(
+        "partitions:\n  ev_2025:\n    from: [\"2025-01-01\"]\n    to: [\"2026-01-01\"]\n    \
+         checks:\n      ev_2025_k_ck: k > 0\n    indexes:\n      ev_2025_k:\n        \
+         columns: [k]\n    columns:\n      k: {nullable: false}\n  ev_rest:\n    \
+         default: true\n    columns:\n      note: {default: \"'other'\", nullable: false}\n    \
+         storage_parameters:\n      fillfactor: 80\n",
+    );
+    let planned = applied(
+        "own.json",
+        &["--allow", "constraint", "--allow", "not-null"],
+    );
+    assert!(
+        planned.contains("~ note default -> 'other'") && planned.contains("~ k becomes NOT NULL"),
+        "{planned}"
+    );
+    assert_eq!(holds("SELECT to_regclass('app.ev_2025_k') IS NOT NULL"), 1);
+    assert_eq!(
+        holds(
+            "SELECT EXISTS (SELECT FROM pg_constraint WHERE conname = 'ev_2025_k_ck' \
+             AND conrelid = 'app.ev_2025'::regclass)"
+        ),
+        1
+    );
+    assert_eq!(not_null("app.ev_2025", "k"), 1);
+    assert_eq!(
+        holds(&format!(
+            "({}) = '''other''::text'",
+            default_of("app.ev_rest")
+        )),
+        1
+    );
+    assert_eq!(
+        holds(
+            "SELECT relpersistence = 'p' AND reloptions = '{fillfactor=80}' \
+               FROM pg_class WHERE oid = 'app.ev_rest'::regclass"
+        ),
+        1
+    );
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM app.ev"), 3);
+
+    // Dropped: each back to its parent's, the default taken back from it
+    // rather than dropped, and unlogged again with no parameters.
+    declare(
+        "partitions:\n  ev_2025: {from: [\"2025-01-01\"], to: [\"2026-01-01\"]}\n  \
+         ev_rest:\n    default: true\n    unlogged: true\n",
+    );
+    let planned = applied("back.json", &["--allow", "destructive"]);
+    assert!(
+        planned.contains("~ note default -> its parent's"),
+        "{planned}"
+    );
+    assert_eq!(holds("SELECT to_regclass('app.ev_2025_k') IS NULL"), 1);
+    assert_eq!(
+        holds("SELECT NOT EXISTS (SELECT FROM pg_constraint WHERE conname = 'ev_2025_k_ck')"),
+        1
+    );
+    assert_eq!(not_null("app.ev_2025", "k"), 0);
+    assert_eq!(not_null("app.ev_rest", "note"), 0);
+    assert_eq!(
+        holds(&format!(
+            "({}) = ({})",
+            default_of("app.ev_rest"),
+            default_of("app.ev")
+        )),
+        1
+    );
+    assert_eq!(
+        holds(
+            "SELECT relpersistence = 'u' AND reloptions IS NULL \
+               FROM pg_class WHERE oid = 'app.ev_rest'::regclass"
+        ),
+        1
+    );
+    // A row written to it directly takes its parent's default again.
+    on_server(
+        &conn,
+        "INSERT INTO app.ev_rest (id, ts) VALUES (4, '2031-01-01')",
+    );
+    assert_eq!(
+        scalar(&conn, "SELECT count(*) FROM app.ev WHERE note = 'p'"),
+        1
+    );
+
+    // Negative: a NOT NULL over the NULLs the partition holds, refused
+    // before the apply's first statement.
+    declare(
+        "partitions:\n  ev_2025: {from: [\"2025-01-01\"], to: [\"2026-01-01\"]}\n  \
+         ev_rest:\n    default: true\n    columns:\n      k: {nullable: false}\n    \
+         unlogged: true\n",
+    );
+    let plan = d.dir.join("null.json");
+    succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+    let refused = approved_apply(&d, &conn, &plan, &["--allow", "not-null"]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("2 existing NULLs in app.ev_rest.k"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(not_null("app.ev_rest", "k"), 0, "nothing ran");
+
+    // Negative: an index added to the parent is the parent's change, refused
+    // by name until #1546.
+    std::fs::write(
+        &path,
+        text.replace(
+            "partition_by: [ts]\n",
+            "indexes:\n  ev_k: {columns: [k]}\npartition_by: [ts]\n",
+        ),
+    )
+    .unwrap();
+    d.commit();
+    let o = d.run(&["plan", "--db", &conn]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("app.ev is a partitioned table or a partition")
+            && stderr(&o).contains("add index"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// A function rebuilt under a partition tree's defaults (#1588). The
+/// parent's default calls `app.f`, which one partition inherits and another
+/// overrides with its own call; a third overrides it with a call to `app.g`
+/// alone. Every partition's default row that calls `app.f` is taken off
+/// before its drop and put back after its create, and each partition's own,
+/// `ev_g`'s too, is set again after the parent's, which reaches every
+/// partition. The plan applies, verifies and replans empty, and each
+/// partition keeps its default. The same tree, `app.f` new, is created by one
+/// plan and by a bootstrap, its partitions reading back their own. A
+/// partition's own default calling a function the plan drops for good is
+/// still refused by name.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_function_rebuilt_under_partition_defaults_keeps_each_partitions_own() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "parts-1588");
+    let conn = own.connection().to_owned();
+    let tree = "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.g(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE TABLE app.ev (k integer NOT NULL, v integer DEFAULT app.f(1)) \
+             PARTITION BY RANGE (k); \
+         CREATE TABLE app.ev_inh PARTITION OF app.ev FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE app.ev_own PARTITION OF app.ev FOR VALUES FROM (10) TO (20); \
+         CREATE TABLE app.ev_g PARTITION OF app.ev FOR VALUES FROM (20) TO (30); \
+         ALTER TABLE app.ev_own ALTER COLUMN v SET DEFAULT app.f(2); \
+         ALTER TABLE app.ev_g ALTER COLUMN v SET DEFAULT app.g(5)";
+    on_server(
+        &conn,
+        &format!("{tree}; INSERT INTO app.ev (k) VALUES (1), (11), (21)"),
+    );
+    let d = Demo::new("parts-1588");
+    succeeds(d.run(&["pull", "--db", &conn]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+    let defaults = |connection: &str| {
+        scalar(
+            connection,
+            "SELECT (string_agg(c.relname || '=' || pg_get_expr(d.adbin, d.adrelid), ' ' \
+                                ORDER BY c.relname) = \
+                     'ev=app.f(1) ev_g=app.g(5) ev_inh=app.f(1) ev_own=app.f(2)')::int::int8 \
+               FROM pg_attrdef d JOIN pg_class c ON c.oid = d.adrelid \
+              WHERE c.relnamespace = 'app'::regnamespace",
+        )
+    };
+    // A row written straight to each partition takes that partition's
+    // default; one written through the parent takes the parent's.
+    let written = |connection: &str| {
+        on_server(
+            connection,
+            "DELETE FROM app.ev; \
+             INSERT INTO app.ev (k) VALUES (2); INSERT INTO app.ev_inh (k) VALUES (3); \
+             INSERT INTO app.ev_own (k) VALUES (12); INSERT INTO app.ev_g (k) VALUES (22)",
+        );
+        scalar(
+            connection,
+            "SELECT (string_agg(k || ':' || v, ' ' ORDER BY k) = '2:1 3:1 12:2 22:5')::int::int8 \
+               FROM app.ev",
+        )
+    };
+
+    let function = d.dir.join("schema/app.f%28integer%29.function.yml");
+    let text = std::fs::read_to_string(&function).unwrap();
+    let edited = text.replace("SELECT x", "SELECT x * 10");
+    assert_ne!(edited, text);
+    std::fs::write(&function, edited).unwrap();
+    let (plan, script) = connected_plan(&d, &conn);
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    let parents = at("ALTER TABLE \"app\".\"ev\" ALTER COLUMN \"v\" SET DEFAULT");
+    assert!(at("CREATE FUNCTION \"app\".\"f\"") < parents, "{script}");
+    for partition in ["ev_own", "ev_g"] {
+        assert!(
+            parents
+                < at(&format!(
+                    "ALTER TABLE \"app\".\"{partition}\" ALTER COLUMN \"v\" SET DEFAULT"
+                )),
+            "{script}"
+        );
+    }
+    succeeds(approved_apply(&d, &conn, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", &conn]));
+    let next = succeeds(d.run(&["plan", "--db", &conn]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(defaults(&conn), 1);
+    assert_eq!(written(&conn), 0, "app.f now multiplies");
+    assert_eq!(
+        scalar(
+            &conn,
+            "SELECT (string_agg(k || ':' || v, ' ' ORDER BY k) = '2:10 3:10 12:20 22:5')::int::int8 \
+               FROM app.ev"
+        ),
+        1
+    );
+
+    // The same tree, `app.f` new: created by one plan, and by a bootstrap.
+    std::fs::write(&function, &text).unwrap();
+    let fresh = OwnDatabase::new(&server, "parts-1588-plan");
+    on_server(fresh.connection(), "CREATE SCHEMA app");
+    succeeds(d.run(&["baseline", "--db", fresh.connection(), "--reason", "empty"]));
+    let (plan, _) = connected_plan(&d, fresh.connection());
+    succeeds(approved_apply(&d, fresh.connection(), &plan, &[]));
+    let booted = OwnDatabase::new(&server, "parts-1588-boot");
+    on_server(booted.connection(), "CREATE SCHEMA app");
+    succeeds(d.run(&["bootstrap", "--db", booted.connection()]));
+    for connection in [fresh.connection(), booted.connection()] {
+        succeeds(d.run(&["verify", "--db", connection]));
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        assert_eq!(defaults(connection), 1);
+        assert_eq!(written(connection), 1);
+    }
+
+    // Negative: `app.g` dropped for good under `ev_g`'s own default.
+    std::fs::remove_file(d.dir.join("schema/app.g%28integer%29.function.yml")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &conn]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("app.g(integer)") && err.contains("app.ev_g"),
+        "{err}"
+    );
 }

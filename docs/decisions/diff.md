@@ -2664,6 +2664,9 @@ without the validation wiring). Also by the units
 `a_partition_entry_is_one_bound_and_only_what_a_partition_owns` and
 `declaration_schema_and_loader_agree_on_a_partition_entry`.
 
+*Amended by [DEC-1581.1](#dec-1581-1): changing them on a standing partition
+plans and applies.*
+
 <a id="dec-1578-1"></a>
 
 **DEC-1578.1. A partition declares its own column defaults and NOT NULLs under
@@ -2800,6 +2803,11 @@ dropped default leaves its tree out; the other partitions declare none),
 CLI's `partitions_are_added_and_dropped_through_the_cli` applies a partition
 whose own default calls a function the same plan creates.
 
+*Amended by [DEC-1581.1](#dec-1581-1): a partition's own default and NOT NULL
+change on a standing partition, and a parent's default set by a plan, around a
+rebuild or split out of a new table, is followed by each partition's own
+instead of refused (#1588).*
+
 <a id="dec-1579-1"></a>
 
 **DEC-1579.1. A grant on a partition, and one on a partitioned parent, is that
@@ -2923,3 +2931,124 @@ to either refused by name). Also by the units
 `a_partitions_own_checks_and_indexes_answer_to_its_parents_columns`,
 `a_partitions_own_persistence_and_storage_are_its_own_through_a_detach` and
 `a_created_partitions_persistence_and_storage_answer_for_themselves`.
+
+*Amended by [DEC-1581.1](#dec-1581-1): changing either on a standing
+partition plans and applies.*
+
+<a id="dec-1581-1"></a>
+
+**DEC-1581.1. A standing partition's own indexes, checks, storage parameters
+and persistence change through the table's change kinds, and its own defaults
+and NOT NULLs through two kinds keyed by the partition and the column; a
+parent's default the plan sets is followed by every partition's own (#1581,
+#1588).**
+
+The follow-up to #1532's four slices, which read and created a partition's own
+properties (DEC-1577.1 to DEC-1580.1). This one changes them on a partition
+that stands. Grants on a partition already plan as any table's (DEC-1579.1).
+
+Measured on 16.15 and 18.6, each against a partition holding rows:
+
+- `SET UNLOGGED` and `SET LOGGED`, `SET (…)` and `RESET (…)`, `CREATE INDEX … ON`
+  the partition and `DROP INDEX`, and `ADD CONSTRAINT … CHECK` and `DROP
+  CONSTRAINT` all act on the partition alone.
+- `ALTER COLUMN … SET DEFAULT` with the parent's text puts the parent's copy
+  back after a default of the partition's own, and reads back as the parent's.
+  `DROP DEFAULT` leaves the partition's column with none.
+- `SET NOT NULL` and `DROP NOT NULL` work on a column its parent leaves
+  nullable. On 18 `SET NOT NULL` adds the local row `<partition>_<column>_not_null`.
+  `DROP NOT NULL` on a column its parent holds NOT NULL is refused, and
+  `SET NOT NULL` over a NULL the partition holds fails as a table's does.
+- On the parent, `ALTER COLUMN … DROP DEFAULT` takes every partition's default
+  away, a partition's own included, even one that calls nothing the plan
+  rebuilds. `SET DEFAULT` overwrites every partition's own. With `ONLY`, both
+  leave the partitions alone.
+
+**The table's kinds.** `AddIndex`, `DropIndex`, `AddCheck`, `DropCheck`,
+`SetStorageParameters` and `SetTablePersistence` act on the partition alone, so
+`refuse_partition_changes` admits them on a table that is a partition on both
+sides and not itself partitioned. A clone of the parent's index or check is
+never one: the reader holds only the partition's own (DEC-1577.1), and a
+clone is the parent's to change (#1546). Everything else on a partition stays
+refused by name, its renames, its own index's storage parameters and its
+replica identity among them, and so does every change to a partitioned parent.
+Switching a partition to `UNLOGGED` under a parent a declared permanent table
+references is refused, as creating one is (DEC-1580.1).
+
+**Two kinds of their own.** A partition declares no column, so it has no
+column uid, and `AlterColumnDefault` and `AlterColumnNullability` cannot name
+one. `SetPartitionDefault` and `SetPartitionNotNull` are keyed by the
+partition's table uid and the column's name.
+
+- `SetPartitionDefault { from, to, fallback }`: `from` and `to` are the
+  partition's own default as declared, and `fallback` is its parent's
+  declared default.
+  - Without one of its own, the partition takes its parent's back: `SET
+    DEFAULT <fallback>`, measured to read back as the parent's.
+  - `DROP DEFAULT` is emitted only with neither. Otherwise a row written
+    straight to the partition would lose the default its parent gives.
+  - It sorts with `AlterColumnDefault`, and `after_the_rebuilds` moves one
+    whose text calls a function the plan creates.
+  - `Declared::advance` records `to` as a column's default is recorded.
+- `SetPartitionNotNull`: tightening carries `not_null` and a pre-flight NULL
+  count on the partition. Relaxing carries nothing. It sorts by the same
+  ranks as `AlterColumnNullability`.
+
+**Around a rebuild (#1588).** Every partition holds a default row on a column
+whose parent has a default: the copy the engine gave it, or its own. Each such
+row that calls a function the plan rebuilds depends on it, and `weave` now
+holds it as managed whenever the partition is declared:
+
+- it is released with `SetPartitionDefault { to: None, fallback: None }`
+  before the drop;
+- it is restored after the create with the partition's own default, or its
+  parent's.
+
+The parent's release, an ordinary `DROP DEFAULT`, takes every partition's row
+with it, and its restoration, an ordinary `SET DEFAULT`, overwrites every
+partition's own. So `after_their_parents_defaults` runs last on a connected
+plan and in bootstrap, after any parent's default the plan sets. It sets
+every declared partition's own default on that column again, after the
+parent's:
+
+- one the plan already sets earlier is moved there;
+- one it does not set is added, including a partition whose own default calls
+  nothing the plan rebuilds;
+- a partition created after the parent's default needs neither, since its
+  `CREATE` sets its own.
+
+The same pass replaces the refusal in `split_new_tables`. A new parent's
+default split out after a new function no longer refuses a new partition
+that overrides that column. That partition's own is set again after it.
+
+**Why not `ONLY`.** `ALTER TABLE ONLY parent` would leave every partition
+alone, which is right around a rebuild. It is wrong for a split default: the
+partitions created before it would get no copy at all. It also spells the
+parent's own change, which is #1546's to decide. Setting each partition's own
+again after the parent's works for both.
+
+**Plan version 31.** An older build cannot read the two new kinds. The state
+needs no new version.
+
+Pinned on 16 and 18 by the CLI's
+`a_standing_partitions_own_properties_change_through_the_cli`:
+- each kind applied to a populated partition, verified and replanned empty;
+- the default dropped back to the parent's, which a row written to the
+  partition then takes;
+- negatives: a NOT NULL over the partition's NULLs is refused before the first
+  statement, and a parent's index stays refused by name.
+
+Also pinned by `a_function_rebuilt_under_partition_defaults_keeps_each_partitions_own`:
+- a parent's default calling `app.f` with an inheriting partition, an
+  overriding one, and one whose own default calls only `app.g`;
+- `app.f` rebuilt: applied, verified, replanned empty, each partition keeping
+  its default;
+- the same tree created by one plan and by a bootstrap with `app.f` new;
+- `app.g` dropped for good under a partition's own default is refused by name.
+
+Also by the units:
+- `a_partitions_own_column_overrides_are_its_own_through_a_detach`;
+- `a_partitions_own_checks_and_indexes_are_its_own_through_a_detach`;
+- `a_partitions_own_persistence_and_storage_are_its_own_through_a_detach`;
+- `a_partitions_default_is_released_and_set_again_after_its_parents`;
+- the partitioned case of the new-table split test in `dependents.rs`.

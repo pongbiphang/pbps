@@ -676,6 +676,10 @@ fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
         | Change::SetIndexStorageParameters { table, .. }
         | Change::SetTablePersistence { table, .. }
         | Change::SetStorageParameters { table, .. }
+        // A partition has no column of its own to name: its own default and
+        // NOT NULL are the partition's (#1581).
+        | Change::SetPartitionDefault { table, .. }
+        | Change::SetPartitionNotNull { table, .. }
         | Change::SetReplicaIdentity { table, .. }
         | Change::AddUnique { table, .. }
         | Change::DropUnique { table, .. }

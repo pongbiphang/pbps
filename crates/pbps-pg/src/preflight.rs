@@ -810,6 +810,8 @@ impl AsStored {
                 | Change::Revoke { .. }
                 | Change::SetIndexStorageParameters { .. }
                 | Change::SetTablePersistence { .. }
+                | Change::SetPartitionDefault { .. }
+                | Change::SetPartitionNotNull { .. }
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::DetachPartition { .. }
@@ -3117,6 +3119,24 @@ fn build(
             };
             Ok(vec![null_probe(column, &format!("(\n{rows}\n) AS r"), "r.k0")])
         }
+        // A partition's own NOT NULL reads the partition's rows, as a
+        // column's reads its table's (#1581).
+        Change::SetPartitionNotNull {
+            table,
+            column,
+            not_null: true,
+            ..
+        } => {
+            let column = table.column(column);
+            match names.column(&column) {
+                Some(stored) => Ok(vec![null_probe(
+                    &column,
+                    &qualified(&stored.table)?,
+                    &quote(&stored.name)?,
+                )]),
+                None => Ok(skip(change, "the column does not exist before apply", unchecked)),
+            }
+        }
         Change::AlterColumnNullability {
             column,
             to_nullable: false,
@@ -3387,6 +3407,8 @@ fn build(
         | Change::Revoke { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }
+        | Change::SetPartitionDefault { .. }
+        | Change::SetPartitionNotNull { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::DetachPartition { .. }
@@ -3612,6 +3634,8 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }

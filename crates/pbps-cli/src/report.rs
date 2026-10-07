@@ -335,6 +335,8 @@ fn role_of(change: &Change) -> Option<&str> {
         | Change::SetPrimaryKey { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }
+        | Change::SetPartitionDefault { .. }
+        | Change::SetPartitionNotNull { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
@@ -388,6 +390,8 @@ fn renames(cs: &ChangeSet) -> Renames {
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -760,6 +764,24 @@ pub fn describe(c: &Change) -> String {
         Change::SetTablePersistence { unlogged, .. } => {
             if *unlogged { "~ unlogged" } else { "~ logged" }.to_owned()
         }
+        // Named as a column's, under the partition it is listed under
+        // (#1581). Without its own, the partition takes its parent's again.
+        Change::SetPartitionDefault {
+            column,
+            to,
+            fallback,
+            ..
+        } => match (to, fallback) {
+            (Some(v), _) => format!("~ {column} default -> {v}"),
+            (None, Some(_)) => format!("~ {column} default -> its parent's"),
+            (None, None) => format!("~ {column} default removed"),
+        },
+        Change::SetPartitionNotNull {
+            column, not_null, ..
+        } => format!(
+            "~ {column} becomes {}",
+            if *not_null { "NOT NULL" } else { "nullable" }
+        ),
         Change::SetIndexStorageParameters {
             target, set, reset, ..
         } => {

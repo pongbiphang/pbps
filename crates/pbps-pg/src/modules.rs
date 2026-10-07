@@ -1569,9 +1569,19 @@ impl Dependent {
                     Part::Check(name) => t.checks.contains_key(name),
                     Part::Index(name) => t.indexes.contains_key(name),
                     // A default is the column's, and the column is what the
-                    // declaration names.
+                    // declaration names. A partition's is its own where it
+                    // declares one, and otherwise the copy of its parent's
+                    // the engine gave it (#1588).
                     Part::Default(column) => {
                         t.columns.get(column).is_some_and(|c| c.default.is_some())
+                            || t.partition_of.as_ref().is_some_and(|of| {
+                                of.columns.get(column).is_some_and(|o| o.default.is_some())
+                                    || declared
+                                        .tables
+                                        .get(&of.parent)
+                                        .and_then(|parent| parent.columns.get(column))
+                                        .is_some_and(|c| c.default.is_some())
+                            })
                     }
                     // Nothing can put it back, so it is never kept across a
                     // rebuild; only an expression change releases it.

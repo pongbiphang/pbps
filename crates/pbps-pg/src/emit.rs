@@ -2572,6 +2572,53 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             },
         ),
 
+        // A partition's own default, or, without one, the copy of its
+        // parent's that the engine gives every partition: `DROP DEFAULT`
+        // would leave the partition without the default its parent's rows
+        // get, which is not what the declaration says (#1581, DEC-1581.1).
+        Change::SetPartitionDefault {
+            table,
+            column,
+            to,
+            fallback,
+            ..
+        } => one(
+            pg,
+            table,
+            match to.as_ref().or(fallback.as_ref()) {
+                Some(expr) => format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
+                    qualified(table)?,
+                    quote(column)?,
+                    verbatim(expr)
+                ),
+                None => format!(
+                    "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+                    qualified(table)?,
+                    quote(column)?
+                ),
+            },
+        ),
+        Change::SetPartitionNotNull {
+            table,
+            column,
+            not_null,
+            ..
+        } => one(
+            pg,
+            table,
+            format!(
+                "ALTER TABLE {} ALTER COLUMN {} {};",
+                qualified(table)?,
+                quote(column)?,
+                if *not_null {
+                    "SET NOT NULL"
+                } else {
+                    "DROP NOT NULL"
+                }
+            ),
+        ),
+
         // Recomputes every row under the new expression. PostgreSQL 17 and
         // later only: 16 has no in-place form, and the connected path refuses
         // a plan that needs one there rather than emitting a drop and re-add

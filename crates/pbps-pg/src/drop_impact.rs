@@ -212,6 +212,8 @@ pub async fn drop_blockers(
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -363,6 +365,8 @@ fn stored(
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -508,29 +512,12 @@ async fn removal(
             ..
         }
         | Change::AlterColumnExpression { column, .. } => {
-            let Some((table, name)) = stored(cs, index, &column.table, Some(&column.name)) else {
-                return Ok(None);
-            };
-            let Some(on) = relation(conn, classes, &table, name.as_deref()).await? else {
-                return Ok(None);
-            };
-            let rows = conn
-                .query_with(
-                    "SELECT oid::int8 AS oid FROM pg_catalog.pg_attrdef
-                WHERE adrelid=($1::int8)::oid AND adnum=$2::int8",
-                    &[Param::I64(on.object), Param::I64(on.part)],
-                )
-                .await?;
-            rows.first()
-                .map(|row| {
-                    Ok::<Address, DbError>(Address {
-                        class: classes.default,
-                        object: required(row, "oid")?,
-                        part: 0,
-                    })
-                })
-                .transpose()
-                .map_err(Into::into)
+            default_row(conn, classes, cs, index, &column.table, &column.name).await
+        }
+        // A partition's row, its own default or its copy of its parent's,
+        // goes as a column's does (#1581).
+        Change::SetPartitionDefault { table, column, .. } => {
+            default_row(conn, classes, cs, index, table, column).await
         }
         Change::CreateTable { .. }
         | Change::DetachPartition { .. }
@@ -544,6 +531,7 @@ async fn removal(
         | Change::SetPrimaryKey { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }
+        | Change::SetPartitionNotNull { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
@@ -564,6 +552,41 @@ async fn removal(
         | Change::Revoke { .. }
         | Change::PublicExecution { .. } => Ok(None),
     }
+}
+
+/// The `pg_attrdef` row a default change on `table`'s `column` replaces, as
+/// the plan stored them at `index`.
+async fn default_row(
+    conn: &mut Conn,
+    classes: &Classes,
+    cs: &ChangeSet,
+    index: usize,
+    table: &TableName,
+    column: &str,
+) -> Result<Option<Address>, ImpactError> {
+    let Some((table, name)) = stored(cs, index, table, Some(column)) else {
+        return Ok(None);
+    };
+    let Some(on) = relation(conn, classes, &table, name.as_deref()).await? else {
+        return Ok(None);
+    };
+    let rows = conn
+        .query_with(
+            "SELECT oid::int8 AS oid FROM pg_catalog.pg_attrdef
+            WHERE adrelid=($1::int8)::oid AND adnum=$2::int8",
+            &[Param::I64(on.object), Param::I64(on.part)],
+        )
+        .await?;
+    rows.first()
+        .map(|row| {
+            Ok::<Address, DbError>(Address {
+                class: classes.default,
+                object: required(row, "oid")?,
+                part: 0,
+            })
+        })
+        .transpose()
+        .map_err(Into::into)
 }
 
 async fn module_address(

@@ -32,6 +32,8 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         | Change::SetReplicaIdentity { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetTablePersistence { .. }
+        | Change::SetPartitionDefault { .. }
+        | Change::SetPartitionNotNull { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::DropComputedColumn { .. }
         | Change::DropColumn { .. }

@@ -240,6 +240,13 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                     to_nullable: false,
                     ..
                 } => Some(&column.table),
+                // A partition's own NOT NULL narrows its column the same way
+                // (#1581).
+                Change::SetPartitionNotNull {
+                    table,
+                    not_null: true,
+                    ..
+                } => Some(table),
                 // Neither side: a computed column stores nothing, and an
                 // expression change drops and re-adds one under its name, so
                 // readers find it there throughout (#1174).
@@ -252,6 +259,8 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::RenameColumn { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
+                | Change::SetPartitionDefault { .. }
+                | Change::SetPartitionNotNull { .. }
                 | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }

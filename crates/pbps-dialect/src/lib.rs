@@ -386,6 +386,9 @@ impl Unchecked {
                 format!("index storage parameters on {table}")
             }
             Change::AlterColumnNullability { column, .. } => format!("NOT NULL column {column}"),
+            Change::SetPartitionNotNull { table, column, .. } => {
+                format!("NOT NULL column {} on the partition", table.column(column))
+            }
             Change::AddComputedColumn { table, name, .. } => {
                 format!("new computed column {}", table.column(name))
             }
@@ -400,6 +403,7 @@ impl Unchecked {
             | Change::DropColumn { .. }
             | Change::RenameColumn { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::SetPartitionDefault { .. }
             | Change::AlterColumnExpression { .. }
             | Change::DropComputedColumn { .. }
             | Change::SetColumnDeprecated { .. }

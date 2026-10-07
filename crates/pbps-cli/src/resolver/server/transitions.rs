@@ -470,6 +470,10 @@ pub(super) fn derive(
             Change::SetPrimaryKey { table, .. }
             | Change::SetIndexStorageParameters { table, .. }
             | Change::SetTablePersistence { table, .. }
+            // A partition has no column of its own: its default and NOT
+            // NULL are the partition's, as the model projects them (#1581).
+            | Change::SetPartitionDefault { table, .. }
+            | Change::SetPartitionNotNull { table, .. }
             | Change::SetReplicaIdentity { table, .. }
             | Change::SetStorageParameters { table, .. }
             | Change::AddUnique { table, .. }

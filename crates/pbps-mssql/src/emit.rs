@@ -466,6 +466,13 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: DIALECT,
             feature: format!("storage parameters on `{table}`, which are PostgreSQL's"),
         }),
+        // A partition is PostgreSQL's in this model (#1581).
+        Change::SetPartitionDefault { table, .. } | Change::SetPartitionNotNull { table, .. } => {
+            Err(DialectError::Invalid {
+                dialect: crate::types::DIALECT,
+                message: format!("{table} is a partition, which SQL Server's model does not hold"),
+            })
+        }
         Change::SetTablePersistence { table, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
             feature: format!("an unlogged `{table}`, which is PostgreSQL's"),

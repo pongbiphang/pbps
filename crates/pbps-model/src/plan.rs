@@ -206,7 +206,10 @@ use crate::schema::Schema;
 /// (DEC-1580.1): a created partition's `unlogged` and `storage_parameters`,
 /// which an older build reads and then does not emit, creating the
 /// partition permanent and without them.
-pub const CURRENT_VERSION: u32 = 30;
+///
+/// Bumped to 31 for `SetPartitionDefault` and `SetPartitionNotNull`
+/// (DEC-1581.1), changes an older build cannot read.
+pub const CURRENT_VERSION: u32 = 31;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -665,7 +668,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 30);
+        assert_eq!(CURRENT_VERSION, 31);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads
