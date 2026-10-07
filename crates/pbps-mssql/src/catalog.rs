@@ -961,6 +961,38 @@ pub async fn prove_schemas_visible(conn: &mut Conn, schemas: &[String]) -> Resul
     Ok(())
 }
 
+/// Which of `roles`, names a read of `sys.database_principals` did not
+/// return, the database holds anyway (#1606). That view is filtered by
+/// metadata visibility: an effective `DENY VIEW DEFINITION` or `DENY CONTROL`
+/// on a role, to this login or a role it is in, hides the role's row, and a
+/// login without database `VIEW DEFINITION` sees only the roles it belongs to.
+///
+/// DEC-1606.1: `DATABASE_PRINCIPAL_ID` is not filtered (measured on the pinned
+/// 17.0 image). It resolves a role under each of those `DENY`s and for a
+/// login holding nothing but `CONNECT`, and answers NULL only for a name the
+/// database lacks, so it tells hidden from absent by name. A permission check
+/// cannot: `ALTER ANY ROLE` alone shows every role while `VIEW DEFINITION` on
+/// the database answers 0. A name that resolves to a user rather than a role
+/// is returned too: it is not absent, whatever it is.
+pub async fn held_principals(conn: &mut Conn, roles: &[String]) -> Result<Vec<String>, DbError> {
+    if roles.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = roles
+        .iter()
+        .map(|r| format!("({})", crate::ident::literal(r)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.query(&format!(
+        "SELECT w.name FROM (VALUES {rows}) AS w(name)
+          WHERE DATABASE_PRINCIPAL_ID(w.name) IS NOT NULL;"
+    ))
+    .await?
+    .iter()
+    .map(|row| get::<&str>(row, "name").map(str::to_owned))
+    .collect()
+}
+
 /// The [`NameOccupant`]s at `names`, and every object whose parent is one of
 /// `parents` (its constraints, defaults and triggers), compared under the
 /// catalog collation that names them (see [`object_names_alike`]), read in the

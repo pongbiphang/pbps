@@ -3981,6 +3981,103 @@ fn a_hidden_table_is_not_recorded_as_missing() {
     on_server(&server, &format!("DROP LOGIN [{login}];"));
 }
 
+/// #1606: a role hidden from this login is not recorded as missing.
+/// `sys.database_principals` is filtered by metadata visibility, so under a
+/// `DENY VIEW DEFINITION` on role `hidden_r`, the role reads as missing. A
+/// `baseline` or a forced `snapshot` by that login is refused by name rather
+/// than dropping the role's uid from the state, and the state keeps it.
+/// Negative: a managed role really dropped by hand is recorded as missing,
+/// the next plan creates it, and verify is clean after its apply.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_hidden_role_is_not_recorded_as_missing() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "hidden_role");
+    let login = format!("pbps_flow_hidden_role_{}", std::process::id());
+    // Not a secret: this login exists for one test inside a throwaway container.
+    let password = "pbpsLeastPrivilege!1";
+    on_server(
+        &server,
+        &format!(
+            "IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ),
+    );
+    on_server(
+        own.connection(),
+        &format!(
+            "CREATE TABLE dbo.keep (id int); CREATE ROLE hidden_r; CREATE ROLE dropped_r; \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, UPDATE, DELETE, ALTER, REFERENCES \
+                 ON SCHEMA::dbo TO [{login}]; \
+             GRANT CREATE TABLE, VIEW DEFINITION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}]; \
+             DENY VIEW DEFINITION ON ROLE::hidden_r TO [{login}];"
+        ),
+    );
+    let d = Demo::new("hidden-role");
+    let o = d.run(&["pull", "--db", own.connection()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    d.commit();
+    let o = d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let as_login = with_key(
+        &with_key(own.connection(), "User Id", &login),
+        "Password",
+        password,
+    );
+
+    for args in [
+        vec!["baseline", "--db", &as_login, "--reason", "as the login"],
+        vec!["snapshot", "--db", &as_login, "--force"],
+    ] {
+        let o = d.run(&args);
+        assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
+        assert!(
+            stderr(&o).contains("cannot record role(s) hidden_r as missing"),
+            "{args:?}: {}",
+            stderr(&o)
+        );
+    }
+    // The state still holds `hidden_r`: nothing to create, nothing to drop.
+    let o = d.run(&["plan", "--db", own.connection()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+
+    // Negative: dropped by hand, `dropped_r` is missing, the next plan
+    // creates it, and the database then verifies clean.
+    on_server(
+        own.connection(),
+        &format!("DROP ROLE dropped_r; REVOKE VIEW DEFINITION ON ROLE::hidden_r FROM [{login}];"),
+    );
+    let o = d.run(&["baseline", "--db", &as_login, "--reason", "dropped by hand"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("dropped_r"), "{}", stdout(&o));
+    let checksum = plan_checksum(&plan);
+    let o = d.run(&[
+        "apply",
+        "--db",
+        own.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["verify", "--db", own.connection()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    on_server(&server, &format!("DROP LOGIN [{login}];"));
+}
+
 /// #1192: metadata visibility filters `sys.objects`, so a sequence this login
 /// is denied `VIEW DEFINITION` on returns no row and used to read as a free
 /// name. A connected plan that cannot prove the schema it creates into fully
