@@ -469,7 +469,7 @@ fn target_kind(
         return Err(invalid(if signatures.len() == 1 {
             format!(
                 "`{object}` is a routine, which this engine identifies by its signature and not \
-                 by its name (ADR-0009 §1): `pull` reads the grant back as `{}`, so a declaration \
+                 by its name (ADR-0009 section 1): `pull` reads the grant back as `{}`, so a declaration \
                  spelling it `{object}` would differ from the database on every plan and each \
                  plan would revoke and re-grant it. Write `{}` instead",
                 signatures[0], signatures[0]
@@ -477,7 +477,7 @@ fn target_kind(
         } else {
             format!(
                 "`{object}` names {} overloads, so PostgreSQL cannot tell which one this grant is \
-                 on (`routine name \"{object}\" is not unique`); write the signature instead — \
+                 on (`routine name \"{object}\" is not unique`); write the signature instead -- \
                  one of {}",
                 answering.len(),
                 signatures.join(", ")
@@ -522,9 +522,9 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
         errs.push(invalid(format!(
             "`{PUBLIC}` is PostgreSQL's name for every principal in the cluster, not a role: \
              `CREATE ROLE \"{PUBLIC}\"` is refused as reserved, and a `GRANT ... TO \"{PUBLIC}\"` \
-             — quoted, as this emitter writes every name — opens the object to all of them. \
+             -- quoted, as this emitter writes every name -- opens the object to all of them. \
              Declare a role of your own and grant to that; what PUBLIC holds is reported by \
-             `pull` as context and never managed (ADR-0010 §5)"
+             `pull` as context and never managed (ADR-0010 section 5)"
         )));
     }
     // `pg_` is the engine's own prefix: measured, `CREATE ROLE pg_thing` is
@@ -537,7 +537,7 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
             "`{name}` is in PostgreSQL's reserved `pg_` namespace, which holds the cluster's \
              predefined roles; the engine refuses `CREATE ROLE` on such a name, and what those \
              roles are granted is the cluster's business rather than this database's \
-             (ADR-0010 §3)"
+             (ADR-0010 section 3)"
         )));
     }
 
@@ -587,7 +587,7 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
             errs.push(invalid(format!(
                 "role `{name}`: `{target}` is in a schema named `{schema_of}`, which this \
                  engine reads as the current role's own schema wherever a `search_path` names \
-                 it — quoting does not make it literal. Every grant this dialect emits sets \
+                 it -- quoting does not make it literal. Every grant this dialect emits sets \
                  the path first, so no plan can carry this one. Grant in a schema the path \
                  can name"
             )));
@@ -610,7 +610,7 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
         for p in permissions.iter().filter(|p| !has_permission(**p)) {
             errs.push(invalid(format!(
                 "role `{name}`: `{}` on `{target}` is not a permission PostgreSQL has; it is SQL \
-                 Server's (ADR-0010 §6), and this engine takes {}",
+                 Server's (ADR-0010 section 6), and this engine takes {}",
                 p.as_str(),
                 permission_words()
             )));
@@ -634,7 +634,7 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                          {}. On this engine a schema grant does not carry to the objects in it: \
                          `GRANT ... ON ALL TABLES IN SCHEMA` applies once to what is there now, \
                          and `ALTER DEFAULT PRIVILEGES` covers only what one role creates \
-                         afterwards (ADR-0010 §2). Grant `{}` on each object instead, and keep \
+                         afterwards (ADR-0010 section 2). Grant `{}` on each object instead, and keep \
                          `schema::{s}: [usage]` so the role can reach them",
                         p.as_str(),
                         p.as_str().to_ascii_uppercase(),
@@ -655,9 +655,9 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                 if !usable.contains(schema_of) && schema_of != REACHABLE_WITHOUT_A_GRANT {
                     errs.push(invalid(format!(
                         "role `{name}`: `{target}` is granted in schema `{schema_of}`, which this \
-                         role has no `usage` on — PostgreSQL checks the schema before the object, \
+                         role has no `usage` on -- PostgreSQL checks the schema before the object, \
                          so every permission here reaches nothing and the role's own query is \
-                         `permission denied for schema {schema_of}` (ADR-0010 §1, measured). Add \
+                         `permission denied for schema {schema_of}` (ADR-0010 section 1, measured). Add \
                          `schema::{schema_of}: [usage]` to this role"
                     )));
                 }

@@ -913,7 +913,7 @@ pub(crate) fn ledger_facts() -> String {
          -- The roles that can themselves add a trigger to each ledger table,
          -- found once per table (#1529). Asking each candidate actor about
          -- every role in the cluster first made the editor branches call
-         -- `pg_has_role` roles² times: ~1.9 s a call on a 2285-role cluster.
+         -- `pg_has_role` roles^2 times: ~1.9 s a call on a 2285-role cluster.
          -- This set is the owner, its members and the few grantees, and the
          -- actor test below is asked only against it. The same predicate as
          -- before, split in two; who is named does not change.
@@ -926,7 +926,7 @@ pub(crate) fn ledger_facts() -> String {
          ),
          -- Each table's editors as one array, so the walk below unnests the
          -- editors of the table it asks about: scanning the whole set per
-         -- actor and filtering by table is roles² again once one table's set
+         -- actor and filtering by table is roles^2 again once one table's set
          -- is dense (review on #1531).
          trigger_editors AS MATERIALIZED (
            SELECT ledger, pg_catalog.array_agg(role) AS roles
@@ -1046,7 +1046,7 @@ pub(crate) fn ledger_facts() -> String {
          -- value set below the newest id makes the next records sort under
          -- older ones, so `ORDER BY id DESC` stops meaning newest-first. No
          -- schema USAGE clause here, unlike the trigger branch above:
-         -- measured on 18.6, `setval(<oid>, …)` succeeds for a role with
+         -- measured on 18.6, `setval(<oid>, ...)` succeeds for a role with
          -- UPDATE and no USAGE on the schema, since an oid needs no name
          -- lookup. `ALTER SEQUENCE` needs ownership, which follows the
          -- table's owner and cannot be changed apart from it, so the branch
@@ -1076,7 +1076,7 @@ pub(crate) fn ledger_facts() -> String {
             -- An editor itself first, through a hashed lookup, as for the
             -- trigger branch (`TRIGGER_EDITOR`): with `UPDATE` granted to
             -- `PUBLIC` every role is one, and walking the set per actor would
-            -- be roles² again.
+            -- be roles^2 again.
             AND ((d.objid, e.oid) IN (SELECT se.sequence, se.role FROM sequence_editor se)
                  OR EXISTS (
                 SELECT 1 FROM sequence_editors ses, pg_catalog.unnest(ses.roles) AS g(role)
@@ -1253,7 +1253,7 @@ fn migration_error(e: DbError, ownership_missing: bool) -> DbError {
     let code = e.server_error_code();
     let guidance = if code.as_deref() == Some(INSUFFICIENT_PRIVILEGE) && ownership_missing {
         "This is a one-time migration that needs ownership of \
-         public.__pbps_state — PostgreSQL authorizes ALTER TABLE by ownership, \
+         public.__pbps_state -- PostgreSQL authorizes ALTER TABLE by ownership, \
          not by a grantable privilege. Run `pbps doctor` with the same `--db` or \
          `--env` target as the failed command and obtain the \
          ownership right it reports before retrying."

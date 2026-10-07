@@ -1127,7 +1127,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             } else {
                 pulled.warnings.push(format!(
                     "PUBLIC holds {} on {}, which is every principal in the cluster and not a \
-                     role this project can declare (ADR-0010 §5)",
+                     role this project can declare (ADR-0010 section 5)",
                     g.permission,
                     target_label(g, &signatures)
                 ));
@@ -1191,7 +1191,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                 Some(target),
                 format!(
                     "role {grantee}: {} on {} is on an object whose name contains a parenthesis \
-                     or a period, which a declaration cannot spell — written out it reads back \
+                     or a period, which a declaration cannot spell -- written out it reads back \
                      as a different target; the declarations cannot express it",
                     g.permission,
                     target_label(g, &signatures)
@@ -1326,9 +1326,9 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                     // another grantor's entry standing and reports success
                     // (measured on 18.6, DECISIONS 483; #707).
                     "{} on {} was granted by `{}`, and a `REVOKE` from `{}` would not \
-                     carry that grantor — so nothing this tool can run takes it away. \
+                     carry that grantor -- so nothing this tool can run takes it away. \
                      Have `{}` revoke it{set_role} \
-                     (ADR-0010 §1, DECISIONS 483, measured)",
+                     (ADR-0010 section 1, DECISIONS 483, measured)",
                     g.permission,
                     target_label(g, &signatures),
                     g.grantor,
@@ -1351,9 +1351,9 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         pulled.warnings.push(format!(
             "PUBLIC can execute {}: {}. That is this engine's default for a routine \
              (`acldefault('f', owner)` is `{{=X/owner,owner=X/owner}}`), not something anyone \
-             granted, so it is reported rather than compared — and written into those \
+             granted, so it is reported rather than compared -- and written into those \
              declarations as `public_execute: true`, without which the next plan would take it \
-             away as part of rebuilding the routine (ADR-0010 §5)",
+             away as part of rebuilding the routine (ADR-0010 section 5)",
             plural(public_executes.len(), "routine"),
             listed(&public_executes)
         ));
@@ -1363,9 +1363,9 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         pulled.warnings.push(format!(
             "`EXECUTE` has been revoked from PUBLIC on {}: {}. That is the state a plan now \
              writes for every routine it creates, and this pull records it by leaving \
-             `public_execute:` off those declarations — it is still not a grant, because a \
+             `public_execute:` off those declarations -- it is still not a grant, because a \
              revocation here is the absence of the engine's default rather than a row \
-             (ADR-0009 §3, ADR-0010 §5)",
+             (ADR-0009 section 3, ADR-0010 section 5)",
             plural(closed.len(), "routine"),
             listed(&closed)
         ));
@@ -1417,7 +1417,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         pulled.warnings.push(format!(
             "PUBLIC holds {permission} on {class}: {}. This is access beyond the engine's \
              default for every principal in the cluster, reported as context rather than \
-             compared as a role's grants (ADR-0010 §5)",
+             compared as a role's grants (ADR-0010 section 5)",
             listed(&names)
         ));
     }
@@ -1431,7 +1431,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             target: None,
             what: format!(
                 "role {role}: {permission} on {class} is not something the declarations can \
-                 name — {}",
+                 name -- {}",
                 listed(&names)
             ),
         });
@@ -1464,7 +1464,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         pulled.warnings.push(format!(
             "`ALTER DEFAULT PRIVILEGES FOR ROLE {}` in {} grants {} on {} that role creates from \
              now on; the declarations have no such thing, because on this engine who creates an \
-             object decides what it arrives with (ADR-0010 §2)",
+             object decides what it arrives with (ADR-0010 section 2)",
             d.grantor,
             match &d.in_schema {
                 Some(s) => format!("schema `{s}`"),
@@ -1627,8 +1627,8 @@ fn target_named(
             pbps_model::GrantTarget::Object(name.clone()),
             format!(
                 "{} on sequence `{name}` is a grant on a sequence, which this model does not \
-                 declare — an identity column needs no such grant and a `serial` column does, \
-                 which is why `serial` is refused at load (ADR-0010 §7)",
+                 declare -- an identity column needs no such grant and a `serial` column does, \
+                 which is why `serial` is refused at load (ADR-0010 section 7)",
                 permission
             ),
         )),
@@ -1850,7 +1850,7 @@ fn add_module(
             format!(
                 "`{here}` is a module whose definition this reader could not separate from the \
                  statement the engine deparsed for it. It is left out of the pull rather than \
-                 recorded with a body that is not its own — an empty definition would read as a \
+                 recorded with a body that is not its own -- an empty definition would read as a \
                  module with nothing in it, and the next plan would write that back."
             ),
         );
@@ -1987,7 +1987,7 @@ fn a_name_the_declaration_cannot_write(name: &TableName, columns: &[&RawColumn])
     if !unwritable.is_empty() {
         return Some(format!(
             "`{name}` has {} whose type this dialect's catalogue cannot spell and the \
-             declaration format cannot write back either — a type is stored as its own spelling \
+             declaration format cannot write back either -- a type is stored as its own spelling \
              and read by parsing it, and these do not survive that: {}. The whole table is left \
              out of the pull, because a schema that can be written and not loaded is worse than \
              one that says a table is missing (issue #130).",
@@ -2217,7 +2217,7 @@ fn sequence_limitations(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) {
             pulled,
             &parts.name,
             format!(
-                "column `{}`.`{}` defaults from the sequence `{sequence}`, which it owns — the \
+                "column `{}`.`{}` defaults from the sequence `{sequence}`, which it owns -- the \
                  shape `serial` creates. This model holds the default and has nowhere to put the \
                  sequence, so a declaration pulled from here does not create it, and a rebuild \
                  of this table can drop it before the default is applied again.",
@@ -2241,7 +2241,7 @@ fn sequence_limitations(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) {
                 "column `{}`.`{}` defaults from the sequence {sequences}, which it does not own. \
                  This model holds the default and has nowhere to put the sequence, so a \
                  declaration pulled from here creates a table whose default names an object that \
-                 is not there — and `nextval` resolves that name when the table is created, not \
+                 is not there -- and `nextval` resolves that name when the table is created, not \
                  when a row is inserted.",
                 parts.name, raw.name
             ),
@@ -2290,7 +2290,7 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
                 &parts.name,
                 format!(
                     "column `{}`.`{}` is a {} generated column, which this model does not hold. \
-                     Its expression is `{}`, and it is **not** read back as a `default:` — a \
+                     Its expression is `{}`, and it is **not** read back as a `default:` -- a \
                      default is computed once when a row is inserted, and this is recomputed on \
                      every {}.",
                     parts.name,
@@ -2317,7 +2317,7 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
             format!(
                 "column `{}`.`{}` is `COLLATE \"{collation}\"`, and this model holds only the \
                  type. Read back it is a column with the type's own collation, which orders and \
-                 compares differently — so a unique key over it accepts a different set of \
+                 compares differently -- so a unique key over it accepts a different set of \
                  values.",
                 parts.name, raw.name
             ),
@@ -2351,7 +2351,7 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
                 format!(
                     "column `{}`.`{}` has an `identity:` whose sequence runs {}..={}{}, and this \
                      model holds only the seed and the increment. Read back it is an identity \
-                     with this engine's default bounds, which runs out — or wraps — somewhere \
+                     with this engine's default bounds, which runs out -- or wraps -- somewhere \
                      else.",
                     parts.name,
                     raw.name,
@@ -2555,8 +2555,8 @@ fn add_constraint(
                 &parts.name,
                 format!(
                     "constraint `{}` on `{}` is `NOT ENFORCED`: the engine records it and checks \
-                     nothing against it, ever. This model has no word for that — read back it is \
-                     an ordinary constraint, which a plan would recreate as one that enforces — \
+                     nothing against it, ever. This model has no word for that -- read back it is \
+                     an ordinary constraint, which a plan would recreate as one that enforces -- \
                      so it is left out. Its definition is `{}`.",
                     raw.name, parts.name, raw.definition
                 ),
@@ -2594,8 +2594,8 @@ fn add_constraint(
                 &parts.name,
                 format!(
                     "constraint `{}` on `{}` is implemented by triggers that are not in the \
-                     ordinary enable mode — `DISABLE TRIGGER` and the replica modes both land \
-                     here — while the catalog still calls the constraint validated and enforced. \
+                     ordinary enable mode -- `DISABLE TRIGGER` and the replica modes both land \
+                     here -- while the catalog still calls the constraint validated and enforced. \
                      This model holds only the constraint, so it is left out rather than read \
                      back as one whose checks are running. Its definition is `{}`.",
                     raw.name, parts.name, raw.definition
@@ -2613,8 +2613,8 @@ fn add_constraint(
                 pulled,
                 &parts.name,
                 format!(
-                    "constraint `{}` on `{}` is temporal — `WITHOUT OVERLAPS` on a key, `PERIOD` \
-                     on a foreign key — and it carries the `contype` of an ordinary one. What it \
+                    "constraint `{}` on `{}` is temporal -- `WITHOUT OVERLAPS` on a key, `PERIOD` \
+                     on a foreign key -- and it carries the `contype` of an ordinary one. What it \
                      asks is about ranges, not values, and this model holds only the columns, so \
                      it is left out rather than read back as the constraint it is not. Its \
                      definition is `{}`.",
@@ -2678,7 +2678,7 @@ fn add_constraint(
                 format!(
                     "constraint `{}` on `{}` is `DEFERRABLE{}`, and this model holds neither \
                      word. Read back as an ordinary constraint it compares equal to one that is \
-                     checked immediately — so a transaction that relies on `SET CONSTRAINTS`, or \
+                     checked immediately -- so a transaction that relies on `SET CONSTRAINTS`, or \
                      on rows that violate it in the middle of one, would break with no plan \
                      saying anything had changed. Its definition is `{}`.",
                     raw.name,
@@ -2812,7 +2812,7 @@ fn add_foreign_key(
             &parts.name,
             format!(
                 "foreign key `{}` on `{}` is enforced against a uniqueness on the referenced \
-                 table that this pull left out, so it is left out too — read back it would be a \
+                 table that this pull left out, so it is left out too -- read back it would be a \
                  key with nothing to point at, and recreating this schema would fail on it. Its \
                  definition is `{}`.",
                 raw.name, parts.name, raw.definition
@@ -2884,7 +2884,7 @@ fn add_foreign_key(
             format!(
                 "foreign key `{}` on `{}` is `MATCH {}`, and this model holds only the default \
                  `MATCH SIMPLE`. The difference decides what happens to a row whose referencing \
-                 columns are partly null — accepted by SIMPLE, refused by FULL — so the key is \
+                 columns are partly null -- accepted by SIMPLE, refused by FULL -- so the key is \
                  left out rather than read back as the one it is not.",
                 raw.name,
                 parts.name,
@@ -2939,8 +2939,8 @@ fn add_foreign_key(
             &parts.name,
             format!(
                 "foreign key `{}` on `{}` is `ON DELETE {}` `ON UPDATE {}`, and this model holds \
-                 no `RESTRICT`. The difference is not cosmetic — `NO ACTION` is checked at the \
-                 end of the statement and can be deferred, `RESTRICT` cannot — so the key is \
+                 no `RESTRICT`. The difference is not cosmetic -- `NO ACTION` is checked at the \
+                 end of the statement and can be deferred, `RESTRICT` cannot -- so the key is \
                  left out rather than read back as the action it is not.",
                 raw.name,
                 parts.name,
@@ -3060,7 +3060,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             &parts.name,
             format!(
                 "index `{}` on `{}` orders a column by a collation that is not the column's own \
-                 — `COLLATE \"C\"` is the one that comes up — and `IndexColumn` has no field \
+                 -- `COLLATE \"C\"` is the one that comes up -- and `IndexColumn` has no field \
                  for it. Read back it is an ordinary index, which compares different values \
                  equal, so it is left out.",
                 raw.name, parts.name

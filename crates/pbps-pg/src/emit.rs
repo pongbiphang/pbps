@@ -689,9 +689,9 @@ pub(crate) fn refuse_an_unresolved_default(
         "column `{column}` is `{ty}` and its default is the bare literal {default}. What that \
          text means is decided by the session that runs the `CREATE`: measured, `'01/02/2026'` on \
          a `date` stores 2026-01-02 under `DateStyle` MDY and 2026-02-01 under DMY, with no error \
-         either way — so this column would default to February in one environment and January in \
+         either way -- so this column would default to February in one environment and January in \
          another. Write it the way the engine renders it, with the cast it welds on and a \
-         spelling that cannot be read two ways: `'2026-01-02'::date` (ADR-0013 §3, §4)."
+         spelling that cannot be read two ways: `'2026-01-02'::date` (ADR-0013 section 3, section 4)."
     )))
 }
 
@@ -1315,8 +1315,8 @@ pub(crate) fn write_path(pg: &Postgres, schema: &str) -> Result<String, DialectE
                  written. Measured, a schema holding a `lower(text)` of its own binds \
                  `CHECK (lower(c) = c)` to the built-in under `SET search_path = \"shad\"` and to \
                  its own function under `SET search_path = \"shad\", \"pg_catalog\"`, with no \
-                 error either way — so listing it would let a project object shadow a built-in \
-                 in a check, a filter or a default (ADR-0013 §3). Leave it out; it is already \
+                 error either way -- so listing it would let a project object shadow a built-in \
+                 in a check, a filter or a default (ADR-0013 section 3). Leave it out; it is already \
                  first."
             )));
         }
@@ -1324,10 +1324,10 @@ pub(crate) fn write_path(pg: &Postgres, schema: &str) -> Result<String, DialectE
             return Err(invalid(format!(
                 "`{part}` cannot be part of a write `search_path`: this engine reads that entry \
                  as the current role's own schema rather than as a schema of that name, and \
-                 quoting it does not help — measured, `SET search_path = \"$user\"` binds an \
+                 quoting it does not help -- measured, `SET search_path = \"$user\"` binds an \
                  unqualified name through the deployment role's schema even where a schema \
                  called `$user` exists. A statement scoped that way would resolve a name in a \
-                 check, a filter or a default against whatever that role owns (ADR-0013 §3)."
+                 check, a filter or a default against whatever that role owns (ADR-0013 section 3)."
             )));
         }
         // An omitted temporary schema is implicitly searched first. Keeping
@@ -1545,7 +1545,7 @@ fn signature(id: &ModuleId) -> Result<String, DialectError> {
         invalid(format!(
             "`{id}` is a routine without an argument list, and this engine identifies a routine by \
              its arguments: two overloads share the name, so `DROP FUNCTION` needs the signature \
-             to say which one (ADR-0009 §1)"
+             to say which one (ADR-0009 section 1)"
         ))
     })?;
     Ok(args
@@ -1559,7 +1559,7 @@ fn attached_to(id: &ModuleId) -> Result<&TableName, DialectError> {
     id.attached_to().ok_or_else(|| {
         invalid(format!(
             "trigger `{id}` does not say which table it is on, and on this engine a trigger's \
-             name is scoped to its table rather than to a schema (ADR-0009 §1)"
+             name is scoped to its table rather than to a schema (ADR-0009 section 1)"
         ))
     })
 }
@@ -1682,7 +1682,7 @@ pub(crate) fn permission_sql(p: Permission) -> Result<&'static str, DialectError
             return Err(DialectError::Unsupported {
                 dialect: DIALECT,
                 feature: format!(
-                    "the `{}` permission, which is SQL Server's (ADR-0010 §6); this engine takes \
+                    "the `{}` permission, which is SQL Server's (ADR-0010 section 6); this engine takes \
                      {}",
                     p.as_str(),
                     crate::validate::permission_words()
@@ -2194,8 +2194,8 @@ fn the_body_declares_the_identity(
         return vec![invalid(format!(
             "routine `{id}` has a definition that does not begin with a parameter list. On this \
              engine the emitter writes `CREATE FUNCTION {}` and the declaration writes everything \
-             after the name, so the list is the body's — and **measured**, the engine requires \
-             one: `CREATE FUNCTION f RETURNS int …` is a syntax error",
+             after the name, so the list is the body's -- and **measured**, the engine requires \
+             one: `CREATE FUNCTION f RETURNS int ...` is a syntax error",
             id.object_name()
         ))];
     };
@@ -2207,8 +2207,8 @@ fn the_body_declares_the_identity(
         return vec![invalid(format!(
             "routine `{id}` is declared with {} argument type(s), and its definition's parameter \
              list carries {} into the identity. On this engine a routine is its name and its \
-             argument types (ADR-0009 §1), so the engine would create an object this key does not \
-             name — and accept it without a word",
+             argument types (ADR-0009 section 1), so the engine would create an object this key does not \
+             name -- and accept it without a word",
             args.len(),
             carried.len()
         ))];
@@ -2260,7 +2260,7 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
     let schema = id.schema();
     if !crate::catalog::a_projects_schema(schema) {
         found.push(invalid(format!(
-            "module `{id}` is declared in `{schema}`, which this dialect's pull never reads:              `pg_catalog`, `information_schema` and every schema whose name begins with `pg_`              are excluded from the managed set. The engine would create the module and no plan              could ever see it again — and `pg_temp` is worse than invisible, because it is              this engine's alias for the session's temporary schema: measured, `CREATE VIEW              \"pg_temp\".\"v\"` leaves a `pg_temp_4.v` that disappears with the connection.              Declare the module in a schema of the project's own"
+            "module `{id}` is declared in `{schema}`, which this dialect's pull never reads:              `pg_catalog`, `information_schema` and every schema whose name begins with `pg_`              are excluded from the managed set. The engine would create the module and no plan              could ever see it again -- and `pg_temp` is worse than invisible, because it is              this engine's alias for the session's temporary schema: measured, `CREATE VIEW              \"pg_temp\".\"v\"` leaves a `pg_temp_4.v` that disappears with the connection.              Declare the module in a schema of the project's own"
         )));
     }
     // The rule a table and a grant already have, for the same reason: every
@@ -2271,7 +2271,7 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
     if schema == NOT_A_SCHEMA_A_PATH_CAN_NAME {
         found.push(invalid(format!(
             "module `{id}` is declared in a schema named `{schema}`, which this engine reads as \
-             the current role's own schema wherever a `search_path` names it — quoting does not \
+             the current role's own schema wherever a `search_path` names it -- quoting does not \
              make it literal. Every statement this dialect emits for a module sets the path \
              first, so no plan can carry this one. Declare it under a name the path can carry"
         )));
@@ -2314,7 +2314,7 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
                     Some(named) => found.push(invalid(format!(
                         "trigger `{id}` is declared on `{on}`, and its definition puts it on \
                          `{named}`. On this engine the table is part of the statement the \
-                         declaration holds — `CREATE TRIGGER {} AFTER INSERT ON {on} …` — so a \
+                         declaration holds -- `CREATE TRIGGER {} AFTER INSERT ON {on} ...` -- so a \
                          definition naming another table creates the trigger there, under this \
                          key, and the next plan cannot find it",
                         id.name()
@@ -2322,7 +2322,7 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
                     None => found.push(invalid(format!(
                         "trigger `{id}` has a definition this dialect cannot find an `ON \
                          <table>` in. That clause is what decides which table the trigger is \
-                         created on, and it has to be the `{on}` this identity names — so a \
+                         created on, and it has to be the `{on}` this identity names -- so a \
                          definition whose target cannot be read is refused rather than created \
                          somewhere this key does not point"
                     ))),
@@ -2489,11 +2489,11 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             if types::change_risk(&was, &normalized) == pbps_dialect::TypeChangeRisk::Incompatible {
                 return Err(invalid(format!(
                     "column `{}` cannot be changed from `{}` to `{normalized}`: this engine \
-                     refuses the conversion outright — `column \"{}\" cannot be cast \
-                     automatically` — and its remedy is a `USING` clause, which pbps does not \
+                     refuses the conversion outright -- `column \"{}\" cannot be cast \
+                     automatically` -- and its remedy is a `USING` clause, which pbps does not \
                      emit. A `USING` expression says what the data becomes, and that is a \
                      transformation to declare and review, not one for a tool to choose \
-                     (ADR-0012 §5). Add the new column, fill it in a declared step, and drop the \
+                     (ADR-0012 section 5). Add the new column, fill it in a declared step, and drop the \
                      old one.",
                     column.name,
                     types::normalize(from)?,
@@ -2518,10 +2518,10 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                     "column `{}` cannot be changed from `{was}` to `{normalized}`: the \
                      conversion gains or loses the time zone, and what each stored value \
                      becomes is then read from a session setting rather than from anything \
-                     declared — the same value converts to a different instant depending on \
+                     declared -- the same value converts to a different instant depending on \
                      the zone the applying session happens to hold. Say what the values mean \
                      instead: add the new column, fill it in a declared step with the zone \
-                     written out (`AT TIME ZONE \'…\'`), and drop the old one.",
+                     written out (`AT TIME ZONE \'...\'`), and drop the old one.",
                     column.name
                 )));
             }
@@ -2939,19 +2939,19 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         // idea of who a principal is.
         Change::CreateRole { name, .. } => Err(by_hand(
             format!(
-                "`{name}` is a role, which on this engine lives in `pg_authid` and is shared by                  every database in the cluster; pbps manages what a role is granted here and not                  whether it exists (ADR-0010 §3)"
+                "`{name}` is a role, which on this engine lives in `pg_authid` and is shared by                  every database in the cluster; pbps manages what a role is granted here and not                  whether it exists (ADR-0010 section 3)"
             ),
             format!("CREATE ROLE {};", quote(name)?),
         )),
         Change::DropRole { name, .. } => Err(by_hand(
             format!(
-                "`{name}` is a role, and dropping one is a cluster-wide act this database's                  catalog cannot even see the reasons for: measured, with every grant *this*                  database holds revoked, the engine still refuses with `1 object in database                  otherdb`. pbps revokes what the role was granted here and leaves the role                  (ADR-0010 §3, §4)"
+                "`{name}` is a role, and dropping one is a cluster-wide act this database's                  catalog cannot even see the reasons for: measured, with every grant *this*                  database holds revoked, the engine still refuses with `1 object in database                  otherdb`. pbps revokes what the role was granted here and leaves the role                  (ADR-0010 section 3, section 4)"
             ),
             format!("DROP ROLE {};", quote(name)?),
         )),
         Change::RenameRole { from, to, .. } => Err(by_hand(
             format!(
-                "`{from}` is a role, and renaming one renames it in every database of the                  cluster; pbps does not own the principal (ADR-0010 §3). The grants follow the                  role's oid rather than its name, so nothing here has to be re-granted afterwards"
+                "`{from}` is a role, and renaming one renames it in every database of the                  cluster; pbps does not own the principal (ADR-0010 section 3). The grants follow the                  role's oid rather than its name, so nothing here has to be re-granted afterwards"
             ),
             format!("ALTER ROLE {} RENAME TO {};", quote(from)?, quote(to)?),
         )),
@@ -3852,7 +3852,7 @@ fn wrote_the_row(
         qualified(table)?,
         predicate.join("\n       AND "),
         refuse(&format!(
-            "{table} row `{key}` is not what this plan wrote once the statement had run — a \
+            "{table} row `{key}` is not what this plan wrote once the statement had run -- a \
              trigger on the table, another writer inside it, or a value the engine stores \
              differently from the way it is declared. Nothing was applied; `pbps plan --db` \
              says which."
@@ -3908,7 +3908,7 @@ fn gone_row(
         qualified(table)?,
         key_equals(key_column, key, key_type)?,
         refuse(&format!(
-            "{table} row `{key}` is back after this plan deleted it — a trigger on the table, \
+            "{table} row `{key}` is back after this plan deleted it -- a trigger on the table, \
              or another writer inside it. Nothing was applied."
         ))
     ))
@@ -3956,7 +3956,7 @@ fn insert_row(
             "`{table}` keys its declared rows by `{key_column}`, an identity column. This engine \
              writes a pinned key with `OVERRIDING SYSTEM VALUE` and leaves the sequence behind: \
              the apply succeeds, the plan verifies clean, and the next insert from anywhere else \
-             fails on the primary key (ADR-0013 §2). Declare the rows by a natural key, or place \
+             fails on the primary key (ADR-0013 section 2). Declare the rows by a natural key, or place \
              them outside pbps and adopt them with `pbps baseline`."
         )));
     }

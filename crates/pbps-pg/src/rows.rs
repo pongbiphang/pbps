@@ -1447,12 +1447,12 @@ pub(crate) fn data_problems(name: &TableName, table: &Table) -> Vec<DialectError
     {
         errs.push(invalid(format!(
             "a `data:` block cannot key its rows by `{key}`, an identity column. This engine \
-             writes a pinned key with `OVERRIDING SYSTEM VALUE` and leaves the sequence behind — \
-             measured, two pinned rows and the next ordinary insert fails on the primary key — \
+             writes a pinned key with `OVERRIDING SYSTEM VALUE` and leaves the sequence behind -- \
+             measured, two pinned rows and the next ordinary insert fails on the primary key -- \
              so the deployment succeeds and the application breaks afterwards. The sequence is \
              `{}.{}_{key}_seq`, and there is nothing pbps can safely do to it: a `nextval` walks \
              past any lock, a sequence cannot be locked, and an advance survives the rollback of \
-             a failed apply (ADR-0013 §2). Declare the rows by a natural key, or place them \
+             a failed apply (ADR-0013 section 2). Declare the rows by a natural key, or place them \
              outside pbps and adopt them with `pbps baseline`.",
             name.schema, name.name
         )));
@@ -1481,7 +1481,7 @@ pub(crate) fn data_problems(name: &TableName, table: &Table) -> Vec<DialectError
             if !agrees {
                 errs.push(invalid(format!(
                     "row `{key}` sets `{column}` to {value}, {}, but `{base}` reads back as {}: \
-                     the declaration would disagree with its own database on every plan — write \
+                     the declaration would disagree with its own database on every plan -- write \
                      it as {}",
                     value.kind(),
                     kind.name(),
@@ -1513,7 +1513,7 @@ pub(crate) fn data_problems(name: &TableName, table: &Table) -> Vec<DialectError
                 errs.push(invalid(format!(
                     "row `{key}` sets `{column}`, a `bytea` column, to {t:?}, {why}. This engine \
                      reads a `bytea` back as `\\x` followed by hex digits and pbps writes it back \
-                     as `decode('…','hex')` (ADR-0013 §3); a declaration in any other spelling \
+                     as `decode('...','hex')` (ADR-0013 section 3); a declaration in any other spelling \
                      would be restated by every plan."
                 )));
             }
@@ -1594,11 +1594,11 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
         if data.rows.len() > 1 {
             out.push(format!(
                 "`{name}`: whether two of its {} declared row keys are one row is decided by the \
-                 live `{key}` column — by the type's conversion, and, for a character type, by that \
+                 live `{key}` column -- by the type's conversion, and, for a character type, by that \
                  column's collation, which is not in the declarations. A case-insensitive or \
                  nondeterministic collation makes `New` and `new` one key and the second insert \
                  fails on the primary key. `pbps plan --db` asks the engine; this run did not \
-                 (ADR-0013 §5).",
+                 (ADR-0013 section 5).",
                 data.rows.len()
             ));
         }

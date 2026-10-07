@@ -923,3 +923,39 @@ and resolves no `ring`. PostgreSQL constructs its client with aws-lc-rs directly
 (228). An omitted SQL Server `Encrypt` key already meant `Required` in the
 preceding `tiberius-ng` release, so the upstream switch does not weaken or
 change that default. The peer-verified path still sets `Required` explicitly.
+
+<a id="dec-1629-1"></a>
+
+**DEC-1629.1. The statement text pbps itself writes for PostgreSQL is ASCII,
+so every server encoding holds it; the database's encoding is not narrowed to
+UTF8.** The driver connects with `client_encoding=UTF8`, and the server
+converts each statement into the database's encoding, SQL comments and
+`RAISE` messages included. A character that encoding cannot hold fails the
+whole statement.
+
+Measured on 18, of the characters pbps used (`—`, `…`, `²`, `§`), only `UTF8`
+and `WIN1252` hold all four. `LATIN1`, `LATIN2`, `LATIN9`, `WIN1250`,
+`WIN1251`, `KOI8R`, `ISO_8859_5`, `EUC_JP`, `EUC_KR`, `EUC_CN`, `EUC_TW` and
+`MULE_INTERNAL` each fail at least one. So `bootstrap` failed outright on a
+`LATIN1` database (a SQL comment's `…`), and so did a deploy script writing
+declared rows (its row check's `RAISE` text carries `—`).
+
+Refusing every non-UTF8 database at connect would have been the smaller
+change. But it would shut out exactly the older databases adoption is for,
+for the sake of punctuation. So the text changes instead:
+- every string and character literal in the non-test code of `pbps-pg` and
+  `pbps-db`, the two crates that send statement text, is ASCII, enforced by
+  `the_statement_text_pbps_writes_is_ascii`;
+- the rule covers user-facing messages in those crates too, because a scan
+  cannot tell which literal reaches the server;
+- comments are free.
+
+What a user declares is sent as declared, and whether the database's encoding
+holds it is the database's own error to report. SQL Server is not affected:
+TDS carries UTF-16.
+
+Pinned by `the_statement_text_pbps_writes_is_ascii` and
+`the_ascii_scan_reads_literals_and_skips_comments_and_test_code`
+(`crates/pbps-pg/tests/statement_text_is_ascii.rs`), and the live
+`a_database_in_a_non_utf8_encoding_is_bootstrapped_and_deployed`
+(`crates/pbps-cli/tests/flow_pg.rs`, `LATIN1` and `EUC_JP`).

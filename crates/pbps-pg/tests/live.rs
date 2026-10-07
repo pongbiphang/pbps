@@ -2260,7 +2260,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         // A key that asks about ranges, wearing an ordinary key's `contype`.
         // Named down to the phrase: the fixture's table is called `temporal`
         // too, so the bare word is satisfied by any warning about it.
-        "is temporal — `WITHOUT OVERLAPS`",
+        "is temporal -- `WITHOUT OVERLAPS`",
         // A constraint the engine records and never checks. Not `NOT VALID`,
         // which does check every new row — the two are one field apart in the
         // catalog and opposite in what they promise. Named down to the
@@ -12420,7 +12420,7 @@ async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
     // this tool's answer says the opposite in as many words: the plan names
     // every object it drops, or it does not drop (SPEC 14.3).
     assert!(
-        refusal.contains("`DROP … CASCADE` is not offered"),
+        refusal.contains("`DROP ... CASCADE` is not offered"),
         "{refusal}"
     );
 

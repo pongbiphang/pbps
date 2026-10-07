@@ -949,7 +949,7 @@ impl Dialect for Postgres {
                 dialect: types::DIALECT,
                 message: format!(
                     "table `{name}` is declared in a schema named `{schema}`, which this engine \
-                     reads as the current role's own schema wherever a `search_path` names it — \
+                     reads as the current role's own schema wherever a `search_path` names it -- \
                      quoting does not make it literal. The table would be created and then \
                      every unqualified name in its checks, filters and defaults would resolve \
                      through whatever schema the deploying role owns. Declare it under a name \
@@ -964,7 +964,7 @@ impl Dialect for Postgres {
                     "table `{name}` is declared in `{schema}`, which this dialect's pull \
                      never reads: `pg_catalog`, `information_schema` and every schema whose \
                      name begins with `pg_` are excluded from the managed set. The engine \
-                     would create the table and no plan could ever see it again — and \
+                     would create the table and no plan could ever see it again -- and \
                      `pg_temp` is worse than invisible, because it is this engine's alias for \
                      the session's temporary schema: measured, `CREATE TABLE \"pg_temp\".\"t\"` \
                      leaves a `pg_temp_58.t` that disappears with the connection. Declare the \
@@ -978,7 +978,7 @@ impl Dialect for Postgres {
             found.push(DialectError::Invalid {
                 dialect: types::DIALECT,
                 message: format!(
-                    "table `{name}` is one of the ledger tables this tool owns (SPEC §8.1). \
+                    "table `{name}` is one of the ledger tables this tool owns (SPEC section 8.1). \
                      Only those names in schema `{}` are reserved; the same table name in \
                      another project schema is read back normally.",
                     crate::state::LEDGER_SCHEMA
@@ -1019,8 +1019,8 @@ impl Dialect for Postgres {
                         dialect: types::DIALECT,
                         message: format!(
                             "primary key column `{column}` is nullable; a primary key column must \
-                             be NOT NULL. This engine does not refuse the table — it sets \
-                             `NOT NULL` for you — and then no plan can ever make the column match \
+                             be NOT NULL. This engine does not refuse the table -- it sets \
+                             `NOT NULL` for you -- and then no plan can ever make the column match \
                              the declaration again."
                         ),
                     });

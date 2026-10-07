@@ -93,7 +93,7 @@ pub fn unsupported_permissions(
             errs.push(invalid(format!(
                 "role `{name}`: `maintain` on `{target}` needs PostgreSQL 17 or later, and this \
                  server is {}; on an older one the engine answers `unrecognized privilege type \
-                 \"maintain\"` — measured on 16.15 — which is a statement that would fail after \
+                 \"maintain\"` -- measured on 16.15 -- which is a statement that would fail after \
                  everything ordered before it had run. Remove it, or upgrade the server",
                 rendered(server_version_num)
             )));
@@ -149,7 +149,7 @@ pub fn refuse_missing(name: &str) -> DialectError {
         Ok(quoted) => invalid(format!(
             "role `{name}` is declared here and the cluster does not have it. A PostgreSQL role \
              is a cluster object, so pbps manages what a role is granted in this database and \
-             not whether the role exists (ADR-0010 §3). Run it by hand, then plan again:\n\n    \
+             not whether the role exists (ADR-0010 section 3). Run it by hand, then plan again:\n\n    \
              CREATE ROLE {quoted};"
         )),
         Err(e) => e,
@@ -214,7 +214,7 @@ pub fn refuse_rename(from: &str, to: &str, evidence: RenameEvidence) -> Option<D
         // there" would pass — and `to` is a different principal.
         RenameEvidence::BothPresent => format!(
             "both `{from}` and `{to}` exist in the cluster, so `{to}` is a different principal \
-             and not `{from}` under a new name. pbps does not own the principal (ADR-0010 §3), \
+             and not `{from}` under a new name. pbps does not own the principal (ADR-0010 section 3), \
              and it cannot tell which of the two its declarations mean: renaming the role would \
              move the grants, while granting to `{to}` would leave `{from}` holding everything \
              it holds now. Resolve the name collision by hand, preserving the intended \
@@ -222,13 +222,13 @@ pub fn refuse_rename(from: &str, to: &str, evidence: RenameEvidence) -> Option<D
         ),
         RenameEvidence::NeitherPresent => format!(
             "neither `{from}` nor `{to}` is in the cluster, so there is no principal to rename \
-             and none to grant on (ADR-0010 §3). Restore the intended principal or correct \
+             and none to grant on (ADR-0010 section 3). Restore the intended principal or correct \
              the declarations, then plan again."
         ),
         RenameEvidence::NotRunYet => format!(
             "`{from}` is still in the cluster and `{to}` is not: the rename this revision \
              declares has not been run. A PostgreSQL role is a cluster object and pbps does not \
-             own it (ADR-0010 §3); the grants follow the role's oid, so nothing has to be \
+             own it (ADR-0010 section 3); the grants follow the role's oid, so nothing has to be \
              re-granted afterwards. Run it by hand, then plan again:\n\n    ALTER ROLE \
              {quoted_from} RENAME TO {quoted_to};"
         ),
@@ -287,8 +287,8 @@ impl DropBlocker {
             ),
         };
         format!(
-            "`{}` {what} {} {where_}; run {remedy} — in that database, since neither statement \
-             reaches beyond the one it runs in (ADR-0010 §4)",
+            "`{}` {what} {} {where_}; run {remedy} -- in that database, since neither statement \
+             reaches beyond the one it runs in (ADR-0010 section 4)",
             self.role,
             plural(self.objects),
         )

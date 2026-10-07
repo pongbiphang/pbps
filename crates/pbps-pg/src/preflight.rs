@@ -1233,7 +1233,7 @@ pub(crate) fn still_referenced(
         crate::emit::refuse(&format!(
             "{table} row `{key}` cannot be deleted safely: a table with a foreign key into \
              {table} has row-level security in force for this session, so the count of rows \
-             referencing this one is filtered by a policy — and this engine's referential \
+             referencing this one is filtered by a policy -- and this engine's referential \
              actions are not. Measured, an `ON DELETE CASCADE` child the policy hides is \
              deleted anyway, which is the silent loss this guard exists to prevent. Nothing \
              was applied. Delete the row as a role the policy does not filter, or remove the \
@@ -1659,8 +1659,8 @@ fn hidden_children_probe(
     );
     Ok(Probe::new(
         format!(
-            "tables with a foreign key into {table} whose rows this session cannot count — a \
-             policy filters them, or the session cannot read the table at all — or {table} \
+            "tables with a foreign key into {table} whose rows this session cannot count -- a \
+             policy filters them, or the session cannot read the table at all -- or {table} \
              itself, whose key and referenced columns every count reads, so the count of what \
              references row `{key}` is not the count, while this engine's referential actions \
              see every row; delete as a role that can read every referencing table unfiltered \
@@ -2484,7 +2484,7 @@ fn planned_key_probes(
             // probes by a description substring, as this crate's own
             // tests do, must still find exactly one probe per fact.
             "; excludes a row this narrowing's own conversion would \
-                 refuse — the `AlterColumnType` change's conversion probe \
+                 refuse -- the `AlterColumnType` change's conversion probe \
                  counts and names that row instead"
                 .to_owned()
         };
@@ -2574,7 +2574,7 @@ fn planned_key_probes(
         return Err(DialectError::Invalid {
             dialect: crate::types::DIALECT,
             message: format!(
-                "a collation mark reached a probe as text — a comparison of two stored columns \
+                "a collation mark reached a probe as text -- a comparison of two stored columns \
                  outside the engine-assembled count: {}",
                 p.description
             ),

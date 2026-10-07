@@ -18118,16 +18118,46 @@ fn a_default_naming_a_later_index_past_the_identifier_limit_is_refused() {
     assert!(!artifact.exists(), "a refused plan writes no artifact");
 }
 
+/// #1629: pbps's own statement text is ASCII, so a database in an encoding
+/// that cannot hold `—` or `…` (measured: `LATIN1`, `EUC_JP` and others) is
+/// bootstrapped, and a plan whose script writes declared rows applies there.
+/// That script carries the row checks' `RAISE` text, which pbps writes.
+#[test]
+#[ignore = "needs a live PostgreSQL; see scripts/live-tests-pg.sh"]
+fn a_database_in_a_non_utf8_encoding_is_bootstrapped_and_deployed() {
+    for encoding in ["LATIN1", "EUC_JP"] {
+        let slug = format!("encoded_{}", encoding.to_lowercase());
+        let own = OwnDatabase::encoded(&server(), &slug, encoding);
+        let connection = own.connection();
+        let d = bootstrapped_demo(
+            connection,
+            &slug,
+            "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: [id]\n",
+        );
+        d.table(
+            "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+             label: {type: text}\nprimary_key: [id]\n\
+             data:\n  mode: ensure\n  rows:\n    1: {label: one}\n",
+        );
+        let plan = connected_artifact(&d, connection, false);
+        succeeds(approved_apply(&d, connection, &plan, &[]));
+        assert_eq!(
+            scalar(connection, "SELECT count(*) FROM app.t WHERE label = 'one'"),
+            1,
+            "{encoding}"
+        );
+    }
+}
+
 /// #1627 review: `regclass` input cuts a name to 63 bytes of the database's
 /// encoding. In a single-byte database, 62 `a`s and `é` are 63 bytes, so a
 /// default naming that unmanaged table names it whole. It is not the 62-`a`
 /// index the plan creates later, which a cut by UTF-8 bytes would read it as.
-/// The plan writes its artifact and applies. WIN1252 rather than LATIN1:
-/// `bootstrap` does not complete in a LATIN1 database (#1629).
+/// The plan writes its artifact and applies.
 #[test]
 #[ignore = "needs a live PostgreSQL; see scripts/live-tests-pg.sh"]
 fn a_literal_cut_differs_by_encoding_so_a_single_byte_name_is_not_refused() {
-    let own = OwnDatabase::encoded(&server(), "single_byte_literal", "WIN1252");
+    let own = OwnDatabase::encoded(&server(), "single_byte_literal", "LATIN1");
     let connection = own.connection();
     let columns = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n";
     let label = |default: &str| format!("  label: {{type: text, default: \"{default}\"}}\n");
