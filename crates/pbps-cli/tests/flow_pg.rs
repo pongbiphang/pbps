@@ -108,6 +108,27 @@ impl OwnDatabase {
         }
     }
 
+    /// A database in `encoding`, which needs `template0` and the C locale.
+    fn encoded(server: &str, slug: &str, encoding: &str) -> Self {
+        let name = format!("pbps_cli_{slug}_{}", std::process::id());
+        on_server(
+            server,
+            &format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"),
+        );
+        on_server(
+            server,
+            &format!(
+                "CREATE DATABASE \"{name}\" ENCODING '{encoding}' LC_COLLATE 'C' \
+                 LC_CTYPE 'C' TEMPLATE template0"
+            ),
+        );
+        Self {
+            server: server.to_owned(),
+            connection: with_dbname(server, &name),
+            name,
+        }
+    }
+
     fn connection(&self) -> &str {
         &self.connection
     }
@@ -17831,6 +17852,50 @@ fn a_default_naming_a_later_index_past_the_identifier_limit_is_refused() {
         "{why}"
     );
     assert!(!artifact.exists(), "a refused plan writes no artifact");
+}
+
+/// #1627 review: `regclass` input cuts a name to 63 bytes of the database's
+/// encoding. In a single-byte database, 62 `a`s and `é` are 63 bytes, so a
+/// default naming that unmanaged table names it whole. It is not the 62-`a`
+/// index the plan creates later, which a cut by UTF-8 bytes would read it as.
+/// The plan writes its artifact and applies. WIN1252 rather than LATIN1:
+/// `bootstrap` does not complete in a LATIN1 database (#1629).
+#[test]
+#[ignore = "needs a live PostgreSQL; see scripts/live-tests-pg.sh"]
+fn a_literal_cut_differs_by_encoding_so_a_single_byte_name_is_not_refused() {
+    let own = OwnDatabase::encoded(&server(), "single_byte_literal", "WIN1252");
+    let connection = own.connection();
+    let columns = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n";
+    let label = |default: &str| format!("  label: {{type: text, default: \"{default}\"}}\n");
+    let d = bootstrapped_demo(
+        connection,
+        "single_byte_literal",
+        &format!("{columns}{}primary_key: [id]\n", label("''")),
+    );
+    let external = format!("{}é", "a".repeat(62));
+    on_server(
+        connection,
+        &format!("CREATE TABLE app.\"{external}\" (id integer)"),
+    );
+    // YAML's double quotes take `\"` for the identifier's quotes.
+    d.table(&format!(
+        "{columns}{}primary_key: [id]\nindexes:\n  {}:\n    columns: [id]\n",
+        label(&format!("('app.\\\"{external}\\\"'::regclass)::text")),
+        "a".repeat(62)
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(*) FROM pg_class WHERE relname = '{}' \
+                 AND relnamespace = 'app'::regnamespace AND relkind = 'i'",
+                "a".repeat(62)
+            )
+        ),
+        1
+    );
 }
 
 /// #1576: PostgreSQL resolves `'app.ix_new'::regclass` when the default is

@@ -2058,9 +2058,9 @@ fn is_input_space(c: char) -> bool {
 ///   `pg_class`;
 /// - `'-'` exactly is OID 0, while `' -'` and `'"-"'` are names
 ///   (#1589 review);
-/// - each part, quoted or not, is cut to the identifier limit at a character
-///   boundary, silently: 64 `a`s name the 63-`a` relation, and 62 `a`s then
-///   a two-byte `é` name the 62-`a` one (#1593).
+/// - each part, quoted or not, is cut silently to the identifier limit, in
+///   the database's encoding: 64 `a`s name the 63-`a` relation (#1593). See
+///   [`truncated`] for a part whose cut that encoding decides.
 fn relation_literal(contents: &str) -> Option<(Option<String>, String)> {
     // `-` alone, exactly, is the input's spelling of no relation (OID 0).
     if contents == "-" || (!contents.is_empty() && contents.bytes().all(|b| b.is_ascii_digit())) {
@@ -2113,14 +2113,25 @@ fn relation_literal(contents: &str) -> Option<(Option<String>, String)> {
     }
 }
 
-/// `part` cut to PostgreSQL's identifier limit on a character boundary, as
-/// the identifier splitter cuts it.
+/// `part` cut to PostgreSQL's identifier limit, as the identifier splitter
+/// cuts it, wherever that cut is the same in every server encoding: when the
+/// part's first 63 bytes are ASCII, which is one byte in each of them.
+///
+/// The splitter counts bytes of the database's encoding, which this scan
+/// does not know (an offline plan has no target). Measured on 18, 62 `a`s
+/// then `é` is 64 bytes in UTF-8 and is cut to the 62 `a`s there, but is 63
+/// bytes in a LATIN1 or WIN1252 database and names a relation of that whole
+/// name. So a
+/// part with other characters inside the limit is kept whole. A cut by
+/// UTF-8 would read that literal as a later 62-`a` index and refuse a
+/// valid plan (#1627 review). Kept whole, it is longer than any declared
+/// name and matches no arrival: at worst a missed reference, the failed
+/// apply DEC-1576.1 accepts.
 fn truncated(mut part: String) -> String {
-    let mut end = part.len().min(pbps_pg::MAX_IDENT_BYTES);
-    while !part.is_char_boundary(end) {
-        end -= 1;
+    let limit = pbps_pg::MAX_IDENT_BYTES;
+    if part.len() > limit && part.as_bytes()[..limit].is_ascii() {
+        part.truncate(limit);
     }
-    part.truncate(end);
     part
 }
 
@@ -5390,9 +5401,17 @@ mod tests {
             relation_literal(&format!("app.{}", "A".repeat(64))),
             some(Some("app"), &a(63))
         );
+        // Past the limit with other characters inside it, the cut depends
+        // on the database's encoding, so the part is kept whole; past it with
+        // ASCII up to the limit, it does not.
+        let long = format!("{}éb", a(62));
         assert_eq!(
-            relation_literal(&format!("app.\"{}éb\"", a(62))),
-            some(Some("app"), &a(62))
+            relation_literal(&format!("app.\"{long}\"")),
+            some(Some("app"), &long)
+        );
+        assert_eq!(
+            relation_literal(&format!("app.\"{}é\"", a(63))),
+            some(Some("app"), &a(63))
         );
         assert_eq!(
             relation_literal(&format!("{}.ix", "s".repeat(70))),
