@@ -3363,6 +3363,10 @@ fn diff_data(
                         unchanged,
                         types,
                         after_types,
+                        // The declared type: any retype of the key sorts
+                        // before the row changes, so it is the one the
+                        // `WHERE` meets (DEC-1564.2).
+                        key_type: declared.columns.get(&key_column).map(|c| c.ty.clone()),
                     });
                 }
             }
@@ -3455,6 +3459,7 @@ fn diff_data(
                     dropped,
                     types,
                     after_types,
+                    key_type: declared.columns.get(&key_column).map(|c| c.ty.clone()),
                 });
             }
         }
@@ -10333,6 +10338,46 @@ mod tests {
         assert!(row.contains_key("label"), "{row:?}");
         assert_eq!(types["label"], ty("nvarchar(50)"), "{types:?}");
         assert_eq!(after_types["label"], ty("varchar(50)"), "{after_types:?}");
+    }
+
+    /// A row write carries its key's type, the declared one the `WHERE`
+    /// meets once any retype has run, so the emitter can find the row by the
+    /// engine's own `=` without the session's path (DEC-1564.2). The key is
+    /// not a cell: it stays out of `types`, which holds the row's cells.
+    #[test]
+    fn a_row_write_carries_its_keys_declared_type_and_not_as_a_cell() {
+        let base = schema_of(
+            "dbo.s",
+            lookup(DataMode::Exact, &[("old", "Old"), ("kept", "Before")]),
+        );
+        let mut declared_t = lookup(DataMode::Exact, &[("kept", "After")]);
+        declared_t
+            .columns
+            .insert("code".to_owned(), Column::new(ty("varchar(40)")).not_null());
+        let declared = schema_of("dbo.s", declared_t);
+
+        let cs = run(&base, &declared, &[]);
+        let mut seen = 0;
+        for p in &cs.changes {
+            let (key_type, types) = match &p.change {
+                Change::UpdateRow {
+                    key_type, types, ..
+                }
+                | Change::DeleteRow {
+                    key_type, types, ..
+                } => (key_type, types),
+                _ => continue,
+            };
+            seen += 1;
+            assert_eq!(
+                key_type.as_ref(),
+                Some(&ty("varchar(40)")),
+                "{:?}",
+                kinds(&cs)
+            );
+            assert!(!types.contains_key("code"), "{types:?}");
+        }
+        assert_eq!(seen, 2, "an update and a delete: {:?}", kinds(&cs));
     }
 
     /// And the far more common case, which must stay a single type: a column

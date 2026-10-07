@@ -269,6 +269,7 @@ fn unchanged_catalogs_do_not_need_a_transition_for_row_or_metadata_changes() {
                 unchanged: Default::default(),
                 types: Default::default(),
                 after_types: Default::default(),
+                key_type: None,
             }),
         ],
     };

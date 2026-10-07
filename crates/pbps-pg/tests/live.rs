@@ -18920,6 +18920,7 @@ async fn narrowing_projection_keeps_inserted_and_updated_rows_in_composite_keys(
                 unchanged: Default::default(),
                 types: [("tag".into(), ty("integer"))].into(),
                 after_types: Default::default(),
+                key_type: None,
             },
             Change::InsertRow {
                 table: table.clone(),

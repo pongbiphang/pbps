@@ -3131,6 +3131,7 @@ mod tests {
             row: Default::default(),
             types: Default::default(),
             after_types: Default::default(),
+            key_type: None,
         };
         for change in [
             Change::AddCheck {
@@ -3265,6 +3266,7 @@ mod tests {
             row: Default::default(),
             types: Default::default(),
             after_types: Default::default(),
+            key_type: None,
         };
         let repaired = Change::UpdateRow {
             table: tname("dbo.customer"),
@@ -3282,6 +3284,7 @@ mod tests {
             unchanged: Default::default(),
             types: Default::default(),
             after_types: Default::default(),
+            key_type: None,
         };
         // And one that leaves the key alone: it stays in the stored scan,
         // because the plan does nothing to where it points.
@@ -3301,6 +3304,7 @@ mod tests {
             unchanged: Default::default(),
             types: Default::default(),
             after_types: Default::default(),
+            key_type: None,
         };
         let sql = probes(&plan(vec![deleted, repaired, elsewhere, fk()]))
             .into_iter()
@@ -3404,6 +3408,7 @@ mod tests {
                 unchanged: Default::default(),
                 types: Default::default(),
                 after_types: Default::default(),
+                key_type: None,
             },
             fk(),
         ]))
@@ -3564,6 +3569,7 @@ mod tests {
             row: Default::default(),
             types: Default::default(),
             after_types: Default::default(),
+            key_type: None,
         };
         let sql = |changes: Vec<Change>| {
             probes(&plan(changes))
@@ -3665,6 +3671,7 @@ mod tests {
                 row: Default::default(),
                 types: Default::default(),
                 after_types: Default::default(),
+                key_type: None,
             },
             index(&["email"], true, Some("[deleted_at] IS NULL")),
         ]))
@@ -3834,6 +3841,7 @@ mod tests {
                 row: Default::default(),
                 types: Default::default(),
                 after_types: Default::default(),
+                key_type: None,
             },
             check.clone(),
         ]);
@@ -3870,6 +3878,7 @@ mod tests {
                 unchanged: Default::default(),
                 types: Default::default(),
                 after_types: Default::default(),
+                key_type: None,
             },
         ] {
             let s = sql(vec![writing, check.clone()]);
@@ -4232,6 +4241,7 @@ mod tests {
             row: BTreeMap::new(),
             types: BTreeMap::new(),
             after_types: Default::default(),
+            key_type: None,
         }]);
         let p = probes(&cs);
         assert_eq!(p.len(), 1, "{p:?}");
@@ -4289,6 +4299,7 @@ mod tests {
             row: BTreeMap::new(),
             types: BTreeMap::new(),
             after_types: Default::default(),
+            key_type: None,
         };
         let insert = |default: &str| Change::InsertRow {
             table: tname("dbo.kind"),
@@ -4387,6 +4398,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            key_type: None,
         };
         let sql = sql_of(&plan(vec![update, delete]));
         assert!(
@@ -4422,6 +4434,7 @@ mod tests {
             unchanged: Default::default(),
             types: [("k".to_owned(), ty("integer"))].into_iter().collect(),
             after_types: [("k".to_owned(), ty("varchar(10)"))].into_iter().collect(),
+            key_type: None,
         };
         let names = AsStored::of(&plan(vec![update]));
         assert!(names.types.is_empty());
@@ -4493,6 +4506,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            key_type: None,
         };
         let cs = plan(vec![
             update("1", &[("grp", Value::Int(2)), ("sub", Value::Int(1))]),
@@ -4515,6 +4529,7 @@ mod tests {
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
                 after_types: Default::default(),
+                key_type: None,
             },
         ]);
         let p = probes(&cs);
@@ -4578,6 +4593,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                key_type: None,
             },
             Change::DeleteRow {
                 table: tname("dbo.status"),
@@ -4588,6 +4604,7 @@ mod tests {
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
                 after_types: Default::default(),
+                key_type: None,
             },
         ]);
         let p = probes(&cs);
@@ -4644,6 +4661,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                key_type: None,
             },
             Change::DeleteRow {
                 table: tname("dbo.kind"),
@@ -4654,6 +4672,7 @@ mod tests {
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
                 after_types: Default::default(),
+                key_type: None,
             },
             Change::DeleteRow {
                 table: tname("dbo.status"),
@@ -4664,6 +4683,7 @@ mod tests {
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
                 after_types: Default::default(),
+                key_type: None,
             },
         ]);
         let p = probes(&cs);
@@ -4708,6 +4728,7 @@ mod tests {
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
                 after_types: Default::default(),
+                key_type: None,
             },
         ]);
         let p = probes(&cs);
@@ -4743,6 +4764,7 @@ mod tests {
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
                 after_types: Default::default(),
+                key_type: None,
             },
         ]);
         assert!(probes(&cs).is_empty());

@@ -653,6 +653,9 @@ impl AsStored {
                     unchanged,
                     types,
                     after_types,
+                    // The key's type matters to the apply's `WHERE` alone;
+                    // the probes run on the session's empty path.
+                    key_type: _,
                 } => {
                     this.remember_types(table, types);
                     this.remember_types(table, after_types);
@@ -4095,6 +4098,7 @@ mod tests {
             row: BTreeMap::new(),
             types: BTreeMap::new(),
             after_types: BTreeMap::new(),
+            key_type: None,
         }
     }
 
@@ -5068,6 +5072,7 @@ mod tests {
                 unchanged: BTreeMap::new(),
                 types: BTreeMap::new(),
                 after_types: BTreeMap::new(),
+                key_type: None,
             },
             deleting("app.status", "old"),
         ]));

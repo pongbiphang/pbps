@@ -18383,6 +18383,9 @@ fn trap_operators(schema: &str) -> String {
         ("||", "text", "bigint"),
         ("||", "text", "smallint"),
         ("=", "smallint[]", "smallint[]"),
+        // A row write's key: `varchar` has no `=` of its own, so the
+        // built-in one is reached through `text` (DEC-1564.2).
+        ("=", "character varying", "character varying"),
     ];
     for (i, (op, left, right)) in traps.iter().enumerate() {
         let returns = if *op == "||" { "text" } else { "boolean" };
@@ -18400,10 +18403,11 @@ fn trap_operators(schema: &str) -> String {
 /// DEC-1564.1). Traps sit in `public`, on the deployer's default path, and in
 /// the managed schema, the path an apply's batches carry. A pull, a connected
 /// plan with its probes, an apply that drops a key the declaration never
-/// named and deletes a declared row a child could still reference, and
-/// `doctor` all run without springing one. On 16 and 18. Before, the apply's
-/// key lookup compared `conrelid` with a `regclass` on `app`'s path and the
-/// trap there refused the plan.
+/// named, deletes a declared row a child could still reference, and updates
+/// and deletes rows by a `varchar` key, and `doctor` all run without
+/// springing one. On 16 and 18. Before, the apply's key lookup compared
+/// `conrelid` with a `regclass` on `app`'s path and the trap there refused
+/// the plan, and a row write's `"k" = E'a'` called the `varchar` trap.
 #[test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
@@ -18436,6 +18440,9 @@ fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
             "table: app.c\ncolumns:\n  id: {type: integer}\nforeign_keys:\n  fk_c:\n    \
              columns: [id]\n    references: app.p(id)\n",
         );
+        let coded = "table: app.v\ncolumns:\n  k: {type: varchar(10), nullable: false}\n  \
+                     n: {type: integer}\nprimary_key: {columns: [k]}\ndata:\n  mode: exact\n  rows:\n";
+        write("v", &format!("{coded}    a: {{n: 1}}\n    b: {{n: 2}}\n"));
         succeeds(d.run(&["plan"]));
         d.commit();
         succeeds(d.run(&["bootstrap", "--db", connection]));
@@ -18466,8 +18473,10 @@ fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
 
         // Finds the key's index by asking the catalog, twice, deletes row 2
         // under the guard that looks for a child still pointing at it, and
-        // adds a check the probes count violations of.
+        // adds a check the probes count violations of. Updates row `a` and
+        // deletes row `b` by their `varchar` key.
         write("k", &keyed(70, "replica_identity: primary_key\n"));
+        write("v", &format!("{coded}    a: {{n: 5}}\n"));
         write(
             "p",
             &format!(
@@ -18485,7 +18494,7 @@ fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
                 &d,
                 connection,
                 &plan,
-                &["--allow", "destructive,constraint,data-delete"],
+                &["--allow", "destructive,constraint,data-update,data-delete"],
             ),
         );
         assert_eq!(
@@ -18504,6 +18513,14 @@ fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
             scalar(connection, "SELECT count(*) FROM app.p"),
             1,
             "{version}"
+        );
+        assert_eq!(
+            text_of(
+                connection,
+                "SELECT pg_catalog.string_agg(k::text || ':' || n::text, ',') FROM app.v"
+            ),
+            "a:5",
+            "{version}: row a updated and row b deleted by their key"
         );
         clean("doctor", d.run(&["doctor", "--db", connection]));
     }

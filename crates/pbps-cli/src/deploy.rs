@@ -17262,6 +17262,7 @@ mod tests {
                 .collect(),
             types: Default::default(),
             after_types: Default::default(),
+            key_type: None,
         });
         let before = schema(&[("note", "custom")]);
         let check = |after: &Schema, settled: Settled| {

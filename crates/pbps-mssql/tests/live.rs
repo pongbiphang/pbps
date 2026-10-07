@@ -825,6 +825,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
             row: Default::default(),
             types: Default::default(),
             after_types: Default::default(),
+            key_type: None,
         };
         for legacy in [true, false] {
             let types = if legacy {
@@ -850,6 +851,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
                 unchanged: Default::default(),
                 types,
                 after_types: Default::default(),
+                key_type: None,
             };
             for (deleted, count) in [(old, 0), (next, 1)] {
                 let cs = ChangeSet {
@@ -6577,6 +6579,7 @@ async fn a_key_probe_counts_the_rows_the_plan_will_leave() {
         row: Default::default(),
         types: Default::default(),
         after_types: Default::default(),
+        key_type: None,
     });
 
     let count = |changes: Vec<PlannedChange>| {
@@ -8401,6 +8404,7 @@ async fn a_declaration_that_removes_rows_is_told_which_policy_catalog_read_its_c
         row: Default::default(),
         types: Default::default(),
         after_types: Default::default(),
+        key_type: None,
     };
     let probe_sql = Mssql
         .preflight(&ChangeSet {
@@ -9748,6 +9752,7 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
                 row: std::collections::BTreeMap::new(),
                 types: std::collections::BTreeMap::new(),
                 after_types: Default::default(),
+                key_type: None,
             },
         )],
     };
@@ -10038,6 +10043,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         row: std::collections::BTreeMap::new(),
         types: std::collections::BTreeMap::new(),
         after_types: Default::default(),
+        key_type: None,
     });
     let alone = pbps_model::ChangeSet {
         changes: vec![delete.clone()],
@@ -10131,6 +10137,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 )]
                 .into_iter()
                 .collect(),
+                key_type: None,
             }),
             delete,
         ],
@@ -10168,6 +10175,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 )]
                 .into_iter()
                 .collect(),
+                key_type: None,
             }),
             moved.changes[1].clone(),
         ],
@@ -10211,6 +10219,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 )]
                 .into_iter()
                 .collect(),
+                key_type: None,
             }),
             moved.changes[1].clone(),
         ],
@@ -10445,6 +10454,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 )]
                 .into_iter()
                 .collect(),
+                key_type: None,
             }),
             moved.changes[1].clone(),
         ],
@@ -10573,6 +10583,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                     )
                 })
                 .collect(),
+            key_type: None,
         })
     };
     let pair_insert = |id: &str, cells: &[(&str, Value)]| {
@@ -10717,6 +10728,7 @@ async fn a_disabled_foreign_key_neither_cascades_nor_blocks_a_delete() {
         row: std::collections::BTreeMap::new(),
         types: std::collections::BTreeMap::new(),
         after_types: Default::default(),
+        key_type: None,
     };
     let cs = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(delete.clone())],
@@ -10808,6 +10820,7 @@ async fn a_row_rewritten_after_the_plan_was_made_is_not_deleted_as_the_reviewed_
         .into_iter()
         .collect(),
         after_types: Default::default(),
+        key_type: None,
     };
     let sql = Mssql.emit(&delete, Default::default()).expect("emit")[0]
         .sql
@@ -10903,6 +10916,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
         row: std::collections::BTreeMap::new(),
         types: std::collections::BTreeMap::new(),
         after_types: Default::default(),
+        key_type: None,
     };
     let cs = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(delete.clone())],
@@ -11158,6 +11172,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
             .into_iter()
             .collect(),
         after_types: Default::default(),
+        key_type: None,
     };
     let delete = pbps_model::Change::DeleteRow {
         table: table.clone(),
@@ -11168,6 +11183,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         row: std::collections::BTreeMap::new(),
         types: std::collections::BTreeMap::new(),
         after_types: Default::default(),
+        key_type: None,
     };
     let sql_of = |change: &pbps_model::Change| {
         let stmts = Mssql.emit(change, Default::default()).expect("emit");
@@ -11488,6 +11504,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .into_iter()
         .collect(),
         after_types: Default::default(),
+        key_type: None,
     };
     let sql = sql_of(&whole_row);
     db.conn
@@ -11580,6 +11597,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         after_types: [("tier".to_owned(), ty("nvarchar(20)"))]
             .into_iter()
             .collect(),
+        key_type: None,
     };
     let sql = sql_of(&added);
     db.conn
@@ -13298,6 +13316,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
             unchanged: Default::default(),
             types: Default::default(),
             after_types: Default::default(),
+            key_type: None,
         }),
         PlannedChange::new(Change::DeleteRow {
             table: TableName::new("dbo", "customer"),
@@ -13308,6 +13327,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
             row: Default::default(),
             types: Default::default(),
             after_types: Default::default(),
+            key_type: None,
         }),
     ];
 
@@ -13460,6 +13480,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                 unchanged: Default::default(),
                 types: Default::default(),
                 after_types: Default::default(),
+                key_type: None,
             }),
             PlannedChange::new(Change::AddForeignKey {
                 table: TableName::new("dbo", "customer"),

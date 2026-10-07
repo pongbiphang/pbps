@@ -3087,6 +3087,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             unchanged,
             types,
             after_types,
+            key_type,
         } => row_statement(
             pg,
             table,
@@ -3101,6 +3102,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 unchanged,
                 types,
                 after_types,
+                key_type.as_ref(),
             )?),
         ),
         Change::DeleteRow {
@@ -3110,6 +3112,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             row,
             types,
             after_types,
+            key_type,
             ..
         } => row_statement(
             pg,
@@ -3122,6 +3125,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 row,
                 types,
                 after_types,
+                key_type.as_ref(),
             )?),
         ),
     }
@@ -3856,15 +3860,53 @@ fn wrote_the_row(
     ))
 }
 
+/// The row a write means: the key column against the declared key, by the
+/// engine's `=` for the key's type.
+///
+/// The statement runs on the table's schema's path, where the declared
+/// expressions it carries resolve. A user who may create in that schema can
+/// add an `=` whose argument types match the key column exactly, and the
+/// engine prefers it over a built-in it reaches only through a cast —
+/// **measured on 18**: a `varchar` key's `"k" = E'a'` called an
+/// `=(varchar, varchar)` planted there, with the deployer's rights. So a key
+/// of a built-in type names `pg_catalog`'s operator, which is the one the
+/// unqualified `=` meant: the same comparison, the same index, and nothing a
+/// schema user can outbid. A key of any other type keeps the unqualified
+/// `=`, because its `=` is not `pg_catalog`'s to name — measured, `citext`
+/// under `pg_catalog.=` compares case-sensitively and `ltree` has no such
+/// operator at all, so naming it would change which row is meant or refuse
+/// the plan. A plan made before the key's type was carried keeps it too
+/// (DEC-1564.2).
+fn key_equals(
+    key_column: &str,
+    key: &RowKey,
+    key_type: Option<&ColumnType>,
+) -> Result<String, DialectError> {
+    let operator = if key_type.is_some_and(|ty| types::normalize(ty).is_ok()) {
+        "OPERATOR(pg_catalog.=)"
+    } else {
+        "="
+    };
+    Ok(format!(
+        "{} {operator} {}",
+        quote(key_column)?,
+        row_key(key)
+    ))
+}
+
 /// The check after a row's `DELETE`: it is still gone once the statement has
 /// run. A trigger that reinserted it would otherwise be read back and recorded
 /// as this plan's own result (DECISIONS 132).
-fn gone_row(table: &TableName, key: &RowKey, key_column: &str) -> Result<String, DialectError> {
+fn gone_row(
+    table: &TableName,
+    key: &RowKey,
+    key_column: &str,
+    key_type: Option<&ColumnType>,
+) -> Result<String, DialectError> {
     Ok(format!(
-        "IF EXISTS (SELECT 1 FROM {} WHERE {} = {}) THEN\n    {}\nEND IF;",
+        "IF EXISTS (SELECT 1 FROM {} WHERE {}) THEN\n    {}\nEND IF;",
         qualified(table)?,
-        quote(key_column)?,
-        row_key(key),
+        key_equals(key_column, key, key_type)?,
         refuse(&format!(
             "{table} row `{key}` is back after this plan deleted it — a trigger on the table, \
              or another writer inside it. Nothing was applied."
@@ -3988,6 +4030,7 @@ fn insert_row(
 /// run, by which time this plan's `AddColumn` and `AlterColumnType` have
 /// already run — so every declared cell is held, the added column included
 /// (DECISIONS 140).
+#[allow(clippy::too_many_arguments)]
 fn update_row(
     table: &TableName,
     key_column: &str,
@@ -3996,6 +4039,7 @@ fn update_row(
     unchanged: &BTreeMap<String, Cell>,
     types: &BTreeMap<String, ColumnType>,
     after_types: &BTreeMap<String, ColumnType>,
+    key_type: Option<&ColumnType>,
 ) -> Result<String, DialectError> {
     let before_ty = |column: &String| Held::of(types.get(column), after_types.get(column));
     let after_ty = |column: &String| {
@@ -4029,11 +4073,10 @@ fn update_row(
         )));
     }
     let mut sql = format!(
-        "UPDATE {} SET {}\n WHERE {} = {}",
+        "UPDATE {} SET {}\n WHERE {}",
         qualified(table)?,
         sets.join(", "),
-        quote(key_column)?,
-        row_key(key)
+        key_equals(key_column, key, key_type)?
     );
     for r in &recorded {
         sql.push_str("\n   AND ");
@@ -4072,8 +4115,9 @@ fn delete_row(
     row: &BTreeMap<String, Cell>,
     types: &BTreeMap<String, ColumnType>,
     after_types: &BTreeMap<String, ColumnType>,
+    key_type: Option<&ColumnType>,
 ) -> Result<String, DialectError> {
-    let mut predicates = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
+    let mut predicates = vec![key_equals(key_column, key, key_type)?];
     for (column, cell) in row {
         predicates.extend(recorded_cell(
             column,
@@ -4092,7 +4136,7 @@ fn delete_row(
         exactly_one_row(table, key),
         // And the row stayed gone: a trigger that put it back would otherwise
         // be read back and recorded as this plan's result.
-        gone_row(table, key, key_column)?,
+        gone_row(table, key, key_column, key_type)?,
     );
     // The guard, the delete and the checks after it are one block: the row
     // lock the guard takes has to be held through the delete it protects, and
@@ -4467,6 +4511,44 @@ mod tests {
 
     fn name(schema: &str, table: &str) -> TableName {
         TableName::new(schema, table)
+    }
+
+    /// A row write finds its row by `pg_catalog`'s `=` where the key's type
+    /// is a built-in one: the same comparison the unqualified `=` meant, and
+    /// nothing a user of the table's schema can outbid (DEC-1564.2).
+    #[test]
+    fn a_built_in_keys_row_is_found_by_pg_catalogs_equality() {
+        let key = RowKey("a'b".into());
+        for spelled in [
+            "varchar(10)",
+            "text",
+            "integer",
+            "uuid",
+            "character(3)",
+            "integer[]",
+        ] {
+            assert_eq!(
+                key_equals("k", &key, Some(&ty(spelled))).unwrap(),
+                "\"k\" OPERATOR(pg_catalog.=) E'a''b'",
+                "{spelled}"
+            );
+        }
+    }
+
+    /// Negative: a key whose `=` is not `pg_catalog`'s keeps the unqualified
+    /// one, since naming `pg_catalog`'s would compare `citext` case-sensitively
+    /// and find no operator at all for `ltree` (measured); and a plan made
+    /// before the key's type was carried keeps it too.
+    #[test]
+    fn a_key_whose_equality_is_not_pg_catalogs_keeps_its_own() {
+        let key = RowKey("a".into());
+        for key_type in [Some(ty("citext")), Some(ty("ltree")), None] {
+            assert_eq!(
+                key_equals("k", &key, key_type.as_ref()).unwrap(),
+                "\"k\" = E'a'",
+                "{key_type:?}"
+            );
+        }
     }
 
     fn sql_of(pg: &Postgres, change: &Change) -> Vec<String> {
@@ -7086,6 +7168,7 @@ mod tests {
             .into_iter()
             .collect(),
             after_types: BTreeMap::new(),
+            key_type: None,
         };
         let sql = sql_of(&Postgres::new(), &change).join("\n");
         assert!(sql.contains("SET \"label\" = E'New'"), "{sql}");
@@ -7137,6 +7220,7 @@ mod tests {
             .into_iter()
             .collect(),
             after_types: BTreeMap::new(),
+            key_type: None,
         };
         let json = serde_json::to_value(&change).unwrap();
         assert_eq!(

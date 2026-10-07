@@ -491,3 +491,30 @@ in `public` now reports the probe unchecked, as any other unqualified name
 already did. The live test `pbps_sql_calls_no_operator_a_schema_user_could_add`
 plants raising operators in `public` and in the managed schema and runs a
 pull, a connected plan with probes, an apply and `doctor` on 16 and 18.
+
+<a id="dec-1564-2"></a>
+
+**DEC-1564.2. A row write finds its row by `pg_catalog`'s `=` where the key's
+type is a built-in one, and by the unqualified `=` otherwise; the plan carries
+the key's type to say which (#1564).** An update's and a delete's `WHERE`, and
+the check that a deleted row stayed gone, compare the key column with the
+declared key on the table's schema's path, which the statement needs for the
+declared expressions it carries (DEC-1564.1). Measured on 18: a `varchar` key's
+`"k" = E'a'` called an `=(varchar, varchar)` planted in that schema, because
+`varchar` has no `=` of its own and the built-in one is reached through
+`text`. The row-count check beside it, `bigint <> integer`, has an exact
+built-in and called nothing.
+
+Spelling every key comparison `OPERATOR(pg_catalog.=)` closes it for every
+key, and was measured to change which row some keys mean: `citext` then
+compares case-sensitively, and `ltree` has no such operator at all, so its
+plan is refused. So the diff records the key column's declared type on the
+row change (`key_type`, the type the `WHERE` meets once any retype has run),
+and the emitter names `pg_catalog`'s operator only for a type the dialect's
+catalogue knows, where it is the one the unqualified `=` meant: the same
+comparison, the same index. A key of another type keeps its own `=`; one of
+those (an enum, a domain) is still reached through a polymorphic or base-type
+built-in on the schema's path. A plan made before `key_type` existed has none
+and keeps the unqualified `=`. SQL Server has no user-defined operators and
+ignores the field. The live test above updates and deletes rows by a
+`varchar` key under that trap.

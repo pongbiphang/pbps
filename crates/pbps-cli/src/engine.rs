@@ -2775,6 +2775,7 @@ mod tests {
             unchanged: BTreeMap::new(),
             types: BTreeMap::new(),
             after_types: BTreeMap::new(),
+            key_type: None,
         };
         let mut cs = plan(vec![retype("a"), update("a"), recompute("b * 2")]);
         let refusal = order_after_releases(&mut cs, &reads_a).unwrap_err();

@@ -56,6 +56,7 @@ async fn self_reference_case(tag: &str, key: &str) {
         row: Default::default(),
         types: Default::default(),
         after_types: Default::default(),
+        key_type: None,
     };
     let cs = ChangeSet {
         changes: vec![PlannedChange::new(change.clone())],
