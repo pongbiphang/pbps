@@ -38,15 +38,23 @@ pub async fn has_history_retention(conn: &mut Conn) -> Result<bool, DbError> {
     get(row, "has_retention")
 }
 
+/// The system-versioned tables, guarded the way the probe is: a server
+/// older than 2016 has no `sys.tables.temporal_type`, and merely naming it
+/// fails the batch (207), so the read runs only where the column is, and
+/// such a server, which has no system-versioned table, answers with none
+/// (#1628 review). Measured on 17.0 with a missing column in its place.
+const VERSIONED_TABLES: &str = "\
+IF COL_LENGTH('sys.tables', 'temporal_type') IS NULL
+    SELECT CONVERT(sysname, NULL) AS schema_name, CONVERT(sysname, NULL) AS table_name
+     WHERE 1 = 0;
+ELSE
+    EXEC (N'SELECT SCHEMA_NAME(t.schema_id) AS schema_name, t.name AS table_name
+              FROM sys.tables t
+             WHERE t.temporal_type = 2;');";
+
 /// The system-versioned tables the database holds now, by name.
 pub async fn system_versioned_tables(conn: &mut Conn) -> Result<BTreeSet<TableName>, DbError> {
-    let rows = conn
-        .query(
-            "SELECT SCHEMA_NAME(t.schema_id) AS schema_name, t.name AS table_name
-               FROM sys.tables t
-              WHERE t.temporal_type = 2;",
-        )
-        .await?;
+    let rows = conn.query(VERSIONED_TABLES).await?;
     rows.iter()
         .map(|row| {
             Ok(TableName::new(
@@ -324,6 +332,24 @@ mod tests {
             key("dbo.b", Cascade),
         ]);
         assert!(refused_without_retention(&reused, &BTreeSet::from([tname("dbo.b")])).is_empty());
+    }
+
+    /// A server older than 2016 has no `temporal_type` column, so the read
+    /// names it only inside the guarded `EXEC`, never in the batch that a
+    /// server compiles first (#1628 review).
+    #[test]
+    fn the_versioned_tables_read_names_the_temporal_column_only_behind_its_guard() {
+        let (guard, rest) = VERSIONED_TABLES
+            .split_once("ELSE")
+            .expect("a guarded batch");
+        assert!(
+            guard.contains("IF COL_LENGTH('sys.tables', 'temporal_type') IS NULL"),
+            "{guard}"
+        );
+        assert!(!guard.contains("t.temporal_type"), "{guard}");
+        let (outside, inside) = rest.split_once("EXEC (N'").expect("dynamic SQL");
+        assert!(!outside.contains("temporal_type"), "{outside}");
+        assert!(inside.contains("WHERE t.temporal_type = 2"), "{inside}");
     }
 
     /// No 2016 server is in the live matrix, so the probe's text is pinned:
