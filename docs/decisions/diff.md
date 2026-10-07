@@ -3506,8 +3506,13 @@ The table's kinds and `SetPartitionDefault`/`SetPartitionNotNull` then bring it
 to the declaration: a drop in class 2 before the attach, everything else
 after it. A column with no default where its parent's has one has nothing the
 model can hold, so it takes its parent's back (`SetPartitionDefault` with the
-fallback) unless it declares its own. `refuse_partition_changes` admits
-these changes on a table the plan attaches.
+fallback) unless it declares its own. An index the attach would adopt keeps
+its name as the parent's clone, so one whose name the declaration gives an
+index of its own is dropped before the attach. The engine then builds the
+clone under a name of its own choosing (`t_n_idx`, measured on 18), and the
+declared index is added after. A declared name the engine's choice then
+takes is #1558's class. `refuse_partition_changes` admits these changes on a
+table the plan attaches.
 
 **Identity.** A table that holds column uids and is declared as a partition
 is the one being attached. Its column uids leave the ids file, and the file's

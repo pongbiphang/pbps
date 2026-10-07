@@ -613,8 +613,31 @@ fn diff_partial_rebuilding(
         if base_table.partition_of.is_none()
             && let Some(of) = &declared_table.partition_of
         {
-            match attached(base, base_name, declared_name, base_table, of, dialect) {
-                Ok(Attached { table, defaultless }) => {
+            match attached(
+                base,
+                base_name,
+                declared_name,
+                base_table,
+                declared_table,
+                of,
+                dialect,
+            ) {
+                Ok(Attached {
+                    table,
+                    defaultless,
+                    reclaimed,
+                }) => {
+                    // An index the attach would adopt keeps its name as the
+                    // parent's clone, so one the declaration gives that name
+                    // as its own is dropped first: the engine builds the clone
+                    // under a name it chooses, and the declared index is
+                    // added after (#1642 review).
+                    for name in reclaimed {
+                        changes.push(Change::DropIndex {
+                            table: declared_name.clone(),
+                            name,
+                        });
+                    }
                     changes.push(Change::AttachPartition {
                         uid: uid.clone(),
                         table: declared_name.clone(),
@@ -2478,6 +2501,9 @@ fn detached_names(
 struct Attached {
     table: Table,
     defaultless: Vec<String>,
+    /// The table's indexes the attach would adopt whose names the
+    /// declaration gives indexes of its own.
+    reclaimed: Vec<String>,
 }
 
 /// What the ordinary table `table` is once attached to `of.parent`, or what
@@ -2501,6 +2527,7 @@ fn attached(
     base_name: &TableName,
     declared_name: &TableName,
     table: &Table,
+    declared: &Table,
     of: &pbps_model::PartitionOf,
     dialect: &dyn Dialect,
 ) -> Result<Attached, Vec<String>> {
@@ -2751,6 +2778,11 @@ fn attached(
             ..Table::default()
         },
         defaultless,
+        reclaimed: adopted
+            .iter()
+            .filter(|n| declared.indexes.contains_key(n.as_str()))
+            .map(|n| (*n).clone())
+            .collect(),
     })
 }
 
@@ -6226,6 +6258,41 @@ mod tests {
                 [("fillfactor".to_owned(), "60".to_owned())].into();
         });
         let adopted = outcome(&tuned, &declared, &[]).2.expect("adopted");
+        // An index of its own declared under the name of one the attach
+        // would adopt, as another index or the same: the adopted one goes
+        // before the attach, which builds the parent's clone under a name of
+        // the engine's, and the declared one is added after.
+        for definition in [index_on("id"), index_on("n")] {
+            let mut reusing = declared.clone();
+            reusing
+                .tables
+                .get_mut(&"app.t".parse::<TableName>().unwrap())
+                .unwrap()
+                .indexes
+                .insert("t_n".into(), definition);
+            let reclaimed = outcome(&base, &reusing, &[]).2.expect("the name is freed");
+            let order: Vec<String> = reclaimed
+                .changes
+                .iter()
+                .map(|p| match &p.change {
+                    Change::DropIndex { name, .. } => format!("drop {name}"),
+                    Change::AddIndex { name, .. } => format!("add {name}"),
+                    other => format!("{other:?}").split(' ').next().unwrap().to_owned(),
+                })
+                .collect();
+            assert_eq!(
+                order,
+                [
+                    "drop t_id",
+                    "drop t_n",
+                    "AttachPartition",
+                    "SetPartitionDefault",
+                    "add t_n"
+                ],
+                "{:?}",
+                reclaimed.changes
+            );
+        }
         // A deprecation is an annotation, not the column's shape.
         let annotated = ordinary(&|t| t.columns["n"].deprecated = Some("old".into()));
         outcome(&annotated, &declared, &[])
