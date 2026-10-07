@@ -8325,6 +8325,176 @@ fn doctor_reports_data_and_role_grant_gaps_from_the_declarations() {
     );
 }
 
+/// #820. Once a project has recorded identities, `doctor`'s permission read
+/// starts by reading the last recorded state, so a deploying role that may not
+/// `SELECT` from `public.__pbps_state` gets `permission.unknown` even though
+/// the catalogs it was sent to are readable. The remedy has to name the ledger.
+///
+/// One project, one restricted login, three fresh observations: the read
+/// works, the table's `SELECT` alone is taken away, and it is given back. Each
+/// is checked by the login's own read of the table and by the server's
+/// effective-privilege answer, so the finding is tied to that one grant and
+/// not to a connection, a missing table or the lock.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn doctor_names_the_recorded_state_read_when_its_select_is_denied() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_doctor_ledger_{}", std::process::id()),
+    );
+    let deployer = role.1.as_str();
+    let own = OwnDatabase::new(&server, "doctor-ledger-read");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'ledger-820-secret'; CREATE SCHEMA app"
+        ),
+    );
+    let login = format!(
+        "{} user={deployer} password=ledger-820-secret",
+        connection
+            .split_whitespace()
+            .filter(|word| !word.starts_with("user=") && !word.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let d = Demo::new("doctor-ledger-read");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nenvironments:\n  dev:\n    url_env: PBPS_FLOW_PG_DEV\n",
+    )
+    .unwrap();
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    let ids = std::fs::read_to_string(d.dir.join("schema.ids.json")).unwrap();
+    assert!(
+        ids.contains("app.t"),
+        "the project has recorded identities: {ids}"
+    );
+    assert_eq!(
+        scalar(connection, "SELECT count(*) FROM public.__pbps_state"),
+        1,
+        "bootstrap recorded one state"
+    );
+    // Everything a read of this project needs, the ledger's included, so the
+    // only thing the middle observation changes is the one grant.
+    on_server(
+        connection,
+        &format!(
+            "GRANT USAGE ON SCHEMA public, app TO {deployer}; \
+             GRANT SELECT ON public.__pbps_state, public.__pbps_lock, app.t TO {deployer}"
+        ),
+    );
+    let can_select = || {
+        scalar(
+            connection,
+            &format!(
+                "SELECT has_table_privilege('{deployer}', 'public.__pbps_state', 'SELECT')::int::bigint"
+            ),
+        ) == 1
+    };
+    let reads_it = || try_on_server(&login, "SELECT count(*) FROM public.__pbps_state");
+    let diagnose = || {
+        let output = d.run_with_env(
+            &["doctor", "--format", "json"],
+            &[("PBPS_FLOW_PG_DEV", login.as_str())],
+        );
+        let json: serde_json::Value = serde_json::from_str(&stdout(&output))
+            .unwrap_or_else(|e| panic!("{e}: {}", stdout(&output)));
+        assert!(
+            !stdout(&output).contains("ledger-820-secret")
+                && !stderr(&output).contains("ledger-820-secret"),
+            "the password is never printed"
+        );
+        (output, json)
+    };
+    let unknown = |json: &serde_json::Value| -> Vec<serde_json::Value> {
+        json["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{json}"))
+            .iter()
+            .filter(|f| f["id"] == "permission.unknown")
+            .cloned()
+            .collect()
+    };
+    let identities = || std::fs::read_to_string(d.dir.join("schema.ids.json")).unwrap();
+    let ledger = || scalar(connection, "SELECT count(*) FROM public.__pbps_state");
+
+    // Readable: the permission read answers.
+    assert!(can_select());
+    reads_it().expect("the login reads the recorded state");
+    let (_, json) = diagnose();
+    assert!(unknown(&json).is_empty(), "{json}");
+    // Serialized only when set.
+    assert_ne!(
+        json["data"]["environments"][0]["permissions_unknown"], true,
+        "{json}"
+    );
+
+    // That one grant taken away, and nothing else granting it.
+    on_server(
+        connection,
+        &format!("REVOKE SELECT ON public.__pbps_state FROM {deployer}"),
+    );
+    assert!(
+        !can_select(),
+        "no other grant lets the login read the table"
+    );
+    let denied = reads_it().expect_err("the login can no longer read the recorded state");
+    assert!(
+        denied.contains("permission denied for table __pbps_state"),
+        "{denied}"
+    );
+    try_on_server(&login, "SELECT count(*) FROM public.__pbps_lock")
+        .expect("the lock is still readable");
+    try_on_server(&login, "SELECT count(*) FROM pg_catalog.pg_class")
+        .expect("the catalogs are still readable");
+    let (output, json) = diagnose();
+    assert_ne!(code(&output), 0, "{json}");
+    let found = unknown(&json);
+    assert_eq!(found.len(), 1, "{json}");
+    assert_eq!(found[0]["severity"], "error", "{json}");
+    let remedy = found[0]["remedy"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{json}"));
+    assert!(remedy.contains("SELECT on public.__pbps_state"), "{remedy}");
+    assert!(remedy.contains("USAGE on schema public"), "{remedy}");
+    let environment = &json["data"]["environments"][0];
+    assert_eq!(environment["permissions_unknown"], true, "{json}");
+    let detail = environment["detail"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{json}"));
+    assert!(detail.contains("recorded identities"), "{detail}");
+    // Read-only: doctor changed neither the declarations nor the ledger.
+    assert_eq!(identities(), ids);
+    assert_eq!(ledger(), 1);
+
+    // Given back, by the same login in a fresh session: the finding goes.
+    on_server(
+        connection,
+        &format!("GRANT SELECT ON public.__pbps_state TO {deployer}"),
+    );
+    assert!(can_select());
+    reads_it().expect("the login reads the recorded state again");
+    let (_, json) = diagnose();
+    assert!(unknown(&json).is_empty(), "{json}");
+    assert_eq!(identities(), ids);
+    assert_eq!(ledger(), 1);
+
+    // The database goes before the cluster-wide role, which it holds grants for.
+    drop(own);
+}
+
 /// #566: doctor keys a declared routine the way the dialect spells it, as
 /// the planner does. A managed `app.f(integer)` whose ACL grants `EXECUTE` to
 /// a declared role, granted by somebody this deployer cannot act for, needs
