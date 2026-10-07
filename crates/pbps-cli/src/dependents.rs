@@ -1822,8 +1822,8 @@ pub(crate) fn later_relation_refusal(names: &[LaterName]) -> Result<(), String> 
 }
 
 /// Where in its change's statements a relation arrives or an expression is
-/// set (#1592). Every change but a new table and an added index is one step;
-/// an added index arrives after its own expression.
+/// set (#1592). Every change but a new table is one statement, whose relation
+/// arrives after the statement's own expressions.
 ///
 /// A new table follows the PostgreSQL emitter (`create_table`), measured on
 /// 18:
@@ -1878,12 +1878,9 @@ fn relations_brought(change: &Change) -> Vec<(Step, TableName)> {
             return out;
         }
         Change::RenameTable { to, .. } => vec![to.clone()],
-        // An index arrives only once its own expression and filter are
-        // resolved, as one a new table holds does: measured on 18, a filter
-        // or expression naming the index itself fails its `CREATE INDEX`
-        // (#1617 review).
-        Change::AddIndex { table, name, .. } => return vec![(AT_CREATE + 1, index(table, name))],
-        Change::AddUnique { table, name, .. } => vec![index(table, name)],
+        Change::AddIndex { table, name, .. } | Change::AddUnique { table, name, .. } => {
+            vec![index(table, name)]
+        }
         Change::SetPrimaryKey {
             table,
             to: Some(pk),
@@ -1897,7 +1894,12 @@ fn relations_brought(change: &Change) -> Vec<(Step, TableName)> {
         }
         _ => Vec::new(),
     };
-    one.into_iter().map(|r| (AT_CREATE, r)).collect()
+    // A one-statement change's relation exists only once its statement has
+    // run, after the statement's own text is resolved: measured on 18, an
+    // index filter or expression naming the index, and a view naming the
+    // view, each fail (#1617 review). Only a new table is seen by its own
+    // defaults and checks, which `AT_CREATE` above keeps.
+    one.into_iter().map(|r| (AT_CREATE + 1, r)).collect()
 }
 
 /// The schema an expression a change creates is written in. Its write
@@ -5292,12 +5294,13 @@ mod tests {
         }
     }
 
-    /// An added index arrives after its own expression and filter, as a new
-    /// table's does: one naming the index itself is refused, whether it is
-    /// added alone or split out of a new table (#1617 review). Another index
-    /// it names that already arrived is not.
+    /// A one-statement change's relation arrives after its own text: an
+    /// index whose filter or expression names the index, and a view naming
+    /// the view, are refused (#1617 review). Another relation that already
+    /// arrived is not, and a new table naming itself is not (see
+    /// `a_new_tables_own_indexes_arrive_after_its_expressions`).
     #[test]
-    fn an_added_index_naming_itself_is_refused() {
+    fn a_change_naming_the_relation_it_creates_is_refused() {
         let own = "('app.ix_self'::regclass)::oid > 0";
         assert!(refusal_of(&plan(vec![add_index("ix_self", Some(own))]), &*pg()).is_err());
         let mut expression = add_index("ix_self", None);
@@ -5311,6 +5314,21 @@ mod tests {
                     add_index("ix_other", None),
                     add_index("ix_self", Some("('app.ix_other'::regclass)::oid > 0")),
                 ]),
+                &*pg()
+            ),
+            Ok(())
+        );
+        let view = |name: &str, names: &str| Change::CreateModule {
+            id: id(name),
+            module: Box::new(module(
+                ModuleKind::View,
+                &format!("SELECT ('{names}'::regclass)::text AS x"),
+            )),
+        };
+        assert!(refusal_of(&plan(vec![view("app.v", "app.v")]), &*pg()).is_err());
+        assert_eq!(
+            refusal_of(
+                &plan(vec![view("app.w", "app.w0"), view("app.v", "app.w")]),
                 &*pg()
             ),
             Ok(())
