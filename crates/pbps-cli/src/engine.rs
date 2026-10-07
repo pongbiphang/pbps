@@ -1937,6 +1937,31 @@ pub fn read_remedies(driver: Driver) -> ReadRemedies {
     }
 }
 
+/// What `doctor` says when it could not read what this server can do, in this
+/// engine's words. The cause is the read's own error and goes in as it is.
+///
+/// The sentence used to be SQL Server's alone: a PostgreSQL environment whose
+/// version read failed was told that `CREATE OR ALTER` and online index
+/// operations were undetermined, neither of which the version decides there
+/// (#817). On PostgreSQL that read is the only one that can fail here
+/// ([`capabilities`] reads nothing on that engine), and what the version
+/// decides is checked again by [`permission_support`] and the generated-column
+/// check whenever a plan is made against the server, so the message says that
+/// rather than promising a later query will answer.
+pub fn capabilities_unknown_message(driver: Driver, cause: &str) -> String {
+    match driver {
+        Driver::Mssql => format!(
+            "this server's version or edition could not be read ({cause}), so whether it \
+             accepts `CREATE OR ALTER` and online index operations is undetermined"
+        ),
+        Driver::Postgres => format!(
+            "this PostgreSQL server's version could not be read ({cause}), so doctor cannot \
+             report it; what the version decides (`MAINTAIN` grants, changing a generated \
+             column's expression) is checked again when a plan is made against this server"
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // What a rename touches (SPEC §7.4)
 // ---------------------------------------------------------------------------
