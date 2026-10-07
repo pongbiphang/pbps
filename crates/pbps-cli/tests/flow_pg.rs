@@ -17972,6 +17972,77 @@ fn a_new_tables_default_naming_its_own_index_is_refused_and_two_plans_deploy_it(
     );
 }
 
+/// #1619: an unnamed key's index is `<table>_pkey`, built at the end of the
+/// `CREATE TABLE`, after the defaults. A connected plan whose new table's
+/// default names it is refused, writing no artifact; two plans deploy it.
+/// While an unmanaged relation holds that name, the engine numbers the key's
+/// index instead and the literal names what holds it, so the plan is not
+/// refused and applies.
+#[test]
+#[ignore = "needs a live PostgreSQL; see scripts/live-tests-pg.sh"]
+fn a_default_naming_an_unnamed_keys_index_is_refused_unless_the_name_is_held() {
+    let own = OwnDatabase::new(&server(), "names_generated_key");
+    let connection = own.connection();
+    let d = bootstrapped_demo(
+        connection,
+        "names_generated_key",
+        "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: [id]\n",
+    );
+    let new_table = |table: &str, default: &str| {
+        std::fs::write(
+            d.dir.join(format!("schema/app.{table}.yml")),
+            format!(
+                "table: app.{table}\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                 label: {{type: text, default: \"{default}\"}}\nprimary_key: [id]\n"
+            ),
+        )
+        .unwrap();
+    };
+    let names = |what: &str| format!("('app.{what}'::regclass)::text");
+
+    new_table("n", &names("n_pkey"));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let artifact = d.dir.join("refused-plan.json");
+    let refused = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    let why = stderr(&refused);
+    assert!(
+        why.contains("app.n.label's default or expression names app.n_pkey"),
+        "{why}"
+    );
+    assert!(!artifact.exists(), "a refused plan writes no artifact");
+
+    // The remedy: the table without the default first, then the default.
+    new_table("n", "''");
+    let first = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &first, &[]));
+    new_table("n", &names("n_pkey"));
+    let second = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &second, &[]));
+
+    // Negative: `app.m_pkey` is held, so the key's index is `m_pkey1`, and
+    // the default names the table that holds the name.
+    on_server(connection, "CREATE TABLE app.m_pkey (x integer)");
+    new_table("m", &names("m_pkey"));
+    let held = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &held, &[]));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_index WHERE indrelid = 'app.m'::regclass \
+             AND indisprimary AND indexrelid = 'app.m_pkey1'::regclass"
+        ),
+        1
+    );
+}
+
 /// #1593: `regclass` input cuts a name part to 63 bytes, silently, so a
 /// default naming 64 `a`s names the 63-`a` index the plan creates later. The
 /// connected plan is refused, writing no artifact, though the two spellings

@@ -1723,12 +1723,20 @@ ask (#1599 review).
   escape string) matches a later relation of that name in any schema
   (#1599 review).
 - **The relations a change brings:**
-  - a table it creates, with the indexes, unique constraints and named
-    primary key the create holds;
+  - a table it creates, with the indexes, unique constraints and primary
+    key the create holds;
   - a table renamed to a name;
   - an index or unique constraint added;
-  - a named primary key set;
+  - a primary key set;
   - a view created.
+
+  An unnamed key's index arrives under the name the engine generates
+  (#1619). Measured on 18, that name is `<table>_pkey`, with the table's part
+  cut to fit 63 bytes. While any relation of the schema holds that name, a
+  composite type included, the engine uses `_pkey1`, `_pkey2`… instead.
+  - The cut counts the database's encoding, as above. So past the limit, the
+    name is told only when the part kept is ASCII.
+  - A generated name the plan also declares is the declared relation's.
 - **What counts as later is the statement, not only the change (#1592).** A
   new table is several statements, and its own relations come after some of
   its expressions. Measured on 18, in the order the emitter writes them:
@@ -1778,14 +1786,21 @@ ask (#1599 review).
   depend on it`). So a plan that rebuilds a relation an expression names is
   refused like one that adds it (#1589).
 
+  A generated name is the exception. One held now makes the engine number
+  the key's index, and the literal names what holds the name. So the
+  arrival's schema is asked for it, qualified or not, and a plan without a
+  target refuses it (#1619).
+
 Pinned by `an_expression_naming_a_relation_the_plan_creates_later_is_refused`,
 `a_new_tables_own_indexes_arrive_after_its_expressions`,
+`an_unnamed_keys_generated_index_name_arrives_with_the_key`,
 `a_change_naming_the_relation_it_creates_is_refused`,
 `a_relation_literal_is_read_as_regclass_input_reads_it` and
 `a_later_name_is_looked_up_where_the_write_path_searches`
 (`crates/pbps-cli/src/dependents.rs`), the live
 `a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_deploy_it`,
 `a_new_tables_default_naming_its_own_index_is_refused_and_two_plans_deploy_it`,
+`a_default_naming_an_unnamed_keys_index_is_refused_unless_the_name_is_held`,
 `a_name_that_already_resolves_on_the_target_is_not_refused`,
 `a_name_the_plan_rebuilds_is_refused_although_it_exists_now`,
 `a_default_naming_a_later_index_past_the_identifier_limit_is_refused` and

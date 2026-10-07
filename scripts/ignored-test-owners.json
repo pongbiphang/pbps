@@ -1341,6 +1341,7 @@
         "a_default_naming_a_later_index_past_the_identifier_limit_is_refused",
         "a_literal_cut_differs_by_encoding_so_a_single_byte_name_is_not_refused",
         "a_new_tables_default_naming_its_own_index_is_refused_and_two_plans_deploy_it",
+        "a_default_naming_an_unnamed_keys_index_is_refused_unless_the_name_is_held",
         "a_name_that_already_resolves_on_the_target_is_not_refused",
         "a_name_the_plan_rebuilds_is_refused_although_it_exists_now",
         "a_bootstrap_creates_what_a_new_table_calls_before_it",
