@@ -18530,7 +18530,8 @@ fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
 /// declarations references through a permanent key is refused by name
 /// (#1595, DEC-1595.1): at `plan --db`, and again at the apply of a plan
 /// made before that key arrived, before its first statement. The engine
-/// takes the partition all the same, so nothing else would. Not refused: an
+/// takes the partition all the same, so nothing else would. A partitioned
+/// referencing table is named by the key it declares. Not refused: an
 /// unlogged referencing table, which a crash empties too, and a permanent
 /// partition.
 #[test]
@@ -18589,6 +18590,33 @@ fn an_unlogged_partition_under_an_undeclared_permanent_key_is_refused() {
     assert_ne!(code(&refused), 0, "{}", stdout(&refused));
     assert!(stderr(&refused).contains(named), "{}", stderr(&refused));
     assert_eq!(absent(), 1, "nothing ran");
+
+    // A partitioned referencing table is named by the key it declares,
+    // through the leaf that holds a copy under a name of its own (#1612
+    // review).
+    on_server(
+        &conn,
+        "DROP TABLE ext.r; \
+         CREATE TABLE ext.rp (id integer, CONSTRAINT rp_k FOREIGN KEY (id) REFERENCES app.ev) \
+             PARTITION BY RANGE (id); \
+         CREATE TABLE ext.rp_1 (id integer, \
+             CONSTRAINT own_name FOREIGN KEY (id) REFERENCES app.ev); \
+         ALTER TABLE ext.rp ATTACH PARTITION ext.rp_1 FOR VALUES FROM (0) TO (10)",
+    );
+    let refused = d.run(&["plan", "--db", &conn]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains(
+            "which ext.rp's foreign key `rp_k` (on its partition ext.rp_1 as `own_name`) \
+             references"
+        ),
+        "{}",
+        stderr(&refused)
+    );
+    on_server(
+        &conn,
+        "DROP TABLE ext.rp; CREATE TABLE ext.r (id integer REFERENCES app.ev)",
+    );
 
     // Negative: a permanent partition under the same key plans and applies.
     declare(false);

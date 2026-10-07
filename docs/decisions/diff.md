@@ -3099,14 +3099,20 @@ table holding a key to the partitioned parent:
 **The read.** For the parent of each partition the plan creates `UNLOGGED`,
 `pg_constraint` gives every foreign key whose target is that parent and whose
 table holds rows (`relkind = 'r'`) and is permanent. A partitioned
-referencing table holds no rows. Each of its leaf partitions carries the key
-under the same name, so a permanent leaf is named and an unlogged one, which
-a crash empties too, is not.
+referencing table holds no rows. Each of its leaf partitions carries a copy of
+the key, so a permanent leaf is named and an unlogged one, which a crash
+empties too, is not. A leaf attached with a key of its own keeps that key's
+name (measured on 16 and 18), so each copy is followed up `conparentid` to
+the key its partitioned table declares, and named through it.
 
-**What is not a referencer.** A key the plan takes away first: a table it
-drops or makes unlogged, or a key it drops, compared under the catalog's name
-when the plan also renames the table. A declared permanent referencer is
-refused before planning (DEC-1580.1) and is not read again.
+**What is not a referencer.** A key the plan takes away before the
+partition's `CREATE`: a table it drops or makes unlogged, or a key it drops,
+matched against the leaf's copy or the key its table declares, and compared
+under the catalog's name when the plan also renames the table. Only one that
+runs before: a staged apply commits between statements, and the persistence
+switch sorts after table creation, so making the referencing table unlogged
+takes a plan of its own first. A declared permanent referencer is refused
+before planning (DEC-1580.1) and is not read again.
 
 **Why not a probe.** A preflight `Probe` returns a count, and the message has
 to name the referencing table and key. A probe that cannot run is also
@@ -3122,7 +3128,8 @@ The read runs only on a fresh start, as the other preflight reads do.
 Pinned on 16 and 18 by the CLI's
 `an_unlogged_partition_under_an_undeclared_permanent_key_is_refused`:
 - an undeclared permanent table's key refuses the plan, naming the table and
-  the key;
+  the key, and a partitioned one's leaf copy is named through the key its
+  table declares;
 - a plan made while only an unlogged table held a key is refused at the apply
   once a permanent key arrives, and nothing ran;
 - negatives: the unlogged referencing table is not named, and a permanent

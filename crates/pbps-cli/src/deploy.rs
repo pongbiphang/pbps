@@ -551,8 +551,8 @@ pub(crate) fn unlogged_partitions_created(
 /// takes it, and a crash would empty the partition under rows that still
 /// reference it. A declared referencing table is refused before planning
 /// (DEC-1580.1); this is the one the declarations do not hold, read from the
-/// catalog. A key this plan takes away first is not one: a table it drops or
-/// makes unlogged, or a key it drops.
+/// catalog. A key this plan takes away before the partition's `CREATE` is
+/// not one: a table it drops or makes unlogged, or a key it drops.
 // The complement is every change that leaves a referencing key in place.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn refuse_permanent_referencers(
@@ -572,37 +572,69 @@ pub(crate) fn refuse_permanent_referencers(
         })
         .collect();
     let now = |t: &TableName| (*renamed_from.get(t).unwrap_or(&t)).clone();
-    let mut gone_tables = BTreeSet::new();
-    let mut gone_keys = BTreeSet::new();
-    for p in &cs.changes {
+    // Each removal with its place in the plan, and a whole table's with no
+    // key. Only one that runs before the partition's `CREATE` counts: a
+    // staged apply commits between statements, and a removal after it would
+    // leave the unlogged partition under a permanent key until it ran. The
+    // persistence switch sorts after table creation, so making the
+    // referencing table unlogged takes a plan of its own first (#1612
+    // review).
+    let mut removals: Vec<(usize, TableName, Option<&str>)> = Vec::new();
+    for (at, p) in cs.changes.iter().enumerate() {
         match &p.change {
             Change::DropTable { name, .. }
             | Change::SetTablePersistence {
                 table: name,
                 unlogged: true,
                 ..
-            } => {
-                gone_tables.insert(now(name));
-            }
+            } => removals.push((at, now(name), None)),
             Change::DropForeignKey { table, name } => {
-                gone_keys.insert((now(table), name.clone()));
+                removals.push((at, now(table), Some(name.as_str())));
             }
             _ => {}
         }
     }
+    let removed_before = |at: usize, table: &TableName, key: &str| {
+        removals
+            .iter()
+            .any(|(j, t, k)| *j < at && t == table && k.is_none_or(|k| k == key))
+    };
     let mut lines = Vec::new();
-    for (partition, parent) in unlogged_partitions_created(cs) {
+    for (at, p) in cs.changes.iter().enumerate() {
+        let Change::CreateTable {
+            name: partition,
+            table,
+            ..
+        } = &p.change
+        else {
+            continue;
+        };
+        let Some(parent) = table
+            .partition_of
+            .as_ref()
+            .filter(|_| table.unlogged)
+            .map(|of| &of.parent)
+        else {
+            continue;
+        };
         for r in referencers.iter().filter(|r| &r.parent == parent) {
-            if gone_tables.contains(&r.table)
-                || gone_keys.contains(&(r.table.clone(), r.key.clone()))
+            // A leaf's copy goes with the key its partitioned table declares,
+            // which is the one a plan names.
+            if removed_before(at, &r.table, &r.key)
+                || removed_before(at, &r.root_table, &r.root_key)
             {
                 continue;
             }
+            let through = if r.table == r.root_table {
+                String::new()
+            } else {
+                format!(" (on its partition {} as `{}`)", r.table, r.key)
+            };
             lines.push(format!(
                 "{partition} would be created unlogged under {parent}, which {}'s foreign key \
-                 `{}` references; a crash would empty {partition} and leave rows of {} \
+                 `{}`{through} references; a crash would empty {partition} and leave rows of {} \
                  referencing nothing",
-                r.table, r.key, r.table
+                r.root_table, r.root_key, r.table
             ));
         }
     }
@@ -612,9 +644,9 @@ pub(crate) fn refuse_permanent_referencers(
     bail!(
         "{} unlogged partition(s) under a permanent table's foreign key:\n  {}\n\
          PostgreSQL refuses a permanent table's key to an unlogged table, but not through a \
-         partitioned one. Declare the partition permanent, or make the referencing table \
-         unlogged or drop its key first; a table the declarations do not hold is the \
-         operator's to change (DEC-1595.1).",
+         partitioned one. Declare the partition permanent, or first drop that key or make its \
+         table unlogged, in a plan before this one; a table the declarations do not hold is \
+         the operator's to change (DEC-1595.1).",
         lines.len(),
         lines.join("\n  ")
     );
@@ -9843,9 +9875,11 @@ mod tests {
     /// An unlogged partition this plan creates under a parent a permanent
     /// table's key references is refused, naming the table and the key
     /// (#1595, DEC-1595.1). Not refused: a permanent partition, a key under
-    /// another parent, and a key this plan takes away first, by dropping
-    /// it, dropping its table or making that table unlogged, under the
-    /// name the catalog has now when the plan also renames the table.
+    /// another parent, and a key this plan takes away before the partition's
+    /// `CREATE`, by dropping it, dropping its table or making that table
+    /// unlogged, under the name the catalog has now when the plan also
+    /// renames the table, and through the key a partitioned table declares
+    /// for its leaf's copy.
     #[test]
     fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
         use pbps_model::{Change, ChangeSet, PartitionBound, PartitionOf, PlannedChange, Table};
@@ -9870,6 +9904,8 @@ mod tests {
             parent: of.clone(),
             table: TableName::new("ext", "r"),
             key: "r_ev_fkey".into(),
+            root_table: TableName::new("ext", "r"),
+            root_key: "r_ev_fkey".into(),
         };
         let refused = |changes: Vec<PlannedChange>, of: &TableName| {
             refuse_permanent_referencers(&ChangeSet { changes }, &[referencer(of)])
@@ -9940,6 +9976,49 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("ext.r's foreign key"), "{e}");
+        // Negative: a removal after the partition's `CREATE`, as the
+        // persistence switch sorts, leaves the key in place until it runs,
+        // across a staged apply's commits (#1612 review).
+        let e = refused(
+            vec![
+                partition(true),
+                PlannedChange::new(Change::SetTablePersistence {
+                    uid: "t_bbbbbb".parse().unwrap(),
+                    table: TableName::new("ext", "r"),
+                    unlogged: true,
+                }),
+            ],
+            &parent,
+        )
+        .unwrap_err();
+        assert!(e.contains("ext.r's foreign key"), "{e}");
+
+        // A partitioned referencing table: its leaf's copy, under a name of
+        // its own, goes with the key the table declares, and is named
+        // through it (#1612 review).
+        let leaf = PermanentReferencer {
+            parent: parent.clone(),
+            table: TableName::new("ext", "rp_1"),
+            key: "own_name".into(),
+            root_table: TableName::new("ext", "rp"),
+            root_key: "rp_k".into(),
+        };
+        let drop_root = PlannedChange::new(Change::DropForeignKey {
+            table: TableName::new("ext", "rp"),
+            name: "rp_k".into(),
+        });
+        let leaf_refused = |changes: Vec<PlannedChange>| {
+            refuse_permanent_referencers(&ChangeSet { changes }, std::slice::from_ref(&leaf))
+                .map_err(|e| e.to_string())
+        };
+        leaf_refused(vec![drop_root.clone(), partition(true)]).expect("the declared key dropped");
+        let e = leaf_refused(vec![partition(true)]).unwrap_err();
+        assert!(
+            e.contains("ext.rp's foreign key `rp_k` (on its partition ext.rp_1 as `own_name`)"),
+            "{e}"
+        );
+        let e = leaf_refused(vec![partition(true), drop_root]).unwrap_err();
+        assert!(e.contains("ext.rp's foreign key `rp_k`"), "{e}");
     }
 
     /// An index the plan creates takes a relation name too (#1355): one at

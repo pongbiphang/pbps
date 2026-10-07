@@ -2771,15 +2771,22 @@ pub struct PermanentReferencer {
     pub parent: TableName,
     /// The table holding the key: an ordinary table, or a permanent leaf
     /// partition of a partitioned one, which carries a copy of its parent's
-    /// key under the same name.
+    /// key, under the same name or, attached with a key of its own, under
+    /// that one's.
     pub table: TableName,
     pub key: String,
+    /// The key as its table declares it: for a leaf's copy, the partitioned
+    /// table's key it descends from (`conparentid`, followed to the top),
+    /// which is the one a plan drops; otherwise `table` and `key` again.
+    pub root_table: TableName,
+    pub root_key: String,
 }
 
 /// The [`PermanentReferencer`]s of `parents`, read in the caller's
 /// transaction. Only tables holding rows are asked about: a partitioned
 /// referencing table holds none, and each of its leaf partitions carries the
 /// key itself, so an unlogged leaf, which a crash empties too, is left out.
+/// Each leaf's key is also named as its partitioned table declares it.
 pub async fn permanent_referencers(
     conn: &mut Conn,
     parents: &[TableName],
@@ -2794,18 +2801,38 @@ pub async fn permanent_referencers(
     let rows: Vec<String> = (0..parents.len())
         .map(|i| format!("(${}::text, ${}::text)", 2 * i + 1, 2 * i + 2))
         .collect();
+    // Each leaf's key walked up `conparentid` to the key its partitioned
+    // table declares (measured on 16 and 18: a leaf attached with a key of
+    // its own keeps that key's name under the parent's).
     let sql = format!(
-        "WITH wanted(schema_name, table_name) AS (VALUES {})\n\
+        "WITH RECURSIVE wanted(schema_name, table_name) AS (VALUES {}),\n\
+         leaves AS (\n  \
+           SELECT k.oid AS leaf, k.oid AS at, k.conparentid AS next\n    \
+             FROM pg_catalog.pg_constraint k\n    \
+             JOIN pg_catalog.pg_class c ON c.oid = k.conrelid\n    \
+             JOIN pg_catalog.pg_class pc ON pc.oid = k.confrelid\n    \
+             JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace\n    \
+             JOIN wanted w ON w.schema_name = pn.nspname AND w.table_name = pc.relname\n   \
+            WHERE k.contype = 'f' AND c.relkind = 'r' AND c.relpersistence = 'p'\n  \
+           UNION ALL\n  \
+           SELECT l.leaf, q.oid, q.conparentid\n    \
+             FROM leaves l JOIN pg_catalog.pg_constraint q ON q.oid = l.next\n\
+         )\n\
          SELECT pn.nspname AS parent_schema, pc.relname AS parent_name,\n       \
                 n.nspname AS table_schema, c.relname AS table_name,\n       \
-                k.conname AS key_name\n  \
-           FROM pg_catalog.pg_constraint k\n  \
+                k.conname AS key_name,\n       \
+                rn.nspname AS root_schema, rc.relname AS root_name,\n       \
+                r.conname AS root_key\n  \
+           FROM leaves l\n  \
+           JOIN pg_catalog.pg_constraint k ON k.oid = l.leaf\n  \
            JOIN pg_catalog.pg_class c ON c.oid = k.conrelid\n  \
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n  \
            JOIN pg_catalog.pg_class pc ON pc.oid = k.confrelid\n  \
            JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace\n  \
-           JOIN wanted w ON w.schema_name = pn.nspname AND w.table_name = pc.relname\n \
-          WHERE k.contype = 'f' AND c.relkind = 'r' AND c.relpersistence = 'p'\n \
+           JOIN pg_catalog.pg_constraint r ON r.oid = l.at\n  \
+           JOIN pg_catalog.pg_class rc ON rc.oid = r.conrelid\n  \
+           JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace\n \
+          WHERE l.next = 0\n \
           ORDER BY 3, 4, 5, 1, 2",
         rows.join(", ")
     );
@@ -2824,6 +2851,8 @@ pub async fn permanent_referencers(
             parent: TableName::new(text("parent_schema")?, text("parent_name")?),
             table: TableName::new(text("table_schema")?, text("table_name")?),
             key: text("key_name")?,
+            root_table: TableName::new(text("root_schema")?, text("root_name")?),
+            root_key: text("root_key")?,
         });
     }
     Ok(out)
