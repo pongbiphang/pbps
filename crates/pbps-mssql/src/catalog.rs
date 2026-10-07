@@ -944,6 +944,10 @@ pub async fn prove_referrers_visible(
 /// The targets an edge this login cannot attribute refers to: the engine's
 /// row is there, and `sys.objects` does not show its referencing object. A
 /// function is matched whole; a computed column only by an edge naming it.
+/// Only a schema-bound reference can block either change: a computed
+/// column's call and a `WITH SCHEMABINDING` module's read are, and the row
+/// says so when its referrer is hidden; a plain procedure or view calling the
+/// function, or reading the column, lets both run (measured on 17.0).
 fn hidden_referrers_query(targets: &ReferrerTargets) -> Option<String> {
     let lit = crate::ident::literal;
     let values = targets
@@ -980,6 +984,7 @@ fn hidden_referrers_query(targets: &ReferrerTargets) -> Option<String> {
                  OR w.column_name = COL_NAME(d.referenced_id, d.referenced_minor_id)
                                     COLLATE CATALOG_DEFAULT)
           WHERE d.referencing_class = 1 AND d.referenced_class = 1
+            AND d.is_schema_bound_reference = 1
             AND NOT EXISTS (SELECT 1 FROM sys.objects ro WHERE ro.object_id = d.referencing_id)
           ORDER BY to_schema, to_name, to_column;",
         values.join(", ")

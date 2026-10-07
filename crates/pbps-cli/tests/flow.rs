@@ -3209,7 +3209,9 @@ fn computed_function_drops_follow_the_catalogs_edges() {
 /// edge itself, as the engine would refuse the alter (3729). A hidden
 /// schema-bound view reading `dbo.k.c` refuses that column's drop, by name,
 /// and not a computed column added beside it, which it cannot block (#1643
-/// review).
+/// review). A hidden plain view over `dbo.k.c`, or a hidden procedure calling
+/// `dbo.h`, blocks neither the drop nor the function's alter, and refuses
+/// nothing (#1643 ready review).
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
@@ -3229,6 +3231,10 @@ fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
     on_server(
         own.connection(),
         "CREATE FUNCTION dbo.f (@x int) RETURNS int AS BEGIN RETURN @x * 3 END;",
+    );
+    on_server(
+        own.connection(),
+        "CREATE FUNCTION dbo.h (@x int) RETURNS int AS BEGIN RETURN @x * 5 END;",
     );
     on_server(
         own.connection(),
@@ -3291,16 +3297,28 @@ fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
     );
     refused_by_edge(&d.run(&["plan", "--db", &as_login]));
 
-    // A hidden schema-bound view over `dbo.k.c`, with `dbo.f` declared as it
-    // stands again.
+    // Hidden plain referrers, with `dbo.f` declared as it stands again: a
+    // procedure calling `dbo.h` and a view reading `dbo.k.c` block neither
+    // the function's alter nor the column's drop, so they refuse nothing.
     std::fs::write(&module, &text).unwrap();
     on_server(
         own.connection(),
         &format!(
-            "EXEC(N'CREATE VIEW hidden.v WITH SCHEMABINDING AS SELECT c FROM dbo.k;'); \
+            "EXEC(N'CREATE PROCEDURE hidden.p AS SELECT dbo.h(1) AS h;'); \
+             EXEC(N'CREATE VIEW hidden.plain AS SELECT c FROM dbo.k;'); \
              DENY VIEW DEFINITION ON SCHEMA::hidden TO [{login}];"
         ),
     );
+    let callee = walk(&d.dir.join("schema"))
+        .into_iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("@x * 5")))
+        .expect("dbo.h's declaration");
+    let callee_text = std::fs::read_to_string(&callee).unwrap();
+    std::fs::write(&callee, callee_text.replacen("@x * 5", "@x * 6", 1)).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", &as_login]));
+    std::fs::write(&callee, &callee_text).unwrap();
     let table = d.dir.join("schema/dbo.k.yml");
     let pulled = std::fs::read_to_string(&table).unwrap();
     let line = pulled
@@ -3308,6 +3326,16 @@ fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
         .find(|l| l.starts_with("  c: {expression:"))
         .unwrap_or_else(|| panic!("the computed column's entry: {pulled}"))
         .to_owned();
+    std::fs::write(&table, pulled.replacen(&format!("{line}\n"), "", 1)).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", &as_login]));
+
+    // A hidden schema-bound view over `dbo.k.c`.
+    on_server(
+        own.connection(),
+        "EXEC(N'CREATE VIEW hidden.v WITH SCHEMABINDING AS SELECT c FROM dbo.k;');",
+    );
     // A column added beside it: the view cannot block that, and the login
     // plans it.
     let added = line.replacen("  c: ", "  d: ", 1).replacen('2', "3", 1);

@@ -3174,7 +3174,10 @@ It then looks for an edge whose referencing object `sys.objects` does not
 show, onto what a hidden referrer could block: a function the plan alters or
 drops, which a computed column anywhere may call, and a computed column the
 plan drops, matched by that column, which a schema-bound module may read.
-Either refuses the plan by name: "a referrer of `dbo.f` is hidden from this
+Only a schema-bound reference counts (`is_schema_bound_reference`, which the
+row keeps when its referrer is hidden): a computed column's call and a
+`WITH SCHEMABINDING` module's read block the change, a plain procedure or view
+does not. Either refuses the plan by name: "a referrer of `dbo.f` is hidden from this
 login". A column change or a computed column added is judged by the computed
 columns of its own table, which are visible with it, so a hidden view over
 another column of that table refuses nothing. A `db_owner` member sees through
@@ -3192,4 +3195,5 @@ Pinned by the live `a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no
 referrer's schema is refused by name; as `sa`, and as the login once the
 `DENY` is revoked, the edge itself refuses the alter. A hidden schema-bound
 view over `dbo.k.c` refuses that column's drop by name, and a computed column
-added beside it plans.
+added beside it plans. A hidden plain view over `dbo.k.c`, or a hidden
+procedure calling `dbo.h`, refuses neither the drop nor the alter.
