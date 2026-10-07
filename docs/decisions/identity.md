@@ -752,7 +752,8 @@ PostgreSQL role reads every `pg_class` row, so nothing is hidden there.
 
 Roles are not pruned. On PostgreSQL a missing role is refused, not created, so
 pruning would change nothing. On SQL Server `sys.database_principals` is
-filtered too, and no proof exists for it yet; that is #1606.
+filtered too, and no proof existed for it yet; DEC-1606.1 adds one and prunes
+SQL Server's roles.
 
 The pruning sits at those three callers, not inside `StateSnapshot::new`. They
 are the paths that knowingly record ids beside objects the database lacks, and
@@ -772,3 +773,45 @@ Pinned by:
   fails at each when that path records the whole ids file again;
 - `a_hidden_table_is_not_recorded_as_missing` (SQL Server live suite), which
   fails without the proof.
+
+<a id="dec-1606-1"></a>
+
+**DEC-1606.1. A SQL Server state records a role as missing only once the
+database proves it lacks the name (#1606; completes DEC-1600.1).** `snapshot`,
+`baseline` and `bootstrap` recorded every role uid the ids file names. A
+managed role dropped by hand before a `baseline` or a forced `snapshot` was
+recorded as held, so the next `plan --db` emitted no `CREATE ROLE` and its
+`apply` recorded the role as present: a wrong recording with a single deployer.
+Each of the three now records `without_roles(...)` beside DEC-1600.1's
+`without(...)`, taking out the roles `managed_state` reports missing.
+
+Missing must mean absent, not hidden. `sys.database_principals` is filtered by
+metadata visibility, measured on the pinned 17.0 image: a login without
+database `VIEW DEFINITION` sees only the roles it belongs to, and an effective
+`DENY VIEW DEFINITION` or `DENY CONTROL` on a role, to the login or to a role
+it is in, hides that role even from a login holding database `VIEW
+DEFINITION`. Before pruning, `absent_roles` asks `DATABASE_PRINCIPAL_ID` for
+each missing name. That function is not filtered: it resolves the role under
+each of those `DENY`s and for a login holding only `CONNECT`, and answers NULL
+only for a name the database lacks. A name it resolves refuses the command by
+name, and the state keeps the uid.
+
+A permission proof, as DEC-1192.1 gives for tables, was the obvious shape and
+is wrong here. `ALTER ANY ROLE` alone shows every role while
+`HAS_PERMS_BY_NAME(NULL, 'DATABASE', 'VIEW DEFINITION')` answers 0, so asking
+for that grant would refuse a login that sees everything. Asking by name also
+needs no scan of `sys.database_permissions` for a `DENY`, and refuses only for
+the names being recorded. A name that resolves to a user, not a role, is
+refused too: whatever it is, it is not absent.
+
+PostgreSQL's roles are not pruned. They are the cluster's, a plan refuses a
+missing one rather than creating it (`refuse_missing_cluster_roles`), so
+taking its uid out would change no plan.
+
+Pinned by:
+- `a_state_keeps_only_the_role_uids_the_database_holds` (unit);
+- `a_hidden_role_is_not_recorded_as_missing` (SQL Server live suite): a
+  `baseline` and a forced `snapshot` by a login denied the role are refused by
+  name and the state keeps it, which fails when pruning skips the proof; a role
+  dropped by hand is created by the next plan and verifies clean, which fails
+  when the role is not pruned.

@@ -744,6 +744,33 @@ fn absence_unproven(missing: &[TableName], error: DbError) -> anyhow::Error {
     ))
 }
 
+/// The roles a recording may take out of the state: those the catalog read
+/// did not return and the database proves it lacks (#1606). On SQL Server
+/// `sys.database_principals` is filtered by metadata visibility, so a role
+/// hidden from this login reads as missing; recorded as missing, its uid
+/// would leave the state and the next plan create a role that exists. A name
+/// the database still resolves refuses the command by name instead
+/// (DEC-1606.1).
+///
+/// PostgreSQL's roles are the cluster's, which a plan refuses rather than
+/// creates (`refuse_missing_cluster_roles`), so a missing one is kept as
+/// before: taking its uid out would change no plan.
+pub async fn absent_roles(conn: &mut Conn, missing: &[String]) -> anyhow::Result<Vec<String>> {
+    if conn.driver() != Driver::Mssql || missing.is_empty() {
+        return Ok(Vec::new());
+    }
+    let held = pbps_mssql::catalog::held_principals(conn, missing).await?;
+    if !held.is_empty() {
+        anyhow::bail!(
+            "cannot record role(s) {} as missing: the database holds a principal by that name \
+             this login cannot see; record the state with a login that can see it, so a role \
+             hidden from this one is not taken for one that is gone",
+            held.join(", ")
+        );
+    }
+    Ok(missing.to_vec())
+}
+
 /// Which requested names occur in an already captured table inventory.
 pub async fn matching_table_names(
     conn: &mut Conn,

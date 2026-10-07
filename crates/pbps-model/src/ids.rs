@@ -107,6 +107,18 @@ impl IdsFile {
         kept
     }
 
+    /// This mapping without the roles named: what a state records for a
+    /// database that does not hold them, as [`IdsFile::without`] is for
+    /// tables. A recorded role uid is one the next plan reads as already
+    /// there, so a role dropped by hand and kept here is never created again
+    /// (#1606).
+    #[must_use]
+    pub fn without_roles(&self, roles: &[String]) -> Self {
+        let mut kept = self.clone();
+        kept.roles.retain(|_, name| !roles.contains(name));
+        kept
+    }
+
     /// Looks a UID up by name. Diffing does this constantly.
     pub fn table_uid(&self, name: &TableName) -> Option<&Uid> {
         self.tables.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
@@ -328,6 +340,29 @@ mod tests {
         held.validate().unwrap();
         // Nothing missing, nothing removed.
         assert_eq!(f.without(&[]), f);
+    }
+
+    /// #1606: a state records only the role uids the database holds. A
+    /// missing role goes; the other roles, every table and column, and the
+    /// tombstones stay.
+    #[test]
+    fn a_state_keeps_only_the_role_uids_the_database_holds() {
+        let mut f = sample();
+        f.roles.insert(uid("r_h5t3pk"), "reader".into());
+        f.roles.insert(uid("r_w8n2cd"), "writer".into());
+        let held = f.without_roles(&["reader".to_owned()]);
+        assert!(held.role_uid("reader").is_none());
+        // Negative: what the database holds keeps its uid, and the tables
+        // are not touched by a role going.
+        assert_eq!(held.role_uid("writer"), Some(&uid("r_w8n2cd")));
+        assert_eq!(held.tables, f.tables);
+        assert_eq!(held.columns, f.columns);
+        assert_eq!(held.tombstones, f.tombstones);
+        held.validate().unwrap();
+        // A name the file does not hold removes nothing, and nothing missing
+        // removes nothing.
+        assert_eq!(f.without_roles(&["Reader".to_owned()]), f);
+        assert_eq!(f.without_roles(&[]), f);
     }
 
     /// A staged apply replays the renames the emitter declared, one statement
