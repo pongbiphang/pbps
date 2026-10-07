@@ -90,8 +90,8 @@ pub struct Tombstone {
 }
 
 impl IdsFile {
-    /// This mapping without the tables named, their columns, and the roles
-    /// named: what a state records for a database that does not hold them.
+    /// This mapping without the tables named and their columns: what a state
+    /// records for a database that does not hold them.
     ///
     /// A recorded uid is what the next plan reads as "already there": the
     /// differ creates a table only for a uid its base side lacks. A state
@@ -99,12 +99,11 @@ impl IdsFile {
     /// next plan skip the table and its apply record it as built (#1600).
     /// Tombstones stay: they record identities retired, not objects held.
     #[must_use]
-    pub fn without(&self, tables: &[TableName], roles: &[String]) -> Self {
+    pub fn without(&self, tables: &[TableName]) -> Self {
         let mut kept = self.clone();
         kept.tables.retain(|_, name| !tables.contains(name));
         kept.columns
             .retain(|_, column| !tables.contains(&column.table));
-        kept.roles.retain(|_, name| !roles.contains(name));
         kept
     }
 
@@ -295,8 +294,8 @@ mod tests {
     }
 
     /// #1600: a state records only the uids of what the database holds. A
-    /// missing table goes with its columns and a missing role with it; the
-    /// tables, columns and roles it holds, and every tombstone, stay.
+    /// missing table goes with its columns; the tables and columns it holds,
+    /// the roles, and every tombstone stay.
     #[test]
     fn a_state_keeps_only_the_uids_the_database_holds() {
         let mut f = sample();
@@ -314,10 +313,9 @@ mod tests {
                 operator: "leon".into(),
             },
         );
-        let held = f.without(&["dbo.order".parse().unwrap()], &["writer".to_owned()]);
+        let held = f.without(&["dbo.order".parse().unwrap()]);
         assert!(held.table_uid(&"dbo.order".parse().unwrap()).is_none());
         assert!(held.column_uid(&col("dbo.order.order_id")).is_none());
-        assert!(!held.roles.values().any(|r| r == "writer"));
         // Negative: what the database holds keeps its uid, and tombstones
         // are not objects held.
         assert_eq!(
@@ -325,11 +323,11 @@ mod tests {
             Some(&uid("t_a9k2mq"))
         );
         assert_eq!(held.columns.len(), 2);
-        assert!(held.roles.values().any(|r| r == "reader"));
+        assert_eq!(held.roles, f.roles);
         assert_eq!(held.tombstones.len(), 1);
         held.validate().unwrap();
         // Nothing missing, nothing removed.
-        assert_eq!(f.without(&[], &[]), f);
+        assert_eq!(f.without(&[]), f);
     }
 
     /// A staged apply replays the renames the emitter declared, one statement

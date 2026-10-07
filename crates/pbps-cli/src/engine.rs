@@ -698,12 +698,40 @@ pub async fn order_created_object_names(
         .collect();
     schemas.sort();
     schemas.dedup();
-    pbps_mssql::catalog::prove_schemas_visible(conn, &schemas).await?;
+    pbps_mssql::catalog::prove_schemas_visible(conn, &schemas)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot prove the names this plan creates are free: {e}"))?;
     // Which of the plan's own names are one under the database's
     // collation (#1215).
     let candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
     let alike = pbps_mssql::catalog::object_names_alike(conn, &candidates).await?;
     crate::object_order::order_occupied_objects_under(cs, &occupants, &alike, label)
+}
+
+/// Proves the tables a catalog read did not return are absent, not hidden,
+/// before a state records them as missing (#1600). On SQL Server `sys.tables`
+/// is filtered by metadata visibility, so a table under an effective `DENY
+/// VIEW DEFINITION`, or in a schema this login cannot view, returns no row
+/// and reads as missing. Recorded as missing, its uid would leave the state
+/// and the table the managed set, silently. The proof is DEC-1192.1's. A
+/// PostgreSQL role reads every row of `pg_class`, so nothing there is hidden.
+pub async fn prove_tables_absent(conn: &mut Conn, missing: &[TableName]) -> anyhow::Result<()> {
+    if conn.driver() != Driver::Mssql || missing.is_empty() {
+        return Ok(());
+    }
+    let mut schemas: Vec<String> = missing.iter().map(|t| t.schema.clone()).collect();
+    schemas.sort();
+    schemas.dedup();
+    pbps_mssql::catalog::prove_schemas_visible(conn, &schemas)
+        .await
+        .map_err(|e| {
+            let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
+            anyhow::anyhow!(
+                "cannot record {} as missing: {e}. Record the state with a login that can see \
+                 those schemas, so a table hidden from this one is not taken for one that is gone",
+                names.join(", ")
+            )
+        })
 }
 
 /// Which requested names occur in an already captured table inventory.

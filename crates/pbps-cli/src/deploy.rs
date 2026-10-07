@@ -5165,7 +5165,8 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
             // What the database holds, not every uid the ids file names: a
             // missing table recorded as held is one the next plan never
             // creates (#1600).
-            let held = ids.without(&scoped.missing, &scoped.missing_roles);
+            crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
+            let held = ids.without(&scoped.missing);
             let mut snapshot = with_provenance(
                 project.root(),
                 StateSnapshot::new(StateKind::Apply, scoped.schema, held, &operator),
@@ -5220,7 +5221,8 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
             refuse_unexpressible(&scoped, &target.label, "baseline again")?;
 
             // What the database holds, as `snapshot` records it (#1600).
-            let held = ids.without(&scoped.missing, &scoped.missing_roles);
+            crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
+            let held = ids.without(&scoped.missing);
             let mut snapshot = with_provenance(
                 project.root(),
                 StateSnapshot::new(StateKind::Baseline, scoped.schema, held, &operator),
@@ -5627,7 +5629,8 @@ pub fn cmd_bootstrap(
             // Only the uids of what this build made. The ids file may name
             // tables these declarations do not hold, and recording those as
             // held would make the next plan skip them (#1600).
-            let held = ids.without(&built.missing, &built.missing_roles);
+            crate::engine::prove_tables_absent(&mut conn, &built.missing).await?;
+            let held = ids.without(&built.missing);
             let mut snapshot = with_provenance(
                 project.root(),
                 StateSnapshot::new(StateKind::Bootstrap, built.schema, held, &operator),

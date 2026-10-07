@@ -739,10 +739,20 @@ whose declaration was not part of the bootstrap, or one dropped before a
 reported it, and its `apply` recorded it as built: a wrong recording with a
 single deployer.
 
-Each of the three now records `ids.without(missing, missing_roles)`: the ids
-file less the tables `managed_state` reports missing, their columns, and the
-missing roles. Tombstones stay, since they record retired identities, not held
-objects.
+Each of the three now records `ids.without(missing)`: the ids file less the
+tables `managed_state` reports missing and their columns. Tombstones stay,
+since they record retired identities, not held objects.
+
+Missing must mean absent, not hidden. On SQL Server `sys.tables` is filtered by
+metadata visibility, so a table in a schema this login cannot view, or under an
+object `DENY`, reads as missing. Before pruning, `prove_tables_absent` runs
+DEC-1192.1's proof on the missing tables' schemas. Where it fails, the command
+is refused by name rather than taking the table out of the managed set. A
+PostgreSQL role reads every `pg_class` row, so nothing is hidden there.
+
+Roles are not pruned. On PostgreSQL a missing role is refused, not created, so
+pruning would change nothing. On SQL Server `sys.database_principals` is
+filtered too, and no proof exists for it yet; that is #1606.
 
 The pruning sits at those three callers, not inside `StateSnapshot::new`. They
 are the paths that knowingly record ids beside objects the database lacks, and
@@ -755,7 +765,10 @@ A differ guard, treating a base uid whose table the base schema lacks as absent,
 was the alternative. It would also change what every other caller of the
 differ sees, for a state no recording path now writes.
 
-Pinned by `a_state_keeps_only_the_uids_the_database_holds` (unit) and
-`a_table_bootstrap_did_not_build_is_created_by_the_next_plan` (PostgreSQL live
-suite). The live test covers bootstrap, baseline and a forced snapshot, and
-fails at each when that path records the whole ids file again.
+Pinned by:
+- `a_state_keeps_only_the_uids_the_database_holds` (unit);
+- `a_table_bootstrap_did_not_build_is_created_by_the_next_plan` (PostgreSQL
+  live suite), which covers bootstrap, baseline and a forced snapshot, and
+  fails at each when that path records the whole ids file again;
+- `a_hidden_table_is_not_recorded_as_missing` (SQL Server live suite), which
+  fails without the proof.
