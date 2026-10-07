@@ -2817,6 +2817,115 @@ fn a_history_taken_over_mid_apply_rolls_the_plan_back() {
     }
 }
 
+/// A history declared in another schema is renamed off the engine's name
+/// before it is moved there (#1512): that schema may hold an object of exactly
+/// the engine's name, which the move would meet although the declared name is
+/// free. A database DDL trigger stands in for the object, made inside the
+/// `CREATE`'s own transaction once the engine has named the history. A
+/// declared name that is taken still fails the plan and leaves nothing.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_history_moved_to_its_schema_does_not_pass_through_the_engines_name() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "temporal1512_move");
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.base (id int NOT NULL CONSTRAINT pk_base PRIMARY KEY);",
+    );
+    on_server(own.connection(), "CREATE SCHEMA hist;");
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("temporal1512-move");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    std::fs::write(
+        d.dir.join("schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  vf: {type: datetime2(7), nullable: false}\n  vt: {type: datetime2(7), nullable: false}\n\nprimary_key: [id]\n\nsystem_time:\n  period: [vf, vt]\n  versioning:\n    history: hist.t_history\n",
+    )
+    .unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let path = d.dir.join("plan.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        path.to_str().unwrap(),
+    ]));
+    let checksum = plan_checksum(&path);
+    let apply = || {
+        d.run(&[
+            "apply",
+            "--db",
+            own.connection(),
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ])
+    };
+    // Fires once the engine has created `dbo.t` and named its history, and
+    // makes `hist.<name>` before the plan's own statements move it.
+    let sneak = |name: &str| {
+        format!(
+            "CREATE TRIGGER tr_sneak ON DATABASE FOR CREATE_TABLE AS
+             IF EVENTDATA().value('(/EVENT_INSTANCE/ObjectName)[1]', 'sysname') = N't'
+             BEGIN
+                 DECLARE @name sysname = {name};
+                 DECLARE @sql nvarchar(max) =
+                     N'CREATE TABLE hist.' + QUOTENAME(@name) + N' (x int NOT NULL);';
+                 EXEC sys.sp_executesql @sql;
+             END;"
+        )
+    };
+
+    // The declared name taken: refused, and nothing is left behind.
+    on_server(own.connection(), &sneak("N't_history'"));
+    let refused = apply();
+    on_server(own.connection(), "DROP TRIGGER tr_sneak ON DATABASE;");
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("'t_history' is already in use"),
+        "{}",
+        stderr(&refused)
+    );
+    on_server(
+        own.connection(),
+        "IF OBJECT_ID('dbo.t') IS NOT NULL OR OBJECT_ID('hist.t_history') IS NOT NULL
+             OR EXISTS (SELECT 1 FROM sys.tables WHERE name LIKE 'MSSQL_TemporalHistoryFor%'
+                                                    OR name LIKE 'pbps_history_%')
+             THROW 50000, 'the CREATE was left behind', 1;",
+    );
+
+    // The engine's name taken in the declared schema: the plan applies.
+    on_server(
+        own.connection(),
+        &sneak(
+            "(SELECT OBJECT_NAME(history_table_id) FROM sys.tables
+               WHERE object_id = OBJECT_ID(N'dbo.t'))",
+        ),
+    );
+    let applied = apply();
+    on_server(own.connection(), "DROP TRIGGER tr_sneak ON DATABASE;");
+    ok(&applied);
+    on_server(
+        own.connection(),
+        "IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE object_id = OBJECT_ID('dbo.t')
+                          AND history_table_id = OBJECT_ID('hist.t_history'))
+             THROW 50000, 'hist.t_history is not the history of dbo.t', 1;
+         IF INDEXPROPERTY(OBJECT_ID('hist.t_history'), 'ix_t_history', 'IndexID') IS NULL
+             THROW 50000, 'the history index was not renamed', 1;
+         IF NOT EXISTS (SELECT 1 FROM sys.tables t
+                         WHERE t.schema_id = SCHEMA_ID('hist')
+                           AND t.name LIKE 'MSSQL_TemporalHistoryFor%')
+             THROW 50000, 'the trigger did not take the engine''s name', 1;
+         IF EXISTS (SELECT 1 FROM sys.tables WHERE name LIKE 'pbps_history_%')
+             THROW 50000, 'the staged name was left behind', 1;",
+    );
+    ok(&d.run(&["verify", "--db", own.connection()]));
+}
+
 /// A history's schema is held to the database's spelling before bootstrap
 /// runs, like a table's (#1501 review). Without that, the history was created
 /// in `Hist`, read back so, and the recorded state already differed from the

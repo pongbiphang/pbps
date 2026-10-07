@@ -2169,9 +2169,12 @@ two apart: in a tight loop, 169 of 200 fresh histories had their table's
 `create_date`, which is a `datetime`. So pbps does not use `HISTORY_TABLE`.
 It creates the table with versioning on and lets the engine name the history
 `MSSQL_TemporalHistoryFor_<object_id>`, a name that belongs to the new table
-and that nothing can hold. In the same batch it then moves the history to
-the declared schema and renames it and its `ix_` index. The engine accepts
-both renames and the transfer while versioning is on, in one transaction. A
+and that nothing can hold in the table's own schema. In the same batch it then
+renames the history and its `ix_` index to the declared names. A history
+declared in another schema could meet an object of exactly the engine's name
+there, so it is first renamed to a name made from a fresh GUID, then moved,
+then renamed (#1512). The engine accepts the renames and the transfer while
+versioning is on, in one transaction. A
 declared name that is taken fails the rename (15335), and the plan rolls back
 with it. The `CREATE` and the renames are one transaction of their own, which
 nests in a transactional apply, so a staged apply, whose statements commit one

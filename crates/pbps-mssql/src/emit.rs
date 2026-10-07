@@ -1765,21 +1765,36 @@ fn computed_definition(
 /// that takes it as the history, rows and all, and no check before the
 /// statement closes the window another session has until it runs. The name
 /// the engine chooses, `MSSQL_TemporalHistoryFor_<object_id>`, is the new
-/// table's own and cannot be taken; it is moved to the declared schema, then
-/// renamed, with its index, to the declared names. A name that is taken there
-/// fails the rename (15335), and the plan with it. Measured on 17.0: the
-/// history and its `ix_` index take both renames and the transfer while
-/// versioning is on, in one transaction.
+/// table's own and cannot be taken in the table's schema; it is renamed, with
+/// its index, to the declared names. A name that is taken there fails the
+/// rename (15335), and the plan with it. Measured on 17.0: the history and its
+/// `ix_` index take both renames and the transfer while versioning is on, in
+/// one transaction.
+///
+/// A history declared in another schema is first renamed, in the table's own
+/// schema, to a name made from a fresh GUID, then moved, then renamed to the
+/// declared name (#1512). The engine's name is the table's own only where the
+/// engine made it: the declared schema may hold an object of exactly that
+/// name, and moving under it would fail although the declared name is free.
 fn history_rename(table: &TableName, history: &TableName) -> Result<String, DialectError> {
     let mut sql = format!(
         "\nDECLARE @pbps_history sysname = (SELECT OBJECT_NAME(history_table_id) \
          FROM sys.tables WHERE object_id = OBJECT_ID({}));\nDECLARE @pbps_object nvarchar(max);",
         literal(&qualified(table)?)
     );
+    // The name the history has when it reaches the declared schema: the
+    // engine's own where it is already there, a fresh GUID's otherwise.
+    let mut moved = "@pbps_history";
     if history.schema != table.schema {
+        moved = "@pbps_staged";
         sql.push_str(&format!(
-            "\nSET @pbps_object = {} + QUOTENAME(@pbps_history) + N';';\n\
+            "\nDECLARE @pbps_staged sysname = N'pbps_history_' + \
+             REPLACE(CONVERT(nchar(36), NEWID()), N'-', N'');\n\
+             SET @pbps_object = {} + QUOTENAME(@pbps_history);\n\
+             EXEC sys.sp_rename @pbps_object, @pbps_staged, N'OBJECT';\n\
+             SET @pbps_object = {} + QUOTENAME(@pbps_staged) + N';';\n\
              EXEC sys.sp_executesql @pbps_object;",
+            literal(&format!("{}.", quote(&table.schema)?)),
             literal(&format!(
                 "ALTER SCHEMA {} TRANSFER {}.",
                 quote(&history.schema)?,
@@ -1788,7 +1803,7 @@ fn history_rename(table: &TableName, history: &TableName) -> Result<String, Dial
         ));
     }
     sql.push_str(&format!(
-        "\nSET @pbps_object = {} + QUOTENAME(@pbps_history);\n\
+        "\nSET @pbps_object = {} + QUOTENAME({moved});\n\
          EXEC sys.sp_rename @pbps_object, {}, N'OBJECT';\n\
          SET @pbps_object = {} + QUOTENAME(N'ix_' + @pbps_history);\n\
          EXEC sys.sp_rename @pbps_object, {}, N'INDEX';",
@@ -2296,8 +2311,12 @@ mod tests {
             // Created under the engine's name, which nothing can hold, then
             // moved and renamed: never adopted (#1501 review).
             "OBJECT_ID(N'[dbo].[t]')",
-            "SET @pbps_object = N'ALTER SCHEMA [hist] TRANSFER [dbo].' + QUOTENAME(@pbps_history) + N';';",
-            "SET @pbps_object = N'[hist].' + QUOTENAME(@pbps_history);",
+            // Renamed off the engine's name before the move, which the
+            // declared schema may hold (#1512).
+            "DECLARE @pbps_staged sysname = N'pbps_history_' + REPLACE(CONVERT(nchar(36), NEWID()), N'-', N'');",
+            "SET @pbps_object = N'[dbo].' + QUOTENAME(@pbps_history);\nEXEC sys.sp_rename @pbps_object, @pbps_staged, N'OBJECT';",
+            "SET @pbps_object = N'ALTER SCHEMA [hist] TRANSFER [dbo].' + QUOTENAME(@pbps_staged) + N';';",
+            "SET @pbps_object = N'[hist].' + QUOTENAME(@pbps_staged);",
             "EXEC sys.sp_rename @pbps_object, N't_history', N'OBJECT';",
             "SET @pbps_object = N'[hist].[t_history].' + QUOTENAME(N'ix_' + @pbps_history);",
             "EXEC sys.sp_rename @pbps_object, N'ix_t_history', N'INDEX';",
@@ -2318,7 +2337,8 @@ mod tests {
             sql[0].contains("GENERATED ALWAYS AS ROW START NOT NULL")
                 && sql[0].contains(") WITH (SYSTEM_VERSIONING = ON);")
                 && sql[0].contains("N't_history', N'OBJECT'")
-                && !sql[0].contains("ALTER SCHEMA"),
+                && !sql[0].contains("ALTER SCHEMA")
+                && !sql[0].contains("@pbps_staged"),
             "{}",
             sql[0]
         );
