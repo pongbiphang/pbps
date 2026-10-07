@@ -3690,7 +3690,10 @@ fn refuse_unplanned_movement(
         // certify the replacement against itself (decision 458). Comparable
         // structure is held to the declaration; engine-rewritten expressions
         // still use presence, as SPEC 7.6 requires.
-        let not_yet_attached = attached.contains(now_name)
+        // Only at a read taken while statements remain: once every one has
+        // run, an attached table that reads as an ordinary one is movement.
+        let not_yet_attached = !settled.whole()
+            && attached.contains(now_name)
             && after
                 .tables
                 .get(now_name)
@@ -10082,6 +10085,12 @@ mod tests {
             .map_err(|e| format!("{e:#}"))
         };
         held(&before, Settled::SoFar).expect("not attached yet");
+        // Negative: once every statement has run, it must be attached.
+        let e = held(&before, Settled::Whole).expect_err("detached again");
+        assert!(
+            e.contains("app.t is not attached to the parent and range this plan declares"),
+            "{e}"
+        );
         held(&schema(&shape), Settled::Whole).expect("attached as declared");
         // Negative: attached somewhere else than the plan says.
         let mut elsewhere = shape.clone();

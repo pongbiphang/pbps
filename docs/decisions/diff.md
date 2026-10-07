@@ -3544,8 +3544,9 @@ hazard before approval.
 **The apply's hold.** Once the table reads back as a partition, it is held to
 the declared shape, as a created table is, and to the parent and range the
 plan declares, which another session could change by detaching and attaching
-it again. A staged read taken before the attach has run compares it as the
-ordinary table it was. An attach the plan
+it again. A staged read taken while statements remain, before the attach has
+run, compares it as the ordinary table it was; once every statement has run,
+an ordinary table there is movement. An attach the plan
 leaves `UNLOGGED` is a new unlogged partition under the parent's referencing
 keys, refused as a created one is (DEC-1595.1).
 
