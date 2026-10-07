@@ -1206,9 +1206,9 @@ fn env_findings(
         out.push(output::Finding::error(
             "server.capabilities-unknown",
             format!(
-                "{}: this server's version or edition could not be read ({why}), so whether it \
-                 accepts `CREATE OR ALTER` and online index operations is undetermined",
-                d.environment
+                "{}: {}",
+                d.environment,
+                crate::engine::capabilities_unknown_message(driver, why)
             ),
         ));
     }
@@ -2159,6 +2159,113 @@ mod tests {
             EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "unreachable");
         d.note("cannot connect".to_owned());
         assert_eq!(d.detail.as_deref(), Some("cannot connect"));
+    }
+
+    /// #817: the finding for an unread server version speaks the connected
+    /// engine's language. PostgreSQL has no `CREATE OR ALTER` gate and no
+    /// edition-gated online index operations, so it was told about features
+    /// its version does not decide. Through the real `env_findings`, for both
+    /// drivers, with the cause carried through verbatim.
+    #[test]
+    fn capability_read_failures_use_the_connected_engines_words() {
+        let only = |findings: &[output::Finding]| -> output::Finding {
+            let matched: Vec<&output::Finding> = findings
+                .iter()
+                .filter(|f| f.id == "server.capabilities-unknown")
+                .collect();
+            assert_eq!(matched.len(), 1, "{findings:?}");
+            matched[0].clone()
+        };
+        let mut d = EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready");
+        d.server_capabilities_unknown = Some("version probe failed".to_owned());
+
+        let mssql = only(&env_findings(
+            &d,
+            true,
+            &pbps_mssql::Mssql,
+            pbps_db::Driver::Mssql,
+        ));
+        assert_eq!(mssql.severity, output::Severity::Error);
+        assert_eq!(
+            mssql.message,
+            "prod: this server's version or edition could not be read (version probe failed), \
+             so whether it accepts `CREATE OR ALTER` and online index operations is undetermined"
+        );
+
+        // PostgreSQL's capabilities are static: both are supported, there is
+        // no edition, and the version read alone failed. Neither the flags nor
+        // the missing edition may hide the error or turn into another finding.
+        d.supports_online = Some(true);
+        d.supports_create_or_alter = Some(true);
+        for declares_modules in [true, false] {
+            let findings = env_findings(
+                &d,
+                declares_modules,
+                &pbps_pg::Postgres::new(),
+                pbps_db::Driver::Postgres,
+            );
+            let pg = only(&findings);
+            assert_eq!(pg.severity, output::Severity::Error);
+            assert!(
+                pg.message.starts_with(
+                    "prod: this PostgreSQL server's version could not be read \
+                     (version probe failed)"
+                ),
+                "{}",
+                pg.message
+            );
+            assert!(pg.message.contains("`MAINTAIN`"), "{}", pg.message);
+            for foreign in ["CREATE OR ALTER", "online", "edition"] {
+                assert!(!pg.message.contains(foreign), "{foreign}: {}", pg.message);
+            }
+            assert!(
+                findings
+                    .iter()
+                    .all(|f| f.id != "server.no-create-or-alter" && f.id != "edition.no-online"),
+                "{findings:?}"
+            );
+        }
+
+        // A cause is the read's own error, whatever words it uses: it goes
+        // through as it is and does not change which engine's text is used.
+        let cause = "SQLSTATE 42501: permission denied;\nSQL Server's `CREATE OR ALTER`?";
+        d.server_capabilities_unknown = Some(cause.to_owned());
+        let pg = only(&env_findings(
+            &d,
+            false,
+            &pbps_pg::Postgres::new(),
+            pbps_db::Driver::Postgres,
+        ));
+        assert!(pg.message.contains(&format!("({cause})")), "{}", pg.message);
+        assert!(
+            pg.message.contains("PostgreSQL server's version"),
+            "{}",
+            pg.message
+        );
+
+        // The negative: no cause, no finding, on either engine, even with the
+        // version and the edition both absent.
+        d.server_capabilities_unknown = None;
+        d.server_version = None;
+        d.edition = None;
+        for (dialect, driver) in [
+            (
+                &pbps_mssql::Mssql as &dyn pbps_dialect::Dialect,
+                pbps_db::Driver::Mssql,
+            ),
+            (
+                &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
+                pbps_db::Driver::Postgres,
+            ),
+        ] {
+            let findings = env_findings(&d, false, dialect, driver);
+            assert!(
+                findings
+                    .iter()
+                    .all(|f| f.id != "server.capabilities-unknown"),
+                "{driver:?}: {findings:?}"
+            );
+        }
     }
 
     /// The version read and the edition read fail independently, and each
