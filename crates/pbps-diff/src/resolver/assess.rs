@@ -557,7 +557,7 @@ mod tests {
     /// (#1578 review): a module arriving makes it a question for the engine,
     /// where reading only the partition's columns, which it has none of,
     /// found nothing to ask. A partition with no default of its own raises
-    /// none.
+    /// none, and one the plan rewrites is a rebuild.
     #[test]
     fn a_partitions_own_default_is_a_question_when_bindings_move() {
         let tree = |own: Option<&str>| {
@@ -609,6 +609,18 @@ mod tests {
         assert!(found.requires_resolution());
         let found = arrives(&tree(None));
         assert!(found.questions.is_empty(), "{found:?}");
+        // Its default rewritten by the same plan is rebuilt, not asked
+        // (#1607 review), while bindings still move.
+        let mut desired = tree(Some("app.f(2)"));
+        desired
+            .modules
+            .insert("app.v".parse().unwrap(), view("SELECT 1 AS n"));
+        let found = assessed(&base, &desired);
+        assert_eq!(
+            found.questions[&Surface::Default("app.ev_1.id".parse().unwrap())],
+            Answer::Rebuild,
+            "{found:?}"
+        );
     }
 
     /// An index's name leaves the relation namespace with it: a surface

@@ -4031,6 +4031,27 @@ fn refuse_unplanned_movement(
                     if now.unlogged { "unlogged" } else { "logged" }
                 ));
             }
+            // Its place in the tree: a partition's parent and bound, and a
+            // parent's partition key. No change of this plan moves either on
+            // a table it keeps (a detach is held to its declaration above),
+            // so the two reads back compare outright. A standing partition
+            // the plan touches is not compared whole, and another session
+            // detaching it and attaching it again under a wider range would
+            // have routed rows by a bound nobody approved (#1607 review).
+            let place = |t: &pbps_model::Table| {
+                (
+                    t.partition_of
+                        .as_ref()
+                        .map(|of| (of.parent.clone(), of.bound.clone())),
+                    t.partition_by.clone(),
+                )
+            };
+            if place(was) != place(now) {
+                moved.push(format!(
+                    "{now_name}'s partition parent, bound or key is not the one the plan was \
+                     approved over"
+                ));
+            }
             // A partition's own defaults and NOT NULLs (#1581), as a created
             // one's above: a default by presence, the engine respelling its
             // text. Once the run is whole, the before-read with this plan's
@@ -13290,6 +13311,44 @@ mod tests {
         assert!(format!("{e:#}").contains("app.ev_1's own column"), "{e:#}");
         let e = check(&defaulting, &none, &none, Settled::Whole).expect_err("never set");
         assert!(format!("{e:#}").contains("app.ev_1's own column"), "{e:#}");
+        // Attached again under another bound, or to another parent, while
+        // the plan sets its default: its own columns are as planned, its
+        // place in the tree is not (#1607 review).
+        let moved_to = |edit: &dyn Fn(&mut PartitionOf)| {
+            let mut s = own.clone();
+            edit(
+                s.tables
+                    .get_mut(&name)
+                    .unwrap()
+                    .partition_of
+                    .as_mut()
+                    .unwrap(),
+            );
+            s
+        };
+        for (what, after) in [
+            (
+                "wider bound",
+                moved_to(&|of| {
+                    of.bound = PartitionBound::Range {
+                        from: vec![pbps_model::BoundDatum::MinValue],
+                        to: vec![pbps_model::BoundDatum::MaxValue],
+                    }
+                }),
+            ),
+            (
+                "another parent",
+                moved_to(&|of| of.parent = TableName::new("app", "other")),
+            ),
+        ] {
+            for settled in [Settled::SoFar, Settled::Whole] {
+                let e = check(&defaulting, &none, &after, settled).expect_err(what);
+                assert!(
+                    format!("{e:#}").contains("app.ev_1's partition parent, bound or key"),
+                    "{what}: {e:#}"
+                );
+            }
+        }
     }
 
     /// A table's persistence is held across an apply (#1443): another
