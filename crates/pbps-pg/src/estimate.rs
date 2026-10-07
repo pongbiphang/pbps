@@ -541,6 +541,18 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             )
         }
 
+        // Every form, `DEFAULT` included, takes `AccessExclusiveLock` and
+        // reads no row: `USING INDEX` validates the index from the catalog.
+        // Measured on 16 and 18 against a 473 MB table, each form ran in
+        // about a millisecond and left `seq_scan` unchanged (#1478).
+        Change::SetReplicaIdentity { table, .. } => e(
+            format!("setting the replica identity of {table}"),
+            table,
+            Rewrite::No,
+            Reads::Nothing,
+            Lock::AccessExclusive,
+        ),
+
         // The case ADR-0012's Limits name outright: nothing is rebuilt and
         // every row is read anyway. Measured, 100,000 of them.
         Change::AlterColumnNullability {
@@ -841,7 +853,6 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         | Change::RenameRole { .. }
         | Change::Grant { .. }
         | Change::Revoke { .. }
-        | Change::SetReplicaIdentity { .. }
         | Change::PublicExecution { .. } => None,
     }
 }
@@ -1092,6 +1103,33 @@ mod tests {
             lock(&change(&["autovacuum_enabled"], &["user_catalog_table"])),
             Lock::AccessExclusive
         ));
+    }
+
+    /// Every replica identity, and the return to the default, rebuilds and
+    /// reads nothing but takes `AccessExclusiveLock` (measured on 16 and 18,
+    /// #1478).
+    #[test]
+    fn every_replica_identity_change_takes_an_access_exclusive_lock() {
+        use pbps_model::ReplicaIdentity;
+        for to in [
+            None,
+            Some(ReplicaIdentity::Full),
+            Some(ReplicaIdentity::Nothing),
+            Some(ReplicaIdentity::PrimaryKey),
+            Some(ReplicaIdentity::Unique("uq".into())),
+            Some(ReplicaIdentity::Index("ix".into())),
+        ] {
+            let change = Change::SetReplicaIdentity {
+                uid: "t_000000".parse().unwrap(),
+                table: tname("app.t"),
+                to: to.clone(),
+            };
+            let e = estimate(&change, Strategy::default())
+                .unwrap_or_else(|| panic!("no estimate for {to:?}"));
+            assert!(matches!(e.rewrite, Rewrite::No), "{to:?}");
+            assert!(matches!(e.reads, Reads::Nothing), "{to:?}");
+            assert!(matches!(e.lock, Lock::AccessExclusive), "{to:?}");
+        }
     }
 
     #[test]
