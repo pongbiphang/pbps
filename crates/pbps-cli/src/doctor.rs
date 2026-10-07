@@ -2145,7 +2145,8 @@ mod tests {
             (
                 mssql,
                 Some(LockReadGap::Hidden),
-                "GRANT VIEW DEFINITION TO \"<database user>\";".to_owned(),
+                "GRANT VIEW DEFINITION ON OBJECT::dbo.__pbps_lock TO \"<database user>\";"
+                    .to_owned(),
             ),
             (
                 mssql,

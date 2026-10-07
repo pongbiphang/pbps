@@ -6783,9 +6783,9 @@ fn doctor_asks_about_a_column_under_the_name_a_pending_rename_has_not_changed_ye
 /// words, the one statement that repairs what its own catalog shows, and
 /// running exactly that statement repairs it. With no permission at all the
 /// table is invisible to the user (measured on 2025 RTM: `OBJECT_ID` is NULL,
-/// as for a table that is not there), so the first statement is
-/// `VIEW DEFINITION`; once the table is visible, a fresh `doctor` names its
-/// `SELECT`. The user's name holds a `]`, so each statement is run with its
+/// as for a table that is not there), so the first statement is the table's
+/// own `VIEW DEFINITION`, which shows no other schema's modules; once the
+/// table is visible, a fresh `doctor` names its `SELECT`. The user's name holds a `]`, so each statement is run with its
 /// placeholder replaced by the bracket-quoted name and nothing else changed.
 /// Then the negative: a `DENY` through a role overrides the grant the remedy
 /// names, the message says so, and running it leaves the finding in place.
@@ -6820,7 +6820,11 @@ fn doctor_mssql_lock_recovery_executes_the_emitted_statement() {
     ok(project.run(&["bootstrap", "--db", db.connection()]));
     on_server(
         db.connection(),
-        &format!("CREATE USER {quoted} FOR LOGIN {quoted};"),
+        &format!(
+            "CREATE USER {quoted} FOR LOGIN {quoted};
+             EXEC(N'CREATE SCHEMA other;');
+             EXEC(N'CREATE PROCEDURE other.secret AS SELECT 42;');"
+        ),
     );
     let base = db
         .connection()
@@ -6835,6 +6839,15 @@ fn doctor_mssql_lock_recovery_executes_the_emitted_statement() {
         .join(";");
     let as_login = with_key(&with_key(&base, "User Id", &login), "Password", password);
     let reads_lock = || try_on_server(&as_login, "SELECT COUNT(*) FROM dbo.__pbps_lock;");
+    // What the remedy must not open up: another schema's module definition.
+    let sees_other_modules = || {
+        try_on_server(
+            &as_login,
+            "IF OBJECT_DEFINITION(OBJECT_ID(N'other.secret')) IS NOT NULL \
+             THROW 50000, 'visible', 1;",
+        )
+        .is_err()
+    };
     let diagnose = || {
         let output = Command::new(BIN)
             .arg("--project")
@@ -6878,8 +6891,8 @@ fn doctor_mssql_lock_recovery_executes_the_emitted_statement() {
     let first = first.unwrap_or_else(|| panic!("no lock finding: {report}"));
     assert_eq!(first["severity"], "error", "{report}");
     assert_eq!(
-        first["remedy"], "GRANT VIEW DEFINITION TO \"<database user>\";",
-        "an invisible table first: {report}"
+        first["remedy"], "GRANT VIEW DEFINITION ON OBJECT::dbo.__pbps_lock TO \"<database user>\";",
+        "an invisible table first, and only that table: {report}"
     );
     for foreign in ["public.", "USAGE", "pg_catalog"] {
         assert!(
@@ -6887,8 +6900,13 @@ fn doctor_mssql_lock_recovery_executes_the_emitted_statement() {
             "{foreign:?} in {first}"
         );
     }
+    assert!(!sees_other_modules());
     run_remedy(&first);
     reads_lock().expect_err("visibility is not SELECT");
+    assert!(
+        !sees_other_modules(),
+        "the object's grant shows that object and nothing else"
+    );
 
     let (report, second) = diagnose();
     let second = second.unwrap_or_else(|| panic!("the table gap remains: {report}"));
@@ -6898,6 +6916,7 @@ fn doctor_mssql_lock_recovery_executes_the_emitted_statement() {
     );
     run_remedy(&second);
     reads_lock().expect("the user reads the lock itself");
+    assert!(!sees_other_modules());
     let (report, cleared) = diagnose();
     assert!(cleared.is_none(), "{report}");
 
@@ -6927,6 +6946,93 @@ fn doctor_mssql_lock_recovery_executes_the_emitted_statement() {
     );
 
     after_test_on_server(&server, &format!("DROP LOGIN {quoted};"));
+    drop(db);
+}
+
+/// Review of #1641: a visible object under the lock table's name that is not
+/// a table — a view here — fails the lock read on its columns, and reads
+/// `NULL` from the table-typed `OBJECT_ID` even to its owner. That is not an
+/// invisible table, and no grant turns it into the lock, so `doctor` names no
+/// statement: its remedy is to check again, after looking at what is there.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+fn doctor_mssql_names_no_grant_for_a_lock_name_that_is_not_a_table() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB");
+    let db = OwnDatabase::new(&server, "doctorlockview822");
+    let login = format!("pbps_lockview822_{}", std::process::id());
+    let password = "pbpsLeastPrivilege!1";
+    on_server(
+        &server,
+        &format!("CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"),
+    );
+    on_server(
+        db.connection(),
+        &format!(
+            "EXEC(N'CREATE VIEW dbo.__pbps_lock AS SELECT 1 AS id;');
+             CREATE USER [{login}] FOR LOGIN [{login}];
+             GRANT VIEW DEFINITION, SELECT ON OBJECT::dbo.__pbps_lock TO [{login}];"
+        ),
+    );
+    let project = Demo::new("doctorlockview822");
+    let var = format!("PBPS_DOCTOR_LOCKVIEW822_{}", std::process::id());
+    std::fs::write(
+        project.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+    project.table(
+        "table: app.t\ncolumns:\n  code: {type: int, nullable: false}\nprimary_key: [code]\n",
+    );
+    assert_eq!(code(&project.run(&["plan"])), 0);
+    project.commit();
+    let base = db
+        .connection()
+        .split(';')
+        .filter(|part| {
+            let key = part.split('=').next().unwrap_or("").trim();
+            !["user id", "uid", "password", "pwd"]
+                .iter()
+                .any(|credential| key.eq_ignore_ascii_case(credential))
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = with_key(&with_key(&base, "User Id", &login), "Password", password);
+    // The premise: the user sees the view, may select from it, and the lock
+    // read still fails, on a column the view does not have.
+    let refused = try_on_server(
+        &as_login,
+        "SELECT locked_by FROM dbo.__pbps_lock WHERE id = 1;",
+    )
+    .expect_err("the view is not the lock");
+    assert!(refused.contains("Invalid column name"), "{refused}");
+
+    let output = Command::new(BIN)
+        .arg("--project")
+        .arg(&project.dir)
+        .args(["doctor", "--format", "json"])
+        .env(&var, &as_login)
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output))
+        .unwrap_or_else(|e| panic!("{e}: {}", stdout(&output)));
+    let lock: Vec<&serde_json::Value> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["id"] == "state.lock-unknown")
+        .collect();
+    assert_eq!(lock.len(), 1, "{report}");
+    assert_eq!(lock[0]["remedy"], "pbps doctor --env test", "{report}");
+    assert!(
+        lock[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nothing this user can see explains it"),
+        "{report}"
+    );
+    assert!(!report.to_string().contains("GRANT"), "{report}");
+
+    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
     drop(db);
 }
 

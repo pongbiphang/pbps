@@ -282,10 +282,11 @@ pub enum LockReadGap {
     /// Nothing about the table is asked: without the schema it cannot be the
     /// next gap, and a never-initialized database has no table to grant on.
     SchemaUsage,
-    /// SQL Server: this user cannot see the lock table at all — no metadata
-    /// visibility, so whether it exists is not something this session can
-    /// learn. Absent and hidden are the same answer here, and neither is
-    /// taken as absent.
+    /// SQL Server: this user cannot see anything under the lock table's name
+    /// — no metadata visibility, so whether it exists is not something this
+    /// session can learn. Absent and hidden are the same answer here, and
+    /// neither is taken as absent. A visible object of another kind under
+    /// that name is not this: it is [`LockReadGap::Unexplained`].
     Hidden,
     /// The lock table exists, this session can see it, and it may not
     /// `SELECT` from it.

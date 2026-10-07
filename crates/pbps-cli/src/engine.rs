@@ -2011,16 +2011,22 @@ pub fn lock_remedy(driver: Driver, gap: Option<pbps_db::doctor::LockReadGap>) ->
             )),
         },
         // Measured on 2025 RTM: without any permission on it the table is
-        // invisible, and whether it lacks only `SELECT` cannot be told; the
-        // database-wide `VIEW DEFINITION` is what this tool's permission read
-        // asks for anyway, and it makes the table's own gap visible.
+        // invisible, and whether it lacks only `SELECT` cannot be told. The
+        // object's own `VIEW DEFINITION` makes it visible and nothing else:
+        // the database-wide grant would also show every other schema's
+        // objects and module definitions, which the narrower grants of
+        // DECISIONS 505 keep hidden (review of #1641).
         (Driver::Mssql, LockReadGap::Hidden) => LockRemedy {
             why: format!(
-                "this user cannot see {} at all, so what it lacks on it cannot be told yet; \
-                 {how}; {next}",
-                pbps_mssql::state::LOCK_TABLE
+                "this user cannot see {table} at all, so what it lacks on it cannot be told \
+                 yet; {how}; {next}; the statement fails if {table} does not exist, and then \
+                 the database is not initialized as pbps expects",
+                table = pbps_mssql::state::LOCK_TABLE
             ),
-            statement: Some(format!("GRANT VIEW DEFINITION TO {principal};")),
+            statement: Some(format!(
+                "GRANT VIEW DEFINITION ON OBJECT::{} TO {principal};",
+                pbps_mssql::state::LOCK_TABLE
+            )),
         },
         (Driver::Mssql, LockReadGap::TableSelect) => LockRemedy {
             why: format!(

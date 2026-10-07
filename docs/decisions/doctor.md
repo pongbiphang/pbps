@@ -926,10 +926,17 @@ lookup does not say whether the table exists. So after the lock read fails,
 - **SQL Server cannot tell an invisible table from an absent one.** Measured
   on 2025 RTM: with no permission on `dbo.__pbps_lock`, `OBJECT_ID` is NULL
   for it, as for a missing table, and `HAS_PERMS_BY_NAME` answers 0 for both.
-  An invisible table therefore gets `GRANT VIEW DEFINITION`, the database
-  permission this tool's permission read already asks for. Once the table is
-  visible, the next `doctor` names its `SELECT`. A `DENY` through a role
-  overrides that grant, and the message says so.
+  An invisible table therefore gets `GRANT VIEW DEFINITION ON
+  OBJECT::dbo.__pbps_lock`. That object grant makes the table visible and
+  nothing else; the database-wide grant would also show every other schema's
+  objects and module definitions, which DECISIONS 505 keeps hidden (measured:
+  another schema's procedure definition stays `NULL` under the object grant
+  and appears under the database one). Once the table is visible, the next
+  `doctor` names its `SELECT`. A `DENY` through a role overrides that grant,
+  and the message says so. The name is looked up untyped first: a visible
+  object of another kind there, such as a view, reads `NULL` from the
+  table-typed lookup too, and no grant can make it the lock table, so it is
+  unexplained.
 - **One statement in the remedy, the explanation in the message.** The
   principal is the whole quoted placeholder (`"<database role>"` or
   `"<database user>"`). The message says to replace it, quotes included, with

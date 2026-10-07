@@ -2659,15 +2659,21 @@ pub fn supports_create_or_alter(product_version: &str, edition_raw: &str) -> boo
 ///
 /// Measured on 2025 RTM: a user with no permission on `dbo.__pbps_lock` gets
 /// `NULL` from `OBJECT_ID` for it, exactly as for a table that does not exist,
-/// and `HAS_PERMS_BY_NAME` answers 0 for both. So a hidden table is reported
+/// and `HAS_PERMS_BY_NAME` answers 0 for both. So a hidden name is reported
 /// as hidden, never as absent and never as a `SELECT` gap: once the user can
 /// see it, the next run of `doctor` can tell which it is. A visible table
 /// this user may not read is the one case with a single grant to name.
+///
+/// The name is asked about untyped first. A visible object there that is not
+/// a user table — a view, say — reads `NULL` from the `'U'`-typed lookup too,
+/// even to its owner; that is not invisibility, and no grant makes it the
+/// lock table, so it is unexplained (review of #1641).
 pub async fn lock_read_gap(conn: &mut Conn) -> Result<pbps_db::doctor::LockReadGap, DbError> {
     use pbps_db::doctor::LockReadGap;
     let rows = conn
         .query_with(
-            "SELECT OBJECT_ID(@P1, N'U') AS object_id, \
+            "SELECT OBJECT_ID(@P1) AS any_id, \
+                    OBJECT_ID(@P1, N'U') AS table_id, \
                     HAS_PERMS_BY_NAME(@P1, N'OBJECT', N'SELECT') AS select_ok;",
             &[Param::Str(crate::state::LOCK_TABLE)],
         )
@@ -2675,8 +2681,11 @@ pub async fn lock_read_gap(conn: &mut Conn) -> Result<pbps_db::doctor::LockReadG
     let row = rows
         .first()
         .ok_or_else(|| DbError::BadRow("the lock question returned no row".into()))?;
-    if row.try_get::<i32>("object_id")?.is_none() {
+    if row.try_get::<i32>("any_id")?.is_none() {
         return Ok(LockReadGap::Hidden);
+    }
+    if row.try_get::<i32>("table_id")?.is_none() {
+        return Ok(LockReadGap::Unexplained);
     }
     Ok(match row.try_get::<i32>("select_ok")? {
         Some(0) => LockReadGap::TableSelect,
