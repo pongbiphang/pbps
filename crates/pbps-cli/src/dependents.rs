@@ -1389,8 +1389,16 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
     }
     // A generated name the plan also declares is the declared relation's:
     // the engine moves the key's index aside to a numbered name, so only
-    // the declared one is read as arriving.
-    generated.retain(|(_, g)| !arrivals.iter().any(|(_, r)| r == g));
+    // the declared one is read as arriving. Likewise only the first of two
+    // keys generating one name holds it: two tables sharing their first 58
+    // bytes cut to the same `_pkey` (#1640 review).
+    generated.sort_by_key(|(at, _)| *at);
+    let mut held: Vec<TableName> = Vec::new();
+    generated.retain(|(_, g)| {
+        let free = !arrivals.iter().any(|(_, r)| r == g) && !held.contains(g);
+        held.push(g.clone());
+        free
+    });
     let generated: Vec<TableName> = generated
         .into_iter()
         .map(|(at, r)| {
@@ -5432,6 +5440,28 @@ mod tests {
         ] {
             assert_eq!(refusal_of(&cs, &*pg()), Ok(()), "{cs:?}");
         }
+        // Two tables cutting to one generated name: the first key holds it,
+        // so the first table's check naming it binds that index, and the
+        // second key's index is numbered.
+        let long = |last: char| format!("{}{last}", "t".repeat(62));
+        let pair = |table: &str, check: Option<&str>| {
+            let mut t = new_table(None, check, &[]);
+            t.primary_key = Some(unnamed());
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, &format!("app.{table}"), 0),
+                name: TableName::new("app", table),
+                table: Box::new(t),
+            }
+        };
+        let cut = format!("{}_pkey", "t".repeat(58));
+        let check = format!("{} <> ''", names(&cut));
+        assert_eq!(
+            refusal_of(
+                &plan(vec![pair(&long('a'), Some(&check)), pair(&long('b'), None)]),
+                &*pg()
+            ),
+            Ok(())
+        );
         // Held by an index the plan declares: that index is the arrival,
         // and its name is its own, so the target is not asked.
         let mut held = new_table(Some(&names("n_pkey")), None, &[("n_pkey", None)]);

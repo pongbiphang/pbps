@@ -1737,6 +1737,9 @@ ask (#1599 review).
   - The cut counts the database's encoding, as above. So past the limit, the
     name is told only when the part kept is ASCII.
   - A generated name the plan also declares is the declared relation's.
+  - Of two keys generating one name, as two tables sharing their first 58
+    bytes do, only the first holds it, and the second is numbered (measured
+    on 18, #1640 review).
 - **What counts as later is the statement, not only the change (#1592).** A
   new table is several statements, and its own relations come after some of
   its expressions. Measured on 18, in the order the emitter writes them:
