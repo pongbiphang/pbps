@@ -1955,12 +1955,22 @@ pub fn read_remedies(driver: Driver) -> ReadRemedies {
         // Both grants, measured on 18.6: without `SELECT` the read is
         // "permission denied for table __pbps_lock", and with it but without
         // `USAGE` it is "permission denied for schema public".
+        //
+        // The schema first, and the table only if the finding outlives it.
+        // Without `USAGE` the lookup is refused before the table is found or
+        // missed, so an uninitialized database reads as this finding too; with
+        // `USAGE` it reads "relation does not exist", which `lock_holder`
+        // takes as no lock at all (measured on 18.6). Asking for both at once
+        // sent that operator to grant `SELECT` on a table that does not exist
+        // yet (#821). Which of the two failed is not carried this far, and
+        // the error text is not parsed to guess it, so the order does the work.
         Driver::Postgres => ReadRemedies {
             lock: format!(
-                "grant SELECT on {} and USAGE on schema {} to this role, or check that the \
-                 table is intact",
-                pbps_pg::state::LOCK_TABLE,
-                pbps_pg::state::LEDGER_SCHEMA
+                "grant USAGE on schema {schema} to this role and rerun doctor; only if this \
+                 finding remains and {table} exists, grant SELECT on {table} too, or check \
+                 that the table is intact",
+                schema = pbps_pg::state::LEDGER_SCHEMA,
+                table = pbps_pg::state::LOCK_TABLE,
             ),
             // The read asks `has_*_privilege` and the system catalogs, which
             // every role may read unless someone revoked it; the other way it

@@ -11534,6 +11534,165 @@ fn doctor_tells_a_role_that_cannot_read_the_lock_what_to_grant_in_postgres_terms
         !text.contains("pw-306-secret"),
         "the password leaked: {report}"
     );
+
+    // #821: the role already has `USAGE` on `public` (through PUBLIC), so the
+    // remedy's first step changes nothing and the finding stays; the table
+    // exists, so its second step applies, and taking it clears the finding.
+    on_server(
+        connection,
+        &format!("GRANT SELECT ON public.__pbps_lock TO {}", role.1),
+    );
+    let report = json_output(d.run(&["doctor", "--db", &login, "--format", "json"]));
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["id"] != "state.lock-unknown"),
+        "{report}"
+    );
+}
+
+/// #821. Without `USAGE` on `public`, PostgreSQL refuses the lock lookup at
+/// the schema, before the table is found or missed, so an uninitialized
+/// database reads as `state.lock-unknown` too (measured on 18.6: "permission
+/// denied for schema public", then "relation ... does not exist" once the
+/// schema is usable). Its remedy used to ask for `SELECT` on a lock table that
+/// did not exist yet. Following the remedy in its order — the schema, then
+/// rerun — has to finish the job here without any grant on the table.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn doctor_repairs_schema_access_before_an_absent_lock_table() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_lock_schema_{}", std::process::id()),
+    );
+    let own = OwnDatabase::new(&server, "lock_absent");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {} LOGIN NOSUPERUSER PASSWORD 'pw-821-secret'; \
+             REVOKE USAGE ON SCHEMA public FROM PUBLIC",
+            role.1
+        ),
+    );
+    let login = format!(
+        "{} user={} password=pw-821-secret",
+        connection
+            .split_whitespace()
+            .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" "),
+        role.1
+    );
+    let d = Demo::new("lock-absent");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nenvironments:\n  dev:\n    url_env: PBPS_FLOW_PG_DEV\n",
+    )
+    .unwrap();
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let ledger_tables = || {
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND c.relname IN ('__pbps_state', '__pbps_lock')",
+        )
+    };
+    let has_usage = || {
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(*) WHERE has_schema_privilege('{}', 'public', 'USAGE')",
+                role.1
+            ),
+        ) == 1
+    };
+    let diagnose = || {
+        let o = d.run_with_env(
+            &["doctor", "--format", "json"],
+            &[("PBPS_FLOW_PG_DEV", login.as_str())],
+        );
+        assert!(
+            !stdout(&o).contains("pw-821-secret") && !stderr(&o).contains("pw-821-secret"),
+            "the password is never printed"
+        );
+        json_output(o)
+    };
+    let lock_findings = |report: &serde_json::Value| -> Vec<serde_json::Value> {
+        report["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{report}"))
+            .iter()
+            .filter(|f| f["id"] == "state.lock-unknown")
+            .cloned()
+            .collect()
+    };
+
+    // The premise, established directly: no ledger, no schema access, and the
+    // role's own lookup refused at the schema rather than missing the table.
+    assert_eq!(ledger_tables(), 0, "the database is uninitialized");
+    assert!(
+        !has_usage(),
+        "no grant, direct or through PUBLIC, reaches public"
+    );
+    let refused = try_on_server(&login, "SELECT locked_by FROM public.__pbps_lock")
+        .expect_err("the lookup is refused");
+    assert!(
+        refused.contains("permission denied for schema public"),
+        "{refused}"
+    );
+
+    let report = diagnose();
+    let found = lock_findings(&report);
+    assert_eq!(found.len(), 1, "{report}");
+    assert_eq!(found[0]["severity"], "error", "{report}");
+    assert_eq!(
+        report["data"]["environments"][0]["state"], "lock-unknown",
+        "{report}"
+    );
+    let remedy = found[0]["remedy"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{report}"));
+    let usage = remedy
+        .find("USAGE on schema public")
+        .unwrap_or_else(|| panic!("{remedy}"));
+    let rerun = remedy
+        .find("rerun doctor")
+        .unwrap_or_else(|| panic!("{remedy}"));
+    let select = remedy
+        .find("SELECT on public.__pbps_lock")
+        .unwrap_or_else(|| panic!("{remedy}"));
+    assert!(usage < rerun && rerun < select, "{remedy}");
+
+    // Its first step, as it says, and nothing else.
+    on_server(
+        connection,
+        &format!("GRANT USAGE ON SCHEMA public TO {}", role.1),
+    );
+    assert!(has_usage());
+    let report = diagnose();
+    assert!(lock_findings(&report).is_empty(), "{report}");
+    assert_eq!(
+        report["data"]["environments"][0]["state"], "uninitialized",
+        "{report}"
+    );
+    // The remedy's second step never applied: the finding is gone and the
+    // table it names still does not exist, so there was nothing to grant on.
+    assert_eq!(ledger_tables(), 0, "doctor created nothing");
+
+    // The database goes before the cluster-wide role it holds a grant for.
+    drop(own);
 }
 
 #[test]

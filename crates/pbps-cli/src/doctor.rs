@@ -2097,6 +2097,22 @@ mod tests {
         let (lock, permissions) = remedies(pbps_db::Driver::Postgres);
         assert!(lock.contains("public.__pbps_lock"), "{lock}");
         assert!(lock.contains("USAGE on schema public"), "{lock}");
+        // #821: the schema comes first, then a rerun, and the table's grant
+        // only if the finding survives and the table exists — on an
+        // uninitialized database the table is not there to grant on.
+        let usage = lock.find("USAGE on schema public").unwrap();
+        let rerun = lock
+            .find("rerun doctor")
+            .unwrap_or_else(|| panic!("{lock}"));
+        let select = lock
+            .find("SELECT on public.__pbps_lock")
+            .unwrap_or_else(|| panic!("{lock}"));
+        assert!(usage < rerun && rerun < select, "{lock}");
+        assert!(
+            lock[rerun..select].contains("only if this finding remains")
+                && lock[rerun..select].contains("public.__pbps_lock exists"),
+            "{lock}"
+        );
         assert!(permissions.contains("pg_catalog"), "{permissions}");
         assert!(permissions.contains("role that deploys"), "{permissions}");
         // #820: with recorded identities the permission read starts with the
