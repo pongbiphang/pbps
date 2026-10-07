@@ -19,6 +19,7 @@ MERGE = "d" * 40
 OLD_MERGE = "e" * 40
 NEW_BASE = "f" * 40
 NEW_MERGE = "1" * 40
+FOREIGN_BASE = "3" * 40
 
 
 class Api:
@@ -35,6 +36,7 @@ class Api:
         self.absent = False
         self.stale_pr_base = False
         self.actual_base = None
+        self.merge_base = None
 
     def __call__(self, path):
         self.requests.append(path)
@@ -47,6 +49,10 @@ class Api:
         if "/compare/" in path:
             ancestor, descendant = path.rsplit("/", 1)[1].split("...")
             order = {OLD_BASE: 0, BASE: 1, NEW_BASE: 2}
+            if descendant == FOREIGN_BASE and ancestor in (OLD_BASE, BASE):
+                return {"base_commit": {"sha": ancestor}, "merge_base_commit": {"sha": ancestor}, "status": "ahead"}
+            if ancestor not in order or descendant not in order:
+                return {"base_commit": {"sha": ancestor}, "merge_base_commit": {"sha": OLD_BASE}, "status": "diverged"}
             status = "ahead" if order[ancestor] < order[descendant] else "behind"
             return {"base_commit": {"sha": ancestor}, "merge_base_commit": {"sha": ancestor if status == "ahead" else descendant}, "status": status}
         if "/pulls/" in path:
@@ -59,7 +65,7 @@ class Api:
             return {"ref": "refs/pull/1535/merge", "object": {"type": "commit", "sha": merge}}
         if "/git/commits/" in path:
             self.commits_read += 1
-            return {"sha": path.rsplit("/", 1)[1], "parents": [{"sha": OLD_BASE if stale else base}] + ([] if self.incomplete else [{"sha": HEAD}])}
+            return {"sha": path.rsplit("/", 1)[1], "parents": [{"sha": self.merge_base or (OLD_BASE if stale else base)}] + ([] if self.incomplete else [{"sha": HEAD}])}
         raise AssertionError(path)
 
 
@@ -97,6 +103,24 @@ class CheckoutTests(unittest.TestCase):
         api.actual_base = NEW_BASE
         result = self.select(api)
         self.assertEqual((result.checkout_sha, result.base_sha), (MERGE, BASE))
+
+    def test_pr_base_metadata_can_lag_a_merge_ref_advanced_on_the_same_branch(self):
+        # Actual #1535: the PR and associated run cached an earlier master SHA,
+        # while the merge commit already had current master as its first parent.
+        api = Api()
+        api.actual_base = NEW_BASE
+        api.merge_base = NEW_BASE
+        result = self.select(api)
+        self.assertEqual((result.checkout_sha, result.base_sha, result.head_sha),
+                         (MERGE, NEW_BASE, HEAD))
+
+    def test_a_merge_parent_outside_the_event_floor_or_intended_branch_is_refused(self):
+        for base in (OLD_BASE, FOREIGN_BASE):
+            api = Api()
+            api.actual_base = NEW_BASE
+            api.merge_base = base
+            with self.subTest(base=base), self.assertRaisesRegex(CheckoutError, "No stable merge ref"):
+                self.select(api, attempts=2)
 
     def test_a_base_branch_that_no_longer_contains_the_selected_base_is_refused(self):
         api = Api()

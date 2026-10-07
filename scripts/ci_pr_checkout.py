@@ -124,14 +124,21 @@ def select_checkout(api, repository, number, expected_head, expected_base, expec
                 raise CheckoutError("The merge ref lacks an exact two-parent commit")
         except (KeyError, TypeError) as error:
             raise CheckoutError("Incomplete merge-commit parent evidence") from error
-        if parents != [before["base_sha"], expected_head]:
+        # PR.base.sha is cached independently of the synthetic merge ref.
+        # Qualify the commit's actual base parent against the event floor and
+        # intended live branch; equality with that cached field rejects a
+        # valid merge ref after ordinary same-branch advancement.
+        selected_base = parents[0]
+        if (parents[1] != expected_head
+                or not base_contains(expected_base_sha, selected_base)
+                or not base_contains(selected_base, current_base)):
             sleep(2)
             continue
         after = pr_state(read(f"{prefix}/pulls/{number}"), number, expected_head, expected_base)
         confirmed = ref_sha(read(f"{prefix}/git/ref/pull/{number}/merge"), merge_ref)
         confirmed_base = ref_sha(read(f"{prefix}/git/ref/{base_path}"), base_ref)
         if before == after and current == confirmed and current_base == confirmed_base:
-            return Checkout(current, before["base_sha"], expected_head, expected_base, merge_ref)
+            return Checkout(current, selected_base, expected_head, expected_base, merge_ref)
         sleep(2)
     raise CheckoutError("No stable merge ref matching the intended PR head and base within the bound")
 
