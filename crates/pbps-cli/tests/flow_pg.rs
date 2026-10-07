@@ -108,6 +108,27 @@ impl OwnDatabase {
         }
     }
 
+    /// A database in `encoding`, which needs `template0` and the C locale.
+    fn encoded(server: &str, slug: &str, encoding: &str) -> Self {
+        let name = format!("pbps_cli_{slug}_{}", std::process::id());
+        on_server(
+            server,
+            &format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"),
+        );
+        on_server(
+            server,
+            &format!(
+                "CREATE DATABASE \"{name}\" ENCODING '{encoding}' LC_COLLATE 'C' \
+                 LC_CTYPE 'C' TEMPLATE template0"
+            ),
+        );
+        Self {
+            server: server.to_owned(),
+            connection: with_dbname(server, &name),
+            name,
+        }
+    }
+
     fn connection(&self) -> &str {
         &self.connection
     }
@@ -17946,6 +17967,91 @@ fn a_new_tables_default_naming_its_own_index_is_refused_and_two_plans_deploy_it(
             connection,
             "SELECT count(*) FROM pg_attrdef WHERE adrelid = 'app.n'::regclass \
              AND pg_get_expr(adbin, adrelid) LIKE '%ix_n%'"
+        ),
+        1
+    );
+}
+
+/// #1593: `regclass` input cuts a name part to 63 bytes, silently, so a
+/// default naming 64 `a`s names the 63-`a` index the plan creates later. The
+/// connected plan is refused, writing no artifact, though the two spellings
+/// differ.
+#[test]
+#[ignore = "needs a live PostgreSQL; see scripts/live-tests-pg.sh"]
+fn a_default_naming_a_later_index_past_the_identifier_limit_is_refused() {
+    let own = OwnDatabase::new(&server(), "names_long_index");
+    let connection = own.connection();
+    let columns = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n";
+    let label = |default: &str| format!("  label: {{type: text, default: \"{default}\"}}\n");
+    let index = format!("indexes:\n  {}:\n    columns: [id]\n", "a".repeat(63));
+    let d = bootstrapped_demo(
+        connection,
+        "names_long_index",
+        &format!("{columns}{}primary_key: [id]\n", label("''")),
+    );
+    let named = format!("('app.{}'::regclass)::text", "a".repeat(64));
+    d.table(&format!(
+        "{columns}{}primary_key: [id]\n{index}",
+        label(&named)
+    ));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let artifact = d.dir.join("refused-plan.json");
+    let refused = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    let why = stderr(&refused);
+    assert!(
+        why.contains(&format!("names app.{}", "a".repeat(63))),
+        "{why}"
+    );
+    assert!(!artifact.exists(), "a refused plan writes no artifact");
+}
+
+/// #1627 review: `regclass` input cuts a name to 63 bytes of the database's
+/// encoding. In a single-byte database, 62 `a`s and `é` are 63 bytes, so a
+/// default naming that unmanaged table names it whole. It is not the 62-`a`
+/// index the plan creates later, which a cut by UTF-8 bytes would read it as.
+/// The plan writes its artifact and applies. WIN1252 rather than LATIN1:
+/// `bootstrap` does not complete in a LATIN1 database (#1629).
+#[test]
+#[ignore = "needs a live PostgreSQL; see scripts/live-tests-pg.sh"]
+fn a_literal_cut_differs_by_encoding_so_a_single_byte_name_is_not_refused() {
+    let own = OwnDatabase::encoded(&server(), "single_byte_literal", "WIN1252");
+    let connection = own.connection();
+    let columns = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n";
+    let label = |default: &str| format!("  label: {{type: text, default: \"{default}\"}}\n");
+    let d = bootstrapped_demo(
+        connection,
+        "single_byte_literal",
+        &format!("{columns}{}primary_key: [id]\n", label("''")),
+    );
+    let external = format!("{}é", "a".repeat(62));
+    on_server(
+        connection,
+        &format!("CREATE TABLE app.\"{external}\" (id integer)"),
+    );
+    // YAML's double quotes take `\"` for the identifier's quotes.
+    d.table(&format!(
+        "{columns}{}primary_key: [id]\nindexes:\n  {}:\n    columns: [id]\n",
+        label(&format!("('app.\\\"{external}\\\"'::regclass)::text")),
+        "a".repeat(62)
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(*) FROM pg_class WHERE relname = '{}' \
+                 AND relnamespace = 'app'::regnamespace AND relkind = 'i'",
+                "a".repeat(62)
+            )
         ),
         1
     );
