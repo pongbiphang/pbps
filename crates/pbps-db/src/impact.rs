@@ -13,7 +13,7 @@
 //! into a dependent does not imply that it permits deleting the target.
 
 use pbps_dialect::DialectError;
-use pbps_model::{ColumnRef, ObjectName, TableName};
+use pbps_model::{ColumnRef, ModuleId, ModuleKind, ObjectName, TableName};
 
 use crate::DbError;
 
@@ -97,6 +97,12 @@ pub struct Referrer {
     pub name: String,
     /// Why this one matters, when the kind alone does not say it.
     pub detail: Option<String>,
+    /// The module whose explicit drop removes this referrer, when the engine
+    /// proved one — so a plan that drops it is not told it keeps working
+    /// (#823). Typed rather than read back out of `name`: the display is the
+    /// engine's wording, and a name match would excuse a same-named survivor.
+    /// `None` means nothing proves removal, and the referrer stays reported.
+    pub removed_with: Option<(ModuleKind, ModuleId)>,
 }
 
 /// Everything the catalog says depends on the rename target.
@@ -186,6 +192,7 @@ mod tests {
             kind: "view".into(),
             name: "app.v".into(),
             detail: None,
+            removed_with: None,
         });
         assert!(!report.is_empty());
     }

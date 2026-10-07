@@ -650,6 +650,7 @@ pub async fn rename_impact(
             kind: kind.to_owned(),
             name,
             detail: schema_bound.then(|| "SCHEMABINDING".to_owned()),
+            removed_with: None,
         };
         if schema_bound {
             report.blocking.push(referrer);
@@ -674,6 +675,7 @@ pub async fn rename_impact(
                 kind: "computed column".to_owned(),
                 name: format!("{}.{}", column.table, get::<&str>(&row, "column_name")?),
                 detail: definition.map(str::to_owned),
+                removed_with: None,
             });
         }
     }
@@ -688,6 +690,7 @@ pub async fn rename_impact(
                 kind: get::<&str>(&row, "kind")?.to_owned(),
                 name: get::<&str>(&row, "name")?.to_owned(),
                 detail: definition.map(str::to_owned),
+                removed_with: None,
             });
         }
     }
@@ -702,6 +705,7 @@ pub async fn rename_impact(
                 kind: get::<&str>(&row, "kind")?.to_owned(),
                 name: name.to_owned(),
                 detail: Some("the name embeds the old column name".to_owned()),
+                removed_with: None,
             });
         }
     }

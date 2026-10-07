@@ -11315,6 +11315,129 @@ fn a_carried_only_rename_impact_lists_what_the_rename_carries() {
     );
 }
 
+/// #823: a plan that drops a view and renames a column it reads printed the
+/// view as carried into the new name and still working — about an object the
+/// same plan removes first. The catalog still holds the edge when preflight
+/// reads it, so the report has to excuse the view by the plan's own drop. A
+/// view the plan keeps is still listed, once, with its note; with nothing
+/// left the report prints no heading at all.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_dropped_view_is_not_reported_as_carried_by_a_column_rename() {
+    for survivor in [true, false] {
+        let slug = if survivor {
+            "dropped_carried_kept"
+        } else {
+            "dropped_carried_alone"
+        };
+        let own = OwnDatabase::new(&server(), slug);
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new(slug);
+        d.table(TWO_COLUMNS);
+        let view = d.dir.join("schema/v.yml");
+        std::fs::write(&view, "view: app.v\ndefinition: SELECT label FROM app.t\n").unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        if survivor {
+            on_server(
+                connection,
+                "CREATE SCHEMA outside; CREATE VIEW outside.keep AS SELECT label FROM app.t;",
+            );
+        }
+        on_server(connection, "INSERT INTO app.t VALUES (1, 'kept')");
+
+        std::fs::remove_file(&view).unwrap();
+        d.table(&TWO_COLUMNS.replace(
+            "  label: {type: varchar(50)}",
+            "  note: {type: varchar(50), renamed_from: label}",
+        ));
+        let plan = connected_artifact(&d, connection, false);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+        let kinds: Vec<&pbps_model::Change> =
+            saved.changes.changes.iter().map(|p| &p.change).collect();
+        assert!(
+            kinds.iter().any(|c| matches!(
+                c,
+                pbps_model::Change::DropModule {
+                    kind: pbps_model::ModuleKind::View,
+                    id: pbps_model::ModuleId::Named(n),
+                } if n.to_string() == "app.v"
+            )),
+            "{kinds:#?}"
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|c| matches!(c, pbps_model::Change::RenameColumn { .. })),
+            "{kinds:#?}"
+        );
+
+        let applied = succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "destructive,rename"],
+        ));
+        let out = stdout(&applied);
+        let heading = out.lines().position(|l| l.ends_with("affects:"));
+        let body: Vec<&str> = heading
+            .map(|h| {
+                out.lines()
+                    .skip(h + 1)
+                    .take_while(|l| l.starts_with("  "))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !body.iter().any(|l| l.contains("app.v")),
+            "the dropped view is not carried: {out}"
+        );
+        if survivor {
+            assert_eq!(
+                body.iter()
+                    .filter(|l| l.contains("view outside.keep")
+                        && l.contains("carried into the new name, keeps working"))
+                    .count(),
+                1,
+                "{out}"
+            );
+            assert!(
+                body.iter()
+                    .any(|l| l.contains("keeps its old output column name")),
+                "{out}"
+            );
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM outside.keep WHERE label = 'kept'"
+                ),
+                1
+            );
+        } else {
+            assert!(heading.is_none(), "nothing is left to report: {out}");
+            assert!(!out.contains("keeps its old output column name"), "{out}");
+        }
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = 'app' AND c.relname = 'v'"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(connection, "SELECT count(*) FROM app.t WHERE note = 'kept'"),
+            1
+        );
+        succeeds(d.run(&["verify", "--db", connection]));
+        assert!(stdout(&succeeds(d.run(&["plan", "--db", connection]))).contains("No changes"));
+    }
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn postgres_rename_impact_reaches_the_cli_as_advisory_and_requires_explicit_approval() {

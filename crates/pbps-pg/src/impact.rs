@@ -76,7 +76,7 @@ use std::collections::BTreeMap;
 
 use pbps_db::{Conn, DbError, Row};
 use pbps_dialect::DialectError;
-use pbps_model::TableName;
+use pbps_model::{ModuleId, ModuleKind, ObjectName, TableName};
 
 use crate::emit::qualified;
 
@@ -242,14 +242,35 @@ SELECT n.nspname AS schema_name,
 /// The internal edges (`deptype = 'i'`) are the object's own parts — a view's
 /// `_RETURN` rule is the view — and listing them would report the object as its
 /// own dependant.
+///
+/// A view's edge comes from its `_RETURN` rule, so it is resolved to the view
+/// itself — described as the view, and named by its raw catalog schema and
+/// name so a plan that drops it can excuse it by its typed id (#823). Every
+/// guard is needed: `_RETURN` alone also names a materialized view's rule, and
+/// a user rule on a view is not the view. Anything else keeps the engine's
+/// description and no name, and stays reported. A left join, so resolving one
+/// kind of row never discards another.
 const CARRIED: &str = "\
-SELECT DISTINCT pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid) AS described
+SELECT DISTINCT
+       CASE WHEN v.oid IS NULL
+            THEN pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid)
+            ELSE pg_catalog.pg_describe_object('pg_catalog.pg_class'::regclass, v.oid, 0)
+       END AS described,
+       vn.nspname AS view_schema,
+       v.relname AS view_name
   FROM pg_catalog.pg_depend d
+  LEFT JOIN pg_catalog.pg_rewrite r
+    ON d.classid = 'pg_catalog.pg_rewrite'::regclass
+   AND r.oid = d.objid
+   AND r.rulename = '_RETURN'
+  LEFT JOIN pg_catalog.pg_class v
+    ON v.oid = r.ev_class AND v.relkind = 'v'
+  LEFT JOIN pg_catalog.pg_namespace vn ON vn.oid = v.relnamespace
  WHERE d.refclassid = 'pg_catalog.pg_class'::regclass
    AND d.refobjid = ($1::int8)::oid
    AND d.deptype <> 'i'
    AND ($2 = 0 OR d.refobjsubid IN (0, $2))
- ORDER BY 1";
+ ORDER BY 1, 2, 3";
 
 /// Indexes and constraints on the table whose **name** embeds the old column
 /// name. The objects keep working — measured, `ix_customer_email` is still
@@ -402,6 +423,7 @@ pub async fn rename_impact(
                  and the failure lands the next time it runs",
                 text(&row, "language")?
             )),
+            removed_with: None,
         });
     }
 
@@ -416,6 +438,7 @@ pub async fn rename_impact(
                 kind: text(&row, "kind")?,
                 name,
                 detail: Some("the name embeds the old column name".to_owned()),
+                removed_with: None,
             });
         }
     }
@@ -425,10 +448,30 @@ pub async fn rename_impact(
         .query_with(CARRIED, &[relation.into(), attnum.into()])
         .await?
     {
+        let view = match (
+            row.try_get::<&str>("view_schema")?,
+            row.try_get::<&str>("view_name")?,
+        ) {
+            (Some(schema), Some(name)) => Some(ObjectName::new(schema, name)),
+            (None, None) => None,
+            // The join resolved one half of the view and not the other: a
+            // row this reader does not understand, said as one rather than
+            // read as "not a view" (absent is not unreadable).
+            _ => {
+                return Err(ImpactError::Name(DialectError::Invalid {
+                    dialect: crate::types::DIALECT,
+                    message: format!(
+                        "a view carried by the rename of {target} came back without its full \
+                         name, so the report cannot say which view it is"
+                    ),
+                }));
+            }
+        };
         report.carried.push(Referrer {
-            kind: "carried".to_owned(),
+            kind: if view.is_some() { "view" } else { "carried" }.to_owned(),
             name: text(&row, "described")?,
             detail: None,
+            removed_with: view.map(|v| (ModuleKind::View, ModuleId::Named(v))),
         });
     }
     Ok(report)

@@ -25693,6 +25693,9 @@ async fn a_rename_is_carried_into_what_the_catalog_holds_and_not_into_a_text_bod
              email text,
              amount numeric(10,2) CHECK (amount >= 0));
          CREATE VIEW {s}.v_plain AS SELECT id, email FROM {s}.customer;
+         CREATE MATERIALIZED VIEW {s}.mv_plain AS SELECT email FROM {s}.customer;
+         CREATE RULE r_insert AS ON INSERT TO {s}.v_plain DO INSTEAD
+             INSERT INTO {s}.customer (id, email) VALUES (NEW.id, NEW.email);
          CREATE FUNCTION {s}.f_atomic() RETURNS text LANGUAGE sql
              BEGIN ATOMIC SELECT email FROM {s}.customer LIMIT 1; END;
          CREATE FUNCTION {s}.f_plpgsql() RETURNS text LANGUAGE plpgsql AS
@@ -25727,6 +25730,36 @@ async fn a_rename_is_carried_into_what_the_catalog_holds_and_not_into_a_text_bod
         advisory.contains(&"ix_customer_email"),
         "an index whose name embeds the column is naming drift: {report:#?}"
     );
+
+    // #823: the view, and only the view, carries the typed module a plan that
+    // drops it is matched by — under the view's own description, once however
+    // many of its columns read the target. A materialized view's `_RETURN`
+    // rule and a user rule on the view are not the view and carry none.
+    let keyed: Vec<_> = report
+        .carried
+        .iter()
+        .filter_map(|r| r.removed_with.as_ref().map(|key| (r.name.as_str(), key)))
+        .collect();
+    assert_eq!(
+        keyed,
+        [(
+            format!("view {s}.v_plain").as_str(),
+            &(
+                pbps_model::ModuleKind::View,
+                pbps_model::ModuleId::Named(pbps_model::ObjectName::new(&s, "v_plain"))
+            )
+        )],
+        "{report:#?}"
+    );
+    for unkeyed in ["materialized view", "rule r_insert"] {
+        assert!(
+            report
+                .carried
+                .iter()
+                .any(|r| r.name.contains(unkeyed) && r.removed_with.is_none()),
+            "the {unkeyed} is listed, and is not the view: {report:#?}"
+        );
+    }
 
     let carried: Vec<&str> = report.carried.iter().map(|r| r.name.as_str()).collect();
     for expected in ["view", "function", "index", "policy"] {
