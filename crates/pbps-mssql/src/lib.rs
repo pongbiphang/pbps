@@ -41,6 +41,7 @@ pub mod preflight;
 pub mod resolver;
 pub mod rows;
 pub mod state;
+pub mod temporal;
 pub mod types;
 pub mod validate;
 

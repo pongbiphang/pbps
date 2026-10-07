@@ -2087,7 +2087,8 @@ review):
 | A history name over 124 characters | its `ix_` index name is cut at 127 | validation refuses it |
 | An INSTEAD OF trigger on a versioned table | refused (13569) | validation refuses it |
 | An AFTER trigger on it, or either kind with a period alone | accepted | held |
-| A cascading foreign key from or to a versioned table | accepted | held; the restriction was 2016's (#1502) |
+| A cascading foreign key from or to a versioned table | accepted | held; a key from one is refused when connected to 2016, which refuses it (#1502) |
+| A finite history retention | accepted (2017 added it) | held; refused when connected to 2016, which has none (#1502) |
 | A computed, identity, `xml`, `(max)` or `ntext` column | accepted | held as for any table |
 | A sparse or FILESTREAM column | refused (11418) | outside the model |
 | A history table's constraints, triggers or own layout | see above | the pair is left out |

@@ -5701,6 +5701,8 @@ pub fn cmd_bootstrap(
         // by the `CREATE TABLE` that names it after the ones before it ran
         // (#1175).
         crate::engine::refuse_unknown_collations(&mut conn, &loaded.schema).await?;
+        // A history retention or a cascading key the server lacks (#1502).
+        crate::engine::refuse_unsupported_temporal(&mut conn, &cs).await?;
         crate::engine::permission_support(&mut conn, &cs).await?;
         crate::engine::lock(&mut conn, &operator).await?;
         let mut transaction_attempted = false;
@@ -6554,6 +6556,9 @@ pub fn cmd_plan_db(
         // addition that is metadata-only on Enterprise rewrites every row
         // here. An offline plan has to assume the conservative answer.
         let verdict = crate::engine::edition_verdict(&mut conn, &cs).await?;
+        // A server fact like the edition: 2016 has no history retention and
+        // no cascading key from a system-versioned table (#1502).
+        crate::engine::refuse_unsupported_temporal(&mut conn, &cs).await?;
         if !verdict.refused_online.is_empty() {
             let refusal = format!(
                 "`strategy: online` is declared for {}, and `{}` runs {}, which has no online \
@@ -7240,6 +7245,8 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     // Under the lock, before anything runs: a table made at a history's name
     // since the plan was computed would be adopted, not refused (#1176).
     refuse_taken_history_names(conn, &plan.changes, &target.label).await?;
+    // Nothing binds a saved plan to a server: asked again here (#1502).
+    crate::engine::refuse_unsupported_temporal(conn, &plan.changes).await?;
     let original_ids = entry.snapshot.ids.clone();
     let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids)
         .await?
@@ -7570,6 +7577,8 @@ async fn apply_staged_under_lock(
     // the history itself, before its checkpoint (DEC-1176.1).
     if !resume {
         refuse_taken_history_names(conn, &plan.changes, &target.label).await?;
+        // Nothing binds a saved plan to a server: asked again here (#1502).
+        crate::engine::refuse_unsupported_temporal(conn, &plan.changes).await?;
     }
     let (start, mut previous) = if resume {
         let progress = match (&entry.snapshot.staged, entry.snapshot.kind) {

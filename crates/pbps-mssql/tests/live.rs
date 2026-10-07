@@ -1980,6 +1980,46 @@ async fn index_types(conn: &mut Conn, table: &str) -> std::collections::BTreeMap
 /// updated on the rebuild lands in its history (#1176). A pair whose history
 /// has a layout of its own, and anything bound to a history, stay out by
 /// name.
+/// The connected temporal capability check's two catalog reads, which a
+/// server with retention never needs for a plan, run here against one (#1502):
+/// the probe answers yes, and the versioned tables are the current tables
+/// alone, not their histories or a table with a period only. A 2016 server,
+/// which would answer no, is not in the live matrix.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn the_temporal_capability_reads_answer_on_a_server_with_retention() {
+    let mut db = TestDb::create("temporal1502").await;
+    for statement in [
+        "CREATE TABLE dbo.versioned (
+             id int NOT NULL CONSTRAINT pk_versioned PRIMARY KEY,
+             vf datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (vf, vt)
+         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));",
+        "CREATE TABLE dbo.period_only (
+             id int NOT NULL CONSTRAINT pk_period_only PRIMARY KEY,
+             vf datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (vf, vt)
+         );",
+        "CREATE TABLE dbo.plain (id int NOT NULL);",
+    ] {
+        db.conn.execute(statement).await.expect(statement);
+    }
+    let has = pbps_mssql::temporal::has_history_retention(&mut db.conn)
+        .await
+        .expect("probe");
+    let versioned = pbps_mssql::temporal::system_versioned_tables(&mut db.conn)
+        .await
+        .expect("read the versioned tables");
+    db.drop().await;
+    assert!(has, "17.0 keeps a finite retention");
+    assert_eq!(
+        versioned,
+        std::collections::BTreeSet::from([TableName::new("dbo", "versioned")])
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn system_versioned_tables_round_trip_through_an_empty_database() {

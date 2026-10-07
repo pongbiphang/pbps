@@ -391,16 +391,18 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     // Temporal metadata arrived in 2016; merely referencing the column fails
     // on older servers. Azure's 12.x banner is not SQL Server 2014, and an
     // unreadable version must not silently classify temporal tables as plain.
+    // The retention probe is shared with the connected check that refuses
+    // what a server without it cannot take (#1502).
     let versions = conn
-        .query(
+        .query(&format!(
             "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')) AS version,
                 CONVERT(nvarchar(128), SERVERPROPERTY('Edition')) AS edition,
                 CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')) AS db_collation,
                 CONVERT(bit, CASE WHEN COL_LENGTH('sys.tables', 'ledger_type') IS NULL
                                   THEN 0 ELSE 1 END) AS has_ledger,
-                CONVERT(bit, CASE WHEN COL_LENGTH('sys.tables', 'history_retention_period')
-                                       IS NULL THEN 0 ELSE 1 END) AS has_retention;",
-        )
+                CONVERT(bit, {}) AS has_retention;",
+            crate::temporal::RETENTION_PROBE
+        ))
         .await?;
     let version = versions
         .first()
