@@ -2987,6 +2987,12 @@ partition's table uid and the column's name.
     DEFAULT <fallback>`, measured to read back as the parent's.
   - `DROP DEFAULT` is emitted only with neither. Otherwise a row written
     straight to the partition would lose the default its parent gives.
+  - It carries its `parent`, because each text is resolved under the schema
+    it was written for. Its own default is set under the partition's write
+    path, as its `CREATE` sets it. Its parent's is set under the parent's
+    write path, which a partition in another schema does not share: an
+    unqualified `f()` is the parent schema's function, not the partition
+    schema's (#1607 review).
   - It sorts with `AlterColumnDefault`, and `after_the_rebuilds` moves one
     whose text calls a function the plan creates.
   - `Declared::advance` records `to` as a column's default is recorded.
@@ -3021,6 +3027,17 @@ The same pass replaces the refusal in `split_new_tables`. A new parent's
 default split out after a new function no longer refuses a new partition
 that overrides that column. That partition's own is set again after it.
 
+**Held at the close.** A staged apply's closing read holds a standing
+partition's own defaults (by presence) and NOT NULLs, as it holds a created
+partition's:
+- once the run is whole, to the before-read with the plan's settings applied
+  in order;
+- mid-run, a column the plan sets on the partition, or whose default it sets
+  on the parent, may hold either value, and every other column is held to
+  the before-read.
+
+Another session's change to them is movement (#1607 review).
+
 **Why not `ONLY`.** `ALTER TABLE ONLY parent` would leave every partition
 alone, which is right around a rebuild. It is wrong for a split default: the
 partitions created before it would get no copy at all. It also spells the
@@ -3038,6 +3055,10 @@ Pinned on 16 and 18 by the CLI's
 - negatives: a NOT NULL over the partition's NULLs is refused before the first
   statement, and a parent's index stays refused by name.
 
+Also by `a_partitions_default_taken_back_resolves_under_its_parents_schema`: a
+partition in another schema takes back its parent's unqualified `f()` as the
+parent schema's function.
+
 Also pinned by `a_function_rebuilt_under_partition_defaults_keeps_each_partitions_own`:
 - a parent's default calling `app.f` with an inheriting partition, an
   overriding one, and one whose own default calls only `app.g`;
@@ -3051,4 +3072,5 @@ Also by the units:
 - `a_partitions_own_checks_and_indexes_are_its_own_through_a_detach`;
 - `a_partitions_own_persistence_and_storage_are_its_own_through_a_detach`;
 - `a_partitions_default_is_released_and_set_again_after_its_parents`;
+- `a_partitions_own_columns_set_by_someone_else_are_movement`;
 - the partitioned case of the new-table split test in `dependents.rs`.

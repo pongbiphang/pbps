@@ -18302,3 +18302,61 @@ fn a_function_rebuilt_under_partition_defaults_keeps_each_partitions_own() {
         "{err}"
     );
 }
+
+/// A partition in another schema than its parent takes its parent's default
+/// back as the parent's declaration means it (#1607 review): the text is
+/// resolved under the parent's schema, so the unqualified `f()` is `app.f`,
+/// not the partition schema's `arch.f`. Its own default stays under its own.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_partitions_default_taken_back_resolves_under_its_parents_schema() {
+    let server = server();
+    let db = OwnDatabase::new(&server, "parts-1607");
+    on_server(
+        db.connection(),
+        "CREATE SCHEMA app; CREATE SCHEMA arch; \
+         CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT 1 $$; \
+         CREATE FUNCTION arch.f() RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT 2 $$; \
+         SET search_path = app; \
+         CREATE TABLE app.ev (k integer NOT NULL, v integer DEFAULT f()) \
+             PARTITION BY RANGE (k); \
+         RESET search_path; \
+         CREATE TABLE arch.ev_a PARTITION OF app.ev FOR VALUES FROM (0) TO (10); \
+         ALTER TABLE arch.ev_a ALTER COLUMN v SET DEFAULT 7",
+    );
+    let d = Demo::new("parts-1607");
+    succeeds(d.run(&["pull", "--db", db.connection()]));
+    let path = d.dir.join("schema/app.ev.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let own = "    columns:\n      v: {default: \"7\"}\n";
+    assert!(text.contains(own), "{text}");
+    // Written unqualified, as a declaration may be: resolved under the
+    // parent's schema, it is the `app.f` the database holds.
+    let text = text.replace("default: app.f()", "default: f()");
+    assert!(text.contains("default: f()"), "{text}");
+    std::fs::write(&path, &text).unwrap();
+    d.commit();
+    // Built from that declaration, which the bootstrap records as written.
+    let target = OwnDatabase::new(&server, "parts-1607-target");
+    let conn = target.connection().to_owned();
+    on_server(&conn, "CREATE SCHEMA app; CREATE SCHEMA arch");
+    succeeds(d.run(&["bootstrap", "--db", &conn]));
+    let next = succeeds(d.run(&["plan", "--db", &conn]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    std::fs::write(&path, text.replace(own, "")).unwrap();
+    d.commit();
+    let plan = d.dir.join("back.json");
+    let o = succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&o).contains("~ v default -> its parent's"),
+        "{}",
+        stdout(&o)
+    );
+    succeeds(approved_apply(&d, &conn, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", &conn]));
+    let next = succeeds(d.run(&["plan", "--db", &conn]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    on_server(&conn, "INSERT INTO arch.ev_a (k) VALUES (1)");
+    assert_eq!(scalar(&conn, "SELECT v::int8 FROM app.ev WHERE k = 1"), 1);
+}

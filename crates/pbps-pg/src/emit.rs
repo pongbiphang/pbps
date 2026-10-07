@@ -2576,29 +2576,41 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         // parent's that the engine gives every partition: `DROP DEFAULT`
         // would leave the partition without the default its parent's rows
         // get, which is not what the declaration says (#1581, DEC-1581.1).
+        //
+        // Each text under the path it was written for: its own under the
+        // partition's schema, as its `CREATE` sets it, and its parent's
+        // under the parent's, which another schema's partition does not
+        // share (#1607 review).
         Change::SetPartitionDefault {
             table,
+            parent,
             column,
             to,
             fallback,
             ..
-        } => one(
-            pg,
-            table,
-            match to.as_ref().or(fallback.as_ref()) {
-                Some(expr) => format!(
+        } => {
+            let set = |expr: &str| -> Result<String, DialectError> {
+                Ok(format!(
                     "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
                     qualified(table)?,
                     quote(column)?,
                     verbatim(expr)
+                ))
+            };
+            match (to, fallback) {
+                (Some(own), _) => one(pg, table, set(own)?),
+                (None, Some(parents)) => Ok(vec![scoped(pg, &parent.schema, &set(parents)?)?]),
+                (None, None) => one(
+                    pg,
+                    table,
+                    format!(
+                        "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+                        qualified(table)?,
+                        quote(column)?
+                    ),
                 ),
-                None => format!(
-                    "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
-                    qualified(table)?,
-                    quote(column)?
-                ),
-            },
-        ),
+            }
+        }
         Change::SetPartitionNotNull {
             table,
             column,

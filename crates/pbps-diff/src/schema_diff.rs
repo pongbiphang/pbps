@@ -2484,6 +2484,7 @@ fn diff_partition_columns(
             changes.push(Change::SetPartitionDefault {
                 uid: uid.clone(),
                 table: name.clone(),
+                parent: now.parent.clone(),
                 column: column.clone(),
                 from: from.default.clone(),
                 to: to.default.clone(),

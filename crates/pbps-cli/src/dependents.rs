@@ -341,6 +341,7 @@ fn split_in_place_edit(changes: &mut Vec<PlannedChange>, holds: &Holds, dialect:
         Change::SetPartitionDefault {
             uid,
             table,
+            parent,
             column,
             from,
             to,
@@ -349,6 +350,7 @@ fn split_in_place_edit(changes: &mut Vec<PlannedChange>, holds: &Holds, dialect:
             Change::SetPartitionDefault {
                 uid: uid.clone(),
                 table: table.clone(),
+                parent: parent.clone(),
                 column: column.clone(),
                 from,
                 to: None,
@@ -357,6 +359,7 @@ fn split_in_place_edit(changes: &mut Vec<PlannedChange>, holds: &Holds, dialect:
             Change::SetPartitionDefault {
                 uid,
                 table,
+                parent,
                 column,
                 from: None,
                 to,
@@ -502,7 +505,7 @@ fn removal_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Result<Chan
             },
             // A partition's, its own or its copy of its parent's: taken off
             // the partition alone (#1588).
-            Part::Default(column) if partition_of(declared, table).is_some() => {
+            Part::Default(column) if let Some(of) = partition_of(declared, table) => {
                 Change::SetPartitionDefault {
                     uid: ids
                         .iter()
@@ -510,10 +513,9 @@ fn removal_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Result<Chan
                         .cloned()
                         .ok_or_else(|| format!("{}: no identity names `{table}`", d.described))?,
                     table: table.clone(),
+                    parent: of.parent.clone(),
                     column: column.clone(),
-                    from: partition_of(declared, table)
-                        .and_then(|of| of.columns.get(column))
-                        .and_then(|own| own.default.clone()),
+                    from: of.columns.get(column).and_then(|own| own.default.clone()),
                     to: None,
                     fallback: None,
                 }
@@ -586,6 +588,7 @@ fn restoration_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Option<
                     Some(Change::SetPartitionDefault {
                         uid: ids.iter().find_map(|ids| ids.table_uid(table))?.clone(),
                         table: table.clone(),
+                        parent: partition_of(declared, table)?.parent.clone(),
                         column: column.clone(),
                         from: None,
                         to,
@@ -1142,6 +1145,7 @@ pub(crate) fn after_their_parents_defaults(
                         Change::SetPartitionDefault {
                             uid,
                             table: partition,
+                            parent: column.table.clone(),
                             column: column.name.clone(),
                             from: None,
                             to: Some(default),
@@ -1864,7 +1868,15 @@ fn expression_schema(change: &Change) -> Option<&str> {
         | Change::AddIndex { table, .. } => Some(&table.schema),
         Change::AlterColumnDefault { column, .. }
         | Change::AlterColumnExpression { column, .. } => Some(&column.table.schema),
-        Change::SetPartitionDefault { table, .. } => Some(&table.schema),
+        // Its own under the partition's schema, its parent's taken back
+        // under the parent's, as each is written (#1607 review).
+        Change::SetPartitionDefault {
+            table, parent, to, ..
+        } => Some(if to.is_some() {
+            &table.schema
+        } else {
+            &parent.schema
+        }),
         // A module's body is written in its own schema, and a literal in it
         // that the engine casts as it creates the module, an atomic body's or
         // a view's, is bound then (#1599 review).

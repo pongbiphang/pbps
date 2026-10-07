@@ -395,10 +395,13 @@ pub enum Change {
     /// copies into every partition, or none. The statement sets `to`, else
     /// `fallback`, else drops the default. With both `None` it takes the
     /// default off entirely, which is how a function rebuild releases it
-    /// (#1588).
+    /// (#1588). `parent` is where `fallback` was written: it is resolved under
+    /// the parent's schema, and `to` under the partition's, which may be
+    /// another.
     SetPartitionDefault {
         uid: Uid,
         table: TableName,
+        parent: TableName,
         column: String,
         from: Option<String>,
         to: Option<String>,
