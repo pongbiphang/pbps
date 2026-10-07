@@ -1647,6 +1647,16 @@ fn an_online_strategy_reaches_the_emitted_sql_and_says_it_is_unverified() {
     // An offline plan cannot read the target's edition, and a preview that
     // reads as verified is the one thing worse than no preview.
     assert!(stdout(&o).contains("unverified"), "{}", stdout(&o));
+    let o = d.run(&["plan", "--format", "json"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert!(
+        json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "strategy.online-unverified"),
+        "{json}"
+    );
 }
 
 /// A rename plans as sp_rename — proof the dialect, not a drop+add, is in charge.
