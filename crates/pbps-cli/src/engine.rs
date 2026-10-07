@@ -678,6 +678,15 @@ pub async fn order_computed_by_edges(conn: &mut Conn, cs: &mut ChangeSet) -> any
     if objects.is_empty() {
         return Ok(());
     }
+    // An empty read is "no edge" only where no referrer can be hidden
+    // (#1462).
+    pbps_mssql::catalog::prove_referrers_visible(conn, &objects)
+        .await
+        .map_err(|e| {
+            anyhow::Error::new(e).context(
+                "cannot prove the catalog shows everything that calls what this plan changes",
+            )
+        })?;
     let edges = pbps_mssql::catalog::expression_edges(conn, &objects).await?;
     if edges.is_empty() {
         return Ok(());

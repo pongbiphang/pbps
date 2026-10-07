@@ -3201,6 +3201,91 @@ fn computed_function_drops_follow_the_catalogs_edges() {
     ]));
 }
 
+/// The connected pass reads "no edge" as none only where no referrer can be
+/// hidden (#1462). A login denied `VIEW DEFINITION` on schema `hidden` does
+/// not see `hidden.t`, whose computed column calls `dbo.f`, so its plan to
+/// alter `dbo.f` is refused by name rather than read as free to run. The same
+/// plan as `sa`, and as the login once the `DENY` is gone, is refused by the
+/// edge itself, as the engine would refuse the alter (3729).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "edges1462_hidden");
+    let login = format!("pbps_flow_referrer_{}", std::process::id());
+    // Not a secret: this login exists for one test inside a throwaway container.
+    let password = "pbpsLeastPrivilege!1";
+    on_server(
+        &server,
+        &format!(
+            "IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ),
+    );
+    on_server(own.connection(), "EXEC(N'CREATE SCHEMA hidden;');");
+    on_server(
+        own.connection(),
+        "CREATE FUNCTION dbo.f (@x int) RETURNS int AS BEGIN RETURN @x * 3 END;",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("edges1462-hidden");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    // Made after the baseline: somebody else's table, which the project
+    // does not manage and this login cannot see.
+    on_server(
+        own.connection(),
+        &format!(
+            "CREATE TABLE hidden.t (id int NOT NULL, c AS (dbo.f(id))); \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, UPDATE, DELETE, ALTER, REFERENCES \
+                 ON SCHEMA::dbo TO [{login}]; \
+             GRANT VIEW DEFINITION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}]; \
+             DENY VIEW DEFINITION ON SCHEMA::hidden TO [{login}];"
+        ),
+    );
+    let module = walk(&d.dir.join("schema"))
+        .into_iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("@x * 3")))
+        .expect("the function's declaration");
+    let text = std::fs::read_to_string(&module).unwrap();
+    std::fs::write(&module, text.replacen("@x * 3", "@x * 4", 1)).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let as_login = with_key(
+        &with_key(own.connection(), "User Id", &login),
+        "Password",
+        password,
+    );
+
+    let o = d.run(&["plan", "--db", &as_login]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("a referrer of `dbo.f` is hidden from this login"),
+        "{}",
+        stderr(&o)
+    );
+
+    // Everything visible: the edge refuses the alter, by the column.
+    let refused_by_edge = |o: &Output| {
+        assert_ne!(code(o), 0, "{}", stdout(o));
+        assert!(
+            stderr(o).contains("computed column hidden.t.c calls"),
+            "{}",
+            stderr(o)
+        );
+    };
+    refused_by_edge(&d.run(&["plan", "--db", own.connection()]));
+    on_server(
+        own.connection(),
+        &format!("REVOKE VIEW DEFINITION ON SCHEMA::hidden TO [{login}];"),
+    );
+    refused_by_edge(&d.run(&["plan", "--db", &as_login]));
+    on_server(&server, &format!("DROP LOGIN [{login}];"));
+}
+
 /// A connected plan refuses what the catalog's edges say SQL Server would,
 /// where a text scan could not tell (#1431, DEC-1431.1): a retype of `café`,
 /// which `[cafe]` binds under an accent-insensitive collation (#1426); and a
