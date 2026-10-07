@@ -1372,10 +1372,17 @@ pub(crate) fn after_the_rebuilds(
 /// refused. One that is the name and is not cast can still be refused; the
 /// remedy then costs a second plan, where missing a reference costs a failed
 /// apply.
+///
+/// "Later" is by statement, not only by change: a new table's own indexes
+/// are created after its defaults and checks ([`Step`], #1592).
 pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> Vec<LaterName> {
-    let mut arrivals: Vec<(usize, TableName)> = Vec::new();
+    let mut arrivals: Vec<((usize, Step), TableName)> = Vec::new();
     for (i, p) in cs.changes.iter().enumerate() {
-        arrivals.extend(relations_brought(&p.change).into_iter().map(|r| (i, r)));
+        arrivals.extend(
+            relations_brought(&p.change)
+                .into_iter()
+                .map(|(step, r)| ((i, step), r)),
+        );
     }
     let mut found = Vec::new();
     for (i, p) in cs.changes.iter().enumerate() {
@@ -1412,7 +1419,8 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
             Some(None) => written.clone(),
             None => None,
         });
-        for (whose, text) in expressions_set(&p.change) {
+        for (step, whose, text) in expressions_set(&p.change) {
+            let here = (i, step);
             let outer = dialect.lexicon().string_literals(&text);
             // A routine's string body is itself a literal, and its own
             // literals are bound as it is created: under the
@@ -1449,7 +1457,7 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
                 let later = |s: &str| {
                     arrivals
                         .iter()
-                        .find(|(at, r)| *at > i && r.name == name && r.schema == s)
+                        .find(|(at, r)| *at > here && r.name == name && r.schema == s)
                         .map(|(_, r)| r)
                 };
                 let reference = match (&schema, path) {
@@ -1466,7 +1474,7 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
                         let earlier = path.iter().any(|s| {
                             arrivals
                                 .iter()
-                                .any(|(at, r)| *at <= i && r.name == name && r.schema == *s)
+                                .any(|(at, r)| *at <= here && r.name == name && r.schema == *s)
                         });
                         let first = path.iter().find_map(|s| later(s));
                         first.filter(|_| !earlier).map(|r| {
@@ -1479,7 +1487,7 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
                         for (k, s) in path.iter().enumerate() {
                             if arrivals
                                 .iter()
-                                .any(|(at, r)| *at <= i && r.name == name && r.schema == *s)
+                                .any(|(at, r)| *at <= here && r.name == name && r.schema == *s)
                             {
                                 break;
                             }
@@ -1494,7 +1502,7 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
                     // in any schema may be the one, so it is read as one.
                     (None, None) => arrivals
                         .iter()
-                        .find(|(at, r)| *at > i && r.name == name)
+                        .find(|(at, r)| *at > here && r.name == name)
                         .map(|(_, r)| (r, vec!["pg_catalog".to_owned()])),
                 };
                 if let Some((relation, searched)) = reference {
@@ -1813,27 +1821,61 @@ pub(crate) fn later_relation_refusal(names: &[LaterName]) -> Result<(), String> 
     ))
 }
 
+/// Where in its change's statements a relation arrives or an expression is
+/// set (#1592). Every change but a new table is one statement, whose relation
+/// arrives after the statement's own expressions.
+///
+/// A new table follows the PostgreSQL emitter (`create_table`), measured on
+/// 18:
+/// - Its defaults and generation expressions see the table itself, but no
+///   index of it, the inline primary key's included: that index is built at
+///   the end of the `CREATE TABLE`, after they are resolved. A partition's
+///   own defaults, set right after its `CREATE`, see the same.
+/// - Its checks are added after its primary key and unique constraints.
+/// - Its indexes are created last, one by one in name order, and each one's
+///   expression and filter see only those before it.
+type Step = usize;
+
+/// The table and its column expressions.
+const AT_CREATE: Step = 0;
+/// The primary key's and unique constraints' indexes.
+const KEYS: Step = 1;
+/// The checks.
+const CHECKS: Step = 2;
+
+/// The step of a new table's `k`th index in name order: its expression is
+/// set at the step, and the index arrives at the next.
+fn index_step(k: usize) -> Step {
+    CHECKS + 1 + 2 * k
+}
+
 /// The relations a change brings into the namespace, by the name they arrive
 /// under. An index's name is a relation's on PostgreSQL, as is a view's.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn relations_brought(change: &Change) -> Vec<TableName> {
+fn relations_brought(change: &Change) -> Vec<(Step, TableName)> {
     let index = |table: &TableName, name: &str| TableName {
         schema: table.schema.clone(),
         name: name.to_owned(),
     };
-    match change {
+    let one = match change {
         Change::CreateTable { name, table, .. } => {
-            let mut out = vec![name.clone()];
-            out.extend(table.indexes.keys().map(|n| index(name, n)));
-            out.extend(table.unique.keys().map(|n| index(name, n)));
+            let mut out = vec![(AT_CREATE, name.clone())];
+            out.extend(
+                table
+                    .indexes
+                    .keys()
+                    .enumerate()
+                    .map(|(k, n)| (index_step(k) + 1, index(name, n))),
+            );
+            out.extend(table.unique.keys().map(|n| (KEYS, index(name, n))));
             out.extend(
                 table
                     .primary_key
                     .as_ref()
                     .and_then(|pk| pk.name.as_deref())
-                    .map(|n| index(name, n)),
+                    .map(|n| (KEYS, index(name, n))),
             );
-            out
+            return out;
         }
         Change::RenameTable { to, .. } => vec![to.clone()],
         Change::AddIndex { table, name, .. } | Change::AddUnique { table, name, .. } => {
@@ -1851,7 +1893,13 @@ fn relations_brought(change: &Change) -> Vec<TableName> {
             vec![name.clone()]
         }
         _ => Vec::new(),
-    }
+    };
+    // A one-statement change's relation exists only once its statement has
+    // run, after the statement's own text is resolved: measured on 18, an
+    // index filter or expression naming the index, and a view naming the
+    // view, each fail (#1617 review). Only a new table is seen by its own
+    // defaults and checks, which `AT_CREATE` above keeps.
+    one.into_iter().map(|r| (AT_CREATE + 1, r)).collect()
 }
 
 /// The schema an expression a change creates is written in. Its write
@@ -1885,9 +1933,10 @@ fn expression_schema(change: &Change) -> Option<&str> {
     }
 }
 
-/// The expressions a change creates, each with what holds it.
+/// The expressions a change creates, each with its [`Step`] and what holds
+/// it.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn expressions_set(change: &Change) -> Vec<(String, String)> {
+fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
     let column = |table: &TableName, name: &str, c: &pbps_model::Column| {
         column_expression(c).map(|e| {
             (
@@ -1896,40 +1945,52 @@ fn expressions_set(change: &Change) -> Vec<(String, String)> {
             )
         })
     };
-    match change {
-        Change::CreateTable { name, table, .. } => {
-            let mut out: Vec<(String, String)> = table
-                .columns
+    if let Change::CreateTable { name, table, .. } = change {
+        let at = |step: Step| move |(whose, text): (String, String)| (step, whose, text);
+        let mut out: Vec<(Step, String, String)> = table
+            .columns
+            .iter()
+            .filter_map(|(n, c)| column(name, n, c))
+            .map(at(AT_CREATE))
+            .collect();
+        // A partition's own defaults, as a column's (#1578).
+        out.extend(
+            table
+                .partition_of
                 .iter()
-                .filter_map(|(n, c)| column(name, n, c))
-                .collect();
-            out.extend(
-                table
-                    .checks
-                    .iter()
-                    .map(|(n, c)| (format!("check {n} on {name}"), c.expression.clone())),
-            );
-            out.extend(
-                table
-                    .indexes
-                    .iter()
-                    .filter(|(_, ix)| ix.holds_expression() || ix.filter.is_some())
-                    .map(|(n, ix)| (format!("index {n} on {name}"), index_text(ix))),
-            );
-            // A partition's own defaults, as a column's (#1578).
-            out.extend(
-                table
-                    .partition_of
-                    .iter()
-                    .flat_map(|of| of.columns.iter())
-                    .filter_map(|(n, own)| {
-                        own.default
-                            .clone()
-                            .map(|d| (format!("{}'s own default", name.column(n)), d))
-                    }),
-            );
-            out
-        }
+                .flat_map(|of| of.columns.iter())
+                .filter_map(|(n, own)| {
+                    own.default
+                        .clone()
+                        .map(|d| (format!("{}'s own default", name.column(n)), d))
+                })
+                .map(at(AT_CREATE)),
+        );
+        out.extend(
+            table
+                .checks
+                .iter()
+                .map(|(n, c)| (format!("check {n} on {name}"), c.expression.clone()))
+                .map(at(CHECKS)),
+        );
+        // Counted over every index, so `k` matches `relations_brought`.
+        out.extend(
+            table
+                .indexes
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, ix))| ix.holds_expression() || ix.filter.is_some())
+                .map(|(k, (n, ix))| {
+                    (
+                        index_step(k),
+                        format!("index {n} on {name}"),
+                        index_text(ix),
+                    )
+                }),
+        );
+        return out;
+    }
+    let one: Vec<(String, String)> = match change {
         Change::AddColumn {
             table,
             name,
@@ -1971,7 +2032,10 @@ fn expressions_set(change: &Change) -> Vec<(String, String)> {
             vec![(format!("{id}"), module.definition.clone())]
         }
         _ => Vec::new(),
-    }
+    };
+    one.into_iter()
+        .map(|(whose, text)| (AT_CREATE, whose, text))
+        .collect()
 }
 
 /// The white space `regclass` input skips: the scanner's six, vertical tab
@@ -5103,6 +5167,172 @@ mod tests {
         let refused =
             refusal_of(&plan(vec![partition, add_index("ix_new", None)]), &*pg()).unwrap_err();
         assert!(refused.contains("app.p.n's own default"), "{refused}");
+    }
+
+    /// A new table `app.n` with an `id` column, a `label` column defaulting
+    /// to `default`, a check `ck` and the named indexes with their filters.
+    fn new_table(
+        default: Option<&str>,
+        check: Option<&str>,
+        indexes: &[(&str, Option<&str>)],
+    ) -> Table {
+        let mut t = Table::default();
+        t.columns.insert(
+            "id".into(),
+            Column::new("integer".parse().unwrap()).not_null(),
+        );
+        let mut label = Column::new("text".parse().unwrap());
+        label.default = default.map(Into::into);
+        t.columns.insert("label".into(), label);
+        if let Some(check) = check {
+            t.checks.insert(
+                "ck".into(),
+                CheckConstraint {
+                    expression: check.into(),
+                },
+            );
+        }
+        for (name, filter) in indexes {
+            if let Change::AddIndex { index, .. } = add_index(name, *filter) {
+                t.indexes.insert((*name).into(), *index);
+            }
+        }
+        t
+    }
+
+    fn create(table: Table) -> Change {
+        Change::CreateTable {
+            uid: Uid::derived(UidKind::Table, "app.n", 0),
+            name: TableName::new("app", "n"),
+            table: Box::new(table),
+        }
+    }
+
+    /// #1592: a new table's own indexes are created after its defaults and
+    /// checks, its key's index included (measured on 18), and in name order.
+    /// So one of its expressions naming one of them is refused, though both
+    /// are one change; what is created before the expression is not.
+    #[test]
+    fn a_new_tables_own_indexes_arrive_after_its_expressions() {
+        let names = |what: &str| format!("('app.{what}'::regclass)::text");
+        // Its default, naming its index, its unique constraint's and its
+        // named primary key's.
+        for own in ["ix_new", "uq_n", "pk_n"] {
+            let mut t = new_table(Some(&names(own)), None, &[("ix_new", None)]);
+            t.unique.insert(
+                "uq_n".into(),
+                pbps_model::UniqueConstraint {
+                    columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
+                },
+            );
+            t.primary_key = Some(pbps_model::PrimaryKey {
+                name: Some("pk_n".into()),
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            });
+            let refused = refusal_of(&plan(vec![create(t)]), &*pg()).unwrap_err();
+            assert!(
+                refused.contains(&format!(
+                    "app.n.label's default or expression names app.{own}"
+                )),
+                "{refused}"
+            );
+        }
+        // Its check, naming its index.
+        let check = format!("{} <> ''", names("ix_new"));
+        assert!(
+            refusal_of(
+                &plan(vec![create(new_table(
+                    None,
+                    Some(&check),
+                    &[("ix_new", None)]
+                ))]),
+                &*pg()
+            )
+            .is_err()
+        );
+        // An index filter naming a sibling created after it, in name order.
+        let filter = format!("{} IS NOT NULL", names("ix_b"));
+        assert!(
+            refusal_of(
+                &plan(vec![create(new_table(
+                    None,
+                    None,
+                    &[("ix_a", Some(&filter)), ("ix_b", None)]
+                ))]),
+                &*pg()
+            )
+            .is_err()
+        );
+        // Negative: the table itself from its default, its key's index from
+        // its check (added after the key), a sibling created before the
+        // index naming it, and a relation the plan does not create, such as
+        // an existing table's index.
+        let mut keyed = new_table(None, Some(&format!("{} <> ''", names("pk_n"))), &[]);
+        keyed.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("pk_n".into()),
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+        });
+        let before = format!("{} IS NOT NULL", names("ix_a"));
+        for cs in [
+            plan(vec![create(new_table(Some(&names("n")), None, &[]))]),
+            plan(vec![create(keyed)]),
+            plan(vec![create(new_table(
+                None,
+                None,
+                &[("ix_a", None), ("ix_b", Some(&before))],
+            ))]),
+            plan(vec![create(new_table(
+                Some(&names("ix_elsewhere")),
+                None,
+                &[("ix_new", None)],
+            ))]),
+        ] {
+            assert_eq!(refusal_of(&cs, &*pg()), Ok(()), "{cs:?}");
+        }
+    }
+
+    /// A one-statement change's relation arrives after its own text: an
+    /// index whose filter or expression names the index, and a view naming
+    /// the view, are refused (#1617 review). Another relation that already
+    /// arrived is not, and a new table naming itself is not (see
+    /// `a_new_tables_own_indexes_arrive_after_its_expressions`).
+    #[test]
+    fn a_change_naming_the_relation_it_creates_is_refused() {
+        let own = "('app.ix_self'::regclass)::oid > 0";
+        assert!(refusal_of(&plan(vec![add_index("ix_self", Some(own))]), &*pg()).is_err());
+        let mut expression = add_index("ix_self", None);
+        if let Change::AddIndex { index, .. } = &mut expression {
+            index.columns[0].key = pbps_model::IndexKey::Expression(format!("({own})::int"));
+        }
+        assert!(refusal_of(&plan(vec![expression]), &*pg()).is_err());
+        assert_eq!(
+            refusal_of(
+                &plan(vec![
+                    add_index("ix_other", None),
+                    add_index("ix_self", Some("('app.ix_other'::regclass)::oid > 0")),
+                ]),
+                &*pg()
+            ),
+            Ok(())
+        );
+        let view = |name: &str, names: &str| Change::CreateModule {
+            id: id(name),
+            module: Box::new(module(
+                ModuleKind::View,
+                &format!("SELECT ('{names}'::regclass)::text AS x"),
+            )),
+        };
+        assert!(refusal_of(&plan(vec![view("app.v", "app.v")]), &*pg()).is_err());
+        assert_eq!(
+            refusal_of(
+                &plan(vec![view("app.w", "app.w0"), view("app.v", "app.w")]),
+                &*pg()
+            ),
+            Ok(())
+        );
     }
 
     /// A literal is a relation's name as `regclass` input reads it: unquoted

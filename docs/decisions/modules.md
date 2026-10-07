@@ -1729,6 +1729,22 @@ ask (#1599 review).
   - an index or unique constraint added;
   - a named primary key set;
   - a view created.
+- **What counts as later is the statement, not only the change (#1592).** A
+  new table is several statements, and its own relations come after some of
+  its expressions. Measured on 18, in the order the emitter writes them:
+  - Its defaults and generation expressions see the table itself, but no
+    index of it, not even the inline primary key's. That index is built at
+    the end of the `CREATE TABLE`, after they are resolved.
+  - Its checks are added after its primary key and unique constraints.
+  - Its indexes come last, one by one in name order, and each one's
+    expression and filter see only those before it.
+
+  So a new table whose default names its own index is refused, though both
+  are one change. Every other change is one statement, and the relation it
+  creates exists only once that statement has run: an index whose filter or
+  expression names the index, and a view naming the view, fail (measured on
+  18). Only a new table is seen by its own defaults and checks (#1617
+  review).
 - **What counts as naming one:** a literal is read as `regclass` input reads
   it (measured on 18). The whole literal must be the name: optionally
   schema-qualified (a catalog before the schema allowed), with white space
@@ -1754,10 +1770,13 @@ ask (#1599 review).
   refused like one that adds it (#1589).
 
 Pinned by `an_expression_naming_a_relation_the_plan_creates_later_is_refused`,
+`a_new_tables_own_indexes_arrive_after_its_expressions`,
+`a_change_naming_the_relation_it_creates_is_refused`,
 `a_relation_literal_is_read_as_regclass_input_reads_it` and
 `a_later_name_is_looked_up_where_the_write_path_searches`
 (`crates/pbps-cli/src/dependents.rs`), the live
 `a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_deploy_it`,
+`a_new_tables_default_naming_its_own_index_is_refused_and_two_plans_deploy_it`,
 `a_name_that_already_resolves_on_the_target_is_not_refused` and
 `a_name_the_plan_rebuilds_is_refused_although_it_exists_now`
 (`crates/pbps-cli/tests/flow_pg.rs`), and the live

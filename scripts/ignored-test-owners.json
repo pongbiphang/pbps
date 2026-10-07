@@ -1337,6 +1337,7 @@
         "partitions_are_added_and_dropped_through_the_cli",
         "a_partition_is_detached_and_kept_through_the_cli",
         "a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_deploy_it",
+        "a_new_tables_default_naming_its_own_index_is_refused_and_two_plans_deploy_it",
         "a_name_that_already_resolves_on_the_target_is_not_refused",
         "a_name_the_plan_rebuilds_is_refused_although_it_exists_now",
         "a_bootstrap_creates_what_a_new_table_calls_before_it",
