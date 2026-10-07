@@ -287,7 +287,10 @@ indexes:
   its role's file as on any table, and is the partition's own: one on the
   parent does not reach it (DEC-1579.1). Its persistence and storage
   parameters are its own too, `unlogged:` and `storage_parameters:` under its
-  entry as a table's, `toast.*` excepted (DEC-1580.1). A bound value is written as the engine prints it, and a connected
+  entry as a table's, `toast.*` excepted (DEC-1580.1). An unlogged partition
+  under a parent a permanent table references is refused, a table outside the
+  declarations read from the catalog at `plan --db` and before the apply
+  (DEC-1595.1). A bound value is written as the engine prints it, and a connected
   command refuses any other spelling with the engine's. A tree is created
   whole, parent first. A partition the database has and the declarations do not is refused with the
   commands that adopt it. `data:` beside a tree, and partitioning on SQL Server,

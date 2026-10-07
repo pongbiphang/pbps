@@ -2935,6 +2935,9 @@ to either refused by name). Also by the units
 *Amended by [DEC-1581.1](#dec-1581-1): changing either on a standing
 partition plans and applies.*
 
+*Amended by [DEC-1595.1](#dec-1595-1): a referencing table pbps does not
+manage is read from the catalog, and the partition is refused by name.*
+
 <a id="dec-1581-1"></a>
 
 **DEC-1581.1. A standing partition's own indexes, checks, storage parameters
@@ -3075,3 +3078,65 @@ Also by the units:
 - `a_partitions_default_is_released_and_set_again_after_its_parents`;
 - `a_partitions_own_columns_set_by_someone_else_are_movement`;
 - the partitioned case of the new-table split test in `dependents.rs`.
+
+<a id="dec-1595-1"></a>
+
+**DEC-1595.1. An `UNLOGGED` partition a plan creates under a parent that a
+permanent table outside the declarations references is refused by name, from
+a catalog read at `plan --db` and again before the apply's first statement
+(#1595).**
+
+DEC-1580.1 refuses a declared permanent table's key to a parent with an
+`UNLOGGED` partition. A table pbps does not manage is not in the declarations,
+so the differ cannot see its key. Measured on 16 and 18, with a permanent
+table holding a key to the partitioned parent:
+- `CREATE UNLOGGED TABLE … PARTITION OF` is accepted, and the partition gets
+  a copy of that key;
+- `ALTER TABLE <partition> SET UNLOGGED` on a standing partition is refused by
+  the engine itself ("could not change table … to unlogged because it
+  references logged table …"), so only a created partition needs the read.
+
+**The read.** For the parent of each partition the plan creates `UNLOGGED`,
+`pg_constraint` gives every foreign key whose target is that parent and whose
+table holds rows (`relkind = 'r'`) and is permanent. A partitioned
+referencing table holds no rows. Each of its leaf partitions carries a copy of
+the key, so a permanent leaf is named and an unlogged one, which a crash
+empties too, is not. A leaf attached with a key of its own keeps that key's
+name (measured on 16 and 18), so each copy is followed up `conparentid` to
+the key its partitioned table declares, and named through it.
+
+**What is not a referencer.** A key the plan takes away: a table it drops or
+makes unlogged, or a key it drops, matched against the leaf's copy or the key
+its table declares. Each is compared under the catalog's name: a persistence
+switch through its table's rename by uid, a dropped key under the name the
+rename leaves, and a dropped table as it stands, since a rename may take the
+name it frees. In a transactional plan the removal may sit anywhere, since
+both commit or neither does. In a staged plan only one that runs before the
+partition's `CREATE` counts: a staged apply commits between statements, and
+the persistence switch sorts after table creation, so there making the
+referencing table unlogged takes a plan of its own first. A declared
+permanent referencer is refused before planning (DEC-1580.1) and is not read
+again.
+
+**Why not a probe.** A preflight `Probe` returns a count, and the message has
+to name the referencing table and key. A probe that cannot run is also
+reported as "the engine will enforce it during the apply", which is not true
+here: the engine takes the partition. So this is a catalog read like the
+relation-name occupants (#951), and a failed read is an error, never "no
+referencers".
+
+**Why again at the apply.** Nothing binds a saved plan to the catalog it was
+planned against. A key added after the plan meets the partition all the same.
+The read runs only on a fresh start, as the other preflight reads do.
+
+Pinned on 16 and 18 by the CLI's
+`an_unlogged_partition_under_an_undeclared_permanent_key_is_refused`:
+- an undeclared permanent table's key refuses the plan, naming the table and
+  the key, and a partitioned one's leaf copy is named through the key its
+  table declares;
+- a plan made while only an unlogged table held a key is refused at the apply
+  once a permanent key arrives, and nothing ran;
+- negatives: the unlogged referencing table is not named, and a permanent
+  partition plans, applies and verifies.
+
+Also by the unit `an_unlogged_partition_under_a_permanent_key_is_refused_by_name`.

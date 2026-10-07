@@ -79,7 +79,9 @@ range over DEFAULT-partition rows and the drop of a referenced partition
 (#1171, DEC-1171.1). A partition declared in a file of its own with its
 parent's shape is detached and kept, under its declared names (#1544,
 DEC-1544.1). A standing partition's own indexes, checks, defaults, NOT NULLs,
-storage parameters and persistence change on it alone (#1581, DEC-1581.1). The
+storage parameters and persistence change on it alone (#1581, DEC-1581.1). An
+unlogged partition under a key from a table outside the declarations is
+refused from the catalog (#1595, DEC-1595.1). The
 parent's own changes and attaching an existing table stay refused by name
 (#1545–#1547).
 
