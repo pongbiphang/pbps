@@ -143,6 +143,8 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }

@@ -185,6 +185,18 @@ fn removes(change: &Change, holds: &Holds) -> bool {
                     column, to: None, ..
                 },
             ) => column.table == *table && column.name == *c,
+            // A partition's default goes only when the partition takes
+            // neither its own nor its parent's (#1588).
+            (
+                Part::Default(c),
+                Change::SetPartitionDefault {
+                    table: t,
+                    column,
+                    to: None,
+                    fallback: None,
+                    ..
+                },
+            ) => t == table && column == c,
             // A changed expression takes the old one's dependency away
             // (DEC-1168.1). If the new one calls the module again, its
             // `SET EXPRESSION` binds the old module and the drop is refused
@@ -216,6 +228,17 @@ fn restores(change: &Change, holds: &Holds) -> bool {
                     ..
                 },
             ) => column.table == *table && column.name == *c,
+            (
+                Part::Default(c),
+                Change::SetPartitionDefault {
+                    table: t,
+                    column,
+                    from: None,
+                    to,
+                    fallback,
+                    ..
+                },
+            ) => t == table && column == c && (to.is_some() || fallback.is_some()),
             _ => false,
         },
         _ => false,
@@ -260,6 +283,21 @@ fn edits_in_place(change: &Change, holds: &Holds) -> bool {
                 ..
             },
         ) => column.table == *table && column.name == *c,
+        // A partition's own default replaced by another, or by its parent's.
+        (
+            Holds::TablePart {
+                table,
+                part: Part::Default(c),
+            },
+            Change::SetPartitionDefault {
+                table: t,
+                column,
+                from: Some(_),
+                to,
+                fallback,
+                ..
+            },
+        ) => t == table && column == c && (to.is_some() || fallback.is_some()),
         _ => false,
     }
 }
@@ -298,6 +336,34 @@ fn split_in_place_edit(changes: &mut Vec<PlannedChange>, holds: &Holds, dialect:
                 column,
                 from: None,
                 to,
+            },
+        ),
+        Change::SetPartitionDefault {
+            uid,
+            table,
+            parent,
+            column,
+            from,
+            to,
+            fallback,
+        } => (
+            Change::SetPartitionDefault {
+                uid: uid.clone(),
+                table: table.clone(),
+                parent: parent.clone(),
+                column: column.clone(),
+                from,
+                to: None,
+                fallback: None,
+            },
+            Change::SetPartitionDefault {
+                uid,
+                table,
+                parent,
+                column,
+                from: None,
+                to,
+                fallback,
             },
         ),
         _ => return,
@@ -389,33 +455,26 @@ fn as_declared(changes: &[PlannedChange], d: &Dependent) -> Dependent {
     }
 }
 
-/// A declared partition's default, its own or the copy of its parent's the
-/// engine gives every partition, named as what it is: the partition declares
-/// no column, so `managed` cannot find it, yet the declarations hold it. A
-/// rebuild cannot take it off and put it back until a change sets a
-/// partition's default, which #1588 brings (DEC-1578.1).
-fn partition_default(d: &Dependent, changes: &[PlannedChange], declared: &Schema) -> Dependent {
-    let Holds::TablePart {
-        table,
-        part: Part::Default(_),
-    } = &as_declared(changes, d).holds
-    else {
-        return d.clone();
-    };
-    if declared
+/// The partition `table` is, as declared.
+fn partition_of<'a>(
+    declared: &'a Schema,
+    table: &TableName,
+) -> Option<&'a pbps_model::PartitionOf> {
+    declared.tables.get(table)?.partition_of.as_ref()
+}
+
+/// The declared default of the column a partition's `column` is, on its
+/// parent: what the engine copies into the partition and what it takes back
+/// without one of its own.
+fn parent_default(declared: &Schema, table: &TableName, column: &str) -> Option<String> {
+    let of = partition_of(declared, table)?;
+    declared
         .tables
-        .get(table)
-        .is_none_or(|t| t.partition_of.is_none())
-    {
-        return d.clone();
-    }
-    Dependent {
-        described: d.described.clone(),
-        holds: Holds::Unrepresentable(format!(
-            "a default of the partition {table}, its own or its parent's copy, which a rebuild \
-             cannot yet take off and put back (#1588)"
-        )),
-    }
+        .get(&of.parent)?
+        .columns
+        .get(column)?
+        .default
+        .clone()
 }
 
 /// The change that removes a dependent the plan does not remove yet.
@@ -444,6 +503,23 @@ fn removal_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Result<Chan
                 table: table.clone(),
                 name: name.clone(),
             },
+            // A partition's, its own or its copy of its parent's: taken off
+            // the partition alone (#1588).
+            Part::Default(column) if let Some(of) = partition_of(declared, table) => {
+                Change::SetPartitionDefault {
+                    uid: ids
+                        .iter()
+                        .find_map(|ids| ids.table_uid(table))
+                        .cloned()
+                        .ok_or_else(|| format!("{}: no identity names `{table}`", d.described))?,
+                    table: table.clone(),
+                    parent: of.parent.clone(),
+                    column: column.clone(),
+                    from: of.columns.get(column).and_then(|own| own.default.clone()),
+                    to: None,
+                    fallback: None,
+                }
+            }
             Part::Default(column) => {
                 let column = ColumnRef::new(table.clone(), column.clone());
                 let uid = ids
@@ -499,6 +575,26 @@ fn restoration_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Option<
                     clustered: false,
                 }),
                 Part::Generated(_) => None,
+                // Its own, or its parent's again (#1588).
+                Part::Default(column) if t.partition_of.is_some() => {
+                    let to = partition_of(declared, table)?
+                        .columns
+                        .get(column)
+                        .and_then(|own| own.default.clone());
+                    let fallback = parent_default(declared, table, column);
+                    if to.is_none() && fallback.is_none() {
+                        return None;
+                    }
+                    Some(Change::SetPartitionDefault {
+                        uid: ids.iter().find_map(|ids| ids.table_uid(table))?.clone(),
+                        table: table.clone(),
+                        parent: partition_of(declared, table)?.parent.clone(),
+                        column: column.clone(),
+                        from: None,
+                        to,
+                        fallback,
+                    })
+                }
                 Part::Default(column) => {
                     let to = t.columns.get(column)?.default.clone()?;
                     let column = ColumnRef::new(table.clone(), column.clone());
@@ -555,7 +651,7 @@ pub(crate) fn weave(
                 matches!(d.holds, Holds::Unrepresentable(_))
                     || (!as_declared(&cs.changes, d).managed(declared) && !accounted)
             })
-            .map(|d| partition_default(d, &cs.changes, declared))
+            .cloned()
             .collect();
         if let Some(why) = pbps_pg::modules::unmanaged_refusal(root, &blocked, &Schema::default()) {
             refused.push(why);
@@ -880,12 +976,10 @@ fn column_expression(column: &pbps_model::Column) -> Option<&str> {
 /// one, and taken out of the table as a column of its own it would change the
 /// table's column order (DEC-1168.1, DEC-1364.1).
 ///
-/// A partitioned table's default is refused by name, with the two-plan
-/// remedy, when a new partition declares its own default on that column: the
-/// parent's `SET DEFAULT` reaches every partition, measured on 16 and 18, so
-/// set after the partition it would overwrite the partition's own. Putting
-/// the partition's own back after it takes a change for a partition's
-/// default, which #1588 brings (DEC-1578.1).
+/// A partitioned table's default split out this way reaches every partition
+/// when it is set, measured on 16 and 18, a new partition's own default
+/// included: [`after_their_parents_defaults`] sets each own default again
+/// after it (#1588).
 // The complement is every change that writes no rows.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn split_new_tables(
@@ -896,20 +990,6 @@ pub(crate) fn split_new_tables(
     let Some(last) = last_function_create(cs) else {
         return Ok(0);
     };
-    let overridden: BTreeSet<ColumnRef> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::CreateTable { table, .. } => table.partition_of.as_ref(),
-            _ => None,
-        })
-        .flat_map(|of| {
-            of.columns
-                .iter()
-                .filter(|(_, own)| own.default.is_some())
-                .map(|(column, _)| ColumnRef::new(of.parent.clone(), column.clone()))
-        })
-        .collect();
     let taken = defaults_taken_by_rows(cs);
     let functions = function_creates(cs);
     let calls = |text: &str| calls_one_of(text, &functions);
@@ -962,14 +1042,6 @@ pub(crate) fn split_new_tables(
             let Some(uid) = ids.iter().find_map(|ids| ids.column_uid(&column_ref)) else {
                 continue;
             };
-            if spec.default.as_deref().is_some_and(calls) && overridden.contains(&column_ref) {
-                return Err(format!(
-                    "{column_ref}'s default calls a function this plan creates or rebuilds, so \
-                     it is set after the function, and a new partition of {name} declares its \
-                     own default on `{column}`, which the parent's would overwrite. Plan the \
-                     function first and the table in the next plan, or wait for #1588"
-                ));
-            }
             if spec.default.as_deref().is_some_and(calls)
                 && let Some(to) = spec.default.take()
             {
@@ -992,6 +1064,100 @@ pub(crate) fn split_new_tables(
         for (k, part) in parts.into_iter().enumerate() {
             cs.changes.insert(i + 1 + k, planned(part, dialect));
         }
+    }
+    Ok(added)
+}
+
+/// Sets each partition's own default again after its parent's (#1588,
+/// DEC-1581.1). Returns how many changes it added.
+///
+/// A partitioned table's `ALTER COLUMN … SET DEFAULT` reaches every
+/// partition and overwrites a partition's own default on that column, and its
+/// `DROP DEFAULT` takes it away, measured on 16 and 18. A parent's default this
+/// plan sets, put back around a rebuild by [`weave`] or split out of a new
+/// table by [`split_new_tables`], is therefore followed by every declared
+/// partition's own default on that column, whether or not it calls the
+/// function: one the plan already sets ahead of the parent's is moved after
+/// it, and one it does not set is added. A partition created after the
+/// parent's default needs neither, since its `CREATE` sets its own.
+///
+/// `ONLY` on the parent would leave the partitions alone, but it would also
+/// leave a new partition without the parent's copy, and the parent's own
+/// change is the parent's to spell (#1546).
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn after_their_parents_defaults(
+    cs: &mut ChangeSet,
+    declared: &Schema,
+    ids: &[&IdsFile],
+    dialect: &dyn Dialect,
+) -> Result<usize, String> {
+    let mut added = 0;
+    let mut i = 0;
+    while i < cs.changes.len() {
+        let Change::AlterColumnDefault {
+            column,
+            to: Some(_),
+            ..
+        } = &cs.changes[i].change
+        else {
+            i += 1;
+            continue;
+        };
+        let column = column.clone();
+        let own: Vec<(TableName, String)> = declared
+            .tables
+            .iter()
+            .filter_map(|(name, t)| {
+                let of = t
+                    .partition_of
+                    .as_ref()
+                    .filter(|of| of.parent == column.table)?;
+                let default = of.columns.get(&column.name)?.default.clone()?;
+                Some((name.clone(), default))
+            })
+            .collect();
+        for (partition, default) in own {
+            let sets = |c: &Change| {
+                matches!(c, Change::SetPartitionDefault { table, column: c, to: Some(_), .. }
+                    if *table == partition && *c == column.name)
+            };
+            let later = cs.changes[i + 1..].iter().any(|p| {
+                sets(&p.change)
+                    || matches!(&p.change, Change::CreateTable { name, .. } if *name == partition)
+            });
+            if later {
+                continue;
+            }
+            if let Some(k) = (0..i).rev().find(|&k| sets(&cs.changes[k].change)) {
+                let moved = cs.changes.remove(k);
+                i -= 1;
+                cs.changes.insert(i + 1, moved);
+            } else {
+                let uid = ids
+                    .iter()
+                    .find_map(|ids| ids.table_uid(&partition))
+                    .cloned()
+                    .ok_or_else(|| format!("no identity names the partition `{partition}`"))?;
+                let fallback = parent_default(declared, &partition, &column.name);
+                cs.changes.insert(
+                    i + 1,
+                    planned(
+                        Change::SetPartitionDefault {
+                            uid,
+                            table: partition,
+                            parent: column.table.clone(),
+                            column: column.name.clone(),
+                            from: None,
+                            to: Some(default),
+                            fallback,
+                        },
+                        dialect,
+                    ),
+                );
+                added += 1;
+            }
+        }
+        i += 1;
     }
     Ok(added)
 }
@@ -1113,6 +1279,13 @@ pub(crate) fn after_the_rebuilds(
                 to: Some(to),
                 ..
             } => !taken.contains(column) && calls(to),
+            // A partition's, its own or its parent's taken back (#1588). A
+            // row written through its parent takes the parent's default, not
+            // the partition's (DEC-1578.1), so none is taken ahead of it.
+            Change::SetPartitionDefault { to, fallback, .. } => to
+                .as_ref()
+                .or(fallback.as_ref())
+                .is_some_and(|text| calls(text)),
             // A generation expression binds the functions it calls exactly
             // as a default does (DEC-1168.1). No row writes a generated
             // column, so none is taken ahead of it.
@@ -1695,6 +1868,15 @@ fn expression_schema(change: &Change) -> Option<&str> {
         | Change::AddIndex { table, .. } => Some(&table.schema),
         Change::AlterColumnDefault { column, .. }
         | Change::AlterColumnExpression { column, .. } => Some(&column.table.schema),
+        // Its own under the partition's schema, its parent's taken back
+        // under the parent's, as each is written (#1607 review).
+        Change::SetPartitionDefault {
+            table, parent, to, ..
+        } => Some(if to.is_some() {
+            &table.schema
+        } else {
+            &parent.schema
+        }),
         // A module's body is written in its own schema, and a literal in it
         // that the engine casts as it creates the module, an atomic body's or
         // a view's, is bound then (#1599 review).
@@ -1759,6 +1941,18 @@ fn expressions_set(change: &Change) -> Vec<(String, String)> {
             to: Some(to),
             ..
         } => vec![(format!("{column}'s default"), to.clone())],
+        Change::SetPartitionDefault {
+            table,
+            column,
+            to,
+            fallback,
+            ..
+        } => to
+            .as_ref()
+            .or(fallback.as_ref())
+            .map(|text| (format!("{}'s default", table.column(column)), text.clone()))
+            .into_iter()
+            .collect(),
         Change::AlterColumnExpression { column, to, .. } => {
             vec![(format!("{column}'s generation expression"), to.clone())]
         }
@@ -2183,6 +2377,13 @@ fn names_column(change: &Change, table: &TableName, column: &str) -> bool {
         Change::AlterColumnDefault { column: c, to, .. } => {
             c.name == column || to.as_deref().is_some_and(named)
         }
+        Change::SetPartitionDefault {
+            column: c,
+            to,
+            fallback,
+            ..
+        } => c == column || to.as_deref().or(fallback.as_deref()).is_some_and(named),
+        Change::SetPartitionNotNull { column: c, .. } => c == column,
         Change::AlterColumnExpression { column: c, to, .. } => c.name == column || named(to),
         Change::AlterColumnType { column: c, .. }
         | Change::AlterColumnNullability { column: c, .. }
@@ -2378,6 +2579,16 @@ mod tests {
                 Change::AlterColumnDefault { column, to, .. } => {
                     format!("default {} -> {to:?}", column.name)
                 }
+                Change::SetPartitionDefault {
+                    table,
+                    column,
+                    to,
+                    fallback,
+                    ..
+                } => format!(
+                    "default {}.{column} -> {to:?} else {fallback:?}",
+                    table.name
+                ),
                 other => format!("{other:?}"),
             })
             .collect()
@@ -2829,55 +3040,70 @@ mod tests {
         );
 
         // As a partitioned parent with a new partition declaring its own
-        // default on `v`: the parent's, set after the function, would
-        // overwrite it, so the plan is refused by name until #1588 (#1578
-        // review). One overriding another column is no reason to refuse.
-        let partitioned = |column: &str| {
-            let mut parent = t.clone();
-            parent.partition_by = Some(pbps_model::PartitionBy {
-                columns: vec!["id".into()],
-            });
-            let partition = Table {
-                partition_of: Some(pbps_model::PartitionOf {
-                    parent: n.clone(),
-                    bound: pbps_model::PartitionBound::Default,
-                    columns: [(
-                        column.to_owned(),
-                        pbps_model::PartitionColumn {
-                            default: Some("7".into()),
-                            not_null: false,
-                        },
-                    )]
-                    .into(),
-                }),
-                ..Table::default()
+        // default on `v`: the parent's, set after the function, overwrites
+        // it, so the partition's own is set again right after (#1588). One
+        // overriding another column needs nothing.
+        let mut parent = t.clone();
+        parent.partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["id".into()],
+        });
+        let p1 = TableName::new("app", "n_1");
+        let partition = |column: &str| Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: n.clone(),
+                bound: pbps_model::PartitionBound::Default,
+                columns: [(
+                    column.to_owned(),
+                    pbps_model::PartitionColumn {
+                        default: Some("7".into()),
+                        not_null: false,
+                    },
+                )]
+                .into(),
+            }),
+            ..Table::default()
+        };
+        let mut ids = ids.clone();
+        ids.tables
+            .insert(Uid::derived(UidKind::Table, "app.n_1", 0), p1.clone());
+        for (column, again) in [("v", true), ("id", false)] {
+            let declared = Schema {
+                tables: [(n.clone(), parent.clone()), (p1.clone(), partition(column))].into(),
+                ..Schema::default()
             };
-            plan(vec![
+            let mut cs = plan(vec![
                 Change::CreateTable {
                     uid: Uid::derived(UidKind::Table, "app.n", 0),
                     name: n.clone(),
-                    table: Box::new(parent),
+                    table: Box::new(parent.clone()),
                 },
                 Change::CreateTable {
                     uid: Uid::derived(UidKind::Table, "app.n_1", 0),
-                    name: TableName::new("app", "n_1"),
-                    table: Box::new(partition),
+                    name: p1.clone(),
+                    table: Box::new(partition(column)),
                 },
                 alter(&s, "app.f(integer)"),
-            ])
-        };
-        let refused = split_new_tables(&mut partitioned("v"), &[&ids], pg().as_ref())
-            .expect_err("the partition's own default would be overwritten");
-        assert!(
-            refused.contains("app.n.v's default calls a function this plan creates or rebuilds")
-                && refused.contains("a new partition of app.n declares its own default on `v`")
-                && refused.contains("#1588"),
-            "{refused}"
-        );
-        assert_eq!(
-            split_new_tables(&mut partitioned("id"), &[&ids], pg().as_ref()),
-            Ok(3)
-        );
+            ]);
+            assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), Ok(3));
+            rebuilds(&mut cs, &BTreeSet::new());
+            assert_eq!(
+                after_their_parents_defaults(&mut cs, &declared, &[&ids], pg().as_ref()),
+                Ok(usize::from(again)),
+                "{column}"
+            );
+            let parents = cs.changes.iter().position(|p| {
+                matches!(&p.change, Change::AlterColumnDefault { column, .. } if column.table == n)
+            });
+            let own = cs.changes.iter().position(|p| {
+                matches!(&p.change, Change::SetPartitionDefault { table, column: c, to: Some(to), .. }
+                    if *table == p1 && c == "v" && to == "7")
+            });
+            if again {
+                assert_eq!(own, parents.map(|i| i + 1), "{:?}", cs.changes);
+            } else {
+                assert_eq!(own, None, "{:?}", cs.changes);
+            }
+        }
 
         // A row that omits `v` takes its default: the default stays for it.
         let insert = Change::InsertRow {
@@ -3956,10 +4182,9 @@ mod tests {
         let e = weave(&mut rebuild(), &found, &s, &[&ids], pg().as_ref()).unwrap_err();
         assert!(e.contains("index ix on table app.t"), "{e}");
 
-        // A declared partition's default, its own or its parent's copy: the
-        // declarations hold it, so it is not "not declared", but nothing can
-        // release it around a rebuild yet (#1578 review, #1588). A default on
-        // a table that is no partition and not declared still reads as such.
+        // A declared partition's default on a column neither it nor its
+        // parent declares a default for: the declarations do not hold it
+        // (#1588), as one on a table they do not declare.
         let mut with_partition = s.clone();
         with_partition.tables.insert(
             TableName::new("app", "t_1"),
@@ -3989,10 +4214,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            e.contains("column v of table app.t_1")
-                && e.contains("a default of the partition app.t_1")
-                && e.contains("#1588")
-                && !e.contains("does not declare it"),
+            e.contains("column v of table app.t_1") && e.contains("does not declare it"),
             "{e}"
         );
         let found = BTreeMap::from([(id("app.v0"), vec![default_on("other")])]);
@@ -4021,6 +4243,108 @@ mod tests {
         assert!(
             e.contains("constraint ck") && e.contains("kept by the declarations"),
             "{e}"
+        );
+    }
+
+    /// A function rebuilt under a partitioned table's default (#1588). Every
+    /// partition holds a default row on the column, the parent's copy or its
+    /// own, and each that calls the function is taken off before its drop and
+    /// put back after its create: the copy as its parent's, the own as its
+    /// own. The parent's, set again, reaches every partition, so each
+    /// partition's own default follows it, one that calls nothing of the
+    /// function's included.
+    #[test]
+    fn a_partitions_default_is_released_and_set_again_after_its_parents() {
+        let (mut s, mut ids) = declared();
+        let t = TableName::new("app", "t");
+        s.tables.get_mut(&t).unwrap().partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["id".into()],
+        });
+        let partition = |own: Option<&str>| Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: t.clone(),
+                bound: pbps_model::PartitionBound::Default,
+                columns: own
+                    .map(|default| {
+                        (
+                            "n".to_owned(),
+                            pbps_model::PartitionColumn {
+                                default: Some(default.to_owned()),
+                                not_null: false,
+                            },
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+            }),
+            ..Table::default()
+        };
+        for (name, own) in [("t_1", None), ("t_2", Some("app.f(2)")), ("t_3", Some("5"))] {
+            let name = TableName::new("app", name);
+            s.tables.insert(name.clone(), partition(own));
+            ids.tables
+                .insert(Uid::derived(UidKind::Table, &name.to_string(), 0), name);
+        }
+        let default_on = |table: &str| Dependent {
+            described: format!("default value for column n of table app.{table}"),
+            holds: Holds::TablePart {
+                table: TableName::new("app", table),
+                part: Part::Default("n".into()),
+            },
+        };
+        // The engine's order: each row that calls the function, `t_3`'s not.
+        let found = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![default_on("t_2"), default_on("t"), default_on("t_1")],
+        )]);
+        let mut cs = plan(vec![alter(&s, "app.f(integer)")]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        assert_eq!(
+            after_their_parents_defaults(&mut cs, &s, &[&ids], pg().as_ref()),
+            Ok(1)
+        );
+        let names = rendered(&cs);
+        let at = |name: &str| {
+            names
+                .iter()
+                .position(|n| n == name)
+                .unwrap_or_else(|| panic!("{name} in {names:?}"))
+        };
+        // One `ALTER` here, a drop and a create when emitted (ADR-0009 §3).
+        let rebuilt = at("alter app.f(integer)");
+        for released in [
+            "default n -> None",
+            "default t_1.n -> None else None",
+            "default t_2.n -> None else None",
+        ] {
+            assert!(at(released) < rebuilt, "{names:?}");
+        }
+        // The copy back as its parent's, which the parent's own sets too.
+        assert!(
+            at("default t_1.n -> None else Some(\"app.f(1)\")") > rebuilt,
+            "{names:?}"
+        );
+        let parents = at("default n -> Some(\"app.f(1)\")");
+        assert!(parents > rebuilt, "{names:?}");
+        // Its own, after the parent's: the one that calls the function, and
+        // the one that does not, which the parent's overwrote.
+        assert_eq!(
+            names[parents + 1..],
+            [
+                "default t_3.n -> Some(\"5\") else Some(\"app.f(1)\")",
+                "default t_2.n -> Some(\"app.f(2)\") else Some(\"app.f(1)\")",
+            ],
+            "{names:?}"
+        );
+
+        // Negative: without a parent's default set, no partition's is set
+        // again.
+        let mut own_only = plan(vec![alter(&s, "app.f(integer)")]);
+        let found = BTreeMap::from([(id("app.f(integer)"), vec![default_on("t_2")])]);
+        weave(&mut own_only, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        assert_eq!(
+            after_their_parents_defaults(&mut own_only, &s, &[&ids], pg().as_ref()),
+            Ok(0)
         );
     }
 

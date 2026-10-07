@@ -149,6 +149,8 @@ pub async fn key_drop_blockers(
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
                 | Change::DetachPartition { .. }
+                | Change::SetPartitionDefault { .. }
+                | Change::SetPartitionNotNull { .. }
                 | Change::PublicExecution { .. } => return None,
             };
             let stored = stored_key_table(cs, index, table)?;
@@ -313,6 +315,8 @@ pub async fn key_drop_blockers(
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::DetachPartition { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::PublicExecution { .. } => continue,
         };
         let Some(table) = stored_key_table(cs, index, table) else {
@@ -505,6 +509,8 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::DetachPartition { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::PublicExecution { .. } => None,
         })
         .collect()

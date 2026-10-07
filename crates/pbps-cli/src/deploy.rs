@@ -4031,6 +4031,93 @@ fn refuse_unplanned_movement(
                     if now.unlogged { "unlogged" } else { "logged" }
                 ));
             }
+            // Its place in the tree: a partition's parent and bound, and a
+            // parent's partition key. No change of this plan moves either on
+            // a table it keeps (a detach is held to its declaration above),
+            // so the two reads back compare outright. A standing partition
+            // the plan touches is not compared whole, and another session
+            // detaching it and attaching it again under a wider range would
+            // have routed rows by a bound nobody approved (#1607 review).
+            let place = |t: &pbps_model::Table| {
+                (
+                    t.partition_of
+                        .as_ref()
+                        .map(|of| (of.parent.clone(), of.bound.clone())),
+                    t.partition_by.clone(),
+                )
+            };
+            if place(was) != place(now) {
+                moved.push(format!(
+                    "{now_name}'s partition parent, bound or key is not the one the plan was \
+                     approved over"
+                ));
+            }
+            // A partition's own defaults and NOT NULLs (#1581), as a created
+            // one's above: a default by presence, the engine respelling its
+            // text. Once the run is whole, the before-read with this plan's
+            // settings applied in order. Mid-run, a field the plan sets may
+            // hold either: a column's default where the plan sets it on the
+            // partition or on the parent, which reaches every partition
+            // (DEC-1581.1), and its NOT NULL where the plan sets that. Every
+            // other field is held to the before-read, the other field of a
+            // column the plan touches included (#1607 review).
+            let own = |t: &pbps_model::Table| -> BTreeMap<String, (bool, bool)> {
+                t.partition_of
+                    .iter()
+                    .flat_map(|of| &of.columns)
+                    .map(|(n, c)| (n.clone(), (c.default.is_some(), c.not_null)))
+                    .filter(|(_, held)| *held != (false, false))
+                    .collect()
+            };
+            let parent = now.partition_of.as_ref().map(|of| &of.parent);
+            let mut expected = own(was);
+            let mut planned_defaults: BTreeSet<&str> = BTreeSet::new();
+            let mut planned_not_nulls: BTreeSet<&str> = BTreeSet::new();
+            for p in &changes.changes {
+                if let pbps_model::Change::SetPartitionDefault {
+                    table, column, to, ..
+                } = &p.change
+                    && table == now_name
+                {
+                    expected.entry(column.clone()).or_default().0 = to.is_some();
+                    planned_defaults.insert(column);
+                }
+                if let pbps_model::Change::SetPartitionNotNull {
+                    table,
+                    column,
+                    not_null,
+                    ..
+                } = &p.change
+                    && table == now_name
+                {
+                    expected.entry(column.clone()).or_default().1 = *not_null;
+                    planned_not_nulls.insert(column);
+                }
+                if let pbps_model::Change::AlterColumnDefault { column, .. } = &p.change
+                    && Some(&column.table) == parent
+                {
+                    planned_defaults.insert(&column.name);
+                }
+            }
+            expected.retain(|_, held| *held != (false, false));
+            let (was_own, now_own) = (own(was), own(now));
+            let own_moved = if settled.whole() {
+                expected != now_own
+            } else {
+                let held = |own: &BTreeMap<String, (bool, bool)>, c: &str| {
+                    own.get(c).copied().unwrap_or_default()
+                };
+                was_own.keys().chain(now_own.keys()).any(|c| {
+                    let (was_held, now_held) = (held(&was_own, c), held(&now_own, c));
+                    (was_held.0 != now_held.0 && !planned_defaults.contains(c.as_str()))
+                        || (was_held.1 != now_held.1 && !planned_not_nulls.contains(c.as_str()))
+                })
+            };
+            if own_moved {
+                moved.push(format!(
+                    "{now_name}'s own column defaults or NOT NULLs are not the ones this plan leaves"
+                ));
+            }
             // No change of a plan sets it on a table that exists (#1176), so
             // it is held to the before-read throughout.
             if was.system_time != now.system_time {
@@ -4213,6 +4300,8 @@ fn refuse_unplanned_movement(
                         | pbps_model::Change::PublicExecution { .. }
                         | pbps_model::Change::SetIndexStorageParameters { .. }
                         | pbps_model::Change::SetTablePersistence { .. }
+                        | pbps_model::Change::SetPartitionDefault { .. }
+                        | pbps_model::Change::SetPartitionNotNull { .. }
                         | pbps_model::Change::SetStorageParameters { .. }
                         | pbps_model::Change::SetReplicaIdentity { .. } => {}
                     }
@@ -5396,6 +5485,14 @@ pub fn cmd_bootstrap(
                     &mut cs,
                     &BTreeSet::new(),
                     &loaded.hints.module_deps,
+                )
+            })
+            .and_then(|_| {
+                crate::dependents::after_their_parents_defaults(
+                    &mut cs,
+                    &loaded.schema,
+                    &[&ids],
+                    dialect.as_ref(),
                 )
             });
         ordered.map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
@@ -13095,6 +13192,163 @@ mod tests {
         assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
         let e = check(&schema("90"), Settled::SoFar).expect_err("neither side mid-run");
         assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
+    }
+
+    /// A standing partition's own defaults and NOT NULLs are held across an
+    /// apply (#1581, #1607 review): another session's change to them is
+    /// movement; the plan's own is held once the run is whole; mid-run a
+    /// column the plan sets may hold either, and another may not.
+    #[test]
+    fn a_partitions_own_columns_set_by_someone_else_are_movement() {
+        use pbps_model::{
+            Change, Column, PartitionBound, PartitionBy, PartitionColumn, PartitionOf,
+            PlannedChange, Table,
+        };
+        let parent = TableName::new("app", "ev");
+        let name = TableName::new("app", "ev_1");
+        // Each column's own default (by presence) and NOT NULL.
+        let schema = |own: &[(&str, bool, bool)]| {
+            let mut p = Table::default();
+            for c in ["v", "w"] {
+                p.columns
+                    .insert(c.into(), Column::new("integer".parse().unwrap()));
+            }
+            p.partition_by = Some(PartitionBy {
+                columns: vec!["v".into()],
+            });
+            let t = Table {
+                partition_of: Some(PartitionOf {
+                    parent: parent.clone(),
+                    bound: PartitionBound::Default,
+                    columns: own
+                        .iter()
+                        .map(|(c, default, not_null)| {
+                            (
+                                (*c).to_owned(),
+                                PartitionColumn {
+                                    default: default.then(|| "1".to_owned()),
+                                    not_null: *not_null,
+                                },
+                            )
+                        })
+                        .collect(),
+                }),
+                ..Table::default()
+            };
+            Schema {
+                tables: [(parent.clone(), p), (name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let check = |plan: &pbps_model::ChangeSet, before: &Schema, after: &Schema, settled| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                plan,
+                before,
+                after,
+                "test",
+                settled,
+            )
+        };
+        let plan = |changes: Vec<Change>| pbps_model::ChangeSet {
+            changes: changes.into_iter().map(PlannedChange::new).collect(),
+        };
+        let none = schema(&[]);
+        let nothing = plan(Vec::new());
+        check(&nothing, &none, &none, Settled::Whole).expect("unchanged");
+        // Untouched, the whole table answers for it.
+        let e = check(
+            &nothing,
+            &none,
+            &schema(&[("v", false, true)]),
+            Settled::SoFar,
+        )
+        .expect_err("tightened by another");
+        assert!(format!("{e:#}").contains("app.ev_1"), "{e:#}");
+
+        let uid: pbps_model::Uid = "t_000000".parse().unwrap();
+        let tightening = plan(vec![Change::SetPartitionNotNull {
+            uid: uid.clone(),
+            table: name.clone(),
+            column: "v".into(),
+            not_null: true,
+        }]);
+        let tight = schema(&[("v", false, true)]);
+        check(&tightening, &none, &tight, Settled::Whole).expect("the plan's own");
+        check(&tightening, &none, &none, Settled::SoFar).expect("not run yet");
+        let e = check(&tightening, &none, &none, Settled::Whole).expect_err("relaxed again");
+        assert!(format!("{e:#}").contains("app.ev_1's own column"), "{e:#}");
+        // Another column moved while the plan sets `v`.
+        let e = check(
+            &tightening,
+            &none,
+            &schema(&[("v", false, true), ("w", true, false)]),
+            Settled::SoFar,
+        )
+        .expect_err("another column");
+        assert!(format!("{e:#}").contains("app.ev_1's own column"), "{e:#}");
+
+        let defaulting = plan(vec![Change::SetPartitionDefault {
+            uid,
+            table: name.clone(),
+            parent: parent.clone(),
+            column: "v".into(),
+            from: None,
+            to: Some("1".into()),
+            fallback: None,
+        }]);
+        let own = schema(&[("v", true, false)]);
+        check(&defaulting, &none, &own, Settled::Whole).expect("the plan's own");
+        check(&defaulting, &none, &own, Settled::SoFar).expect("run so far");
+        // Its NOT NULL set by another while the plan sets its default.
+        let e = check(
+            &defaulting,
+            &none,
+            &schema(&[("v", true, true)]),
+            Settled::SoFar,
+        )
+        .expect_err("the other field of the same column");
+        assert!(format!("{e:#}").contains("app.ev_1's own column"), "{e:#}");
+        let e = check(&defaulting, &none, &none, Settled::Whole).expect_err("never set");
+        assert!(format!("{e:#}").contains("app.ev_1's own column"), "{e:#}");
+        // Attached again under another bound, or to another parent, while
+        // the plan sets its default: its own columns are as planned, its
+        // place in the tree is not (#1607 review).
+        let moved_to = |edit: &dyn Fn(&mut PartitionOf)| {
+            let mut s = own.clone();
+            edit(
+                s.tables
+                    .get_mut(&name)
+                    .unwrap()
+                    .partition_of
+                    .as_mut()
+                    .unwrap(),
+            );
+            s
+        };
+        for (what, after) in [
+            (
+                "wider bound",
+                moved_to(&|of| {
+                    of.bound = PartitionBound::Range {
+                        from: vec![pbps_model::BoundDatum::MinValue],
+                        to: vec![pbps_model::BoundDatum::MaxValue],
+                    }
+                }),
+            ),
+            (
+                "another parent",
+                moved_to(&|of| of.parent = TableName::new("app", "other")),
+            ),
+        ] {
+            for settled in [Settled::SoFar, Settled::Whole] {
+                let e = check(&defaulting, &none, &after, settled).expect_err(what);
+                assert!(
+                    format!("{e:#}").contains("app.ev_1's partition parent, bound or key"),
+                    "{what}: {e:#}"
+                );
+            }
+        }
     }
 
     /// A table's persistence is held across an apply (#1443): another

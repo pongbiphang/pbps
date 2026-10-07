@@ -28,7 +28,7 @@ The differ sorts every planned change by, in order:
    | 6 | `DropTable` |
    | 7 | `CreateTable` |
    | 8 | `AddColumn` |
-   | 9 (`COLUMN_ALTERATIONS`) | `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression`; `AddComputedColumn` at the class's end (9, 3); P: `SetTablePersistence` after it, by the foreign-key graph |
+   | 9 (`COLUMN_ALTERATIONS`) | `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression`, `SetPartitionDefault`, `SetPartitionNotNull`; `AddComputedColumn` at the class's end (9, 3); P: `SetTablePersistence` after it, by the foreign-key graph |
    | 10 | `SetColumnDeprecated`; P: `SetStorageParameters`, `SetIndexStorageParameters` |
    | 11 | `InsertRow`, `UpdateRow` |
    | 12 | `DeleteRow` |
@@ -98,6 +98,9 @@ Then, in this order:
     names a function the plan creates after the last function create, and
     places a new column whose expression names one after that create, with
     what may read the column after it (DEC-942.1, DEC-1364.1).
+  - `after_their_parents_defaults` then sets each partition's own default
+    again after a parent's default the plan sets, which reaches every
+    partition (DEC-1581.1). It runs in bootstrap too.
 - **On SQL Server**, a retype or recollation drops and re-adds the keys,
   indexes and checks over the column, through `retype_dependents` and
   `recollate_dependents` (#1175, DECISIONS 515). `CREATE OR ALTER` means a
@@ -160,6 +163,8 @@ requirement is common to all of them, so it is listed once,
 | `AlterColumnType` | 9 | What blocks a retype gone. S: keys, indexes, checks, foreign keys. P: views and rules (`weave`), generated readers (refused). An old default dropped first | Converted values |
 | `AlterColumnNullability` | 9 | Tightening: the values non-null | Accepts or refuses NULL |
 | `AlterColumnDefault` | 9 | Functions the default calls: *content* | The default |
+| `SetPartitionDefault` | 9 | Functions the default calls: *content*. P: after its parent's default set by the plan (`after_their_parents_defaults`) | One partition's default: its own, or its parent's again (DEC-1581.1) |
+| `SetPartitionNotNull` | 9 | Tightening: the partition's values non-null | One partition's column accepts or refuses NULL (DEC-1581.1) |
 | `AlterColumnExpression` | 9 | P: its inputs, a relaxation of its own column. Functions it calls: *content* | Recomputed stored values |
 | `AddComputedColumn` | 9 (9, 3) | S: the columns it reads, in their final type. Functions it calls exist (one this plan creates is refused by name) | A computed column at the end of its table (DEC-1174.1) |
 | `SetColumnDeprecated` | 10 | Nothing | Metadata only |
@@ -329,6 +334,7 @@ one class and the dependents a class cannot see.
 | Row writes setting a column, or deleting the rows that hold its NULLs → tightening it to NOT NULL | fixed, value | (12, 2), after the rows of its table; split from a retype; the probe reads the rows after the plan's writes | ✓ DEC-1367.1 |
 | `AlterColumnExpression` → tightening, keys, checks, filtered indexes, deletes | value | the probe is unchecked; the order is tighten and keys after the recomputation | ✓ DEC-1168.1 |
 | Default set → a row that takes it | value | the default goes first; it stays ahead of a rebuild | ✓ #1030 |
+| Parent's default set → a partition's own default on that column | value | `after_their_parents_defaults`: the partition's after the parent's, which overwrites it | ✓ DEC-1581.1 |
 | Nullability relaxed → expression recomputing a NULL | value | rank −1 before 0 | ✓ DEC-1168.1 |
 | Expression recomputed → nullability tightened | value | rank 0 before +1; split from a retype | ✓ DEC-1168.1 |
 

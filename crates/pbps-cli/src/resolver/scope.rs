@@ -292,6 +292,8 @@ pub(crate) fn planned_schema_grants(
             | Change::SetStorageParameters { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::DropColumn { .. }
             | Change::RenameColumn { .. }
             | Change::AlterColumnType { .. }

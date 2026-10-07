@@ -262,6 +262,8 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
                 | Change::DetachPartition { .. }
+                | Change::SetPartitionDefault { .. }
+                | Change::SetPartitionNotNull { .. }
                 | Change::PublicExecution { .. } => return None,
             };
             let (rewrite, reads) = unknown("the table's clustered layout has not been read yet");
@@ -356,6 +358,8 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
                 | Change::DetachPartition { .. }
+                | Change::SetPartitionDefault { .. }
+                | Change::SetPartitionNotNull { .. }
                 | Change::PublicExecution { .. } => return None,
             };
             let source = stored(&column.table)

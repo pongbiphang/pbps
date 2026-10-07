@@ -173,6 +173,11 @@ pub(super) fn invalidates(change: &Change, surface: &Surface) -> bool {
         Surface::Default(column) => {
             matches!(change, Change::AlterColumnDefault { column: r, from: Some(_), .. } if r == column)
                 || matches!(change, Change::AlterColumnExpression { column: r, .. } if r == column)
+                // A partition's: every one of these sets, replaces or drops
+                // the partition's own `pg_attrdef`, an inherited copy of its
+                // parent's included (#1607 review).
+                || matches!(change, Change::SetPartitionDefault { table, column: c, .. }
+                    if *table == column.table && *c == column.name)
         }
         Surface::Check { table, name } => {
             matches!(change, Change::DropCheck { table: t, name: n } if t == table && n == name)

@@ -400,6 +400,21 @@ impl Declared {
                             .insert(column.name.clone(), default.clone());
                     }
                 }
+                // A partition's own default, recorded where `from_schema`
+                // records it: under the partition and the column (#1581).
+                Change::SetPartitionDefault {
+                    table, column, to, ..
+                } => {
+                    remove_nested(&mut self.expressions.defaults, table, column);
+                    remove_nested(&mut self.bindings.defaults, table, column);
+                    if let Some(default) = to {
+                        self.expressions
+                            .defaults
+                            .entry(table.clone())
+                            .or_default()
+                            .insert(column.clone(), default.clone());
+                    }
+                }
                 Change::AlterColumnExpression { column, to, .. } => {
                     self.expressions
                         .generated
@@ -479,6 +494,7 @@ impl Declared {
                 | Change::SetIndexStorageParameters { .. }
                 | Change::SetTablePersistence { .. }
                 | Change::SetStorageParameters { .. }
+                | Change::SetPartitionNotNull { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }

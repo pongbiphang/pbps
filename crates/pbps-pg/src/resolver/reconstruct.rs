@@ -361,6 +361,8 @@ impl Reconstruction {
                 | Change::SetPrimaryKey { .. }
                 | Change::SetIndexStorageParameters { .. }
                 | Change::SetTablePersistence { .. }
+                | Change::SetPartitionDefault { .. }
+                | Change::SetPartitionNotNull { .. }
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }

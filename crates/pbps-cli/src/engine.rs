@@ -2355,6 +2355,11 @@ pub async fn account_for_module_dependents(
     let released = crate::dependents::released(changes, &found);
     let moved = crate::dependents::after_the_rebuilds(changes, &released, deps)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
+    // Last of the reorderings: a partition's own default after its parent's,
+    // wherever the passes above left that (#1588).
+    let added = added
+        + crate::dependents::after_their_parents_defaults(changes, declared, ids, dialect)
+            .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     // On the final order: every pass above may move what an expression
     // names, or the expression (#1576).
     let mut later = Vec::new();

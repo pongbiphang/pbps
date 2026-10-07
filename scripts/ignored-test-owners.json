@@ -1340,7 +1340,10 @@
         "a_bootstrap_creates_what_a_new_table_calls_before_it",
         "a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused",
         "a_bootstrap_reads_a_routines_own_search_path_as_pulled",
-        "a_table_bootstrap_did_not_build_is_created_by_the_next_plan"
+        "a_table_bootstrap_did_not_build_is_created_by_the_next_plan",
+        "a_standing_partitions_own_properties_change_through_the_cli",
+        "a_function_rebuilt_under_partition_defaults_keeps_each_partitions_own",
+        "a_partitions_default_taken_back_resolves_under_its_parents_schema"
       ]
     },
     {

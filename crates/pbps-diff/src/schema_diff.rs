@@ -569,6 +569,14 @@ fn diff_partial_rebuilding(
                 unlogged: declared_table.unlogged,
             });
         }
+        diff_partition_columns(
+            uid,
+            declared_name,
+            base_table,
+            declared_table,
+            declared.schema,
+            &mut changes,
+        );
         // Rows are compared by column *name* on each side, and a rename in
         // this same plan means the two sides know one column by two names.
         // The uid is what says they are the same column.
@@ -634,6 +642,8 @@ fn diff_partial_rebuilding(
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -681,6 +691,8 @@ fn diff_partial_rebuilding(
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -832,6 +844,8 @@ fn diff_partial_rebuilding(
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -881,6 +895,8 @@ fn diff_partial_rebuilding(
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1547,6 +1563,8 @@ fn recreate_referenced_foreign_keys(
             | Change::PublicExecution { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. } => continue,
         };
@@ -1812,6 +1830,8 @@ fn recreate_retyped_dependents(
         | Change::SetPrimaryKey { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }
+        | Change::SetPartitionDefault { .. }
+        | Change::SetPartitionNotNull { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
@@ -2341,16 +2361,6 @@ fn refuse_partition_changes(
             if (b.partition_by != d.partition_by || where_(b) != where_(d)) && !detached {
                 refuse(declared_name, "change its partitioning".to_owned());
             }
-            // A partition's own default or NOT NULL, which no change carries
-            // until #1581.
-            if let (Some(b), Some(d)) = (&b.partition_of, &d.partition_of)
-                && b.columns != d.columns
-            {
-                refuse(
-                    declared_name,
-                    "change a column's own default or NOT NULL".to_owned(),
-                );
-            }
         }
     }
     // As for a temporal table: the changes split out of a table this plan
@@ -2383,6 +2393,34 @@ fn refuse_partition_changes(
                 ..
             } | Change::DetachPartition { .. }
         ) {
+            continue;
+        }
+        // A standing partition's own: its indexes and checks, which the
+        // reader never confuses with its parent's clones (#1577), its
+        // defaults and NOT NULLs, its storage parameters and its persistence
+        // (#1581). A clone is its parent's to change (#1546).
+        let own = matches!(
+            change,
+            Change::AddIndex { .. }
+                | Change::DropIndex { .. }
+                | Change::AddCheck { .. }
+                | Change::DropCheck { .. }
+                | Change::SetPartitionDefault { .. }
+                | Change::SetPartitionNotNull { .. }
+                | Change::SetStorageParameters { .. }
+                | Change::SetTablePersistence { .. }
+        );
+        let standing = |schema: &Schema, name: &TableName| {
+            schema
+                .tables
+                .get(name)
+                .is_some_and(|t| t.partition_of.is_some() && t.partition_by.is_none())
+        };
+        if own
+            && change
+                .table()
+                .is_some_and(|t| standing(base.schema, t) && standing(declared.schema, t))
+        {
             continue;
         }
         let ends_a_table = matches!(
@@ -2419,6 +2457,53 @@ fn refuse_partition_changes(
             .into_iter()
             .map(|(table, what)| DiffError::PartitionedTableChange { table, what }),
     );
+}
+
+/// A standing partition's own defaults and NOT NULLs (#1581, DEC-1581.1),
+/// one change per column and kind. Its partitioning, when changed, is refused
+/// by `refuse_partition_changes`; these are compared only where both sides
+/// are a partition.
+fn diff_partition_columns(
+    uid: &Uid,
+    name: &TableName,
+    base: &Table,
+    declared: &Table,
+    declared_schema: &Schema,
+    changes: &mut Vec<Change>,
+) {
+    let (Some(was), Some(now)) = (&base.partition_of, &declared.partition_of) else {
+        return;
+    };
+    let parent = declared_schema.tables.get(&now.parent);
+    let none = pbps_model::PartitionColumn::default();
+    let columns: BTreeSet<&String> = was.columns.keys().chain(now.columns.keys()).collect();
+    for column in columns {
+        let from = was.columns.get(column).unwrap_or(&none);
+        let to = now.columns.get(column).unwrap_or(&none);
+        if from.default != to.default {
+            changes.push(Change::SetPartitionDefault {
+                uid: uid.clone(),
+                table: name.clone(),
+                parent: now.parent.clone(),
+                column: column.clone(),
+                from: from.default.clone(),
+                to: to.default.clone(),
+                // What the engine gave the partition when it was made, and
+                // what a row written to it directly gets without one.
+                fallback: parent
+                    .and_then(|p| p.columns.get(column))
+                    .and_then(|c| c.default.clone()),
+            });
+        }
+        if from.not_null != to.not_null {
+            changes.push(Change::SetPartitionNotNull {
+                uid: uid.clone(),
+                table: name.clone(),
+                column: column.clone(),
+                not_null: to.not_null,
+            });
+        }
+    }
 }
 
 /// A change's kind as words, `drop column` for `DropColumn`: the variant's
@@ -2522,6 +2607,8 @@ fn refuse_computed_dependencies(
                     | Change::SetPrimaryKey { .. }
                     | Change::SetIndexStorageParameters { .. }
                     | Change::SetTablePersistence { .. }
+                    | Change::SetPartitionDefault { .. }
+                    | Change::SetPartitionNotNull { .. }
                     | Change::SetStorageParameters { .. }
                     | Change::SetReplicaIdentity { .. }
                     | Change::AddUnique { .. }
@@ -3593,6 +3680,13 @@ fn dependency_rank(
         Change::AlterColumnNullability {
             to_nullable: false, ..
         } => 1,
+        // A partition's own, alike: its column's type is its parent's, which
+        // no change here moves (#1581).
+        Change::SetPartitionDefault { .. } => 0,
+        Change::SetPartitionNotNull {
+            not_null: false, ..
+        } => -1,
+        Change::SetPartitionNotNull { not_null: true, .. } => 1,
         // Rows follow the foreign keys between their tables: a referenced
         // table's rows go in first, and out last.
         Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
@@ -4135,7 +4229,9 @@ fn order_key(c: &Change) -> u8 {
         Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
         | Change::AlterColumnDefault { .. }
-        | Change::AlterColumnExpression { .. } => COLUMN_ALTERATIONS,
+        | Change::AlterColumnExpression { .. }
+        | Change::SetPartitionDefault { .. }
+        | Change::SetPartitionNotNull { .. } => COLUMN_ALTERATIONS,
         // Once every column its expression reads is there in its final type
         // (`sort_class` places it after the class's alterations), and before
         // the indexes and checks of class 13 that may be over it (#1174).
@@ -5697,9 +5793,9 @@ mod tests {
     }
 
     /// A partition's own column defaults and NOT NULLs (#1578) are created
-    /// with it, are refused by name when changed on a standing partition
-    /// (#1581) without reading as a change of its partitioning, and are its
-    /// detached table's columns: a detach keeps them.
+    /// with it, are changed on a standing partition one column and kind at a
+    /// time (#1581), with its parent's default as what it takes back, and
+    /// are its detached table's columns: a detach keeps them.
     #[test]
     fn a_partitions_own_column_overrides_are_its_own_through_a_detach() {
         use pbps_model::{PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
@@ -5757,20 +5853,71 @@ mod tests {
         )));
         assert!(outcome(&tree, &tree).expect("unchanged").changes.is_empty());
 
-        // Changed on a standing partition: refused by name, and not as a
-        // change of its partitioning.
+        // Changed on a standing partition: the default alone, from its own
+        // to its own.
         let mut changed = tree.clone();
         changed.tables.insert(p.clone(), own("8"));
-        let errors: Vec<String> = outcome(&tree, &changed)
-            .expect_err("refused")
+        let planned = outcome(&tree, &changed).expect("a standing partition's default changes");
+        assert!(
+            matches!(
+                planned.changes.as_slice(),
+                [c] if matches!(&c.change, Change::SetPartitionDefault {
+                    table, column, from: Some(from), to: Some(to), fallback: None, ..
+                } if *table == p && column == "n" && from == "7" && to == "8")
+            ),
+            "{:?}",
+            planned.changes
+        );
+        // Both overrides gone: its parent's again, a default to take back
+        // where the parent has one.
+        let parents = |declared: &mut Schema| {
+            declared
+                .tables
+                .get_mut(&"app.ev".parse::<TableName>().unwrap())
+                .unwrap()
+                .columns
+                .get_mut("n")
+                .unwrap()
+                .default = Some("1".into());
+        };
+        let mut was = tree.clone();
+        parents(&mut was);
+        let mut dropped = was.clone();
+        dropped.tables.insert(
+            p.clone(),
+            Table {
+                partition_of: Some(PartitionOf {
+                    columns: BTreeMap::new(),
+                    ..own("7").partition_of.unwrap()
+                }),
+                ..Default::default()
+            },
+        );
+        let planned = outcome(&was, &dropped).expect("both overrides dropped");
+        let kinds: Vec<&Change> = planned.changes.iter().map(|c| &c.change).collect();
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [
+                    Change::SetPartitionNotNull { not_null: false, .. },
+                    Change::SetPartitionDefault { from: Some(_), to: None, fallback: Some(f), .. },
+                ] if f == "1"
+            ),
+            "{kinds:?}"
+        );
+        // Negative: the parent's own default is the parent's change, still
+        // refused by name (#1546).
+        let mut parent_default = tree.clone();
+        parents(&mut parent_default);
+        let errors: Vec<String> = outcome(&tree, &parent_default)
+            .expect_err("a partitioned parent's default")
             .iter()
             .map(ToString::to_string)
             .collect();
         assert!(
             errors.iter().any(
-                |e| e.starts_with("app.p is a partitioned table or a partition")
-                    && e.contains("change a column's own default or NOT NULL")
-                    && !e.contains("change its partitioning")
+                |e| e.starts_with("app.ev is a partitioned table or a partition")
+                    && e.contains("alter column default")
             ),
             "{errors:?}"
         );
@@ -5813,8 +5960,9 @@ mod tests {
     }
 
     /// A partition's own checks and indexes (#1577) are created with it, are
-    /// refused by name as any change to a standing partition is (#1581), and
-    /// stay under their own names through a detach, which renames only the
+    /// added, dropped and redefined on a standing partition alone, its
+    /// parent's still refused (#1581), and stay under their own names through
+    /// a detach, which renames only the
     /// parent's clones: an own one declared otherwise is a change the detach
     /// does not make, and is refused by name.
     #[test]
@@ -5901,38 +6049,57 @@ mod tests {
         );
 
         // An own one added, dropped or changed on a standing partition is
-        // refused by name (#1581).
+        // planned on the partition alone (#1581).
         for (edit, expected) in [
             (
                 &(|t: &mut Table| {
                     t.indexes.insert("p_n".into(), index("n"));
                 }) as &dyn Fn(&mut Table),
-                "would add index",
+                &["add index"] as &[&str],
             ),
             (
                 &|t: &mut Table| {
                     t.checks.clear();
                 },
-                "would drop check",
+                &["drop check"],
             ),
             (
                 &|t: &mut Table| {
                     t.indexes.insert("p_ts".into(), index("n"));
                 },
-                "index",
+                &["drop index", "add index"],
             ),
         ] {
             let mut declared = tree.clone();
             edit(declared.tables.get_mut(&p).unwrap());
-            let errors = said(outcome(&tree, &declared).expect_err("refused"));
-            assert!(
-                errors.iter().any(
-                    |e| e.starts_with("app.p is a partitioned table or a partition")
-                        && e.contains(expected)
-                ),
-                "{errors:?}"
-            );
+            let planned = outcome(&tree, &declared).expect("planned");
+            let kinds: Vec<String> = planned
+                .changes
+                .iter()
+                .map(|c| {
+                    assert_eq!(c.change.table(), Some(&p), "{:?}", c.change);
+                    change_in_words(&c.change)
+                })
+                .collect();
+            assert_eq!(kinds, expected, "{:?}", planned.changes);
         }
+        // Negative: one added to the parent is the parent's change, refused
+        // by name until #1546.
+        let mut declared = tree.clone();
+        declared
+            .tables
+            .get_mut(&"app.ev".parse::<TableName>().unwrap())
+            .unwrap()
+            .indexes
+            .insert("ev_ts".into(), index("ts"));
+        let errors = said(outcome(&tree, &declared).expect_err("refused"));
+        assert!(
+            errors.iter().any(
+                |e| e.starts_with("app.ev is a partitioned table or a partition")
+                    && e.contains("add index")
+            ),
+            "{errors:?}"
+        );
 
         // Detached: the parent's index renamed to the declared name, its own
         // left alone under theirs.
@@ -5992,7 +6159,8 @@ mod tests {
 
     /// A partition's persistence and storage parameters (#1580) are created
     /// with it, in the one change that creates it; changed on a standing
-    /// partition they are refused by name (#1581); and a detach keeps them,
+    /// partition alone (#1581), a switch to unlogged under a permanent
+    /// table's key refused as a creation is; and a detach keeps them,
     /// so the table it leaves is declared with them or the plan is refused.
     #[test]
     fn a_partitions_own_persistence_and_storage_are_its_own_through_a_detach() {
@@ -6098,8 +6266,18 @@ mod tests {
         let mut permanent = keyed.clone();
         permanent.tables.get_mut(&p).unwrap().unlogged = false;
         outcome(&Schema::default(), &permanent).expect("every partition permanent");
+        // And switched to unlogged on a standing partition (#1581).
+        let errors = outcome(&permanent, &keyed).expect_err("refused");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                DiffError::PermanentReferencesUnloggedPartition { table, partition, .. }
+                    if *table == r && *partition == p
+            )),
+            "{errors:?}"
+        );
 
-        // Changed on a standing partition: refused by name (#1581).
+        // Changed on a standing partition: planned on it alone (#1581).
         for (edit, expected) in [
             (
                 &(|t: &mut Table| t.unlogged = false) as &dyn Fn(&mut Table),
@@ -6115,13 +6293,14 @@ mod tests {
         ] {
             let mut declared = tree.clone();
             edit(declared.tables.get_mut(&p).unwrap());
-            let errors = said(outcome(&tree, &declared).expect_err("refused"));
+            let planned = outcome(&tree, &declared).expect("planned");
             assert!(
-                errors.iter().any(
-                    |e| e.starts_with("app.p is a partitioned table or a partition")
-                        && e.contains(expected)
+                matches!(
+                    planned.changes.as_slice(),
+                    [c] if c.change.table() == Some(&p) && change_in_words(&c.change) == expected
                 ),
-                "{errors:?}"
+                "{:?}",
+                planned.changes
             );
         }
 

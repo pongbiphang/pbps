@@ -78,9 +78,10 @@ standing parent, or dropped with drop intent; the apply's pre-flight refuses a
 range over DEFAULT-partition rows and the drop of a referenced partition
 (#1171, DEC-1171.1). A partition declared in a file of its own with its
 parent's shape is detached and kept, under its declared names (#1544,
-DEC-1544.1). The parent's own changes, attaching an existing table, and changes
-to a partition's own checks, indexes, defaults and NOT NULLs stay refused by
-name (#1545–#1547, #1581).
+DEC-1544.1). A standing partition's own indexes, checks, defaults, NOT NULLs,
+storage parameters and persistence change on it alone (#1581, DEC-1581.1). The
+parent's own changes and attaching an existing table stay refused by name
+(#1545–#1547).
 
 A SQL Server column may name its collation (`collation:`); `pull` declares one
 that differs from the database's default, and a collation change is a planned

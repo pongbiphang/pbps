@@ -386,6 +386,37 @@ pub enum Change {
         unlogged: bool,
     },
 
+    /// A partition's own default on a column it inherits (#1581, DEC-1581.1):
+    /// `ALTER TABLE <partition> ALTER COLUMN … SET DEFAULT` or `DROP
+    /// DEFAULT`. A partition declares no column and so has no column uid; it
+    /// is keyed by its table uid and the column's name. `from` and `to` are
+    /// the partition's own default as declared, and `fallback` is what the
+    /// partition holds without one: its parent's default, which the engine
+    /// copies into every partition, or none. The statement sets `to`, else
+    /// `fallback`, else drops the default. With both `None` it takes the
+    /// default off entirely, which is how a function rebuild releases it
+    /// (#1588). `parent` is where `fallback` was written: it is resolved under
+    /// the parent's schema, and `to` under the partition's, which may be
+    /// another.
+    SetPartitionDefault {
+        uid: Uid,
+        table: TableName,
+        parent: TableName,
+        column: String,
+        from: Option<String>,
+        to: Option<String>,
+        fallback: Option<String>,
+    },
+    /// A partition's own NOT NULL on a column its parent leaves nullable
+    /// (#1581): `ALTER TABLE <partition> ALTER COLUMN … SET NOT NULL` or
+    /// `DROP NOT NULL`, keyed as [`Change::SetPartitionDefault`] is.
+    SetPartitionNotNull {
+        uid: Uid,
+        table: TableName,
+        column: String,
+        not_null: bool,
+    },
+
     /// A PostgreSQL index's storage parameters (#1442): `ALTER INDEX … SET
     /// (…), RESET (…)`, in place, which every supported parameter of both
     /// methods is (measured on 16 and 18). Only what changes; an index
@@ -1155,6 +1186,8 @@ impl Change {
             | Change::SetIndexStorageParameters { table, .. }
             | Change::SetTablePersistence { table, .. }
             | Change::SetStorageParameters { table, .. }
+            | Change::SetPartitionDefault { table, .. }
+            | Change::SetPartitionNotNull { table, .. }
             | Change::SetReplicaIdentity { table, .. }
             | Change::AddUnique { table, .. }
             | Change::DropUnique { table, .. }
@@ -1235,6 +1268,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1350,6 +1385,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1416,6 +1453,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1523,6 +1562,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1584,6 +1625,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1663,6 +1706,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1719,6 +1764,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1772,6 +1819,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1865,6 +1914,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1928,6 +1979,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -2075,6 +2128,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. } => None,
         }
     }
@@ -2106,6 +2161,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -2164,6 +2221,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -2210,6 +2269,8 @@ impl Change {
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -2278,6 +2339,9 @@ impl Change {
             Change::AlterColumnNullability {
                 to_nullable: false, ..
             }
+            // A partition's own NOT NULL tightens its column as a table's
+            // does, over the rows it holds (#1581).
+            | Change::SetPartitionNotNull { not_null: true, .. }
             | Change::AlterColumnType {
                 from_nullable: true,
                 to_nullable: false,
@@ -2406,7 +2470,14 @@ impl Change {
             // and vacuums the rows, not the rows: none rewrites the table
             // (DEC-1441.1).
             | Change::SetIndexStorageParameters { .. }
-            | Change::SetStorageParameters { .. } => {}
+            | Change::SetStorageParameters { .. }
+            // A partition's own default changes what a row written to it
+            // directly gets, as a column's does; dropping its own NOT NULL
+            // relaxes it.
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull {
+                not_null: false, ..
+            } => {}
         }
         r
     }

@@ -716,6 +716,36 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             Lock::AccessExclusive,
         ),
 
+        // The same two statements on a partition alone (#1581): a default
+        // is catalog-only, and a NOT NULL reads the partition's rows.
+        Change::SetPartitionDefault { table, column, .. } => e(
+            format!("changing the default of {}", table.column(column)),
+            table,
+            Rewrite::No,
+            Reads::Nothing,
+            Lock::AccessExclusive,
+        ),
+        Change::SetPartitionNotNull {
+            table,
+            column,
+            not_null,
+            ..
+        } => e(
+            format!(
+                "making {} {}",
+                table.column(column),
+                if *not_null { "NOT NULL" } else { "nullable" }
+            ),
+            table,
+            Rewrite::No,
+            if *not_null {
+                Reads::EveryRow
+            } else {
+                Reads::Nothing
+            },
+            Lock::AccessExclusive,
+        ),
+
         // Measured on 17.11 and 18.6: `SET EXPRESSION` recomputes every row
         // and rewrites the table under `ACCESS EXCLUSIVE`, rebuilding its
         // indexes (DEC-1168.1).
