@@ -725,3 +725,37 @@ name (review of #1200).
 Pinned by `a_default_whose_new_name_is_taken_frees_its_old_one` (SQL Server
 live suite). `a_renamed_tables_and_columns_generated_defaults_follow_them` now
 expects the fallback name where DEC-975.1 kept the old one.
+
+<a id="dec-1600-1"></a>
+
+**DEC-1600.1. A state records the uids of what the database holds, not every
+uid the ids file names (#1600).** The differ creates a table only for a uid its
+base side lacks, and a connected plan's base side is the recorded state's ids.
+`bootstrap`, `snapshot` and `baseline` recorded the whole ids file beside a
+schema read back from the database. So a table the ids file named but the
+database did not hold was recorded as held. Two ways this happened: a table
+whose declaration was not part of the bootstrap, or one dropped before a
+`baseline` or a forced `snapshot`. The next `plan --db` neither created it nor
+reported it, and its `apply` recorded it as built: a wrong recording with a
+single deployer.
+
+Each of the three now records `ids.without(missing, missing_roles)`: the ids
+file less the tables `managed_state` reports missing, their columns, and the
+missing roles. Tombstones stay, since they record retired identities, not held
+objects.
+
+The pruning sits at those three callers, not inside `StateSnapshot::new`. They
+are the paths that knowingly record ids beside objects the database lacks, and
+`managed_state` names exactly which. The apply and staged paths record the
+plan's ids beside the schema read back after it. Pruning there by schema
+membership would turn any table a read leaves out into a `CREATE` of a table
+that exists.
+
+A differ guard, treating a base uid whose table the base schema lacks as absent,
+was the alternative. It would also change what every other caller of the
+differ sees, for a state no recording path now writes.
+
+Pinned by `a_state_keeps_only_the_uids_the_database_holds` (unit) and
+`a_table_bootstrap_did_not_build_is_created_by_the_next_plan` (PostgreSQL live
+suite). The live test covers bootstrap, baseline and a forced snapshot, and
+fails at each when that path records the whole ids file again.

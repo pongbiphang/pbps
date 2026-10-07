@@ -1338,7 +1338,8 @@
         "a_name_the_plan_rebuilds_is_refused_although_it_exists_now",
         "a_bootstrap_creates_what_a_new_table_calls_before_it",
         "a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused",
-        "a_bootstrap_reads_a_routines_own_search_path_as_pulled"
+        "a_bootstrap_reads_a_routines_own_search_path_as_pulled",
+        "a_table_bootstrap_did_not_build_is_created_by_the_next_plan"
       ]
     },
     {
