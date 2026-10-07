@@ -1938,7 +1938,7 @@ pub struct ReadRemedies {
     /// The deployment lock could not be read.
     pub lock: String,
     /// The account's permissions could not be read.
-    pub permissions: &'static str,
+    pub permissions: String,
 }
 
 pub fn read_remedies(driver: Driver) -> ReadRemedies {
@@ -1949,7 +1949,8 @@ pub fn read_remedies(driver: Driver) -> ReadRemedies {
                 pbps_mssql::state::LOCK_TABLE
             ),
             permissions: "grant VIEW DEFINITION, or check what the login is mapped to in this \
-                          database",
+                          database"
+                .into(),
         },
         // Both grants, measured on 18.6: without `SELECT` the read is
         // "permission denied for table __pbps_lock", and with it but without
@@ -1963,9 +1964,21 @@ pub fn read_remedies(driver: Driver) -> ReadRemedies {
             ),
             // The read asks `has_*_privilege` and the system catalogs, which
             // every role may read unless someone revoked it; the other way it
-            // fails is a connection that is not the role meant to deploy.
-            permissions: "check that this role can read the system catalogs (`pg_catalog`), \
-                          and that the connection names the role that deploys",
+            // fails is a connection that is not the role meant to deploy. But
+            // once the project has recorded identities (tables, columns or a
+            // tombstone), `pbps_pg::doctor::permissions` first reads the last
+            // recorded state, and that read needs the ledger's own grants: a
+            // role without them was sent to the catalogs, which were fine
+            // (#820). Named conditionally, because which read failed is not
+            // carried this far, and the table may not exist at all.
+            permissions: format!(
+                "check that the connection names the role that deploys and that it can read \
+                 the system catalogs (`pg_catalog`); once this project has recorded \
+                 identities, doctor also reads its last recorded state, which needs USAGE on \
+                 schema {} and, where that table exists, SELECT on {}",
+                pbps_pg::state::LEDGER_SCHEMA,
+                pbps_pg::state::STATE_TABLE
+            ),
         },
     }
 }

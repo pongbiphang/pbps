@@ -1274,6 +1274,7 @@
         "doctor_json_reports_external_schema_absence_before_grant_authority",
         "doctor_reports_an_adopted_routine_grant_whatever_the_argument_spelling",
         "doctor_reports_data_and_role_grant_gaps_from_the_declarations",
+        "doctor_names_the_recorded_state_read_when_its_select_is_denied",
         "doctor_resolver_discovery_is_advisory_and_never_acquires_an_engine",
         "doctor_tells_a_role_that_cannot_read_the_lock_what_to_grant_in_postgres_terms",
         "drift_and_pull_are_read_from_the_postgres_catalog",

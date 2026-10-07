@@ -2098,6 +2098,17 @@ mod tests {
         assert!(lock.contains("public.__pbps_lock"), "{lock}");
         assert!(lock.contains("USAGE on schema public"), "{lock}");
         assert!(permissions.contains("pg_catalog"), "{permissions}");
+        assert!(permissions.contains("role that deploys"), "{permissions}");
+        // #820: with recorded identities the permission read starts with the
+        // recorded state, so the ledger's grants are named too.
+        assert!(
+            permissions.contains("SELECT on public.__pbps_state"),
+            "{permissions}"
+        );
+        assert!(
+            permissions.contains("USAGE on schema public"),
+            "{permissions}"
+        );
         // And nothing of the other engine's vocabulary.
         for text in [&lock, &permissions] {
             for foreign in ["dbo.", "VIEW DEFINITION", "login"] {
@@ -2107,12 +2118,75 @@ mod tests {
 
         let (lock, permissions) = remedies(pbps_db::Driver::Mssql);
         assert!(lock.contains("dbo.__pbps_lock"), "{lock}");
-        assert!(permissions.contains("VIEW DEFINITION"), "{permissions}");
+        assert_eq!(
+            permissions,
+            "grant VIEW DEFINITION, or check what the login is mapped to in this database"
+        );
         for text in [&lock, &permissions] {
             for foreign in ["public.", "USAGE", "pg_catalog"] {
                 assert!(!text.contains(foreign), "{foreign:?} in {text}");
             }
         }
+    }
+
+    /// #820: a permission read that failed on the recorded state is one
+    /// finding, `permission.unknown`, whose PostgreSQL remedy names the
+    /// ledger's grants beside the catalogs. The cause stays in the
+    /// diagnosis's detail; the finding's own message is generic. A diagnosis
+    /// that did not fail its permission read has no such finding, whatever
+    /// its detail says.
+    #[test]
+    fn a_failed_recorded_state_read_is_remedied_with_the_ledgers_grants() {
+        let mut d = EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready");
+        d.permissions_unknown = true;
+        d.note(
+            "could not read this account's permissions: cannot read recorded identities for \
+             doctor: permission denied for table __pbps_state"
+                .to_owned(),
+        );
+        let findings = env_findings(
+            &d,
+            false,
+            &pbps_pg::Postgres::new(),
+            pbps_db::Driver::Postgres,
+        );
+        let unknown: Vec<&output::Finding> = findings
+            .iter()
+            .filter(|f| f.id == "permission.unknown")
+            .collect();
+        assert_eq!(unknown.len(), 1, "{findings:?}");
+        assert_eq!(unknown[0].severity, output::Severity::Error);
+        let remedy = unknown[0].remedy.as_deref().unwrap();
+        for named in [
+            "SELECT on public.__pbps_state",
+            "USAGE on schema public",
+            "pg_catalog",
+            "role that deploys",
+        ] {
+            assert!(remedy.contains(named), "{named:?} in {remedy}");
+        }
+        for foreign in ["dbo.", "VIEW DEFINITION", "login"] {
+            assert!(!remedy.contains(foreign), "{foreign:?} in {remedy}");
+        }
+        assert!(
+            d.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("recorded identities")),
+            "{:?}",
+            d.detail
+        );
+
+        d.permissions_unknown = false;
+        let findings = env_findings(
+            &d,
+            false,
+            &pbps_pg::Postgres::new(),
+            pbps_db::Driver::Postgres,
+        );
+        assert!(
+            findings.iter().all(|f| f.id != "permission.unknown"),
+            "{findings:?}"
+        );
     }
 
     /// Issue #313: a ledger that is not the one pbps creates is an error with
