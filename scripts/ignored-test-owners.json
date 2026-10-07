@@ -1019,6 +1019,7 @@
         "a_foreign_key_is_dropped_before_the_key_it_references_live",
         "a_history_name_taken_after_the_plan_is_refused_at_apply",
         "a_history_schema_the_database_spells_otherwise_is_refused",
+        "a_history_moved_to_its_schema_does_not_pass_through_the_engines_name",
         "a_history_taken_over_mid_apply_rolls_the_plan_back",
         "a_ledger_failure_rolls_back_the_ddl_it_would_have_recorded",
         "a_lock_names_its_holders_process_and_says_how_to_find_its_session",
