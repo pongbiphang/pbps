@@ -397,6 +397,9 @@ impl Unchecked {
             Change::DetachPartition { table, parent, .. } => {
                 format!("references to the partition {table}, detached from {parent}")
             }
+            Change::AttachPartition { table, parent, .. } => {
+                format!("rows of {table} outside the range it takes under {parent}")
+            }
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }

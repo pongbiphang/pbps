@@ -185,7 +185,9 @@ fn tables_query() -> String {
 /// where the parent's is nullable, but never a default dropped where the
 /// parent's has one. Measured on 16 and 18: a table `ATTACH`ed as a partition
 /// keeps its own column order and has none of the parent's defaults, which
-/// `PARTITION OF` would give it, so `attislocal` alone does not say so. Every constraint a clone
+/// `PARTITION OF` would give it, so `attislocal` alone does not say so. A
+/// column the table dropped before it was attached stays local, measured on
+/// 16 and 18, and is no column (#1545). Every constraint a clone
 /// (`conparentid`, the keys and foreign keys), inherited and not local (a
 /// CHECK, and on 18 a NOT NULL row), a CHECK of its own, local and
 /// inherited from nowhere (#1577), or on 18 a validated NOT NULL row of its
@@ -256,6 +258,7 @@ fn partition_tree(root: &str) -> String {
                                   AND {child_plain}
                                   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute ca
                                                    WHERE ca.attrelid = ch.oid AND ca.attnum > 0
+                                                     AND NOT ca.attisdropped
                                                      AND (ca.attislocal OR ca.attacl IS NOT NULL))
                                   AND ch.relam = (SELECT am.oid FROM pg_catalog.pg_am am
                                                    WHERE am.amname = 'heap')

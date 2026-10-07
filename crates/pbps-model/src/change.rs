@@ -231,6 +231,20 @@ pub enum Change {
         /// the read-back to, as it holds a created table to its `CREATE`.
         shape: Box<Table>,
     },
+    /// An ordinary table becomes a partition of a standing parent and keeps
+    /// its rows (#1545, DEC-1545.1). Its columns become the parent's; what it
+    /// holds of them otherwise, and its own indexes and checks, are brought
+    /// to the declaration by the partition's own changes after it.
+    AttachPartition {
+        uid: Uid,
+        table: TableName,
+        parent: TableName,
+        bound: crate::schema::PartitionBound,
+        /// The partition as declared: what the apply holds the read-back to
+        /// once every statement has run, as it holds a created table to its
+        /// `CREATE`.
+        shape: Box<Table>,
+    },
     RenameTable {
         uid: Uid,
         from: TableName,
@@ -1219,7 +1233,8 @@ impl Change {
             | Change::UpdateRow { table, .. }
             | Change::DeleteRow { table, .. }
             | Change::SetDataMode { table, .. }
-            | Change::DetachPartition { table, .. } => table,
+            | Change::DetachPartition { table, .. }
+            | Change::AttachPartition { table, .. } => table,
             Change::DropColumn { column, .. }
             | Change::AlterColumnType { column, .. }
             | Change::AlterColumnNullability { column, .. }
@@ -1271,6 +1286,7 @@ impl Change {
             // table holds no declared rows (#1544).
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -1387,6 +1403,7 @@ impl Change {
             Change::DeleteRow { table, key, .. } => Some((table, key, RowAfter::Gone)),
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -1463,6 +1480,7 @@ impl Change {
             | Change::SetColumnDeprecated { .. }
             | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
@@ -1572,6 +1590,7 @@ impl Change {
             }
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
@@ -1628,6 +1647,7 @@ impl Change {
             Change::DropModule { id, .. } => Some(Dropped::Module(id.clone())),
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -1708,6 +1728,7 @@ impl Change {
             Change::PublicExecution { .. } => None,
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -1766,6 +1787,7 @@ impl Change {
             Change::PublicExecution { .. } => (None, None),
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -1819,6 +1841,8 @@ impl Change {
             Change::CreateTable { name, .. } => vec![(name, Presence::Present)],
             // The table stays, as an ordinary one (#1544).
             Change::DetachPartition { table, .. } => vec![(table, Presence::Present)],
+            // The table stays, as a partition (#1545).
+            Change::AttachPartition { table, .. } => vec![(table, Presence::Present)],
             Change::DropTable { name, .. } => vec![(name, Presence::Absent)],
             Change::RenameTable { from, to, .. } => {
                 vec![(from, Presence::Absent), (to, Presence::Present)]
@@ -1924,6 +1948,7 @@ impl Change {
             | Change::SetColumnDeprecated { .. }
             | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
@@ -1989,6 +2014,7 @@ impl Change {
             }
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
@@ -2118,6 +2144,7 @@ impl Change {
             }
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -2163,6 +2190,7 @@ impl Change {
             }
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -2223,6 +2251,7 @@ impl Change {
             Change::DropModule { id, .. } => Some((id, ModuleAfter::Gone)),
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -2271,6 +2300,7 @@ impl Change {
             | Change::DropModule { id, .. } => Some(id),
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -2337,6 +2367,13 @@ impl Change {
             // parent: a query on the parent stops returning them (#1544).
             | Change::DetachPartition { .. } => {
                 r.insert(RiskClass::Destructive);
+            }
+            // The table's rows must satisfy the bound, and the keys,
+            // uniques and foreign keys the parent clones onto it; the engine
+            // scans for both, and fails the attach on the first that does
+            // not (#1545).
+            Change::AttachPartition { .. } => {
+                r.insert(RiskClass::Constraint);
             }
             // What a dropped module destroys is the validity of whatever
             // depends on it, not data — so it faces the gate, but needs no

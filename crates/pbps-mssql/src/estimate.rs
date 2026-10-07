@@ -262,6 +262,7 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
                 | Change::DetachPartition { .. }
+                | Change::AttachPartition { .. }
                 | Change::SetPartitionDefault { .. }
                 | Change::SetPartitionNotNull { .. }
                 | Change::PublicExecution { .. } => return None,
@@ -358,6 +359,7 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
                 | Change::DetachPartition { .. }
+                | Change::AttachPartition { .. }
                 | Change::SetPartitionDefault { .. }
                 | Change::SetPartitionNotNull { .. }
                 | Change::PublicExecution { .. } => return None,

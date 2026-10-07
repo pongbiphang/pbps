@@ -2376,6 +2376,22 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             names,
             ..
         } => unscoped(detach_partition(table, parent, names)?),
+        // pbps's alone, every name qualified and no declared expression in
+        // it, so on the session's empty path (DEC-1564.1). The engine takes
+        // the parent, then the table; it adopts the table's indexes and keys
+        // that match the parent's and builds the rest (#1545, measured on 16
+        // and 18).
+        Change::AttachPartition {
+            table,
+            parent,
+            bound,
+            ..
+        } => unscoped(format!(
+            "ALTER TABLE {} ATTACH PARTITION {} {};",
+            qualified(parent)?,
+            qualified(table)?,
+            bound_clause(bound)
+        )),
 
         // Two statements when both halves move, and neither engine has one that
         // does both: `RENAME TO` cannot cross a schema and `SET SCHEMA` cannot
@@ -4341,6 +4357,40 @@ mod tests {
             sql[0].contains("DROP TABLE \"app\".\"ev_2025\";"),
             "{sql:?}"
         );
+    }
+
+    /// A table is attached by one statement of pbps's alone, every name
+    /// qualified and on the session's empty path, with its bound's values as
+    /// literals no session setting reinterprets (#1545).
+    #[test]
+    fn a_table_is_attached_in_one_unscoped_statement() {
+        let sql: Vec<String> = Postgres::new()
+            .emit(
+                &Change::AttachPartition {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    table: "app.t".parse().unwrap(),
+                    parent: "app.ev".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Range {
+                        from: vec![pbps_model::BoundDatum::Value("2024-01-01".into())],
+                        to: vec![pbps_model::BoundDatum::MaxValue],
+                    },
+                    shape: Box::default(),
+                },
+                Default::default(),
+            )
+            .expect("emit")
+            .into_iter()
+            .map(|s| s.sql)
+            .collect();
+        assert_eq!(
+            sql,
+            [
+                "ALTER TABLE \"app\".\"ev\" ATTACH PARTITION \"app\".\"t\" FOR VALUES FROM \
+              (E'2024-01-01') TO (MAXVALUE);"
+            ],
+        );
+        // Negative: nothing runs on a schema's path.
+        assert!(!sql[0].contains("search_path"), "{sql:?}");
     }
 
     /// A partitioned parent is created with its key and no access method,

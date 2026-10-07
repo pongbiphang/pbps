@@ -973,6 +973,18 @@ fn resolve_columns(
             .filter(|(_, c)| &c.table == table_name)
             .map(|(u, c)| (c.name.clone(), u.clone()))
             .collect();
+        // A partition's columns are its parent's, and it declares none, so a
+        // table that holds column uids and is declared as a partition is one
+        // being attached (#1545, DEC-1545.1): its columns become the
+        // parent's, and their uids leave with the attach, as the ids file's
+        // diff records. Not a drop: no column and no row goes, and the
+        // parent's own uids are untouched, so none is duplicated either.
+        if table.partition_of.is_some() {
+            for uid in known.values() {
+                r.ids.columns.remove(uid);
+            }
+            continue;
+        }
 
         let mut appeared: BTreeSet<String> = declared_cols
             .iter()

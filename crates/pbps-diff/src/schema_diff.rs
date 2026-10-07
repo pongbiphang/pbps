@@ -168,6 +168,21 @@ pub enum DiffError {
         what: Vec<String>,
     },
 
+    /// An ordinary table declared as a partition that the engine would not
+    /// attach as declared, or would attach into something the model does
+    /// not hold (#1545, DEC-1545.1): each reason is a change to make to the
+    /// table in an earlier plan.
+    #[error(
+        "{table} is attached to {parent} as a partition, but {}. Bring the table to its \
+         parent's shape in an earlier plan, then attach it.",
+        what.join("; ")
+    )]
+    AttachedShape {
+        table: TableName,
+        parent: TableName,
+        what: Vec<String>,
+    },
+
     /// A `data:` table whose primary key moved to a different column. The row
     /// keys on each side are values of that side's key column, so the two sets
     /// have nothing in common and matching them by text would update and
@@ -590,6 +605,79 @@ fn diff_partial_rebuilding(
             continue;
         }
 
+        // An ordinary table declared as a partition is attached, and keeps
+        // its rows (#1545, DEC-1545.1). Its columns become its parent's, so
+        // they are not compared; what it holds of its own once attached is
+        // compared with the declaration as a standing partition's is, and
+        // brought to it by the same changes after the attach.
+        if base_table.partition_of.is_none()
+            && let Some(of) = &declared_table.partition_of
+        {
+            match attached(base, base_name, declared_name, base_table, of, dialect) {
+                Ok(Attached { table, defaultless }) => {
+                    changes.push(Change::AttachPartition {
+                        uid: uid.clone(),
+                        table: declared_name.clone(),
+                        parent: of.parent.clone(),
+                        bound: of.bound.clone(),
+                        shape: Box::new(declared_table.clone()),
+                    });
+                    diff_constraints(declared_name, &table, declared_table, &mut changes);
+                    diff_storage_parameters(
+                        uid,
+                        declared_name,
+                        &table,
+                        declared_table,
+                        &mut changes,
+                    );
+                    if table.unlogged != declared_table.unlogged {
+                        changes.push(Change::SetTablePersistence {
+                            uid: uid.clone(),
+                            table: declared_name.clone(),
+                            unlogged: declared_table.unlogged,
+                        });
+                    }
+                    diff_partition_columns(
+                        uid,
+                        declared_name,
+                        &table,
+                        declared_table,
+                        declared.schema,
+                        &mut changes,
+                    );
+                    // A column without a default where its parent's has one:
+                    // the attach gives it none, which no declaration can say
+                    // and the reader does not hold, so it takes its parent's
+                    // unless it declares its own, which the comparison above
+                    // sets (measured on 16 and 18).
+                    let parent = declared.schema.tables.get(&of.parent);
+                    for column in defaultless {
+                        let own = of.columns.get(&column).and_then(|c| c.default.as_ref());
+                        let fallback = parent
+                            .and_then(|p| p.columns.get(&column))
+                            .and_then(|c| c.default.clone());
+                        if let (None, Some(fallback)) = (own, fallback) {
+                            changes.push(Change::SetPartitionDefault {
+                                uid: uid.clone(),
+                                table: declared_name.clone(),
+                                parent: of.parent.clone(),
+                                column,
+                                from: None,
+                                to: None,
+                                fallback: Some(fallback),
+                            });
+                        }
+                    }
+                }
+                Err(what) => errs.push(DiffError::AttachedShape {
+                    table: declared_name.clone(),
+                    parent: of.parent.clone(),
+                    what,
+                }),
+            }
+            continue;
+        }
+
         diff_columns(
             base,
             declared,
@@ -685,6 +773,7 @@ fn diff_partial_rebuilding(
             Change::RenameTable { to, .. } => Some(ModuleId::Named(to.clone())),
             Change::DropTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
             | Change::RenameColumn { .. }
@@ -733,6 +822,7 @@ fn diff_partial_rebuilding(
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -887,6 +977,7 @@ fn diff_partial_rebuilding(
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -938,6 +1029,7 @@ fn diff_partial_rebuilding(
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::RenameColumn { .. }
@@ -1584,6 +1676,7 @@ fn recreate_referenced_foreign_keys(
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -1874,6 +1967,7 @@ fn recreate_retyped_dependents(
         Change::CreateTable { .. }
         | Change::DropTable { .. }
         | Change::DetachPartition { .. }
+        | Change::AttachPartition { .. }
         | Change::RenameTable { .. }
         | Change::AddColumn { .. }
         | Change::DropColumn { .. }
@@ -2378,6 +2472,279 @@ fn detached_names(
     }
 }
 
+/// A table being attached as declared (#1545): itself as a partition the
+/// moment the attach has run, holding only what the engine leaves it of its
+/// own, and its columns without a default where the parent's has one.
+struct Attached {
+    table: Table,
+    defaultless: Vec<String>,
+}
+
+/// What the ordinary table `table` is once attached to `of.parent`, or what
+/// keeps it from being attached into a tree the model holds (#1545,
+/// DEC-1545.1). Measured on 16 and 18:
+///
+/// - its columns must be its parent's, in its parent's order, with the same
+///   types, collations, identities and generations, and NOT NULL wherever
+///   the parent's are, or the engine refuses the attach; the order is the
+///   reader's, which leaves a tree out over a partition in another;
+/// - each of the parent's checks must be on it under the same name, and
+///   becomes the inherited copy; the rest of its checks stay its own;
+/// - an index, a key or a foreign key matching one of the parent's is
+///   adopted as its clone, and the engine builds whichever is missing; a key
+///   or a foreign key of its own would stay its own, which a partition does
+///   not hold yet, while an index of its own stays as one;
+/// - its defaults stay, and none of the parent's is given to a column
+///   without one.
+fn attached(
+    base: Side<'_>,
+    base_name: &TableName,
+    declared_name: &TableName,
+    table: &Table,
+    of: &pbps_model::PartitionOf,
+    dialect: &dyn Dialect,
+) -> Result<Attached, Vec<String>> {
+    let mut what = Vec::new();
+    let Some(parent) = base
+        .schema
+        .tables
+        .get(&of.parent)
+        .filter(|p| p.partition_by.is_some() && p.partition_of.is_none())
+    else {
+        return Err(vec![format!(
+            "its parent {} is not a partitioned table before this plan; create the partition \
+             with its parent, or attach the table in a later plan",
+            of.parent
+        )]);
+    };
+    if base_name != declared_name {
+        what.push(format!(
+            "it is renamed from {base_name} in the same plan; rename it in one plan and attach it \
+             in another"
+        ));
+    }
+    if table.partition_by.is_some() {
+        what.push("it is partitioned itself".to_owned());
+    }
+    if of.bound == pbps_model::PartitionBound::Default {
+        what.push(
+            "it would be the DEFAULT partition, which only a range is attached as here; create \
+             the DEFAULT partition and move the rows into it"
+                .to_owned(),
+        );
+    }
+    // Types in the engine's spelling, as `diff_columns` compares them. A
+    // default and NOT NULL may be its own, and are compared below.
+    let columns = |t: &Table| -> Vec<(String, pbps_model::Column)> {
+        t.columns
+            .iter()
+            .map(|(name, c)| {
+                let ty = dialect
+                    .normalize_type(&c.ty)
+                    .unwrap_or_else(|_| c.ty.clone());
+                let column = pbps_model::Column {
+                    ty,
+                    nullable: true,
+                    default: None,
+                    description: None,
+                    ..c.clone()
+                };
+                (name.clone(), column)
+            })
+            .collect()
+    };
+    let (mine, theirs) = (columns(table), columns(parent));
+    let names = |c: &[(String, pbps_model::Column)]| {
+        c.iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if names(&mine) != names(&theirs) {
+        what.push(format!(
+            "its columns are ({}), and its parent's are ({}), in that order",
+            names(&mine),
+            names(&theirs)
+        ));
+    } else {
+        for ((name, a), (_, b)) in mine.iter().zip(&theirs) {
+            if a != b {
+                what.push(format!(
+                    "its column `{name}` is not its parent's in type, collation, identity or \
+                     generation"
+                ));
+            }
+        }
+    }
+    let mut own_columns = BTreeMap::new();
+    let mut defaultless = Vec::new();
+    for (name, c) in &table.columns {
+        let Some(p) = parent.columns.get(name) else {
+            continue;
+        };
+        if c.nullable && !p.nullable {
+            what.push(format!(
+                "its column `{name}` is nullable, and its parent's is NOT NULL"
+            ));
+        }
+        let own = pbps_model::PartitionColumn {
+            // The same text as the parent's is the parent's, as the reader
+            // reads it back.
+            default: c.default.clone().filter(|d| Some(d) != p.default.as_ref()),
+            not_null: !c.nullable && p.nullable,
+        };
+        if c.default.is_none() && p.default.is_some() {
+            defaultless.push(name.clone());
+        }
+        if own != pbps_model::PartitionColumn::default() {
+            own_columns.insert(name.clone(), own);
+        }
+    }
+    match (&table.primary_key, &parent.primary_key) {
+        (None, _) => {}
+        (Some(own), Some(p)) if own.columns == p.columns => {}
+        (Some(_), _) => what.push("its primary key is not its parent's".to_owned()),
+    }
+    // One to one: a second match would stay its own.
+    fn unmatched<'a, V: PartialEq>(
+        own: &'a BTreeMap<String, V>,
+        parent: &BTreeMap<String, V>,
+    ) -> Vec<&'a String> {
+        let mut free: Vec<&V> = parent.values().collect();
+        own.iter()
+            .filter(|(_, d)| match free.iter().position(|p| p == d) {
+                Some(at) => {
+                    free.remove(at);
+                    false
+                }
+                None => true,
+            })
+            .map(|(n, _)| n)
+            .collect()
+    }
+    // By definition, storage parameters aside: measured on 16 and 18, the
+    // engine adopts a key or an index whatever its own, which it keeps, and a
+    // clone's are not held.
+    let unique = |t: &Table| -> BTreeMap<String, pbps_model::UniqueConstraint> {
+        t.unique
+            .iter()
+            .map(|(n, u)| {
+                let mut u = u.clone();
+                u.storage_parameters.clear();
+                (n.clone(), u)
+            })
+            .collect()
+    };
+    let index = |t: &Table| -> BTreeMap<String, Index> {
+        t.indexes
+            .iter()
+            .map(|(n, i)| {
+                let mut i = i.clone();
+                i.storage_parameters.clear();
+                (n.clone(), i)
+            })
+            .collect()
+    };
+    for name in unmatched(&unique(table), &unique(parent)) {
+        what.push(format!(
+            "its unique constraint `{name}` is not its parent's, and a partition holds none of \
+             its own yet"
+        ));
+    }
+    for name in unmatched(&table.foreign_keys, &parent.foreign_keys) {
+        what.push(format!(
+            "its foreign key `{name}` is not its parent's, and a partition holds none of its own \
+             yet"
+        ));
+    }
+    let mut checks = table.checks.clone();
+    for (name, p) in &parent.checks {
+        if checks.remove(name).as_ref() != Some(p) {
+            what.push(format!(
+                "its parent's check `{name}` is not on it under that name, which the engine \
+                 requires"
+            ));
+        }
+    }
+    let (own_indexes, parents_indexes) = (index(table), index(parent));
+    let free = unmatched(&own_indexes, &parents_indexes);
+    let adopted: BTreeSet<&String> = table.indexes.keys().filter(|n| !free.contains(n)).collect();
+    let indexes = table
+        .indexes
+        .iter()
+        .filter(|(n, _)| !adopted.contains(n))
+        .map(|(n, i)| (n.clone(), i.clone()))
+        .collect();
+    if table.replica_identity.is_some() {
+        what.push(
+            "it has a replica identity of its own, which a partition does not hold yet".to_owned(),
+        );
+    }
+    if table.data.is_some() {
+        what.push("it declares `data:`, which a partition does not".to_owned());
+    }
+    // Neither engine's other settings: SQL Server's, which a partition never
+    // has, since the dialect holds no partitions.
+    let rest = Table {
+        description: None,
+        columns: Default::default(),
+        primary_key: None,
+        unique: Default::default(),
+        foreign_keys: Default::default(),
+        checks: Default::default(),
+        indexes: Default::default(),
+        replica_identity: None,
+        storage_parameters: Default::default(),
+        unlogged: false,
+        partition_by: None,
+        partition_of: None,
+        data: None,
+        ..table.clone()
+    };
+    if rest != Table::default() {
+        what.push("it holds a setting a partition does not".to_owned());
+    }
+    // Held by the schema rather than the table: what reaches it from
+    // elsewhere would then reach a partition, which the model does not hold.
+    for id in base.schema.modules.keys() {
+        if let pbps_model::ModuleId::Trigger { on, name } = id
+            && on == base_name
+        {
+            what.push(format!(
+                "the trigger `{name}` is on it, and a partition holds none yet"
+            ));
+        }
+    }
+    for (other, t) in &base.schema.tables {
+        for (name, fk) in &t.foreign_keys {
+            if &fk.references_table == base_name {
+                what.push(format!(
+                    "the foreign key `{name}` of {other} references it, and nothing references a \
+                     partition yet"
+                ));
+            }
+        }
+    }
+    if !what.is_empty() {
+        return Err(what);
+    }
+    Ok(Attached {
+        table: Table {
+            checks,
+            indexes,
+            storage_parameters: table.storage_parameters.clone(),
+            unlogged: table.unlogged,
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: of.parent.clone(),
+                bound: of.bound.clone(),
+                columns: own_columns,
+            }),
+            ..Table::default()
+        },
+        defaultless,
+    })
+}
+
 fn refuse_partition_changes(
     base: Side<'_>,
     declared: Side<'_>,
@@ -2406,13 +2773,19 @@ fn refuse_partition_changes(
             base.schema.tables.get(base_name),
             declared.schema.tables.get(declared_name),
         ) {
-            // A partition declared as an ordinary table is detached (#1544).
+            // A partition declared as an ordinary table is detached (#1544),
+            // and an ordinary table declared as a partition attached (#1545):
+            // each is its own change, or its own refusal.
             let detached =
                 b.partition_of.is_some() && d.partition_of.is_none() && d.partition_by.is_none();
+            let attached = b.partition_of.is_none() && d.partition_of.is_some();
             fn where_(t: &Table) -> Option<(&TableName, &pbps_model::PartitionBound)> {
                 t.partition_of.as_ref().map(|of| (&of.parent, &of.bound))
             }
-            if (b.partition_by != d.partition_by || where_(b) != where_(d)) && !detached {
+            if (b.partition_by != d.partition_by || where_(b) != where_(d))
+                && !detached
+                && !attached
+            {
                 refuse(declared_name, "change its partitioning".to_owned());
             }
         }
@@ -2425,6 +2798,16 @@ fn refuse_partition_changes(
         .filter_map(|c| {
             if let Change::CreateTable { name, .. } = c {
                 Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let attaching: BTreeSet<&TableName> = changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::AttachPartition { table, .. } = c {
+                Some(table)
             } else {
                 None
             }
@@ -2446,6 +2829,7 @@ fn refuse_partition_changes(
                 detach_from: Some(_),
                 ..
             } | Change::DetachPartition { .. }
+                | Change::AttachPartition { .. }
         ) {
             continue;
         }
@@ -2470,10 +2854,12 @@ fn refuse_partition_changes(
                 .get(name)
                 .is_some_and(|t| t.partition_of.is_some() && t.partition_by.is_none())
         };
+        // A table this plan attaches is a partition from the attach on, and
+        // its own are brought to the declaration after it (#1545).
         if own
-            && change
-                .table()
-                .is_some_and(|t| standing(base.schema, t) && standing(declared.schema, t))
+            && change.table().is_some_and(|t| {
+                (standing(base.schema, t) || attaching.contains(t)) && standing(declared.schema, t)
+            })
         {
             continue;
         }
@@ -2651,6 +3037,7 @@ fn refuse_computed_dependencies(
                     Change::CreateTable { .. }
                     | Change::DropTable { .. }
                     | Change::DetachPartition { .. }
+                    | Change::AttachPartition { .. }
                     | Change::RenameTable { .. }
                     | Change::AddColumn { .. }
                     | Change::DropColumn { .. }
@@ -3648,6 +4035,7 @@ fn dependency_rank(
         Change::CreateTable { .. }
         | Change::DropTable { .. }
         | Change::DetachPartition { .. }
+        | Change::AttachPartition { .. }
         | Change::RenameTable { .. }
         | Change::AddColumn { .. }
         | Change::DropColumn { .. }
@@ -4287,7 +4675,9 @@ fn order_key(c: &Change) -> u8 {
         // A detach frees its range, as a drop does, before a partition is
         // created over it in class 7 (#1544).
         Change::DropTable { .. } | Change::DetachPartition { .. } => 6,
-        Change::CreateTable { .. } => 7,
+        // An attach takes its range as a created partition does, and once
+        // a detach or a drop has freed it (#1545).
+        Change::CreateTable { .. } | Change::AttachPartition { .. } => 7,
         Change::AddColumn { .. } => 8,
         Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
@@ -5581,6 +5971,444 @@ mod tests {
             "{:?}",
             kinds(&planned)
         );
+    }
+
+    /// An ordinary table declared as a partition of a standing parent is
+    /// attached and keeps its rows (#1545, DEC-1545.1). Its matching key,
+    /// foreign key and index become the parent's clones and the parent's
+    /// check its inherited copy, so none of them is planned; what it keeps of
+    /// its own is brought to the declaration after the attach, a column with
+    /// no default taking its parent's back. Its column uids leave the ids
+    /// file, and its parent's stay. Every shape the engine would refuse, or
+    /// would attach into something the model does not hold, is refused by
+    /// name before anything is planned.
+    #[test]
+    fn an_ordinary_table_declared_as_a_partition_is_attached() {
+        use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+        let index_on = |column: &str| Index {
+            columns: vec![pbps_model::IndexColumn {
+                key: pbps_model::IndexKey::Column(column.to_owned()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
+        let fk = pbps_model::ForeignKey {
+            columns: vec!["n".into()],
+            references_table: "app.r".parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete: pbps_model::ReferentialAction::NoAction,
+            on_update: pbps_model::ReferentialAction::NoAction,
+        };
+        let check = |expression: &str| pbps_model::CheckConstraint {
+            expression: expression.into(),
+        };
+        let key = |name: &str, columns: &[&str]| PrimaryKey {
+            name: Some(name.into()),
+            columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+            storage_parameters: Default::default(),
+        };
+        let columns = || {
+            table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("ts", Column::new(ty("date")).not_null()),
+                ("n", Column::new(ty("int"))),
+            ])
+        };
+        let mut parent = columns();
+        parent.columns["n"].default = Some("0".into());
+        parent.primary_key = Some(key("ev_pk", &["id", "ts"]));
+        parent.checks.insert("ev_n_ck".into(), check("n > 0"));
+        parent.indexes.insert("ev_n".into(), index_on("n"));
+        parent.foreign_keys.insert("ev_n_fk".into(), fk.clone());
+        let unique = |fillfactor: Option<&str>| pbps_model::UniqueConstraint {
+            columns: vec!["n".into(), "ts".into()],
+            storage_parameters: fillfactor
+                .map(|f| ("fillfactor".to_owned(), f.to_owned()))
+                .into_iter()
+                .collect(),
+        };
+        parent.unique.insert("ev_u".into(), unique(None));
+        parent.partition_by = Some(PartitionBy {
+            columns: vec!["ts".into()],
+        });
+        let range = |from: &str, to: &str| PartitionBound::Range {
+            from: vec![BoundDatum::Value(from.into())],
+            to: vec![BoundDatum::Value(to.into())],
+        };
+        let mut tree = schema_of("app.ev", parent);
+        let mut referenced = table(&[("id", Column::new(ty("int")).not_null())]);
+        referenced.primary_key = Some(key("r_pk", &["id"]));
+        tree.tables.insert("app.r".parse().unwrap(), referenced);
+        tree.tables.insert(
+            "app.ev_2025".parse().unwrap(),
+            Table {
+                partition_of: Some(PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: range("2025-01-01", "2026-01-01"),
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            },
+        );
+        // The table as it stands: the parent's columns in the parent's
+        // order, `n` NOT NULL of its own and without the parent's default,
+        // the parent's key, foreign key, check and index under names of its
+        // own, plus a check and an index of its own.
+        let ordinary = |f: &dyn Fn(&mut Table)| {
+            let mut t = columns();
+            t.columns["n"].nullable = false;
+            t.primary_key = Some(key("t_pk", &["id", "ts"]));
+            t.foreign_keys.insert("t_fk".into(), fk.clone());
+            t.unique.insert("t_u".into(), unique(None));
+            t.checks.insert("ev_n_ck".into(), check("n > 0"));
+            t.checks.insert("t_small".into(), check("n < 100"));
+            t.indexes.insert("t_n".into(), index_on("n"));
+            t.indexes.insert("t_id".into(), index_on("id"));
+            f(&mut t);
+            let mut base = tree.clone();
+            base.tables.insert("app.t".parse().unwrap(), t);
+            base
+        };
+        // Declared as a partition keeping its own check and NOT NULL, and
+        // not its own index.
+        let attached = |bound: PartitionBound| {
+            let mut declared = tree.clone();
+            declared.tables.insert(
+                "app.t".parse().unwrap(),
+                Table {
+                    checks: [("t_small".to_owned(), check("n < 100"))].into(),
+                    partition_of: Some(PartitionOf {
+                        parent: "app.ev".parse().unwrap(),
+                        bound,
+                        columns: [(
+                            "n".to_owned(),
+                            PartitionColumn {
+                                default: None,
+                                not_null: true,
+                            },
+                        )]
+                        .into(),
+                    }),
+                    ..Default::default()
+                },
+            );
+            declared
+        };
+        let declared = attached(range("2024-01-01", "2025-01-01"));
+        let outcome = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            let cs = diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            );
+            (base_ids, declared_ids, cs)
+        };
+        let refused = |base: &Schema, declared: &Schema, intents: &[Intent]| -> Vec<String> {
+            match outcome(base, declared, intents).2 {
+                Ok(cs) => panic!("planned {:?}", kinds(&cs)),
+                Err(errors) => errors.iter().map(ToString::to_string).collect(),
+            }
+        };
+
+        let base = ordinary(&|_| {});
+        let (base_ids, declared_ids, planned) = outcome(&base, &declared, &[]);
+        let planned = planned.expect("an attach is planned");
+        assert_eq!(
+            kinds(&planned),
+            ["DropIndex", "AttachPartition", "SetPartitionDefault"],
+            "{:?}",
+            planned.changes
+        );
+        let Change::AttachPartition {
+            table: t,
+            parent: p,
+            bound,
+            shape,
+            ..
+        } = &planned.changes[1].change
+        else {
+            panic!("{:?}", planned.changes)
+        };
+        assert_eq!(
+            (t.to_string(), p.to_string()),
+            ("app.t".into(), "app.ev".into())
+        );
+        assert_eq!(*bound, range("2024-01-01", "2025-01-01"));
+        assert_eq!(
+            **shape,
+            declared.tables[&"app.t".parse::<TableName>().unwrap()]
+        );
+        assert!(matches!(
+            &planned.changes[0].change,
+            Change::DropIndex { name, .. } if name == "t_id"
+        ));
+        assert!(matches!(
+            &planned.changes[2].change,
+            Change::SetPartitionDefault { column, from: None, to: None, fallback: Some(f), .. }
+                if column == "n" && f == "0"
+        ));
+        assert!(planned.changes[1].risks.contains(&RiskClass::Constraint));
+        // The table keeps its uid, its columns' leave, and the parent's stay.
+        let on = |ids: &IdsFile, name: &str| -> Vec<Uid> {
+            ids.columns
+                .iter()
+                .filter(|(_, c)| c.table.to_string() == name)
+                .map(|(u, _)| u.clone())
+                .collect()
+        };
+        assert_eq!(on(&base_ids, "app.t").len(), 3);
+        assert!(on(&declared_ids, "app.t").is_empty());
+        assert_eq!(on(&base_ids, "app.ev"), on(&declared_ids, "app.ev"));
+        assert_eq!(
+            base_ids
+                .tables
+                .iter()
+                .find(|(_, n)| n.to_string() == "app.t")
+                .map(|(u, _)| u),
+            declared_ids
+                .tables
+                .iter()
+                .find(|(_, n)| n.to_string() == "app.t")
+                .map(|(u, _)| u),
+        );
+
+        // A default of its own is kept, and none is asked of the parent.
+        let own_default = ordinary(&|t| t.columns["n"].default = Some("7".into()));
+        let mut keeps = declared.clone();
+        keeps
+            .tables
+            .get_mut(&"app.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .columns
+            .get_mut("n")
+            .unwrap()
+            .default = Some("7".into());
+        let kept = outcome(&own_default, &keeps, &[])
+            .2
+            .expect("its own default is kept");
+        assert_eq!(kinds(&kept), ["DropIndex", "AttachPartition"]);
+
+        // A key or an index of the parent's under other storage parameters
+        // is adopted all the same, as the engine adopts it.
+        let tuned = ordinary(&|t| {
+            t.unique.insert("t_u".into(), unique(Some("70")));
+            t.indexes.get_mut("t_n").unwrap().storage_parameters =
+                [("fillfactor".to_owned(), "60".to_owned())].into();
+        });
+        let adopted = outcome(&tuned, &declared, &[]).2.expect("adopted");
+        assert_eq!(
+            kinds(&adopted),
+            ["DropIndex", "AttachPartition", "SetPartitionDefault"]
+        );
+
+        // Negative: every shape the engine refuses, or that would attach
+        // into something the model does not hold, is refused by name.
+        let mut r2 = table(&[
+            ("t_id", Column::new(ty("int"))),
+            ("t_ts", Column::new(ty("date"))),
+        ]);
+        r2.foreign_keys.insert(
+            "r2_t".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["t_id".into(), "t_ts".into()],
+                references_table: "app.t".parse().unwrap(),
+                references_columns: vec!["id".into(), "ts".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        let mut referencing_base = ordinary(&|_| {});
+        referencing_base
+            .tables
+            .insert("app.r2".parse().unwrap(), r2.clone());
+        let mut referencing_declared = declared.clone();
+        referencing_declared
+            .tables
+            .insert("app.r2".parse().unwrap(), r2);
+        let trigger = (
+            pbps_model::ModuleId::Trigger {
+                on: "app.t".parse().unwrap(),
+                name: "audit".to_owned(),
+            },
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::Trigger,
+                description: None,
+                definition: "AFTER INSERT AS SELECT 1".to_owned(),
+            },
+        );
+        let mut triggered_base = ordinary(&|_| {});
+        triggered_base.modules.extend([trigger.clone()]);
+        let mut triggered = declared.clone();
+        triggered.modules.extend([trigger]);
+        let mut unpartitioned = ordinary(&|_| {});
+        unpartitioned
+            .tables
+            .get_mut(&"app.ev".parse::<TableName>().unwrap())
+            .unwrap()
+            .partition_by = None;
+        let mut renamed = declared.clone();
+        let moved = renamed
+            .tables
+            .remove(&"app.t".parse::<TableName>().unwrap())
+            .unwrap();
+        renamed.tables.insert("app.t2".parse().unwrap(), moved);
+        let rename = [Intent::RenameTable {
+            from: "app.t".parse().unwrap(),
+            to: "app.t2".parse().unwrap(),
+        }];
+        let swap = |t: &mut Table| {
+            let n = t.columns.shift_remove("n").unwrap();
+            t.columns.shift_insert(0, "n".into(), n);
+        };
+        for (base, declared, intents, expected) in [
+            (
+                ordinary(&swap),
+                &declared,
+                &[][..],
+                "its columns are (n, id, ts), and its parent's are (id, ts, n)",
+            ),
+            (
+                ordinary(&|t| {
+                    t.columns.insert("extra".into(), Column::new(ty("text")));
+                }),
+                &declared,
+                &[][..],
+                "its columns are (id, ts, n, extra)",
+            ),
+            (
+                ordinary(&|t| t.columns["n"].ty = ty("bigint")),
+                &declared,
+                &[][..],
+                "its column `n` is not its parent's in type",
+            ),
+            (
+                ordinary(&|t| t.columns["id"].nullable = true),
+                &declared,
+                &[][..],
+                "its column `id` is nullable",
+            ),
+            (
+                ordinary(&|t| t.primary_key = Some(key("t_pk", &["id"]))),
+                &declared,
+                &[][..],
+                "its primary key is not its parent's",
+            ),
+            (
+                ordinary(&|t| {
+                    t.unique.insert(
+                        "t_u".into(),
+                        pbps_model::UniqueConstraint {
+                            columns: vec!["n".into()],
+                            storage_parameters: Default::default(),
+                        },
+                    );
+                }),
+                &declared,
+                &[][..],
+                "its unique constraint `t_u` is not its parent's",
+            ),
+            (
+                ordinary(&|t| {
+                    t.foreign_keys.get_mut("t_fk").unwrap().on_delete =
+                        pbps_model::ReferentialAction::Cascade;
+                }),
+                &declared,
+                &[][..],
+                "its foreign key `t_fk` is not its parent's",
+            ),
+            (
+                ordinary(&|t| {
+                    t.checks.remove("ev_n_ck");
+                }),
+                &declared,
+                &[][..],
+                "its parent's check `ev_n_ck` is not on it",
+            ),
+            (
+                ordinary(&|t| {
+                    t.replica_identity = Some(pbps_model::ReplicaIdentity::Full);
+                }),
+                &declared,
+                &[][..],
+                "replica identity",
+            ),
+            (
+                ordinary(&|t| {
+                    t.data = Some(pbps_model::TableData {
+                        mode: pbps_model::DataMode::Exact,
+                        rows: Default::default(),
+                    });
+                }),
+                &declared,
+                &[][..],
+                "`data:`",
+            ),
+            (
+                ordinary(&|_| {}),
+                &attached(PartitionBound::Default),
+                &[][..],
+                "DEFAULT partition",
+            ),
+            (
+                unpartitioned,
+                &declared,
+                &[][..],
+                "is not a partitioned table before this plan",
+            ),
+            (
+                ordinary(&|_| {}),
+                &renamed,
+                &rename[..],
+                "renamed from app.t",
+            ),
+            (
+                triggered_base,
+                &triggered,
+                &[][..],
+                "the trigger `audit` is on it",
+            ),
+            (
+                referencing_base,
+                &referencing_declared,
+                &[][..],
+                "the foreign key `r2_t` of app.r2 references it",
+            ),
+        ] {
+            let found = refused(&base, declared, intents);
+            assert!(
+                found
+                    .iter()
+                    .any(|e| e.contains("is attached to app.ev") && e.contains(expected)),
+                "{expected}: {found:?}"
+            );
+        }
+
+        // Negative: an ordinary table that stays one keeps its column uids,
+        // and plans nothing.
+        let (_, stay_ids, stays) = outcome(&base, &base, &[]);
+        assert!(stays.expect("nothing changes").changes.is_empty());
+        assert_eq!(on(&stay_ids, "app.t").len(), 3);
     }
 
     /// A partition declared as an ordinary table of its parent's shape is

@@ -385,6 +385,7 @@ impl AsStored {
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
                 | Change::DetachPartition { .. }
+                | Change::AttachPartition { .. }
                 | Change::SetPartitionDefault { .. }
                 | Change::SetPartitionNotNull { .. }
                 | Change::PublicExecution { .. } => {}
@@ -601,6 +602,7 @@ impl AsStored {
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::DetachPartition { .. }
+                | Change::AttachPartition { .. }
                 | Change::SetPartitionDefault { .. }
                 | Change::SetPartitionNotNull { .. }
                 | Change::PublicExecution { .. } => {}
@@ -1025,6 +1027,7 @@ fn build(
         Change::CreateTable { .. }
         | Change::DropTable { .. }
         | Change::DetachPartition { .. }
+        | Change::AttachPartition { .. }
         | Change::SetPartitionDefault { .. }
         | Change::SetPartitionNotNull { .. }
         | Change::RenameTable { .. }

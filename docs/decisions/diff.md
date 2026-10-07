@@ -2372,6 +2372,9 @@ undeclared-partition refusal; and the unit tests
 `partitions_load_as_tables_and_render_back_in_the_parent_file` and
 `a_deparsed_bound_comes_apart_and_nothing_else_does`.
 
+*Amended by [DEC-1545.1](#dec-1545-1): the reader skips a column the
+partition dropped before it was attached.*
+
 <a id="dec-1171-1"></a>
 
 **DEC-1171.1. A standing partition tree gains a partition or loses one with
@@ -2445,6 +2448,9 @@ exclusion or the `drop_blockers` removal; the CLI
 `a_partition_is_detached_and_dropped_in_one_statement`,
 `a_range_end_compares_the_columns_before_its_first_unbounded_end` and
 `a_partition_change_under_a_standing_parent_is_probed`.
+
+*Amended by [DEC-1545.1](#dec-1545-1): an ordinary table declared in its
+parent's `partitions:` is attached, with its rows.*
 
 <a id="dec-1544-1"></a>
 
@@ -3423,3 +3429,145 @@ the search, `dbo.g` drops between `dbo.u` and `dbo.lookup`, and the plan
 applies and verifies. Also by the unit
 `a_module_drop_among_the_drops_keeps_its_place_in_the_search`, whose negative
 keeps a module drop ahead of the region out of it.
+
+<a id="dec-1545-1"></a>
+
+**DEC-1545.1. An ordinary managed table declared in its parent's `partitions:`
+under its own name is attached and keeps its rows, provided it already has
+its parent's columns; what it keeps of its own is brought to the declaration
+in the same plan, and its column uids leave the ids file (#1545).**
+
+**The declaration.** The maintainer chose it on the issue (2026-10-08). The
+table's entry moves from its own file into its parent's `partitions:`, under
+the same name and so the same table uid. This mirrors DEC-1544.1's detach.
+No identity intent is added: the name does not change, so the declaration's
+move, which git records, is the intent. Renaming and attaching at once stays
+refused.
+
+Measured on 16.15 and 18.6:
+
+- `ATTACH PARTITION` makes the table's columns inherited (`attislocal` false).
+  A table in its parent's column order then reads back as a partition the
+  model holds.
+- The engine refuses a column the parent lacks, another type or collation, a
+  nullable column where the parent's is NOT NULL, a generated column where
+  the parent's is plain or the reverse, an identity column on 18, and a
+  parent's CHECK the table does not hold under the same name.
+- A table in another column order keeps that order, which the reader does not
+  hold.
+- An index, a primary key, a unique constraint or a foreign key that matches
+  one of the parent's is adopted as its clone, under the table's own name and
+  whatever its storage parameters. A foreign key with other referential
+  actions is not adopted. One the table lacks is built, under a name the
+  engine chooses. A foreign key of
+  the table's own stays its own, which no partition holds yet. A parent's
+  CHECK on the table becomes the inherited copy, and the table's other checks
+  stay its own.
+- The table keeps its own defaults and is given none of its parent's.
+- A row outside the range, or with a NULL in a key column, fails the attach
+  (`partition constraint … is violated by some row`). So does a duplicate
+  under the parent's key, a row the parent's foreign key does not find, and a
+  row of the parent's DEFAULT partition inside the range.
+- A column the table dropped before the attach stays `attislocal`.
+
+**The shape**, refused by name (`AttachedShape`) as a change for an earlier
+plan. The table must hold:
+
+- its parent's columns, by name and in order, with the same types (in the
+  dialect's spelling), collations, identities and generations;
+- NOT NULL wherever its parent's columns are;
+- no primary key, or one on the parent's key columns;
+- no unique constraint or foreign key that is not one of the parent's,
+  matched one to one by definition, storage parameters aside as the engine
+  matches them;
+- each of the parent's checks under the same name;
+- no replica identity, no `data:` and no other setting a partition does not
+  hold;
+- no trigger on it, and no foreign key of another table referencing it.
+
+The parent must be a partitioned table before the plan. A DEFAULT bound is
+refused: attaching as the DEFAULT partition is #1639.
+
+**What it keeps of its own** is compared with the declaration as a standing
+partition's is (DEC-1581.1). The differ reads the table as the engine leaves
+it after the attach:
+
+- the indexes the parent's do not match, storage parameters aside, and the
+  checks that are not the parent's;
+- its persistence and storage parameters;
+- a default whose text is not its parent's;
+- a NOT NULL its parent's column does not have.
+
+The table's kinds and `SetPartitionDefault`/`SetPartitionNotNull` then bring it
+to the declaration: a drop in class 2 before the attach, everything else
+after it. A column with no default where its parent's has one has nothing the
+model can hold, so it takes its parent's back (`SetPartitionDefault` with the
+fallback) unless it declares its own. `refuse_partition_changes` admits
+these changes on a table the plan attaches.
+
+**Identity.** A table that holds column uids and is declared as a partition
+is the one being attached. Its column uids leave the ids file, and the file's
+diff in git records it. This is not a drop: no row or column goes, so there is
+no tombstone and no drop intent. The parent's uids are untouched, so none is
+duplicated. A plan the differ refuses writes no ids file, so a refused attach
+loses no uid. A later detach gives the columns uids again (DEC-1544.1).
+
+**The change.** `AttachPartition { uid, table, parent, bound, shape }`, plan
+version 32. It sorts in class 7 with a created partition's `CREATE`, after
+the detaches and drops of class 6 that free a range. Its risk is
+`constraint`: no row leaves, but the engine checks every row against the
+bound and builds or checks the parent's keys and foreign keys over them. SQL
+Server refuses it.
+
+**The statement** is one `ALTER TABLE parent ATTACH PARTITION t FOR VALUES …`,
+pbps's alone and every name qualified, so it runs on the empty path
+(DEC-1564.1). The estimate says it reads every row and holds the table
+exclusively. Avoiding the scan with a CHECK that implies the bound was left to
+#1638 by the maintainer's choice.
+
+**The pre-flight** asks two counts, before any statement:
+
+- the table's rows outside the range or with a NULL key column, counted
+  against the parent's key;
+- the DEFAULT partition's rows inside the range, the probe a created
+  partition already asks (DEC-1171.1).
+
+A duplicate under the parent's key and a row the parent's foreign key does
+not find are not counted. The engine refuses the attach on either, a
+transactional apply changes nothing, and the `constraint` risk names the
+hazard before approval.
+
+**The apply's hold.** Once the table reads back as a partition, it is held to
+the declared shape, as a created table is. A staged read taken before the
+attach has run compares it as the ordinary table it was. An attach the plan
+leaves `UNLOGGED` is a new unlogged partition under the parent's referencing
+keys, refused as a created one is (DEC-1595.1).
+
+**The reader** skips a dropped column when it asks whether a partition's
+columns are inherited. Dropping a column is the remedy the shape refusal
+names, and the attach otherwise leaves a tree the model would not read
+(amends DEC-1170.1).
+
+Pinned on 16 and 18 by the CLI's
+`a_table_is_attached_as_a_partition_through_the_cli`:
+
+- an extra column is refused by name and the ids file is left unchanged;
+- after the column is dropped, the attach is refused without its risk;
+- the pre-flight refuses a row outside the range and a DEFAULT-partition row
+  inside it, and nothing changes;
+- once those rows are gone, the attach applies, `verify` is clean and the
+  next plan is empty;
+- afterwards the rows answer through the parent, the parent's default is back,
+  the matching index is a clone, the dropped own index is gone, the own check
+  stays, and the table's column uids are gone;
+- a table already its parent's shape is attached in a staged apply.
+
+Also by the live `an_attach_counts_the_rows_its_range_does_not_take`, which
+pins a two-column key, NULL keys and `MINVALUE`/`MAXVALUE` against the
+engine's own refusal, and by these unit tests:
+
+- `an_ordinary_table_declared_as_a_partition_is_attached`;
+- `an_attached_table_is_held_to_its_shape_once_it_is_a_partition`;
+- `a_table_is_attached_in_one_unscoped_statement`;
+- `a_partition_change_under_a_standing_parent_is_probed`;
+- `an_unlogged_partition_under_a_permanent_key_is_refused_by_name`.

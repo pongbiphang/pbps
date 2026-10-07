@@ -4668,6 +4668,121 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
     }
 }
 
+/// The pre-flight count of a table's rows outside the range it is attached
+/// over agrees with the engine (#1545): over a two-column key, a row below,
+/// above or with a NULL in either key column is outside, and the engine
+/// refuses the attach while one is there and takes it once none is, with a
+/// bound of values and one of `MINVALUE` and `MAXVALUE` alike. On 16 and 18.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn an_attach_counts_the_rows_its_range_does_not_take() {
+    use pbps_model::{BoundDatum as D, Change, PartitionBound as B};
+
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
+    for connection in [conn_str(), old] {
+        let database = format!("pbps_test_part1545_{}", std::process::id());
+        let mut admin = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+        admin
+            .execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+            .await
+            .expect("clear a database left by an earlier run");
+        admin
+            .execute(&format!("CREATE DATABASE {database}"))
+            .await
+            .expect("create the database");
+        let own = connection.replace("dbname=pbps_test", &format!("dbname={database}"));
+        assert_ne!(
+            own, connection,
+            "the fixture names its database `pbps_test`"
+        );
+        let mut conn = Conn::connect(Driver::Postgres, &own).await.unwrap();
+        let s = emit_schema("part1545");
+        fresh(&mut conn, &s).await;
+        conn.execute(&format!(
+            "CREATE TABLE {s}.m (a integer, b integer) PARTITION BY RANGE (a, b);
+             CREATE TABLE {s}.m_rest PARTITION OF {s}.m DEFAULT;
+             CREATE TABLE {s}.t (a integer, b integer);
+             INSERT INTO {s}.t VALUES (5, 1), (5, 9), (6, 0), (4, 100), (NULL, 1), (5, NULL);
+             CREATE TABLE {s}.u (a integer, b integer);
+             INSERT INTO {s}.u VALUES (7, -1000), (7, 1000), (8, 0), (NULL, NULL);"
+        ))
+        .await
+        .expect("the tables");
+        let pg = Postgres::new();
+        let value = |v: &str| D::Value(v.to_owned());
+        let attach = |table: &str, from: Vec<D>, to: Vec<D>| pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(Change::AttachPartition {
+                uid: "t_aaaaaa".parse().unwrap(),
+                table: TableName::new(&s, table),
+                parent: TableName::new(&s, "m"),
+                bound: B::Range { from, to },
+                shape: Box::default(),
+            })],
+        };
+        for (table, step, outside, cleared) in [
+            (
+                "t",
+                attach(
+                    "t",
+                    vec![value("5"), value("0")],
+                    vec![value("6"), value("0")],
+                ),
+                4,
+                format!("DELETE FROM {s}.t WHERE a IS DISTINCT FROM 5 OR b IS NULL"),
+            ),
+            (
+                "u",
+                attach(
+                    "u",
+                    vec![value("7"), D::MinValue],
+                    vec![value("7"), D::MaxValue],
+                ),
+                2,
+                format!("DELETE FROM {s}.u WHERE a IS DISTINCT FROM 7"),
+            ),
+        ] {
+            let probes = pg.preflight(&step).probes;
+            assert_eq!(probes.len(), 2, "{probes:?}");
+            assert!(
+                probes[0].description.contains("outside the range"),
+                "{probes:?}"
+            );
+            assert_eq!(counted(&mut conn, &probes[0].sql).await, outside, "{table}");
+            assert_eq!(counted(&mut conn, &probes[1].sql).await, 0, "{table}");
+            let sql: String = pg
+                .emit(&step.changes[0].change, Default::default())
+                .expect("emit")
+                .into_iter()
+                .map(|statement| statement.sql)
+                .collect();
+            let refused = conn
+                .execute(&sql)
+                .await
+                .expect_err("rows outside the range");
+            assert!(
+                format!("{refused:?}").contains("violated by some row"),
+                "{table}: {refused:?}"
+            );
+            conn.execute(&cleared)
+                .await
+                .expect("the rows outside cleared");
+            assert_eq!(counted(&mut conn, &probes[0].sql).await, 0, "{table}");
+            conn.execute(&sql)
+                .await
+                .expect("attached once none is outside");
+        }
+        assert_eq!(
+            counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.m")).await,
+            4
+        );
+        drop(conn);
+        admin
+            .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .await
+            .expect("drop the database");
+    }
+}
+
 /// A detach locks the parent before it renames anything on the partition,
 /// the order every query on the tree takes them in (#1544). The other order
 /// deadlocks against a reader that holds the parent and has not reached the

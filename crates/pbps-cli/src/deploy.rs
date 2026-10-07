@@ -533,17 +533,31 @@ pub(crate) fn unlogged_partitions_created(
 ) -> Vec<(&TableName, &TableName)> {
     cs.changes
         .iter()
-        .filter_map(|p| {
-            let pbps_model::Change::CreateTable { name, table, .. } = &p.change else {
-                return None;
-            };
-            table
-                .partition_of
-                .as_ref()
-                .filter(|_| table.unlogged)
-                .map(|of| (name, &of.parent))
-        })
+        .filter_map(|p| unlogged_partition(&p.change))
         .collect()
+}
+
+/// The partition `change` leaves `UNLOGGED`, with its parent: one it creates
+/// so, or a table it attaches that the plan leaves so, which is a new
+/// partition under the parent's referencing keys all the same (#1545).
+fn unlogged_partition(change: &pbps_model::Change) -> Option<(&TableName, &TableName)> {
+    if let pbps_model::Change::CreateTable { name, table, .. } = change {
+        return table
+            .partition_of
+            .as_ref()
+            .filter(|_| table.unlogged)
+            .map(|of| (name, &of.parent));
+    }
+    if let pbps_model::Change::AttachPartition {
+        table,
+        parent,
+        shape,
+        ..
+    } = change
+    {
+        return shape.unlogged.then_some((table, parent));
+    }
+    None
 }
 
 /// Refuses an `UNLOGGED` partition this plan creates under a parent that a
@@ -621,20 +635,7 @@ pub(crate) fn refuse_permanent_referencers(
     };
     let mut lines = Vec::new();
     for (at, p) in cs.changes.iter().enumerate() {
-        let Change::CreateTable {
-            name: partition,
-            table,
-            ..
-        } = &p.change
-        else {
-            continue;
-        };
-        let Some(parent) = table
-            .partition_of
-            .as_ref()
-            .filter(|_| table.unlogged)
-            .map(|of| &of.parent)
-        else {
+        let Some((partition, parent)) = unlogged_partition(&p.change) else {
             continue;
         };
         for r in referencers.iter().filter(|r| &r.parent == parent) {
@@ -651,10 +652,17 @@ pub(crate) fn refuse_permanent_referencers(
                 format!(" (on its partition {} as `{}`)", r.table, r.key)
             };
             lines.push(format!(
-                "{partition} would be created unlogged under {parent}, which {}'s foreign key \
+                "{partition} would be {} unlogged under {parent}, which {}'s foreign key \
                  `{}`{through} references; a crash would empty {partition} and leave rows of {} \
                  referencing nothing",
-                r.root_table, r.root_key, r.table
+                if matches!(p.change, Change::AttachPartition { .. }) {
+                    "attached"
+                } else {
+                    "created"
+                },
+                r.root_table,
+                r.root_key,
+                r.table
             ));
         }
     }
@@ -3221,6 +3229,7 @@ fn refuse_unplanned_movement(
     // carries (#1467 review).
     let mut created_uids: BTreeMap<&TableName, &pbps_model::Uid> = BTreeMap::new();
     let mut detached: BTreeSet<&TableName> = BTreeSet::new();
+    let mut attached: BTreeSet<&TableName> = BTreeSet::new();
     // The parts this plan puts on a table by a change of its own. A created
     // table's `CREATE` payload is *not* everything it will hold: the differ
     // takes the foreign keys out of it (`std::mem::take`) and emits each as
@@ -3384,6 +3393,13 @@ fn refuse_unplanned_movement(
         if let pbps_model::Change::DetachPartition { table, shape, .. } = &p.change {
             created.insert(table, shape.as_ref());
             detached.insert(table);
+        }
+        // And an attached one, once it reads as a partition: before its
+        // attach has run, a staged read finds the ordinary table it was, and
+        // compares it as one (#1545).
+        if let pbps_model::Change::AttachPartition { table, shape, .. } = &p.change {
+            created.insert(table, shape.as_ref());
+            attached.insert(table);
         }
         if let pbps_model::Change::SetReplicaIdentity { uid, table, to } = &p.change {
             identities.insert(uid, (to.as_ref(), table));
@@ -3674,7 +3690,14 @@ fn refuse_unplanned_movement(
         // certify the replacement against itself (decision 458). Comparable
         // structure is held to the declaration; engine-rewritten expressions
         // still use presence, as SPEC 7.6 requires.
-        if let (Some(declared), Some(now)) = (created.get(now_name), after.tables.get(now_name)) {
+        let not_yet_attached = attached.contains(now_name)
+            && after
+                .tables
+                .get(now_name)
+                .is_some_and(|t| t.partition_of.is_none());
+        if let (Some(declared), Some(now)) = (created.get(now_name), after.tables.get(now_name))
+            && !not_yet_attached
+        {
             let no_parts = BTreeSet::new();
             let planned = added_parts.get(now_name).unwrap_or(&no_parts);
             let mut named = |kind: &str,
@@ -3933,9 +3956,10 @@ fn refuse_unplanned_movement(
                 ));
             }
         }
-        // Held to its declared shape above; its partition held nothing to
-        // compare it with.
-        if detached.contains(now_name) {
+        // Held to its declared shape above: a detached table's partition held
+        // nothing to compare it with, and an attached table's columns are its
+        // parent's now (#1545).
+        if detached.contains(now_name) || (attached.contains(now_name) && !not_yet_attached) {
             continue;
         }
         if let (Some(was), Some(now)) = (before.tables.get(name), after.tables.get(now_name)) {
@@ -4430,6 +4454,7 @@ fn refuse_unplanned_movement(
                         pbps_model::Change::CreateTable { .. }
                         | pbps_model::Change::DropTable { .. }
                         | pbps_model::Change::DetachPartition { .. }
+                        | pbps_model::Change::AttachPartition { .. }
                         | pbps_model::Change::RenameTable { .. }
                         | pbps_model::Change::AddColumn { .. }
                         | pbps_model::Change::DropColumn { .. }
@@ -9986,6 +10011,91 @@ mod tests {
             .expect("no history to collide");
     }
 
+    /// A table this plan attaches is held to its declared shape once it reads
+    /// as a partition, as a created one is, and compared as the ordinary
+    /// table it was before then (#1545): neither read is movement, and
+    /// something another session adds to it is, before the attach or after.
+    #[test]
+    fn an_attached_table_is_held_to_its_shape_once_it_is_a_partition() {
+        use pbps_model::{
+            Change, ChangeSet, Column, PartitionBound, PartitionBy, PartitionOf, PlannedChange,
+            Table,
+        };
+        let column = || Column::new("integer".parse().unwrap());
+        let parent = Table {
+            columns: [("id".to_owned(), column())].into_iter().collect(),
+            partition_by: Some(PartitionBy {
+                columns: vec!["id".into()],
+            }),
+            ..Table::default()
+        };
+        let ordinary = Table {
+            columns: [("id".to_owned(), column())].into_iter().collect(),
+            ..Table::default()
+        };
+        let shape = Table {
+            partition_of: Some(PartitionOf {
+                parent: TableName::new("app", "ev"),
+                bound: PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Table::default()
+        };
+        let schema = |t: &Table| {
+            let mut s = Schema::default();
+            s.tables.insert(TableName::new("app", "ev"), parent.clone());
+            s.tables.insert(TableName::new("app", "t"), t.clone());
+            s
+        };
+        let changes = ChangeSet {
+            changes: vec![PlannedChange::new(Change::AttachPartition {
+                uid: "t_aaaaaa".parse().unwrap(),
+                table: TableName::new("app", "t"),
+                parent: TableName::new("app", "ev"),
+                bound: PartitionBound::Default,
+                shape: Box::new(shape.clone()),
+            })],
+        };
+        let before = schema(&ordinary);
+        let held = |after: &Schema, settled: Settled| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                &changes,
+                &before,
+                after,
+                "prod",
+                settled,
+            )
+            .map_err(|e| format!("{e:#}"))
+        };
+        held(&before, Settled::SoFar).expect("not attached yet");
+        held(&schema(&shape), Settled::Whole).expect("attached as declared");
+        // Negative: an index another session adds, after the attach and
+        // before it.
+        let index = pbps_model::Index {
+            columns: vec![pbps_model::IndexColumn {
+                key: pbps_model::IndexKey::Column("id".to_owned()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
+        let mut moved = shape.clone();
+        moved.indexes.insert("x".into(), index.clone());
+        let e = held(&schema(&moved), Settled::Whole).expect_err("an index of its own");
+        assert!(
+            e.contains("app.t index `x` is there, and this plan declares no such index"),
+            "{e}"
+        );
+        let mut moved = ordinary.clone();
+        moved.indexes.insert("x".into(), index);
+        held(&schema(&moved), Settled::SoFar).expect_err("an index before the attach");
+    }
+
     /// An unlogged partition this plan creates under a parent a permanent
     /// table's key references is refused, naming the table and the key
     /// (#1595, DEC-1595.1). Not refused: a permanent partition, a key under
@@ -10035,6 +10145,35 @@ mod tests {
         refused(vec![partition(false)], &parent).expect("a permanent partition");
         refused(vec![partition(true)], &TableName::new("app", "other"))
             .expect("a key to another parent");
+        // A table attached unlogged is a new partition under the key all
+        // the same (#1545), and one attached permanent is not.
+        let attach = |unlogged: bool| {
+            PlannedChange::new(Change::AttachPartition {
+                uid: "t_bbbbbb".parse().unwrap(),
+                table: TableName::new("app", "t"),
+                parent: parent.clone(),
+                bound: PartitionBound::Default,
+                shape: Box::new(Table {
+                    unlogged,
+                    ..Table::default()
+                }),
+            })
+        };
+        let e = refused(vec![attach(true)], &parent).unwrap_err();
+        assert!(
+            e.contains("app.t would be attached unlogged under app.ev, which ext.r's foreign key `r_ev_fkey` references"),
+            "{e}"
+        );
+        refused(vec![attach(false)], &parent).expect("a permanent attach");
+        assert_eq!(
+            unlogged_partitions_created(&ChangeSet {
+                changes: vec![attach(true), attach(false), partition(true)],
+            }),
+            [
+                (&TableName::new("app", "t"), &parent),
+                (&TableName::new("app", "ev_u"), &parent)
+            ]
+        );
         let renamed = TableName::new("ext", "r2");
         for (what, first) in [
             (

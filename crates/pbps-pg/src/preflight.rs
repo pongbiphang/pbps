@@ -818,6 +818,7 @@ impl AsStored {
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::DetachPartition { .. }
+                | Change::AttachPartition { .. }
                 | Change::PublicExecution { .. } => {}
             }
         }
@@ -3418,6 +3419,7 @@ fn build(
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::DetachPartition { .. }
+        | Change::AttachPartition { .. }
         | Change::PublicExecution { .. } => Ok(Vec::new()),
     }
 }
@@ -3666,6 +3668,7 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::PublicExecution { .. } => Vec::new(),
         };
         for (table, name, constraint) in keys {
@@ -3794,7 +3797,7 @@ fn partition_probes(
             && !created.contains(&of.parent)
         {
             let leaving = dropped.get(&of.parent).map_or(&[][..], Vec::as_slice);
-            partition_range_probe(name, &of.parent, from, to, leaving)
+            partition_range_probe(name, &of.parent, from, to, leaving, "create a partition")
         } else if let Change::DropTable {
             name,
             detach_from: Some(parent),
@@ -3810,6 +3813,24 @@ fn partition_probes(
             // partition's key becomes its own on the detach, and still
             // references the parent (#1544).
             partition_reference_probe(table, parent, names, &dropped_before)
+        } else if let Change::AttachPartition {
+            table,
+            parent,
+            bound: pbps_model::PartitionBound::Range { from, to },
+            ..
+        } = &p.change
+        {
+            // Two questions, as a created partition's one: the table's own
+            // rows outside the range, which the engine refuses to attach
+            // over, and the DEFAULT partition's inside it (#1545).
+            let leaving = dropped.get(parent).map_or(&[][..], Vec::as_slice);
+            match attach_range_probe(table, parent, from, to) {
+                Ok(probe) => out.push(probe),
+                Err(error) => {
+                    unchecked.push(Unchecked::for_change(&p.change, error.to_string()));
+                }
+            }
+            partition_range_probe(table, parent, from, to, leaving, "attach a table")
         } else {
             continue;
         };
@@ -3882,6 +3903,7 @@ fn partition_range_probe(
     from: &[pbps_model::BoundDatum],
     to: &[pbps_model::BoundDatum],
     leaving: &[&TableName],
+    making: &str,
 ) -> Result<Probe, DialectError> {
     let not_null = "(SELECT pg_catalog.string_agg('r.' || pg_catalog.quote_ident(a.attname) || \
                     ' IS NOT NULL', ' AND ' ORDER BY k.n) \
@@ -3908,8 +3930,53 @@ fn partition_range_probe(
     Ok(Probe::new(
         format!(
             "rows of {parent} inside the range of its new partition {partition}: they are in its \
-             DEFAULT partition now, and the engine will not create a partition over them; move \
-             or delete them first, then plan again"
+             DEFAULT partition now, and the engine will not {making} over them; move or delete \
+             them first, then plan again"
+        ),
+        format!(
+            "SELECT {}",
+            saturated_count(&format!(
+                "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()', \
+                 pg_catalog.query_to_xml({text}, false, true, '')))[1]::text::numeric \
+                 FROM pg_catalog.pg_partitioned_table pt \
+                 WHERE pt.partrelid = pg_catalog.to_regclass({})), 0)",
+                value_literal(&qualified(parent)?)
+            ))
+        ),
+    ))
+}
+
+/// The rows of `table`, about to be attached to `parent` over the range from
+/// `from` to `to`, that the range does not take: outside it, or with a NULL
+/// in any key column. The engine scans for them and refuses the attach on the
+/// first (`partition constraint of relation … is violated by some row`),
+/// measured on 16 and 18 (#1545). The key is the parent's, and the table's
+/// columns are its parent's by name.
+fn attach_range_probe(
+    table: &TableName,
+    parent: &TableName,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+) -> Result<Probe, DialectError> {
+    let not_null = "(SELECT pg_catalog.string_agg('r.' || pg_catalog.quote_ident(a.attname) || \
+                    ' IS NOT NULL', ' AND ' ORDER BY k.n) \
+                    FROM pg_catalog.unnest(pt.partattrs::int2[]) WITH ORDINALITY AS k(attnum, n) \
+                    JOIN pg_catalog.pg_attribute a \
+                    ON a.attrelid = pt.partrelid AND a.attnum = k.attnum)";
+    let text = format!(
+        "{} || {not_null} || ' AND ' || {} || ' AND ' || {} || ')'",
+        value_literal(&format!(
+            "SELECT count(*) AS n FROM {} AS r WHERE NOT (",
+            qualified(table)?
+        )),
+        range_end(from, true),
+        range_end(to, false),
+    );
+    Ok(Probe::new(
+        format!(
+            "rows of {table} outside the range it takes under {parent}, or with a NULL in its \
+             partition key: the engine will not attach it over them; move or delete them first, \
+             then plan again"
         ),
         format!(
             "SELECT {}",
@@ -4259,6 +4326,44 @@ mod tests {
         });
         assert_eq!(dropped.len(), 1, "{dropped:?}");
         assert!(dropped[0].description.contains("reference app.ev_1"));
+        // An attach asks two (#1545): the table's own rows outside its
+        // range, counted against the parent's key, and the DEFAULT
+        // partition's inside it, which a create asks too.
+        let attach = |bound: B| {
+            probes(&ChangeSet {
+                changes: vec![pbps_model::PlannedChange::new(Change::AttachPartition {
+                    uid: "t_cccccc".parse().unwrap(),
+                    table: "app.t".parse().unwrap(),
+                    parent: "app.ev".parse().unwrap(),
+                    bound,
+                    shape: Box::default(),
+                })],
+            })
+        };
+        let attached = attach(B::Range {
+            from: vec![pbps_model::BoundDatum::Value("2024-01-01".into())],
+            to: vec![pbps_model::BoundDatum::Value("2025-01-01".into())],
+        });
+        assert_eq!(attached.len(), 2, "{attached:?}");
+        assert!(
+            attached[0]
+                .description
+                .contains("rows of app.t outside the range it takes under app.ev"),
+            "{attached:?}"
+        );
+        let sql = &attached[0].sql;
+        assert!(sql.contains("FROM \"app\".\"t\" AS r WHERE NOT ("), "{sql}");
+        assert!(sql.contains("IS NOT NULL"), "{sql}");
+        assert!(sql.contains("to_regclass(E'\"app\".\"ev\"')"), "{sql}");
+        assert!(sql.starts_with("SELECT LEAST("), "{sql}");
+        assert!(
+            attached[1]
+                .description
+                .contains("will not attach a table over them"),
+            "{attached:?}"
+        );
+        // Negative: a DEFAULT bound, which the differ refuses, asks nothing.
+        assert!(attach(B::Default).is_empty());
     }
 
     #[test]

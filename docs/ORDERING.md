@@ -159,6 +159,7 @@ requirement is common to all of them, so it is listed once,
 | `DropTable` | 6 | Inbound foreign keys and dependent modules gone | Removes the table, frees its name |
 | `DetachPartition` | 6 | P: no row referencing the partition through a foreign key to its parent (pre-flight) | The partition leaves its parent with its rows, as an ordinary table under the declared names; frees its range (DEC-1544.1) |
 | `CreateTable` | 7 | The name free, its types. Functions its defaults, checks and generated columns call: *content* | The table, columns, key, uniques, checks, indexes |
+| `AttachPartition` | 7 | The parent standing; the table already its parent's columns, order and parent's checks (refused otherwise). P: no row of the table outside its range, none in the parent's DEFAULT partition inside it (pre-flight) | The table becomes a partition with its rows; its columns become its parent's, its matching keys and indexes clones, and the rest its own; takes its range (DEC-1545.1) |
 | `AddColumn` | 8 | The table, the name free. A generated column's inputs; functions its default or expression calls: *content* | The column, backfilled |
 | `AlterColumnType` | 9 | What blocks a retype gone. S: keys, indexes, checks, foreign keys. P: views and rules (`weave`), generated readers (refused). An old default dropped first | Converted values |
 | `AlterColumnNullability` | 9 | Tightening: the values non-null | Accepts or refuses NULL |
@@ -265,6 +266,7 @@ and the expression-bearing changes that need a function.
 |---|---|---|---|
 | `CreateTable` → rows, keys, foreign keys, modules and grants on it | fixed | class 7 before 11, 13, 14, 16 | ✓ |
 | `CreateTable` of a partitioned parent → `CreateTable` of its partition | fixed | (7, 2) after the rest of class 7 | ✓ DEC-1170.1 |
+| `AttachPartition` → the partition's own `SetPartitionDefault`, `SetPartitionNotNull`, `SetTablePersistence`, `SetStorageParameters`, `AddIndex` and `AddCheck` | fixed | class 7 before 9, 10 and 13; each acts on the partition alone once attached | ✓ DEC-1545.1 |
 | `AddColumn` → rows, constraints, modules naming it | fixed | class 8 before 11, 13, 14 | ✓ |
 | `AddColumn` (input) → generated `AddColumn` reading it | fixed | (9, 2) after class 8 | ✓ DEC-1168.1 |
 | `AlterColumnType` of an existing input → generated `AddColumn` reading it | fixed | (9, 2) after the in-place alterations: a standing generated reader blocks the retype | ✓ DEC-1168.1 |
@@ -312,6 +314,8 @@ one class and the dependents a class cannot see.
 | `DropTable` of a partition → `CreateTable` of a partition over its range | fixed | class 6 before 7; the new range's pre-flight count leaves the dropped partition's rows out | ✓ DEC-1171.1 |
 | `DropTable` → `DetachPartition` claiming a name the dropped table's index or key holds | fixed | (6, 1) before (6, 2) | ✓ DEC-1544.1 |
 | `DetachPartition` → `CreateTable` of a partition over its range | fixed | class 6 before 7; the new range's pre-flight count leaves the detached partition's rows out | ✓ DEC-1544.1 |
+| `DropTable` or `DetachPartition` of a partition → `AttachPartition` over its range | fixed | class 6 before 7; the new range's pre-flight count leaves the leaving partition's rows out | ✓ DEC-1545.1 |
+| A table's own `DropIndex` or `DropCheck` → its `AttachPartition` | fixed | class 2 before 7; the engine takes either order, an own index or check staying the table's across the attach | ✓ DEC-1545.1 |
 | `SetPrimaryKey { to: None }` → relaxing a key column's nullability | fixed | class 2 before 9 | ✓ DECISIONS 269 |
 | Generated column → its input's drop | fixed | (5, 0); (2, 2) beside a rename | ✓ DEC-1168.1 |
 | S: index, unique or check over a computed column → its drop, and its re-add around an expression change | fixed | dropped in class 2 before (2, 4), re-added in 13 (`recreate_retyped_dependents`) | ✓ DEC-1174.1 |

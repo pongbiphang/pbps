@@ -342,6 +342,42 @@ impl Declared {
                         renamed(crate::DetachedKind::Index, of)
                     });
                 }
+                // The attached table keeps its own defaults, checks and
+                // indexes where they stand, under its own name; an index its
+                // parent's matches becomes a clone, which the parent's
+                // records answer for (#1545). The declared text is the
+                // shape's, as a created table's is its payload's, and a
+                // binding stays only with an object the shape still holds as
+                // its own: the partition's later changes re-record the rest.
+                Change::AttachPartition { table, shape, .. } => {
+                    let fresh = Self::from_schema(&Schema {
+                        tables: [(table.clone(), (**shape).clone())].into_iter().collect(),
+                        ..Schema::default()
+                    });
+                    let mut defaults = self.bindings.defaults.remove(table).unwrap_or_default();
+                    let mut checks = self.bindings.checks.remove(table).unwrap_or_default();
+                    let mut filters = self.bindings.filters.remove(table).unwrap_or_default();
+                    self.forget_table(table);
+                    let held = |map: &BTreeMap<TableName, BTreeMap<String, String>>,
+                                key: &String| {
+                        map.get(table).is_some_and(|m| m.contains_key(key))
+                    };
+                    defaults.retain(|column, _| held(&fresh.expressions.defaults, column));
+                    checks.retain(|name, _| held(&fresh.expressions.checks, name));
+                    filters.retain(|name, _| held(&fresh.expressions.filters, name));
+                    for (map, kept) in [
+                        (&mut self.bindings.defaults, defaults),
+                        (&mut self.bindings.checks, checks),
+                        (&mut self.bindings.filters, filters),
+                    ] {
+                        if !kept.is_empty() {
+                            map.insert(table.clone(), kept);
+                        }
+                    }
+                    self.expressions.defaults.extend(fresh.expressions.defaults);
+                    self.expressions.checks.extend(fresh.expressions.checks);
+                    self.expressions.filters.extend(fresh.expressions.filters);
+                }
                 Change::RenameTable { from, to, .. } => {
                     rekey_table(&mut self.expressions.defaults, from, to);
                     rekey_table(&mut self.expressions.generated, from, to);
