@@ -700,7 +700,11 @@ pub async fn order_created_object_names(
     schemas.dedup();
     pbps_mssql::catalog::prove_schemas_visible(conn, &schemas)
         .await
-        .map_err(|e| anyhow::anyhow!("cannot prove the names this plan creates are free: {e}"))?;
+        // As context, never interpolated: a driver frame has to reach
+        // `ledger_safe_reason` intact to be redacted (DECISIONS 455).
+        .map_err(|e| {
+            anyhow::Error::new(e).context("cannot prove the names this plan creates are free")
+        })?;
     // Which of the plan's own names are one under the database's
     // collation (#1215).
     let candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
@@ -724,14 +728,20 @@ pub async fn prove_tables_absent(conn: &mut Conn, missing: &[TableName]) -> anyh
     schemas.dedup();
     pbps_mssql::catalog::prove_schemas_visible(conn, &schemas)
         .await
-        .map_err(|e| {
-            let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
-            anyhow::anyhow!(
-                "cannot record {} as missing: {e}. Record the state with a login that can see \
-                 those schemas, so a table hidden from this one is not taken for one that is gone",
-                names.join(", ")
-            )
-        })
+        .map_err(|e| absence_unproven(missing, e))
+}
+
+/// Why [`prove_tables_absent`] refused. The source error is kept as one,
+/// never interpolated: a driver frame has to reach `ledger_safe_reason`
+/// intact to be redacted, and a failed bootstrap records this (DECISIONS 455,
+/// #1605 review).
+fn absence_unproven(missing: &[TableName], error: DbError) -> anyhow::Error {
+    let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
+    anyhow::Error::new(error).context(format!(
+        "cannot record {} as missing; record the state with a login that can see those \
+         schemas, so a table hidden from this one is not taken for one that is gone",
+        names.join(", ")
+    ))
 }
 
 /// Which requested names occur in an already captured table inventory.
@@ -2964,6 +2974,29 @@ mod tests {
             "SQLSTATE is a PostgreSQL word; SQL Server's own code is not one \
              (this same wording renders both): {rendered}"
         );
+    }
+
+    /// #1605 review: the absence proof's refusal keeps a driver failure as
+    /// its source, so a failed bootstrap's ledger row is redacted still, and
+    /// the operator reads both the refusal and its cause.
+    #[test]
+    fn an_unproven_absence_keeps_its_driver_frame_redactable() {
+        let refused = absence_unproven(
+            &["other.t".parse().unwrap()],
+            DbError::Driver {
+                message: "server says super-secret-abc".to_owned(),
+                code: Some("229".to_owned()),
+            },
+        );
+        let recorded = ledger_safe_reason(&refused);
+        assert!(!recorded.contains("super-secret-abc"), "{recorded}");
+        assert!(
+            recorded.contains("cannot record other.t as missing"),
+            "{recorded}"
+        );
+        assert!(recorded.contains("229"), "{recorded}");
+        // Negative: what the operator reads still names the cause.
+        assert!(format!("{refused:#}").contains("super-secret-abc"));
     }
 
     /// A driver failure with no code at all (a broken protocol, not a
