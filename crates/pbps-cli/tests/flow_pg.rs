@@ -18525,3 +18525,76 @@ fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
         clean("doctor", d.run(&["doctor", "--db", connection]));
     }
 }
+
+/// An unlogged partition under a parent that a table outside the
+/// declarations references through a permanent key is refused by name
+/// (#1595, DEC-1595.1): at `plan --db`, and again at the apply of a plan
+/// made before that key arrived, before its first statement. The engine
+/// takes the partition all the same, so nothing else would. Not refused: an
+/// unlogged referencing table, which a crash empties too, and a permanent
+/// partition.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_unlogged_partition_under_an_undeclared_permanent_key_is_refused() {
+    let server = server();
+    let db = OwnDatabase::new(&server, "parts-1595");
+    let conn = db.connection().to_owned();
+    on_server(
+        &conn,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (id integer PRIMARY KEY) PARTITION BY RANGE (id); \
+         CREATE TABLE app.ev_1 PARTITION OF app.ev FOR VALUES FROM (0) TO (10)",
+    );
+    let d = Demo::new("parts-1595");
+    succeeds(d.run(&["pull", "--db", &conn]));
+    let path = d.dir.join("schema/app.ev.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+    // Outside the declarations: a permanent table and an unlogged one, each
+    // with a key to the parent.
+    on_server(
+        &conn,
+        "CREATE SCHEMA ext; \
+         CREATE TABLE ext.r (id integer REFERENCES app.ev); \
+         CREATE UNLOGGED TABLE ext.u (id integer REFERENCES app.ev)",
+    );
+    let declare = |unlogged: bool| {
+        let partition = if unlogged {
+            "  ev_2:\n    from: [\"10\"]\n    to: [\"20\"]\n    unlogged: true\n"
+        } else {
+            "  ev_2: {from: [\"10\"], to: [\"20\"]}\n"
+        };
+        std::fs::write(&path, format!("{text}{partition}")).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+    };
+    let named = "app.ev_2 would be created unlogged under app.ev, which ext.r's foreign key \
+                 `r_id_fkey` references";
+    let absent = || scalar(&conn, "SELECT (to_regclass('app.ev_2') IS NULL)::int::int8");
+
+    declare(true);
+    let refused = d.run(&["plan", "--db", &conn]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(stderr(&refused).contains(named), "{}", stderr(&refused));
+    assert!(!stderr(&refused).contains("ext.u"), "{}", stderr(&refused));
+
+    // Planned while only the unlogged table held a key, then the permanent
+    // one arrives: the apply refuses before its first statement.
+    on_server(&conn, "DROP TABLE ext.r");
+    let plan = d.dir.join("unlogged.json");
+    succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+    on_server(&conn, "CREATE TABLE ext.r (id integer REFERENCES app.ev)");
+    let refused = approved_apply(&d, &conn, &plan, &[]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(stderr(&refused).contains(named), "{}", stderr(&refused));
+    assert_eq!(absent(), 1, "nothing ran");
+
+    // Negative: a permanent partition under the same key plans and applies.
+    declare(false);
+    let plan = d.dir.join("permanent.json");
+    succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, &conn, &plan, &[]));
+    assert_eq!(absent(), 0);
+    succeeds(d.run(&["verify", "--db", &conn]));
+}

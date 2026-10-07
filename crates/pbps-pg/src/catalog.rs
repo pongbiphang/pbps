@@ -2760,6 +2760,75 @@ pub async fn relation_name_occupants(
     Ok(out)
 }
 
+/// A permanent table whose foreign key references a partitioned table
+/// (#1595). The engine refuses a permanent table's key to an unlogged table,
+/// but not one through a partitioned table that has, or later gets, an
+/// unlogged partition (measured on 16 and 18): a crash empties the partition
+/// and leaves the referencing rows pointing at nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermanentReferencer {
+    /// The partitioned table the key references.
+    pub parent: TableName,
+    /// The table holding the key: an ordinary table, or a permanent leaf
+    /// partition of a partitioned one, which carries a copy of its parent's
+    /// key under the same name.
+    pub table: TableName,
+    pub key: String,
+}
+
+/// The [`PermanentReferencer`]s of `parents`, read in the caller's
+/// transaction. Only tables holding rows are asked about: a partitioned
+/// referencing table holds none, and each of its leaf partitions carries the
+/// key itself, so an unlogged leaf, which a crash empties too, is left out.
+pub async fn permanent_referencers(
+    conn: &mut Conn,
+    parents: &[TableName],
+) -> Result<Vec<PermanentReferencer>, DbError> {
+    if parents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let params: Vec<Param<'_>> = parents
+        .iter()
+        .flat_map(|n| [Param::Str(n.schema.as_str()), Param::Str(n.name.as_str())])
+        .collect();
+    let rows: Vec<String> = (0..parents.len())
+        .map(|i| format!("(${}::text, ${}::text)", 2 * i + 1, 2 * i + 2))
+        .collect();
+    let sql = format!(
+        "WITH wanted(schema_name, table_name) AS (VALUES {})\n\
+         SELECT pn.nspname AS parent_schema, pc.relname AS parent_name,\n       \
+                n.nspname AS table_schema, c.relname AS table_name,\n       \
+                k.conname AS key_name\n  \
+           FROM pg_catalog.pg_constraint k\n  \
+           JOIN pg_catalog.pg_class c ON c.oid = k.conrelid\n  \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n  \
+           JOIN pg_catalog.pg_class pc ON pc.oid = k.confrelid\n  \
+           JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace\n  \
+           JOIN wanted w ON w.schema_name = pn.nspname AND w.table_name = pc.relname\n \
+          WHERE k.contype = 'f' AND c.relkind = 'r' AND c.relpersistence = 'p'\n \
+          ORDER BY 3, 4, 5, 1, 2",
+        rows.join(", ")
+    );
+    let mut out = Vec::new();
+    for row in &conn.query_with(&sql, &params).await? {
+        let text = |column: &str| -> Result<String, DbError> {
+            row.try_get::<&str>(column)?
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    DbError::BadRow(format!(
+                        "the referencing-key query returned a NULL {column}"
+                    ))
+                })
+        };
+        out.push(PermanentReferencer {
+            parent: TableName::new(text("parent_schema")?, text("parent_name")?),
+            table: TableName::new(text("table_schema")?, text("table_name")?),
+            key: text("key_name")?,
+        });
+    }
+    Ok(out)
+}
+
 /// What the catalog calls each declared table's key column collation *now*.
 ///
 /// The one input to the spelling checks that is read from the database rather

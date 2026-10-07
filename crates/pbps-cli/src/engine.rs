@@ -571,6 +571,38 @@ pub async fn refuse_created_name_occupants(
     }
 }
 
+/// Refuses an `UNLOGGED` partition this plan creates under a parent that a
+/// permanent table outside the declarations references (#1595,
+/// DEC-1595.1), asked of the catalog in the caller's transaction. A failed
+/// read is an error, never "no referencers": the engine accepts the
+/// partition, so nothing later would catch what this missed.
+pub async fn refuse_unlogged_partition_referencers(
+    conn: &mut Conn,
+    cs: &ChangeSet,
+) -> anyhow::Result<()> {
+    if conn.driver() != Driver::Postgres {
+        return Ok(());
+    }
+    let parents: Vec<TableName> = crate::deploy::unlogged_partitions_created(cs)
+        .into_iter()
+        .map(|(_, parent)| parent.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if parents.is_empty() {
+        return Ok(());
+    }
+    let referencers = pbps_pg::catalog::permanent_referencers(conn, &parents)
+        .await
+        .map_err(|e| {
+            anyhow::Error::new(e).context(
+                "cannot read the foreign keys that reference a parent this plan adds an unlogged \
+                 partition to",
+            )
+        })?;
+    crate::deploy::refuse_permanent_referencers(cs, &referencers)
+}
+
 /// Orders a SQL Server plan's function drops after the computed columns that
 /// call them, with what each is schema-bound to after it, and refuses what
 /// the catalog's expression edges say the engine will not do (#1431,
