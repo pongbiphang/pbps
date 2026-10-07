@@ -17940,3 +17940,100 @@ fn a_bootstrap_reads_a_routines_own_search_path_as_pulled() {
         "the body reads other.k"
     );
 }
+
+/// #1600: a bootstrap records only the uids of what it built. Declarations
+/// without `app.t` bootstrap a database whose ids file names `app.t` too;
+/// once `app.t` is declared again, the next `plan --db` creates it, `apply`
+/// builds it, and verify and a replan are clean. The same holds for a
+/// `baseline` or a forced `snapshot` taken while a declared table is
+/// missing: the next plan creates it. Negative: a bootstrap of the full declarations still records
+/// every uid, so its replan is clean.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_table_bootstrap_did_not_build_is_created_by_the_next_plan() {
+    let server = server();
+    let source = OwnDatabase::new(&server, "boot-ids");
+    let partial = OwnDatabase::new(&server, "boot-ids-partial");
+    let full = OwnDatabase::new(&server, "boot-ids-full");
+    let (src, part, whole) = (
+        source.connection().to_owned(),
+        partial.connection().to_owned(),
+        full.connection().to_owned(),
+    );
+    on_server(
+        &src,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.t (id integer, note text DEFAULT 'z'); \
+         CREATE TABLE app.a_plain (id integer)",
+    );
+    let d = Demo::new("boot-ids");
+    succeeds(d.run(&["pull", "--db", &src]));
+    d.commit();
+    let schema = d.dir.join("schema");
+    let aside = d.dir.join("aside");
+    std::fs::create_dir_all(&aside).unwrap();
+    let held_back = ["app.t.yml"];
+
+    // Without `app.t`: a bootstrap of `a_plain` alone.
+    for file in held_back {
+        std::fs::rename(schema.join(file), aside.join(file)).unwrap();
+    }
+    d.commit();
+    on_server(&part, "CREATE SCHEMA app");
+    succeeds(d.run(&["bootstrap", "--db", &part]));
+    for file in held_back {
+        std::fs::rename(aside.join(file), schema.join(file)).unwrap();
+    }
+    d.commit();
+
+    // Declared again, it is created by the next plan.
+    let plan = d.dir.join("rest.json");
+    let o = succeeds(d.run(&["plan", "--db", &part, "--out", plan.to_str().unwrap()]));
+    assert!(stdout(&o).contains("app.t"), "{}", stdout(&o));
+    succeeds(approved_apply(&d, &part, &plan, &[]));
+    assert_eq!(
+        scalar(
+            &part,
+            "SELECT count(*) FROM pg_class WHERE oid = to_regclass('app.t')"
+        ),
+        1,
+        "app.t is built"
+    );
+    succeeds(d.run(&["verify", "--db", &part]));
+    let next = succeeds(d.run(&["plan", "--db", &part]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // A baseline taken while a declared table is missing records it as
+    // missing, not held: the next plan creates it.
+    on_server(&part, "DROP TABLE app.a_plain");
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &part,
+        "--reason",
+        "a_plain dropped by hand",
+    ]));
+    let again = d.dir.join("again.json");
+    let o = succeeds(d.run(&["plan", "--db", &part, "--out", again.to_str().unwrap()]));
+    assert!(stdout(&o).contains("app.a_plain"), "{}", stdout(&o));
+    succeeds(approved_apply(&d, &part, &again, &[]));
+    succeeds(d.run(&["verify", "--db", &part]));
+    let next = succeeds(d.run(&["plan", "--db", &part]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // And a forced snapshot, the same way.
+    on_server(&part, "DROP TABLE app.a_plain");
+    succeeds(d.run(&["snapshot", "--db", &part, "--force"]));
+    let third = d.dir.join("third.json");
+    let o = succeeds(d.run(&["plan", "--db", &part, "--out", third.to_str().unwrap()]));
+    assert!(stdout(&o).contains("app.a_plain"), "{}", stdout(&o));
+    succeeds(approved_apply(&d, &part, &third, &[]));
+    succeeds(d.run(&["verify", "--db", &part]));
+
+    // Negative: the full declarations, every uid recorded.
+    on_server(&whole, "CREATE SCHEMA app");
+    succeeds(d.run(&["bootstrap", "--db", &whole]));
+    succeeds(d.run(&["verify", "--db", &whole]));
+    let next = succeeds(d.run(&["plan", "--db", &whole]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}

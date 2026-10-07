@@ -698,12 +698,50 @@ pub async fn order_created_object_names(
         .collect();
     schemas.sort();
     schemas.dedup();
-    pbps_mssql::catalog::prove_schemas_visible(conn, &schemas).await?;
+    pbps_mssql::catalog::prove_schemas_visible(conn, &schemas)
+        .await
+        // As context, never interpolated: a driver frame has to reach
+        // `ledger_safe_reason` intact to be redacted (DECISIONS 455).
+        .map_err(|e| {
+            anyhow::Error::new(e).context("cannot prove the names this plan creates are free")
+        })?;
     // Which of the plan's own names are one under the database's
     // collation (#1215).
     let candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
     let alike = pbps_mssql::catalog::object_names_alike(conn, &candidates).await?;
     crate::object_order::order_occupied_objects_under(cs, &occupants, &alike, label)
+}
+
+/// Proves the tables a catalog read did not return are absent, not hidden,
+/// before a state records them as missing (#1600). On SQL Server `sys.tables`
+/// is filtered by metadata visibility, so a table under an effective `DENY
+/// VIEW DEFINITION`, or in a schema this login cannot view, returns no row
+/// and reads as missing. Recorded as missing, its uid would leave the state
+/// and the table the managed set, silently. The proof is DEC-1192.1's. A
+/// PostgreSQL role reads every row of `pg_class`, so nothing there is hidden.
+pub async fn prove_tables_absent(conn: &mut Conn, missing: &[TableName]) -> anyhow::Result<()> {
+    if conn.driver() != Driver::Mssql || missing.is_empty() {
+        return Ok(());
+    }
+    let mut schemas: Vec<String> = missing.iter().map(|t| t.schema.clone()).collect();
+    schemas.sort();
+    schemas.dedup();
+    pbps_mssql::catalog::prove_schemas_visible(conn, &schemas)
+        .await
+        .map_err(|e| absence_unproven(missing, e))
+}
+
+/// Why [`prove_tables_absent`] refused. The source error is kept as one,
+/// never interpolated: a driver frame has to reach `ledger_safe_reason`
+/// intact to be redacted, and a failed bootstrap records this (DECISIONS 455,
+/// #1605 review).
+fn absence_unproven(missing: &[TableName], error: DbError) -> anyhow::Error {
+    let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
+    anyhow::Error::new(error).context(format!(
+        "cannot record {} as missing; record the state with a login that can see those \
+         schemas, so a table hidden from this one is not taken for one that is gone",
+        names.join(", ")
+    ))
 }
 
 /// Which requested names occur in an already captured table inventory.
@@ -2936,6 +2974,29 @@ mod tests {
             "SQLSTATE is a PostgreSQL word; SQL Server's own code is not one \
              (this same wording renders both): {rendered}"
         );
+    }
+
+    /// #1605 review: the absence proof's refusal keeps a driver failure as
+    /// its source, so a failed bootstrap's ledger row is redacted still, and
+    /// the operator reads both the refusal and its cause.
+    #[test]
+    fn an_unproven_absence_keeps_its_driver_frame_redactable() {
+        let refused = absence_unproven(
+            &["other.t".parse().unwrap()],
+            DbError::Driver {
+                message: "server says super-secret-abc".to_owned(),
+                code: Some("229".to_owned()),
+            },
+        );
+        let recorded = ledger_safe_reason(&refused);
+        assert!(!recorded.contains("super-secret-abc"), "{recorded}");
+        assert!(
+            recorded.contains("cannot record other.t as missing"),
+            "{recorded}"
+        );
+        assert!(recorded.contains("229"), "{recorded}");
+        // Negative: what the operator reads still names the cause.
+        assert!(format!("{refused:#}").contains("super-secret-abc"));
     }
 
     /// A driver failure with no code at all (a broken protocol, not a

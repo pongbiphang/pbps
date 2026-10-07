@@ -3891,6 +3891,86 @@ fn two_added_checks_one_name_under_the_collation_refuse_the_plan() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// #1600 review: a table hidden from this login is not recorded as missing.
+/// `sys.tables` is filtered by metadata visibility, so under a `DENY VIEW
+/// DEFINITION` on schema `other`, `other.t` reads as missing. A `baseline`
+/// or a forced `snapshot` by that login is refused by name rather than
+/// dropping the table's uid from the state, and the state keeps it.
+/// Negative: a table really dropped from a schema the login can see is
+/// recorded as missing, and the next plan creates it.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_hidden_table_is_not_recorded_as_missing() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "hidden_missing");
+    let login = format!("pbps_flow_hidden_missing_{}", std::process::id());
+    // Not a secret: this login exists for one test inside a throwaway container.
+    let password = "pbpsLeastPrivilege!1";
+    on_server(
+        &server,
+        &format!(
+            "IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ),
+    );
+    on_server(
+        own.connection(),
+        &format!(
+            "EXEC(N'CREATE SCHEMA other;'); CREATE TABLE other.t (id int); \
+             CREATE TABLE dbo.keep (id int); \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, UPDATE, DELETE, ALTER, REFERENCES \
+                 ON SCHEMA::dbo TO [{login}]; \
+             GRANT CREATE TABLE, VIEW DEFINITION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}]; \
+             DENY VIEW DEFINITION ON SCHEMA::other TO [{login}];"
+        ),
+    );
+    let d = Demo::new("hidden-missing");
+    let o = d.run(&["pull", "--db", own.connection()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    d.commit();
+    let o = d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let as_login = with_key(
+        &with_key(own.connection(), "User Id", &login),
+        "Password",
+        password,
+    );
+
+    for args in [
+        vec!["baseline", "--db", &as_login, "--reason", "as the login"],
+        vec!["snapshot", "--db", &as_login, "--force"],
+    ] {
+        let o = d.run(&args);
+        assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
+        assert!(
+            stderr(&o).contains("cannot record other.t as missing")
+                && stderr(&o).contains("VIEW DEFINITION on schema other"),
+            "{args:?}: {}",
+            stderr(&o)
+        );
+    }
+    // The state still holds `other.t`: nothing to create, nothing to drop.
+    let o = d.run(&["plan", "--db", own.connection()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+
+    // Negative: dropped from a schema the login sees, `dbo.keep` is missing,
+    // and the next plan creates it.
+    on_server(own.connection(), "DROP TABLE dbo.keep;");
+    on_server(
+        own.connection(),
+        &format!("REVOKE VIEW DEFINITION ON SCHEMA::other FROM [{login}];"),
+    );
+    let o = d.run(&["baseline", "--db", &as_login, "--reason", "keep dropped"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["plan", "--db", own.connection()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("dbo.keep"), "{}", stdout(&o));
+    on_server(&server, &format!("DROP LOGIN [{login}];"));
+}
+
 /// #1192: metadata visibility filters `sys.objects`, so a sequence this login
 /// is denied `VIEW DEFINITION` on returns no row and used to read as a free
 /// name. A connected plan that cannot prove the schema it creates into fully

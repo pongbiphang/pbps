@@ -931,8 +931,8 @@ pub async fn prove_schemas_visible(conn: &mut Conn, schemas: &[String]) -> Resul
         .collect::<Result<_, _>>()?;
     if !hidden.is_empty() {
         return Err(DbError::Refused(format!(
-            "cannot prove the names this plan creates are free: this login does not hold \
-             VIEW DEFINITION on schema {}, so objects there can be hidden from sys.objects",
+            "this login does not hold VIEW DEFINITION on schema {}, so objects there can be \
+             hidden from sys.objects",
             hidden.join(", ")
         )));
     }
@@ -951,9 +951,8 @@ pub async fn prove_schemas_visible(conn: &mut Conn, schemas: &[String]) -> Resul
         .await?;
     if !denials.is_empty() {
         return Err(DbError::Refused(
-            "cannot prove the names this plan creates are free: an object DENY of VIEW \
-             DEFINITION or CONTROL hides an object from this login, and the catalog does not \
-             say which schema it is in"
+            "an object DENY of VIEW DEFINITION or CONTROL hides an object from this login, \
+             and the catalog does not say which schema it is in"
                 .into(),
         ));
     }

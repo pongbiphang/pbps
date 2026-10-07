@@ -90,6 +90,23 @@ pub struct Tombstone {
 }
 
 impl IdsFile {
+    /// This mapping without the tables named and their columns: what a state
+    /// records for a database that does not hold them.
+    ///
+    /// A recorded uid is what the next plan reads as "already there": the
+    /// differ creates a table only for a uid its base side lacks. A state
+    /// that kept the uid of a table the database never had would make the
+    /// next plan skip the table and its apply record it as built (#1600).
+    /// Tombstones stay: they record identities retired, not objects held.
+    #[must_use]
+    pub fn without(&self, tables: &[TableName]) -> Self {
+        let mut kept = self.clone();
+        kept.tables.retain(|_, name| !tables.contains(name));
+        kept.columns
+            .retain(|_, column| !tables.contains(&column.table));
+        kept
+    }
+
     /// Looks a UID up by name. Diffing does this constantly.
     pub fn table_uid(&self, name: &TableName) -> Option<&Uid> {
         self.tables.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
@@ -274,6 +291,43 @@ mod tests {
     #[test]
     fn sample_is_valid() {
         sample().validate().unwrap();
+    }
+
+    /// #1600: a state records only the uids of what the database holds. A
+    /// missing table goes with its columns; the tables and columns it holds,
+    /// the roles, and every tombstone stay.
+    #[test]
+    fn a_state_keeps_only_the_uids_the_database_holds() {
+        let mut f = sample();
+        f.tables
+            .insert(uid("t_b4r7wx"), "dbo.order".parse().unwrap());
+        f.columns.insert(uid("c_q2m9zt"), col("dbo.order.order_id"));
+        f.roles.insert(uid("r_h5t3pk"), "reader".into());
+        f.roles.insert(uid("r_w8n2cd"), "writer".into());
+        f.tombstones.insert(
+            uid("c_z9z9z9"),
+            Tombstone {
+                was: "dbo.order.legacy".into(),
+                dropped_at: "2026-10-07".into(),
+                reason: "gone".into(),
+                operator: "leon".into(),
+            },
+        );
+        let held = f.without(&["dbo.order".parse().unwrap()]);
+        assert!(held.table_uid(&"dbo.order".parse().unwrap()).is_none());
+        assert!(held.column_uid(&col("dbo.order.order_id")).is_none());
+        // Negative: what the database holds keeps its uid, and tombstones
+        // are not objects held.
+        assert_eq!(
+            held.table_uid(&"dbo.customer".parse().unwrap()),
+            Some(&uid("t_a9k2mq"))
+        );
+        assert_eq!(held.columns.len(), 2);
+        assert_eq!(held.roles, f.roles);
+        assert_eq!(held.tombstones.len(), 1);
+        held.validate().unwrap();
+        // Nothing missing, nothing removed.
+        assert_eq!(f.without(&[]), f);
     }
 
     /// A staged apply replays the renames the emitter declared, one statement
