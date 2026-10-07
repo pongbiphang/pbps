@@ -17521,6 +17521,70 @@ fn a_name_that_already_resolves_on_the_target_is_not_refused() {
     );
 }
 
+/// #1592: a new table's own index is created after its defaults, so a
+/// default naming it fails the apply though both are one change. A connected
+/// plan that does both is refused, writing no artifact, with the two-plan
+/// remedy; the table without the default, then the default, deploy it.
+#[test]
+#[ignore = "needs a live PostgreSQL; see scripts/live-tests-pg.sh"]
+fn a_new_tables_default_naming_its_own_index_is_refused_and_two_plans_deploy_it() {
+    let own = OwnDatabase::new(&server(), "names_own_index");
+    let connection = own.connection();
+    let d = bootstrapped_demo(
+        connection,
+        "names_own_index",
+        "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: [id]\n",
+    );
+    let new_table = |default: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.n.yml"),
+            format!(
+                "table: app.n\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                 label: {{type: text, default: \"{default}\"}}\nprimary_key: [id]\n\
+                 indexes:\n  ix_n:\n    columns: [id]\n"
+            ),
+        )
+        .unwrap();
+    };
+    let named = "('app.ix_n'::regclass)::text";
+
+    new_table(named);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let artifact = d.dir.join("refused-plan.json");
+    let refused = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    let why = stderr(&refused);
+    assert!(
+        why.contains("app.n.label's default or expression names app.ix_n"),
+        "{why}"
+    );
+    assert!(why.contains("second plan"), "{why}");
+    assert!(!artifact.exists(), "a refused plan writes no artifact");
+
+    // The remedy: the table without the default first, then the default.
+    new_table("''");
+    let first = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &first, &[]));
+    new_table(named);
+    let second = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &second, &[]));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_attrdef WHERE adrelid = 'app.n'::regclass \
+             AND pg_get_expr(adbin, adrelid) LIKE '%ix_n%'"
+        ),
+        1
+    );
+}
+
 /// #1576: PostgreSQL resolves `'app.ix_new'::regclass` when the default is
 /// set, and the differ sets a default before it creates an index. A connected
 /// plan that does both is refused, writing no artifact, with a two-plan
