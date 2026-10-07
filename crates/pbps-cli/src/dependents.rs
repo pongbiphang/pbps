@@ -1500,7 +1500,12 @@ pub(crate) fn names_a_later_relation(cs: &ChangeSet, dialect: &dyn Dialect) -> V
                         });
                         let first = path.iter().find_map(|s| later(s));
                         first.filter(|_| !earlier).map(|r| {
-                            let asked = path.iter().filter(|s| later(s).is_none()).cloned();
+                            // A schema whose later arrival is a generated
+                            // name may hold it now as well (#1640 review).
+                            let asked = path
+                                .iter()
+                                .filter(|s| later(s).is_none_or(|r| generated.contains(r)))
+                                .cloned();
                             (r, asked.collect())
                         })
                     }
@@ -5440,6 +5445,27 @@ mod tests {
         ] {
             assert_eq!(refusal_of(&cs, &*pg()), Ok(()), "{cs:?}");
         }
+        // A string body checked against its own path, where two schemas get
+        // the generated name later: either may hold it now, so the target is
+        // asked about both (#1640 review).
+        let body = Change::CreateModule {
+            id: id("app.f()"),
+            module: Box::new(module(
+                ModuleKind::Function,
+                "() RETURNS integer LANGUAGE sql SET search_path = app, other \
+                 AS $$ SELECT ('n_pkey'::regclass)::oid::integer $$",
+            )),
+        };
+        let key_on = |schema: &str| Change::SetPrimaryKey {
+            table: TableName::new(schema, "n"),
+            from: None,
+            to: Some(unnamed()),
+            nonclustered: false,
+        };
+        let later =
+            names_a_later_relation(&plan(vec![body, key_on("app"), key_on("other")]), &*pg());
+        assert_eq!(later.len(), 1, "{later:?}");
+        assert_eq!(later[0].searched, ["pg_catalog", "app", "other"]);
         // Two tables cutting to one generated name: the first key holds it,
         // so the first table's check naming it binds that index, and the
         // second key's index is numbered.

@@ -1790,9 +1790,10 @@ ask (#1599 review).
   refused like one that adds it (#1589).
 
   A generated name is the exception. One held now makes the engine number
-  the key's index, and the literal names what holds the name. So the
-  arrival's schema is asked for it, qualified or not, and a plan without a
-  target refuses it (#1619).
+  the key's index, and the literal names what holds the name. So every
+  schema whose later arrival is a generated name is asked, qualified or not:
+  the arrival's own, and each such schema on a checked string body's path
+  (#1619, #1640 review). A plan without a target refuses it.
 
 Pinned by `an_expression_naming_a_relation_the_plan_creates_later_is_refused`,
 `a_new_tables_own_indexes_arrive_after_its_expressions`,
