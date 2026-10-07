@@ -2088,7 +2088,8 @@ review):
 | An INSTEAD OF trigger on a versioned table | refused (13569) | validation refuses it |
 | A foreign key to a history table (which takes no key: 13558, 13583, 13741) | refused (13565) | validation refuses it (#1513) |
 | An AFTER trigger on it, or either kind with a period alone | accepted | held |
-| A cascading foreign key from or to a versioned table | accepted | held; the restriction was 2016's (#1502) |
+| A cascading foreign key from or to a versioned table | accepted | held; a key from one is refused when connected to 2016, which refuses it (#1502) |
+| A finite history retention | accepted (2017 added it) | held; refused when connected to 2016, which has none (#1502) |
 | A computed, identity, `xml`, `(max)` or `ntext` column | accepted | held as for any table |
 | A sparse or FILESTREAM column | refused (11418) | outside the model |
 | A history table's constraints, triggers or own layout | see above | the pair is left out |

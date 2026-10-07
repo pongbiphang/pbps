@@ -489,6 +489,35 @@ pub async fn refuse_unknown_collations(conn: &mut Conn, schema: &Schema) -> anyh
     Ok(())
 }
 
+/// Refuses what this server cannot take of a system-versioned table, before
+/// the first statement (#1502): SQL Server 2016 has no history retention and
+/// no cascading key from a system-versioned table, and refuses either only
+/// once the statements before it have run. A plan with neither asks nothing.
+pub async fn refuse_unsupported_temporal(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+) -> anyhow::Result<()> {
+    if conn.driver() != Driver::Mssql || !pbps_mssql::temporal::needs_the_question(changes) {
+        return Ok(());
+    }
+    if pbps_mssql::temporal::has_history_retention(conn).await? {
+        return Ok(());
+    }
+    let versioned = if pbps_mssql::temporal::needs_the_catalog(changes) {
+        pbps_mssql::temporal::system_versioned_tables(conn).await?
+    } else {
+        Default::default()
+    };
+    let problems = pbps_mssql::temporal::refused_without_retention(changes, &versioned);
+    if !problems.is_empty() {
+        anyhow::bail!(
+            "this server cannot take the plan's system-versioned tables as declared:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
 pub async fn read_rows(
     conn: &mut Conn,
     schema: &Schema,
