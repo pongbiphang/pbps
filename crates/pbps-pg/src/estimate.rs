@@ -407,6 +407,12 @@ fn estimates_with(
                 // Its label is the old name, which may now name a different
                 // planned table. Only its own UID selects the right source.
                 identities.get(uid)
+            } else if let Change::SetReplicaIdentity { uid, .. } = &p.change {
+                // Planned at (0, 1) it runs under the name before any rename,
+                // which the final-name map may give to another table (#1620
+                // review). Its UID is right in either position; a UID no
+                // rename or creation names keeps its own, stable name.
+                identities.get(uid)
             } else {
                 tables.get(&e.table).copied()
             };
@@ -1251,6 +1257,67 @@ mod tests {
             ],
             "the plan's name to read, the catalog's name to measure"
         );
+    }
+
+    /// A replica identity set before the renames runs under a name the final
+    /// plan may give to another table; it is measured by its own UID (#1620
+    /// review).
+    #[test]
+    fn an_early_replica_identity_is_measured_as_its_own_table() {
+        use pbps_model::{ChangeSet, PlannedChange, ReplicaIdentity};
+        let identity = |uid: &str, table| {
+            PlannedChange::new(Change::SetReplicaIdentity {
+                uid: uid.parse().unwrap(),
+                table: tname(table),
+                to: Some(ReplicaIdentity::Full),
+            })
+        };
+        let rename = |uid: &str, from, to| {
+            PlannedChange::new(Change::RenameTable {
+                uid: uid.parse().unwrap(),
+                from: tname(from),
+                to: tname(to),
+                defaults: Vec::new(),
+            })
+        };
+        let stored = |table| CatalogSource::Stored {
+            table: tname(table),
+            column: None,
+        };
+        // The chain a -> b, b -> c: `app.b`'s early identity runs under
+        // `app.b`, which ends the plan naming the table that was `app.a`.
+        let cs = ChangeSet {
+            changes: vec![
+                identity("t_bbbbbb", "app.b"),
+                rename("t_bbbbbb", "app.b", "app.c"),
+                rename("t_aaaaaa", "app.a", "app.b"),
+                // The same change after the renames, under its final name.
+                identity("t_aaaaaa", "app.b"),
+                // A table no rename touches keeps its own name.
+                identity("t_dddddd", "app.d"),
+            ],
+        };
+        let es = planned_estimates(&cs);
+        assert_eq!(es[0].0, 0);
+        assert_eq!(es[0].1.source, stored("app.b"), "not app.a's rows");
+        assert_eq!(es[3].0, 3);
+        assert_eq!(es[3].1.source, stored("app.a"));
+        assert_eq!(es[4].1.source, stored("app.d"));
+
+        // A new table reusing the vacated name is not the one measured.
+        let cs = ChangeSet {
+            changes: vec![
+                identity("t_bbbbbb", "app.b"),
+                rename("t_bbbbbb", "app.b", "app.c"),
+                PlannedChange::new(Change::CreateTable {
+                    uid: "t_eeeeee".parse().unwrap(),
+                    name: tname("app.b"),
+                    table: Box::default(),
+                }),
+            ],
+        };
+        let es = planned_estimates(&cs);
+        assert_eq!(es[0].1.source, stored("app.b"), "not the created table");
     }
 
     #[test]
