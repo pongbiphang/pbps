@@ -57,6 +57,7 @@ async fn kernel_names_cannot_enter_either_private_runtime_view() {
                 guarded_tasks(&guard, privileges).unwrap();
             }
         }
+        crate::resolver::fixture_on_public(&mut state.connection).await.map_err(|e| e.to_string())?;
         state.connection.execute("CREATE TABLE pbps_uts_table (id integer)").await.map_err(|e| e.to_string())?;
         state.connection.execute("CREATE VIEW pbps_uts_view AS SELECT id FROM pbps_uts_table").await.map_err(|e| e.to_string())?;
         assert_eq!(state.connection.query("SELECT COUNT(*) FROM pbps_uts_view").await.map_err(|e| e.to_string())?.len(), 1);

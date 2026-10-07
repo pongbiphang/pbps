@@ -328,6 +328,9 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             unchanged,
             types,
             after_types,
+            // T-SQL has no user-defined operators: a key's `=` is the
+            // engine's whatever the session (DEC-1564.2).
+            key_type: _,
         } => update_row(
             table,
             key_column,
@@ -3845,6 +3848,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            key_type: None,
         });
         // No type carried (an older plan): the key alone holds the row, and
         // the count still has to be one. The postcondition is the key alone
@@ -3944,6 +3948,7 @@ mod tests {
             .map(|(c, t)| (c.to_owned(), t.parse::<ColumnType>().unwrap()))
             .collect(),
             after_types: Default::default(),
+            key_type: None,
         });
         let sql = sql[0].replace("\n)", ")");
         let body = sql
@@ -4032,6 +4037,7 @@ mod tests {
             .map(|(c, t)| (c.to_owned(), ty(t)))
             .collect(),
             after_types: Default::default(),
+            key_type: None,
         });
         let sql = sql[0].replace("\n)", ")");
         let update = sql
@@ -4096,6 +4102,7 @@ mod tests {
                     .into_iter()
                     .map(|(c, t)| (c.to_owned(), ty(t)))
                     .collect(),
+                key_type: None,
             });
             assert!(
                 !retyped[0].contains(&format!("TRY_CONVERT({before}")),
@@ -4126,6 +4133,7 @@ mod tests {
                 .into_iter()
                 .map(|(c, t)| (c.to_owned(), ty(t)))
                 .collect(),
+            key_type: None,
         });
         // The postcondition still names it, and needs no inverse — it reads
         // the column as the type the `ALTER` left and compares the recorded
@@ -4151,6 +4159,7 @@ mod tests {
                 .map(|(c, t)| (c.to_owned(), ty(t)))
                 .collect(),
             after_types: Default::default(),
+            key_type: None,
         });
         assert!(
             held[0].contains(
@@ -4200,6 +4209,7 @@ mod tests {
                 .into_iter()
                 .map(|(c, t)| (c.to_owned(), ty(t)))
                 .collect(),
+            key_type: None,
         });
         let sql = &sql[0];
         let update = sql
@@ -4266,6 +4276,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            key_type: None,
         });
         assert!(
             sql[0].contains("UPDATE [dbo].[t] SET @pbps_key_before = CONVERT(nvarchar(max), [code]), [sort] = DEFAULT WHERE [code] = N'a';"),
@@ -4294,6 +4305,7 @@ mod tests {
                     key_column: "code".to_owned(),
                     key: RowKey::from("a"),
                     columns: BTreeMap::new(),
+                    key_type: None,
                 },
                 Strategy::default()
             )
@@ -4341,6 +4353,7 @@ mod tests {
             .into_iter()
             .collect(),
             after_types: Default::default(),
+            key_type: None,
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(!sql[0].contains("Dropped baseline"), "{sql:?}");
@@ -4370,6 +4383,7 @@ mod tests {
             row: BTreeMap::new(),
             types: BTreeMap::new(),
             after_types: Default::default(),
+            key_type: None,
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
         let sql = &sql[0];
@@ -4671,6 +4685,7 @@ mod tests {
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
                 after_types: Default::default(),
+                key_type: None,
             },
         ] {
             assert!(!takes_online(&c), "{c:?}");

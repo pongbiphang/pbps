@@ -18360,3 +18360,168 @@ fn a_partitions_default_taken_back_resolves_under_its_parents_schema() {
     on_server(&conn, "INSERT INTO arch.ev_a (k) VALUES (1)");
     assert_eq!(scalar(&conn, "SELECT v::int8 FROM app.ev WHERE k = 1"), 1);
 }
+
+/// Operators a user who may create in a schema could add, each raising when
+/// it is called. Every one has a built-in that pbps's own SQL reaches only
+/// through a cast or a polymorphic argument, and an operator whose argument
+/// types match exactly is chosen over that built-in even with `pg_catalog`
+/// searched first (measured on 16 and 18; #1564).
+fn trap_operators(schema: &str) -> String {
+    let mut sql = format!(
+        "CREATE FUNCTION {schema}.pbps_trap() RETURNS boolean LANGUAGE plpgsql AS $$
+             BEGIN RAISE EXCEPTION 'pbps-trap: an operator in {schema} was called'; END $$;"
+    );
+    let traps = [
+        ("=", "oid", "regclass"),
+        ("<>", "oid", "regclass"),
+        ("=", "oid", "integer"),
+        ("<>", "oid", "integer"),
+        ("||", "text", "name"),
+        ("||", "name", "text"),
+        ("||", "text", "oid"),
+        ("||", "text", "\"char\""),
+        ("||", "text", "bigint"),
+        ("||", "text", "smallint"),
+        ("=", "smallint[]", "smallint[]"),
+        // A row write's key: `varchar` has no `=` of its own, so the
+        // built-in one is reached through `text` (DEC-1564.2).
+        ("=", "character varying", "character varying"),
+    ];
+    for (i, (op, left, right)) in traps.iter().enumerate() {
+        let returns = if *op == "||" { "text" } else { "boolean" };
+        sql.push_str(&format!(
+            "CREATE FUNCTION {schema}.pbps_trap_{i}({left}, {right}) RETURNS {returns}
+                 LANGUAGE plpgsql AS $$ BEGIN PERFORM {schema}.pbps_trap(); RETURN NULL; END $$;
+             CREATE OPERATOR {schema}.{op} (leftarg = {left}, rightarg = {right},
+                 function = {schema}.pbps_trap_{i});"
+        ));
+    }
+    sql
+}
+
+/// pbps's own SQL calls no operator a schema user could add (#1564,
+/// DEC-1564.1). Traps sit in `public`, on the deployer's default path, and in
+/// the managed schema, the path an apply's batches carry. A pull, a connected
+/// plan with its probes, an apply that drops a key the declaration never
+/// named, deletes a declared row a child could still reference, and updates
+/// and deletes rows by a `varchar` key, and `doctor` all run without
+/// springing one. On 16 and 18. Before, the apply's key lookup compared
+/// `conrelid` with a `regclass` on `app`'s path and the trap there refused
+/// the plan, and a row write's `"k" = E'a'` called the `varchar` trap.
+#[test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (version, server) in [("18", server()), ("16", old)] {
+        let slug = format!("operator_traps_{version}");
+        let own = OwnDatabase::new(&server, &slug);
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new(&slug);
+        let write = |name: &str, body: &str| {
+            std::fs::write(d.dir.join(format!("schema/app.{name}.yml")), body).unwrap();
+        };
+        let keyed = |fillfactor: u8, identity: &str| {
+            format!(
+                "table: app.k\ncolumns:\n  id: {{type: integer, nullable: false}}\n\
+                 primary_key: {{columns: [id], storage_parameters: {{fillfactor: {fillfactor}}}}}\n\
+                 {identity}"
+            )
+        };
+        write("k", &keyed(80, ""));
+        let parent = "table: app.p\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+                      n: {type: integer}\nprimary_key: {name: pk_p, columns: [id]}\n";
+        write(
+            "p",
+            &format!("{parent}data:\n  mode: exact\n  rows:\n    1: {{}}\n    2: {{}}\n"),
+        );
+        write(
+            "c",
+            "table: app.c\ncolumns:\n  id: {type: integer}\nforeign_keys:\n  fk_c:\n    \
+             columns: [id]\n    references: app.p(id)\n",
+        );
+        let coded = "table: app.v\ncolumns:\n  k: {type: varchar(10), nullable: false}\n  \
+                     n: {type: integer}\nprimary_key: {columns: [k]}\ndata:\n  mode: exact\n  rows:\n";
+        write("v", &format!("{coded}    a: {{n: 1}}\n    b: {{n: 2}}\n"));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        on_server(connection, "INSERT INTO app.c (id) VALUES (1)");
+        on_server(connection, &trap_operators("public"));
+        on_server(connection, &trap_operators("app"));
+        // The traps spring where nothing guards against them.
+        let sprung = try_on_server(
+            connection,
+            "SET search_path = app; \
+             SELECT count(*) FROM pg_catalog.pg_class WHERE oid = 'app.k'::pg_catalog.regclass",
+        );
+        assert!(
+            sprung.as_ref().is_err_and(|e| e.contains("pbps-trap")),
+            "{version}: {sprung:?}"
+        );
+
+        let clean = |what: &str, out: Output| {
+            let all = format!("{}{}", stdout(&out), stderr(&out));
+            assert!(
+                !all.contains("pbps-trap"),
+                "{version}: {what} called a trap:\n{all}"
+            );
+            assert_eq!(code(&out), 0, "{version}: {what}:\n{all}");
+        };
+        let pulled = Demo::new(&format!("{slug}_pull"));
+        clean("pull", pulled.run(&["pull", "--db", connection]));
+
+        // Finds the key's index by asking the catalog, twice, deletes row 2
+        // under the guard that looks for a child still pointing at it, and
+        // adds a check the probes count violations of. Updates row `a` and
+        // deletes row `b` by their `varchar` key.
+        write("k", &keyed(70, "replica_identity: primary_key\n"));
+        write("v", &format!("{coded}    a: {{n: 5}}\n"));
+        write(
+            "p",
+            &format!(
+                "{parent}checks:\n  ck_n: n IS NULL OR n > 0\ndata:\n  mode: exact\n  rows:\n    1: {{}}\n"
+            ),
+        );
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        let planned = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+        clean("plan --db", planned);
+        clean(
+            "apply",
+            approved_apply(
+                &d,
+                connection,
+                &plan,
+                &["--allow", "destructive,constraint,data-update,data-delete"],
+            ),
+        );
+        assert_eq!(
+            text_of(
+                connection,
+                "SELECT pg_catalog.array_to_string(i.reloptions, ',') || ' ' || c.relreplident::text \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_constraint k ON k.conrelid = c.oid AND k.contype = 'p' \
+                 JOIN pg_catalog.pg_class i ON i.oid = k.conindid \
+                 WHERE c.oid = 'app.k'::regclass::oid"
+            ),
+            "fillfactor=70 i",
+            "{version}: the key's index and the replica identity changed"
+        );
+        assert_eq!(
+            scalar(connection, "SELECT count(*) FROM app.p"),
+            1,
+            "{version}"
+        );
+        assert_eq!(
+            text_of(
+                connection,
+                "SELECT pg_catalog.string_agg(k::text || ':' || n::text, ',') FROM app.v"
+            ),
+            "a:5",
+            "{version}: row a updated and row b deleted by their key"
+        );
+        clean("doctor", d.run(&["doctor", "--db", connection]));
+    }
+}

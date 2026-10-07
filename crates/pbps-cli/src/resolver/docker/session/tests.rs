@@ -80,6 +80,9 @@ async fn the_private_channel_compiles_declarations_and_control_loss_discards_the
             .find_map(|entry| entry.strip_prefix(prefix))
             .unwrap();
         let compile = async {
+            // Left on the empty path, `dblink_connect` would fail as an
+            // unknown function and read as a refused network.
+            crate::resolver::fixture_on_public(&mut state.connection).await?;
             state
                 .connection
                 .execute("CREATE TABLE pbps_channel_table (id integer NOT NULL)")

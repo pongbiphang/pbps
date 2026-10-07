@@ -1298,6 +1298,7 @@
         "narrowing_projection_refuses_constraint_failures_before_the_first_statement",
         "nonordinary_trigger_modes_are_reported_instead_of_recorded",
         "omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload",
+        "pbps_sql_calls_no_operator_a_schema_user_could_add",
         "permission_versions_are_checked_before_planning_bootstrap_apply_and_resume",
         "postgres_rename_impact_reaches_the_cli_as_advisory_and_requires_explicit_approval",
         "pull_adopts_a_cluster_role_only_once_this_database_grants_it_something",
@@ -1385,7 +1386,8 @@
         "a_server_refusal_carries_the_servers_own_sentence",
         "a_session_is_named_for_this_process_unless_the_string_names_it",
         "a_statement_literal_inside_a_function_never_reaches_the_message",
-        "an_exceptions_call_stack_never_reaches_the_message"
+        "an_exceptions_call_stack_never_reaches_the_message",
+        "every_session_opens_on_an_empty_search_path"
       ]
     },
     {

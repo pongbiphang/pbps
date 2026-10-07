@@ -1345,15 +1345,43 @@ pub(crate) fn write_path(pg: &Postgres, schema: &str) -> Result<String, DialectE
 ///
 /// `SET` and not `SET LOCAL`: a rendered script is run statement by statement
 /// outside any transaction, where `SET LOCAL` is a warning and a no-op, and a
-/// scope that quietly does nothing is worse than none. The `RESET` afterwards
-/// is in the same batch, so inside a transaction a failure rolls it back with
-/// everything else, and outside one it returns the connection to the settings
-/// the operator's environment gives it.
+/// scope that quietly does nothing is worse than none. The empty path
+/// afterwards is in the same batch, so inside a transaction a failure rolls it
+/// back with everything else.
+///
+/// Empty and not `RESET`: the session pins an empty path (DEC-1564.1), and
+/// `RESET` would return to the role's own, where anyone who may create in a
+/// schema on it can add an operator pbps's next statement calls. So only what
+/// the scope holds runs on the schema's path, and pbps's own SQL there must
+/// not reach an operator a user of that schema could add: [`unscoped`] for a
+/// statement that is pbps's alone, [`on_catalog_path`] inside one that is not.
 fn scoped(pg: &Postgres, schema: &str, body: &str) -> Result<Statement, DialectError> {
     Ok(Statement::new(format!(
-        "SET search_path = {};\n{body}\nRESET search_path;",
+        "SET search_path = {};\n{body}\nSET search_path = '';",
         write_path(pg, schema)?
     )))
+}
+
+/// A statement that is pbps's alone, on the session's empty path: every name
+/// in it qualified, and no declared expression to resolve, so it needs no
+/// schema's path and is safer without one (DEC-1564.1).
+fn unscoped(body: String) -> Sql {
+    Ok(vec![Statement::new(body)])
+}
+
+/// pbps's own statements inside a `DO` block that runs on a schema's path,
+/// moved onto the empty one and back. For a block that also holds a declared
+/// expression, which needs the schema's path: plpgsql plans each statement
+/// when it first runs, under the path set then (measured on 16 and 18; a
+/// local setting, so a failure rolls it back with the block). The block
+/// declares `pbps_path text` (DEC-1564.1).
+pub(crate) fn on_catalog_path(statements: &str) -> String {
+    format!(
+        "pbps.pbps_path := pg_catalog.current_setting('search_path');\n\
+         PERFORM pg_catalog.set_config('search_path', '', true);\n\
+         {statements}\n\
+         PERFORM pg_catalog.set_config('search_path', pbps.pbps_path, true);"
+    )
 }
 
 /// The same, for a table's own schema.
@@ -1471,7 +1499,7 @@ fn create_module(pg: &Postgres, id: &ModuleId, module: &Module) -> Result<Statem
     };
     // The terminator on a line of its own, because the line before it is the
     // user's: a definition ending in `-- note` would otherwise swallow it, and
-    // the statement would run on into the `RESET search_path` the scope adds.
+    // the statement would run on into the `SET search_path` the scope ends on.
     // The same rule as every other verbatim expression here (DECISIONS 281),
     // and the whole body is verbatim.
     scoped(pg, id.schema(), &format!("{sql}\n;"))
@@ -2347,7 +2375,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             parent,
             names,
             ..
-        } => one(pg, table, detach_partition(table, parent, names)?),
+        } => unscoped(detach_partition(table, parent, names)?),
 
         // Two statements when both halves move, and neither engine has one that
         // does both: `RENAME TO` cannot cross a schema and `SET SCHEMA` cannot
@@ -2664,7 +2692,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         Change::SetColumnDeprecated { .. } => Ok(Vec::new()),
 
         Change::SetReplicaIdentity { table, to, .. } => {
-            one(pg, table, set_replica_identity(table, to.as_ref())?)
+            unscoped(set_replica_identity(table, to.as_ref())?)
         }
         // Rewrites the table and its indexes, in either direction (#1443).
         Change::SetTablePersistence {
@@ -2722,7 +2750,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                         ))
                     );
                     let tag = dollar_tag(&body);
-                    one(pg, table, format!("DO {tag}\n{body}\n{tag};"))
+                    unscoped(format!("DO {tag}\n{body}\n{tag};"))
                 }
             }
         }
@@ -2755,7 +2783,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             }
             let mut out = Vec::new();
             if let Some(pk) = from {
-                out.push(on(pg, table, &drop_primary_key(table, pk)?)?);
+                out.push(Statement::new(drop_primary_key(table, pk)?));
             }
             if let Some(pk) = to {
                 out.push(on(
@@ -3059,6 +3087,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             unchanged,
             types,
             after_types,
+            key_type,
         } => row_statement(
             pg,
             table,
@@ -3073,6 +3102,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 unchanged,
                 types,
                 after_types,
+                key_type.as_ref(),
             )?),
         ),
         Change::DeleteRow {
@@ -3082,6 +3112,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             row,
             types,
             after_types,
+            key_type,
             ..
         } => row_statement(
             pg,
@@ -3094,6 +3125,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 row,
                 types,
                 after_types,
+                key_type.as_ref(),
             )?),
         ),
     }
@@ -3368,11 +3400,10 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
     }
     // Last: the index it may name is the last statement above (#1444).
     if table.replica_identity.is_some() {
-        out.push(on(
-            pg,
+        out.push(Statement::new(set_replica_identity(
             name,
-            &set_replica_identity(name, table.replica_identity.as_ref())?,
-        )?);
+            table.replica_identity.as_ref(),
+        )?));
     }
     Ok(out)
 }
@@ -3829,15 +3860,53 @@ fn wrote_the_row(
     ))
 }
 
+/// The row a write means: the key column against the declared key, by the
+/// engine's `=` for the key's type.
+///
+/// The statement runs on the table's schema's path, where the declared
+/// expressions it carries resolve. A user who may create in that schema can
+/// add an `=` whose argument types match the key column exactly, and the
+/// engine prefers it over a built-in it reaches only through a cast —
+/// **measured on 18**: a `varchar` key's `"k" = E'a'` called an
+/// `=(varchar, varchar)` planted there, with the deployer's rights. So a key
+/// of a built-in type names `pg_catalog`'s operator, which is the one the
+/// unqualified `=` meant: the same comparison, the same index, and nothing a
+/// schema user can outbid. A key of any other type keeps the unqualified
+/// `=`, because its `=` is not `pg_catalog`'s to name — measured, `citext`
+/// under `pg_catalog.=` compares case-sensitively and `ltree` has no such
+/// operator at all, so naming it would change which row is meant or refuse
+/// the plan. A plan made before the key's type was carried keeps it too
+/// (DEC-1564.2).
+fn key_equals(
+    key_column: &str,
+    key: &RowKey,
+    key_type: Option<&ColumnType>,
+) -> Result<String, DialectError> {
+    let operator = if key_type.is_some_and(|ty| types::normalize(ty).is_ok()) {
+        "OPERATOR(pg_catalog.=)"
+    } else {
+        "="
+    };
+    Ok(format!(
+        "{} {operator} {}",
+        quote(key_column)?,
+        row_key(key)
+    ))
+}
+
 /// The check after a row's `DELETE`: it is still gone once the statement has
 /// run. A trigger that reinserted it would otherwise be read back and recorded
 /// as this plan's own result (DECISIONS 132).
-fn gone_row(table: &TableName, key: &RowKey, key_column: &str) -> Result<String, DialectError> {
+fn gone_row(
+    table: &TableName,
+    key: &RowKey,
+    key_column: &str,
+    key_type: Option<&ColumnType>,
+) -> Result<String, DialectError> {
     Ok(format!(
-        "IF EXISTS (SELECT 1 FROM {} WHERE {} = {}) THEN\n    {}\nEND IF;",
+        "IF EXISTS (SELECT 1 FROM {} WHERE {}) THEN\n    {}\nEND IF;",
         qualified(table)?,
-        quote(key_column)?,
-        row_key(key),
+        key_equals(key_column, key, key_type)?,
         refuse(&format!(
             "{table} row `{key}` is back after this plan deleted it — a trigger on the table, \
              or another writer inside it. Nothing was applied."
@@ -3961,6 +4030,7 @@ fn insert_row(
 /// run, by which time this plan's `AddColumn` and `AlterColumnType` have
 /// already run — so every declared cell is held, the added column included
 /// (DECISIONS 140).
+#[allow(clippy::too_many_arguments)]
 fn update_row(
     table: &TableName,
     key_column: &str,
@@ -3969,6 +4039,7 @@ fn update_row(
     unchanged: &BTreeMap<String, Cell>,
     types: &BTreeMap<String, ColumnType>,
     after_types: &BTreeMap<String, ColumnType>,
+    key_type: Option<&ColumnType>,
 ) -> Result<String, DialectError> {
     let before_ty = |column: &String| Held::of(types.get(column), after_types.get(column));
     let after_ty = |column: &String| {
@@ -4002,11 +4073,10 @@ fn update_row(
         )));
     }
     let mut sql = format!(
-        "UPDATE {} SET {}\n WHERE {} = {}",
+        "UPDATE {} SET {}\n WHERE {}",
         qualified(table)?,
         sets.join(", "),
-        quote(key_column)?,
-        row_key(key)
+        key_equals(key_column, key, key_type)?
     );
     for r in &recorded {
         sql.push_str("\n   AND ");
@@ -4027,7 +4097,7 @@ fn update_row(
     }
     sql.push('\n');
     sql.push_str(&wrote_the_row(table, key, key_column, &cells)?);
-    Ok(with_variables(&["pbps_rows"], &sql))
+    Ok(with_variables(&[("pbps_rows", "bigint")], &sql))
 }
 
 /// One `DELETE`, keyed *and* held to the row the plan recorded.
@@ -4045,8 +4115,9 @@ fn delete_row(
     row: &BTreeMap<String, Cell>,
     types: &BTreeMap<String, ColumnType>,
     after_types: &BTreeMap<String, ColumnType>,
+    key_type: Option<&ColumnType>,
 ) -> Result<String, DialectError> {
-    let mut predicates = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
+    let mut predicates = vec![key_equals(key_column, key, key_type)?];
     for (column, cell) in row {
         predicates.extend(recorded_cell(
             column,
@@ -4065,15 +4136,22 @@ fn delete_row(
         exactly_one_row(table, key),
         // And the row stayed gone: a trigger that put it back would otherwise
         // be read back and recorded as this plan's result.
-        gone_row(table, key, key_column)?,
+        gone_row(table, key, key_column, key_type)?,
     );
     // The guard, the delete and the checks after it are one block: the row
     // lock the guard takes has to be held through the delete it protects, and
     // a staged apply runs each statement outside a transaction.
-    Ok(with_variables(&["pbps_rows", "pbps_referencing"], &sql))
+    Ok(with_variables(
+        &[
+            ("pbps_rows", "bigint"),
+            ("pbps_referencing", "bigint"),
+            ("pbps_path", "text"),
+        ],
+        &sql,
+    ))
 }
 
-/// A row block's body with its `bigint` variables declared.
+/// A row block's body with its variables declared.
 ///
 /// The row writes name the table's columns unqualified, and a data table may
 /// have a column spelled like one of these variables. Under the default
@@ -4083,10 +4161,10 @@ fn delete_row(
 /// label (`pbps.pbps_rows`), which a column cannot shadow. Renaming the
 /// variables to something less likely would only move the collision
 /// (DEC-976.1).
-fn with_variables(variables: &[&str], body: &str) -> String {
+fn with_variables(variables: &[(&str, &str)], body: &str) -> String {
     let declared: String = variables
         .iter()
-        .map(|v| format!("    {v} bigint;\n"))
+        .map(|(v, ty)| format!("    {v} {ty};\n"))
         .collect();
     format!("#variable_conflict use_column\n<<pbps>>\nDECLARE\n{declared}BEGIN\n{body}\nEND pbps")
 }
@@ -4433,6 +4511,44 @@ mod tests {
 
     fn name(schema: &str, table: &str) -> TableName {
         TableName::new(schema, table)
+    }
+
+    /// A row write finds its row by `pg_catalog`'s `=` where the key's type
+    /// is a built-in one: the same comparison the unqualified `=` meant, and
+    /// nothing a user of the table's schema can outbid (DEC-1564.2).
+    #[test]
+    fn a_built_in_keys_row_is_found_by_pg_catalogs_equality() {
+        let key = RowKey("a'b".into());
+        for spelled in [
+            "varchar(10)",
+            "text",
+            "integer",
+            "uuid",
+            "character(3)",
+            "integer[]",
+        ] {
+            assert_eq!(
+                key_equals("k", &key, Some(&ty(spelled))).unwrap(),
+                "\"k\" OPERATOR(pg_catalog.=) E'a''b'",
+                "{spelled}"
+            );
+        }
+    }
+
+    /// Negative: a key whose `=` is not `pg_catalog`'s keeps the unqualified
+    /// one, since naming `pg_catalog`'s would compare `citext` case-sensitively
+    /// and find no operator at all for `ltree` (measured); and a plan made
+    /// before the key's type was carried keeps it too.
+    #[test]
+    fn a_key_whose_equality_is_not_pg_catalogs_keeps_its_own() {
+        let key = RowKey("a".into());
+        for key_type in [Some(ty("citext")), Some(ty("ltree")), None] {
+            assert_eq!(
+                key_equals("k", &key, key_type.as_ref()).unwrap(),
+                "\"k\" = E'a'",
+                "{key_type:?}"
+            );
+        }
     }
 
     fn sql_of(pg: &Postgres, change: &Change) -> Vec<String> {
@@ -5695,7 +5811,7 @@ mod tests {
             assert_eq!(
                 sql,
                 vec![format!(
-                    "SET search_path = \"app\", \"pg_temp\";\n{expected}\n;\nRESET search_path;"
+                    "SET search_path = \"app\", \"pg_temp\";\n{expected}\n;\nSET search_path = '';"
                 )],
                 "{id}"
             );
@@ -6021,7 +6137,7 @@ mod tests {
             vec![
                 "SET search_path = \"app\", \"shared\", \"public\", \"pg_temp\";\n\
                  DROP TABLE \"app\".\"t\";\n\
-                 RESET search_path;"
+                 SET search_path = '';"
             ]
         );
     }
@@ -6071,7 +6187,7 @@ mod tests {
         assert_eq!(
             sql,
             vec![
-                "SET search_path = \"app\", \"pg_temp\";\nDROP INDEX \"app\".\"ix\";\nRESET search_path;"
+                "SET search_path = \"app\", \"pg_temp\";\nDROP INDEX \"app\".\"ix\";\nSET search_path = '';"
             ]
         );
     }
@@ -6232,7 +6348,7 @@ mod tests {
             vec![
                 "SET search_path = \"app\", \"pg_temp\";\n\
                  ALTER TABLE \"app\".\"t\" ALTER COLUMN \"at\" TYPE character varying(20);\n\
-                 RESET search_path;"
+                 SET search_path = '';"
             ]
         );
     }
@@ -6267,7 +6383,7 @@ mod tests {
                  CREATE TABLE \"app\".\"t\" (\n\
                  \x20   \"id\" integer NOT NULL\n\
                  ) USING heap;\n\
-                 RESET search_path;"
+                 SET search_path = '';"
             ]
         );
     }
@@ -6581,10 +6697,9 @@ mod tests {
             },
         );
         let block = &sql[0];
-        assert!(
-            block.contains("SET search_path = \"odd schema\", \"pg_temp\";"),
-            "{block}"
-        );
+        // pbps's alone, so on the session's empty path and not the schema's
+        // (DEC-1564.1).
+        assert!(!block.contains("SET search_path"), "{block}");
         // Code position: doubled quotes. Literal position: doubled apostrophe —
         // and the statement `format` builds is a literal *inside* a literal, so
         // its own apostrophes are doubled a second time. Quoting the name as an
@@ -6602,10 +6717,7 @@ mod tests {
         // The `DO` body is dollar-quoted, so that literal needs one level of
         // doubling and not two — and the tag is chosen so the body cannot end
         // it early.
-        assert!(
-            block.starts_with("SET search_path = \"odd schema\", \"pg_temp\";\nDO $pbps$\n"),
-            "{block}"
-        );
+        assert!(block.starts_with("DO $pbps$\n"), "{block}");
     }
 
     /// A name carrying the tag would close the block and put the rest of it on
@@ -7056,6 +7168,7 @@ mod tests {
             .into_iter()
             .collect(),
             after_types: BTreeMap::new(),
+            key_type: None,
         };
         let sql = sql_of(&Postgres::new(), &change).join("\n");
         assert!(sql.contains("SET \"label\" = E'New'"), "{sql}");
@@ -7107,6 +7220,7 @@ mod tests {
             .into_iter()
             .collect(),
             after_types: BTreeMap::new(),
+            key_type: None,
         };
         let json = serde_json::to_value(&change).unwrap();
         assert_eq!(

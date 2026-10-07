@@ -3959,6 +3959,7 @@ mod tests {
             unchanged: BTreeMap::new(),
             types: BTreeMap::new(),
             after_types: BTreeMap::new(),
+            key_type: None,
         };
         let moved = |write: Change| {
             let mut cs = plan(vec![set_default("u"), write, alter(&s, "app.f(integer)")]);

@@ -44,6 +44,9 @@ async fn host_file_loss_refuses_admission_and_discards_live_analysis() {
         changed.restore();
         let mut run = open_when_exclusive(&mut target).await;
         let connection = &mut run.scratch.as_mut().unwrap().connection;
+        crate::resolver::fixture_on_public(connection)
+            .await
+            .unwrap();
         connection
             .execute("CREATE TABLE pbps_host_file_table (id integer)")
             .await

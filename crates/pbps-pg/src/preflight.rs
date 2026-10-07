@@ -653,6 +653,9 @@ impl AsStored {
                     unchanged,
                     types,
                     after_types,
+                    // The key's type matters to the apply's `WHERE` alone;
+                    // the probes run on the session's empty path.
+                    key_type: _,
                 } => {
                     this.remember_types(table, types);
                     this.remember_types(table, after_types);
@@ -1215,7 +1218,10 @@ pub(crate) fn still_referenced(
         quote(key_column)?,
         value_literal(key.as_str())
     );
-    Ok(format!(
+    // On the empty path: the block runs on the table's schema's path, for
+    // the declared defaults its delete compares with, and none of this is
+    // declared (DEC-1564.1).
+    Ok(crate::emit::on_catalog_path(&format!(
         "PERFORM 1 FROM {parent} AS p WHERE p.{} = {} FOR UPDATE;\n\
          IF {} THEN\n    {}\nEND IF;\n\
          pbps.pbps_referencing := {};\n\
@@ -1271,7 +1277,7 @@ pub(crate) fn still_referenced(
              checked; the delete would orphan or cascade into them. Nothing was applied. \
              Plan again."
         ))
-    ))
+    )))
 }
 
 /// The row about to be deleted, left out of the count on its own table.
@@ -4092,6 +4098,7 @@ mod tests {
             row: BTreeMap::new(),
             types: BTreeMap::new(),
             after_types: BTreeMap::new(),
+            key_type: None,
         }
     }
 
@@ -5065,6 +5072,7 @@ mod tests {
                 unchanged: BTreeMap::new(),
                 types: BTreeMap::new(),
                 after_types: BTreeMap::new(),
+                key_type: None,
             },
             deleting("app.status", "old"),
         ]));

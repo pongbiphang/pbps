@@ -29,6 +29,7 @@ fn update(table: &str, key: &str) -> Change {
         unchanged: Default::default(),
         types: [("label".into(), ty("nvarchar(20)"))].into(),
         after_types: Default::default(),
+        key_type: None,
     }
 }
 

@@ -199,8 +199,8 @@ mod scope610 {
             .execute(&format!(
                 "CREATE SCHEMA a; CREATE SCHEMA b; CREATE TABLE a.t (x int); CREATE TABLE b.t (y int); \
                  REVOKE ALL ON SCHEMA a FROM PUBLIC; GRANT USAGE ON SCHEMA b TO {deployer}; \
-                 GRANT CONNECT ON DATABASE {database} TO {deployer}; CREATE EXTENSION hstore; \
-                 CREATE EXTENSION cube; CREATE EXTENSION earthdistance"
+                 GRANT CONNECT ON DATABASE {database} TO {deployer}; CREATE EXTENSION hstore SCHEMA public; \
+                 CREATE EXTENSION cube SCHEMA public; CREATE EXTENSION earthdistance SCHEMA public"
             ))
             .await
             .unwrap();
@@ -440,7 +440,10 @@ mod scope610 {
             .await
             .unwrap();
         let mut target = connect(&format!("{current} dbname={name}")).await;
-        target.execute("CREATE EXTENSION hstore").await.unwrap();
+        target
+            .execute("CREATE EXTENSION hstore SCHEMA public")
+            .await
+            .unwrap();
         let mut resolver = connect(&format!("{old} dbname={name}")).await;
 
         let target_facts = read(&mut target, &scope).await.unwrap();
@@ -855,6 +858,9 @@ mod auth688 {
             .execute(&format!("SET ROLE {effective}"))
             .await
             .unwrap();
+        // Back from the empty path every session opens on (DEC-1564.1) to
+        // the default the engine gave this one.
+        planning.execute("RESET search_path").await.unwrap();
         let shown = planning
             .query("SELECT pg_catalog.current_setting('search_path') AS p")
             .await

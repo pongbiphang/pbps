@@ -300,7 +300,30 @@ impl Conn {
         // whichever of the two connect errors above fires.
         conn.require_session(config.get_target_session_attrs(), &format!("{host}:{port}"))
             .await?;
+        conn.pin_search_path().await?;
         Ok(conn)
+    }
+
+    /// Empties the session's `search_path` before pbps asks anything.
+    ///
+    /// pbps's own SQL runs as the deployer, and an operator whose argument
+    /// types match exactly is chosen over a built-in that needs a cast or
+    /// takes a polymorphic argument, even with `pg_catalog` searched first.
+    /// Measured on 16 and 18: a `CREATE OPERATOR public.= (oid, regclass)`
+    /// is what `oid = 'x'::regclass` calls on the default path, and so are an
+    /// `=(oid, integer)` for `conparentid = 0` and a `||(text, name)` for
+    /// `'x' || relname`. Anyone who may create in a schema on the path could
+    /// run code with the deployer's rights. On an empty path only
+    /// `pg_catalog` is searched for operators and functions, so none of them
+    /// can be reached, whatever the statement spells (DEC-1564.1).
+    ///
+    /// Here, on every connection, rather than at the reads that need it: a
+    /// caller that forgets is the bug back, and the reads are many. A plain
+    /// `SET` and not a startup option, because a pooler may refuse or drop
+    /// `options`; so `RESET` would return to the role's path, and the
+    /// emitter's scopes end on this setting instead.
+    async fn pin_search_path(&mut self) -> Result<(), DbError> {
+        self.execute("SET search_path = ''").await
     }
 
     pub(crate) fn tcp_endpoints(&self) -> Option<crate::transport::TcpEndpoints> {
@@ -319,11 +342,13 @@ impl Conn {
             .application_name(crate::session_application_name())
             .ssl_mode(tokio_postgres::config::SslMode::Disable);
         let (client, connection) = config.connect_raw(stream, tokio_postgres::NoTls).await?;
-        Ok(Self {
+        let mut conn = Self {
             client,
             _driver: hold(connection),
             endpoints: None,
-        })
+        };
+        conn.pin_search_path().await?;
+        Ok(conn)
     }
 
     /// Enforces `target_session_attrs`, which `connect_raw` does not.

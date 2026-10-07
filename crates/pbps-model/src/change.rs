@@ -607,6 +607,14 @@ pub enum Change {
         /// `types`. Absent from older plans, which is an empty map.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         after_types: BTreeMap<String, ColumnType>,
+        /// The key column's type when the statement runs, so the emitter
+        /// can find the row by the engine's own `=` for that type without
+        /// asking the session's path for it: a built-in type is compared by
+        /// `pg_catalog`'s operator, which a user who may create in the
+        /// table's schema cannot outbid (DEC-1564.2). Absent from older
+        /// plans, which keep the unqualified `=`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_type: Option<ColumnType>,
     },
     DeleteRow {
         table: TableName,
@@ -654,6 +662,14 @@ pub enum Change {
         /// back to `types`. Absent from older plans, which is an empty map.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         after_types: BTreeMap<String, ColumnType>,
+        /// The key column's type when the statement runs, so the emitter
+        /// can find the row by the engine's own `=` for that type without
+        /// asking the session's path for it: a built-in type is compared by
+        /// `pg_catalog`'s operator, which a user who may create in the
+        /// table's schema cannot outbid (DEC-1564.2). Absent from older
+        /// plans, which keep the unqualified `=`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_type: Option<ColumnType>,
     },
     /// `exact` <-> `ensure`. It emits no SQL by itself — the row changes it
     /// implies are separate entries — but it is a change to the declaration

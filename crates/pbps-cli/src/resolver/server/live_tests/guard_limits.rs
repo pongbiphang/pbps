@@ -202,6 +202,9 @@ async fn every_forwarder_guard_requires_effective_descriptor_evidence() {
         for change in [Change::Higher, Change::Missing, Change::Unreadable] {
             let mut run = open_when_exclusive(&mut target).await;
             let connection = &mut run.scratch.as_mut().unwrap().connection;
+            crate::resolver::fixture_on_public(connection)
+                .await
+                .unwrap();
             connection
                 .execute("CREATE TABLE pbps_limit_table (id integer)")
                 .await

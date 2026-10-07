@@ -11,6 +11,7 @@ fn deletion() -> Change {
         row: Default::default(),
         types: Default::default(),
         after_types: Default::default(),
+        key_type: None,
     }
 }
 
