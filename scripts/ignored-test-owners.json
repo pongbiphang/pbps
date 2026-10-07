@@ -1187,6 +1187,7 @@
         "a_deployers_own_onward_grant_is_one_it_can_still_narrow",
         "a_dropped_function_follows_what_releases_its_generated_columns",
         "a_dropped_table_frees_a_name_a_moved_table_carries_in_applies",
+        "a_dropped_view_is_not_reported_as_carried_by_a_column_rename",
         "a_generated_columns_expression_change_is_refused_by_name_before_postgres_17",
         "a_generated_columns_expression_changes_through_the_cli_and_its_inputs_are_held",
         "a_grant_a_third_role_made_is_kept_and_only_its_removal_is_refused",

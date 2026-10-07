@@ -8512,12 +8512,12 @@ async fn preflight(
     // it still sees the dependency — and reporting it would refuse a plan whose
     // own first statement removes the obstacle.
     let dropped = dropped_referrer_names(&plan.changes);
+    let dropped_modules = dropped_modules(&plan.changes);
 
     let mut blocked = Vec::new();
     for target in rename_targets {
         let mut report = crate::engine::rename_impact(conn, target).await?;
-        report.blocking.retain(|r| !dropped.contains(&r.name));
-        report.advisory.retain(|r| !dropped.contains(&r.name));
+        excuse_dropped_referrers(&mut report, &dropped, &dropped_modules);
         if report.is_empty() {
             continue;
         }
@@ -8833,6 +8833,47 @@ fn with_provenance(root: &std::path::Path, mut snapshot: StateSnapshot) -> State
 /// matched nothing, a trigger this plan drops before the rename stayed in the
 /// report, and a schema-bound one refused the plan whose first statement
 /// removes it. The object name is what the catalog has (ADR-0009 §1).
+/// Leaves out of a rename's impact report the referrers this plan drops
+/// first, before anything is counted or printed — so an empty remainder
+/// prints no heading and the notes are computed from what is left.
+///
+/// Blocking and advisory referrers are matched by name, as they always were.
+/// A carried one is matched only by the typed module the engine proved its
+/// removal with: its display is the engine's description, so a name match
+/// would never fire on it, and a looser one would excuse a same-named
+/// survivor (#823).
+fn excuse_dropped_referrers(
+    report: &mut pbps_db::impact::ImpactReport,
+    dropped: &BTreeSet<String>,
+    dropped_modules: &BTreeSet<(pbps_model::ModuleKind, pbps_model::ModuleId)>,
+) {
+    report.blocking.retain(|r| !dropped.contains(&r.name));
+    report.advisory.retain(|r| !dropped.contains(&r.name));
+    report.carried.retain(|r| {
+        r.removed_with
+            .as_ref()
+            .is_none_or(|key| !dropped_modules.contains(key))
+    });
+}
+
+/// Every module this plan drops outright, by its full typed identity. A
+/// rebuild (`AlterModule`) keeps the module, so it is not here.
+fn dropped_modules(
+    changes: &pbps_model::ChangeSet,
+) -> BTreeSet<(pbps_model::ModuleKind, pbps_model::ModuleId)> {
+    changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::DropModule { id, kind } = &p.change {
+                Some((*kind, id.clone()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
     changes
         .changes
@@ -11317,7 +11358,105 @@ mod tests {
             kind: kind.to_owned(),
             name: name.to_owned(),
             detail: detail.map(ToOwned::to_owned),
+            removed_with: None,
         }
+    }
+
+    fn carried_view(described: &str, schema: &str, name: &str) -> pbps_db::impact::Referrer {
+        pbps_db::impact::Referrer {
+            removed_with: Some((
+                pbps_model::ModuleKind::View,
+                pbps_model::ModuleId::Named(pbps_model::ObjectName::new(schema, name)),
+            )),
+            ..referrer("view", described, None)
+        }
+    }
+
+    fn dropping(kind: pbps_model::ModuleKind, id: &str) -> pbps_model::PlannedChange {
+        pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
+            id: id.parse().unwrap(),
+            kind,
+        })
+    }
+
+    /// #823: a view this plan drops is not reported as carried by the rename
+    /// that follows it. Excused before anything is counted, so a report left
+    /// with nothing prints no heading and no carried note, and one that still
+    /// holds a surviving view keeps both.
+    #[test]
+    fn a_dropped_carried_view_is_excused_before_impact_rendering() {
+        let changes = pbps_model::ChangeSet {
+            changes: vec![dropping(pbps_model::ModuleKind::View, "app.v")],
+        };
+        let names = dropped_referrer_names(&changes);
+        let modules = dropped_modules(&changes);
+
+        let mut only_dropped = pbps_db::impact::ImpactReport {
+            target: "column app.t.label".to_owned(),
+            carried: vec![carried_view("view app.v", "app", "v")],
+            ..Default::default()
+        };
+        excuse_dropped_referrers(&mut only_dropped, &names, &modules);
+        assert!(only_dropped.is_empty(), "{only_dropped:#?}");
+
+        let mut with_survivor = pbps_db::impact::ImpactReport {
+            target: "column app.t.label".to_owned(),
+            carried: vec![
+                carried_view("view app.v", "app", "v"),
+                carried_view("view outside.keep", "outside", "keep"),
+            ],
+            ..Default::default()
+        };
+        excuse_dropped_referrers(&mut with_survivor, &names, &modules);
+        let lines = impact_lines(
+            &with_survivor,
+            &crate::engine::impact_notes(pbps_db::Driver::Postgres, &with_survivor),
+        );
+        assert!(!lines.iter().any(|l| l.contains("app.v")), "{lines:#?}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("view outside.keep") && l.contains("keeps working"))
+                .count(),
+            1,
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("keeps its old output column name")),
+            "{lines:#?}"
+        );
+    }
+
+    /// The negative half of #823: only the exact typed module excuses a
+    /// carried referrer. A view of the same name in another schema, a
+    /// function dropped under the view's name, and a carried object the engine
+    /// named no module for — even one whose description is the dropped name —
+    /// all stay reported.
+    #[test]
+    fn a_carried_referrer_is_excused_only_by_its_exact_dropped_module() {
+        let changes = pbps_model::ChangeSet {
+            changes: vec![
+                dropping(pbps_model::ModuleKind::View, "app.v"),
+                dropping(pbps_model::ModuleKind::Function, "app.w()"),
+            ],
+        };
+        let names = dropped_referrer_names(&changes);
+        let modules = dropped_modules(&changes);
+        let mut report = pbps_db::impact::ImpactReport {
+            target: "column app.t.label".to_owned(),
+            carried: vec![
+                carried_view("view other.v", "other", "v"),
+                carried_view("view app.w", "app", "w"),
+                referrer("carried", "app.v", None),
+                referrer("carried", "rule r on view app.v", None),
+            ],
+            ..Default::default()
+        };
+        let before = report.carried.clone();
+        excuse_dropped_referrers(&mut report, &names, &modules);
+        assert_eq!(report.carried, before);
     }
 
     /// #307: a PostgreSQL report holding only carried objects printed an
