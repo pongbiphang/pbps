@@ -4034,10 +4034,12 @@ fn refuse_unplanned_movement(
             // A partition's own defaults and NOT NULLs (#1581), as a created
             // one's above: a default by presence, the engine respelling its
             // text. Once the run is whole, the before-read with this plan's
-            // settings applied in order. Mid-run, a column the plan sets on
-            // the partition, or whose default it sets on the parent, which
-            // reaches every partition (DEC-1581.1), may hold either; every
-            // other column is held to the before-read (#1607 review).
+            // settings applied in order. Mid-run, a field the plan sets may
+            // hold either: a column's default where the plan sets it on the
+            // partition or on the parent, which reaches every partition
+            // (DEC-1581.1), and its NOT NULL where the plan sets that. Every
+            // other field is held to the before-read, the other field of a
+            // column the plan touches included (#1607 review).
             let own = |t: &pbps_model::Table| -> BTreeMap<String, (bool, bool)> {
                 t.partition_of
                     .iter()
@@ -4048,7 +4050,8 @@ fn refuse_unplanned_movement(
             };
             let parent = now.partition_of.as_ref().map(|of| &of.parent);
             let mut expected = own(was);
-            let mut planned_here: BTreeSet<&str> = BTreeSet::new();
+            let mut planned_defaults: BTreeSet<&str> = BTreeSet::new();
+            let mut planned_not_nulls: BTreeSet<&str> = BTreeSet::new();
             for p in &changes.changes {
                 if let pbps_model::Change::SetPartitionDefault {
                     table, column, to, ..
@@ -4056,7 +4059,7 @@ fn refuse_unplanned_movement(
                     && table == now_name
                 {
                     expected.entry(column.clone()).or_default().0 = to.is_some();
-                    planned_here.insert(column);
+                    planned_defaults.insert(column);
                 }
                 if let pbps_model::Change::SetPartitionNotNull {
                     table,
@@ -4067,12 +4070,12 @@ fn refuse_unplanned_movement(
                     && table == now_name
                 {
                     expected.entry(column.clone()).or_default().1 = *not_null;
-                    planned_here.insert(column);
+                    planned_not_nulls.insert(column);
                 }
                 if let pbps_model::Change::AlterColumnDefault { column, .. } = &p.change
                     && Some(&column.table) == parent
                 {
-                    planned_here.insert(&column.name);
+                    planned_defaults.insert(&column.name);
                 }
             }
             expected.retain(|_, held| *held != (false, false));
@@ -4080,10 +4083,14 @@ fn refuse_unplanned_movement(
             let own_moved = if settled.whole() {
                 expected != now_own
             } else {
-                was_own
-                    .keys()
-                    .chain(now_own.keys())
-                    .any(|c| !planned_here.contains(c.as_str()) && was_own.get(c) != now_own.get(c))
+                let held = |own: &BTreeMap<String, (bool, bool)>, c: &str| {
+                    own.get(c).copied().unwrap_or_default()
+                };
+                was_own.keys().chain(now_own.keys()).any(|c| {
+                    let (was_held, now_held) = (held(&was_own, c), held(&now_own, c));
+                    (was_held.0 != now_held.0 && !planned_defaults.contains(c.as_str()))
+                        || (was_held.1 != now_held.1 && !planned_not_nulls.contains(c.as_str()))
+                })
             };
             if own_moved {
                 moved.push(format!(
@@ -13271,6 +13278,16 @@ mod tests {
         }]);
         let own = schema(&[("v", true, false)]);
         check(&defaulting, &none, &own, Settled::Whole).expect("the plan's own");
+        check(&defaulting, &none, &own, Settled::SoFar).expect("run so far");
+        // Its NOT NULL set by another while the plan sets its default.
+        let e = check(
+            &defaulting,
+            &none,
+            &schema(&[("v", true, true)]),
+            Settled::SoFar,
+        )
+        .expect_err("the other field of the same column");
+        assert!(format!("{e:#}").contains("app.ev_1's own column"), "{e:#}");
         let e = check(&defaulting, &none, &none, Settled::Whole).expect_err("never set");
         assert!(format!("{e:#}").contains("app.ev_1's own column"), "{e:#}");
     }

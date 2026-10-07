@@ -3032,9 +3032,10 @@ partition's own defaults (by presence) and NOT NULLs, as it holds a created
 partition's:
 - once the run is whole, to the before-read with the plan's settings applied
   in order;
-- mid-run, a column the plan sets on the partition, or whose default it sets
-  on the parent, may hold either value, and every other column is held to
-  the before-read.
+- mid-run, a field the plan sets may hold either value: a column's default
+  where the plan sets it on the partition or on the parent, and its NOT NULL
+  where the plan sets that. Every other field is held to the before-read,
+  including the other field of a column the plan touches.
 
 Another session's change to them is movement (#1607 review).
 
