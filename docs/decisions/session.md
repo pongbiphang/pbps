@@ -444,3 +444,50 @@ add an entry here.
      `Dialect::probe_framing` is required, not defaulted, for the reason
      `transaction_framing` is. SQL Server answers `None`: a T-SQL function
      cannot modify data, so a declared `CHECK` has nothing to set off.
+
+<a id="dec-1564-1"></a>
+
+**DEC-1564.1. pbps's own PostgreSQL SQL runs on an empty `search_path`: every
+connection empties it, every scope ends on it, and pbps's statements inside a
+scope leave it (#1564).** An operator whose argument types match exactly is
+chosen over a built-in that needs a cast or takes a polymorphic argument, even
+with `pg_catalog` searched first. Measured on 16 and 18, with a raising
+operator created in a schema on the path: `oid = 'x'::regclass`,
+`oid = pg_catalog.to_regclass(...)`, `conparentid = 0`, `'x' || relname`,
+`relname || 'x'` and `int2[] = int2[]` all call it, and 276 protects only an
+identical signature. pbps's SQL runs as the deployer, so anyone who may
+create in such a schema could run code with the deployer's rights, inside the
+apply's transaction where its writes commit with the plan; DEC-319.1's pins
+catch a routine changed after planning, not one that was already there.
+
+The obvious fix is the issue's own: spell every comparison with an exact
+built-in signature (`::pg_catalog.oid`, `pg_catalog.format`) and lint for the
+two shapes found. It was measured to be one instance of a class with at least
+four more members (an `oid` against an integer literal, `text ||` any
+non-text, array `=`, `aclitem[] ||`), spread over about a hundred sites, and
+a lint over source text cannot know a column's type. So the path is removed
+instead of the operators: on an empty path only `pg_catalog` is searched for
+operators and functions, and nothing a user created is reachable whatever the
+statement spells.
+
+- `pbps-db` empties the path on every PostgreSQL connection, so a read that
+  forgets to pin one is safe anyway. A plain `SET` and not a startup option,
+  which a pooler may refuse or drop.
+- `session_pins` carries it too, so a rendered script run by `psql` starts
+  there.
+- A scope (`SET search_path = <write path>`) ends with `SET search_path = ''`
+  rather than `RESET`, which would return to the role's path.
+- A statement that is pbps's alone, with no declared expression to resolve
+  (an unnamed key's drop, its index's storage, a replica identity through
+  the key, a detach), is emitted outside any scope.
+- A `DO` block that also holds a declared expression stays scoped, and its
+  pbps-only statements (a row delete's referencing guard) move to the empty
+  path and back with a local `set_config`. plpgsql plans each statement under
+  the path in force when it first runs.
+
+The probes already ran on the session's path, not the write path (259); an
+unqualified name in a declared check that the deployer's path used to reach
+in `public` now reports the probe unchecked, as any other unqualified name
+already did. The live test `pbps_sql_calls_no_operator_a_schema_user_could_add`
+plants raising operators in `public` and in the managed schema and runs a
+pull, a connected plan with probes, an apply and `doctor` on 16 and 18.

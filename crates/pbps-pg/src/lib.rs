@@ -420,9 +420,15 @@ fn quote(ident: &str) -> Result<String, DialectError> {
 /// `BEGIN;`, and `concat!` takes literals and not constants. Transactional
 /// execution, staged/resumed execution and rendered scripts share this text,
 /// so their parser settings cannot drift apart.
+///
+/// The empty `search_path` is the one setting here that is not a parser's:
+/// pbps's own SQL between the scopes must reach no operator a schema user
+/// added (DEC-1564.1). `pbps-db` sets it on every connection already; here it
+/// reaches a rendered script, and every scope ends on it.
 macro_rules! session_pins {
     () => {
-        "SET standard_conforming_strings = on; SET check_function_bodies = on; \
+        "SET search_path = ''; \
+         SET standard_conforming_strings = on; SET check_function_bodies = on; \
          SET DateStyle = 'ISO, MDY'; SET TimeZone = 'UTC'; \
          SET IntervalStyle = 'postgres'; \
          SET timezone_abbreviations = 'Default'; \

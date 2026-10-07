@@ -1345,15 +1345,43 @@ pub(crate) fn write_path(pg: &Postgres, schema: &str) -> Result<String, DialectE
 ///
 /// `SET` and not `SET LOCAL`: a rendered script is run statement by statement
 /// outside any transaction, where `SET LOCAL` is a warning and a no-op, and a
-/// scope that quietly does nothing is worse than none. The `RESET` afterwards
-/// is in the same batch, so inside a transaction a failure rolls it back with
-/// everything else, and outside one it returns the connection to the settings
-/// the operator's environment gives it.
+/// scope that quietly does nothing is worse than none. The empty path
+/// afterwards is in the same batch, so inside a transaction a failure rolls it
+/// back with everything else.
+///
+/// Empty and not `RESET`: the session pins an empty path (DEC-1564.1), and
+/// `RESET` would return to the role's own, where anyone who may create in a
+/// schema on it can add an operator pbps's next statement calls. So only what
+/// the scope holds runs on the schema's path, and pbps's own SQL there must
+/// not reach an operator a user of that schema could add: [`unscoped`] for a
+/// statement that is pbps's alone, [`on_catalog_path`] inside one that is not.
 fn scoped(pg: &Postgres, schema: &str, body: &str) -> Result<Statement, DialectError> {
     Ok(Statement::new(format!(
-        "SET search_path = {};\n{body}\nRESET search_path;",
+        "SET search_path = {};\n{body}\nSET search_path = '';",
         write_path(pg, schema)?
     )))
+}
+
+/// A statement that is pbps's alone, on the session's empty path: every name
+/// in it qualified, and no declared expression to resolve, so it needs no
+/// schema's path and is safer without one (DEC-1564.1).
+fn unscoped(body: String) -> Sql {
+    Ok(vec![Statement::new(body)])
+}
+
+/// pbps's own statements inside a `DO` block that runs on a schema's path,
+/// moved onto the empty one and back. For a block that also holds a declared
+/// expression, which needs the schema's path: plpgsql plans each statement
+/// when it first runs, under the path set then (measured on 16 and 18; a
+/// local setting, so a failure rolls it back with the block). The block
+/// declares `pbps_path text` (DEC-1564.1).
+pub(crate) fn on_catalog_path(statements: &str) -> String {
+    format!(
+        "pbps.pbps_path := pg_catalog.current_setting('search_path');\n\
+         PERFORM pg_catalog.set_config('search_path', '', true);\n\
+         {statements}\n\
+         PERFORM pg_catalog.set_config('search_path', pbps.pbps_path, true);"
+    )
 }
 
 /// The same, for a table's own schema.
@@ -1471,7 +1499,7 @@ fn create_module(pg: &Postgres, id: &ModuleId, module: &Module) -> Result<Statem
     };
     // The terminator on a line of its own, because the line before it is the
     // user's: a definition ending in `-- note` would otherwise swallow it, and
-    // the statement would run on into the `RESET search_path` the scope adds.
+    // the statement would run on into the `SET search_path` the scope ends on.
     // The same rule as every other verbatim expression here (DECISIONS 281),
     // and the whole body is verbatim.
     scoped(pg, id.schema(), &format!("{sql}\n;"))
@@ -2347,7 +2375,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             parent,
             names,
             ..
-        } => one(pg, table, detach_partition(table, parent, names)?),
+        } => unscoped(detach_partition(table, parent, names)?),
 
         // Two statements when both halves move, and neither engine has one that
         // does both: `RENAME TO` cannot cross a schema and `SET SCHEMA` cannot
@@ -2664,7 +2692,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         Change::SetColumnDeprecated { .. } => Ok(Vec::new()),
 
         Change::SetReplicaIdentity { table, to, .. } => {
-            one(pg, table, set_replica_identity(table, to.as_ref())?)
+            unscoped(set_replica_identity(table, to.as_ref())?)
         }
         // Rewrites the table and its indexes, in either direction (#1443).
         Change::SetTablePersistence {
@@ -2722,7 +2750,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                         ))
                     );
                     let tag = dollar_tag(&body);
-                    one(pg, table, format!("DO {tag}\n{body}\n{tag};"))
+                    unscoped(format!("DO {tag}\n{body}\n{tag};"))
                 }
             }
         }
@@ -2755,7 +2783,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             }
             let mut out = Vec::new();
             if let Some(pk) = from {
-                out.push(on(pg, table, &drop_primary_key(table, pk)?)?);
+                out.push(Statement::new(drop_primary_key(table, pk)?));
             }
             if let Some(pk) = to {
                 out.push(on(
@@ -3368,11 +3396,10 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
     }
     // Last: the index it may name is the last statement above (#1444).
     if table.replica_identity.is_some() {
-        out.push(on(
-            pg,
+        out.push(Statement::new(set_replica_identity(
             name,
-            &set_replica_identity(name, table.replica_identity.as_ref())?,
-        )?);
+            table.replica_identity.as_ref(),
+        )?));
     }
     Ok(out)
 }
@@ -4027,7 +4054,7 @@ fn update_row(
     }
     sql.push('\n');
     sql.push_str(&wrote_the_row(table, key, key_column, &cells)?);
-    Ok(with_variables(&["pbps_rows"], &sql))
+    Ok(with_variables(&[("pbps_rows", "bigint")], &sql))
 }
 
 /// One `DELETE`, keyed *and* held to the row the plan recorded.
@@ -4070,10 +4097,17 @@ fn delete_row(
     // The guard, the delete and the checks after it are one block: the row
     // lock the guard takes has to be held through the delete it protects, and
     // a staged apply runs each statement outside a transaction.
-    Ok(with_variables(&["pbps_rows", "pbps_referencing"], &sql))
+    Ok(with_variables(
+        &[
+            ("pbps_rows", "bigint"),
+            ("pbps_referencing", "bigint"),
+            ("pbps_path", "text"),
+        ],
+        &sql,
+    ))
 }
 
-/// A row block's body with its `bigint` variables declared.
+/// A row block's body with its variables declared.
 ///
 /// The row writes name the table's columns unqualified, and a data table may
 /// have a column spelled like one of these variables. Under the default
@@ -4083,10 +4117,10 @@ fn delete_row(
 /// label (`pbps.pbps_rows`), which a column cannot shadow. Renaming the
 /// variables to something less likely would only move the collision
 /// (DEC-976.1).
-fn with_variables(variables: &[&str], body: &str) -> String {
+fn with_variables(variables: &[(&str, &str)], body: &str) -> String {
     let declared: String = variables
         .iter()
-        .map(|v| format!("    {v} bigint;\n"))
+        .map(|(v, ty)| format!("    {v} {ty};\n"))
         .collect();
     format!("#variable_conflict use_column\n<<pbps>>\nDECLARE\n{declared}BEGIN\n{body}\nEND pbps")
 }
@@ -5695,7 +5729,7 @@ mod tests {
             assert_eq!(
                 sql,
                 vec![format!(
-                    "SET search_path = \"app\", \"pg_temp\";\n{expected}\n;\nRESET search_path;"
+                    "SET search_path = \"app\", \"pg_temp\";\n{expected}\n;\nSET search_path = '';"
                 )],
                 "{id}"
             );
@@ -6021,7 +6055,7 @@ mod tests {
             vec![
                 "SET search_path = \"app\", \"shared\", \"public\", \"pg_temp\";\n\
                  DROP TABLE \"app\".\"t\";\n\
-                 RESET search_path;"
+                 SET search_path = '';"
             ]
         );
     }
@@ -6071,7 +6105,7 @@ mod tests {
         assert_eq!(
             sql,
             vec![
-                "SET search_path = \"app\", \"pg_temp\";\nDROP INDEX \"app\".\"ix\";\nRESET search_path;"
+                "SET search_path = \"app\", \"pg_temp\";\nDROP INDEX \"app\".\"ix\";\nSET search_path = '';"
             ]
         );
     }
@@ -6232,7 +6266,7 @@ mod tests {
             vec![
                 "SET search_path = \"app\", \"pg_temp\";\n\
                  ALTER TABLE \"app\".\"t\" ALTER COLUMN \"at\" TYPE character varying(20);\n\
-                 RESET search_path;"
+                 SET search_path = '';"
             ]
         );
     }
@@ -6267,7 +6301,7 @@ mod tests {
                  CREATE TABLE \"app\".\"t\" (\n\
                  \x20   \"id\" integer NOT NULL\n\
                  ) USING heap;\n\
-                 RESET search_path;"
+                 SET search_path = '';"
             ]
         );
     }
@@ -6581,10 +6615,9 @@ mod tests {
             },
         );
         let block = &sql[0];
-        assert!(
-            block.contains("SET search_path = \"odd schema\", \"pg_temp\";"),
-            "{block}"
-        );
+        // pbps's alone, so on the session's empty path and not the schema's
+        // (DEC-1564.1).
+        assert!(!block.contains("SET search_path"), "{block}");
         // Code position: doubled quotes. Literal position: doubled apostrophe —
         // and the statement `format` builds is a literal *inside* a literal, so
         // its own apostrophes are doubled a second time. Quoting the name as an
@@ -6603,7 +6636,7 @@ mod tests {
         // doubling and not two — and the tag is chosen so the body cannot end
         // it early.
         assert!(
-            block.starts_with("SET search_path = \"odd schema\", \"pg_temp\";\nDO $pbps$\n"),
+            block.starts_with("DO $pbps$\n"),
             "{block}"
         );
     }

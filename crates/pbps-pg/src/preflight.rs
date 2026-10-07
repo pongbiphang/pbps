@@ -1215,7 +1215,10 @@ pub(crate) fn still_referenced(
         quote(key_column)?,
         value_literal(key.as_str())
     );
-    Ok(format!(
+    // On the empty path: the block runs on the table's schema's path, for
+    // the declared defaults its delete compares with, and none of this is
+    // declared (DEC-1564.1).
+    Ok(crate::emit::on_catalog_path(&format!(
         "PERFORM 1 FROM {parent} AS p WHERE p.{} = {} FOR UPDATE;\n\
          IF {} THEN\n    {}\nEND IF;\n\
          pbps.pbps_referencing := {};\n\
@@ -1271,7 +1274,7 @@ pub(crate) fn still_referenced(
              checked; the delete would orphan or cascade into them. Nothing was applied. \
              Plan again."
         ))
-    ))
+    )))
 }
 
 /// The row about to be deleted, left out of the count on its own table.
