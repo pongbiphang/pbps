@@ -899,3 +899,67 @@ Pinned by:
   (`crates/pbps-cli/tests/flow.rs`). This test runs on a database whose
   default collation is not the server's, and reads the real plan's script to
   check that `doctor` agrees with it.
+
+<a id="dec-822-1"></a>
+
+**DEC-822.1. A refused lock read is remedied with the one statement for the
+gap a fresh session can see, or with a recheck when it sees none.** SPEC §14.1
+promises a copy-pastable remedy for every `doctor` failure. The read-failure
+remedies were prose that neither `psql` nor `sqlcmd` can run. Written as
+statements instead, they would have asked for every grant at once, including
+`SELECT` on a lock table that a never-initialized database does not have
+(#821, #822). The failed read cannot say which grant is missing: a refused
+lookup does not say whether the table exists. So after the lock read fails,
+`doctor` asks the catalog, and names only what the catalog shows.
+
+- **A fresh session with the same connection string.** The failed read's own
+  recovery is deliberately quiet (`rewind_quietly`), so its session is not
+  proof of a usable one. The same identity means the catalog answers for the
+  role that deploys. Any failure to ask, the connection included, answers
+  `Unexplained`, which names no grant.
+- **PostgreSQL asks about the schema first, and the table only when the schema
+  is usable.** Without `USAGE` the lookup is refused before the table is found
+  or missed, so the schema's grant is the next fix. The table's `SELECT` is
+  named only when `pg_class` shows the table in that schema. `pg_namespace`
+  and `pg_class` are readable without the schema's `USAGE` (measured on
+  18.6).
+- **SQL Server cannot tell an invisible table from an absent one.** Measured
+  on 2025 RTM: with no permission on `dbo.__pbps_lock`, `OBJECT_ID` is NULL
+  for it, as for a missing table, and `HAS_PERMS_BY_NAME` answers 0 for both.
+  An invisible table therefore gets `GRANT VIEW DEFINITION ON
+  OBJECT::dbo.__pbps_lock`. That object grant makes the table visible and
+  nothing else; the database-wide grant would also show every other schema's
+  objects and module definitions, which DECISIONS 505 keeps hidden (measured:
+  another schema's procedure definition stays `NULL` under the object grant
+  and appears under the database one). Once the table is visible, the next
+  `doctor` names its `SELECT`. A `DENY` through a role overrides that grant,
+  and the message says so. The name is looked up untyped first: a visible
+  object of another kind there, such as a view, reads `NULL` from the
+  table-typed lookup too, and no grant can make it the lock table, so it is
+  unexplained.
+- **One statement in the remedy, the explanation in the message.** The
+  principal is the whole quoted placeholder (`"<database role>"` or
+  `"<database user>"`). The message says to replace it, quotes included, with
+  the name quoted as an identifier. pbps does not escape a name it does not
+  know.
+- **`permission.unknown` names no statement.** Which of its reads failed is not
+  carried that far, so the advice moves to the message, and the remedy is
+  `pbps doctor` against the same target.
+
+Rejected: classifying the failure from its SQLSTATE or error text, which
+cannot say whether the table exists. Also rejected: a single conditional
+batch, whose quoting and no-write behaviour would need measuring for an
+arbitrary principal.
+
+Pinned by:
+- `a_failed_read_is_remedied_in_the_connected_engines_words` and
+  `a_lock_question_that_cannot_be_asked_names_no_grant`
+  (`crates/pbps-cli/src`);
+- `doctor_tells_a_role_that_cannot_read_the_lock_what_to_grant_in_postgres_terms`
+  and `doctor_repairs_schema_access_before_an_absent_lock_table`
+  (`crates/pbps-cli/tests/flow_pg.rs`);
+- `doctor_mssql_lock_recovery_executes_the_emitted_statement`
+  (`crates/pbps-cli/tests/flow.rs`).
+
+Each live test runs the emitted statement with only the placeholder replaced,
+and the principal's name holds a quote character.

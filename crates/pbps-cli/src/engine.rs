@@ -1982,70 +1982,163 @@ pub async fn permissions(
     }
 }
 
-/// What `doctor` tells the operator when one of its own reads was refused, in
-/// this engine's words.
+/// What `doctor` tells the operator when its lock read was refused, in this
+/// engine's words: why, and the one statement that repairs what a fresh
+/// session could see (#822).
 ///
-/// The two remedies used to be SQL Server's alone: a PostgreSQL environment
-/// whose lock read was denied was told to grant `SELECT` on `dbo.__pbps_lock`,
-/// a table that does not exist there, and one whose permission read failed was
-/// told to grant `VIEW DEFINITION`, which PostgreSQL does not have (#306).
+/// The remedies used to be SQL Server's alone: a PostgreSQL environment whose
+/// lock read was denied was told to grant `SELECT` on `dbo.__pbps_lock`, a
+/// table that does not exist there (#306). Then they were prose, which
+/// neither `psql` nor `sqlcmd` can run, and asked for every grant at once —
+/// including `SELECT` on a lock table a never-initialized database does not
+/// have (#821, #822). Now the statement is chosen from what the catalog
+/// shows, one grant at a time; after it, `doctor` run again names the next.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReadRemedies {
-    /// The deployment lock could not be read.
-    pub lock: String,
-    /// The account's permissions could not be read.
-    pub permissions: String,
+pub struct LockRemedy {
+    /// Why the lock could not be read, as far as the catalog says, and how
+    /// to run the statement. Goes in the finding's message.
+    pub why: String,
+    /// One complete statement, or `None` when nothing seen explains the
+    /// failure and no grant is named.
+    pub statement: Option<String>,
 }
 
-pub fn read_remedies(driver: Driver) -> ReadRemedies {
-    match driver {
-        Driver::Mssql => ReadRemedies {
-            lock: format!(
-                "grant SELECT on {}, or check that the table is intact",
+/// Asks a session of its own, with the same connection string, why the lock
+/// could not be read (#822).
+///
+/// A fresh session rather than the one that failed: the failed read's own
+/// recovery is deliberately quiet (`rewind_quietly`), so that session is not
+/// proof of a usable one, and a question asked on it could answer for the
+/// wrong state. Same identity, so the catalog answers for the role that
+/// deploys. Every failure here, the connection included, is
+/// [`LockReadGap::Unexplained`]: a question that could not be asked never
+/// becomes a grant.
+pub async fn lock_read_gap(driver: Driver, connection: &str) -> pbps_db::doctor::LockReadGap {
+    use pbps_db::doctor::LockReadGap;
+    let Ok(mut conn) = Conn::connect(driver, connection).await else {
+        return LockReadGap::Unexplained;
+    };
+    let answer = match driver {
+        Driver::Mssql => pbps_mssql::doctor::lock_read_gap(&mut conn).await,
+        Driver::Postgres => pbps_pg::doctor::lock_read_gap(&mut conn).await,
+    };
+    answer.unwrap_or(LockReadGap::Unexplained)
+}
+
+/// The remedy for a lock read that failed, from what [`lock_read_gap`] saw.
+/// `None` — nothing asked — is treated as nothing seen.
+///
+/// The principal is the whole quoted placeholder, `"<database role>"` or
+/// `"<database user>"`: the message says to replace it, quotes included,
+/// with the name quoted as an identifier. It is not SQL-escaped for the
+/// operator, and it cannot be: pbps does not know which principal they will
+/// grant to.
+pub fn lock_remedy(driver: Driver, gap: Option<pbps_db::doctor::LockReadGap>) -> LockRemedy {
+    use pbps_db::doctor::LockReadGap;
+    let gap = gap.unwrap_or(LockReadGap::Unexplained);
+    let (noun, principal) = match driver {
+        Driver::Mssql => ("user", crate::report::placeholder("database user")),
+        Driver::Postgres => ("role", crate::report::placeholder("database role")),
+    };
+    let how = format!(
+        "run the remedy as a principal allowed to grant it, with {principal} (quotes \
+         included) replaced by this {noun}'s name quoted as an identifier, then rerun doctor"
+    );
+    let next = "if the lock is still unreadable after that, doctor names the next grant";
+    match (driver, gap) {
+        (Driver::Postgres, LockReadGap::SchemaUsage) => LockRemedy {
+            why: format!(
+                "this role may not use schema {schema}, which holds the ledger; {how}; {next}",
+                schema = pbps_pg::state::LEDGER_SCHEMA
+            ),
+            statement: Some(format!(
+                "GRANT USAGE ON SCHEMA {} TO {principal};",
+                pbps_pg::state::LEDGER_SCHEMA
+            )),
+        },
+        (Driver::Postgres, LockReadGap::TableSelect) => LockRemedy {
+            why: format!(
+                "{} exists and this role may not read it; {how}",
+                pbps_pg::state::LOCK_TABLE
+            ),
+            statement: Some(format!(
+                "GRANT SELECT ON TABLE {} TO {principal};",
+                pbps_pg::state::LOCK_TABLE
+            )),
+        },
+        // Measured on 2025 RTM: without any permission on it the table is
+        // invisible, and whether it lacks only `SELECT` cannot be told. The
+        // object's own `VIEW DEFINITION` makes it visible and nothing else:
+        // the database-wide grant would also show every other schema's
+        // objects and module definitions, which the narrower grants of
+        // DECISIONS 505 keep hidden (review of #1641).
+        (Driver::Mssql, LockReadGap::Hidden) => LockRemedy {
+            why: format!(
+                "this user cannot see {table} at all, so what it lacks on it cannot be told \
+                 yet; {how}; {next}; the statement fails if {table} does not exist, and then \
+                 the database is not initialized as pbps expects",
+                table = pbps_mssql::state::LOCK_TABLE
+            ),
+            statement: Some(format!(
+                "GRANT VIEW DEFINITION ON OBJECT::{} TO {principal};",
+                pbps_mssql::state::LOCK_TABLE
+            )),
+        },
+        (Driver::Mssql, LockReadGap::TableSelect) => LockRemedy {
+            why: format!(
+                "{} exists and this user may not read it; {how}; a DENY through a role this \
+                 user is in overrides the grant, and leaves the lock unreadable",
                 pbps_mssql::state::LOCK_TABLE
             ),
-            permissions: "grant VIEW DEFINITION, or check what the login is mapped to in this \
-                          database"
-                .into(),
+            statement: Some(format!(
+                "GRANT SELECT ON OBJECT::{} TO {principal};",
+                pbps_mssql::state::LOCK_TABLE
+            )),
         },
-        // Both grants, measured on 18.6: without `SELECT` the read is
-        // "permission denied for table __pbps_lock", and with it but without
-        // `USAGE` it is "permission denied for schema public".
-        //
-        // The schema first, and the table only if the finding outlives it.
-        // Without `USAGE` the lookup is refused before the table is found or
-        // missed, so an uninitialized database reads as this finding too; with
-        // `USAGE` it reads "relation does not exist", which `lock_holder`
-        // takes as no lock at all (measured on 18.6). Asking for both at once
-        // sent that operator to grant `SELECT` on a table that does not exist
-        // yet (#821). Which of the two failed is not carried this far, and
-        // the error text is not parsed to guess it, so the order does the work.
-        Driver::Postgres => ReadRemedies {
-            lock: format!(
-                "grant USAGE on schema {schema} to this role and rerun doctor; only if this \
-                 finding remains and {table} exists, grant SELECT on {table} too, or check \
-                 that the table is intact",
-                schema = pbps_pg::state::LEDGER_SCHEMA,
-                table = pbps_pg::state::LOCK_TABLE,
+        (Driver::Postgres, _) => LockRemedy {
+            why: format!(
+                "nothing this role can see explains it: check that the connection names the \
+                 role that deploys and that {} is intact, then rerun doctor",
+                pbps_pg::state::LOCK_TABLE
             ),
-            // The read asks `has_*_privilege` and the system catalogs, which
-            // every role may read unless someone revoked it; the other way it
-            // fails is a connection that is not the role meant to deploy. But
-            // once the project has recorded identities (tables, columns or a
-            // tombstone), `pbps_pg::doctor::permissions` first reads the last
-            // recorded state, and that read needs the ledger's own grants: a
-            // role without them was sent to the catalogs, which were fine
-            // (#820). Named conditionally, because which read failed is not
-            // carried this far, and the table may not exist at all.
-            permissions: format!(
-                "check that the connection names the role that deploys and that it can read \
-                 the system catalogs (`pg_catalog`); once this project has recorded \
-                 identities, doctor also reads its last recorded state, which needs USAGE on \
-                 schema {} and, where that table exists, SELECT on {}",
-                pbps_pg::state::LEDGER_SCHEMA,
-                pbps_pg::state::STATE_TABLE
-            ),
+            statement: None,
         },
+        (Driver::Mssql, _) => LockRemedy {
+            why: format!(
+                "nothing this user can see explains it: check what the login is mapped to in \
+                 this database and that {} is intact, then rerun doctor",
+                pbps_mssql::state::LOCK_TABLE
+            ),
+            statement: None,
+        },
+    }
+}
+
+/// What to check when `doctor` could not read the account's permissions, in
+/// this engine's words. Advice, not a statement: which read failed is not
+/// carried this far, so no single grant is known to be the repair (#822).
+pub fn permission_read_advice(driver: Driver) -> String {
+    match driver {
+        Driver::Mssql => "check that this user has VIEW DEFINITION in this database and what \
+                          the login is mapped to, then rerun doctor"
+            .to_owned(),
+        // The read asks `has_*_privilege` and the system catalogs, which
+        // every role may read unless someone revoked it; the other way it
+        // fails is a connection that is not the role meant to deploy. But
+        // once the project has recorded identities (tables, columns or a
+        // tombstone), `pbps_pg::doctor::permissions` first reads the last
+        // recorded state, and that read needs the ledger's own grants: a
+        // role without them was sent to the catalogs, which were fine
+        // (#820). Named conditionally, because which read failed is not
+        // carried this far, and the table may not exist at all.
+        Driver::Postgres => format!(
+            "check that the connection names the role that deploys and that it can read the \
+             system catalogs (`pg_catalog`); once this project has recorded identities, doctor \
+             also reads its last recorded state, which needs USAGE on schema {} and, where that \
+             table exists, SELECT on {}",
+            pbps_pg::state::LEDGER_SCHEMA,
+            pbps_pg::state::STATE_TABLE
+        ),
     }
 }
 
@@ -2742,6 +2835,29 @@ pub fn validate_plan_analysis(plan: &pbps_model::SavedPlan) -> anyhow::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #822: when the follow-up question cannot be asked — here, nothing
+    /// answers the connection — the answer is "unexplained", which names no
+    /// grant, on either engine. A failure to ask is never read as a gap.
+    #[test]
+    fn a_lock_question_that_cannot_be_asked_names_no_grant() {
+        use pbps_db::doctor::LockReadGap;
+        for (driver, connection) in [
+            (
+                Driver::Postgres,
+                "host=127.0.0.1 port=1 user=u dbname=d sslmode=disable connect_timeout=1",
+            ),
+            (
+                Driver::Mssql,
+                "Server=127.0.0.1,1;User Id=u;Password=p;TrustServerCertificate=true;\
+                 Connect Timeout=1",
+            ),
+        ] {
+            let gap = block_on(lock_read_gap(driver, connection));
+            assert_eq!(gap, LockReadGap::Unexplained, "{driver:?}");
+            assert_eq!(lock_remedy(driver, Some(gap)).statement, None, "{driver:?}");
+        }
+    }
 
     /// A retype or drop of a column a live generated column reads goes after
     /// the plan's change to that expression which stops reading it, and only

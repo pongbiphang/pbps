@@ -157,6 +157,14 @@ pub struct EnvDiagnosis {
     /// was.
     #[serde(skip)]
     untrusted_ledger: Vec<String>,
+
+    /// What a fresh session with the same identity could see about why the
+    /// lock read failed (#822), which chooses `state.lock-unknown`'s remedy.
+    /// `None` when the lock was read, or nothing was asked. Not serialized:
+    /// the finding carries what it decided, and the published schema stays
+    /// as it was.
+    #[serde(skip)]
+    lock_gap: Option<pbps_db::doctor::LockReadGap>,
 }
 
 impl EnvDiagnosis {
@@ -188,6 +196,7 @@ impl EnvDiagnosis {
             server_capabilities_unknown: None,
             detail: None,
             untrusted_ledger: Vec::new(),
+            lock_gap: None,
         }
     }
 
@@ -1032,6 +1041,10 @@ async fn examine(
         // `missing_permissions` meaning "none missing".
         Err(e) => {
             d.note(format!("could not read the deployment lock: {e}"));
+            // Only to choose the remedy: the state stays `lock-unknown`
+            // whatever this finds, and a question that cannot be asked is
+            // an unexplained failure, never a grant (#822).
+            d.lock_gap = Some(crate::engine::lock_read_gap(driver, connection).await);
             "lock-unknown"
         }
         Ok(Some(lock)) => {
@@ -1094,7 +1107,6 @@ fn env_findings(
     driver: pbps_db::Driver,
 ) -> Vec<output::Finding> {
     let mut out = Vec::new();
-    let remedies = crate::engine::read_remedies(driver);
     match d.state {
         // Unreachable and unconfigured are errors: this is the command whose
         // whole job is to answer "can I deploy from here", and it cannot.
@@ -1156,19 +1168,31 @@ fn env_findings(
         // Unanswerable, like `permission.unknown`: `doctor` could not establish
         // whether a deployment is running, and "probably not" is not an answer
         // this command is allowed to give.
-        "lock-unknown" => out.push(
-            output::Finding::error(
-                "state.lock-unknown",
-                format!(
-                    "{}: {}",
-                    d.environment,
-                    d.detail
-                        .as_deref()
-                        .unwrap_or("the deployment lock could not be read")
+        // The remedy is one complete statement for the one gap a fresh
+        // session could see, or a recheck when it saw none; the explanation,
+        // including how to fill in the principal, is in the message, so the
+        // remedy is exactly what to run (#822).
+        "lock-unknown" => {
+            let repair = crate::engine::lock_remedy(driver, d.lock_gap);
+            out.push(
+                output::Finding::error(
+                    "state.lock-unknown",
+                    format!(
+                        "{}: {}; {}",
+                        d.environment,
+                        d.detail
+                            .as_deref()
+                            .unwrap_or("the deployment lock could not be read"),
+                        repair.why
+                    ),
+                )
+                .remedy(
+                    repair
+                        .statement
+                        .unwrap_or_else(|| format!("pbps doctor {}", target_arg(d))),
                 ),
-            )
-            .remedy(remedies.lock.clone()),
-        ),
+            );
+        }
         // An error, not a warning. `doctor` answers "can I deploy from here",
         // and while the lock is held an apply is refused — so a readiness check
         // that passed would be answering a different question than the one it
@@ -1236,11 +1260,15 @@ fn env_findings(
                 "permission.unknown",
                 format!(
                     "{}: this account's permissions could not be read, so whether it can deploy \
-                     here is undetermined",
-                    d.environment
+                     here is undetermined; {}",
+                    d.environment,
+                    crate::engine::permission_read_advice(driver)
                 ),
             )
-            .remedy(remedies.permissions),
+            // Which of the reads failed is not known here, so there is no one
+            // statement to name: the advice says what to check, and the
+            // remedy is the command that checks again (#822).
+            .remedy(format!("pbps doctor {}", target_arg(d))),
         );
     }
     for gap in &d.missing_permissions {
@@ -2067,86 +2095,129 @@ mod tests {
         assert!(lock.message.contains("__pbps_lock"), "{}", lock.message);
     }
 
-    /// #306: a failed lock read and a failed permission read are remedied in
-    /// the connected engine's words. PostgreSQL was told to grant `SELECT` on
-    /// `dbo.__pbps_lock` and `VIEW DEFINITION`, neither of which exists there.
+    /// #306, #821, #822: a failed lock read is remedied in the connected
+    /// engine's words, with one complete statement for the one gap a fresh
+    /// session saw — never two grants at once, never a grant for a gap that
+    /// was not seen. The explanation, and how to fill in the principal, are
+    /// in the message, so the remedy is exactly what to run; when nothing was
+    /// seen, the remedy is the command that checks again.
     #[test]
     fn a_failed_read_is_remedied_in_the_connected_engines_words() {
-        let remedies = |driver: pbps_db::Driver| {
+        use pbps_db::doctor::LockReadGap;
+        let diagnosed = |gap: Option<LockReadGap>| {
             let mut d =
                 EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "unreachable");
             d.permissions_unknown = true;
             d.note("could not read the deployment lock: permission denied".to_owned());
             d.state = "lock-unknown";
-            let findings = match driver {
-                pbps_db::Driver::Mssql => env_findings(&d, false, &pbps_mssql::Mssql, driver),
-                pbps_db::Driver::Postgres => {
-                    env_findings(&d, false, &pbps_pg::Postgres::new(), driver)
-                }
-            };
-            let remedy = |id: &str| {
-                findings
-                    .iter()
-                    .find(|f| f.id == id)
-                    .and_then(|f| f.remedy.clone())
-                    .unwrap_or_else(|| panic!("no remedy for {id}: {findings:?}"))
-            };
-            (remedy("state.lock-unknown"), remedy("permission.unknown"))
+            d.lock_gap = gap;
+            d
         };
-
-        let (lock, permissions) = remedies(pbps_db::Driver::Postgres);
-        assert!(lock.contains("public.__pbps_lock"), "{lock}");
-        assert!(lock.contains("USAGE on schema public"), "{lock}");
-        // #821: the schema comes first, then a rerun, and the table's grant
-        // only if the finding survives and the table exists — on an
-        // uninitialized database the table is not there to grant on.
-        let usage = lock.find("USAGE on schema public").unwrap();
-        let rerun = lock
-            .find("rerun doctor")
-            .unwrap_or_else(|| panic!("{lock}"));
-        let select = lock
-            .find("SELECT on public.__pbps_lock")
-            .unwrap_or_else(|| panic!("{lock}"));
-        assert!(usage < rerun && rerun < select, "{lock}");
-        assert!(
-            lock[rerun..select].contains("only if this finding remains")
-                && lock[rerun..select].contains("public.__pbps_lock exists"),
-            "{lock}"
-        );
-        assert!(permissions.contains("pg_catalog"), "{permissions}");
-        assert!(permissions.contains("role that deploys"), "{permissions}");
-        // #820: with recorded identities the permission read starts with the
-        // recorded state, so the ledger's grants are named too.
-        assert!(
-            permissions.contains("SELECT on public.__pbps_state"),
-            "{permissions}"
-        );
-        assert!(
-            permissions.contains("USAGE on schema public"),
-            "{permissions}"
-        );
-        // And nothing of the other engine's vocabulary.
-        for text in [&lock, &permissions] {
-            for foreign in ["dbo.", "VIEW DEFINITION", "login"] {
-                assert!(!text.contains(foreign), "{foreign:?} in {text}");
+        let findings = |d: &EnvDiagnosis, driver: pbps_db::Driver| match driver {
+            pbps_db::Driver::Mssql => env_findings(d, false, &pbps_mssql::Mssql, driver),
+            pbps_db::Driver::Postgres => env_findings(d, false, &pbps_pg::Postgres::new(), driver),
+        };
+        let only = |findings: &[output::Finding], id: &str| -> output::Finding {
+            let matched: Vec<&output::Finding> = findings.iter().filter(|f| f.id == id).collect();
+            assert_eq!(matched.len(), 1, "{id}: {findings:?}");
+            assert_eq!(matched[0].severity, output::Severity::Error);
+            matched[0].clone()
+        };
+        let recheck = format!("pbps doctor {}", target_arg(&diagnosed(None)));
+        let pg = pbps_db::Driver::Postgres;
+        let mssql = pbps_db::Driver::Mssql;
+        let cases = [
+            (
+                pg,
+                Some(LockReadGap::SchemaUsage),
+                "GRANT USAGE ON SCHEMA public TO \"<database role>\";".to_owned(),
+            ),
+            (
+                pg,
+                Some(LockReadGap::TableSelect),
+                "GRANT SELECT ON TABLE public.__pbps_lock TO \"<database role>\";".to_owned(),
+            ),
+            (pg, Some(LockReadGap::Unexplained), recheck.clone()),
+            // Not a PostgreSQL answer; if it ever arrives, nothing is granted.
+            (pg, Some(LockReadGap::Hidden), recheck.clone()),
+            // Nothing asked is nothing seen.
+            (pg, None, recheck.clone()),
+            (
+                mssql,
+                Some(LockReadGap::Hidden),
+                "GRANT VIEW DEFINITION ON OBJECT::dbo.__pbps_lock TO \"<database user>\";"
+                    .to_owned(),
+            ),
+            (
+                mssql,
+                Some(LockReadGap::TableSelect),
+                "GRANT SELECT ON OBJECT::dbo.__pbps_lock TO \"<database user>\";".to_owned(),
+            ),
+            (mssql, Some(LockReadGap::Unexplained), recheck.clone()),
+            (mssql, Some(LockReadGap::SchemaUsage), recheck.clone()),
+            (mssql, None, recheck.clone()),
+        ];
+        for (driver, gap, expected) in cases {
+            let d = diagnosed(gap);
+            let all = findings(&d, driver);
+            let lock = only(&all, "state.lock-unknown");
+            let remedy = lock.remedy.clone().unwrap_or_default();
+            assert_eq!(remedy, expected, "{driver:?} {gap:?}");
+            assert!(
+                !crate::report::has_bare_placeholder(&remedy),
+                "{driver:?} {gap:?}: {remedy}"
+            );
+            // The cause stays, and the explanation goes beside it.
+            assert!(
+                lock.message.contains("permission denied"),
+                "{}",
+                lock.message
+            );
+            if remedy.starts_with("GRANT") {
+                assert!(lock.message.contains("quotes included"), "{}", lock.message);
+            } else {
+                assert!(lock.message.contains("nothing this"), "{}", lock.message);
+            }
+            let foreign: &[&str] = match driver {
+                pbps_db::Driver::Postgres => &["dbo.", "VIEW DEFINITION", "login", "OBJECT::"],
+                pbps_db::Driver::Mssql => &["public.", "USAGE", "pg_catalog"],
+            };
+            for word in foreign {
+                assert!(
+                    !lock.message.contains(word) && !remedy.contains(word),
+                    "{word:?} in {driver:?} {gap:?}: {} / {remedy}",
+                    lock.message
+                );
+            }
+            // The permission read names no statement: which read failed is
+            // not known, so it says what to check and how to check again.
+            let permissions = only(&all, "permission.unknown");
+            assert_eq!(permissions.remedy.as_deref(), Some(recheck.as_str()));
+            for word in foreign {
+                assert!(
+                    !permissions.message.contains(word),
+                    "{word:?}: {}",
+                    permissions.message
+                );
             }
         }
 
-        let (lock, permissions) = remedies(pbps_db::Driver::Mssql);
-        assert!(lock.contains("dbo.__pbps_lock"), "{lock}");
-        assert_eq!(
-            permissions,
-            "grant VIEW DEFINITION, or check what the login is mapped to in this database"
-        );
-        for text in [&lock, &permissions] {
-            for foreign in ["public.", "USAGE", "pg_catalog"] {
-                assert!(!text.contains(foreign), "{foreign:?} in {text}");
-            }
+        // The negative: a lock that was read has no such finding, whatever
+        // a stale answer in the diagnosis says.
+        for driver in [pg, mssql] {
+            let mut d = diagnosed(Some(LockReadGap::TableSelect));
+            d.state = "ready";
+            assert!(
+                findings(&d, driver)
+                    .iter()
+                    .all(|f| f.id != "state.lock-unknown"),
+                "{driver:?}"
+            );
         }
     }
 
     /// #820: a permission read that failed on the recorded state is one
-    /// finding, `permission.unknown`, whose PostgreSQL remedy names the
+    /// finding, `permission.unknown`, whose PostgreSQL advice names the
     /// ledger's grants beside the catalogs. The cause stays in the
     /// diagnosis's detail; the finding's own message is generic. A diagnosis
     /// that did not fail its permission read has no such finding, whatever
@@ -2172,18 +2243,24 @@ mod tests {
             .collect();
         assert_eq!(unknown.len(), 1, "{findings:?}");
         assert_eq!(unknown[0].severity, output::Severity::Error);
-        let remedy = unknown[0].remedy.as_deref().unwrap();
+        // Since #822 the advice is in the message and the remedy is the
+        // command that checks again: which read failed is not known here.
+        let advice = &unknown[0].message;
         for named in [
             "SELECT on public.__pbps_state",
             "USAGE on schema public",
             "pg_catalog",
             "role that deploys",
         ] {
-            assert!(remedy.contains(named), "{named:?} in {remedy}");
+            assert!(advice.contains(named), "{named:?} in {advice}");
         }
         for foreign in ["dbo.", "VIEW DEFINITION", "login"] {
-            assert!(!remedy.contains(foreign), "{foreign:?} in {remedy}");
+            assert!(!advice.contains(foreign), "{foreign:?} in {advice}");
         }
+        assert_eq!(
+            unknown[0].remedy.as_deref(),
+            Some(format!("pbps doctor {}", target_arg(&d)).as_str())
+        );
         assert!(
             d.detail
                 .as_deref()

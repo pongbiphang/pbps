@@ -8522,11 +8522,14 @@ fn doctor_names_the_recorded_state_read_when_its_select_is_denied() {
     let found = unknown(&json);
     assert_eq!(found.len(), 1, "{json}");
     assert_eq!(found[0]["severity"], "error", "{json}");
-    let remedy = found[0]["remedy"]
+    // Since #822 the finding's message carries the advice, and its remedy is
+    // the command that checks again: which read failed is not known there.
+    let advice = found[0]["message"]
         .as_str()
         .unwrap_or_else(|| panic!("{json}"));
-    assert!(remedy.contains("SELECT on public.__pbps_state"), "{remedy}");
-    assert!(remedy.contains("USAGE on schema public"), "{remedy}");
+    assert!(advice.contains("SELECT on public.__pbps_state"), "{advice}");
+    assert!(advice.contains("USAGE on schema public"), "{advice}");
+    assert_eq!(found[0]["remedy"], "pbps doctor --env dev", "{json}");
     let environment = &json["data"]["environments"][0];
     assert_eq!(environment["permissions_unknown"], true, "{json}");
     let detail = environment["detail"]
@@ -11490,11 +11493,15 @@ fn doctor_exercises_a_real_non_superuser_and_names_the_permission_removed_from_i
     succeeds(d.run(&["doctor", "--db", &login]));
 }
 
-/// #306: a role that cannot read the deployment lock is told what to grant in
-/// PostgreSQL's words — `public.__pbps_lock` and `USAGE` on its schema — and
-/// not SQL Server's `dbo.__pbps_lock` and `VIEW DEFINITION`. A real restricted
-/// role against a ledger another role created, as a deployment account meets
-/// it.
+/// #306, #821, #822: a role that cannot read the deployment lock is told,
+/// in PostgreSQL's words, the one statement that repairs what the catalog
+/// shows, and running exactly that statement repairs it. Two gaps here, the
+/// schema's `USAGE` and the table's `SELECT`: the remedy names the schema
+/// first, and only after it is run does a fresh `doctor` name the table. A
+/// real restricted role against a ledger another role created, as a
+/// deployment account meets it, with a name holding an upper-case letter and
+/// a double quote, so the emitted statement is run with its placeholder
+/// replaced exactly as the message says and nothing else changed.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn doctor_tells_a_role_that_cannot_read_the_lock_what_to_grant_in_postgres_terms() {
@@ -11505,73 +11512,104 @@ fn doctor_tells_a_role_that_cannot_read_the_lock_what_to_grant_in_postgres_terms
         }
     }
     let server = server();
-    let role = Role(
-        server.clone(),
-        format!("pbps_lock_reader_{}", std::process::id()),
-    );
+    let name = format!("Pbps\"Lock_{}", std::process::id());
+    let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+    let _role = Role(server.clone(), quoted.clone());
     let own = OwnDatabase::new(&server, "lock_remedy");
     let connection = own.connection();
     let d = bootstrapped_demo(connection, "lock-remedy", ONE_COLUMN);
     on_server(
         connection,
         &format!(
-            "CREATE ROLE {} LOGIN NOSUPERUSER PASSWORD 'pw-306-secret'; \
-             REVOKE SELECT ON public.__pbps_lock FROM PUBLIC",
-            role.1
+            "CREATE ROLE {quoted} LOGIN NOSUPERUSER PASSWORD 'pw-306-secret'; \
+             REVOKE SELECT ON public.__pbps_lock FROM PUBLIC; \
+             REVOKE USAGE ON SCHEMA public FROM PUBLIC"
         ),
     );
     let login = format!(
-        "{} user={} password=pw-306-secret",
+        "{} user={name} password=pw-306-secret",
         connection
             .split_whitespace()
             .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
             .collect::<Vec<_>>()
-            .join(" "),
-        role.1
+            .join(" ")
     );
-    let refused = d.run(&["doctor", "--db", &login, "--format", "json"]);
-    assert_ne!(
-        code(&refused),
-        0,
-        "{}{}",
-        stdout(&refused),
-        stderr(&refused)
+    try_on_server(&login, "SELECT 1").expect("the role connects as itself");
+    let fact = |sql: String| scalar(connection, &format!("SELECT count(*) WHERE {sql}")) == 1;
+    let usage = || {
+        fact(format!(
+            "has_schema_privilege('{}', 'public', 'USAGE')",
+            name.replace('\'', "''")
+        ))
+    };
+    let select = || {
+        fact(format!(
+            "has_table_privilege('{}', 'public.__pbps_lock', 'SELECT')",
+            name.replace('\'', "''")
+        ))
+    };
+    let lock_rows = || scalar(connection, "SELECT count(*) FROM public.__pbps_lock");
+    let diagnose = || {
+        let o = d.run(&["doctor", "--db", &login, "--format", "json"]);
+        assert!(
+            !stdout(&o).contains("pw-306-secret") && !stderr(&o).contains("pw-306-secret"),
+            "the password leaked"
+        );
+        json_output(o)
+    };
+    let lock_finding = |report: &serde_json::Value| -> Option<serde_json::Value> {
+        let found: Vec<&serde_json::Value> = report["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{report}"))
+            .iter()
+            .filter(|f| f["id"] == "state.lock-unknown")
+            .collect();
+        assert!(found.len() <= 1, "{report}");
+        found.first().map(|f| (*f).clone())
+    };
+    // The placeholder, quotes included, replaced by the role's name quoted as
+    // an identifier, as the message says; every other byte as emitted.
+    let run_remedy = |finding: &serde_json::Value| {
+        let message = finding["message"].as_str().unwrap();
+        assert!(message.contains("quotes included"), "{message}");
+        let remedy = finding["remedy"].as_str().unwrap();
+        assert_eq!(remedy.matches("\"<database role>\"").count(), 1, "{remedy}");
+        on_server(connection, &remedy.replace("\"<database role>\"", &quoted));
+    };
+    let before = lock_rows();
+    assert!(!usage() && !select(), "both gaps are real");
+
+    let report = diagnose();
+    let first = lock_finding(&report).unwrap_or_else(|| panic!("no lock finding: {report}"));
+    assert_eq!(first["severity"], "error", "{report}");
+    assert_eq!(
+        first["remedy"], "GRANT USAGE ON SCHEMA public TO \"<database role>\";",
+        "the schema first: {report}"
     );
-    let report = json_output(refused);
-    let lock = report["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|f| f["id"] == "state.lock-unknown")
-        .unwrap_or_else(|| panic!("no lock finding: {report}"));
-    let remedy = lock["remedy"].as_str().unwrap_or_default();
-    assert!(remedy.contains("public.__pbps_lock"), "{report}");
-    assert!(remedy.contains("USAGE on schema public"), "{report}");
     let text = report.to_string();
-    for foreign in ["dbo.__pbps_lock", "VIEW DEFINITION"] {
+    for foreign in ["dbo.__pbps_lock", "VIEW DEFINITION", "OBJECT::"] {
         assert!(!text.contains(foreign), "{foreign:?} in {report}");
     }
-    assert!(
-        !text.contains("pw-306-secret"),
-        "the password leaked: {report}"
-    );
+    run_remedy(&first);
+    assert!(usage() && !select(), "the schema's grant, and nothing more");
 
-    // #821: the role already has `USAGE` on `public` (through PUBLIC), so the
-    // remedy's first step changes nothing and the finding stays; the table
-    // exists, so its second step applies, and taking it clears the finding.
-    on_server(
-        connection,
-        &format!("GRANT SELECT ON public.__pbps_lock TO {}", role.1),
+    let report = diagnose();
+    let second = lock_finding(&report).unwrap_or_else(|| panic!("the table gap remains: {report}"));
+    assert_eq!(
+        second["remedy"], "GRANT SELECT ON TABLE public.__pbps_lock TO \"<database role>\";",
+        "then the table: {report}"
     );
-    let report = json_output(d.run(&["doctor", "--db", &login, "--format", "json"]));
-    assert!(
-        report["findings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|f| f["id"] != "state.lock-unknown"),
-        "{report}"
-    );
+    run_remedy(&second);
+    assert!(select());
+    try_on_server(&login, "SELECT count(*) FROM public.__pbps_lock")
+        .expect("the role reads the lock itself");
+
+    let report = diagnose();
+    assert!(lock_finding(&report).is_none(), "{report}");
+    assert_eq!(lock_rows(), before, "doctor wrote nothing to the lock");
+
+    // The database goes before the cluster-wide role it holds grants for.
+    drop(own);
 }
 
 /// #821. Without `USAGE` on `public`, PostgreSQL refuses the lock lookup at
@@ -11579,8 +11617,8 @@ fn doctor_tells_a_role_that_cannot_read_the_lock_what_to_grant_in_postgres_terms
 /// database reads as `state.lock-unknown` too (measured on 18.6: "permission
 /// denied for schema public", then "relation ... does not exist" once the
 /// schema is usable). Its remedy used to ask for `SELECT` on a lock table that
-/// did not exist yet. Following the remedy in its order — the schema, then
-/// rerun — has to finish the job here without any grant on the table.
+/// did not exist yet. The remedy names the schema alone (#822), and running
+/// it as emitted has to finish the job here without any grant on the table.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn doctor_repairs_schema_access_before_an_absent_lock_table() {
@@ -11682,24 +11720,20 @@ fn doctor_repairs_schema_access_before_an_absent_lock_table() {
         report["data"]["environments"][0]["state"], "lock-unknown",
         "{report}"
     );
+    // #822: one statement, the schema's, and no grant on a table the
+    // catalog cannot show — there is none.
     let remedy = found[0]["remedy"]
         .as_str()
         .unwrap_or_else(|| panic!("{report}"));
-    let usage = remedy
-        .find("USAGE on schema public")
-        .unwrap_or_else(|| panic!("{remedy}"));
-    let rerun = remedy
-        .find("rerun doctor")
-        .unwrap_or_else(|| panic!("{remedy}"));
-    let select = remedy
-        .find("SELECT on public.__pbps_lock")
-        .unwrap_or_else(|| panic!("{remedy}"));
-    assert!(usage < rerun && rerun < select, "{remedy}");
+    assert_eq!(
+        remedy, "GRANT USAGE ON SCHEMA public TO \"<database role>\";",
+        "{report}"
+    );
 
-    // Its first step, as it says, and nothing else.
+    // Run as emitted, with only the placeholder replaced.
     on_server(
         connection,
-        &format!("GRANT USAGE ON SCHEMA public TO {}", role.1),
+        &remedy.replace("\"<database role>\"", &format!("\"{}\"", role.1)),
     );
     assert!(has_usage());
     let report = diagnose();
@@ -11708,8 +11742,8 @@ fn doctor_repairs_schema_access_before_an_absent_lock_table() {
         report["data"]["environments"][0]["state"], "uninitialized",
         "{report}"
     );
-    // The remedy's second step never applied: the finding is gone and the
-    // table it names still does not exist, so there was nothing to grant on.
+    // No second statement was ever named: the finding is gone and the table
+    // still does not exist, so there was nothing to grant on.
     assert_eq!(ledger_tables(), 0, "doctor created nothing");
 
     // The database goes before the cluster-wide role it holds a grant for.
