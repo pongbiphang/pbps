@@ -3518,6 +3518,22 @@ give an index of its own. Every other match is dropped before the attach, and
 one the declaration keeps is added after it. With none left, the engine
 builds the clone under a name of its own choosing (`t_n_idx`, measured on
 18). A declared name that the engine's choice then takes is #1558's class.
+In another schema than its parent, an index with an expression or a filter
+is never left for the engine to choose: the same text may call another
+schema's function, and different text the same one. The engine compares what
+each is bound to, which the text does not say. So every such index is dropped
+before the attach, and one the declaration keeps is added after.
+
+**The attach validates the parent's foreign keys** over the rows it brings,
+as `ADD FOREIGN KEY` does. One whose parent references a table the plan
+writes rows into therefore runs among the row changes, at (11, 1), ranked
+just after the latest of those tables. That puts it before the rows of a
+table referencing the parent, which rank after every table the parent
+references. Its own alterations of classes 9 and 10 follow it to (11, 2). A
+staged plan never holds both, being one logical change. Pre-flight reads a
+parent's rows, once a table is attached to it in the plan, as its own and
+that table's together, so a foreign key into the parent is not refused for
+child rows only the attached rows satisfy.
 `refuse_partition_changes` admits these changes on a table the plan
 attaches.
 

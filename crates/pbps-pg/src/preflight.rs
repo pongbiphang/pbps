@@ -495,6 +495,11 @@ struct AsStored {
     /// new values cannot be computed here without running the operator's
     /// expression before approval (DEC-1168.1).
     recomputed: BTreeSet<ColumnRef>,
+    /// Tables this plan attaches, by the parent they are attached to. The
+    /// attach runs before every row change and key addition a probe stands
+    /// for, so the parent's rows are its own and these tables' together
+    /// (DEC-1545.1).
+    attached: BTreeMap<TableName, Vec<TableName>>,
 }
 
 /// A column this plan adds, as the pre-delete probe needs it.
@@ -818,8 +823,13 @@ impl AsStored {
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::DetachPartition { .. }
-                | Change::AttachPartition { .. }
                 | Change::PublicExecution { .. } => {}
+                Change::AttachPartition { table, parent, .. } => {
+                    this.attached
+                        .entry(parent.clone())
+                        .or_default()
+                        .push(table.clone());
+                }
             }
         }
         this
@@ -2909,6 +2919,23 @@ fn rows_after(
     // side of the constraint it is on: on the parent side a child matching the
     // missing row reads as an orphan and a valid foreign key is refused; on the
     // child side an orphan hidden in the missing row is not counted at all.
+    // A parent's rows once this plan has attached a table to it are that
+    // table's too, read through the same columns, which the attach required
+    // to be its parent's. Left out, every child row the attached rows satisfy
+    // reads as an orphan and a valid plan is refused (#1642 review). The
+    // filter of a partial key is never asked of a parent, whose own keys a
+    // plan does not change; where it is, nothing is assumed.
+    if let Some(incoming) = names.attached.get(table) {
+        if filter.is_some() {
+            return Ok(None);
+        }
+        for attached in incoming {
+            match rows_after(names, attached, columns, alias, &Applies::AllRows)? {
+                Some(rows) => branches.push(rows),
+                None => return Ok(None),
+            }
+        }
+    }
     if unspellable {
         return Ok(None);
     }

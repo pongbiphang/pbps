@@ -1235,6 +1235,42 @@ fn diff_partial_rebuilding(
         .iter()
         .filter_map(|p| row_table(&p.change).cloned())
         .collect();
+    // An attach validates its parent's foreign keys over the rows it brings,
+    // as `ADD FOREIGN KEY` does, so one whose parent references a table this
+    // plan writes rows into waits for them: among the row changes, just after
+    // the latest of those tables, and so before the rows of a table that
+    // references the parent, which rank after every table the parent does.
+    // Its own changes follow it there (#1642 review).
+    let late_attach: BTreeMap<TableName, isize> = planned
+        .iter()
+        .filter_map(|p| {
+            let Change::AttachPartition { table, parent, .. } = &p.change else {
+                return None;
+            };
+            let after = declared
+                .schema
+                .tables
+                .get(parent)?
+                .foreign_keys
+                .values()
+                .filter(|fk| row_tables.contains(&fk.references_table))
+                .filter_map(|fk| data_rank.get(&fk.references_table))
+                .max()?;
+            Some((table.clone(), 2 * *after as isize + 1))
+        })
+        .collect();
+    let follows_late_attach = |c: &Change| -> bool {
+        if let Change::SetPartitionDefault { table, .. }
+        | Change::SetPartitionNotNull { table, .. }
+        | Change::SetTablePersistence { table, .. }
+        | Change::SetStorageParameters { table, .. }
+        | Change::SetIndexStorageParameters { table, .. } = c
+        {
+            late_attach.contains_key(table)
+        } else {
+            false
+        }
+    };
     // A function a computed column calls is dropped after the column, by a
     // connected plan's pass over the catalog's own edges
     // (`order_computed_by_edges`, DEC-1431.1). An offline plan is never
@@ -1284,6 +1320,14 @@ fn diff_partial_rebuilding(
     };
     let deepest = depth_of.values().copied().max().unwrap_or(0);
     let sort_class = |c: &Change| -> (u8, usize) {
+        if let Change::AttachPartition { table, .. } = c
+            && late_attach.contains_key(table)
+        {
+            return (ROW_DELETIONS - 1, 1);
+        }
+        if follows_late_attach(c) {
+            return (ROW_DELETIONS - 1, 2);
+        }
         if let Change::SetTablePersistence {
             table, unlogged, ..
         } = c
@@ -1400,7 +1444,13 @@ fn diff_partial_rebuilding(
         (
             class,
             within,
-            dependency_rank(&p.change, &create_rank, &drop_rank, &data_rank, &role_rank),
+            if let Change::AttachPartition { table, .. } = &p.change
+                && let Some(rank) = late_attach.get(table)
+            {
+                *rank
+            } else {
+                dependency_rank(&p.change, &create_rank, &drop_rank, &data_rank, &role_rank)
+            },
             p.change.subject(),
             format!("{:?}", p.change),
         )
@@ -2715,6 +2765,24 @@ fn attached(
     let (own_indexes, parents_indexes) = (index(table), index(parent));
     let mut taken: BTreeSet<&String> = BTreeSet::new();
     let mut displaced = Vec::new();
+    // In another schema than its parent, an expression or a filter of the
+    // same text may call another schema's function, and of different text
+    // the same one: the engine compares what each is bound to, which the
+    // text does not say. So every such index is dropped before the attach,
+    // and one the declaration keeps added after it (#1642 review).
+    if base_name.schema != of.parent.schema {
+        for (name, index) in &table.indexes {
+            if index.filter.is_some()
+                || index
+                    .columns
+                    .iter()
+                    .any(|c| matches!(c.key, pbps_model::IndexKey::Expression(_)))
+            {
+                taken.insert(name);
+                displaced.push(name.clone());
+            }
+        }
+    }
     for definition in parents_indexes.values() {
         let matches: Vec<&String> = own_indexes
             .iter()
@@ -4204,10 +4272,12 @@ fn dependency_rank(
         Change::SetPartitionNotNull { not_null: true, .. } => 1,
         // Rows follow the foreign keys between their tables: a referenced
         // table's rows go in first, and out last.
+        // Doubled, so an attach that waits for rows ranks between two tables
+        // (`late_attach`).
         Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
-            data_rank.get(table).map_or(0, |r| *r as isize)
+            data_rank.get(table).map_or(0, |r| 2 * *r as isize)
         }
-        Change::DeleteRow { table, .. } => -(data_rank.get(table).map_or(0, |r| *r as isize)),
+        Change::DeleteRow { table, .. } => -(data_rank.get(table).map_or(0, |r| 2 * *r as isize)),
         // Two roles dropped together are ordered by membership: see
         // [`member_depth`].
         Change::DropRole { name, .. } => role_rank.get(name).map_or(0, |r| *r as isize),
@@ -6316,6 +6386,97 @@ mod tests {
                 reclaimed.changes
             );
         }
+        // The attach validates the parent's foreign key over the rows it
+        // brings, so it waits for the rows the plan writes into the table that
+        // key references, and goes before the rows of a table referencing
+        // the parent; its own changes after it (#1642 review).
+        let with_rows = |schema: &Schema| {
+            let mut schema = schema.clone();
+            let rows = |entries: Vec<(&str, Row)>| pbps_model::TableData {
+                mode: pbps_model::DataMode::Ensure,
+                rows: entries
+                    .into_iter()
+                    .map(|(k, row)| (pbps_model::RowKey::from(k), row))
+                    .collect(),
+            };
+            schema
+                .tables
+                .get_mut(&"app.r".parse::<TableName>().unwrap())
+                .unwrap()
+                .data = Some(rows(vec![("7", Row::default())]));
+            let mut q = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("eid", Column::new(ty("int"))),
+                ("ets", Column::new(ty("date"))),
+            ]);
+            q.primary_key = Some(key("q_pk", &["id"]));
+            q.foreign_keys.insert(
+                "q_ev".into(),
+                pbps_model::ForeignKey {
+                    columns: vec!["eid".into(), "ets".into()],
+                    references_table: "app.ev".parse().unwrap(),
+                    references_columns: vec!["id".into(), "ts".into()],
+                    on_delete: pbps_model::ReferentialAction::NoAction,
+                    on_update: pbps_model::ReferentialAction::NoAction,
+                },
+            );
+            q.data = Some(rows(vec![(
+                "1",
+                [
+                    ("eid".to_owned(), Value::Int(1)),
+                    ("ets".to_owned(), Value::Text("2024-06-01".into())),
+                ]
+                .into_iter()
+                .collect(),
+            )]));
+            schema.tables.insert("app.q".parse().unwrap(), q);
+            schema
+        };
+        let mut base_with_q = with_rows(&base);
+        for t in ["app.r", "app.q"] {
+            let t = base_with_q
+                .tables
+                .get_mut(&t.parse::<TableName>().unwrap())
+                .unwrap();
+            t.data.as_mut().unwrap().rows.clear();
+        }
+        let waits = outcome(&base_with_q, &with_rows(&declared), &[])
+            .2
+            .expect("attached after the rows");
+        let order: Vec<String> = waits
+            .changes
+            .iter()
+            .map(|p| {
+                if let Change::InsertRow { table, .. } = &p.change {
+                    format!("insert {table}")
+                } else {
+                    format!("{:?}", p.change)
+                        .split([' ', '{'])
+                        .next()
+                        .unwrap()
+                        .to_owned()
+                }
+            })
+            .filter(|k| k != "SetDataMode")
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "DropIndex",
+                "insert app.r",
+                "AttachPartition",
+                "insert app.q",
+                "SetPartitionDefault"
+            ],
+            "{:?}",
+            waits.changes
+        );
+        // Negative: with no rows to wait for, it stays with the creates.
+        assert_eq!(
+            kinds(&outcome(&base, &declared, &[]).2.expect("attached")),
+            ["DropIndex", "AttachPartition", "SetPartitionDefault"]
+        );
+
         // The engine's match: a descending index is its parent's all the
         // same, and of two matches neither is assumed adopted. One is left,
         // one the declaration does not keep, and the other goes first.
@@ -6585,6 +6746,39 @@ mod tests {
         .2
         .expect("attached");
         assert_eq!(kinds(&same), ["DropIndex", "AttachPartition"]);
+        // An expression index kept as its own: in another schema it is
+        // dropped before the attach and built again after, in the parent's
+        // left alone.
+        let expression = |t: &mut Table| {
+            t.indexes.insert(
+                "t_f".into(),
+                Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        key: pbps_model::IndexKey::Expression("f(n)".into()),
+                        descending: false,
+                        opclass: None,
+                    }],
+                    ..index_on("n")
+                },
+            );
+        };
+        let mut keeps_t_f = declared.clone();
+        expression(
+            keeps_t_f
+                .tables
+                .get_mut(&"app.t".parse::<TableName>().unwrap())
+                .unwrap(),
+        );
+        let with_t_f = ordinary(&|t| expression(t));
+        let rebuilt = outcome(&elsewhere(&with_t_f), &elsewhere(&keeps_t_f), &[])
+            .2
+            .expect("rebuilt");
+        assert_eq!(
+            order_of(&rebuilt),
+            ["drop t_f", "drop t_id", "attach", "add t_f"]
+        );
+        let kept = outcome(&with_t_f, &keeps_t_f, &[]).2.expect("kept");
+        assert_eq!(order_of(&kept), ["drop t_id", "attach"]);
 
         // Negative: an ordinary table that stays one keeps its column uids,
         // and plans nothing.

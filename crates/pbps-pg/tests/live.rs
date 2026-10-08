@@ -4775,6 +4775,68 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
             counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.m")).await,
             4
         );
+
+        // A foreign key the same plan adds into the parent counts the rows the
+        // attach brings as its parent's: only `(1, 3)` is an orphan, where
+        // the parent alone would make all three one (#1642 review).
+        conn.execute(&format!(
+            "CREATE TABLE {s}.k (a integer, b integer, PRIMARY KEY (a, b)) PARTITION BY RANGE (a);
+             CREATE TABLE {s}.kt (a integer NOT NULL, b integer NOT NULL, PRIMARY KEY (a, b));
+             INSERT INTO {s}.kt VALUES (1, 1), (1, 2);
+             CREATE TABLE {s}.r (a integer, b integer);
+             INSERT INTO {s}.r VALUES (1, 1), (1, 2), (1, 3), (NULL, 3);"
+        ))
+        .await
+        .expect("a keyed parent, its table and a referencing one");
+        let keyed = pbps_model::ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(Change::AttachPartition {
+                    uid: "t_bbbbbb".parse().unwrap(),
+                    table: TableName::new(&s, "kt"),
+                    parent: TableName::new(&s, "k"),
+                    bound: B::Range {
+                        from: vec![value("0")],
+                        to: vec![value("10")],
+                    },
+                    shape: Box::default(),
+                }),
+                pbps_model::PlannedChange::new(Change::AddForeignKey {
+                    table: TableName::new(&s, "r"),
+                    name: "r_k".into(),
+                    constraint: Box::new(pbps_model::ForeignKey {
+                        columns: vec!["a".into(), "b".into()],
+                        references_table: TableName::new(&s, "k"),
+                        references_columns: vec!["a".into(), "b".into()],
+                        on_delete: Default::default(),
+                        on_update: Default::default(),
+                    }),
+                }),
+            ],
+        };
+        let sql: Vec<String> = keyed
+            .changes
+            .iter()
+            .flat_map(|p| pg.emit(&p.change, Default::default()).expect("emit"))
+            .map(|statement| statement.sql)
+            .collect();
+        let orphans = |c: &[(String, i64)]| one(c, "no matching parent");
+        assert_eq!(orphans(&counts(&mut conn, &keyed).await), 1);
+        let refused = conn
+            .execute(&format!("BEGIN; {} COMMIT;", sql.join(" ")))
+            .await
+            .expect_err("an orphan");
+        assert!(
+            format!("{refused:?}").contains("violates foreign key"),
+            "{refused:?}"
+        );
+        conn.execute("ROLLBACK").await.ok();
+        conn.execute(&format!("DELETE FROM {s}.r WHERE b = 3 AND a = 1"))
+            .await
+            .expect("the orphan cleared");
+        assert_eq!(orphans(&counts(&mut conn, &keyed).await), 0);
+        conn.execute(&format!("BEGIN; {} COMMIT;", sql.join(" ")))
+            .await
+            .expect("attached and referenced once no row is an orphan");
         drop(conn);
         admin
             .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
