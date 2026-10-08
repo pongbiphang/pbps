@@ -3457,7 +3457,9 @@ Measured on 16.15 and 18.6:
   hold.
 - An index, a primary key, a unique constraint or a foreign key that matches
   one of the parent's is adopted as its clone, under the table's own name and
-  whatever its storage parameters. A foreign key with other referential
+  whatever its storage parameters; an index whatever its sort order (`DESC`,
+  `NULLS FIRST`), though not under another collation, operator class,
+  `INCLUDE` list or method. Of several matches, the first by oid is adopted. A foreign key with other referential
   actions is not adopted. One the table lacks is built, under a name the
   engine chooses. A foreign key of
   the table's own stays its own, which no partition holds yet. A parent's
@@ -3506,13 +3508,18 @@ The table's kinds and `SetPartitionDefault`/`SetPartitionNotNull` then bring it
 to the declaration: a drop in class 2 before the attach, everything else
 after it. A column with no default where its parent's has one has nothing the
 model can hold, so it takes its parent's back (`SetPartitionDefault` with the
-fallback) unless it declares its own. An index the attach would adopt keeps
-its name as the parent's clone, so one whose name the declaration gives an
-index of its own is dropped before the attach. The engine then builds the
-clone under a name of its own choosing (`t_n_idx`, measured on 18), and the
-declared index is added after. A declared name the engine's choice then
-takes is #1558's class. `refuse_partition_changes` admits these changes on a
-table the plan attaches.
+fallback) unless it declares its own.
+
+**Which index the engine adopts** is left to no guess. A plan does not know
+which of several matches comes first by oid, and an adopted index keeps its
+name as the clone. So for each of the parent's indexes, at most one of the
+table's matching indexes is left: one whose name the declaration does not
+give an index of its own. Every other match is dropped before the attach, and
+one the declaration keeps is added after it. With none left, the engine
+builds the clone under a name of its own choosing (`t_n_idx`, measured on
+18). A declared name that the engine's choice then takes is #1558's class.
+`refuse_partition_changes` admits these changes on a table the plan
+attaches.
 
 **Identity.** A table that holds column uids and is declared as a partition
 is the one being attached. Its column uids leave the ids file, and the file's

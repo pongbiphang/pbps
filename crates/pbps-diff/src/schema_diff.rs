@@ -625,14 +625,12 @@ fn diff_partial_rebuilding(
                 Ok(Attached {
                     table,
                     defaultless,
-                    reclaimed,
+                    displaced,
                 }) => {
-                    // An index the attach would adopt keeps its name as the
-                    // parent's clone, so one the declaration gives that name
-                    // as its own is dropped first: the engine builds the clone
-                    // under a name it chooses, and the declared index is
-                    // added after (#1642 review).
-                    for name in reclaimed {
+                    // Gone before the attach, so the engine adopts the one
+                    // index left for each of its parent's or builds it; one
+                    // the declaration keeps as its own is added after.
+                    for name in displaced {
                         changes.push(Change::DropIndex {
                             table: declared_name.clone(),
                             name,
@@ -2501,9 +2499,9 @@ fn detached_names(
 struct Attached {
     table: Table,
     defaultless: Vec<String>,
-    /// The table's indexes the attach would adopt whose names the
-    /// declaration gives indexes of its own.
-    reclaimed: Vec<String>,
+    /// The table's indexes dropped before the attach: every one the engine
+    /// could adopt but for the one left to it.
+    displaced: Vec<String>,
 }
 
 /// What the ordinary table `table` is once attached to `of.parent`, or what
@@ -2671,12 +2669,18 @@ fn attached(
             })
             .collect()
     };
+    // An index as the engine matches it to adopt it: storage parameters
+    // and sort order aside, measured on 16 and 18 (`DESC` and `NULLS FIRST`
+    // adopted, another collation, operator class, `INCLUDE` or method not).
     let index = |t: &Table| -> BTreeMap<String, Index> {
         t.indexes
             .iter()
             .map(|(n, i)| {
                 let mut i = i.clone();
                 i.storage_parameters.clear();
+                for c in &mut i.columns {
+                    c.descending = false;
+                }
                 (n.clone(), i)
             })
             .collect()
@@ -2702,13 +2706,36 @@ fn attached(
             ));
         }
     }
+    // Which of several matches the engine adopts is the first by oid, which
+    // no plan knows (`RelationGetIndexList`). So at most one is left for
+    // each of the parent's indexes, and one the declaration does not keep
+    // as its own; the others are dropped before the attach. An adopted
+    // index keeps its name as the clone, so one whose name the declaration
+    // gives an index of its own is never the one left (#1642 review).
     let (own_indexes, parents_indexes) = (index(table), index(parent));
-    let free = unmatched(&own_indexes, &parents_indexes);
-    let adopted: BTreeSet<&String> = table.indexes.keys().filter(|n| !free.contains(n)).collect();
+    let mut taken: BTreeSet<&String> = BTreeSet::new();
+    let mut displaced = Vec::new();
+    for definition in parents_indexes.values() {
+        let matches: Vec<&String> = own_indexes
+            .iter()
+            .filter(|(n, d)| *d == definition && !taken.contains(n))
+            .map(|(n, _)| n)
+            .collect();
+        let left = matches
+            .iter()
+            .find(|n| !declared.indexes.contains_key(n.as_str()))
+            .copied();
+        for n in matches {
+            taken.insert(n);
+            if Some(n) != left {
+                displaced.push(n.clone());
+            }
+        }
+    }
     let indexes = table
         .indexes
         .iter()
-        .filter(|(n, _)| !adopted.contains(n))
+        .filter(|(n, _)| !taken.contains(n))
         .map(|(n, i)| (n.clone(), i.clone()))
         .collect();
     if table.replica_identity.is_some() {
@@ -2778,11 +2805,7 @@ fn attached(
             ..Table::default()
         },
         defaultless,
-        reclaimed: adopted
-            .iter()
-            .filter(|n| declared.indexes.contains_key(n.as_str()))
-            .map(|n| (*n).clone())
-            .collect(),
+        displaced,
     })
 }
 
@@ -6293,6 +6316,50 @@ mod tests {
                 reclaimed.changes
             );
         }
+        // The engine's match: a descending index is its parent's all the
+        // same, and of two matches neither is assumed adopted. One is left,
+        // one the declaration does not keep, and the other goes first.
+        let order_of = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .filter_map(|p| {
+                    if let Change::DropIndex { name, .. } = &p.change {
+                        Some(format!("drop {name}"))
+                    } else if let Change::AddIndex { name, .. } = &p.change {
+                        Some(format!("add {name}"))
+                    } else if let Change::AttachPartition { .. } = &p.change {
+                        Some("attach".to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let descending = ordinary(&|t| {
+            t.indexes.get_mut("t_n").unwrap().columns[0].descending = true;
+        });
+        let planned = outcome(&descending, &declared, &[]).2.expect("adopted");
+        assert_eq!(order_of(&planned), ["drop t_id", "attach"]);
+        let twice = ordinary(&|t| {
+            t.indexes.insert("a_n".into(), index_on("n"));
+        });
+        let planned = outcome(&twice, &declared, &[]).2.expect("one is left");
+        assert_eq!(order_of(&planned), ["drop t_id", "drop t_n", "attach"]);
+        let mut keeps_a_n = declared.clone();
+        keeps_a_n
+            .tables
+            .get_mut(&"app.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .indexes
+            .insert("a_n".into(), index_on("n"));
+        let planned = outcome(&twice, &keeps_a_n, &[])
+            .2
+            .expect("the other is left");
+        assert_eq!(
+            order_of(&planned),
+            ["drop a_n", "drop t_id", "attach", "add a_n"]
+        );
+
         // A deprecation is an annotation, not the column's shape.
         let annotated = ordinary(&|t| t.columns["n"].deprecated = Some("old".into()));
         outcome(&annotated, &declared, &[])
