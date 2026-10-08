@@ -773,6 +773,38 @@ pub async fn order_computed_by_edges(conn: &mut Conn, cs: &mut ChangeSet) -> any
         .map_err(|why| anyhow::anyhow!("computed_dependencies (SQL Server): {why}"))
 }
 
+/// Refuses a SQL Server computed column this plan adds, new or again, whose
+/// expression calls a function the plan creates, alters or drops, comparing
+/// the names under the database's collation (#1459, DEC-1459.1). Only the
+/// collation is asked, not `sys.sql_expression_dependencies`, which has no
+/// edge for an expression not yet stored, so no grant beyond reading names.
+pub async fn refuse_added_computed_calls(
+    conn: &mut Conn,
+    cs: &ChangeSet,
+    declared: &pbps_model::Schema,
+) -> anyhow::Result<()> {
+    if conn.driver() != Driver::Mssql {
+        return Ok(());
+    }
+    let dialect = pbps_mssql::Mssql;
+    let spellings: Vec<String> =
+        crate::computed_order::added_call_spellings(cs, declared, &dialect)
+            .into_iter()
+            .collect();
+    if spellings.is_empty() {
+        return Ok(());
+    }
+    let grouped: Vec<(usize, String)> = spellings.iter().map(|s| (0, s.clone())).collect();
+    let alike = crate::computed_order::Alike::from_pairs(
+        pbps_mssql::catalog::column_names_alike(conn, &grouped)
+            .await?
+            .into_iter()
+            .map(|(a, b)| (spellings[a].clone(), spellings[b].clone())),
+    );
+    crate::computed_order::refuse_added_calls(cs, declared, &dialect, &alike)
+        .map_err(|why| anyhow::anyhow!("computed_dependencies (SQL Server): {why}"))
+}
+
 /// Orders this plan's column and table renames on SQL Server from what the
 /// catalog holds and how its collation compares names, and refuses a name a
 /// change claims that another `sys.objects` entry holds when it runs (#1077,

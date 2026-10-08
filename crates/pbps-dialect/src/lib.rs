@@ -2107,6 +2107,82 @@ pub trait Dialect {
         names_at_a_boundary(&code, &wanted)
     }
 
+    /// Every two-part name `text` calls in code, undelimited:
+    /// `[dbo].[cafe]([a])` is `("dbo", "cafe")`. The names as written, for a
+    /// caller that compares them the way the engine binds them, under the
+    /// database's collation (#1459): what
+    /// [`may_name_qualified`](Dialect::may_name_qualified) folds by text
+    /// misses an accent- or width-insensitive match.
+    ///
+    /// Only a pair an opening parenthesis follows: SQL Server calls a scalar
+    /// function by `schema.name(`, so `[geo].Lat`, a property of a spatial
+    /// column, calls nothing (#1668 review). A column's method,
+    /// `geo.STAsText()`, has that shape too and is reported: SQL Server
+    /// rejects it as ambiguous while a function of that name exists (Msg 327,
+    /// measured on 17.0).
+    fn qualified_calls(&self, text: &str) -> Vec<(String, String)> {
+        enum Token {
+            Name(String),
+            Dot,
+            Open,
+            Other,
+        }
+        let mut tokens = Vec::new();
+        let lexicon = self.lexicon();
+        // The engine's own rule: SQL Server continues a name with `@`, `#`
+        // and `$`, so `dbo.cafe#helper` is not `dbo.cafe` (#1668 review).
+        let continues = lexicon.identifier_continues;
+        let code = lexicon.code_only(text);
+        let mut chars = code.chars().peekable();
+        while let Some(c) = chars.next() {
+            let close = match c {
+                '[' => Some(']'),
+                '"' => Some('"'),
+                _ => None,
+            };
+            if let Some(close) = close {
+                // A delimited name doubles its closing delimiter.
+                let mut name = String::new();
+                while let Some(n) = chars.next() {
+                    if n == close && chars.next_if_eq(&close).is_none() {
+                        break;
+                    }
+                    name.push(n);
+                }
+                tokens.push(Token::Name(name));
+            } else if c.is_ascii_digit() || c == '$' {
+                // A number or a money literal, `1.5e0` or `$1.5`, dot and all:
+                // a bare name never starts with either (#1668 review).
+                while chars.next_if(|n| continues(*n) || *n == '.').is_some() {}
+                tokens.push(Token::Other);
+            } else if continues(c) {
+                let mut name = String::from(c);
+                while let Some(n) = chars.next_if(|n| continues(*n)) {
+                    name.push(n);
+                }
+                tokens.push(Token::Name(name));
+            } else if c == '.' {
+                tokens.push(Token::Dot);
+            } else if c == '(' {
+                tokens.push(Token::Open);
+            } else if !c.is_whitespace() {
+                // `f(a).b` is not `a.b`.
+                tokens.push(Token::Other);
+            }
+        }
+        tokens
+            .windows(4)
+            .filter_map(|w| match w {
+                [Token::Name(a), Token::Dot, Token::Name(b), Token::Open]
+                    if !a.is_empty() && !b.is_empty() =>
+                {
+                    Some((a.clone(), b.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn may_name(&self, text: &str, name: &str) -> bool {
         // A delimited name doubles its closing delimiter: `a]b` is stored as
         // `[a]]b]` and `a"b` as `"a""b"`, so each spelling is looked for
@@ -3395,6 +3471,44 @@ mod tests {
         // A delimited name is stored with its closing delimiter doubled.
         assert!(d.may_name("[a]]b] * 2", "a]b"));
         assert!(d.may_name("\"a\"\"b\" * 2", "a\"b"));
+    }
+
+    /// The two-part names an expression calls in code, as written, for a
+    /// comparison under the database's collation (#1459); never one in a
+    /// literal or a comment, one only a call separates, or one no
+    /// parenthesis follows.
+    #[test]
+    fn qualified_calls_are_read_from_code_as_written() {
+        let d = MinimalDialect;
+        let names = |text: &str| d.qualified_calls(text);
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(names("[dbo].[cafe]([a])"), [pair("dbo", "cafe")]);
+        assert_eq!(names("DBO . f(a) + 1"), [pair("DBO", "f")]);
+        assert_eq!(names("\"s\".\"f\"(a)"), [pair("s", "f")]);
+        // A delimited name is stored with its closing delimiter doubled.
+        assert_eq!(names("[a]]b].[c](1)"), [pair("a]b", "c")]);
+        assert_eq!(names("x.y.z(1)"), [pair("y", "z")]);
+        assert_eq!(names("dbo.f (a)"), [pair("dbo", "f")]);
+        assert_eq!(
+            names("dbo.f(a) * dbo.g(b)"),
+            [pair("dbo", "f"), pair("dbo", "g")]
+        );
+        // Negatives.
+        for text in [
+            "'dbo.f'",
+            "a -- dbo.f\n + 1",
+            "f(a).b",
+            "a * 2",
+            "1.5 * a",
+            "1.5e0 * a",
+            "$1.5 * a",
+            "[geo].Lat",
+            "geo.Lat + 1",
+            "x.y.z",
+            "",
+        ] {
+            assert!(names(text).is_empty(), "{text}: {:?}", names(text));
+        }
     }
 
     #[test]
