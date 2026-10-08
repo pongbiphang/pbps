@@ -3288,9 +3288,19 @@ differs. None, and no DDL runs. Otherwise one temporary table holds a column
 pair per candidate, typed as the column is, and each pair gets the parent's
 text under the parent's schema path and the partition's under its own, which
 is the path the emitter writes each under, so an unqualified name resolves as
-it will at the apply. Equal `pg_get_expr` texts are refused, naming the
+it will at the apply. The transaction first takes every parser setting the
+apply pins (`session_pins!`), not only the deparse's: measured on 18, a
+database's `transform_null_equals = on` stores `(false = NULL)` as `(false IS
+NULL)`, which the apply, pinned off, stores as `(false = NULL::boolean)`. Equal `pg_get_expr` texts are refused, naming the
 partition, the column, both texts and the remedy: drop the partition's own
 default, it is the parent's.
+
+**One statement, never a batch.** The declared text is the tail of an
+`ALTER TABLE` sent through the extended protocol, which the engine refuses
+when it holds a second command. Through a batch, a text such as `1; COMMIT;
+CREATE TABLE …; COMMIT; BEGIN; SAVEPOINT …` ended the probe's transaction and
+committed SQL of its own (measured on 18), while a connected `plan` is
+read-only (SPEC §9.8). Such a text is unasked, with its warning.
 
 **Why not `EXPLAIN` or `SELECT`.** The planner folds constants, so the text it
 shows is not what `pg_attrdef` stores. Only storing the default gives the
@@ -3308,4 +3318,8 @@ Pinned on 16 and 18 by the CLI's
   beside `'x'`, refuse `plan --db` naming both and the remedy, write no plan
   file, and leave no temporary table behind;
 - negatives: own defaults the engine stores differently (`2`, `'other'`, `'y'`)
-  plan, apply and verify, and a row inserted into the partition takes its own.
+  plan, apply and verify, and a row inserted into the partition takes its own;
+  so does an own `(false = NULL)` beside the parent's `(false IS NULL)` under a
+  database that sets `transform_null_equals = on`.
+- a declared text that ends the transaction and creates a table commits
+  nothing, and is warned about as unasked.

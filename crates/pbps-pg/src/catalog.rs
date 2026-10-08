@@ -2643,11 +2643,16 @@ async fn store_one(conn: &mut Conn, column: &str, under: &str, text: &str) -> Re
             path.replace('\'', "''")
         ))
         .await?;
-        conn.execute(&format!(
+        // One statement through the extended protocol, never a batch: the
+        // engine refuses a second command in it, so a declared text cannot
+        // end this transaction and commit SQL of its own during a plan that
+        // is read-only (SPEC §9.8; #1609 security review).
+        conn.query(&format!(
             "ALTER TABLE pg_temp.pbps_1609 ALTER COLUMN {column} SET DEFAULT {}",
             crate::emit::verbatim(text)
         ))
         .await
+        .map(drop)
     }
     .await;
     match result {
@@ -2674,6 +2679,11 @@ async fn store_and_read(
 ) -> Result<Vec<Result<(String, String), String>>, String> {
     let fail = |e: DbError| e.to_string();
     conn.execute("BEGIN").await.map_err(fail)?;
+    // Every parser setting the apply pins, not only the deparse's: a role's
+    // `transform_null_equals = on` would store `FALSE = NULL` as `FALSE IS
+    // NULL` here and not at the apply (#1609 review). A `SET` in a
+    // transaction that rolls back is undone with it.
+    conn.execute(crate::SESSION_PINS).await.map_err(fail)?;
     conn.query(CANONICAL_PATH).await.map_err(fail)?;
     let columns = asked
         .iter()
@@ -2681,7 +2691,8 @@ async fn store_and_read(
         .map(|(i, d)| format!("p{i} {ty}, o{i} {ty}", ty = d.ty))
         .collect::<Vec<_>>()
         .join(", ");
-    conn.execute(&format!("CREATE TEMP TABLE pbps_1609 ({columns})"))
+    // One statement, as each default below is.
+    conn.query(&format!("CREATE TEMP TABLE pbps_1609 ({columns})"))
         .await
         .map_err(fail)?;
     let mut stored = Vec::with_capacity(asked.len());

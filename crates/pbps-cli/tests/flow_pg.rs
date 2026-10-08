@@ -19278,10 +19278,19 @@ fn a_partitions_own_default_stored_as_its_parents_is_refused_before_the_plan() {
         on_server(
             &conn,
             "CREATE SCHEMA app; \
-             CREATE TABLE app.ev (k integer NOT NULL, v integer DEFAULT 1, b text DEFAULT 'x') \
-                 PARTITION BY RANGE (k); \
+             CREATE TABLE app.ev (k integer NOT NULL, v integer DEFAULT 1, b text DEFAULT 'x', \
+                 f boolean DEFAULT (false IS NULL)) PARTITION BY RANGE (k); \
              CREATE TABLE app.ev_a PARTITION OF app.ev FOR VALUES FROM (0) TO (10); \
              ALTER TABLE app.ev_a ALTER COLUMN v SET DEFAULT 7",
+        );
+        // The apply pins `transform_null_equals` off; a probe that inherited
+        // this would store the own `false = NULL` below as the parent's
+        // `false IS NULL` and refuse it (measured on 18; #1609 review).
+        on_server(
+            &conn,
+            "DO $$ BEGIN EXECUTE pg_catalog.format( \
+                 'ALTER DATABASE %I SET transform_null_equals = on', \
+                 pg_catalog.current_database()); END $$",
         );
         let d = Demo::new(&format!("parts-1609-{version}"));
         succeeds(d.run(&["pull", "--db", &conn]));
@@ -19325,10 +19334,42 @@ fn a_partitions_own_default_stored_as_its_parents_is_refused_before_the_plan() {
             "{version}"
         );
 
+        // A declared text cannot end the probe's transaction: the connected
+        // plan is read-only (SPEC §9.8), and a batch would have committed
+        // the table below (#1609 security review). Unasked, so a warning.
+        let escape = pulled.replace(
+            own,
+            "      v: {default: \"1; COMMIT; CREATE TABLE app.pwned (); COMMIT; BEGIN; \
+             SAVEPOINT pbps_1609; SELECT 1\"}\n",
+        ) + "  ev_b:\n    from: [\"10\"]\n    to: [\"20\"]\n    columns:\n      \
+               b: {default: \"'y'\"}\n";
+        std::fs::write(&path, &escape).unwrap();
+        d.commit();
+        let plan = d.dir.join("escape.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'pwned'"
+            ),
+            0,
+            "{version}: the plan committed a declared text's SQL"
+        );
+        assert!(
+            stderr(&o).contains(
+                "warning: not checked before the plan whether the engine stores it as the \
+                 parent's default: partition app.ev_a column `v`"
+            ),
+            "{version}: {}{}",
+            stdout(&o),
+            stderr(&o)
+        );
+
         // Negative: a default of its own, and one the engine only respells.
         let own_defaults = pulled.replace(
             own,
-            "      v: {default: \"2\"}\n      b: {default: \"'other'\"}\n",
+            "      v: {default: \"2\"}\n      b: {default: \"'other'\"}\n      \
+             f: {default: \"(false = NULL)\"}\n",
         ) + "  ev_b:\n    from: [\"10\"]\n    to: [\"20\"]\n    columns:\n      \
                b: {default: \"'y'\"}\n";
         std::fs::write(&path, &own_defaults).unwrap();
