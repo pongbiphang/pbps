@@ -409,7 +409,7 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
                     format!(
                         "the precision of `{base}` must be between 0 and \
                          {max}, got {n}. The engine does not refuse a larger \
-                         one — it stores precision {max} and says nothing, \
+                         one -- it stores precision {max} and says nothing, \
                          so a declaration that kept it would read back as something else"
                     ),
                 ));

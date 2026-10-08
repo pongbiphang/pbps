@@ -132,7 +132,7 @@ impl Rebuild {
             .collect();
         Some(format!(
             "`{}` cannot be rebuilt: this engine has no `CREATE OR ALTER`, so every module change \
-             is a drop and a create (ADR-0009 §3), and the catalog holds things for this object \
+             is a drop and a create (ADR-0009 section 3), and the catalog holds things for this object \
              that a `CREATE` would not put back:\n{}\nDeclare them, or undo them, and plan again. \
              Proceeding would report success while quietly changing who may use this object.",
             self.id,
@@ -338,7 +338,7 @@ async fn serialize(
                 object: "the view's own ACCESS EXCLUSIVE lock",
                 and_the_schema: "the view's own ACCESS EXCLUSIVE lock, and a row lock on its \
                                  schema's `pg_namespace` entry",
-                how_it_moved: "a `LOCK TABLE` resolves its name when it runs — so the lock is \
+                how_it_moved: "a `LOCK TABLE` resolves its name when it runs -- so the lock is \
                                held on something other than what the reads describe",
             };
             conn.execute(&format!(
@@ -358,7 +358,7 @@ async fn serialize(
                 object: "the trigger's parent table's ACCESS EXCLUSIVE lock",
                 and_the_schema: "the trigger's parent table's ACCESS EXCLUSIVE lock, and a row \
                                  lock on that table's schema's `pg_namespace` entry",
-                how_it_moved: "a `LOCK TABLE` resolves its name when it runs — so the lock is \
+                how_it_moved: "a `LOCK TABLE` resolves its name when it runs -- so the lock is \
                                held on something other than what the reads describe",
             };
             // Asked again rather than carried down: the block above took only
@@ -390,7 +390,7 @@ async fn serialize(
                 // is never on the wrong object. What can have moved is the
                 // name, and the `DROP` that follows goes by name.
                 how_it_moved: "the row lock is keyed by oid, so it is held on the object the \
-                               reads describe — what moved is the name, and the `DROP` that \
+                               reads describe -- what moved is the name, and the `DROP` that \
                                follows goes by name",
             };
             // Inside a savepoint, because a failed statement dooms a
@@ -467,7 +467,7 @@ async fn serialize(
                          entry, and this account cannot take one ({e}). A concurrent \
                          `ALTER FUNCTION` between this read and the `DROP` is reverted by the \
                          rebuild, and pbps cannot stop it without privileges it should not need \
-                         (ADR-0009 §3).{and_the_schema}"
+                         (ADR-0009 section 3).{and_the_schema}"
                     )))
                 }
             }
@@ -554,7 +554,7 @@ async fn pin_the_namespace(conn: &mut Conn, schema: &str) -> Result<SchemaPin, D
             }
             Ok(SchemaPin::Not(format!(
                 "only a row lock on `{schema}`'s `pg_namespace` entry stops an \
-                 `ALTER SCHEMA … RENAME`, and this account cannot take one ({e})"
+                 `ALTER SCHEMA ... RENAME`, and this account cannot take one ({e})"
             )))
         }
     }
@@ -574,11 +574,11 @@ fn both_halves_held(locks: Locks, schema: &str, pin: SchemaPin) -> Serialized {
         SchemaPin::Held => Serialized::By(locks.and_the_schema),
         SchemaPin::Not(why) => Serialized::Not(format!(
             "this rebuild is serialized only halfway: its reads are held by {}, but the schema \
-             component of the name its `DROP` uses is not pinned — {why}. A session that renames \
+             component of the name its `DROP` uses is not pinned -- {why}. A session that renames \
              `{schema}` away and creates a replacement under that name between this check and \
-             the `DROP` sends the `DROP` to an object this plan never approved over. SPEC §7.6's \
+             the `DROP` sends the `DROP` to an object this plan never approved over. SPEC section 7.6's \
              read-back catches that and rolls the whole apply back, and pbps cannot prevent it \
-             without privileges it should not need (ADR-0009 §3)",
+             without privileges it should not need (ADR-0009 section 3)",
             locks.object
         )),
     }
@@ -655,7 +655,7 @@ async fn locked_what_the_reads_describe(
          {now_means}. Another session renamed or dropped the object and gave its name away in \
          between, and {how_it_moved}.\nNothing is reported rather than an answer about one \
          object beside a lock on another: the `DROP` that follows goes by name, so it would \
-         destroy whatever stands under it — an object no plan approved over. Run the deploy \
+         destroy whatever stands under it -- an object no plan approved over. Run the deploy \
          again once the other session has finished.",
         held = locks.object,
         how_it_moved = locks.how_it_moved
@@ -969,7 +969,7 @@ fn push_owner(row: &Row, carries: &mut Vec<Carried>) -> Result<(), DbError> {
         what: "the object's owner, which a rebuild gives to the deploying account",
         detail: if secdef {
             format!(
-                "`{owner}` owns it and this session is `{deploying_as}` — and it is \
+                "`{owner}` owns it and this session is `{deploying_as}` -- and it is \
                  `SECURITY DEFINER`, so the rebuild would leave it running with this account's \
                  privileges"
             )
@@ -1153,8 +1153,8 @@ async fn read_acl(
         if grantee.is_empty() {
             carries.push(Carried {
                 what: "a grant to PUBLIC beyond the engine's own default, which is not a role \
-                       the declarations can name — the one thing a plan may say about PUBLIC is \
-                       that a routine's default `EXECUTE` goes away (ADR-0010 §5)",
+                       the declarations can name -- the one thing a plan may say about PUBLIC is \
+                       that a routine's default `EXECUTE` goes away (ADR-0010 section 5)",
                 detail: format!("PUBLIC holds `{permission}`"),
             });
             continue;
@@ -1381,9 +1381,9 @@ async fn require_the_callers_transaction(conn: &mut Conn) -> Result<(), DbError>
          and it takes the object's lock so that nothing changes between the read and the \
          `DROP`. Outside a transaction the lock is released at the end of the statement \
          that took it, and the canonical `search_path` these reads pin is set \
-         `is_local` and does nothing at all — so the answer would be true when it was \
+         `is_local` and does nothing at all -- so the answer would be true when it was \
          given, unenforced afterwards, and worded by whatever path the session happened \
-         to hold (ADR-0009 §3)."
+         to hold (ADR-0009 section 3)."
             .to_owned(),
     ))
 }
@@ -1411,7 +1411,7 @@ fn not_in_the_catalog(id: &ModuleId) -> DbError {
     DbError::Refused(format!(
         "`{id}` is not in this database's catalog, and this read is about what a rebuild of \
          it would destroy.\nAn answer of \"nothing\" here would mean \"nothing is attached to \
-         it\", which is what lets a rebuild go ahead — so a module that is not there is \
+         it\", which is what lets a rebuild go ahead -- so a module that is not there is \
          refused instead. If the plan means to create it, it is not being rebuilt and this \
          question does not apply."
     ))
@@ -2127,7 +2127,7 @@ fn the_engine_broke_a_tie(id: &ModuleId, e: DbError) -> DbError {
             "another session held what this rebuild of `{id}` needed, and needed what this \
                  held: the engine broke the tie and rolled this side back whole.\n\
                  Nothing was changed. Run the deploy again once the other session has \
-                 finished — most often it is a `pull` or a `status`, which opens every view in \
+                 finished -- most often it is a `pull` or a `status`, which opens every view in \
                  the database to read its definition back."
         )),
         _ => e,
@@ -2151,18 +2151,18 @@ pub fn unmanaged_refusal(
         .iter()
         .filter(|d| !d.managed(declared))
         .map(|d| match &d.holds {
-            Holds::Unrepresentable(why) => format!("- {} — {why}", d.described),
+            Holds::Unrepresentable(why) => format!("- {} -- {why}", d.described),
             Holds::TablePart {
                 part: Part::Generated(_),
                 ..
             } => format!(
-                "- {} — a generated column, whose expression no statement can take off and put \
+                "- {} -- a generated column, whose expression no statement can take off and put \
                  back around the rebuild; a plan that changes the expression so it no longer \
                  calls `{id}` releases it",
                 d.described
             ),
             Holds::Module(_) | Holds::TablePart { .. } => {
-                format!("- {} — this project does not declare it", d.described)
+                format!("- {} -- this project does not declare it", d.described)
             }
         })
         .collect();
@@ -2171,9 +2171,9 @@ pub fn unmanaged_refusal(
     }
     Some(format!(
         "`{id}` cannot be rebuilt: this engine has no `CREATE OR ALTER`, so the change is a drop \
-         and a create (ADR-0009 §3), and these objects depend on it and this project could not \
+         and a create (ADR-0009 section 3), and these objects depend on it and this project could not \
          put them back:\n{}\nThe plan names every object it drops, or it does not drop \
-         (SPEC 14.3), so `DROP … CASCADE` is not offered. Declare them, or remove the \
+         (SPEC 14.3), so `DROP ... CASCADE` is not offered. Declare them, or remove the \
          dependency, and plan again.",
         blocked.join("\n")
     ))
@@ -2269,9 +2269,9 @@ pub fn callers_report(id: &ModuleId, callers: &[ModuleId]) -> Option<String> {
     let named: Vec<String> = callers.iter().map(|c| format!("- {c}")).collect();
     Some(format!(
         "`{id}` is being rebuilt or removed, and these declared modules mention its name. The \
-         catalog records a dependency only for a body it parsed at creation time — measured, a \
+         catalog records a dependency only for a body it parsed at creation time -- measured, a \
          `BEGIN ATOMIC` body records one and a plpgsql or SQL string-literal body records \
-         nothing — so this is a scan, and a name is not an identity where routines overload. It \
+         nothing -- so this is a scan, and a name is not an identity where routines overload. It \
          is reported and not refused; check each and, where the call has to be reordered, say so \
          with `depends_on:`:\n{}",
         named.join("\n")
@@ -2703,7 +2703,7 @@ mod tests {
         // sentence it is: a `!contains("CASCADE")` would pass on a message
         // that never mentioned the subject at all.
         assert!(
-            refusal.contains("`DROP … CASCADE` is not offered"),
+            refusal.contains("`DROP ... CASCADE` is not offered"),
             "{refusal}"
         );
         assert!(to_rebuild(&one_missing, &declared).is_empty());

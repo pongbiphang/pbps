@@ -233,7 +233,7 @@ pub struct UnmanagedModule {
 /// Why a table's rows could not be read back.
 #[derive(Debug, thiserror::Error)]
 pub enum RowsError {
-    #[error("{table}: its rows cannot be read back — {why}")]
+    #[error("{table}: its rows cannot be read back -- {why}")]
     Unreadable { table: TableName, why: String },
 
     /// `{source}` is deliberately not in this format string. `pbps-cli`'s

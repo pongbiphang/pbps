@@ -1167,7 +1167,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             target: LimitationTarget::Relation(TableName::new(&schema, &name)),
             detail: format!(
                 "`{schema}.{name}` is {kind}, which this model does not hold. It is left out of \
-                 the pull entirely — not read back as an ordinary table, which would make a plan \
+                 the pull entirely -- not read back as an ordinary table, which would make a plan \
                  that recreates it without what makes it one."
             ),
         });
@@ -1481,7 +1481,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         };
         let detail = format!(
             "`{target}` is {}, which this model does not hold. It is left out of the \
-             pull entirely — not read back as an ordinary module, which would make a plan \
+             pull entirely -- not read back as an ordinary module, which would make a plan \
              that recreates it as something else.",
             text(row, "detail")?
         );
