@@ -973,12 +973,59 @@ impl NameFacts {
         self.first.get(name).unwrap_or(name)
     }
 
-    /// Whether the catalog read found an object under `id`'s name: the only
-    /// way the walk's step for its drop frees anything (`Walk::step`), so the
-    /// only way where that drop runs can matter to a name (#1680 review).
-    pub(crate) fn holds_module(&self, id: &ModuleId) -> bool {
+    /// Whether where the drop of module `id` runs among `changes`' table
+    /// renames can change what the walk finds (#1680 review). Only then may
+    /// the rename search move it. Two things must hold:
+    /// - The catalog read found an object under its name. Otherwise its drop
+    ///   frees nothing (`Walk::step`).
+    /// - A table rename can claim that name, under the collation. The renames
+    ///   are the only changes among the drops that claim a name. Every claim
+    ///   after them runs after every module drop whatever the order, and every
+    ///   claim before them runs before it.
+    ///
+    /// A rename can claim its target, the stop a transfer passes through, the
+    /// generated and fallback names of each default it moves, and, across
+    /// schemas, the name of each child the read found that it carries
+    /// (`Walk::rename_table`). Missing one leaves the drop where it is, as
+    /// before #1680.
+    // The complement is every change that is not a table rename.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub(crate) fn module_drop_matters(
+        &self,
+        changes: &[pbps_model::PlannedChange],
+        id: &ModuleId,
+    ) -> bool {
+        use pbps_mssql::emit::default_constraint_name as generated;
+        use pbps_mssql::emit::fallback_default_constraint_name as fallback_name;
         let name = module_object(id);
-        self.occupants.iter().any(|o| o.name == name)
+        if !self.occupants.iter().any(|o| o.name == name) {
+            return false;
+        }
+        let module = self.one(&name);
+        let in_schema = |t: &TableName, n: &str| TableName::new(t.schema.clone(), n);
+        changes.iter().any(|p| {
+            let pbps_model::Change::RenameTable {
+                from, to, defaults, ..
+            } = &p.change
+            else {
+                return false;
+            };
+            let mut claims = vec![to.clone()];
+            for c in defaults {
+                claims.push(in_schema(to, &generated(to, c)));
+                claims.push(in_schema(to, &fallback_name(to, c)));
+            }
+            if from.schema != to.schema {
+                claims.push(in_schema(to, &from.name));
+                claims.extend(
+                    self.occupants
+                        .iter()
+                        .filter(|o| o.parent.is_some())
+                        .map(|o| in_schema(to, &o.name.name)),
+                );
+            }
+            claims.iter().any(|c| self.one(c) == module)
+        })
     }
 }
 

@@ -307,11 +307,12 @@ impl<'c> Search<'c> {
         // gave (#1680); moved past them, `DROP TABLE` would run while the
         // module still binds the table (#1461). One no pair names keeps its
         // place among the drops, as the drops keep theirs; so does one whose
-        // name the catalog read found nothing under, since its drop frees no
-        // name and every place it may take walks the same. Made movable, a
-        // table's drop releasing a dozen such functions multiplied the
-        // orders past the search's bound (#1680 review). A module drop the
-        // edges left alone runs in class 0, before the first of them.
+        // place no rename can tell apart (`NameFacts::module_drop_matters`):
+        // its name is held by nothing, or claimed by no rename, so every
+        // place it may take walks the same. Made movable, a table's drop
+        // releasing a dozen such functions multiplied the orders past the
+        // search's bound (#1680 review). A module drop the edges left alone
+        // runs in class 0, before the first of them.
         let first = (0..changes.len()).find(|&i| part(&changes[i].change).is_some());
         let at = |c: &Change| (0..changes.len()).find(|&i| changes[i].change == *c);
         let pairs: Vec<(usize, usize)> = precedence
@@ -324,8 +325,8 @@ impl<'c> Search<'c> {
                     && matches!(changes[i].change, Change::DropModule { .. }))
                 .then(|| match &changes[i].change {
                     Change::DropModule { id, .. }
-                        if facts.holds_module(id)
-                            && pairs.iter().any(|&(a, b)| a == i || b == i) =>
+                        if pairs.iter().any(|&(a, b)| a == i || b == i)
+                            && facts.module_drop_matters(changes, id) =>
                     {
                         Part::Module
                     }
@@ -1121,6 +1122,17 @@ mod tests {
             ),
         ];
         let precedence = [(drop_table("dbo.u").change, function.change.clone())];
+        // Its name is one the rename's default can take, so it moves.
+        let facts = NameFacts::new(&occupants, &[]);
+        assert_eq!(Search::new(&plan(), &precedence, &facts).modules, [1]);
+        // Negative: with nothing under that name in the catalog read, its
+        // drop frees nothing, and it stays.
+        let unheld = NameFacts::new(&occupants[..2], &[]);
+        assert!(
+            Search::new(&plan(), &precedence, &unheld)
+                .modules
+                .is_empty()
+        );
         let mut cs = ChangeSet { changes: plan() };
         order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &precedence).unwrap();
         crate::deploy::refuse_occupied_objects_under(&cs, &occupants, &[], "prod").unwrap();
@@ -1244,6 +1256,76 @@ mod tests {
             Search::new(&cs.changes, &precedence, &facts)
                 .modules
                 .is_empty()
+        );
+    }
+
+    /// #1680 review: a module drop whose name only a check the plan adds
+    /// claims keeps its place too. The check runs after every module drop in
+    /// any order, so only a rename's claim can tell two places apart. Here
+    /// the eleven functions are in the catalog, and checks reuse their names.
+    #[test]
+    fn a_module_drop_whose_name_no_rename_claims_keeps_its_place() {
+        let new = name("dbo.new");
+        let generated = default_constraint_name(&new, "x");
+        let check = |n: &str| {
+            PlannedChange::new(Change::AddCheck {
+                table: name("dbo.t"),
+                name: n.into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "a > 0".into(),
+                },
+            })
+        };
+        let functions: Vec<PlannedChange> = (0..11)
+            .map(|k| {
+                PlannedChange::new(Change::DropModule {
+                    id: pbps_model::ModuleId::Named(name(&format!("dbo.g{k}"))),
+                    kind: pbps_model::ModuleKind::Function,
+                })
+            })
+            .collect();
+        let z = PlannedChange::new(Change::DropTable {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.z", 0),
+            name: name("dbo.z"),
+            detach_from: None,
+        });
+        let mut changes = vec![z.clone()];
+        changes.extend(functions.iter().cloned());
+        changes.push(rename("dbo.old", "dbo.new", &["x"]));
+        changes.push(check(&generated));
+        changes.extend((0..11).map(|k| check(&format!("g{k}"))));
+        let mut occupants = vec![
+            held(
+                &format!("dbo.{}", default_constraint_name(&name("dbo.old"), "x")),
+                "default constraint",
+                Some("dbo.old"),
+                Some("x"),
+            ),
+            held(
+                &format!("dbo.{generated}"),
+                "check constraint",
+                Some("dbo.z"),
+                None,
+            ),
+        ];
+        occupants
+            .extend((0..11).map(|k| held(&format!("dbo.g{k}"), "sql scalar function", None, None)));
+        let precedence: Vec<(Change, Change)> = functions
+            .iter()
+            .map(|f| (z.change.clone(), f.change.clone()))
+            .collect();
+        let facts = NameFacts::new(&occupants, &[]);
+        assert!(
+            Search::new(&changes, &precedence, &facts)
+                .modules
+                .is_empty()
+        );
+        let mut cs = ChangeSet { changes };
+        order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &precedence).unwrap();
+        assert!(
+            matches!(cs.changes[0].change, Change::RenameTable { .. }),
+            "{:?}",
+            cs.changes
         );
     }
 

@@ -3717,11 +3717,20 @@ table drops ruled out that order, and the plan was refused at `plan --db`.
   others.
 - `order_computed_by_edges` returns the pairs. The plan pipeline passes them
   to the rename search. Nothing reorders the plan between the two passes.
-- In the search, a module drop in the region moves like a rename when a pair
-  names it and the catalog read found an object under its name. Only then can
-  its drop free a name the walk tracks. One that frees nothing walks the same
-  in every place, and made movable, a table's drop releasing a dozen such
-  functions multiplied the orders past the search's bound. Every candidate, renames, these module drops and the region's next
+- In the search, a module drop in the region moves like a rename only when
+  all three hold:
+  - a pair names it;
+  - the catalog read found an object under its name, so its drop frees one;
+  - a table rename can claim that name under the collation: its target, a
+    transfer's stop, a moved default's generated or fallback name, or a
+    carried child's name (`NameFacts::module_drop_matters`).
+
+  The renames are the only claims among the drops. A claim after them runs
+  after every module drop in any order, so no other place can differ. Made
+  movable without this, a table's drop releasing a dozen functions
+  multiplied the orders past the search's bound. That happened with names
+  nothing held, and again with names only added checks claimed. A claim the
+  list misses leaves the drop in DEC-1461.1's place. Every candidate, renames, these module drops and the region's next
   fixed drop alike, is tried only once everything it waits for in the region
   has run. A pair whose earlier change ran before the region is met.
 - Any other module drop keeps DEC-1461.1's place among the drops. So does
@@ -3739,9 +3748,13 @@ Pinned by:
   refused rather than moved past that drop.
 - `a_module_drop_among_the_drops_keeps_its_place_in_the_search`, now also
   with its pairs.
-- `a_module_drop_that_frees_no_name_keeps_its_place`: eleven function drops a
-  table's drop releases, none under a name the catalog holds, leave the
-  rename free to run first. Made movable, they exhausted the search.
+- `a_module_drop_that_frees_no_name_keeps_its_place` and
+  `a_module_drop_whose_name_no_rename_claims_keeps_its_place`: a table's drop
+  releases eleven function drops. Their names are held by nothing in the
+  first test and claimed only by added checks in the second. In both, the
+  rename is still free to run first; made movable, the drops exhausted the
+  search. The example test's negative keeps a function the catalog does not
+  hold out of the movable set.
 - `what_a_released_function_is_bound_to_follows_it`
   (`crates/pbps-cli/src/computed_order.rs`), on the pairs themselves.
 - `a_computed_drop_follows_the_module_bound_to_it_and_its_inputs_follow_it`
