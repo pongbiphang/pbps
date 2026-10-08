@@ -3291,8 +3291,10 @@ Measured on 16.15 and 18.6:
   share the spelling reads' transaction and gets its own, rolled back whatever
   happens.
 - Without the `TEMP` privilege on the database `CREATE TEMP TABLE` is refused.
-- An event trigger on `ddl_command_end` fires on `CREATE TEMP TABLE`; its
-  effects roll back with the transaction.
+- An event trigger on `ddl_command_end` fires on `CREATE TEMP TABLE` and on
+  each `ALTER`; its writes roll back with the transaction, but not all it
+  does: one calling `nextval` left the sequence three calls on after the
+  probe rolled back (#1669).
 
 **The deparse.** Only a candidate is asked about: a partition's own declared
 default on a column whose parent declares one, with a declared text that
@@ -3321,8 +3323,13 @@ read-only (SPEC §9.8). Such a text is unasked, with its warning.
 shows is not what `pg_attrdef` stores. Only storing the default gives the
 stored text.
 
-**Unasked is not clean.** A candidate whose type cannot be named, or a deparse
-that fails (no `TEMP`, an event trigger that refuses, an expression that does
+**No DDL under an event trigger.** Before storing anything the probe reads
+`pg_event_trigger` for one on `ddl_command_start`, `ddl_command_end` or
+`sql_drop` that is not disabled; with one, or with that read failing, it runs
+no DDL and every candidate is unasked, naming the trigger (#1669).
+
+**Unasked is not clean.** A candidate whose type cannot be named, an enabled
+DDL event trigger, or a deparse that fails (no `TEMP`, an expression that does
 not resolve yet because the plan creates what it names), is not a finding. It
 is printed as a warning that it was not checked before the plan, and the
 apply's closing check still refuses a wrong recording.
@@ -3341,6 +3348,11 @@ Pinned on 16 and 18 by the CLI's
 - an own `('pbps_1609'::regclass)::oid::bigint` beside the parent's
   `app.pbps_1609` reaches the schema's table, not the probe's, and is refused
   as the parent's (#1659).
+
+Also by the CLI's `a_ddl_event_trigger_leaves_the_partition_default_probe_unrun`,
+on 16 and 18: with an enabled `ddl_command_end` trigger calling `nextval`, the
+plan leaves the sequence where it was and warns naming the trigger; disabled,
+the pair is asked and refused as the parent's (#1669).
 
 <a id="dec-1459-1"></a>
 
