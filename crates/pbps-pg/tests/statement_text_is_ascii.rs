@@ -98,6 +98,13 @@ fn non_ascii_in_code(source: &str) -> Vec<(usize, char)> {
             i += 1;
             while i < chars.len() && chars[i] != '"' {
                 if chars[i] == '\\' {
+                    // `\u{...}` decodes to the character the server receives,
+                    // whatever the literal spells (#1650).
+                    if let Some((decoded, len)) = unicode_escape(&chars, i) {
+                        record(line, decoded, skip, &mut found);
+                        i += len;
+                        continue;
+                    }
                     i += 1;
                 }
                 if at(i) == '\n' {
@@ -110,6 +117,9 @@ fn non_ascii_in_code(source: &str) -> Vec<(usize, char)> {
         } else if c == '\'' {
             // A character literal, or a lifetime, which has no closing quote.
             if at(i + 1) == '\\' {
+                if let Some((decoded, _)) = unicode_escape(&chars, i + 1) {
+                    record(line, decoded, skip, &mut found);
+                }
                 let mut k = i + 2;
                 while k < chars.len() && chars[k] != '\'' {
                     k += 1;
@@ -154,6 +164,23 @@ fn non_ascii_in_code(source: &str) -> Vec<(usize, char)> {
         }
     }
     found
+}
+
+/// The character a `\u{...}` escape starting at `chars[i]` decodes to, and
+/// the escape's length; `None` for any other escape. Rust allows `_` between
+/// the hex digits. A `\x` escape needs no decoding: in a `str` or `char` the
+/// compiler limits it to 0x7F, so it is ASCII.
+fn unicode_escape(chars: &[char], i: usize) -> Option<(char, usize)> {
+    if chars.get(i) != Some(&'\\')
+        || chars.get(i + 1) != Some(&'u')
+        || chars.get(i + 2) != Some(&'{')
+    {
+        return None;
+    }
+    let close = (i + 3..chars.len()).find(|&k| chars[k] == '}')?;
+    let hex: String = chars[i + 3..close].iter().filter(|&&c| c != '_').collect();
+    let decoded = char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?;
+    Some((decoded, close + 1 - i))
 }
 
 /// Whether a `#[cfg(...)` attribute compiles its item into test builds only:
@@ -269,4 +296,13 @@ fn the_ascii_scan_reads_literals_and_skips_comments_and_test_code() {
         "§"
     );
     assert_eq!(caught("#[cfg(all(unix, test))]\nfn t() { \"—\"; }"), "");
+    // An escape is read as the character it decodes to (#1650).
+    assert_eq!(caught("const A: &str = \"x \\u{2014} y\";"), "—");
+    assert_eq!(caught("const C: char = '\\u{2026}';"), "…");
+    assert_eq!(caught("const A: &str = \"\\u{20_14}\";"), "—");
+    // Negative: an escape that decodes to ASCII, and other escapes.
+    assert_eq!(caught("const A: &str = \"\\u{41}\";"), "");
+    assert_eq!(caught("const C: char = '\\n';"), "");
+    assert_eq!(caught("const C: char = '\\u{7f}';"), "");
+    assert_eq!(caught("const A: &str = \"\\\\u{2014}\";"), "");
 }
