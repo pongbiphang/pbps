@@ -1562,9 +1562,16 @@ scratch compile (#1616).
     (below), and no property of its own.
   - **The exception is the source text that defines an object:** a routine's
     body (#1655) and a view's query. A binding reads the object's shape, not
-    how it computes it. So a view may be staged as a table of its output
-    columns. It is then compared as a relation, by those columns, and its
-    relation kind and rewrite rule are not compared.
+    how it computes it.
+  - **So a view may be staged as a shape view:** a view of the same output
+    columns over typed NULLs that returns no row, for example
+    `CREATE VIEW ext.v AS SELECT NULL::integer AS id WHERE false`. Its
+    relation kind is still compared; only its query is not.
+  - **A view is never staged as a table.** A table has system columns and a
+    view has none. Measured on 18: for `SELECT v.xmin FROM ext.v v`, with a
+    function `xmin(ext.v)` in scope, a view binds the function and a table of
+    the same columns binds the system column. A table also cannot have a
+    column named `xmin`, which a view can output.
   - This narrows only the baseline comparison. The recheck before
     publication and at apply still compares the target's complete
     fingerprints.
@@ -1599,8 +1606,8 @@ scratch compile (#1616).
 A baseline object compared with the target is not a fabricated stub; an
 uncompared one never reaches binding evidence. Two later steps are planned:
 1. a command that drafts a baseline from the target's external shapes, for
-   review (a view is drafted as a table of its output columns, and a routine
-   is listed but never written);
+   review (a view is drafted as a shape view of its output columns, and a
+   routine is listed but never written);
 2. filling, at plan time, the shapes a baseline lacks, by the same rules;
    the baseline wins on overlap.
 

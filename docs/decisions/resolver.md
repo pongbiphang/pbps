@@ -1625,9 +1625,16 @@ their full definitions sends routine source no reviewer approved.
   for that class: column collations, routine defaults and the like. The
   exception is the source text that defines an object, a routine's body or
   a view's query. A binding reads shape, not computation. That exception is
-  what lets a view be staged as a table of its output columns, compared as
-  a relation without its kind or rewrite rule. The recheck still compares
-  the target's complete fingerprints. A list of properties of its own would miss
+  what lets a view be staged as a shape view: the same output columns over
+  typed NULLs, returning no row. The recheck still compares the target's
+  complete fingerprints.
+- A view is never staged as a table, and its relation kind is still
+  compared. A table's system columns change what a name binds to. Measured
+  on 18: `v.xmin`, with a function `xmin(ext.v)` in scope, binds the
+  function on a view (and on a shape view) but the system column on a table
+  of the same columns. This replaces "a view becomes a table of its output
+  columns" in the design on #1528. The point of that wording, shapes only and
+  never the original SQL, is unchanged (#1652 review). A list of properties of its own would miss
   one per review, as the first drafts of this entry did, with routine
   defaults and then column collations. Reusing the manifest's list makes
   the comparison and the recheck one definition.
@@ -1643,7 +1650,7 @@ their full definitions sends routine source no reviewer approved.
 - pbps itself never sends routine source. A routine reaches scratch only
   through the baseline, under what the operator vouches for.
 - Two later steps reuse the same comparison: a reviewed draft generated from
-  the target (shapes only; a view as a table of its output columns), then
+  the target (shapes only; a view as a shape view of its output columns), then
   automatic fill of missing shapes, where the baseline wins on overlap.
 
 **Naming.**

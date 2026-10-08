@@ -716,8 +716,9 @@ carries the normative text, and DEC-1528.1 the reasons.
     the target by the properties the manifest already fingerprints for its
     class, and sealed into the manifest. The source text that defines an
     object is excepted: a routine's body, and a view's query. A view may
-    therefore be staged as a table of its output columns. The recheck still
-    compares the target's complete fingerprints.
+    therefore be staged as a shape view of its output columns (typed NULLs,
+    no row), never as a table, whose system columns change name resolution.
+    The recheck still compares the target's complete fingerprints.
   - The baseline runs in its own session. Afterwards, every managed object
     already staged must be unchanged, and every object it created must be
     compared; otherwise it refuses. A mismatch, a missing object, or a
@@ -747,7 +748,9 @@ carries the normative text, and DEC-1528.1 the reasons.
   - `vouched_refuses_a_baseline_that_differs_from_the_target`
   - `vouched_refuses_a_baseline_that_creates_a_managed_object`
   - `vouched_refuses_a_baseline_that_alters_a_managed_object_or_leaves_one_uncompared`
-  - `vouched_compiles_a_managed_view_over_an_external_view_staged_as_a_table`
+  - `vouched_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view`
+  - `vouched_refuses_an_external_view_staged_as_a_table` (the computed-field
+    `xmin(ext.v)` case binds differently on a table)
   - `vouched_refuses_a_question_that_needs_routine_source_the_baseline_lacks`
   - `vouched_recheck_binds_the_target_by_engine_identity`
   - `vouched_recheck_refuses_an_external_shape_changed_after_planning`
