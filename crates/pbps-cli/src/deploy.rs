@@ -4412,7 +4412,26 @@ fn refuse_unplanned_movement(
                     t.partition_by.clone(),
                 )
             };
-            if place(was) != place(now) {
+            // A parent whose column names pass to other columns in this plan
+            // has no undo for its key either (#1692 review): its key is
+            // compared under the names the plan leaves, the before-read's
+            // brought forward and the later read's as it is.
+            let (was_place, now_place) = match partition_hands.get(now_name) {
+                None => (place(was), place(now)),
+                Some(net) => {
+                    let (of, by) = place(was);
+                    let forward = |c: String| {
+                        net.iter()
+                            .find(|(_, was)| was.as_deref() == Some(c.as_str()))
+                            .map_or(c, |(now, _)| now.clone())
+                    };
+                    let by = by.map(|by| pbps_model::PartitionBy {
+                        columns: by.columns.into_iter().map(forward).collect(),
+                    });
+                    ((of, by), place(after.tables.get(now_name).unwrap_or(now)))
+                }
+            };
+            if was_place != now_place {
                 moved.push(format!(
                     "{now_name}'s partition parent, bound or key is not the one the plan was \
                      approved over"
@@ -14562,6 +14581,49 @@ mod tests {
         let e = check(&reusing, &was_x, &reused(false), Settled::Whole)
             .expect_err("the renamed column's own NOT NULL lost");
         assert!(format!("{e:#}").contains("app.ev_1's own column"), "{e:#}");
+        // `w` dropped and the key column `v` renamed into its name: the key
+        // is compared under the name the plan leaves (#1692 review).
+        let keyed = |key: &str| {
+            let mut s = schema(&[]);
+            let p = s.tables.get_mut(&parent).unwrap();
+            p.columns = [
+                ("w".to_owned(), Column::new("integer".parse().unwrap())),
+                ("u".to_owned(), Column::new("integer".parse().unwrap())),
+            ]
+            .into_iter()
+            .collect();
+            p.partition_by = Some(PartitionBy {
+                columns: vec![key.into()],
+            });
+            s
+        };
+        let mut was_u = schema(&[]);
+        was_u
+            .tables
+            .get_mut(&parent)
+            .unwrap()
+            .columns
+            .insert("u".into(), Column::new("integer".parse().unwrap()));
+        let rekeying = plan(vec![
+            Change::DropColumn {
+                uid: "c_000002".parse().unwrap(),
+                column: pbps_model::ColumnRef::new(parent.clone(), "w"),
+            },
+            Change::RenameColumn {
+                uid: "c_000003".parse().unwrap(),
+                table: parent.clone(),
+                from: "v".into(),
+                to: "w".into(),
+                table_was: None,
+            },
+        ]);
+        check(&rekeying, &was_u, &keyed("w"), Settled::Whole).expect("the key renamed");
+        let e = check(&rekeying, &was_u, &keyed("u"), Settled::Whole)
+            .expect_err("the key moved to another column");
+        assert!(
+            format!("{e:#}").contains("app.ev's partition parent, bound or key"),
+            "{e:#}"
+        );
     }
 
     /// A table's persistence is held across an apply (#1443): another

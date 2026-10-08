@@ -2607,7 +2607,20 @@ fn names_column(change: &Change, table: &TableName, column: &str) -> bool {
     {
         return true;
     }
-    if change.table() != Some(table) {
+    // A standing partition's own default, NOT NULL, index or check on the
+    // parent's column needs it too (#1692 review). Only a default says its
+    // parent; for the others this pass, which has no schema, cannot tell a
+    // partition from another table, so a change of another table naming a
+    // column of that name waits for it as well. That only holds it longer,
+    // short of a cycle, which is refused with its two-plan remedy.
+    let partition_own = match change {
+        Change::SetPartitionDefault { parent, .. } => parent == table,
+        Change::SetPartitionNotNull { .. } | Change::AddIndex { .. } | Change::AddCheck { .. } => {
+            true
+        }
+        _ => false,
+    };
+    if change.table() != Some(table) && !partition_own {
         return change.table().is_none();
     }
     match change {
@@ -3749,6 +3762,18 @@ mod tests {
                 ..Table::default()
             }),
         };
+        let index_on = |column: &str| pbps_model::Index {
+            columns: vec![pbps_model::IndexColumn {
+                key: pbps_model::IndexKey::Column(column.into()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
         // A new partition whose own index is on the column, with no own
         // default or NOT NULL on it, needs the column all the same.
         let indexed = |name: &str, index: &str, column: &str| {
@@ -3760,22 +3785,19 @@ mod tests {
             else {
                 unreachable!("a partition is created");
             };
-            table.indexes.insert(
-                index.into(),
-                pbps_model::Index {
-                    columns: vec![pbps_model::IndexColumn {
-                        key: pbps_model::IndexKey::Column(column.into()),
-                        descending: false,
-                        opclass: None,
-                    }],
-                    include: Vec::new(),
-                    unique: false,
-                    filter: None,
-                    method: Default::default(),
-                    storage_parameters: Default::default(),
-                },
-            );
+            table.indexes.insert(index.into(), index_on(column));
             Change::CreateTable { uid, name, table }
+        };
+        // A standing partition's own changes on the column, and a default
+        // on another parent's column of the same name.
+        let standing_default = |table: &str, parent: &str| Change::SetPartitionDefault {
+            uid: Uid::derived(UidKind::Table, table, 0),
+            table: table.parse().unwrap(),
+            parent: parent.parse().unwrap(),
+            column: "extra".into(),
+            from: None,
+            to: Some("6".into()),
+            fallback: None,
         };
         let mut extra = Column::new("integer".parse().unwrap());
         extra.default = Some("app.f()".into());
@@ -3790,6 +3812,22 @@ mod tests {
             partition("app.ev_plain", "v"),
             indexed("app.ev_ix", "ev_ix_extra", "extra"),
             indexed("app.ev_ix_v", "ev_ix_v", "v"),
+            standing_default("app.ev_1", "app.ev"),
+            standing_default("app.x_1", "app.x"),
+            // Each on a partition of its own, so that none follows another
+            // change of its table rather than the column.
+            Change::SetPartitionNotNull {
+                uid: Uid::derived(UidKind::Table, "app.ev_2", 0),
+                table: "app.ev_2".parse().unwrap(),
+                column: "extra".into(),
+                not_null: true,
+            },
+            Change::AddIndex {
+                table: "app.ev_3".parse().unwrap(),
+                name: "ev_3_extra".into(),
+                index: Box::new(index_on("extra")),
+                clustered: false,
+            },
             routine("app.f()", "SELECT 1"),
         ]);
         rebuilds(&mut cs, &BTreeSet::new());
@@ -3805,6 +3843,22 @@ mod tests {
         assert!(function < added, "{order:?}");
         assert!(added < table_at("app.ev_new"), "{order:?}");
         assert!(added < table_at("app.ev_ix"), "{order:?}");
+        let default_at = |table: &str| {
+            at(
+                &|c| matches!(c, Change::SetPartitionDefault { table: t, .. } if t.to_string() == table),
+            )
+        };
+        assert!(added < default_at("app.ev_1"), "{order:?}");
+        assert!(
+            added < at(&|c| matches!(c, Change::SetPartitionNotNull { .. })),
+            "{order:?}"
+        );
+        assert!(
+            added < at(&|c| matches!(c, Change::AddIndex { .. })),
+            "{order:?}"
+        );
+        // Negative: another parent's partition default on its own `extra`.
+        assert!(default_at("app.x_1") < function, "{order:?}");
         // Negative: a partition with nothing of its own on `extra` stays ahead.
         assert!(table_at("app.ev_plain") < function, "{order:?}");
         assert!(table_at("app.ev_ix_v") < function, "{order:?}");

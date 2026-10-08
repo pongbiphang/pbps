@@ -3966,7 +3966,12 @@ partition the same plan creates under a parent whose columns change sorts at
 may only now add or retype. The connected pass that holds an added column
 behind the function its default calls (`after_their_functions`, DEC-1364.1)
 holds such a partition behind the column too, and one whose own index or
-check names the column.
+check names the column. So it does a standing partition's own default, NOT
+NULL, index or check on the column. Only the default's change names its
+parent; the pass has no schema to tell a partition from another table by, so
+any table's NOT NULL, index or check naming a column of that name waits as
+well. That holds it longer, short of a cycle, which is refused with its
+two-plan remedy.
 
 **Why not drop the partition's own NOT NULL before the parent's tightening.**
 It would leave no local NOT NULL behind on 18, but it orders a partition
@@ -3982,8 +3987,8 @@ parent's change leaves it. Otherwise it would be compared whole and called
 moved. Where the parent's column names change hands in the plan (DEC-541.1), or a
 dropped column's name is taken by a rename or a new column, undoing would put
 two columns' own entries under one name or cannot be built, so a partition's
-own entries are compared under the names the plan leaves instead, as the
-parent's columns are. A partition held field by field for its parent's change
+own entries, and the parent's key, are compared under the names the plan
+leaves instead, as the parent's columns are. A partition held field by field for its parent's change
 alone is still held to being there: one dropped or created by another session
 is movement, as the whole-table comparison would have called it.
 
