@@ -322,7 +322,7 @@ fn functions_changed(cs: &ChangeSet) -> Vec<(TableName, &'static str)> {
 }
 
 /// A computed column this plan adds, new or again, and the two-part names
-/// its expression spells.
+/// its expression calls.
 struct AddedCall {
     table: TableName,
     column: String,
@@ -342,7 +342,7 @@ fn added_calls(cs: &ChangeSet, dialect: &dyn pbps_dialect::Dialect) -> Vec<Added
             out.push(AddedCall {
                 table: table.clone(),
                 column: name.clone(),
-                names: dialect.qualified_names(&computed.expression),
+                names: dialect.qualified_calls(&computed.expression),
             });
         }
         if let Change::CreateTable { name, table, .. } = &p.change {
@@ -350,7 +350,7 @@ fn added_calls(cs: &ChangeSet, dialect: &dyn pbps_dialect::Dialect) -> Vec<Added
                 out.push(AddedCall {
                     table: name.clone(),
                     column: column.clone(),
-                    names: dialect.qualified_names(&computed.expression),
+                    names: dialect.qualified_calls(&computed.expression),
                 });
             }
         }
@@ -618,6 +618,7 @@ mod tests {
         };
         let dialect = pbps_mssql::Mssql;
         let ai = Alike::from_pairs([("cafe".to_owned(), "café".to_owned())]);
+        let ai_geo = || Alike::from_pairs([("geo".to_owned(), "géo".to_owned())]);
         let refused = refuse_added_calls(
             &plan("[dbo].[cafe]([a])", drop_module("dbo.café")),
             &dialect,
@@ -646,6 +647,15 @@ mod tests {
                 "{longer}"
             );
         }
+        // A spatial column's property, which no parenthesis follows.
+        assert!(
+            refuse_added_calls(
+                &plan("[geo].Lat", drop_module("géo.Lat")),
+                &dialect,
+                &ai_geo()
+            )
+            .is_ok()
+        );
         // Another schema.
         assert!(
             refuse_added_calls(

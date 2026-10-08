@@ -3342,8 +3342,8 @@ call, the column was re-added before the alter, and SQL Server refused the
 alter inside the apply (3729).
 
 **Decision.** `refuse_added_computed_calls` reads, from each added computed
-column's expression, the two-part names it spells in code
-(`Dialect::qualified_names`), and asks the engine which of them name a
+column's expression, the two-part names it calls in code, a pair an opening
+parenthesis follows (`Dialect::qualified_calls`), and asks the engine which of them name a
 function the plan creates, alters or drops under the catalog collation, as
 `column_names_alike` does for DEC-1431.1. A match refuses the plan by name:
 "computed column dbo.t.c calls `dbo.café` as `dbo.cafe`". It reads no
@@ -3353,8 +3353,13 @@ function the plan creates, alters or drops under the catalog collation, as
 column inside the planning transaction or on a scratch database, would be
 exact, but `plan --db` would then take a schema lock on a live table or need
 `CREATE DATABASE`. A computed column calls a function only by a two-part
-name, so the names it spells and the collation that compares them decide
-which function it calls. The maintainer chose this (2026-10-08).
+name, so the names it calls and the collation that compares them decide
+which function it calls. The maintainer chose this (2026-10-08). A spatial
+column's method, `geo.STAsText()`, has a call's shape too. Where its column
+and method equal, under the collation, a schema and a function the plan
+changes, the plan is refused, and so is the engine's own statement: SQL
+Server rejects such a call as ambiguous while the function exists (Msg 327,
+measured on 17.0, `[géo]` for `geo` under `CI_AI` included).
 
 Pinned by the live `a_readded_computed_columns_calls_are_compared_under_the_collation`
 (`crates/pbps-cli/tests/flow.rs`): under `CI_AI`, re-declaring the column as
@@ -3362,5 +3367,6 @@ Pinned by the live `a_readded_computed_columns_calls_are_compared_under_the_coll
 re-declaring it to call `dbo.g` plans. Also by the units
 `an_added_computed_column_is_refused_by_the_collations_reading_of_its_calls`
 (another schema, a spelling the collation keeps apart and a view's drop
-refuse nothing) and `qualified_names_are_read_from_code_as_written` (no name
-from a literal or a comment, nor across a call).
+refuse nothing) and `qualified_calls_are_read_from_code_as_written` (no name
+from a literal or a comment, across a call, or without a parenthesis, so not
+a spatial column's property).
