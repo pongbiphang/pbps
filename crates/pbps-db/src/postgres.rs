@@ -170,30 +170,9 @@ impl Conn {
         if defaulted {
             config.ssl_mode(tokio_postgres::config::SslMode::Require);
         }
-        Self::connect_config(config, is_linux)
-            .await
-            .map_err(|e| match e {
-                // Only a TLS failure: a refused socket, a timeout, a wrong
-                // password or a string refused before any socket opened says
-                // nothing about TLS, and a hint there would send the operator
-                // to the wrong fix. The driver names the handshake in its own
-                // message ("error performing TLS handshake: …").
-                DbError::Driver { ref message, .. } if defaulted && message.contains("TLS") => e
-                    .context(
-                        "this connection string names no `sslmode`, so pbps required verified TLS; \
-                     to connect without TLS on a network you trust, add `sslmode=disable` to it",
-                    ),
-                // Named rather than wildcarded: a new variant has to be
-                // decided on, since a TLS-shaped one would need the hint.
-                DbError::Driver { .. }
-                | DbError::BadConnectionString(_)
-                | DbError::Connect { .. }
-                | DbError::ConnectTimeout { .. }
-                | DbError::Context { .. }
-                | DbError::Refused(_)
-                | DbError::WrongSession { .. }
-                | DbError::BadRow(_) => e,
-            })
+        // Whether to explain a TLS failure is decided where the failure still
+        // says what it was, inside `connect_config` (#829).
+        Self::connect_config(config, is_linux, defaulted).await
     }
 
     pub(crate) async fn connect_verified(connection_string: &str) -> Result<Self, DbError> {
@@ -214,10 +193,19 @@ impl Conn {
                 "peer-verified PostgreSQL connections require sslmode=require".into(),
             ));
         }
-        Self::connect_config(config, cfg!(target_os = "linux")).await
+        // No defaulted-mode advice here: this constructor's callers name what
+        // they asked for, and the advice is about a mode nobody wrote.
+        Self::connect_config(config, cfg!(target_os = "linux"), false).await
     }
 
-    async fn connect_config(mut config: Config, is_linux: bool) -> Result<Self, DbError> {
+    /// `defaulted` is whether the string named no `sslmode`, so the TLS this
+    /// connection requires was pbps's choice and a failure of it is explained
+    /// (#829).
+    async fn connect_config(
+        mut config: Config,
+        is_linux: bool,
+        defaulted: bool,
+    ) -> Result<Self, DbError> {
         if config.get_application_name().is_none() {
             config.application_name(crate::session_application_name());
         }
@@ -285,7 +273,10 @@ impl Conn {
                 .map_err(|e| {
                     DbError::BadConnectionString(format!("`{host}` is not a TLS host: {e}"))
                 })?;
-            let (client, connection) = config.connect_raw(tcp, connector).await?;
+            let (client, connection) = config
+                .connect_raw(tcp, connector)
+                .await
+                .map_err(|e| tls_connect_error(e, defaulted))?;
             (client, hold(connection))
         } else {
             let (client, connection) = config.connect_raw(tcp, tokio_postgres::NoTls).await?;
@@ -726,6 +717,85 @@ fn apply_socket_options(
     Ok(())
 }
 
+/// What a failed TLS handshake says about TLS, read from the driver's typed
+/// error before [`DbError::from`] flattens it to text (#829).
+///
+/// The flattened text cannot tell the two cases that need opposite fixes
+/// apart: the driver renders both a server refusing TLS and a certificate
+/// this host does not accept as "error performing TLS handshake: …", and the
+/// advice for the first — turn TLS off on a network you trust — is the wrong
+/// one for the second, whose server does speak TLS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TlsFailure {
+    /// The server answered the SSL request with something other than `S`.
+    Refused,
+    /// The server's certificate failed verification: a wrong host name, an
+    /// untrusted issuer, an expired certificate.
+    Certificate,
+    /// Anything else, which says nothing a TLS remedy would fix.
+    Other,
+}
+
+/// The driver's own words for a refused SSL request (`connect_tls.rs` in
+/// `tokio-postgres` 0.7.18), carried as the source of a TLS-kind error.
+/// Compared whole, on that source only — never on the flattened message, which
+/// a certificate failure shares.
+const TLS_REFUSED: &str = "server does not support TLS";
+
+/// How deep the cause chain is followed. The real one is three links deep
+/// (driver, `io::Error`, `rustls::Error`); the bound is only so a cyclic or
+/// pathological chain cannot hold the error path.
+const CAUSE_DEPTH: usize = 16;
+
+fn tls_failure(e: &(dyn std::error::Error + 'static)) -> TlsFailure {
+    let mut next = e.source();
+    for depth in 0..CAUSE_DEPTH {
+        let Some(cause) = next else {
+            break;
+        };
+        let io = cause.downcast_ref::<std::io::Error>();
+        if depth == 0 && io.is_none() && cause.to_string() == TLS_REFUSED {
+            return TlsFailure::Refused;
+        }
+        if let Some(rustls::Error::InvalidCertificate(_)) = cause.downcast_ref::<rustls::Error>() {
+            return TlsFailure::Certificate;
+        }
+        // `io::Error::source` skips the error it wraps — it answers that
+        // error's own source — so the rustls error a TLS stream reports
+        // inside an `io::Error` is reached through `get_ref`.
+        next = match io.and_then(std::io::Error::get_ref) {
+            Some(inner) => Some(inner as &(dyn std::error::Error + 'static)),
+            None => cause.source(),
+        };
+    }
+    TlsFailure::Other
+}
+
+/// A TLS connection's failure, explained when the string named no `sslmode`
+/// and the failure is one TLS advice fixes. The driver's error underneath is
+/// kept as it always was; the explanation is this crate's own fixed text.
+fn tls_connect_error(e: tokio_postgres::Error, defaulted: bool) -> DbError {
+    let failure = if defaulted {
+        tls_failure(&e)
+    } else {
+        TlsFailure::Other
+    };
+    let flat = DbError::from(e);
+    match failure {
+        TlsFailure::Refused => flat.context(
+            "this connection string names no `sslmode`, so pbps required verified TLS; to \
+             connect without TLS on a network you trust, add `sslmode=disable` to it",
+        ),
+        TlsFailure::Certificate => flat.context(
+            "this connection string names no `sslmode`, so pbps required verified TLS, and the \
+             server's certificate was not accepted; keep TLS on and check that the certificate \
+             is valid, is issued by a CA this host trusts, and names the host this connection \
+             string uses",
+        ),
+        TlsFailure::Other => flat,
+    }
+}
+
 /// Whether the connection string chose its own `sslmode`.
 ///
 /// Asked of the driver's own parser rather than of a second one written here:
@@ -966,6 +1036,71 @@ mod tests {
     /// #311: whether a string chose its `sslmode` is the driver parser's
     /// answer, in both forms. Unnamed means verified TLS; named is honoured,
     /// insecure modes included — they are a choice once they are written.
+    /// #829: a TLS failure is classified from the driver's typed cause chain,
+    /// never from text. A certificate error inside the `io::Error` a TLS
+    /// stream reports is found through `get_ref`; the driver's refusal is its
+    /// own source and nothing deeper or io-wrapped; and lookalike text — a
+    /// refusal sentence inside an `io::Error`, a message naming certificates,
+    /// another rustls error — is neither.
+    #[test]
+    fn certificate_causes_survive_io_wrappers_without_text_matching() {
+        #[derive(Debug)]
+        struct Wrap(Box<dyn std::error::Error + Send + Sync>);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error performing TLS handshake")
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&*self.0)
+            }
+        }
+        let io = |e: rustls::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+        let certificate =
+            rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName);
+
+        assert_eq!(
+            tls_failure(&Wrap(Box::new(io(certificate.clone())))),
+            TlsFailure::Certificate
+        );
+        assert_eq!(
+            tls_failure(&Wrap(Box::new(Wrap(Box::new(io(certificate)))))),
+            TlsFailure::Certificate,
+            "however deep the wrapping"
+        );
+        assert_eq!(tls_failure(&Wrap(TLS_REFUSED.into())), TlsFailure::Refused);
+
+        for (case, other) in [
+            (
+                "the refusal sentence inside an io::Error",
+                Wrap(Box::new(std::io::Error::other(TLS_REFUSED))),
+            ),
+            (
+                "the refusal one cause deeper",
+                Wrap(Box::new(Wrap(TLS_REFUSED.into()))),
+            ),
+            (
+                "text that names a certificate",
+                Wrap("invalid peer certificate: InvalidCertificate(NotValidForName)".into()),
+            ),
+            (
+                "another rustls error",
+                Wrap(Box::new(io(rustls::Error::AlertReceived(
+                    rustls::AlertDescription::HandshakeFailure,
+                )))),
+            ),
+            (
+                "an io::Error with no inner error",
+                Wrap(Box::new(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionReset,
+                ))),
+            ),
+        ] {
+            assert_eq!(tls_failure(&other), TlsFailure::Other, "{case}");
+        }
+    }
+
     #[test]
     fn only_a_string_that_names_its_sslmode_escapes_the_verified_default() {
         for named in [
