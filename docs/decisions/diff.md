@@ -3478,7 +3478,11 @@ plan. The table must hold:
 - its parent's columns, by name and in order, with the same types (in the
   dialect's spelling), collations, identities and generations; a description
   and a deprecation are annotations the catalog does not hold, and are not
-  compared;
+  compared. A generated column is refused when the table is in another schema
+  than its parent: the engine does not compare generation expressions as it
+  attaches and keeps the table's, so the same text calling another schema's
+  function would compute the column differently in each partition (measured
+  on 18). The remedy is to move the table to its parent's schema first;
 - NOT NULL wherever its parent's columns are;
 - no primary key, or one on the parent's key columns;
 - no unique constraint or foreign key that is not one of the parent's,

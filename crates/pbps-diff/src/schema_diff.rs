@@ -2684,6 +2684,17 @@ fn attached(
                     "its column `{name}` is not its parent's in type, collation, identity or \
                      generation"
                 ));
+            } else if a.generated.is_some() && base_name.schema != of.parent.schema {
+                // The engine does not compare generation expressions as it
+                // attaches, and keeps the table's: in another schema the same
+                // text may call another function, and each partition would
+                // then compute the column its own way (measured on 18, #1642
+                // review).
+                what.push(format!(
+                    "its column `{name}` is generated, and in another schema than its parent \
+                     the same expression may call another function; move the table to its \
+                     parent's schema first"
+                ));
             }
         }
     }
@@ -6825,6 +6836,36 @@ mod tests {
         .2
         .expect("attached");
         assert_eq!(kinds(&same), ["DropIndex", "AttachPartition"]);
+        // A generated column: the engine keeps the table's expression, so in
+        // another schema the attach is refused, and in the parent's it plans.
+        let generated = |schema: &Schema, tables: &[&str]| {
+            let mut schema = schema.clone();
+            for t in tables {
+                let mut g = Column::new(ty("int"));
+                g.generated = Some(pbps_model::Generated {
+                    expression: "f(n)".into(),
+                    stored: true,
+                });
+                schema
+                    .tables
+                    .get_mut(&t.parse::<TableName>().unwrap())
+                    .unwrap()
+                    .columns
+                    .insert("g".into(), g);
+            }
+            schema
+        };
+        let g_base = generated(&base, &["app.ev", "app.t"]);
+        let g_declared = generated(&declared, &["app.ev"]);
+        let e = refused(&elsewhere(&g_base), &elsewhere(&g_declared), &[]);
+        assert!(
+            e.iter()
+                .any(|m| m.contains("its column `g` is generated, and in another schema")),
+            "{e:?}"
+        );
+        outcome(&g_base, &g_declared, &[])
+            .2
+            .expect("a generated column attaches in its parent's schema");
         // An expression index kept as its own: in another schema it is
         // dropped before the attach and built again after, in the parent's
         // left alone.
