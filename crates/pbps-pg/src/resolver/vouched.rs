@@ -75,11 +75,16 @@ pub enum Placement {
     Target,
 }
 
-/// What the scratch account may do beyond its own database, through any role
-/// it is a member of.
+/// What the scratch account may do beyond its own database, through itself
+/// or any role it may `SET ROLE` to. `SUPERUSER`, `CREATEROLE` and
+/// `CREATEDB` are never inherited: a role's attribute is the login's to use
+/// only if the login can become that role. A membership granted `SET FALSE`
+/// is still `MEMBER` but cannot be become, so it does not count (measured
+/// on 16 and 18: `SET ROLE` and `CREATE DATABASE` are both refused; #1678
+/// review).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Account {
-    /// Held by the login or by any role it is a member of.
+    /// Held by the login or by any role it may `SET ROLE` to.
     pub superuser: bool,
     pub create_role: bool,
     pub create_db: bool,
@@ -288,7 +293,7 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
                     coalesce(bool_or(r.rolsuper) FILTER (WHERE r.rolname = session_user), \
                              false)::text AS login_superuser \
                FROM pg_catalog.pg_roles r \
-              WHERE pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER')",
+              WHERE pg_catalog.pg_has_role(session_user, r.oid, 'SET')",
         )
         .await?;
     let row = one(rows, "the scratch account's attributes")?;

@@ -265,6 +265,20 @@ async fn vouched_runs_in_a_precreated_database_with_a_confined_account() {
         let mut fixture = Fixture::new(server);
         let target_db = fixture.target().await;
         let (login, scratch_db) = fixture.confined().await;
+        // A membership it cannot `SET ROLE` through gives it no attribute:
+        // the login stays confined (#1678 review).
+        let creator = format!("pbps_v1672_m_{}", fixture.token);
+        fixture
+            .admin()
+            .await
+            .execute(&format!(
+                "CREATE ROLE {creator} NOLOGIN CREATEDB CREATEROLE; \
+                 GRANT {creator} TO {} WITH SET FALSE",
+                login.0
+            ))
+            .await
+            .unwrap();
+        fixture.roles.insert(0, creator);
         let inputs = Inputs::overload();
         let key = ProjectKey::new(true);
         let result = produce(

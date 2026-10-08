@@ -1764,9 +1764,11 @@ by the engines, and the scratch account decides the layout.** Implemented by
     and 18. It is still not the separation check, for the reason above.
 
 **On the target's cluster, the scratch account must be confined** (#1667).
-- Confined means neither the account nor any role it is a member of has
-  `SUPERUSER`, `CREATEROLE` or `CREATEDB`. A role it can become is as good
-  as holding the attribute.
+- Confined means neither the account nor any role it can `SET ROLE` to
+  has `SUPERUSER`, `CREATEROLE` or `CREATEDB`. A role it can become is as
+  good as holding the attribute. The attributes are never inherited, so a
+  membership granted `SET FALSE` does not count: the login can neither
+  become that role nor use its attribute (#1678 review).
 - Reproducing the deployer's authorization creates roles server-wide, some
   possibly `SUPERUSER`. On a shared cluster that is a write to the target's
   cluster, and only an account that cannot make it is safe there.

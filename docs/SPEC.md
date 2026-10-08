@@ -1424,7 +1424,7 @@ entry implemented by #1672, Docker by #1674).**
       - The credential variable differs from the target's, and there is no
         fallback to target credentials.
     - **On the target's cluster, the scratch account is confined.** Neither
-      it nor any role it is a member of has `SUPERUSER`, `CREATEROLE` or
+      it nor any role it can `SET ROLE` to has `SUPERUSER`, `CREATEROLE` or
       `CREATEDB`. An unconfined account there refuses, naming the attributes
       to remove.
     - **The account decides the layout.**
