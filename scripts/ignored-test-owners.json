@@ -1367,6 +1367,7 @@
         "a_partitions_default_taken_back_resolves_under_its_parents_schema",
         "a_partitions_own_default_stored_as_its_parents_is_refused_before_the_plan",
         "a_ddl_event_trigger_leaves_the_partition_default_probe_unrun",
+        "an_unasked_partition_default_is_a_warning_in_the_json_plan",
         "an_unlogged_partition_under_an_undeclared_permanent_key_is_refused"
       ]
     },

@@ -3331,8 +3331,12 @@ no DDL and every candidate is unasked, naming the trigger (#1669).
 **Unasked is not clean.** A candidate whose type cannot be named, an enabled
 DDL event trigger, or a deparse that fails (no `TEMP`, an expression that does
 not resolve yet because the plan creates what it names), is not a finding. It
-is printed as a warning that it was not checked before the plan, and the
-apply's closing check still refuses a wrong recording.
+is a warning that it was not checked before the plan, and the apply's
+closing check still refuses a wrong recording. A connected plan reports it
+where its other warnings go: on stderr in human output, and in `--format json`
+as the warning finding `plan.partition-default-unasked` inside the one
+envelope, with nothing beside it (SPEC §9.8; #1660). Pinned on 16 and 18 by
+the CLI's `an_unasked_partition_default_is_a_warning_in_the_json_plan`.
 
 Pinned on 16 and 18 by the CLI's
 `a_partitions_own_default_stored_as_its_parents_is_refused_before_the_plan`:
