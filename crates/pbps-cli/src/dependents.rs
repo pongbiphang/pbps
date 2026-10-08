@@ -2590,13 +2590,20 @@ fn names_column(change: &Change, table: &TableName, column: &str) -> bool {
     {
         return true;
     }
-    // A partition created under the table sets its own default or NOT NULL
-    // on the parent's column right after its `CREATE`, so it needs each
-    // column it holds one on (#1692 review).
+    // A partition created under the table sets its own default or NOT NULL,
+    // and builds its own indexes and checks, on the parent's columns right
+    // after its `CREATE`, so it needs each column one of them names (#1692
+    // review).
     if let Change::CreateTable { table: t, .. } = change
         && let Some(of) = &t.partition_of
         && &of.parent == table
-        && of.columns.contains_key(column)
+        && (of.columns.contains_key(column)
+            || t.indexes.values().any(|index| {
+                index.columns.iter().any(|c| c.key.column() == Some(column))
+                    || listed(&index.include)
+                    || named(&index_text(index))
+            })
+            || t.checks.values().any(|check| named(&check.expression)))
     {
         return true;
     }
@@ -3742,6 +3749,34 @@ mod tests {
                 ..Table::default()
             }),
         };
+        // A new partition whose own index is on the column, with no own
+        // default or NOT NULL on it, needs the column all the same.
+        let indexed = |name: &str, index: &str, column: &str| {
+            let Change::CreateTable {
+                uid,
+                name,
+                mut table,
+            } = partition(name, "v")
+            else {
+                unreachable!("a partition is created");
+            };
+            table.indexes.insert(
+                index.into(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        key: pbps_model::IndexKey::Column(column.into()),
+                        descending: false,
+                        opclass: None,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: Default::default(),
+                },
+            );
+            Change::CreateTable { uid, name, table }
+        };
         let mut extra = Column::new("integer".parse().unwrap());
         extra.default = Some("app.f()".into());
         let mut cs = plan(vec![
@@ -3753,6 +3788,8 @@ mod tests {
             },
             partition("app.ev_new", "extra"),
             partition("app.ev_plain", "v"),
+            indexed("app.ev_ix", "ev_ix_extra", "extra"),
+            indexed("app.ev_ix_v", "ev_ix_v", "v"),
             routine("app.f()", "SELECT 1"),
         ]);
         rebuilds(&mut cs, &BTreeSet::new());
@@ -3767,8 +3804,10 @@ mod tests {
         let order = names(&cs);
         assert!(function < added, "{order:?}");
         assert!(added < table_at("app.ev_new"), "{order:?}");
+        assert!(added < table_at("app.ev_ix"), "{order:?}");
         // Negative: a partition with nothing of its own on `extra` stays ahead.
         assert!(table_at("app.ev_plain") < function, "{order:?}");
+        assert!(table_at("app.ev_ix_v") < function, "{order:?}");
     }
 
     /// A new table held back for its generation expression does not drag an

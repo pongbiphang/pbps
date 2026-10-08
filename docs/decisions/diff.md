@@ -3965,7 +3965,8 @@ partition the same plan creates under a parent whose columns change sorts at
 (9, 5): it is created with its own default or NOT NULL on a column the parent
 may only now add or retype. The connected pass that holds an added column
 behind the function its default calls (`after_their_functions`, DEC-1364.1)
-holds such a partition behind the column too.
+holds such a partition behind the column too, and one whose own index or
+check names the column.
 
 **Why not drop the partition's own NOT NULL before the parent's tightening.**
 It would leave no local NOT NULL behind on 18, but it orders a partition
@@ -3978,10 +3979,13 @@ renames a parent's key and a partition's own column entries too, so both
 reads compare under one set of names. A partition of a parent whose column the
 plan drops, renames or makes NOT NULL is held field by field, to what the
 parent's change leaves it. Otherwise it would be compared whole and called
-moved. Where the parent's column names change hands in the plan (DEC-541.1),
-undoing would put two columns' own entries under one name, so a partition's
+moved. Where the parent's column names change hands in the plan (DEC-541.1), or a
+dropped column's name is taken by a rename or a new column, undoing would put
+two columns' own entries under one name or cannot be built, so a partition's
 own entries are compared under the names the plan leaves instead, as the
-parent's columns are.
+parent's columns are. A partition held field by field for its parent's change
+alone is still held to being there: one dropped or created by another session
+is movement, as the whole-table comparison would have called it.
 
 **The cost estimate** names the recursion. On a partitioned table it says the
 statement recurses into its partitions, how many, and the lock it takes on
