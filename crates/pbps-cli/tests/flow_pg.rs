@@ -19537,9 +19537,10 @@ fn a_partitions_own_default_stored_as_its_parents_is_refused_before_the_plan() {
         let conn = db.connection().to_owned();
         on_server(
             &conn,
-            "CREATE SCHEMA app; \
+            "CREATE SCHEMA app; CREATE TABLE app.pbps_1609 (i integer PRIMARY KEY); \
              CREATE TABLE app.ev (k integer NOT NULL, v integer DEFAULT 1, b text DEFAULT 'x', \
-                 f boolean DEFAULT (false IS NULL)) PARTITION BY RANGE (k); \
+                 f boolean DEFAULT (false IS NULL), \
+                 s bigint DEFAULT ('app.pbps_1609'::regclass)::oid::bigint) PARTITION BY RANGE (k); \
              CREATE TABLE app.ev_a PARTITION OF app.ev FOR VALUES FROM (0) TO (10); \
              ALTER TABLE app.ev_a ALTER COLUMN v SET DEFAULT 7",
         );
@@ -19561,8 +19562,13 @@ fn a_partitions_own_default_stored_as_its_parents_is_refused_before_the_plan() {
         let own = "      v: {default: \"7\"}\n";
         assert!(pulled.contains(own), "{pulled}");
 
-        let as_parents = pulled.replace(own, "      v: {default: \"(1)\"}\n")
-            + "  ev_b:\n    from: [\"10\"]\n    to: [\"20\"]\n    columns:\n      \
+        // `s` names the parent's table unqualified: under the emitter's path,
+        // `pg_temp` last, it is the parent's, not the probe's own
+        // `pg_temp.pbps_1609` (#1659).
+        let as_parents = pulled.replace(
+            own,
+            "      v: {default: \"(1)\"}\n      s: {default: \"('pbps_1609'::regclass)::oid::bigint\"}\n",
+        ) + "  ev_b:\n    from: [\"10\"]\n    to: [\"20\"]\n    columns:\n      \
                b: {default: \"('x'::text)\"}\n";
         std::fs::write(&path, &as_parents).unwrap();
         succeeds(d.run(&["plan"]));
@@ -19574,6 +19580,9 @@ fn a_partitions_own_default_stored_as_its_parents_is_refused_before_the_plan() {
         assert!(
             err.contains(
                 "partition app.ev_a column `v`: its own default \"(1)\" is stored as \"1\""
+            ) && err.contains(
+                "partition app.ev_a column `s`: its own default \"('pbps_1609'::regclass)::oid::bigint\" is \
+                 stored as"
             ) && err.contains(
                 "partition app.ev_b column `b`: its own default \"('x'::text)\" is stored as"
             ) && err.contains("drop the partition's own default, it is the parent's"),
@@ -19588,7 +19597,8 @@ fn a_partitions_own_default_stored_as_its_parents_is_refused_before_the_plan() {
         assert_eq!(
             scalar(
                 &conn,
-                "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'pbps_1609'"
+                "SELECT count(*) FROM pg_catalog.pg_class \
+                 WHERE relname = 'pbps_1609' AND relpersistence = 't'"
             ),
             0,
             "{version}"

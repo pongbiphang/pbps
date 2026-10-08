@@ -3299,8 +3299,11 @@ default on a column whose parent declares one, with a declared text that
 differs. None, and no DDL runs. Otherwise one temporary table holds a column
 pair per candidate, typed as the column is, and each pair gets the parent's
 text under the parent's schema path and the partition's under its own, which
-is the path the emitter writes each under, so an unqualified name resolves as
-it will at the apply. The transaction first takes every parser setting the
+is the path the emitter writes each under, built by the emitter's own
+`write_path` with `pg_temp` last, so an unqualified name resolves as it will
+at the apply: without `pg_temp` on it the engine searches the temporary schema
+first, and a name the probe's own table shares would reach that table
+(#1659). The transaction first takes every parser setting the
 apply pins (`session_pins!`), not only the deparse's: measured on 18, a
 database's `transform_null_equals = on` stores `(false = NULL)` as `(false IS
 NULL)`, which the apply, pinned off, stores as `(false = NULL::boolean)`. Equal `pg_get_expr` texts are refused, naming the
@@ -3335,6 +3338,9 @@ Pinned on 16 and 18 by the CLI's
   database that sets `transform_null_equals = on`.
 - a declared text that ends the transaction and creates a table commits
   nothing, and is warned about as unasked.
+- an own `('pbps_1609'::regclass)::oid::bigint` beside the parent's
+  `app.pbps_1609` reaches the schema's table, not the probe's, and is refused
+  as the parent's (#1659).
 
 <a id="dec-1459-1"></a>
 
