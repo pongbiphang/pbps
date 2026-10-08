@@ -1408,6 +1408,9 @@ Pinned by `a_tightening_runs_after_the_rows_of_its_table` and
 **DEC-1366.1. A connected SQL Server plan orders its table renames from the
 catalog: where the namespace walk refuses the differ's order, the other orders
 of the renames are walked, and the first one it clears is the plan (#1366).**
+
+*Amended by [DEC-1461.1](#dec-1461-1): a module drop the computed edges
+placed among the drops keeps its place among them.*
 The differ orders renames and the drops that free their names from the
 declarations alone (DEC-536.1, DEC-981.3). Some of what decides that order is
 only in the target:
@@ -3376,3 +3379,47 @@ verifies. Also by the units
 refuse nothing) and `qualified_calls_are_read_from_code_as_written` (no name
 from a literal or a comment, across a call, or without a parenthesis, so not
 a spatial column's property).
+
+<a id="dec-1461-1"></a>
+
+**DEC-1461.1. The rename search keeps a module drop the computed edges placed
+among the drops in its place among them (#1461; amends DEC-1366.1).**
+
+**Context.** DEC-1431.1's pass moves a function's drop to after the last
+removal of a computed column that calls it, and so between two table drops
+when the function is schema-bound to the second: `DROP TABLE dbo.u`,
+`DROP FUNCTION dbo.g`, `DROP TABLE dbo.lookup`. Where a name only the catalog
+holds made DEC-1366.1's search reorder the renames, the search put every
+rename and drop of its region first and every other change after them, and a
+module drop is neither. `dbo.g` then dropped after `dbo.lookup`, which SQL
+Server refuses while `dbo.g` is bound to it.
+
+**Decision.** A module drop placed after the region's first rename or drop is
+one of the region's drops. The drops keep their order among themselves in the
+search, so the function stays between the two tables, and a rename may still
+move around it: a module drop claims no name, and the walk sees the name it
+frees. A module drop the edges left
+alone runs in class 0, before the first rename or drop, and keeps its place
+outside the region.
+
+**Why not the edges as constraints.** Handing the search the edges would
+order the drops again, which the differ and DEC-1431.1 have already done, and
+needs them carried from that pass into this one. The search's own rule, that
+drops keep their order, places the module drop correctly once it is counted
+among them.
+
+**Limit.** That rule is stricter than the edges: the module drop is held
+among *all* the region's drops, where the edges only need it after its
+release and before a table it is bound to. Which name a rename's default
+takes depends on what is free when it runs (DEC-981.1), so a function that
+holds a default's generated name can need to drop later than its fixed place,
+after the rename has taken the fallback. Such a plan is refused at
+`plan --db` with DEC-1366.1's remedy, splitting it, and nothing runs. Giving
+the search the edges' own constraints is #1680.
+
+Pinned by the live `computed_function_drops_keep_their_place_when_the_renames_are_searched`
+(`crates/pbps-cli/tests/flow.rs`): with a default adopted as `s1.c` forcing
+the search, `dbo.g` drops between `dbo.u` and `dbo.lookup`, and the plan
+applies and verifies. Also by the unit
+`a_module_drop_among_the_drops_keeps_its_place_in_the_search`, whose negative
+keeps a module drop ahead of the region out of it.

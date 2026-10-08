@@ -16,7 +16,9 @@
 //!   one another;
 //! - the drops keep their own order, which already puts a foreign key's drop
 //!   before the key or the table it references (DEC-536.1). A drop claims no
-//!   name, so no order a rename needs is one the drops have to give up;
+//!   name, so no order a rename needs is one the drops have to give up. A
+//!   module drop the computed edges placed among them (DEC-1431.1) is one of
+//!   them, so a table it is schema-bound to still drops after it (#1461);
 //! - every other change keeps its place, after the renames and drops. A name
 //!   one of them frees is refused with that change named (DEC-1366.2).
 //!
@@ -282,14 +284,29 @@ impl<'c> Search<'c> {
     // The complement is every change that is not a table rename.
     #[allow(clippy::wildcard_enum_match_arm)]
     fn new(changes: &'c [PlannedChange]) -> Self {
+        // A module drop after the first rename or drop is one the computed
+        // edges placed among the drops (DEC-1431.1): after the removal of a
+        // computed column that calls it, and before a table it is
+        // schema-bound to. It keeps that place among the drops, as the drops
+        // keep theirs; moved after them all, `DROP TABLE` would run while
+        // the module still binds the table (#1461). A module drop the edges
+        // left alone runs in class 0, before the first of them.
+        let first = (0..changes.len()).find(|&i| part(&changes[i].change).is_some());
+        let part_at = |i: usize| -> Option<Part> {
+            part(&changes[i].change).or_else(|| {
+                (first.is_some_and(|f| i > f)
+                    && matches!(changes[i].change, Change::DropModule { .. }))
+                .then_some(Part::Drop)
+            })
+        };
         let region: Vec<usize> = (0..changes.len())
-            .filter(|&i| part(&changes[i].change).is_some())
+            .filter(|&i| part_at(i).is_some())
             .collect();
         let of = |kind: Part| -> Vec<usize> {
             region
                 .iter()
                 .copied()
-                .filter(|&i| part(&changes[i].change) == Some(kind))
+                .filter(|&i| part_at(i) == Some(kind))
                 .collect()
         };
         let (drops, renames) = (of(Part::Drop), of(Part::Rename));
@@ -894,6 +911,70 @@ mod tests {
         );
         // On a database that reads them as four names, the pair is valid.
         order_column_renames(&mut cs, &[], "prod").unwrap();
+    }
+
+    /// #1461: a module drop the computed edges placed between two table
+    /// drops, after the table whose computed column calls it and before the
+    /// table it is schema-bound to, keeps that place when a name conflict
+    /// makes the search reorder the renames. Moved after every drop, `DROP
+    /// TABLE dbo.lookup` would run while the schema-bound function stands.
+    #[test]
+    fn a_module_drop_among_the_drops_keeps_its_place_in_the_search() {
+        let drop_table = |table: &str| {
+            PlannedChange::new(Change::DropTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, table, 0),
+                name: name(table),
+                detach_from: None,
+            })
+        };
+        let drop_function = PlannedChange::new(Change::DropModule {
+            id: pbps_model::ModuleId::Named(name("dbo.f")),
+            kind: pbps_model::ModuleKind::Function,
+        });
+        // The conflict of the test above: `s1.a` cannot move to `s1.c` until
+        // `s1.old` carries the default holding that name away.
+        let adopted = held("s1.c", "default constraint", Some("s1.old"), Some("x"));
+        let cs = order(
+            vec![
+                drop_table("dbo.u"),
+                drop_function,
+                drop_table("dbo.lookup"),
+                rename("s1.a", "s1.c", &[]),
+                rename("s1.old", "s2.new", &["x"]),
+            ],
+            &[adopted],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            renames(&cs),
+            [pair("s1.old", "s2.new"), pair("s1.a", "s1.c")],
+            "the search ran"
+        );
+        let drops: Vec<String> = cs
+            .changes
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.change,
+                    Change::DropTable { .. } | Change::DropModule { .. }
+                )
+            })
+            .map(|p| p.change.subject().to_string())
+            .collect();
+        assert_eq!(drops, ["dbo.u", "dbo.f", "dbo.lookup"]);
+
+        // Negative: a module drop before the first rename or drop is class
+        // 0's, and stays where it is, ahead of the region.
+        let ahead = [
+            PlannedChange::new(Change::DropModule {
+                id: pbps_model::ModuleId::Named(name("dbo.g")),
+                kind: pbps_model::ModuleKind::Function,
+            }),
+            drop_table("dbo.u"),
+            rename("s1.a", "s1.c", &[]),
+        ];
+        assert_eq!(Search::new(&ahead).region, [1, 2]);
     }
 
     /// A drop on a renamed table names the table as it is called where the

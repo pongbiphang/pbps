@@ -248,6 +248,7 @@ name the old name. It runs before every change that names the new one.
 | `RenameTable` → `RenameColumn` and every later change naming the table | fixed | class 1 before 3 and the rest; `RenameColumn` carries the new table name | ✓ |
 | `RenameTable` → class-2 drops naming the table | fixed | class 1 before 2; the drops use the new name | ✓ |
 | Module drops (class 0) → renames | fixed | class 0 first; the drops use the old names | ✓ |
+| S: a module drop the computed edges moved among the drops ↔ table renames | engine-sourced | on a connected plan whose renames `object_order` searches, the drop keeps its place among the drops and a table rename may move around it: a module's drop names the module, never a renamed table, and the walk still frees its name before a rename into it | ✓ DEC-1461.1 |
 | `RenameColumn` → later changes naming the column (classes 4 to 17) | fixed | class 3 before them | ✓ |
 | Constraint and index drops naming a column → its rename | fixed | class 2 before 3; the drops use the old name | ✓ DECISIONS 474 |
 | `RenameRole` → `Revoke` and `Grant` naming the role | fixed | class 1 before 4 and 16. P: performed by hand, and grants follow the role's oid | ✓ ADR-0010 §3 |
@@ -315,6 +316,7 @@ one class and the dependents a class cannot see.
 | Generated column → its input's drop | fixed | (5, 0); (2, 2) beside a rename | ✓ DEC-1168.1 |
 | S: index, unique or check over a computed column → its drop, and its re-add around an expression change | fixed | dropped in class 2 before (2, 4), re-added in 13 (`recreate_retyped_dependents`) | ✓ DEC-1174.1 |
 | S: computed column dropped, alone or with its table → drop of a function it calls | catalog (`sys.sql_expression_dependencies`), connected | the function's drop moves after the column's or the table's drop, and what it is schema-bound to after it (3729 otherwise) | ✓ DEC-1431.1 |
+| S: that function drop → the drop of a table it is schema-bound to, when the rename search reorders the plan | catalog, connected | `object_order` counts the function drop among its drops, which keep their order | ✓ DEC-1461.1 |
 | S: standing or re-added computed column → rename, drop, retype or nullability change of a column it reads; alter or drop of a function it calls | fixed, over-approximated | refused by name (`may_name`), with a two-plan remedy; a computed column the plan drops or changes is out of the way at (2, 4) | ✓ DEC-1174.1 |
 | S: key, index, check or foreign key over a column → its retype or recollation | fixed | dropped in class 2, re-added in 13 (`retype_dependents`) | ✓ #1175, DECISIONS 515 |
 | S: index key, `INCLUDE` column, filtered predicate or unique constraint over a column → tightening its nullability; filtered predicate → relaxing it | fixed | dropped in class 2, re-added in 13 (`nullability_dependents`), alone or inside a retype | ✓ DEC-1363.1 |

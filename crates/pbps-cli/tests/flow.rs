@@ -3310,6 +3310,116 @@ fn computed_function_drops_follow_the_catalogs_edges() {
     ]));
 }
 
+/// #1461: the drops the computed edges order keep that order when a name only
+/// the catalog holds makes the search reorder the renames (DEC-1366.1). A
+/// default adopted as `s1.c` on `s1.old` holds the name `s1.a` is renamed to,
+/// until `s1.old` moves to `s2`; in the same plan `dbo.u`, whose computed
+/// column calls the schema-bound `dbo.g` over `dbo.lookup`, is dropped with
+/// both. `dbo.g` still drops between the two tables, and the plan applies.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn computed_function_drops_keep_their_place_when_the_renames_are_searched() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "edges1461");
+    for sql in [
+        "CREATE SCHEMA s1;",
+        "CREATE SCHEMA s2;",
+        "CREATE TABLE s1.old (id int NOT NULL CONSTRAINT pk_old PRIMARY KEY,
+             x int NULL CONSTRAINT DF_pbps_old_x DEFAULT 0);",
+        "CREATE TABLE s1.a (id int NOT NULL CONSTRAINT pk_a PRIMARY KEY);",
+        "CREATE TABLE dbo.lookup (id int NOT NULL CONSTRAINT pk_lookup PRIMARY KEY);",
+        "CREATE FUNCTION dbo.g (@x int) RETURNS int WITH SCHEMABINDING AS \
+         BEGIN RETURN @x + (SELECT COUNT(*) FROM dbo.lookup) END;",
+        "CREATE TABLE dbo.u (id int NOT NULL CONSTRAINT pk_u PRIMARY KEY, a int NULL,
+             c1 AS (dbo.g(a)));",
+    ] {
+        on_server(
+            own.connection(),
+            &format!("EXEC(N'{}');", sql.replace('\'', "''")),
+        );
+    }
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("edges1461");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    // In the catalog only: the default adopted under a hand-chosen name.
+    on_server(
+        own.connection(),
+        "EXEC sp_rename N's1.DF_pbps_old_x', N'c', N'OBJECT';",
+    );
+    let schema = d.dir.join("schema");
+    // One table per revision, as a drop's intent names a table already gone
+    // from the declarations; the connected plan spans them all.
+    std::fs::remove_file(schema.join("dbo.u.yml")).unwrap();
+    ok(&d.run(&["drop-table", "dbo.u", "--reason", "gone"]));
+    ok(&d.run(&["plan"]));
+    d.commit();
+    std::fs::remove_file(schema.join("dbo.lookup.yml")).unwrap();
+    let g = walk(&schema)
+        .into_iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("SCHEMABINDING")))
+        .expect("dbo.g's declaration");
+    std::fs::remove_file(g).unwrap();
+    ok(&d.run(&["drop-table", "dbo.lookup", "--reason", "gone"]));
+    ok(&d.run(&["plan"]));
+    d.commit();
+    for (from, to) in [("s1.old", "s2.new"), ("s1.a", "s1.c")] {
+        let path = schema.join(format!("{from}.yml"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let header = format!("table: {from}\n");
+        assert!(text.starts_with(&header), "{text}");
+        std::fs::write(
+            schema.join(format!("{to}.yml")),
+            text.replacen(&header, &format!("table: {to}\nrenamed_from: {from}\n"), 1),
+        )
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+    ok(&d.run(&["plan"]));
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    // The search ran: the move that carries the default away goes first.
+    assert!(at("[s1].[old]") < at("N'c'"), "{script}");
+    assert!(
+        at("DROP TABLE [dbo].[u]") < at("DROP FUNCTION [dbo].[g]"),
+        "{script}"
+    );
+    assert!(
+        at("DROP FUNCTION [dbo].[g]") < at("DROP TABLE [dbo].[lookup]"),
+        "{script}"
+    );
+    ok(&d.run(&[
+        "apply",
+        "--db",
+        own.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "rename,destructive",
+    ]));
+    ok(&d.run(&["verify", "--db", own.connection()]));
+}
+
 /// The connected pass reads "no edge" as none only where no referrer can be
 /// hidden (#1462). A login denied `VIEW DEFINITION` on schema `hidden` does
 /// not see `hidden.t`, whose computed column calls `dbo.f`, so its plan to
