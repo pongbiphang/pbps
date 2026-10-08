@@ -1564,6 +1564,14 @@ scratch compile (#1616).
     the declarations.
   - No privilege rule is needed, so any SQL may be written: an extension, a
     cast, an operator, a `DO` block.
+  - **So a baseline holds only objects that depend on nothing managed.** An
+    object that does, such as a legacy view over a managed table, cannot be
+    created that early, and scratch needs it only when a managed object
+    binds to it, which is a chain (below). A statement that fails is
+    reported with the engine's error and the statement. When the object it
+    names is managed, the remedy is to leave it out of the baseline. The
+    planned draft command and fill never write one: they read the target's
+    `pg_depend`.
 - **Everything it leaves behind must be accounted for.**
   - Each object it creates is compared with the target before any binding
     question is answered. A mismatch, an object the target does not have,

@@ -715,7 +715,9 @@ carries the normative text, and DEC-1528.1 the reasons.
   - Objects outside the managed set come from a reviewed baseline in the
     repository, run on scratch only. It runs whole and first (#1664), as the
     setup role in its own session, before pbps stages any managed object.
-    So it can change nothing pbps staged, and needs no privilege rule.
+    So it can change nothing pbps staged, and needs no privilege rule. It
+    therefore holds only objects that depend on nothing managed; a statement
+    naming a managed object fails with the remedy to leave it out.
   - Every object it creates is compared with the target, and sealed into
     the manifest. A mismatch, a missing object, an uncompared object or a
     baseline object in the managed set refuses. The comparison covers what

@@ -1637,6 +1637,12 @@ their full definitions sends routine source no reviewer approved.
     and each grant opened a path back into managed state.
   - Run first, the baseline meets no managed object, so no privilege rule
     is needed, and any SQL may be written.
+  - The same order is its contract: a baseline holds only objects that
+    depend on nothing managed. An external object over a managed one, such
+    as a legacy view over an adopted table, is left out. Scratch needs it
+    only when a managed object binds to it, which is the chain below, and
+    the draft command and fill omit it from `pg_depend`. A statement that
+    fails names itself and the remedy (#1652 review).
 - **The cost is a chain through the boundary.** A managed object binds to an
   external one that binds to a managed one. Such a chain refuses, naming it,
   with two remedies: adopt the middle object, or select no resolver.
