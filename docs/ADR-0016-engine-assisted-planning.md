@@ -719,10 +719,14 @@ carries the normative text, and DEC-1528.1 the reasons.
     therefore be staged as a shape view of its output columns (typed NULLs,
     no row), never as a table, whose system columns change name resolution.
     The recheck still compares the target's complete fingerprints.
-  - The baseline runs in its own session. Afterwards, every managed object
-    already staged must be unchanged, and every object it created must be
-    compared; otherwise it refuses. A mismatch, a missing object, or a
-    baseline object in the managed set refuses too.
+  - The baseline is confined by privilege. It runs in its own session, as
+    a run-owned non-superuser role that owns nothing managed and holds no
+    privilege on it beyond schema `USAGE`, so the engine refuses any change
+    to managed objects or their rows. pbps runs its `CREATE EXTENSION`
+    statements first, as the setup role. As a backstop, every managed
+    object already staged must be unchanged afterwards, and every object
+    the baseline created must be compared. A mismatch, a missing object, or
+    a baseline object in the managed set refuses.
   - pbps sends no routine source of its own. A question needing routine
     source the baseline lacks refuses with the finding and two remedies.
   - The private-source requirements apply only to the measured profiles'
@@ -747,7 +751,9 @@ carries the normative text, and DEC-1528.1 the reasons.
   - `vouched_compiles_a_managed_view_over_a_baseline_table`
   - `vouched_refuses_a_baseline_that_differs_from_the_target`
   - `vouched_refuses_a_baseline_that_creates_a_managed_object`
-  - `vouched_refuses_a_baseline_that_alters_a_managed_object_or_leaves_one_uncompared`
+  - `vouched_baseline_cannot_change_a_managed_object_or_its_rows` (`ALTER`,
+    `DROP`, DML, `TRUNCATE` and a trigger are each refused by the engine)
+  - `vouched_refuses_a_baseline_object_left_uncompared`
   - `vouched_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view`
   - `vouched_refuses_an_external_view_staged_as_a_table` (the computed-field
     `xmin(ext.v)` case binds differently on a table)

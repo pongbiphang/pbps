@@ -1638,11 +1638,20 @@ their full definitions sends routine source no reviewer approved.
   one per review, as the first drafts of this entry did, with routine
   defaults and then column collations. Reusing the manifest's list makes
   the comparison and the recheck one definition.
-- The baseline is arbitrary SQL, so its effects are bounded, not trusted.
-  It runs in its own session, so its `SET`s never reach the compile. Every
-  managed object staged before it must be unchanged after it. Every object
-  it creates must be compared. Otherwise a baseline could alter the managed
-  namespace, and the evidence would describe declarations nobody wrote. The compared shapes are sealed into the manifest.
+- The baseline is arbitrary SQL, so it is confined by privilege rather than
+  checked case by case. It runs in its own session, as a run-owned
+  non-superuser role that owns nothing managed and holds no privilege on it
+  beyond schema `USAGE`. pbps runs the baseline's `CREATE EXTENSION`
+  statements itself, as the setup role, first.
+  - Review found the cases one at a time: a `SET`, then an `ALTER` or
+    `DROP` of a staged managed table, then rows written into one, which
+    could fail a later CHECK or index build and refuse a valid plan.
+  - Each check would have had a neighbour. Without ownership or table
+    privileges, the engine refuses all of them. Without superuser, it also
+    refuses event triggers.
+  - Re-reading the staged managed objects and refusing an uncompared
+    object remain as a backstop.
+  - Otherwise the evidence could describe declarations nobody wrote. The compared shapes are sealed into the manifest.
   So a wrong or stale baseline refuses instead of answering for a database
   that does not exist.
 - A baseline object in the managed set refuses: the declarations stay the

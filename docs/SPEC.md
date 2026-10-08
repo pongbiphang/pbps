@@ -1589,14 +1589,22 @@ scratch compile (#1616).
   like any other external input.
 - **A baseline object in the managed set refuses.** The declarations stay the
   one source of truth.
-- **The baseline changes nothing but the external objects it creates.**
-  - It runs in its own scratch session, so a `SET` in it, `search_path`
-    included, never reaches the session that compiles the declarations.
-  - After it runs, every managed object already staged is re-read and must
-    still be exactly what pbps staged. One altered, dropped or re-owned
-    refuses, and the finding names the object.
-  - An object it creates that is neither managed nor compared with the
-    target refuses too, so it cannot leave unchecked state behind.
+- **The baseline cannot change what pbps staged: it is confined by
+  privilege, not checked case by case.**
+  - It runs in its own scratch session, as a run-owned role that is not a
+    superuser. That role owns no managed object and holds no privilege on
+    one, beyond `USAGE` on the schemas it must reference. It holds `CREATE`
+    only where an external object it creates lives.
+  - So the engine itself refuses every way to touch managed state: `ALTER`,
+    `DROP`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, triggers, rules,
+    policies, grants, and event triggers. Its `SET`s, `search_path`
+    included, never reach the session that compiles the declarations.
+  - Its `CREATE EXTENSION` statements, which may need more, are run by pbps
+    itself, as the setup role, before any managed object is staged.
+  - Two checks remain as a backstop. Every managed object already staged is
+    re-read afterwards and must be exactly what pbps staged. An object the
+    baseline creates that is neither managed nor compared with the target
+    refuses.
 - **pbps itself never sends routine source to scratch.** A routine is there
   only if the operator put it in the baseline. A binding question that needs
   routine source the baseline lacks refuses with a finding naming the
