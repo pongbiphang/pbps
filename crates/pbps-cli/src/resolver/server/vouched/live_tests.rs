@@ -279,6 +279,9 @@ async fn vouched_runs_in_a_precreated_database_with_a_confined_account() {
             .await
             .unwrap();
         fixture.roles.insert(0, creator);
+        // Owning another database is outside `DROP OWNED`'s reach: no
+        // refusal for it.
+        fixture.database("o", Some(&login.0)).await;
         let inputs = Inputs::overload();
         let key = ProjectKey::new(true);
         let result = produce(
@@ -415,6 +418,20 @@ async fn vouched_refuses_a_scratch_that_is_not_empty() {
             )
             .await,
         );
+        // A large object's OID is the creator's to choose, so no cutoff
+        // tells it from initdb's, which made none.
+        let lob = fixture.database("l", Some(&login.0)).await;
+        fixture.run(&lob, &["SELECT pg_catalog.lo_create(1)"]).await;
+        let large_object = vouched_refusal(
+            produce(
+                &fixture.as_login(&lob, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+            )
+            .await,
+        );
+        let lob_left = fixture.foreign_objects(&lob).await;
         // A database holding a subscription cannot be dropped.
         fixture
             .run(&subscribed, &["DROP SUBSCRIPTION leftover_sub"])
@@ -444,6 +461,14 @@ async fn vouched_refuses_a_scratch_that_is_not_empty() {
         assert!(
             subscription.contains("not empty") && subscription.contains("leftover_sub"),
             "{server}: {subscription}"
+        );
+        assert!(
+            large_object.contains("not empty") && large_object.contains("large object 1"),
+            "{server}: {large_object}"
+        );
+        assert!(
+            lob_left.0.iter().any(|object| object == "large object 1"),
+            "{server}: the large object is kept: {lob_left:?}"
         );
     }
 }
@@ -757,8 +782,9 @@ async fn vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_memberships
             .await
             .execute(&format!(
                 "CREATE ROLE {app} NOLOGIN; CREATE ROLE {user} NOLOGIN; \
-                 GRANT {app} TO {login} WITH ADMIN OPTION; \
-                 SET ROLE {login}; GRANT {app} TO {user}; RESET ROLE",
+                 GRANT {app} TO {login} WITH ADMIN OPTION, INHERIT FALSE; \
+                 SET ROLE {login}; GRANT {app} TO {user}; \
+                 GRANT {app} TO {login} WITH INHERIT TRUE GRANTED BY {login}; RESET ROLE",
                 login = login.0
             ))
             .await
@@ -772,7 +798,10 @@ async fn vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_memberships
                 .query(&format!(
                     "SELECT count(*)::text AS n FROM pg_catalog.pg_auth_members a \
                      JOIN pg_catalog.pg_roles m ON m.oid = a.member \
-                     WHERE m.rolname = '{user}'"
+                     JOIN pg_catalog.pg_roles g ON g.oid = a.grantor \
+                     WHERE m.rolname = '{user}' \
+                        OR (m.rolname = '{login}' AND g.rolname = '{login}')",
+                    login = login.0
                 ))
                 .await
                 .unwrap();
@@ -793,14 +822,17 @@ async fn vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_memberships
         let after = granted().await;
         let left = fixture.foreign_objects(&scratch_db).await;
         fixture.drop().await;
+        // The membership it granted another role, and the one it granted
+        // itself: `DROP OWNED` removes both by grantor.
         assert!(
-            reason.contains(&format!("membership of {user} in {app}")),
+            reason.contains(&format!("membership of {user} in {app}"))
+                && reason.contains(&format!("membership of {} in {app}", login.0)),
             "{server}: {reason}"
         );
         assert_eq!(
             (before.as_str(), after.as_str()),
-            ("1", "1"),
-            "{server}: the membership is kept"
+            ("2", "2"),
+            "{server}: both memberships are kept"
         );
         assert_eq!(left.1, 0, "{server}: nothing was written: {left:?}");
     }

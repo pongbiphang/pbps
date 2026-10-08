@@ -46,8 +46,15 @@ const CATALOGS: &[&str] = &[
     "pg_publication",
     "pg_statistic_ext",
     "pg_transform",
-    "pg_largeobject_metadata",
 ];
+
+/// Catalogs whose OIDs a user may choose (`lo_create(1)`), so no cutoff
+/// tells initdb's rows from later ones. initdb creates none, so every row is
+/// foreign (#1678 review). Each with the class `pg_describe_object` names
+/// its rows by: a large object's is `pg_largeobject`, and the metadata
+/// catalog's own OID is refused as "unsupported object class" (measured on
+/// 16 and 18).
+const EVERY_ROW: &[(&str, &str)] = &[("pg_largeobject_metadata", "pg_largeobject")];
 
 /// Shared catalogs whose rows belong to one database, keyed by that
 /// database's OID: a subscription lives in the database it was created in.
@@ -350,6 +357,12 @@ pub async fn foreign_objects(
                    FROM pg_catalog.{catalog} o WHERE o.oid >= {FIRST_NORMAL_OBJECT_ID}"
             )
         })
+        .chain(EVERY_ROW.iter().map(|(catalog, class)| {
+            format!(
+                "SELECT 'pg_catalog.{class}'::pg_catalog.regclass AS classid, o.oid AS objid \
+                   FROM pg_catalog.{catalog} o"
+            )
+        }))
         .chain(DATABASE_KEYED.iter().map(|(catalog, database)| {
             format!(
                 "SELECT 'pg_catalog.{catalog}'::pg_catalog.regclass AS classid, o.oid AS objid \
@@ -380,45 +393,53 @@ pub async fn foreign_objects(
     Ok((named, total))
 }
 
-/// Every privilege granted directly to the scratch login on a shared object
-/// other than its own database: another database, a tablespace, a
-/// configuration parameter. `DROP OWNED`, which empties the supplied
-/// database, revokes such a grant wherever the login has the authority to,
-/// as a member of the granting role can (measured on 18), and that is a
-/// write outside the run's own database. A role membership the login
-/// granted, through its `ADMIN OPTION`, is revoked as well: measured on 16
-/// and 18, `DROP OWNED` removes the `pg_auth_members` row whose grantor is
-/// the login, so another role loses a membership (#1678 review). The
-/// supplied layout refuses while any of these exists.
+/// Everything outside the run's own database that `DROP OWNED BY
+/// SESSION_USER` would reach, read where `DROP OWNED` itself reads it: the
+/// shared dependencies on the login, in this database and in the shared
+/// catalogs. Each is named; the supplied layout refuses while any exists,
+/// since the cleanup would drop or revoke it (#1678 review).
 ///
-/// What `DROP OWNED` leaves alone needs no check, as measured: a grant the
-/// login made on another database's ACL, and a membership granted to the
-/// login itself.
-pub async fn shared_grants(conn: &mut impl QueryConnection) -> Result<Vec<String>, DbError> {
+/// One entry is the run's own and expected: the login's ownership of, or a
+/// privilege on, the database it compiles in, which `DROP OWNED` keeps.
+/// Ownership of a shared object is left out too: `DROP OWNED` drops no
+/// database, tablespace or subscription, so a login that owns another
+/// scratch database is not refused for it. Only the privileges and
+/// memberships among the shared rows are revoked.
+/// Measured on 16 and 18, this one read covers every case found one by one
+/// before it: a grant to the login on another database, tablespace or
+/// parameter; a role membership the login granted, to another role or to
+/// itself; an object it owns here, a large object with a chosen low OID
+/// included. Objects the login owns in other databases are out of `DROP
+/// OWNED`'s reach from here and are not listed.
+pub async fn cleanup_reach(conn: &mut impl QueryConnection) -> Result<Vec<String>, DbError> {
     let rows = conn
         .query(
-            "WITH login AS (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = session_user) \
-             SELECT 'database ' || d.datname AS object \
-               FROM pg_catalog.pg_database d, pg_catalog.aclexplode(d.datacl) a, login \
-              WHERE a.grantee = login.oid AND d.datname <> pg_catalog.current_database() \
-             UNION \
-             SELECT 'tablespace ' || t.spcname \
-               FROM pg_catalog.pg_tablespace t, pg_catalog.aclexplode(t.spcacl) a, login \
-              WHERE a.grantee = login.oid \
-             UNION \
-             SELECT 'parameter ' || p.parname \
-               FROM pg_catalog.pg_parameter_acl p, pg_catalog.aclexplode(p.paracl) a, login \
-              WHERE a.grantee = login.oid \
-             UNION \
-             SELECT 'membership of ' || m.rolname || ' in ' || r.rolname || ' it granted' \
-               FROM pg_catalog.pg_auth_members a \
-               JOIN pg_catalog.pg_roles r ON r.oid = a.roleid \
-               JOIN pg_catalog.pg_roles m ON m.oid = a.member, login \
-              WHERE a.grantor = login.oid AND a.member <> login.oid \
+            "WITH login AS (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = session_user), \
+                  here AS (SELECT d.oid FROM pg_catalog.pg_database d \
+                            WHERE d.datname = pg_catalog.current_database()) \
+             SELECT CASE WHEN s.classid = 'pg_catalog.pg_auth_members'::pg_catalog.regclass \
+                         THEN (SELECT 'membership of ' || m.rolname || ' in ' || r.rolname \
+                                 FROM pg_catalog.pg_auth_members a \
+                                 JOIN pg_catalog.pg_roles r ON r.oid = a.roleid \
+                                 JOIN pg_catalog.pg_roles m ON m.oid = a.member \
+                                WHERE a.oid = s.objid) \
+                         ELSE pg_catalog.pg_describe_object(s.classid, s.objid, s.objsubid) \
+                    END AS object \
+               FROM pg_catalog.pg_shdepend s, login, here \
+              WHERE s.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass \
+                AND s.refobjid = login.oid \
+                AND (s.dbid = here.oid OR (s.dbid = 0 AND s.deptype <> 'o')) \
+                AND NOT (s.classid = 'pg_catalog.pg_database'::pg_catalog.regclass \
+                         AND s.objid = here.oid) \
              ORDER BY 1",
         )
         .await?;
-    rows.iter().map(|row| text(row, "object")).collect()
+    rows.iter()
+        .map(|row| {
+            // A row the describe cannot name is still a row: never absent.
+            Ok(text(row, "object").unwrap_or_else(|_| "an unnamed dependency".to_owned()))
+        })
+        .collect()
 }
 
 /// Creates each in-scope schema the supplied database lacks, owned by the

@@ -1806,8 +1806,9 @@ by the engines, and the scratch account decides the layout.** Implemented by
     backend timings (#1678 review).
   - It must own that database.
   - The database must hold nothing initdb did not create: no object at or
-    above `FirstNormalObjectId`, a subscription created in it included
-    (#1678 review).
+    above `FirstNormalObjectId`, a subscription created in it included,
+    and no large object at all. A large object's OID is its creator's to
+    choose, so no cutoff applies, and initdb makes none (#1678 review).
   - **Every write goes through the connection the checks were made on**,
     the cleanup included. A second connection from the same string need not
     reach the same server: a name may resolve to several hosts, or to a
@@ -1821,17 +1822,22 @@ by the engines, and the scratch account decides the layout.** Implemented by
     refuses through the compatibility comparison.
   - `DROP OWNED BY SESSION_USER` empties the database afterwards, whether
     the run answered or refused.
-  - **The login holds no direct grant on another shared object**: another
-    database, a tablespace, a configuration parameter. `DROP OWNED` also
-    revokes such a grant wherever the login has the authority to. A member
-    of the role that granted it does (measured on 18), and that is a write
-    outside the run's database. The run refuses while any exists, naming
-    them (#1678 review).
-  - **Nor has the login granted a role membership**, through an
-    `ADMIN OPTION`. `DROP OWNED` removes the membership row whose grantor
-    is the login, so another role would lose it (measured on 16 and 18).
-    A grant the login made on another database's ACL, and a membership
-    granted to the login, are untouched and need no check.
+  - **Nothing outside the database is within the cleanup's reach.**
+    `DROP OWNED` acts on the shared dependencies recorded on the login, so
+    the run reads those (`pg_shdepend`) before any write and refuses,
+    naming them, while any remains other than the run's own. These count:
+    every entry in this database, and every shared entry other than
+    ownership. A privilege or membership is revoked; a database, tablespace
+    or subscription the login owns is not dropped. The login's own entry on
+    the database it compiles in is the run's own.
+    - Measured on 16 and 18, this one read covers each case review found
+      one at a time before it: a grant to the login on another database,
+      tablespace or parameter; a role membership the login granted, to
+      another role or to itself; an object it owns here, a large object
+      with a chosen low OID included (#1678 review).
+    - Left out, as measured: ownership of another database, which
+      `DROP OWNED` keeps, a grant the login made on another database's ACL,
+      and a membership granted to the login.
 - **Why ownership is required.** `DROP OWNED` also revokes what was granted
   to the login on the database, and only an owner keeps its rights through
   that.

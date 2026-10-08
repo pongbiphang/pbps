@@ -633,16 +633,16 @@ impl Run<'_> {
             )));
         }
         refuse_foreign_objects(admin).await?;
-        let grants = sql::shared_grants(admin)
+        let reach = sql::cleanup_reach(admin)
             .await
-            .map_err(db("the scratch account's grants elsewhere"))?;
-        if !grants.is_empty() {
+            .map_err(db("what the scratch account's cleanup would reach"))?;
+        if !reach.is_empty() {
             return Err(Error::Vouched(format!(
-                "the scratch account {} holds or granted privileges outside its database ({}), \
-                 which emptying the database with DROP OWNED could revoke; use an account \
-                 with none",
+                "the scratch account {} has objects or privileges that emptying its database \
+                 with DROP OWNED would also drop or revoke ({}); use an account with none \
+                 outside that database",
                 principal.login,
-                grants.join(", ")
+                reach.join(", ")
             )));
         }
         let database = current_database(admin).await?;
