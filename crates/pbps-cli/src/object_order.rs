@@ -1134,6 +1134,38 @@ mod tests {
         ];
         let mut cs = ChangeSet { changes: plan() };
         order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &bound).unwrap_err();
+
+        // The same with the function bound to a computed column dropped
+        // before `z` (#1680 review): that drop waits for the function, so
+        // the function cannot pass it, and the plan is refused.
+        let computed = PlannedChange::new(Change::DropComputedColumn {
+            table: name("dbo.b"),
+            name: "c".into(),
+            computed: pbps_model::ComputedColumn {
+                expression: "a * 2".into(),
+                persisted: false,
+                not_null: false,
+            },
+        });
+        let mut changes = plan();
+        changes.insert(2, computed.clone());
+        let bound = [
+            (drop_table("dbo.u").change, function.change.clone()),
+            (function.change.clone(), computed.change.clone()),
+        ];
+        let mut cs = ChangeSet {
+            changes: changes.clone(),
+        };
+        order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &bound).unwrap_err();
+        // Without that pair the function would move past the computed drop.
+        let mut cs = ChangeSet { changes };
+        order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &precedence).unwrap();
+        let at = |c: &Change| cs.changes.iter().position(|p| p.change == *c).unwrap();
+        assert!(
+            at(&computed.change) < at(&function.change),
+            "{:?}",
+            cs.changes
+        );
     }
 
     /// A drop on a renamed table names the table as it is called where the

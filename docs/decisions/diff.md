@@ -3706,6 +3706,15 @@ table drops ruled out that order, and the plan was refused at `plan --db`.
   shared through one function: a function's drop waits for each removal of a
   computed column that calls it; a module's or table's drop waits for each
   drop of something schema-bound to it.
+- Two waits are added to that rule, because a module drop can now move later.
+  A computed column's drop waits for the drop of each module schema-bound to
+  it: SQL Server refuses it while such a module stands. The class order runs
+  a module drop (class 0) first, but DEC-1431.1's pass, and now the search,
+  can move it later. A column's drop waits for the drop
+  of each computed column of its table that reads it, which a computed drop
+  moved after such a module could otherwise pass, out of the class order
+  (2 before 5) that kept it first. `release` moves them as it moves the
+  others.
 - `order_computed_by_edges` returns the pairs. The plan pipeline passes them
   to the rename search. Nothing reorders the plan between the two passes.
 - In the search, a module drop in the region that a pair names moves like a
@@ -3729,3 +3738,9 @@ Pinned by:
   with its pairs.
 - `what_a_released_function_is_bound_to_follows_it`
   (`crates/pbps-cli/src/computed_order.rs`), on the pairs themselves.
+- `a_computed_drop_follows_the_module_bound_to_it_and_its_inputs_follow_it`
+  (the same file). It orders a table's drop, then the function it releases,
+  then a computed column the function is bound to, then the column that
+  computed column reads, and checks their pairs. Its negative: unbound, both
+  drops keep their place. The search test above also refuses to move the
+  function past a computed drop bound to it.
