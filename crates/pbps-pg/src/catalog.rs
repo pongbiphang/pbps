@@ -2633,8 +2633,14 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
 
 /// Stores one declared text as `column`'s default, under `under`'s path, in a
 /// savepoint of its own.
+///
+/// The path is the emitter's own, `pg_temp` last included: left out, the
+/// engine searches the temporary schema first, and an unqualified name would
+/// reach this probe's table where the apply reaches the schema's (#1659). A
+/// connected plan's dialect carries no write-path extras.
 async fn store_one(conn: &mut Conn, column: &str, under: &str, text: &str) -> Result<(), String> {
-    let path = crate::quote(under).map_err(|e| e.to_string())?;
+    let path =
+        crate::emit::write_path(&crate::Postgres::new(), under).map_err(|e| e.to_string())?;
     let fail = |e: DbError| e.to_string();
     conn.execute("SAVEPOINT pbps_1609").await.map_err(fail)?;
     let result = async {
