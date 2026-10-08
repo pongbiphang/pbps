@@ -1817,7 +1817,11 @@ by the engines, and the scratch account decides the layout.** Implemented by
     the role.
   - The deployer's role and database defaults become session settings. The
     path, the preload lists and any setting the login may not set are left
-    for the comparison to report.
+    for the comparison to report. So is a setting the session took from its
+    startup packet: the target's session, through the same driver, gets the
+    same override. The driver always sends `client_encoding=UTF8`, so a
+    stored `LATIN1` never takes effect on the target either (measured on 16
+    and 18; #1678 review).
   - No role is reproduced. A deployer that differs in schema visibility
     refuses through the compatibility comparison.
   - `DROP OWNED BY SESSION_USER` empties the database afterwards, whether

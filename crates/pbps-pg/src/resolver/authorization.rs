@@ -514,6 +514,27 @@ pub async fn apply_session_settings(
             if name == "search_path" || LOADED_AT_START.contains(&name) {
                 continue;
             }
+            // A setting this session took from its startup packet overrides
+            // the stored default on the target's session as well, since both
+            // connect through the same driver: the driver always sends
+            // `client_encoding=UTF8`, so a stored `LATIN1` never takes
+            // effect there (measured on 16 and 18). Replaying the stored
+            // value would make scratch differ from the target (#1678
+            // review).
+            let source = conn
+                .query(&format!(
+                    "SELECT s.source FROM pg_catalog.pg_settings s \
+                      WHERE pg_catalog.lower(s.name) = pg_catalog.lower({})",
+                    literal(name)
+                ))
+                .await?;
+            if source
+                .first()
+                .and_then(|row| row.try_get::<&str>("source").ok().flatten())
+                == Some("client")
+            {
+                continue;
+            }
             let statement = format!(
                 "SELECT pg_catalog.set_config({}, {}, false)",
                 literal(name),

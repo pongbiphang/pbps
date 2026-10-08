@@ -668,6 +668,17 @@ async fn vouched_compiles_as_the_login_whatever_its_session_defaults() {
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
         let target_db = fixture.target().await;
+        // A stored default the driver's startup packet overrides on the
+        // target's session: replaying it on scratch would make the two
+        // differ (#1678 review).
+        fixture
+            .admin()
+            .await
+            .execute(&format!(
+                "ALTER DATABASE {target_db} SET client_encoding = 'LATIN1'"
+            ))
+            .await
+            .unwrap();
         let (login, scratch_db) = fixture.confined().await;
         let worker = format!("pbps_v1672_r_{}", fixture.token);
         fixture
