@@ -1598,9 +1598,14 @@ scratch compile (#1616).
 - **The baseline cannot change what pbps staged: it is confined by
   privilege, not checked case by case.**
   - It runs in its own scratch session, as a run-owned role that is not a
-    superuser. That role owns no managed object and holds no privilege on
-    one, beyond `USAGE` on the schemas it must reference. It holds `CREATE`
-    only where an external object it creates lives.
+    superuser. That role owns no managed object. On managed objects it holds
+    exactly the privileges that let a definition *name* one, never use or
+    change it: `USAGE` on their schemas and types, and `REFERENCES` on their
+    tables. It holds `CREATE` only where an external object it creates
+    lives.
+  - `EXECUTE` on managed routines is not granted. Measured on 16 and 18: a
+    view or a `BEGIN ATOMIC` body calling one creates without it, and with it
+    the baseline could run a `SECURITY DEFINER` routine that writes rows.
   - So the engine itself refuses every way to touch managed state: `ALTER`,
     `DROP`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, triggers, rules,
     policies, grants, and event triggers. Its `SET`s, `search_path`
@@ -1610,9 +1615,8 @@ scratch compile (#1616).
     - `CREATE EXTENSION`, and `CREATE CAST` or `CREATE TRANSFORM` over a
       type the baseline does not own, run as the setup role, after the
       objects they name;
-    - `REFERENCES` is granted on a managed table that a baseline foreign
-      key names, and its internal triggers belong to that compared
-      constraint.
+    - a baseline foreign key's internal triggers on a managed table belong
+      to that compared constraint.
   - Each such statement creates one object, compared like any other. Any
     other statement refused for lack of privilege refuses the run, and the
     finding names the statement.

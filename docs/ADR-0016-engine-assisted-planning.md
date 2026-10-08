@@ -720,13 +720,13 @@ carries the normative text, and DEC-1528.1 the reasons.
     no row), never as a table, whose system columns change name resolution.
     The recheck still compares the target's complete fingerprints.
   - The baseline is confined by privilege. It runs in its own session, as
-    a run-owned non-superuser role that owns nothing managed and holds no
-    privilege on it beyond schema `USAGE`, so the engine refuses any change
-    to managed objects or their rows. An external object that needs more
-    gets exactly that from a fixed list (#1658): extensions, and casts or
-    transforms over a type the baseline does not own, run as the setup
-    role; `REFERENCES` is granted for a baseline foreign key to a managed
-    table. Anything else refused for privilege refuses the run. As a backstop, afterwards every
+    a run-owned non-superuser role that owns nothing managed. On managed
+    objects it holds only the privileges that name one (schema and type
+    `USAGE`, table `REFERENCES`), not `EXECUTE`. So the engine refuses any
+    change to managed objects or their rows. A fixed list (#1658) covers
+    what needs more: extensions, and casts or transforms over a type the
+    baseline does not own, run as the setup role. Anything else refused for
+    privilege refuses the run. As a backstop, afterwards every
     managed object already staged must be unchanged, every managed table
     must still be empty, and every object the baseline created must be
     compared. The emptiness check catches indirect writes, such as through
@@ -760,6 +760,9 @@ carries the normative text, and DEC-1528.1 the reasons.
     `DROP`, DML, `TRUNCATE` and a trigger are each refused by the engine;
     a row written through a staged `SECURITY DEFINER` routine refuses)
   - `vouched_refuses_a_baseline_object_left_uncompared`
+  - `vouched_stages_external_objects_naming_managed_ones_with_public_revoked`
+    (a routine over a managed type, a foreign key, a view calling a managed
+    routine)
   - `vouched_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view`
   - `vouched_refuses_an_external_view_staged_as_a_table` (the computed-field
     `xmin(ext.v)` case binds differently on a table)

@@ -1647,13 +1647,19 @@ their full definitions sends routine source no reviewer approved.
   the comparison and the recheck one definition.
 - The baseline is arbitrary SQL, so it is confined by privilege rather than
   checked case by case. It runs in its own session, as a run-owned
-  non-superuser role that owns nothing managed and holds no privilege on it
-  beyond schema `USAGE`. Some external objects legitimately need more:
-  an extension, a cast or transform over a type the baseline does not own,
-  a foreign key to a managed table. For these, pbps grants or runs exactly
-  that, from a fixed list (#1658), and each creates one compared object. A
-  fixed list keeps the confinement a rule rather than a judgment. Anything
-  else refused for privilege refuses the run.
+  non-superuser role that owns nothing managed.
+  - On managed objects it holds exactly the privileges that let a
+    definition name one: `USAGE` on schemas and types, `REFERENCES` on
+    tables. Review found these one per round: a foreign key, then a routine
+    whose signature uses a managed type whose `PUBLIC` usage is revoked.
+    "Name, never use or change" is the rule that ends that sequence.
+  - `EXECUTE` is not among them. Creating a view or `BEGIN ATOMIC` body
+    that calls a managed routine does not need it (measured on 16 and 18),
+    and it would let the baseline run a `SECURITY DEFINER` routine.
+  - Statements that need ownership or superuser run as the setup role from
+    a fixed list (#1658): extensions, and casts or transforms over a type
+    the baseline does not own. Each creates one compared object. Anything
+    else refused for privilege refuses the run.
   - Review found the cases one at a time: a `SET`, then an `ALTER` or
     `DROP` of a staged managed table, then rows written into one, which
     could fail a later CHECK or index build and refuse a valid plan.
