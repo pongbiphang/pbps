@@ -339,8 +339,10 @@ SELECT o.object_id, NULLIF(o.parent_object_id, 0) AS parent_object_id,
 // procedure anywhere would stop every pull. Inside `TRY` the same rows come
 // back with no error sent, the stale referrer's edge included, and as `sa` they
 // match the catalog view's exactly (measured on SQL Server 2017, 2019, 2022
-// and 2025). The `CATCH` rethrows: whatever does transfer control is a read
-// that failed, never one that found nothing.
+// and 2025). The `CATCH` raises the error again: whatever does transfer
+// control is a read that failed, never one that found nothing. With
+// `RAISERROR` rather than `THROW`, which SQL Server 2008 cannot parse, and the
+// pull still reads a server that old.
 const MODULE_DEPENDENCIES: &str = "\
 BEGIN TRY
 SELECT DISTINCT o.object_id AS referencing_id, r.referenced_id
@@ -354,7 +356,8 @@ SELECT DISTINCT o.object_id AS referencing_id, r.referenced_id
  ORDER BY referencing_id, r.referenced_id;
 END TRY
 BEGIN CATCH
-    THROW;
+    DECLARE @error nvarchar(2048) = ERROR_MESSAGE();
+    RAISERROR(N'%s', 16, 1, @error);
 END CATCH;";
 
 // Non-schema-bound FN and TF functions can be created while a referenced
@@ -1829,6 +1832,25 @@ pub async fn misspelt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dependency read that fails is a failed read (#1644): its `CATCH`
+    /// raises the error again, and with `RAISERROR`, since `THROW` does not
+    /// parse on SQL Server 2008, which the pull still reads.
+    #[test]
+    fn the_dependency_read_raises_what_it_catches_on_every_server() {
+        for sql in [
+            MODULE_DEPENDENCIES,
+            crate::impact::DEPENDENCIES_TABLE,
+            crate::impact::DEPENDENCIES_COLUMN,
+        ] {
+            assert!(sql.starts_with("BEGIN TRY\n"), "{sql}");
+            assert!(
+                sql.contains("BEGIN CATCH\n    DECLARE @error nvarchar(2048) = ERROR_MESSAGE();\n    RAISERROR(N'%s', 16, 1, @error);\nEND CATCH;"),
+                "{sql}"
+            );
+            assert!(!sql.contains("THROW"), "{sql}");
+        }
+    }
 
     #[test]
     fn old_servers_are_not_asked_for_a_temporal_catalog_column() {

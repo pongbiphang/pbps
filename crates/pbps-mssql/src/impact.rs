@@ -530,14 +530,14 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
 /// Both run inside `TRY`, as `catalog`'s module dependencies do and for the
 /// same reason: `sys.dm_sql_referenced_entities` raises Msg 207 and 2020 for a
 /// referrer that no longer binds, and inside `TRY` returns its rows instead
-/// (measured on SQL Server 2017 to 2025). The `CATCH` rethrows, so a read that
-/// failed is a failed read.
+/// (measured on SQL Server 2017 to 2025). The `CATCH` raises the error again,
+/// with `RAISERROR` as there, so a read that failed is a failed read.
 ///
 /// The type filter keeps constraints out. A check constraint genuinely depends
 /// on its table, so it turns up here — but whether it is affected depends on
 /// which column its text names, which is what [`EXPRESSIONS`] decides. Letting
 /// both report it would flag every constraint on the table for every rename.
-const DEPENDENCIES_TABLE: &str = "\
+pub(crate) const DEPENDENCIES_TABLE: &str = "\
 BEGIN TRY
 SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_name,
        CONVERT(bit, ISNULL(m.is_schema_bound, 0)) AS schema_bound
@@ -550,7 +550,8 @@ SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_nam
  ORDER BY s.name, o.name;
 END TRY
 BEGIN CATCH
-    THROW;
+    DECLARE @error nvarchar(2048) = ERROR_MESSAGE();
+    RAISERROR(N'%s', 16, 1, @error);
 END CATCH;";
 
 /// The same, narrowed to modules that read *this column*, by each referrer's
@@ -568,7 +569,7 @@ END CATCH;";
 /// schema-bound referrer, and a row of 0 for every referrer, so every module
 /// reading the table matched, and a `SCHEMABINDING` one refused the rename of
 /// a column it never reads (#1644).
-const DEPENDENCIES_COLUMN: &str = "\
+pub(crate) const DEPENDENCIES_COLUMN: &str = "\
 BEGIN TRY
 SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_name,
        CONVERT(bit, ISNULL(m.is_schema_bound, 0)) AS schema_bound
@@ -587,7 +588,8 @@ SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_nam
  ORDER BY s.name, o.name;
 END TRY
 BEGIN CATCH
-    THROW;
+    DECLARE @error nvarchar(2048) = ERROR_MESSAGE();
+    RAISERROR(N'%s', 16, 1, @error);
 END CATCH;";
 
 const COMPUTED_COLUMNS: &str = "\

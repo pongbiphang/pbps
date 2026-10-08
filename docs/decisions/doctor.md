@@ -1000,8 +1000,10 @@ schema the login cannot see is dropped silently, with no row.
 **Decision.**
 - `catalog`'s module dependencies (the pull's omission closure and its
   default- and check-constraint checks) and the rename impact report ask the functions,
-  inside `TRY`, with a `CATCH` that rethrows: a read that fails is never one
-  that found nothing.
+  inside `TRY`, with a `CATCH` that raises the error again: a read that fails
+  is never one that found nothing. It raises with `RAISERROR`, not `THROW`,
+  which SQL Server 2008 cannot parse, and the pull still reads a server that
+  old.
 - A column rename reports a referrer by its own rows: one that reads the column
   by id, reads every column (`is_select_all`), or could not bind all its
   columns (`is_all_columns_found = 0`). The view kept column rows only for a
