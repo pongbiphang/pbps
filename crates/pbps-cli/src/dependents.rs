@@ -1144,7 +1144,9 @@ pub(crate) fn split_new_tables(
 ///
 /// `ONLY` on the parent would leave the partitions alone, but it would also
 /// leave a new partition without the parent's copy, and the parent's own
-/// change is the parent's to spell (#1546).
+/// change is the parent's to spell (#1546). A parent's own default change is
+/// planned on the parent, and its partitions' own defaults set again after it
+/// by the differ, `DROP DEFAULT` included (DEC-1687.1).
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn after_their_parents_defaults(
     cs: &mut ChangeSet,

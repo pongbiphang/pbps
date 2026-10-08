@@ -84,8 +84,10 @@ unlogged partition under a key from a table outside the declarations is
 refused from the catalog (#1595, DEC-1595.1). An ordinary table declared
 in its parent's `partitions:` with its parent's columns is attached with its
 rows, after a pre-flight count of the rows its range does not take (#1545,
-DEC-1545.1). The parent's own changes stay refused by name (#1546, #1547), and
-so does attaching as the DEFAULT partition (#1639).
+DEC-1545.1). A standing parent's columns change, recursed into every partition
+(#1687, DEC-1687.1). Its indexes, keys, checks, foreign keys and rename stay
+refused by name (#1688–#1690), as do moving DEFAULT-partition rows (#1547) and
+attaching as the DEFAULT partition (#1639).
 
 A SQL Server column may name its collation (`collation:`); `pull` declares one
 that differs from the database's default, and a collation change is a planned

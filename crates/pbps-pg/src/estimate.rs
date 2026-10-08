@@ -895,6 +895,8 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
 const SHAPE: &str = "\
 SELECT c.relkind::text AS relkind,
        c.relhassubclass AS inherited,
+       (SELECT pg_catalog.count(*) FROM pg_catalog.pg_inherits h
+         WHERE h.inhparent = c.oid)::int8 AS partitions,
        c.reltuples::int8 AS reltuples,
        EXISTS (SELECT 1 FROM pg_catalog.pg_index i
                 WHERE i.indrelid = c.oid
@@ -970,11 +972,17 @@ pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbE
         -1 => Rows::NeverAnalyzed,
         n => Rows::Estimated(n),
     });
+    // The statement recurses into every partition under the same lock,
+    // measured on 16 and 18 (#1687), which is the part of the cost a reader
+    // of the parent's change would not think to count.
     if row.try_get::<&str>("relkind")?.unwrap_or_default() == "p" {
-        estimate.unknown(
-            "this is a partitioned table, and ADR-0012 records that partitioned tables were not \
-             measured",
-        );
+        let partitions = row.try_get::<i64>("partitions")?.unwrap_or(0);
+        estimate.unknown(&format!(
+            "this is a partitioned table: the statement recurses into its {partitions} \
+             partition(s) and takes {} on each, and ADR-0012 records that partitioned tables \
+             were not measured",
+            estimate.lock
+        ));
         return Ok(());
     }
     if row.try_get::<bool>("inherited")?.unwrap_or(false) {

@@ -3259,6 +3259,40 @@ fn refuse_unplanned_movement(
         touched_modules.extend(p.change.module_id());
         roles.extend(p.change.roles());
     }
+    // A parent's column dropped or made NOT NULL reaches every partition,
+    // whose own default and NOT NULL on it go with no change of the plan
+    // naming the partition (#1687): each is held field by field below, to
+    // what the parent's change leaves it.
+    for p in &changes.changes {
+        let (pbps_model::Change::DropColumn { column, .. }
+        | pbps_model::Change::AlterColumnNullability {
+            column,
+            to_nullable: false,
+            ..
+        }
+        | pbps_model::Change::AlterColumnType {
+            column,
+            from_nullable: true,
+            to_nullable: false,
+            ..
+        }) = &p.change
+        else {
+            continue;
+        };
+        let parent = &column.table;
+        objects.extend(
+            before
+                .tables
+                .iter()
+                .chain(&after.tables)
+                .filter(|(_, t)| {
+                    t.partition_of
+                        .as_ref()
+                        .is_some_and(|of| &of.parent == parent)
+                })
+                .map(|(name, _)| name),
+        );
+    }
 
     // The rows this plan writes, under the name it gives their table, and the
     // old name too where it renames one — the two states are keyed by
@@ -4320,6 +4354,10 @@ fn refuse_unplanned_movement(
             // the plan touches is not compared whole, and another session
             // detaching it and attaching it again under a wider range would
             // have routed rows by a bound nobody approved (#1607 review).
+            //
+            // Both reads are brought back to the names before this plan's
+            // column renames, a parent's key and a partition's own columns
+            // included (#1687), so a renamed key column compares outright.
             let place = |t: &pbps_model::Table| {
                 (
                     t.partition_of
@@ -4352,17 +4390,66 @@ fn refuse_unplanned_movement(
                     .collect()
             };
             let parent = now.partition_of.as_ref().map(|of| &of.parent);
+            // Both reads are under the names before this plan's column
+            // renames, so a change's column is too (#1687).
+            let undone = |c: &str| match parent {
+                Some(p) => undo_after.column(p, c),
+                None => c.to_owned(),
+            };
             let mut expected = own(was);
-            let mut planned_defaults: BTreeSet<&str> = BTreeSet::new();
-            let mut planned_not_nulls: BTreeSet<&str> = BTreeSet::new();
+            let mut planned_defaults: BTreeSet<String> = BTreeSet::new();
+            let mut planned_not_nulls: BTreeSet<String> = BTreeSet::new();
+            // The parent's own column changes reach every partition (#1687):
+            // a drop takes the partition's own, and a NOT NULL set on the
+            // parent leaves none of the partition's own on that column.
+            // Mid-run, either side of each is the plan in progress.
+            for p in &changes.changes {
+                if let pbps_model::Change::DropColumn { column, .. } = &p.change
+                    && Some(&column.table) == parent
+                {
+                    expected.remove(&column.name);
+                    planned_defaults.insert(column.name.clone());
+                    planned_not_nulls.insert(column.name.clone());
+                }
+                // A NOT NULL the parent sets or drops, alone or with a retype.
+                let nullability = if let pbps_model::Change::AlterColumnNullability {
+                    column,
+                    to_nullable,
+                    ..
+                } = &p.change
+                {
+                    Some((column, *to_nullable))
+                } else if let pbps_model::Change::AlterColumnType {
+                    column,
+                    from_nullable,
+                    to_nullable,
+                    ..
+                } = &p.change
+                    && from_nullable != to_nullable
+                {
+                    Some((column, *to_nullable))
+                } else {
+                    None
+                };
+                if let Some((column, to_nullable)) = nullability
+                    && Some(&column.table) == parent
+                {
+                    let c = undone(&column.name);
+                    if !to_nullable && let Some(held) = expected.get_mut(&c) {
+                        held.1 = false;
+                    }
+                    planned_not_nulls.insert(c);
+                }
+            }
             for p in &changes.changes {
                 if let pbps_model::Change::SetPartitionDefault {
                     table, column, to, ..
                 } = &p.change
                     && table == now_name
                 {
-                    expected.entry(column.clone()).or_default().0 = to.is_some();
-                    planned_defaults.insert(column);
+                    let c = undone(column);
+                    expected.entry(c.clone()).or_default().0 = to.is_some();
+                    planned_defaults.insert(c);
                 }
                 if let pbps_model::Change::SetPartitionNotNull {
                     table,
@@ -4372,13 +4459,14 @@ fn refuse_unplanned_movement(
                 } = &p.change
                     && table == now_name
                 {
-                    expected.entry(column.clone()).or_default().1 = *not_null;
-                    planned_not_nulls.insert(column);
+                    let c = undone(column);
+                    expected.entry(c.clone()).or_default().1 = *not_null;
+                    planned_not_nulls.insert(c);
                 }
                 if let pbps_model::Change::AlterColumnDefault { column, .. } = &p.change
                     && Some(&column.table) == parent
                 {
-                    planned_defaults.insert(&column.name);
+                    planned_defaults.insert(undone(&column.name));
                 }
             }
             expected.retain(|_, held| *held != (false, false));
@@ -4391,8 +4479,8 @@ fn refuse_unplanned_movement(
                 };
                 was_own.keys().chain(now_own.keys()).any(|c| {
                     let (was_held, now_held) = (held(&was_own, c), held(&now_own, c));
-                    (was_held.0 != now_held.0 && !planned_defaults.contains(c.as_str()))
-                        || (was_held.1 != now_held.1 && !planned_not_nulls.contains(c.as_str()))
+                    (was_held.0 != now_held.0 && !planned_defaults.contains(c))
+                        || (was_held.1 != now_held.1 && !planned_not_nulls.contains(c))
                 })
             };
             if own_moved {
@@ -14217,6 +14305,74 @@ mod tests {
                 );
             }
         }
+
+        // The parent's own column changes reach the partition (#1687). A
+        // rename of `w` to `w2` with the partition's own default set on it
+        // in the same plan: both reads are brought back to `w`, the change's
+        // column with them.
+        let renamed = |own_default: bool| {
+            let mut s = schema(&[("w", own_default, false)]);
+            for t in s.tables.values_mut() {
+                t.columns = std::mem::take(&mut t.columns)
+                    .into_iter()
+                    .map(|(c, col)| (if c == "w" { "w2".to_owned() } else { c }, col))
+                    .collect();
+                if let Some(of) = t.partition_of.as_mut() {
+                    of.columns = std::mem::take(&mut of.columns)
+                        .into_iter()
+                        .map(|(c, own)| (if c == "w" { "w2".to_owned() } else { c }, own))
+                        .collect();
+                }
+            }
+            s
+        };
+        let renaming = plan(vec![
+            Change::RenameColumn {
+                uid: "c_000001".parse().unwrap(),
+                table: parent.clone(),
+                from: "w".into(),
+                to: "w2".into(),
+                table_was: None,
+            },
+            Change::SetPartitionDefault {
+                uid: "t_000000".parse().unwrap(),
+                table: name.clone(),
+                parent: parent.clone(),
+                column: "w2".into(),
+                from: None,
+                to: Some("1".into()),
+                fallback: None,
+            },
+        ]);
+        check(&renaming, &none, &renamed(true), Settled::Whole).expect("renamed and set");
+        let e = check(&renaming, &none, &renamed(false), Settled::Whole)
+            .expect_err("renamed, never set");
+        assert!(format!("{e:#}").contains("app.ev_1's own column"), "{e:#}");
+        // The parent's `w` made NOT NULL leaves none of the partition's own
+        // on it, though no change names the partition.
+        let mut tightened_parent = none.clone();
+        tightened_parent
+            .tables
+            .get_mut(&parent)
+            .unwrap()
+            .columns
+            .get_mut("w")
+            .unwrap()
+            .nullable = false;
+        let tightening_parent = plan(vec![Change::AlterColumnNullability {
+            uid: "c_000001".parse().unwrap(),
+            column: pbps_model::ColumnRef::new(parent.clone(), "w"),
+            ty: "integer".parse().unwrap(),
+            to_nullable: false,
+            collation: None,
+        }]);
+        check(
+            &tightening_parent,
+            &schema(&[("w", false, true)]),
+            &tightened_parent,
+            Settled::Whole,
+        )
+        .expect("the parent's NOT NULL holds it");
     }
 
     /// A table's persistence is held across an apply (#1443): another

@@ -164,8 +164,8 @@ requirement is common to all of them, so it is listed once,
 | `AlterColumnType` | 9 | What blocks a retype gone. S: keys, indexes, checks, foreign keys. P: views and rules (`weave`), generated readers (refused). An old default dropped first | Converted values |
 | `AlterColumnNullability` | 9 | Tightening: the values non-null | Accepts or refuses NULL |
 | `AlterColumnDefault` | 9 | Functions the default calls: *content* | The default |
-| `SetPartitionDefault` | 9 | Functions the default calls: *content*. P: after its parent's default set by the plan (`after_their_parents_defaults`) | One partition's default: its own, or its parent's again (DEC-1581.1) |
-| `SetPartitionNotNull` | 9 | Tightening: the partition's values non-null | One partition's column accepts or refuses NULL (DEC-1581.1) |
+| `SetPartitionDefault` | 9; (9, 4) after its parent's default or NOT NULL change on the column | Functions the default calls: *content*. P: after its parent's default set by the plan (`after_their_parents_defaults`) | One partition's default: its own, or its parent's again (DEC-1581.1) |
+| `SetPartitionNotNull` | 9; (9, 4) after its parent's default or NOT NULL change on the column | Tightening: the partition's values non-null | One partition's column accepts or refuses NULL (DEC-1581.1) |
 | `AlterColumnExpression` | 9 | P: its inputs, a relaxation of its own column. Functions it calls: *content* | Recomputed stored values |
 | `AddComputedColumn` | 9 (9, 3) | S: the columns it reads, in their final type. Functions it calls exist (one this plan creates is refused by name) | A computed column at the end of its table (DEC-1174.1) |
 | `SetColumnDeprecated` | 10 | Nothing | Metadata only |
@@ -266,6 +266,7 @@ and the expression-bearing changes that need a function.
 |---|---|---|---|
 | `CreateTable` → rows, keys, foreign keys, modules and grants on it | fixed | class 7 before 11, 13, 14, 16 | ✓ |
 | `CreateTable` of a partitioned parent → `CreateTable` of its partition | fixed | (7, 2) after the rest of class 7 | ✓ DEC-1170.1 |
+| `AlterColumnDefault` or `AlterColumnNullability` of a parent → its partitions' `SetPartitionDefault` and `SetPartitionNotNull` on that column | fixed | (9, 4) after the parent's class 9; the parent's change recurses over the partition's own (DEC-1687.1) | ✓ DEC-1687.1 |
 | `AttachPartition` → the partition's own `SetPartitionDefault`, `SetPartitionNotNull`, `SetTablePersistence`, `SetStorageParameters`, `AddIndex` and `AddCheck` | fixed | class 7 before 9, 10 and 13; each acts on the partition alone once attached. After an attach at (11, 1), its own alterations of classes 9 and 10 move to (11, 2) | ✓ DEC-1545.1 |
 | `AddColumn` → rows, constraints, modules naming it | fixed | class 8 before 11, 13, 14 | ✓ |
 | `AddColumn` (input) → generated `AddColumn` reading it | fixed | (9, 2) after class 8 | ✓ DEC-1168.1 |

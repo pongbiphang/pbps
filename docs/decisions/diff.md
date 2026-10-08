@@ -3894,3 +3894,84 @@ Pinned on 16 and 18 by the CLI's
 The text check's spellings are pinned by
 `a_text_that_could_name_a_temporary_schema_is_told_by_any_spelling` and
 `a_text_naming_no_temporary_schema_is_still_asked`.
+
+<a id="dec-1687-1"></a>
+
+**DEC-1687.1. A standing range-partitioned parent's columns change as a
+table's do, the engine recursing each change into every partition, and each
+partition's own default and NOT NULL follow the parent's change on their
+column (#1687).**
+
+The first of #1546's four slices (leon, 2026-10-08): columns here, then
+indexes (#1688), keys, checks and foreign keys (#1689), and renaming the parent
+(#1690). Until DEC-1170.1 every change to a partitioned parent was refused.
+
+Measured on 16.15 and 18.6, on a populated tree:
+
+- `ADD COLUMN` (with a default, NOT NULL, or generated), `DROP COLUMN`,
+  `ALTER COLUMN … TYPE` and `RENAME COLUMN` on the parent recurse into every
+  partition, under `AccessExclusiveLock` on each. No partition can add, drop,
+  retype or rename an inherited column alone.
+- A partition-key column cannot be dropped or retyped. It can be renamed, and
+  the key follows it (`RANGE (ts)` becomes `RANGE (at)`).
+- `SET DEFAULT` and `DROP DEFAULT` on the parent recurse and **overwrite a
+  partition's own default** (DEC-1578.1). `ONLY` leaves the partitions alone,
+  but then the partitions created earlier lack the parent's default, which the
+  reader's tree purity refuses.
+- `SET NOT NULL` recurses. `DROP NOT NULL` recurses too, and a partition's own
+  NOT NULL that predates the parent's **survives on 18 but not on 16**. A NOT
+  NULL a table brought to its attach does not survive it on either version.
+- A partition's own default follows a column rename.
+
+**What is planned.** On a parent that stands before and after the plan, the
+following are admitted with no new change kind: `AddColumn`, `DropColumn`,
+`RenameColumn`, `AlterColumnType`, `AlterColumnNullability`,
+`AlterColumnDefault` and `SetColumnDeprecated`. These stay refused by name:
+- a key column's drop or retype;
+- an identity column added, whose partitions cannot be read back yet (#1681);
+- a generation expression changed in place.
+
+A key column renamed is not a change of the partitioning.
+
+**The partitions' own** (`diff_partition_columns`), compared through the
+parent's renames and drops in the same plan:
+- **A rename** carries a partition's own entry with it, and plans nothing.
+- **A drop** takes the partition's own entries on that column, and plans
+  nothing.
+- **A default the parent sets or drops** is followed by each declared own
+  default on that column, set again. The connected pass
+  `after_their_parents_defaults` (#1588) already did this for a `SET`, and
+  `DROP DEFAULT` is the case it does not cover.
+- **A NOT NULL the parent drops** is followed by every partition brought to
+  its declaration: its own NOT NULL set, or dropped where 18 would keep one
+  from before.
+- **A NOT NULL the parent sets** holds every partition, so a partition's own,
+  which validation then forbids the declaration to keep, is left to it rather
+  than dropped after.
+
+These partition changes sort at (9, 4), after their parent's change of class 9.
+
+**Why not drop the partition's own NOT NULL before the parent's tightening.**
+It would leave no local NOT NULL behind on 18, but it orders a partition
+change before its parent's in a class that otherwise follows the parent. And
+the leftover is harmless until the parent drops its NOT NULL again, which the
+rule above already handles.
+
+**The apply guard.** The undo of a plan's column renames (`Renames::apply`)
+renames a parent's key and a partition's own column entries too, so both
+reads compare under one set of names. A partition of a parent whose column the
+plan drops or makes NOT NULL is held field by field, to what the parent's
+change leaves it. Otherwise it would be compared whole and called moved.
+
+**The cost estimate** names the recursion. On a partitioned table it says the
+statement recurses into its partitions, how many, and the lock it takes on
+each. Rows and rewrite stay unknown, since ADR-0012 did not measure
+partitioned tables.
+
+Pinned by:
+- `a_partitioned_parents_columns_change_and_its_partitions_keep_their_own`;
+- `a_partitions_own_column_overrides_are_its_own_through_a_detach`;
+- `a_partition_key_and_a_partitions_own_columns_follow_the_parents_renames`;
+- `a_partitions_own_columns_set_by_someone_else_are_movement`;
+- the CLI's `a_partitioned_parents_columns_change_through_the_cli`, on 18 and
+  on 16.
