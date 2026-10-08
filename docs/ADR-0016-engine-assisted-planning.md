@@ -699,8 +699,9 @@ carries the normative text, and DEC-1528.1 the reasons.
   sealing and the refusal classes are shared. Only the producer differs.
 - **Decision 4, for the operator-vouched resolver.**
   - "Verify the chosen environment" keeps the shared compatibility
-    qualification (version and build, extensions, encoding, collation,
-    deployment context), which decides whether scratch binds as the target
+    qualification (version, with the build string recorded rather than
+    compared per DEC-1672.1, extensions, encoding, collation, deployment
+    context), which decides whether scratch binds as the target
     would. For separation, before any write on scratch (DEC-1672.1):
     - scratch is never the target, decided from session marks both engines
       report rather than from the connection strings, and its credential

@@ -1805,9 +1805,16 @@ by the engines, and the scratch account decides the layout.** Implemented by
 - Evidence naming the vouched runtime must name this rule, and measured
   evidence the other. A rule that claims coverage the run did not have is
   refused by the artifact reader.
-- It also compares the build string, `server_version`, which stands in for
-  the executables it cannot read: two packagings of one version may patch
-  the parser apart (#1678 review).
+- **The build string, `server_version`, is recorded, not compared.** It
+  names the packaging as much as the build: a managed or distribution-packaged
+  target and a container scratch of one version report two strings
+  (`18.6 (Debian 18.6-1.pgdg13+2)` from the official image). That is the
+  common pairing, and refusing it would refuse most real setups. The version
+  number, extensions, collations and settings, which decide binding, are
+  compared. A packaging that patched name resolution apart within one
+  version is part of what the operator vouches for. A differing string is a
+  named limitation of the report and is in the build fingerprint; an
+  unreadable one is unknown (maintainer's decision on #1678).
 - The build fields carry keyed fingerprints of what each engine reports: its
   version number and build string, and its installed extensions at their
   versions.

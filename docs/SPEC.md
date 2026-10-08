@@ -1445,10 +1445,11 @@ entry implemented by #1672, Docker by #1674).**
       template it was cloned from is covered.
   - The shared compatibility qualification (#610, #611) still runs, as for
     every resolver environment, under rule `pg-reported-scope-v1`. It
-    compares the facts both engines report: version and build string
-    (`server_version`),
+    compares the facts both engines report: version number,
     extensions and their versions, encoding, collation and the deployment
-    context. An incompatible or unreadable fact refuses. A supplied
+    context. An incompatible or unreadable fact refuses. The build string
+    (`server_version`) names the packaging too, so a difference in it is
+    recorded as a limitation, not refused (DEC-1672.1). A supplied
     database in another encoding refuses here, because the encoding decides
     how a name is cut to the identifier limit, so such a scratch would
     answer for another database.

@@ -117,17 +117,44 @@ pub fn compare(
 pub fn compare_reported(target: &CatalogFacts, resolver: &CatalogFacts) -> ScopeReport {
     let mut report = ScopeReport::new(RuleVersion::new(REPORTED_RULE));
     if catalog(REPORTED_RULE, target, resolver, &mut report) {
-        // The build string stands in for the executables this rule cannot
-        // read: two packagings of one version may patch the parser apart.
-        report.facts.insert(
-            "server_version".into(),
-            observation(
-                target.observations.get("server_version"),
-                resolver.observations.get("server_version"),
-            ),
-        );
+        build_string(target, resolver, &mut report);
     }
     report
+}
+
+/// The build string under the reported rule: recorded, never a refusal by
+/// itself. It names the packaging as much as the build, so a managed or
+/// distribution-packaged target and a container scratch of one version
+/// report two strings, which is the common pairing. The version number,
+/// extensions, collations and settings, which do decide binding, are compared
+/// above; a packaging that patched name resolution apart within one version
+/// is what the operator vouches for (maintainer's decision on #1678). An
+/// unreadable string is still unknown, never a match.
+fn build_string(target: &CatalogFacts, resolver: &CatalogFacts, report: &mut ScopeReport) {
+    let read = |facts: &CatalogFacts| {
+        facts
+            .observations
+            .get("server_version")
+            .and_then(Observation::value)
+            .map(str::to_owned)
+    };
+    match (read(target), read(resolver)) {
+        (Some(t), Some(r)) if t != r => {
+            report.limitations.insert(
+                "build:server_version".into(),
+                format!("the target reports {t} and the scratch {r}; the version number matched"),
+            );
+        }
+        _ => {
+            report.facts.insert(
+                "server_version".into(),
+                observation(
+                    target.observations.get("server_version"),
+                    resolver.observations.get("server_version"),
+                ),
+            );
+        }
+    }
 }
 
 /// The catalog facts both rules compare. `false` when the version gate
@@ -620,16 +647,24 @@ mod tests {
                 .verdict(),
             Verdict::Mismatch(vec!["server_version_num".into()])
         );
-        // The build string stands in for the executables it cannot read.
+        // Another packaging of the same version is recorded, not refused.
         let mut repackaged = side("180006", "e1");
         repackaged
             .catalog
             .observations
             .insert("server_version".into(), observed("18.6 (Ubuntu 18.6-1)"));
-        assert_eq!(
-            compare_reported(&side("180006", "e1").catalog, &repackaged.catalog).verdict(),
-            Verdict::Mismatch(vec!["server_version".into()])
+        let report = compare_reported(&side("180006", "e1").catalog, &repackaged.catalog);
+        assert_eq!(report.verdict(), Verdict::Verified, "{report:?}");
+        assert!(
+            report.limitations["build:server_version"].contains("18.6 (Ubuntu 18.6-1)"),
+            "{report:?}"
         );
+        // Negative: an unreadable build string is unknown, never a match.
+        repackaged.catalog.observations.remove("server_version");
+        assert!(matches!(
+            compare_reported(&side("180006", "e1").catalog, &repackaged.catalog).verdict(),
+            Verdict::Unknown(facts) if facts == ["server_version"]
+        ));
         let gated = compare_reported(&side("150013", "e1").catalog, &side("150013", "e1").catalog);
         assert!(matches!(
             &gated.facts["server_version_num"],
