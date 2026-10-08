@@ -87,9 +87,13 @@ impl Account {
         !(self.superuser || self.create_role || self.create_db)
     }
 
-    /// May create the run's own login, roles and database.
+    /// May create the run's own login, roles and database, and act as each
+    /// of them. Only a superuser: a `CREATEROLE` login is granted `ADMIN` on
+    /// the roles it creates but not `SET` (the default
+    /// `createrole_self_grant`), so it cannot hand them the database or
+    /// replay grants as them, and it cannot reproduce a superuser deployer.
     pub fn provisions(&self) -> bool {
-        self.superuser || (self.create_role && self.create_db)
+        self.superuser
     }
 
     /// The attributes that make it unconfined, as `ALTER ROLE` spells their
@@ -135,12 +139,15 @@ fn one(rows: Vec<Row>, what: &str) -> Result<Row, DbError> {
     }
 }
 
-/// Sets this session's `application_name` to the run's token and reports its
-/// backend and database. Session state only: nothing in the database changes.
+/// Sets this session's `application_name` to the run's token for the current
+/// transaction, and reports its backend and database. The caller holds the
+/// transaction open across the whole check, so a pooler cannot hand the
+/// backend to another session meanwhile, and ending it clears the mark.
+/// Nothing in the database changes.
 pub async fn mark(conn: &mut impl QueryConnection, token: &str) -> Result<SessionMark, DbError> {
     let rows = conn
         .query(&format!(
-            "SELECT pg_catalog.set_config('application_name', {}, false) AS marked, \
+            "SELECT pg_catalog.set_config('application_name', {}, true) AS marked, \
                     pg_catalog.pg_backend_pid()::text AS pid, \
                     (SELECT d.oid FROM pg_catalog.pg_database d \
                       WHERE d.datname = pg_catalog.current_database())::text AS database",
@@ -213,11 +220,6 @@ pub fn placement(
     } else {
         Placement::SameCluster
     })
-}
-
-/// Clears the session mark, back to the connection's own name.
-pub async fn unmark(conn: &mut impl QueryConnection) -> Result<(), DbError> {
-    conn.query("RESET application_name").await.map(|_| ())
 }
 
 /// The scratch login's cluster-wide attributes, through every role it is a
@@ -308,6 +310,34 @@ pub async fn foreign_objects(
     Ok((named, total))
 }
 
+/// Every privilege granted directly to the scratch login on a shared object
+/// other than its own database: another database, a tablespace, a
+/// configuration parameter. `DROP OWNED`, which empties the supplied
+/// database, revokes such a grant wherever the login has the authority to,
+/// as a member of the granting role can (measured on 18), and that is a
+/// write outside the run's own database. The supplied layout refuses while
+/// any exists.
+pub async fn shared_grants(conn: &mut impl QueryConnection) -> Result<Vec<String>, DbError> {
+    let rows = conn
+        .query(
+            "WITH login AS (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = session_user) \
+             SELECT 'database ' || d.datname AS object \
+               FROM pg_catalog.pg_database d, pg_catalog.aclexplode(d.datacl) a, login \
+              WHERE a.grantee = login.oid AND d.datname <> pg_catalog.current_database() \
+             UNION \
+             SELECT 'tablespace ' || t.spcname \
+               FROM pg_catalog.pg_tablespace t, pg_catalog.aclexplode(t.spcacl) a, login \
+              WHERE a.grantee = login.oid \
+             UNION \
+             SELECT 'parameter ' || p.parname \
+               FROM pg_catalog.pg_parameter_acl p, pg_catalog.aclexplode(p.paracl) a, login \
+              WHERE a.grantee = login.oid \
+             ORDER BY 1",
+        )
+        .await?;
+    rows.iter().map(|row| text(row, "object")).collect()
+}
+
 /// Creates each in-scope schema the supplied database lacks, owned by the
 /// scratch login. The run-owned path reproduces schemas with their owners
 /// and grants instead; a confined login can create no owner to give them.
@@ -394,12 +424,14 @@ mod tests {
         };
         assert!(!db_only.confined() && !db_only.provisions());
         assert_eq!(db_only.excess(), ["NOCREATEDB"]);
+        // Negative: both attributes without superuser cannot act as the
+        // roles it would create, so it does not provision.
         let both = Account {
             create_role: true,
             create_db: true,
             ..none
         };
-        assert!(both.provisions());
+        assert!(!both.provisions() && !both.confined());
         let superuser = Account {
             superuser: true,
             ..none

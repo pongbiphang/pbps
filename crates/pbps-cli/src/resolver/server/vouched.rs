@@ -14,8 +14,8 @@
 //!   its database: no superuser, no `CREATEROLE`, no `CREATEDB`;
 //! - the database it compiles in holds nothing initdb did not create.
 //!
-//! The account decides how the run provisions scratch. One that may create
-//! roles and databases, on another cluster, gets the measured run's layout: a
+//! The account decides how the run provisions scratch. A superuser on another
+//! cluster gets the measured run's layout: a
 //! run-owned login and database, the deployer's authorization reproduced, the
 //! declarations compiled as the reproduced deployer, all dropped afterwards.
 //! Any other account compiles as itself in the database its connection names,
@@ -156,20 +156,34 @@ async fn separation(
     tokens: &Tokens,
 ) -> Result<Placement, Error> {
     let failed = |error: pbps_db::DbError| Error::Read(format!("the session marks: {error}"));
-    let target_mark = sql::mark(target, &tokens.target).await.map_err(failed)?;
-    let scratch_mark = sql::mark(scratch, &tokens.scratch).await.map_err(failed)?;
-    let seen = sql::marked(scratch, &[&tokens.target, &tokens.scratch])
-        .await
-        .map_err(failed)?;
-    let placement = sql::placement(
+    // Both sessions hold a transaction across the whole check. A
+    // transaction-pooling proxy releases a backend between transactions, and
+    // the scratch session could then be handed the target's backend and
+    // overwrite its mark, reading "another cluster" (#1678 review). The
+    // marks are transaction-local, so ending the transactions clears them.
+    target.execute("BEGIN").await.map_err(failed)?;
+    let observed = async {
+        scratch.execute("BEGIN").await?;
+        let target_mark = sql::mark(target, &tokens.target).await?;
+        let scratch_mark = sql::mark(scratch, &tokens.scratch).await?;
+        let seen = sql::marked(scratch, &[&tokens.target, &tokens.scratch]).await?;
+        Ok::<_, pbps_db::DbError>((target_mark, scratch_mark, seen))
+    }
+    .await;
+    // Nothing was written in either transaction; rolling back only ends it.
+    let ended = (
+        target.execute("ROLLBACK").await,
+        scratch.execute("ROLLBACK").await,
+    );
+    let (target_mark, scratch_mark, seen) = observed.map_err(failed)?;
+    ended.0.map_err(failed)?;
+    ended.1.map_err(failed)?;
+    sql::placement(
         (&tokens.target, target_mark),
         (&tokens.scratch, scratch_mark),
         &seen,
     )
-    .map_err(|reason| Error::Vouched(reason.into()))?;
-    sql::unmark(target).await.map_err(failed)?;
-    sql::unmark(scratch).await.map_err(failed)?;
-    Ok(placement)
+    .map_err(|reason| Error::Vouched(reason.into()))
 }
 
 /// How the run provisions its scratch database.
@@ -412,7 +426,7 @@ impl Run<'_> {
         )
     }
 
-    /// The measured run's layout on an account that may provision it: a
+    /// The measured run's layout for a superuser on another cluster: a
     /// run-owned login and database from `template0` with the target's
     /// recipe, the deployer's authorization reproduced in it, and a session
     /// as the reproduced deployer.
@@ -499,8 +513,8 @@ impl Run<'_> {
         })
     }
 
-    /// The database the scratch connection names, on an account that is
-    /// confined or cannot provision: it must own that database and find it
+    /// The database the scratch connection names, for any account that is
+    /// not a superuser: it must own that database and find it
     /// empty, and it compiles there as itself, with the deployer's defaults.
     async fn supplied(
         &mut self,
@@ -527,6 +541,17 @@ impl Run<'_> {
             )));
         }
         refuse_foreign_objects(admin).await?;
+        let grants = sql::shared_grants(admin)
+            .await
+            .map_err(db("the scratch account's grants elsewhere"))?;
+        if !grants.is_empty() {
+            return Err(Error::Vouched(format!(
+                "the scratch account {} holds privileges outside its database ({}), which \
+                 emptying the database with DROP OWNED could revoke; use an account with none",
+                principal.login,
+                grants.join(", ")
+            )));
+        }
         let database = current_database(admin).await?;
         let scope::Authorization::Postgres(context) = authorization else {
             return Err(Error::Scope(
@@ -637,18 +662,22 @@ async fn current_database(conn: &mut Conn) -> Result<String, Error> {
 }
 
 /// A keyed fingerprint of what one engine reports about its build: its
-/// version and the extensions installed, at their versions. The measured
+/// version number and build string, and the extensions installed, at their
+/// versions. The measured
 /// profiles fingerprint executable content here; nothing reads executables
 /// on this resolver, and the field says only what was reported.
 fn reported_build(
     key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
     catalog: &CatalogFacts,
 ) -> Result<String, Error> {
-    let version = catalog
-        .observations
-        .get("server_version_num")
-        .and_then(|observed| observed.value())
-        .ok_or_else(|| Error::Scope("server_version_num was not reported".into()))?;
+    let reported = |name: &str| {
+        catalog
+            .observations
+            .get(name)
+            .and_then(|observed| observed.value())
+            .ok_or_else(|| Error::Scope(format!("{name} was not reported")))
+    };
+    let version = (reported("server_version_num")?, reported("server_version")?);
     let mut extensions: Vec<(&str, &str)> = catalog
         .extensions
         .iter()

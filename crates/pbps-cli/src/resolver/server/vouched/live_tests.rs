@@ -181,10 +181,12 @@ async fn produce(
 }
 
 fn vouched_refusal(result: Result<ResolvedPlan, ProduceError>) -> String {
+    // Never panics: the caller drops its fixture first and asserts on this,
+    // so a wrong outcome does not leave databases and roles behind.
     match result {
         Err(ProduceError::Run(Error::Vouched(reason))) => reason,
-        Err(other) => panic!("expected a vouched refusal, got {other}"),
-        Ok(_) => panic!("expected a vouched refusal, got a plan"),
+        Err(other) => format!("not a vouched refusal: {other}"),
+        Ok(_) => "not a vouched refusal: a plan".into(),
     }
 }
 
@@ -424,4 +426,104 @@ async fn vouched_empties_the_supplied_database_when_the_run_refuses() {
         );
         assert_eq!(left.1, 0, "{server}: {left:?}");
     }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_grants_elsewhere() {
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        // The login is a member of the role that owns another database and
+        // granted it a privilege there: `DROP OWNED` would revoke that grant.
+        let owner = format!("pbps_v1672_w_{}", fixture.token);
+        fixture
+            .admin()
+            .await
+            .execute(&format!(
+                "CREATE ROLE {owner} NOLOGIN; GRANT {owner} TO {}",
+                login.0
+            ))
+            .await
+            .unwrap();
+        fixture.roles.insert(0, owner.clone());
+        let elsewhere = fixture.database("w", Some(&owner)).await;
+        fixture
+            .admin()
+            .await
+            .execute(&format!(
+                "SET ROLE {owner}; GRANT CREATE ON DATABASE {elsewhere} TO {}; RESET ROLE",
+                login.0
+            ))
+            .await
+            .unwrap();
+        let acl = || async {
+            let rows = fixture
+                .admin()
+                .await
+                .query(&format!(
+                    "SELECT datacl::text AS acl FROM pg_catalog.pg_database WHERE datname = '{elsewhere}'"
+                ))
+                .await
+                .unwrap();
+            rows[0].try_get::<&str>("acl").unwrap().unwrap().to_owned()
+        };
+        let before = acl().await;
+        let inputs = Inputs::overload();
+        let key = ProjectKey::new(true);
+        let reason = vouched_refusal(
+            produce(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+            )
+            .await,
+        );
+        let after = acl().await;
+        let left = fixture.foreign_objects(&scratch_db).await;
+        fixture.drop().await;
+        assert!(
+            reason.contains(&format!("database {elsewhere}")),
+            "{server}: {reason}"
+        );
+        assert_eq!(before, after, "{server}: the grant elsewhere is untouched");
+        assert_eq!(left.1, 0, "{server}: nothing was written: {left:?}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_compiles_as_a_non_superuser_provisioner_in_its_own_database() {
+    // A `CREATEROLE CREATEDB` login on another cluster cannot act as the
+    // roles it would create, so it takes the supplied layout, not run-owned.
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let mut scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = target.target().await;
+    let login = scratch.login("p", "NOSUPERUSER CREATEDB CREATEROLE").await;
+    scratch
+        .admin()
+        .await
+        .execute(&format!("GRANT pg_read_all_settings TO {}", login.0))
+        .await
+        .unwrap();
+    let scratch_db = scratch.database("s", Some(&login.0)).await;
+    let before = scratch.inventory().await;
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let result = produce(
+        &scratch.as_login(&scratch_db, &login),
+        &target.on(&target_db),
+        &inputs,
+        &key,
+    )
+    .await;
+    let after = scratch.inventory().await;
+    let left = scratch.foreign_objects(&scratch_db).await;
+    target.drop().await;
+    scratch.drop().await;
+    assert_answers_the_overload(&result.unwrap());
+    assert_eq!(before, after, "no run-owned database or role was created");
+    assert_eq!(left.1, 0, "{left:?}");
 }

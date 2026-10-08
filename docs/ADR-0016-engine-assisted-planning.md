@@ -708,9 +708,10 @@ carries the normative text, and DEC-1528.1 the reasons.
     - on the target's cluster, the scratch account is confined: no
       `SUPERUSER`, `CREATEROLE` or `CREATEDB` through any role it is a
       member of (#1667);
-    - the database it compiles in is empty: a run-owned one from
-      `template0` with the target's encoding and locale, or the account's own
-      supplied one, emptied again with `DROP OWNED` afterwards.
+    - the database it compiles in is empty: a superuser's run-owned one
+      from `template0` with the target's encoding and locale, or any other
+      account's own supplied one, emptied again with `DROP OWNED`
+      afterwards.
   - Isolation, containment, log handling and channel protection are vouched
     for by the operator, not measured. The evidence names the profile, so a
     reviewer can always tell a vouched answer from a measured one.

@@ -1413,7 +1413,8 @@ entry implemented by #1672, Docker by #1674).**
       connection strings, which can spell one server two ways.
       - Each session marks itself with a run-generated `application_name`.
       - A target mark that the scratch session finds in `pg_stat_activity`
-        is a backend of the scratch's own cluster.
+        is a backend of the scratch's own cluster. Both sessions hold a
+        transaction across the check, so a pooler cannot swap their backends.
       - The scratch session must find its own mark, or the check could not
         be made and the run refuses.
       - Scratch in the target's own database refuses.
@@ -1424,8 +1425,7 @@ entry implemented by #1672, Docker by #1674).**
       `CREATEDB`. An unconfined account there refuses, naming the attributes
       to remove.
     - **The account decides the layout.**
-      - **Run-owned.** On another cluster, an account that may create roles
-        and databases gets:
+      - **Run-owned.** A superuser on another cluster gets:
         - a run-owned login, and a database cloned from `template0` with the
           target's encoding and locale;
         - the deployer's authorization reproduced in that database;
@@ -1433,9 +1433,11 @@ entry implemented by #1672, Docker by #1674).**
 
         All of it is dropped afterwards.
       - **Supplied.** Any other account compiles as itself in the database
-        its connection names, which it must own. The deployer's role and
-        database defaults become session settings, and `DROP OWNED` empties
-        the database afterwards, whether the run answered or refused.
+        its connection names, which it must own. The account may hold no
+        direct grant on another database, tablespace or parameter, which
+        `DROP OWNED` could revoke. The deployer's role and database defaults
+        become session settings, and `DROP OWNED` empties the database
+        afterwards, whether the run answered or refused.
     - **Scratch is empty.** The database the run compiles in holds nothing
       initdb did not create: no object at or above `FirstNormalObjectId`.
       This is checked before the run's first write there, the baseline's
@@ -1443,7 +1445,8 @@ entry implemented by #1672, Docker by #1674).**
       template it was cloned from is covered.
   - The shared compatibility qualification (#610, #611) still runs, as for
     every resolver environment, under rule `pg-reported-scope-v1`. It
-    compares the facts both engines report: version and build string,
+    compares the facts both engines report: version and build string
+    (`server_version`),
     extensions and their versions, encoding, collation and the deployment
     context. An incompatible or unreadable fact refuses. A supplied
     database in another encoding refuses here, because the encoding decides

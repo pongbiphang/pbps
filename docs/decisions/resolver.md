@@ -1736,6 +1736,11 @@ by the engines, and the scratch account decides the layout.** Implemented by
     the run refuses.
   - The scratch session must see its own mark. Otherwise the view shows
     nothing on that cluster, and "not seen" would read as "another cluster".
+  - **Both sessions hold a transaction across the check**, and the marks are
+    transaction-local. A transaction-pooling proxy releases a backend
+    between transactions, so without one the scratch session could be handed
+    the target's backend, overwrite its mark and read "another cluster"
+    (#1678 review).
 - **Rejected: a `pg_database` row with the target database's name and
   OID.** Two clusters started from one image with one `POSTGRES_DB` hold
   identical rows, which is an ordinary CI layout. That check would call them
@@ -1757,11 +1762,15 @@ by the engines, and the scratch account decides the layout.** Implemented by
   naming the attributes to remove.
 
 **The account decides the layout.**
-- **Run-owned.** An account on another cluster that may create roles and
-  databases gets the measured run's layout: a run-owned login and a database
-  from `template0` with the target's recipe, the deployer's authorization
-  reproduced, and a compile as the reproduced deployer. All of it is dropped
-  afterwards.
+- **Run-owned.** A superuser on another cluster gets the measured run's
+  layout: a run-owned login and a database from `template0` with the target's
+  recipe, the deployer's authorization reproduced, and a compile as the
+  reproduced deployer. All of it is dropped afterwards.
+  - Only a superuser. A `CREATEROLE` login is granted `ADMIN` on the roles it
+    creates but not `SET` (the default `createrole_self_grant`). So it can
+    neither hand them the database nor replay grants as them, and it cannot
+    reproduce a superuser deployer at all (#1678 review). It takes the
+    supplied layout instead.
 - **Supplied.** Any other account compiles as itself in the database its
   connection names.
   - It must own that database.
@@ -1774,6 +1783,12 @@ by the engines, and the scratch account decides the layout.** Implemented by
     refuses through the compatibility comparison.
   - `DROP OWNED BY SESSION_USER` empties the database afterwards, whether
     the run answered or refused.
+  - **The login holds no direct grant on another shared object**: another
+    database, a tablespace, a configuration parameter. `DROP OWNED` also
+    revokes such a grant wherever the login has the authority to. A member
+    of the role that granted it does (measured on 18), and that is a write
+    outside the run's database. The run refuses while any exists, naming
+    them (#1678 review).
 - **Why ownership is required.** `DROP OWNED` also revokes what was granted
   to the login on the database, and only an owner keeps its rights through
   that.
@@ -1790,8 +1805,12 @@ by the engines, and the scratch account decides the layout.** Implemented by
 - Evidence naming the vouched runtime must name this rule, and measured
   evidence the other. A rule that claims coverage the run did not have is
   refused by the artifact reader.
+- It also compares the build string, `server_version`, which stands in for
+  the executables it cannot read: two packagings of one version may patch
+  the parser apart (#1678 review).
 - The build fields carry keyed fingerprints of what each engine reports: its
-  version and its installed extensions at their versions.
+  version number and build string, and its installed extensions at their
+  versions.
 
 Recorded in SPEC §9.3.2 and ADR-0016's amendment. Pinned by the `vouched_`
 live tests in `resolver::server::vouched`.

@@ -116,7 +116,17 @@ pub fn compare(
 /// rule's coverage.
 pub fn compare_reported(target: &CatalogFacts, resolver: &CatalogFacts) -> ScopeReport {
     let mut report = ScopeReport::new(RuleVersion::new(REPORTED_RULE));
-    catalog(REPORTED_RULE, target, resolver, &mut report);
+    if catalog(REPORTED_RULE, target, resolver, &mut report) {
+        // The build string stands in for the executables this rule cannot
+        // read: two packagings of one version may patch the parser apart.
+        report.facts.insert(
+            "server_version".into(),
+            observation(
+                target.observations.get("server_version"),
+                resolver.observations.get("server_version"),
+            ),
+        );
+    }
     report
 }
 
@@ -471,6 +481,7 @@ mod tests {
     fn side(version: &str, digest: &str) -> EnvironmentFacts {
         let observations = [
             ("server_version_num", version),
+            ("server_version", "18.6 (Debian 18.6-1.pgdg13+2)"),
             ("database_encoding", "UTF8"),
             ("database_collate", "en_US.utf8"),
             ("database_ctype", "en_US.utf8"),
@@ -608,6 +619,16 @@ mod tests {
             compare_reported(&side("180006", "e1").catalog, &side("180005", "e1").catalog)
                 .verdict(),
             Verdict::Mismatch(vec!["server_version_num".into()])
+        );
+        // The build string stands in for the executables it cannot read.
+        let mut repackaged = side("180006", "e1");
+        repackaged
+            .catalog
+            .observations
+            .insert("server_version".into(), observed("18.6 (Ubuntu 18.6-1)"));
+        assert_eq!(
+            compare_reported(&side("180006", "e1").catalog, &repackaged.catalog).verdict(),
+            Verdict::Mismatch(vec!["server_version".into()])
         );
         let gated = compare_reported(&side("150013", "e1").catalog, &side("150013", "e1").catalog);
         assert!(matches!(
