@@ -3548,7 +3548,7 @@ fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
     );
     on_server(
         own.connection(),
-        "CREATE VIEW dbo.vw AS SELECT id FROM dbo.p;",
+        "CREATE VIEW dbo.vw AS SELECT id, a FROM dbo.p;",
     );
     let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
     let d = Demo::new("edges1462-hidden");
@@ -3728,6 +3728,41 @@ fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
         stderr(&o)
     );
     std::fs::write(&table, &pulled).unwrap();
+    // A column rename `dbo.vw` reads, applied as this login: the report names
+    // the view, read through the per-object functions, where the catalog view
+    // returns this login no row at all (#1644). The view no longer binds
+    // after it, and neither the read that closes the apply nor `verify` stops
+    // there.
+    let from = "\n  a:\n    type: int\n";
+    assert!(plain_text.contains(from), "{plain_text}");
+    std::fs::write(
+        &plain,
+        plain_text.replacen(from, "\n  a2:\n    type: int\n    renamed_from: a\n", 1),
+    )
+    .unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let saved = d.dir.join("rename-1644.json");
+    ok(&d.run(&["plan", "--db", &as_login, "--out", saved.to_str().unwrap()]));
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &as_login,
+        "--plan",
+        saved.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&saved),
+        "--allow",
+        "rename",
+    ]);
+    ok(&o);
+    assert!(
+        stdout(&o).contains("Renaming column dbo.p.a affects:")
+            && stdout(&o).contains("view dbo.vw"),
+        "{}",
+        stdout(&o)
+    );
+    ok(&d.run(&["verify", "--db", &as_login]));
     let view = walk(&d.dir.join("schema"))
         .into_iter()
         .find(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("view: dbo.vw")))
@@ -8217,21 +8252,33 @@ fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
         "a project declaring no row must not be asked for DML: {v}"
     );
 
-    // Reading the catalog also reads `sys.sql_expression_dependencies`,
-    // which the engine gives only to `db_owner`: without it every connected
-    // command fails with Msg 229, so `doctor` names it, on that object
-    // (#1359).
+    // `sys.sql_expression_dependencies`, which the engine gives only to
+    // `db_owner` (#1359), is read only by the hidden-referrer proof since
+    // #1644: `pull`, `plan --db` and `verify` read dependencies through
+    // `sys.dm_sql_referenc*_entities`. Without it the account is ready, and
+    // `doctor` advises it, on that object, as a warning.
     on_server(
         db.connection(),
         &format!("REVOKE SELECT ON sys.sql_expression_dependencies FROM [{login}];"),
     );
     let (named, exit, v) = gaps();
-    assert_eq!(named.len(), 1, "{v}");
+    assert!(named.is_empty(), "{v}");
+    let advised: Vec<&serde_json::Value> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["id"] == "permission.advised")
+        .collect();
+    assert_eq!(advised.len(), 1, "{v}");
+    assert_eq!(advised[0]["severity"], "warning", "{v}");
     assert!(
-        named[0].starts_with("SELECT on OBJECT::[sys].[sql_expression_dependencies] — "),
+        advised[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("SELECT on OBJECT::[sys].[sql_expression_dependencies] — "),
         "{v}"
     );
-    assert_ne!(exit, 0, "{v}");
+    assert_eq!(exit, 0, "{v}");
 
     after_test_on_server(
         &server,

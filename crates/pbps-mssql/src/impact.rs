@@ -519,44 +519,76 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
         .collect()
 }
 
-/// `DISTINCT` is not tidiness: the catalog holds one row per referenced
-/// *column*, so a view naming three columns of the table appears three times,
-/// and a report that listed it three times would read like three problems.
+/// What refers to the object, asked of `sys.dm_sql_referencing_entities`
+/// rather than `sys.sql_expression_dependencies`: the view returns no row at
+/// all without database `VIEW DEFINITION`, which SPEC §9.5 does not ask for,
+/// so a schema-scoped account's report read "nothing depends on this"
+/// (#1644, DEC-1644.1). The function answers under the managed-schema grant.
+/// A referrer in a schema this login cannot see is not listed by either:
+/// the report is of what it can see, as it was.
+///
+/// Both run inside `TRY`, as `catalog`'s module dependencies do and for the
+/// same reason: `sys.dm_sql_referenced_entities` raises Msg 207 and 2020 for a
+/// referrer that no longer binds, and inside `TRY` returns its rows instead
+/// (measured on SQL Server 2017 to 2025). The `CATCH` rethrows, so a read that
+/// failed is a failed read.
 ///
 /// The type filter keeps constraints out. A check constraint genuinely depends
 /// on its table, so it turns up here — but whether it is affected depends on
 /// which column its text names, which is what [`EXPRESSIONS`] decides. Letting
 /// both report it would flag every constraint on the table for every rename.
 const DEPENDENCIES_TABLE: &str = "\
+BEGIN TRY
 SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_name,
        CONVERT(bit, ISNULL(m.is_schema_bound, 0)) AS schema_bound
-  FROM sys.sql_expression_dependencies d
-  JOIN sys.objects o ON o.object_id = d.referencing_id
+  FROM sys.dm_sql_referencing_entities(@P1, N'OBJECT') r
+  JOIN sys.objects o ON o.object_id = r.referencing_id
   JOIN sys.schemas s ON s.schema_id = o.schema_id
   LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
- WHERE d.referenced_id = OBJECT_ID(@P1)
+ WHERE r.referencing_class = 1
    AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
- ORDER BY s.name, o.name;";
+ ORDER BY s.name, o.name;
+END TRY
+BEGIN CATCH
+    THROW;
+END CATCH;";
 
-/// The same, narrowed to modules that name *this column*.
+/// The same, narrowed to modules that read *this column*, by each referrer's
+/// own `sys.dm_sql_referenced_entities` rows.
 ///
-/// `referenced_minor_id = 0` is a reference to the object as a whole (`SELECT
-/// *`), which a column rename does affect. Anything else is a specific column,
-/// and a module naming a different one keeps working — reporting it would flag
-/// a rename as risky when it is not, and a report that blocks valid deploys is
-/// one people learn to override.
+/// A column rename breaks a module that names the column, or reads every
+/// column (`SELECT *`, `is_select_all`), and one whose columns the engine
+/// could not all bind (`is_all_columns_found = 0`) is counted as naming it.
+/// A module naming only other columns keeps working, and SQL Server renames
+/// such a column even under a `SCHEMABINDING` module (measured on 17.0: 15336
+/// only for a column the module reads). `DISTINCT` is not tidiness: there is a
+/// row per referenced column.
+///
+/// Not the view's `referenced_minor_id = 0`: it records columns only for a
+/// schema-bound referrer, and a row of 0 for every referrer, so every module
+/// reading the table matched, and a `SCHEMABINDING` one refused the rename of
+/// a column it never reads (#1644).
 const DEPENDENCIES_COLUMN: &str = "\
+BEGIN TRY
 SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_name,
        CONVERT(bit, ISNULL(m.is_schema_bound, 0)) AS schema_bound
-  FROM sys.sql_expression_dependencies d
-  JOIN sys.objects o ON o.object_id = d.referencing_id
+  FROM sys.dm_sql_referencing_entities(@P1, N'OBJECT') r
+  JOIN sys.objects o ON o.object_id = r.referencing_id
   JOIN sys.schemas s ON s.schema_id = o.schema_id
   LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
- WHERE d.referenced_id = OBJECT_ID(@P1)
+ CROSS APPLY sys.dm_sql_referenced_entities(
+       QUOTENAME(s.name) + N'.' + QUOTENAME(o.name), N'OBJECT') e
+ WHERE r.referencing_class = 1
    AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
-   AND (d.referenced_minor_id = 0
-        OR d.referenced_minor_id = COLUMNPROPERTY(OBJECT_ID(@P1), @P2, 'ColumnId'))
- ORDER BY s.name, o.name;";
+   AND e.referenced_id = OBJECT_ID(@P1)
+   AND (e.referenced_minor_id = COLUMNPROPERTY(OBJECT_ID(@P1), @P2, 'ColumnId')
+        OR e.is_select_all = 1
+        OR e.is_all_columns_found = 0)
+ ORDER BY s.name, o.name;
+END TRY
+BEGIN CATCH
+    THROW;
+END CATCH;";
 
 const COMPUTED_COLUMNS: &str = "\
 SELECT c.name AS column_name, c.definition

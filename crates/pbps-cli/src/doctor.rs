@@ -110,6 +110,12 @@ pub struct EnvDiagnosis {
     pub resolver_discovery_unknown: Option<String>,
     /// The permissions pbps needs and this account does not hold.
     pub missing_permissions: Vec<String>,
+    /// What this account lacks that only some plans need (#1644): reported as
+    /// warnings, not counted against readiness. Kept out of the JSON `data`,
+    /// whose schema is published: the findings carry it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub advised_permissions: Vec<String>,
 
     /// Set when the permission query itself failed, so an empty
     /// `missing_permissions` means "not determined" rather than "none".
@@ -219,6 +225,7 @@ impl EnvDiagnosis {
             resolver: None,
             resolver_discovery_unknown: None,
             missing_permissions: Vec::new(),
+            advised_permissions: Vec::new(),
             permissions_unknown: false,
             absent_schemas: Vec::new(),
             server_capabilities_unknown: None,
@@ -1033,6 +1040,11 @@ async fn examine(
                 // which is the over-grant this check exists to avoid.
                 .map(|g| format!("{} on {} — {}", g.permission, g.securable, g.why))
                 .collect();
+            d.advised_permissions = held
+                .advised
+                .into_iter()
+                .map(|g| format!("{} on {} — {}", g.permission, g.securable, g.why))
+                .collect();
             d.absent_schemas = held.absent_schemas.into_iter().collect();
         }
         // Not merely noted in `detail`: with the list left empty, a successful
@@ -1317,6 +1329,13 @@ fn env_findings(
         out.push(output::Finding::error(
             "permission.missing",
             format!("{}: the account lacks {gap}", d.environment),
+        ));
+    }
+    // A warning: the account is ready for every other plan (#1644).
+    for advice in &d.advised_permissions {
+        out.push(output::Finding::warning(
+            "permission.advised",
+            format!("{}: the account does not hold {advice}", d.environment),
         ));
     }
     for schema in &d.absent_schemas {

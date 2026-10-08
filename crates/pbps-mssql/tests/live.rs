@@ -6842,6 +6842,182 @@ async fn doctor_requires_alter_only_until_the_existing_ledger_is_migrated() {
     db.drop().await;
 }
 
+/// #1644: a schema-scoped account, holding `VIEW DEFINITION` on its schema and
+/// nothing database-wide, reads what depends on what. Under it
+/// `sys.sql_expression_dependencies` returns no row at all; the per-object
+/// functions answer, as for `sa`:
+/// - the pull leaves out a view over a ledger table, which a module the
+///   omission closure could not see would have kept;
+/// - a column rename reports only the modules that read that column, every
+///   column (`SELECT *`), and blocks only on a `SCHEMABINDING` one that reads
+///   it; a table rename reports them all.
+/// The column rule is also why the report no longer blocks the rename of a
+/// column a schema-bound module does not read, which SQL Server allows.
+///
+/// And a module that no longer binds — its column renamed or dropped — stops
+/// neither read: the functions raise Msg 207 and 2020 for it, which the reads
+/// catch, keeping its rows. It is counted as reading every column, since
+/// which ones it names cannot be told.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_schema_scoped_account_reads_what_depends_on_what() {
+    use pbps_model::TableName;
+    use pbps_mssql::impact::{RenameTarget, rename_impact};
+    let mut db = TestDb::create("deps1644").await;
+    for statement in [
+        "CREATE TABLE dbo.acct (id int NOT NULL CONSTRAINT pk_acct PRIMARY KEY, bal int NULL)
+             WITH (SYSTEM_VERSIONING = ON, LEDGER = ON);",
+        "CREATE VIEW dbo.v_acct AS SELECT id, bal FROM dbo.acct;",
+        "CREATE TABLE dbo.k (id int NOT NULL CONSTRAINT pk_k PRIMARY KEY, a int NULL, b int NULL);",
+        "CREATE VIEW dbo.k_a AS SELECT id, a FROM dbo.k;",
+        "CREATE VIEW dbo.k_star AS SELECT * FROM dbo.k;",
+        "CREATE PROCEDURE dbo.k_pb AS SELECT b FROM dbo.k;",
+        "CREATE FUNCTION dbo.k_sb () RETURNS int WITH SCHEMABINDING AS \
+         BEGIN RETURN (SELECT COUNT(a) FROM dbo.k) END;",
+        "CREATE TABLE dbo.rp (id int NOT NULL CONSTRAINT pk_rp PRIMARY KEY, a int NULL, \
+         gone int NULL);",
+        "CREATE PROCEDURE dbo.rp_stale AS SELECT a FROM dbo.rp;",
+        "CREATE VIEW dbo.rp_gone AS SELECT gone FROM dbo.rp;",
+        "EXEC sp_rename 'dbo.rp.a', 'a2', 'COLUMN';",
+        "ALTER TABLE dbo.rp DROP COLUMN gone;",
+    ] {
+        db.conn.execute(statement).await.expect(statement);
+    }
+    let login = format!("pbps_deps_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsLeastPrivilege!1";
+    db.conn
+        .execute(&format!(
+            "USE master; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF; \
+             USE [{0}]; \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT ON SCHEMA::dbo TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("create the login");
+    let base = conn_str();
+    let as_login = base
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = format!(
+        "{as_login};User Id={login};Password={password};Database={}",
+        db.name
+    );
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
+    // The premise: the catalog view is silent for this account.
+    let rows = lp
+        .query("SELECT COUNT(*) AS n FROM sys.sql_expression_dependencies;")
+        .await;
+    assert!(
+        rows.map_or(true, |r| r[0].try_get::<i32>("n").ok().flatten() == Some(0)),
+        "the test's premise is wrong: the view answers this account"
+    );
+
+    let pulled = pbps_mssql::catalog::introspect(&mut lp)
+        .await
+        .expect("introspect as the login");
+    assert!(
+        !pulled
+            .schema
+            .modules
+            .keys()
+            .any(|m| m.object_name() == TableName::new("dbo", "v_acct")),
+        "{:?}",
+        pulled.schema.modules.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        pulled.unmanaged_modules.iter().any(|module| {
+            module.target.object_name() == TableName::new("dbo", "v_acct")
+                && module.why.contains("create-time-bound dependency")
+        }),
+        "{:?}",
+        pulled.unmanaged_modules
+    );
+
+    let names = |list: &[pbps_db::impact::Referrer]| -> Vec<String> {
+        let mut out: Vec<String> = list.iter().map(|r| r.name.clone()).collect();
+        out.sort();
+        out
+    };
+    let report = rename_impact(&mut lp, &RenameTarget::Column("dbo.k.b".parse().unwrap()))
+        .await
+        .expect("impact of b");
+    assert_eq!(
+        names(&report.advisory),
+        ["dbo.k_pb", "dbo.k_star"],
+        "{report:?}"
+    );
+    // `k_sb` reads `a` only: SQL Server renames `b` under it.
+    assert!(report.blocking.is_empty(), "{report:?}");
+    let report = rename_impact(&mut lp, &RenameTarget::Column("dbo.k.a".parse().unwrap()))
+        .await
+        .expect("impact of a");
+    assert_eq!(
+        names(&report.advisory),
+        ["dbo.k_a", "dbo.k_star"],
+        "{report:?}"
+    );
+    assert_eq!(names(&report.blocking), ["dbo.k_sb"], "{report:?}");
+    let report = rename_impact(&mut lp, &RenameTarget::Table("dbo.k".parse().unwrap()))
+        .await
+        .expect("impact of the table");
+    assert_eq!(
+        names(&report.advisory),
+        ["dbo.k_a", "dbo.k_pb", "dbo.k_star"],
+        "{report:?}"
+    );
+    assert_eq!(names(&report.blocking), ["dbo.k_sb"], "{report:?}");
+    // As `sa` too, whose catalog view row of `0` for `k_sb` made every column
+    // rename of `dbo.k` read as blocked.
+    let report = rename_impact(
+        &mut db.conn,
+        &RenameTarget::Column("dbo.k.b".parse().unwrap()),
+    )
+    .await
+    .expect("impact of b as sa");
+    assert!(report.blocking.is_empty(), "{report:?}");
+    // The two that no longer bind, for a column neither names.
+    let report = rename_impact(&mut lp, &RenameTarget::Column("dbo.rp.id".parse().unwrap()))
+        .await
+        .expect("impact over modules that no longer bind");
+    assert_eq!(
+        names(&report.advisory),
+        ["dbo.rp_gone", "dbo.rp_stale"],
+        "{report:?}"
+    );
+    // The engine agrees about `b`: renamed under the schema-bound `k_sb`.
+    db.conn
+        .execute("EXEC sp_rename 'dbo.k.b', 'b2', 'COLUMN';")
+        .await
+        .expect("SQL Server renames a column a schema-bound module does not read");
+
+    drop(lp);
+    db.drop().await;
+    let mut admin = connect_live(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+}
+
 /// The permission check against a real least-privilege login.
 ///
 /// This is the shape the check exists for and the shape no unit test can
@@ -6872,14 +7048,15 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     // Exactly what a careful DBA would grant, and nothing more: the schema-scoped
     // permissions on the schema, the four CREATEs at the database (SQL Server
     // will not grant them lower), and no database-wide ALTER or SELECT at all.
+    // Not `SELECT` on `sys.sql_expression_dependencies` either: only the
+    // hidden-referrer proof reads it since #1644, so it is advice.
     db.conn
         .execute(&format!(
             "USE [{0}]; \
              CREATE USER [{login}] FOR LOGIN [{login}]; \
              GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER, REFERENCES \
              ON SCHEMA::dbo TO [{login}]; \
-             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}]; \
-             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}];",
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];",
             db.name
         ))
         .await
@@ -6933,6 +7110,44 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         gaps.is_empty(),
         "a correctly granted least-privilege login was reported as missing: {gaps:?}"
     );
+    // Ready, and advised the two grants the hidden-referrer proof needs
+    // (#1644): database `VIEW DEFINITION` and `SELECT` on the view.
+    let advice: Vec<String> = pbps_mssql::doctor::advised(&held)
+        .iter()
+        .map(|g| format!("{} on {}", g.permission, g.securable()))
+        .collect();
+    assert_eq!(
+        advice,
+        [
+            "VIEW DEFINITION on the database",
+            "SELECT on OBJECT::[sys].[sql_expression_dependencies]"
+        ],
+        "{held:?}"
+    );
+    // Holding both, no advice.
+    db.conn
+        .execute(&format!(
+            "USE [{}]; GRANT VIEW DEFINITION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant the advised");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &[],
+        &["dbo".to_owned()],
+        &Default::default(),
+        &pbps_mssql::doctor::GrantTargets::default(),
+        &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
+        &pbps_model::IdsFile::default(),
+    )
+    .await
+    .expect("read permissions");
+    let advice = pbps_mssql::doctor::advised(&held);
+    assert!(advice.is_empty(), "{advice:?}");
 
     // The negative case, and the dangerous one: it can take the deployment lock
     // but not release it. `apply` would commit the schema change and only then

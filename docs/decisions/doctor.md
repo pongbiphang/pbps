@@ -963,3 +963,77 @@ Pinned by:
 
 Each live test runs the emitted statement with only the placeholder replaced,
 and the principal's name holds a quote character.
+
+<a id="dec-1644-1"></a>
+
+**DEC-1644.1. SQL Server reads what depends on what through the per-object
+dependency functions under the managed-schema grant; only the hidden-referrer
+proof reads `sys.sql_expression_dependencies`, so `doctor` advises its two
+grants instead of requiring them (#1644; amends SPEC §7.4 and §9.5).**
+
+**Context.** SPEC §9.5 asks for `VIEW DEFINITION` on each managed schema,
+never on the database, and #1359 added `SELECT` on
+`sys.sql_expression_dependencies` to the required list. But that view returns
+**no row at all**, silently, to a login without database `VIEW DEFINITION`:
+schema-scoped `VIEW DEFINITION`, or owning the schema, still reads it empty.
+So for exactly the account §9.5 describes, the pull's omission closure, the
+rename impact report and its `SCHEMABINDING` refusal all read "nothing
+depends on anything".
+
+**Measured**, identically on SQL Server 2017, 2019, 2022 and 2025, with a
+login holding `VIEW DEFINITION` and `SELECT` on `SCHEMA::dbo` only:
+
+| Read | Rows |
+|---|---|
+| `sys.sql_expression_dependencies` | none, no error |
+| `sys.dm_sql_referenced_entities`, one `CROSS APPLY` over `sys.objects` | every edge between visible objects: the view's own edges as `sa`, less the referrer in a schema it cannot see |
+| the same over a module whose column was renamed or dropped | Msg 207 and 2020, the read fails |
+| the same inside `BEGIN TRY … END TRY BEGIN CATCH THROW; END CATCH` | every row, the stale module's table edge included, no error sent; also under `XACT_ABORT ON` inside a transaction, which stays committable |
+
+`public` holds `SELECT` on both functions in `master`; `CONTROL` is not
+needed. A stale module's row has `is_all_columns_found = 0`. A referrer in a
+schema the login cannot see is dropped silently, with no row.
+
+**Decision.**
+- `catalog`'s module dependencies (the pull's omission closure and the
+  default-constraint check) and the rename impact report ask the functions,
+  inside `TRY`, with a `CATCH` that rethrows: a read that fails is never one
+  that found nothing.
+- A column rename reports a referrer by its own rows: one that reads the column
+  by id, reads every column (`is_select_all`), or could not bind all its
+  columns (`is_all_columns_found = 0`). The view kept column rows only for a
+  schema-bound referrer, and a row of `0` for every one, so every
+  `SCHEMABINDING` module reading the table refused the rename of a column it
+  never reads — which SQL Server performs (15336 only for a column the module
+  reads).
+- The hidden-referrer proof of DEC-1462.1, and `expression_edges`, which runs
+  only behind it, keep the view: only the view keeps the edge of a referrer
+  the login cannot see. Both start at one guard,
+  `catalog::require_dependency_catalog`, which refuses by name a login without
+  database `VIEW DEFINITION`.
+- `doctor` moves the view's `SELECT` out of the required list and advises it
+  beside database `VIEW DEFINITION`, each with what it allows, as a
+  `permission.advised` warning. The account stays ready.
+
+**Why not require database `VIEW DEFINITION`.** It is the database-wide grant
+§9.5 exists to avoid, asked of every account for the one kind of plan that
+alters or drops a function or a computed column. DECISIONS 460 and 505 ask for
+it only where it decides something; this does the same.
+
+**Why not the functions without `TRY`.** One module broken by an earlier
+rename anywhere in the database would stop every pull, plan and verify.
+Databases carry such modules.
+
+**What it does not see.** A referrer in a schema the login cannot see is not
+in the report, as it was not before. For a plan it could block, the proof
+refuses; for a report, it is the report of what this login can see.
+
+Pinned by:
+- `a_schema_scoped_account_reads_what_depends_on_what` and
+  `a_schema_scoped_grant_satisfies_the_readiness_check`
+  (`crates/pbps-mssql/tests/live.rs`);
+- `a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge` and
+  `doctor_asks_for_the_dml_a_declared_data_block_needs`
+  (`crates/pbps-cli/tests/flow.rs`);
+- `the_dependency_view_and_database_view_definition_are_advice_not_gaps`
+  (`crates/pbps-mssql/src/doctor.rs`).

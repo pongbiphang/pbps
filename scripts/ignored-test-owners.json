@@ -1543,6 +1543,7 @@
         "a_role_granted_on_more_tables_than_one_statement_holds_is_read_whole",
         "a_row_rewritten_after_the_plan_was_made_is_not_deleted_as_the_reviewed_one",
         "a_row_write_across_a_retyped_column_still_holds_the_recorded_row",
+        "a_schema_scoped_account_reads_what_depends_on_what",
         "a_schema_scoped_grant_satisfies_the_readiness_check",
         "a_spatial_cell_whose_srid_alone_differs_from_its_default_is_still_drift",
         "a_staged_checkpoint_survives_the_ledger",

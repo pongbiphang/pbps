@@ -323,11 +323,39 @@ SELECT o.object_id, NULLIF(o.parent_object_id, 0) AS parent_object_id,
 // Only dependencies the engine resolved to an object in this database can
 // name a temporal table read above. Unresolved and cross-database references
 // have no `referenced_id` and cannot be matched safely by text.
+//
+// Asked object by object, of the modules and default constraints the
+// assembler follows, and not of `sys.sql_expression_dependencies`: that view
+// returns no row at all without database `VIEW DEFINITION`, which SPEC §9.5
+// does not ask for, and the omission closure then read as nothing depending
+// on anything (#1644, DEC-1644.1). The function answers under the
+// managed-schema grant, and `public` holds `SELECT` on it in `master`.
+// A CLR module's dependencies are not in its text, and neither source has
+// any for it, so it is not asked.
+//
+// Inside `TRY`, because the function raises Msg 207 and 2020 for a referrer
+// that no longer binds (a column renamed or dropped under a module that is not
+// schema-bound), and the client turns those into a failed read: one stale
+// procedure anywhere would stop every pull. Inside `TRY` the same rows come
+// back with no error sent, the stale referrer's edge included, and as `sa` they
+// match the catalog view's exactly (measured on SQL Server 2017, 2019, 2022
+// and 2025). The `CATCH` rethrows: whatever does transfer control is a read
+// that failed, never one that found nothing.
 const MODULE_DEPENDENCIES: &str = "\
-SELECT DISTINCT d.referencing_id, d.referenced_id
-  FROM sys.sql_expression_dependencies d
- WHERE d.referenced_id IS NOT NULL
- ORDER BY d.referencing_id, d.referenced_id;";
+BEGIN TRY
+SELECT DISTINCT o.object_id AS referencing_id, r.referenced_id
+  FROM sys.objects o
+  JOIN sys.schemas s ON s.schema_id = o.schema_id
+ CROSS APPLY sys.dm_sql_referenced_entities(
+       QUOTENAME(s.name) + N'.' + QUOTENAME(o.name), N'OBJECT') r
+ WHERE o.is_ms_shipped = 0
+   AND o.type IN ('V', 'P', 'FN', 'IF', 'TF', 'TR', 'D')
+   AND r.referenced_id IS NOT NULL
+ ORDER BY referencing_id, r.referenced_id;
+END TRY
+BEGIN CATCH
+    THROW;
+END CATCH;";
 
 // Non-schema-bound FN and TF functions can be created while a referenced
 // table is absent (pinned against SQL Server by the deferred-resolution live
@@ -812,6 +840,7 @@ pub async fn expression_edges(
     if objects.is_empty() {
         return Ok(Vec::new());
     }
+    require_dependency_catalog(conn).await?;
     let values = objects
         .iter()
         .map(|n| {
@@ -943,23 +972,7 @@ pub async fn prove_referrers_visible(
     conn: &mut Conn,
     targets: &ReferrerTargets,
 ) -> Result<(), DbError> {
-    let granted = conn
-        .query("SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION') AS granted;")
-        .await?;
-    if granted
-        .first()
-        .map(|row| opt::<i32>(row, "granted"))
-        .transpose()?
-        .flatten()
-        != Some(1)
-    {
-        return Err(DbError::Refused(
-            "this login does not hold database VIEW DEFINITION, so \
-             sys.sql_expression_dependencies returns no edge at all and a computed column or \
-             module that calls what this plan changes cannot be seen"
-                .into(),
-        ));
-    }
+    require_dependency_catalog(conn).await?;
     let Some(sql) = hidden_referrers_query(targets) else {
         return Ok(());
     };
@@ -983,6 +996,36 @@ pub async fn prove_referrers_visible(
              plan changes",
             hidden.join(", ")
         )));
+    }
+    Ok(())
+}
+
+/// The one guard every read of `sys.sql_expression_dependencies` passes
+/// (#1644, DEC-1644.1). The view returns no row at all, and no error, without
+/// database `VIEW DEFINITION` (measured on SQL Server 2017 to 2025), so an
+/// empty read is "no
+/// edge" only behind this proof. Only the hidden-referrer proof and the edges
+/// it covers read the view: it alone keeps the edge of a referrer this login
+/// cannot see, with a `NULL` referrer, where `sys.dm_sql_referenc*_entities`
+/// drop it. Every other dependency read asks those functions, which answer
+/// under the managed-schema grant.
+async fn require_dependency_catalog(conn: &mut Conn) -> Result<(), DbError> {
+    let granted = conn
+        .query("SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION') AS granted;")
+        .await?;
+    if granted
+        .first()
+        .map(|row| opt::<i32>(row, "granted"))
+        .transpose()?
+        .flatten()
+        != Some(1)
+    {
+        return Err(DbError::Refused(
+            "this login does not hold database VIEW DEFINITION, so \
+             sys.sql_expression_dependencies returns no edge at all and a computed column or \
+             module that calls what this plan changes cannot be seen"
+                .into(),
+        ));
     }
     Ok(())
 }

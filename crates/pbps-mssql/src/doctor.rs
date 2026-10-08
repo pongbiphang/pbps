@@ -45,12 +45,12 @@ pub use pbps_db::doctor::{DataDemand, DataTables, DeclaredKeys, GrantTargets, Re
 pub enum Needed {
     /// Grantable only at the database, so that is the only place to ask.
     Database,
-    /// `SELECT` on `sys.sql_expression_dependencies`, which reading the
-    /// catalog needs on top of `VIEW DEFINITION` (#1359). The engine grants
-    /// it only to `db_owner` by default, so a least-privilege account holding
-    /// every other entry passed readiness and then met Msg 229 at the first
-    /// `pull`, `plan --db` or `verify`. Asked of that one object, where the
-    /// grant goes.
+    /// `SELECT` on `sys.sql_expression_dependencies` (#1359). The engine
+    /// grants it only to `db_owner` by default. Since #1644 only the
+    /// hidden-referrer proof reads the view, so it is [`ADVISED`] beside
+    /// database `VIEW DEFINITION`, not required: `pull`, `plan --db` and
+    /// `verify` read dependencies through `sys.dm_sql_referenc*_entities`.
+    /// Asked of that one object, where the grant goes.
     CatalogView,
     /// Needed on every schema pbps manages.
     Managed,
@@ -334,6 +334,30 @@ const fn req(name: &'static str, why: &'static str, needed: Needed) -> Requireme
     Requirement { name, why, needed }
 }
 
+/// What one kind of connected plan needs and no other (#1644, DEC-1644.1):
+/// the proof that no computed column or schema-bound module this login
+/// cannot see refers to a function the plan alters or drops, or to a
+/// computed column it drops. Only `sys.sql_expression_dependencies` keeps
+/// such a referrer's edge, and only under database `VIEW DEFINITION` does it
+/// return any row. Without these, that plan is refused by name, and every
+/// other command works: the dependency reads of `pull`, `plan --db` and
+/// `verify` ask `sys.dm_sql_referenc*_entities`, which answer under the
+/// managed-schema grant. So `doctor` names them as advice, never as a gap:
+/// database-wide `VIEW DEFINITION` is the broad ask this list avoids.
+pub const ADVISED: [Requirement; 2] = [
+    req(
+        "VIEW DEFINITION",
+        "proving no hidden computed column or module refers to a function a connected plan \
+         alters or drops, or to a computed column it drops; without it, such a plan is refused",
+        Needed::Database,
+    ),
+    req(
+        "SELECT",
+        "the same proof, which reads this view",
+        Needed::CatalogView,
+    ),
+];
+
 /// The schema the ledger and the lock live in, asked of the module whose
 /// statements put them there rather than spelled a second time here.
 pub use crate::state::LEDGER_SCHEMA;
@@ -342,7 +366,7 @@ pub use crate::state::LEDGER_SCHEMA;
 /// absence still requires the create-time permission.
 pub const LEDGER_TABLES: [&str; 2] = [crate::state::STATE_TABLE, crate::state::LOCK_TABLE];
 
-pub const REQUIRED: [Requirement; 26] = [
+pub const REQUIRED: [Requirement; 25] = [
     req(
         "ALTER",
         "adding the timeline columns to an existing pre-migration state ledger",
@@ -352,11 +376,6 @@ pub const REQUIRED: [Requirement; 26] = [
         "VIEW DEFINITION",
         "reading the catalog: pull, plan --db, verify",
         Needed::Managed,
-    ),
-    req(
-        "SELECT",
-        "reading what views and routines depend on: pull, plan --db, verify",
-        Needed::CatalogView,
     ),
     // `SELECT` twice, because it is needed in two places for two reasons and a
     // single entry made the wrong demand in both directions. The probes count
@@ -2376,8 +2395,18 @@ fn data_gaps(held: &Held, r: &Requirement, wanted: fn(&DataDemand) -> bool, out:
 /// nothing can be said about permissions on it, and saying it anyway would
 /// report a gap on every first deployment.
 pub fn missing(held: &Held) -> Vec<Gap> {
+    gaps(&REQUIRED, held)
+}
+
+/// [`ADVISED`]'s permissions this account does not hold: advice, not a gap
+/// (#1644).
+pub fn advised(held: &Held) -> Vec<Gap> {
+    gaps(&ADVISED, held)
+}
+
+fn gaps(requirements: &[Requirement], held: &Held) -> Vec<Gap> {
     let mut out = Vec::new();
-    for r in &REQUIRED {
+    for r in requirements {
         match r.needed {
             Needed::Database => {
                 if !held.database.contains(r.name) {
@@ -3975,27 +4004,40 @@ mod tests {
     }
 
     /// `SELECT` on `sys.sql_expression_dependencies` is asked of that object,
-    /// where the grant goes, and only when it is not held (#1359): the engine
-    /// gives it to `db_owner` alone, and database `VIEW DEFINITION` does not
-    /// carry it.
+    /// where the grant goes (#1359): the engine gives it to `db_owner` alone,
+    /// and database `VIEW DEFINITION` does not carry it. Since #1644 both are
+    /// advice for the hidden-referrer proof, never a gap: a schema-scoped
+    /// account holding neither is missing nothing, and is told what each
+    /// would allow.
     #[test]
-    fn the_dependency_view_is_asked_for_on_its_own_object() {
+    fn the_dependency_view_and_database_view_definition_are_advice_not_gaps() {
         let mut held = everything(&["dbo"]);
         held.catalog_view.clear();
-        let gaps = missing(&held);
-        assert_eq!(gaps.len(), 1, "{gaps:?}");
-        assert_eq!(gaps[0].permission, "SELECT");
-        assert_eq!(
-            gaps[0].securable,
-            Securable::Object(ObjectName::new("sys", "sql_expression_dependencies"))
+        held.database.remove("VIEW DEFINITION");
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
+        let advice = advised(&held);
+        assert_eq!(advice.len(), 2, "{advice:?}");
+        assert!(
+            advice
+                .iter()
+                .any(|g| g.permission == "VIEW DEFINITION" && g.securable == Securable::Database),
+            "{advice:?}"
         );
+        assert!(
+            advice.iter().any(|g| g.permission == "SELECT"
+                && g.securable
+                    == Securable::Object(ObjectName::new("sys", "sql_expression_dependencies"))),
+            "{advice:?}"
+        );
+        // Each is asked on its own: the database grant does not carry the
+        // view's `SELECT`.
         held.database.insert("VIEW DEFINITION".to_owned());
-        assert_eq!(
-            missing(&held).len(),
-            1,
-            "database VIEW DEFINITION is not it"
-        );
-        assert!(missing(&everything(&["dbo"])).is_empty());
+        let advice = advised(&held);
+        assert_eq!(advice.len(), 1, "{advice:?}");
+        assert_eq!(advice[0].permission, "SELECT");
+        // Negative: holding both, no advice.
+        held.catalog_view.insert("SELECT".to_owned());
+        assert!(advised(&held).is_empty());
     }
 
     #[test]
