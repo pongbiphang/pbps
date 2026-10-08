@@ -713,8 +713,11 @@ carries the normative text, and DEC-1528.1 the reasons.
   - Objects outside the managed set come from a reviewed baseline in the
     repository, run on scratch only. Staging is dependency-ordered with the
     managed declarations. Every external object it creates is compared with
-    the target and sealed into the manifest. For a routine, that is every
-    header property name resolution reads, but never its body. A mismatch, a
+    the target by the properties the manifest already fingerprints for its
+    class, a routine's body excepted, and sealed into the manifest.
+  - The baseline runs in its own session. Afterwards, every managed object
+    already staged must be unchanged, and every object it created must be
+    compared; otherwise it refuses. A mismatch, a
     missing object, or a baseline object in the managed set refuses.
   - pbps sends no routine source of its own. A question needing routine
     source the baseline lacks refuses with the finding and two remedies.

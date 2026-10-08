@@ -1620,13 +1620,18 @@ their full definitions sends routine source no reviewer approved.
 - Staging is dependency-ordered. An external routine taking a managed
   table's row type is created after pbps creates that table from its
   declaration, so the baseline never has to create a managed object.
-- Every external object it creates is compared with the target. That means:
-  - a relation's columns, types and order;
-  - a type's definition;
-  - a routine's header properties that name resolution reads (signature,
-    return type, argument names and modes, defaults, variadic), but never
-    its body. A default alone decides whether `ext.f(1)` is callable;
-  - an extension's version. The compared shapes are sealed into the manifest.
+- Every external object it creates is compared with the target, by exactly
+  the class-specific properties the evidence manifest already fingerprints
+  for that class: column collations, routine defaults and the like. The one
+  exception is a routine's body. A list of properties of its own would miss
+  one per review, as the first drafts of this entry did, with routine
+  defaults and then column collations. Reusing the manifest's list makes
+  the comparison and the recheck one definition.
+- The baseline is arbitrary SQL, so its effects are bounded, not trusted.
+  It runs in its own session, so its `SET`s never reach the compile. Every
+  managed object staged before it must be unchanged after it. Every object
+  it creates must be compared. Otherwise a baseline could alter the managed
+  namespace, and the evidence would describe declarations nobody wrote. The compared shapes are sealed into the manifest.
   So a wrong or stale baseline refuses instead of answering for a database
   that does not exist.
 - A baseline object in the managed set refuses: the declarations stay the

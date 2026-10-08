@@ -1557,19 +1557,32 @@ scratch compile (#1616).
 - **Each external object it creates is compared with the target before any
   binding question is answered.** A mismatch, or an object the target does
   not have, refuses and names the object.
-  - A relation is compared by its column names, types and order (order
-    decides `*` expansion).
-  - A type is compared by its definition: a composite's attributes, an
-    enum's labels in order, a domain's base type.
-  - A routine is compared by every header property name resolution reads:
-    its signature and return type, its argument names and modes, which
-    arguments have defaults, and whether it is variadic. Its body is not
-    compared.
-  - An extension is compared by its name and version.
+  - **One rule decides what is compared:** every class-specific property the
+    evidence manifest already fingerprints for that class of external input
+    (below), and no property of its own. The one exception is a routine's
+    body, which is never compared (#1655).
+  - **Examples:**
+    - a relation's column names, types, collations and order (order decides
+      `*` expansion);
+    - a type's definition: a composite's attributes, an enum's labels in
+      order, a domain's base type and collation;
+    - a routine's header: signature, return type, argument names and modes,
+      defaults, variadic, volatility;
+    - an extension's version.
+  - A property the manifest gains later is compared from then on, without
+    amending this list.
 - **The compared shapes are sealed into the evidence manifest** and rechecked
   like any other external input.
 - **A baseline object in the managed set refuses.** The declarations stay the
   one source of truth.
+- **The baseline changes nothing but the external objects it creates.**
+  - It runs in its own scratch session, so a `SET` in it, `search_path`
+    included, never reaches the session that compiles the declarations.
+  - After it runs, every managed object already staged is re-read and must
+    still be exactly what pbps staged. One altered, dropped or re-owned
+    refuses, and the finding names the object.
+  - An object it creates that is neither managed nor compared with the
+    target refuses too, so it cannot leave unchecked state behind.
 - **pbps itself never sends routine source to scratch.** A routine is there
   only if the operator put it in the baseline. A binding question that needs
   routine source the baseline lacks refuses with a finding naming the
