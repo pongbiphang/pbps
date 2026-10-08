@@ -990,13 +990,16 @@ login holding `VIEW DEFINITION` and `SELECT` on `SCHEMA::dbo` only:
 | the same over a module whose column was renamed or dropped | Msg 207 and 2020, the read fails |
 | the same inside `BEGIN TRY … END TRY BEGIN CATCH THROW; END CATCH` | every row, the stale module's table edge included, no error sent; also under `XACT_ABORT ON` inside a transaction, which stays committable |
 
+As `sa`, the only edges of the view the functions over modules and default
+and check constraints do not return are a table's own, from its computed
+columns, which none of the readers below consumes.
 `public` holds `SELECT` on both functions in `master`; `CONTROL` is not
 needed. A stale module's row has `is_all_columns_found = 0`. A referrer in a
 schema the login cannot see is dropped silently, with no row.
 
 **Decision.**
-- `catalog`'s module dependencies (the pull's omission closure and the
-  default-constraint check) and the rename impact report ask the functions,
+- `catalog`'s module dependencies (the pull's omission closure and its
+  default- and check-constraint checks) and the rename impact report ask the functions,
   inside `TRY`, with a `CATCH` that rethrows: a read that fails is never one
   that found nothing.
 - A column rename reports a referrer by its own rows: one that reads the column

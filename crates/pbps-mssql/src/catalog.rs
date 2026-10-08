@@ -324,8 +324,8 @@ SELECT o.object_id, NULLIF(o.parent_object_id, 0) AS parent_object_id,
 // name a temporal table read above. Unresolved and cross-database references
 // have no `referenced_id` and cannot be matched safely by text.
 //
-// Asked object by object, of the modules and default constraints the
-// assembler follows, and not of `sys.sql_expression_dependencies`: that view
+// Asked object by object, of the modules and the default and check
+// constraints the assembler follows, and not of `sys.sql_expression_dependencies`: that view
 // returns no row at all without database `VIEW DEFINITION`, which SPEC §9.5
 // does not ask for, and the omission closure then read as nothing depending
 // on anything (#1644, DEC-1644.1). The function answers under the
@@ -349,7 +349,7 @@ SELECT DISTINCT o.object_id AS referencing_id, r.referenced_id
  CROSS APPLY sys.dm_sql_referenced_entities(
        QUOTENAME(s.name) + N'.' + QUOTENAME(o.name), N'OBJECT') r
  WHERE o.is_ms_shipped = 0
-   AND o.type IN ('V', 'P', 'FN', 'IF', 'TF', 'TR', 'D')
+   AND o.type IN ('V', 'P', 'FN', 'IF', 'TF', 'TR', 'D', 'C')
    AND r.referenced_id IS NOT NULL
  ORDER BY referencing_id, r.referenced_id;
 END TRY
