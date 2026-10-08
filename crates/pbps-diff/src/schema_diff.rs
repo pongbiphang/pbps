@@ -3214,16 +3214,29 @@ fn refuse_partition_changes(
             }
         })
         .collect();
-    let dropped_columns: BTreeSet<(&TableName, &String)> = changes
+    // The names the plan takes from a column, by a drop or a rename away,
+    // and the name a change gives a column, by an addition or a rename into.
+    let vacated: BTreeSet<(&TableName, &String)> = changes
         .iter()
         .filter_map(|c| {
             if let Change::DropColumn { column, .. } = c {
                 Some((&column.table, &column.name))
+            } else if let Change::RenameColumn { table, from, .. } = c {
+                Some((table, from))
             } else {
                 None
             }
         })
         .collect();
+    let takes_name = |c: &'_ Change| -> Option<String> {
+        if let Change::RenameColumn { to, .. } = c {
+            Some(to.clone())
+        } else if let Change::AddColumn { name, .. } = c {
+            Some(name.clone())
+        } else {
+            None
+        }
+    };
     // A partition dropped under its parent is a transition too: its rows
     // still stand when the pre-flight probes the parent's column (#1692
     // review).
@@ -3378,18 +3391,25 @@ fn refuse_partition_changes(
                         change_in_words(change)
                     ),
                 );
-            } else if let Change::RenameColumn { to, .. } = change
-                && dropped_columns.contains(&(table, to))
+            } else if let Some(name) = takes_name(change)
+                && vacated.contains(&(table, &name))
             {
-                // A name the plan drops, taken by a rename: the apply guard
-                // builds no undo for it (DEC-541.1), and the pre-flight and
-                // the guard key the partitions' carried indexes and probes by
-                // the partition's name (#1692 review, #1699).
+                // A name passing from one column to another in one plan: the
+                // apply guard builds no undo for a dropped name taken again
+                // (DEC-541.1), and the pre-flight and the guard key the
+                // partitions' probes and carried indexes by the partition's
+                // name, so they would read the column the name left (#1692
+                // review, until #1699).
+                let what = if matches!(change, Change::RenameColumn { .. }) {
+                    format!("rename column `{column}` into `{name}`")
+                } else {
+                    format!("add column `{name}`")
+                };
                 refuse(
                     table,
                     format!(
-                        "rename column `{column}` into `{to}`, a name this plan drops; drop the \
-                         column and rename into its name in separate plans"
+                        "{what}, a name this plan takes from another column; free the name and \
+                         give it to the other column in separate plans"
                     ),
                 );
             } else if let Some(tables) = moving.get(table)
@@ -6823,8 +6843,8 @@ mod tests {
         let reuse_refused = |errors: Vec<String>, from: &str, to: &str| {
             assert!(
                 errors.iter().any(|e| e.contains(&format!(
-                    "rename column `{from}` into `{to}`, a name this plan drops; drop the column \
-                     and rename into its name in separate plans"
+                    "rename column `{from}` into `{to}`, a name this plan takes from another \
+                     column; free the name and give it to the other column in separate plans"
                 ))),
                 "{errors:?}"
             );
@@ -7024,17 +7044,38 @@ mod tests {
             from: from.into(),
             to: to.into(),
         };
-        let retyped = from(
+        // The key's old name passes to another column: refused like every
+        // name passing hands under a partitioned parent (until #1699).
+        let retyped = from_outcome(
             &spare_base,
             &[
                 (&moved_key, &[renaming("ts", "k")]),
                 (&moved_in, &[renaming("spare", "ts")]),
             ],
         );
+        reuse_refused(retyped.expect_err("a name passing hands"), "spare", "ts");
+        // A name renamed away and given to a new column (round 8): a
+        // partition's own NOT NULL probe would read the old column.
+        let renamed_away = with(&|p| rename(p, "n", "n_old"), &keep_a, &keep_b);
+        let readded = with(
+            &|p| {
+                rename(p, "n", "n_old");
+                p.columns.insert("n".into(), Column::new(ty("int")));
+            },
+            &keep_a,
+            &keep_b,
+        );
+        let errors = from_outcome(
+            &with(&|_| {}, &keep_a, &keep_b),
+            &[(&renamed_away, &[renaming("n", "n_old")]), (&readded, &[])],
+        )
+        .expect_err("a renamed-away name added again");
         assert!(
-            retyped.iter().any(|c| matches!(c,
-                Change::AlterColumnType { column, .. } if column.name == "ts")),
-            "{retyped:?}"
+            errors.iter().any(|e| e.contains(
+                "add column `n`, a name this plan takes from another column; free the name and \
+                 give it to the other column in separate plans"
+            )),
+            "{errors:?}"
         );
         // A partition's own index on the renamed column is carried by the
         // engine's rename, and not dropped and added again (#1692 review).

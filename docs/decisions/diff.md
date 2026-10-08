@@ -3945,10 +3945,12 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
   moves a name to another column. The probe knows the plan's column changes
   by table, not which table is whose partition, so it would test values or
   columns the engine never checks (DECISIONS 410). The remedy is two plans;
-- a rename into a name the same plan drops. The apply guard builds no undo
-  for a dropped name taken again (DEC-541.1), and the pre-flight and the
-  guard key a partition's probes and carried indexes by the partition's own
-  name. The remedy is two plans, the drop first;
+- a name passing from one column to another in the same plan: a column
+  added, or renamed, into a name the plan drops or renames away. The apply
+  guard builds no undo for a dropped name taken again (DEC-541.1), and the
+  pre-flight and the guard key a partition's probes and carried indexes by
+  the partition's own name, so they would read the column the name left. The
+  remedy is two plans, the name freed first;
 - in a connected plan, a function dropped or rebuilt that a part of one of
   the parent's partitions depends on. The connected passes key parts by the
   partition's name and cannot follow the parent's column change into it. The
