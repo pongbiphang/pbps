@@ -819,6 +819,21 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             ),
             Lock::AccessExclusive,
         ),
+        // The engine scans every row of the table for the range, and builds
+        // or checks each of the parent's keys and foreign keys over it,
+        // holding it exclusively; the parent takes a lock only other schema
+        // changes wait on, and its DEFAULT partition is scanned too.
+        // Measured on 16 and 18 (#1545).
+        Change::AttachPartition { table, parent, .. } => e(
+            format!(
+                "attaching {table} to {parent} as a partition; the parent's DEFAULT partition, if \
+                 it has one, is scanned for rows inside the range as well"
+            ),
+            table,
+            Rewrite::No,
+            Reads::EveryRow,
+            Lock::AccessExclusive,
+        ),
         Change::DropTable {
             name,
             detach_from: Some(parent),

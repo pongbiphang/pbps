@@ -969,6 +969,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             }
             change @ pbps_model::Change::DropTable { .. }
             | change @ pbps_model::Change::DetachPartition { .. }
+            | change @ pbps_model::Change::AttachPartition { .. }
             | change @ pbps_model::Change::RenameTable { .. }
             | change @ pbps_model::Change::AddColumn { .. }
             | change @ pbps_model::Change::DropColumn { .. }
@@ -7041,6 +7042,265 @@ fn a_partition_is_detached_and_kept_through_the_cli() {
             "SELECT count(*) FROM pg_constraint WHERE conname IN ('arch_pk', 'arch_n_ck')"
         ),
         2
+    );
+}
+
+/// An ordinary managed table moved into its parent's `partitions:` is
+/// attached through the CLI and keeps its rows (#1545): refused by name while
+/// it holds a column its parent does not, then behind `--allow constraint`,
+/// refused by the pre-flight while a row of it is outside its range or a row
+/// of the DEFAULT partition is inside it, and nothing changed. Then attached:
+/// its own index the declaration drops goes first, its matching index
+/// becomes its parent's clone, its own check and NOT NULL stay, and the
+/// parent's default comes back. Its rows answer through the parent, its
+/// column uids are gone from the ids file, `verify` is clean, and nothing is
+/// left to plan. A table already its parent's shape is one change, attached
+/// in a staged apply as well.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_table_is_attached_as_a_partition_through_the_cli() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "attach-1545");
+    let connection = own.connection().to_owned();
+    on_server(&connection, "CREATE SCHEMA app");
+    let d = Demo::new("attach-1545");
+    let tree = |partitions: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.ev.yml"),
+            format!(
+                "table: app.ev\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                 ts: {{type: date, nullable: false}}\n  n: {{type: integer, default: \"1\"}}\n\
+                 primary_key: [id, ts]\nindexes:\n  ev_n: {{columns: [n]}}\n\
+                 checks:\n  ev_n_ck: n > 0\npartition_by: [ts]\npartitions:\n{partitions}"
+            ),
+        )
+        .unwrap();
+    };
+    let p2025 = "  ev_2025: {from: [\"2025-01-01\"], to: [\"2026-01-01\"]}\n";
+    let rest = "  ev_rest: default\n";
+    let ordinary = d.dir.join("schema/app.t.yml");
+    let table = |extra: &str| {
+        std::fs::write(
+            &ordinary,
+            format!(
+                "table: app.t\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                 ts: {{type: date, nullable: false}}\n  n: {{type: integer, nullable: false}}\n\
+                 {extra}primary_key:\n  name: t_pk\n  columns: [id, ts]\n\
+                 indexes:\n  t_n: {{columns: [n]}}\n  t_id: {{columns: [id]}}\n\
+                 checks:\n  ev_n_ck: n > 0\n  t_small: n < 100\n"
+            ),
+        )
+        .unwrap();
+    };
+    tree(&format!("{p2025}{rest}"));
+    table("  extra: {type: text}\n");
+    let staged = d.dir.join("schema/app.s.yml");
+    std::fs::write(
+        &staged,
+        "table: app.s\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+         ts: {type: date, nullable: false}\n  n: {type: integer, default: \"1\"}\n\
+         primary_key: [id, ts]\nchecks:\n  ev_n_ck: n>0\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &connection]));
+    on_server(
+        &connection,
+        "INSERT INTO app.t VALUES (1, '2024-06-01', 5, 'a'), (2, '2023-06-01', 6, 'b'); \
+         INSERT INTO app.ev VALUES (9, '2024-07-07', 7); \
+         INSERT INTO app.s VALUES (5, '2022-03-03', 1)",
+    );
+    // The ids file's columns on `app.t`, by name.
+    let columns_of_t = || -> Vec<String> {
+        let text = std::fs::read_to_string(d.dir.join("schema.ids.json")).unwrap();
+        let ids: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut names: Vec<String> = ids["columns"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(|v| v.as_str()?.strip_prefix("app.t.").map(str::to_owned))
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(columns_of_t(), ["extra", "id", "n", "ts"]);
+
+    // A column its parent does not have: refused by name, and the ids file
+    // keeps the table's columns.
+    std::fs::remove_file(&ordinary).unwrap();
+    let attached = "  t:\n    from: [\"2024-01-01\"]\n    to: [\"2025-01-01\"]\n    \
+                    checks:\n      t_small: n < 100\n    columns:\n      n: {nullable: false}\n";
+    tree(&format!("{p2025}{attached}{rest}"));
+    let o = d.run(&["plan"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        said.contains(
+            "app.t is attached to app.ev as a partition, but its columns are \
+                       (id, ts, n, extra), and its parent's are (id, ts, n)"
+        ),
+        "{said}"
+    );
+    assert_eq!(columns_of_t(), ["extra", "id", "n", "ts"]);
+
+    // The column dropped in a plan of its own.
+    tree(&format!("{p2025}{rest}"));
+    table("");
+    succeeds(d.run(&["drop", "app.t.extra", "--reason", "not the parent's"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("drop.json");
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+
+    // Attached: planned behind its risk.
+    std::fs::remove_file(&ordinary).unwrap();
+    tree(&format!("{p2025}{attached}{rest}"));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    assert!(columns_of_t().is_empty(), "{:?}", columns_of_t());
+    let plan = d.dir.join("attach.json");
+    let o = succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&o).contains("~ attach table app.t to app.ev as a partition, keeping its rows"),
+        "{}",
+        stdout(&o)
+    );
+    let o = approved_apply(&d, &connection, &plan, &[]);
+    assert_ne!(
+        code(&o),
+        0,
+        "an attach needs its risk allowed: {}",
+        stdout(&o)
+    );
+    // Refused by the pre-flight, by name, and nothing changed. An unmanaged
+    // trigger and a column grant, which the declarations do not see and the
+    // engine attaches over, are counted from the catalog (#1642 review).
+    on_server(
+        &connection,
+        "CREATE FUNCTION app.noop() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TRIGGER noop BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.noop();
+         GRANT SELECT (n) ON app.t TO PUBLIC",
+    );
+    let o = approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "destructive,constraint"],
+    );
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        said.contains("1 rows of app.t outside the range it takes under app.ev")
+            && said.contains("1 rows of app.ev inside the range of its new partition app.t")
+            && said.contains("1 triggers on app.t, which a partition does not hold yet")
+            && said.contains("1 columns of app.t with grants of their own")
+            && said.contains("nothing has been changed"),
+        "{said}"
+    );
+    let holds = |sql: &str| scalar(&connection, &format!("SELECT ({sql})::int::int8"));
+    assert_eq!(
+        holds("SELECT relispartition FROM pg_class WHERE oid = 'app.t'::regclass"),
+        0
+    );
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_class WHERE relname = 't_id'"),
+        1
+    );
+
+    // Out of the way: attached.
+    on_server(
+        &connection,
+        "DELETE FROM app.t WHERE id = 2; DELETE FROM app.ev WHERE id = 9;
+         DROP TRIGGER noop ON app.t; DROP FUNCTION app.noop();
+         REVOKE SELECT (n) ON app.t FROM PUBLIC",
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "destructive,constraint"],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        holds("SELECT tableoid = 'app.t'::regclass FROM app.ev WHERE id = 1"),
+        1
+    );
+    // The parent's default, given back: a row written straight to the table
+    // takes it, as one through the parent does.
+    on_server(
+        &connection,
+        "INSERT INTO app.t (id, ts) VALUES (3, '2024-08-01'); \
+         INSERT INTO app.ev (id, ts) VALUES (4, '2024-09-01')",
+    );
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM app.t WHERE id IN (3, 4) AND n = 1"
+        ),
+        2
+    );
+    // Its matching index its parent's clone, the other one gone, its own
+    // check still its own.
+    assert_eq!(
+        holds("SELECT relispartition FROM pg_class WHERE relname = 't_n'"),
+        1
+    );
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_class WHERE relname = 't_id'"),
+        0
+    );
+    assert_eq!(
+        holds(
+            "SELECT conislocal AND coninhcount = 0 FROM pg_constraint \
+              WHERE conrelid = 'app.t'::regclass AND conname = 't_small'"
+        ),
+        1
+    );
+
+    // Already its parent's shape: the attach alone, staged. Its check is
+    // spelled `n>0` beside its parent's `n > 0`, which the engine reads as
+    // one, and so does the connected plan (#1642 review).
+    std::fs::remove_file(&staged).unwrap();
+    tree(&format!(
+        "{p2025}{attached}  s: {{from: [\"2022-01-01\"], to: [\"2023-01-01\"]}}\n{rest}"
+    ));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("staged.json");
+    let o = succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    assert!(
+        stdout(&o).contains("~ attach table app.s to app.ev as a partition, keeping its rows"),
+        "{}",
+        stdout(&o)
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--staged", "--allow", "constraint"],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        holds("SELECT tableoid = 'app.s'::regclass FROM app.ev WHERE id = 5"),
+        1
     );
 }
 

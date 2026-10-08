@@ -483,8 +483,9 @@ pub(super) fn derive(
                 (Surface::Table(table.clone()), false, true, true, None)
             }
             // The table stays, and every key, constraint and index on it is
-            // renamed (#1544).
-            Change::DetachPartition { table, .. } => {
+            // renamed (#1544); or, attached, its columns turn inherited and
+            // its matching keys and indexes become clones (#1545).
+            Change::DetachPartition { table, .. } | Change::AttachPartition { table, .. } => {
                 (Surface::Table(table.clone()), true, true, true, None)
             }
             Change::AddCheck { table, name, .. } => (

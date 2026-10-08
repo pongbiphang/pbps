@@ -200,10 +200,12 @@ fn moves_bindings(
         | Change::AddComputedColumn { .. }
         | Change::DropComputedColumn { .. }
         // Renames the clones of its parent's indexes and keys to the
-        // declaration's names, and its table leaves the parent's inheritance.
-        // Partitions are PostgreSQL's alone, where an index's name is a
-        // relation's.
+        // declaration's names, and its table leaves the parent's inheritance;
+        // or, attached, builds whichever of them the table lacks under names
+        // the engine chooses, and its table joins it (#1545). Partitions are
+        // PostgreSQL's alone, where an index's name is a relation's.
         | Change::DetachPartition { .. }
+        | Change::AttachPartition { .. }
         // A routine's identity, a view's columns, a type's existence.
         | Change::CreateModule { .. }
         | Change::DropModule { .. } => true,

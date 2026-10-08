@@ -168,6 +168,21 @@ pub enum DiffError {
         what: Vec<String>,
     },
 
+    /// An ordinary table declared as a partition that the engine would not
+    /// attach as declared, or would attach into something the model does
+    /// not hold (#1545, DEC-1545.1): each reason is a change to make to the
+    /// table in an earlier plan.
+    #[error(
+        "{table} is attached to {parent} as a partition, but {}. Bring the table to its \
+         parent's shape in an earlier plan, then attach it.",
+        what.join("; ")
+    )]
+    AttachedShape {
+        table: TableName,
+        parent: TableName,
+        what: Vec<String>,
+    },
+
     /// A `data:` table whose primary key moved to a different column. The row
     /// keys on each side are values of that side's key column, so the two sets
     /// have nothing in common and matching them by text would update and
@@ -290,6 +305,7 @@ pub fn diff_rebuilding(
         also,
         Rebinding::Candidates,
         Screen::Text,
+        None,
     )
 }
 
@@ -321,6 +337,32 @@ pub enum Screen {
     Catalog,
 }
 
+/// [`diff_rebuilding`], or [`diff_connected`] for `Screen::Catalog`, for a
+/// connected plan, which also hands over `read_back`: what it read, before the
+/// recorded declared texts are put in place of the engine's spelling. Only
+/// the comparisons the engine makes by parse tree read it; every other
+/// comparison stays on the recorded texts (#1642 review).
+pub fn diff_read_back(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &dyn Dialect,
+    hints: &Hints,
+    also: &BTreeSet<ModuleId>,
+    screen: Screen,
+    read_back: &Schema,
+) -> Result<ChangeSet, Vec<DiffError>> {
+    rebuilding_by(
+        base,
+        declared,
+        dialect,
+        hints,
+        also,
+        Rebinding::Candidates,
+        screen,
+        Some(read_back),
+    )
+}
+
 /// [`diff_rebuilding`] for a connected SQL Server plan, which judges its
 /// standing computed columns by the catalog's edges (`Screen::Catalog`).
 pub fn diff_connected(
@@ -338,9 +380,11 @@ pub fn diff_connected(
         also,
         Rebinding::Candidates,
         Screen::Catalog,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rebuilding_by(
     base: Side<'_>,
     declared: Side<'_>,
@@ -349,8 +393,11 @@ pub(crate) fn rebuilding_by(
     also: &BTreeSet<ModuleId>,
     rebinding: Rebinding,
     screen: Screen,
+    read_back: Option<&Schema>,
 ) -> Result<ChangeSet, Vec<DiffError>> {
-    let d = diff_partial_rebuilding(base, declared, dialect, hints, also, rebinding, screen);
+    let d = diff_partial_rebuilding(
+        base, declared, dialect, hints, also, rebinding, screen, read_back,
+    );
     if d.errors.is_empty() {
         Ok(d.changes)
     } else {
@@ -385,9 +432,11 @@ pub fn diff_partial(
         &BTreeSet::new(),
         Rebinding::Candidates,
         Screen::Text,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn diff_partial_rebuilding(
     base: Side<'_>,
     declared: Side<'_>,
@@ -396,6 +445,7 @@ fn diff_partial_rebuilding(
     also: &BTreeSet<ModuleId>,
     rebinding: Rebinding,
     screen: Screen,
+    read_back: Option<&Schema>,
 ) -> Diffed {
     let mut changes = Vec::new();
     let mut errs = Vec::new();
@@ -590,6 +640,103 @@ fn diff_partial_rebuilding(
             continue;
         }
 
+        // An ordinary table declared as a partition is attached, and keeps
+        // its rows (#1545, DEC-1545.1). Its columns become its parent's, so
+        // they are not compared; what it holds of its own once attached is
+        // compared with the declaration as a standing partition's is, and
+        // brought to it by the same changes after the attach.
+        if base_table.partition_of.is_none()
+            && let Some(of) = &declared_table.partition_of
+        {
+            match attached(
+                base,
+                base_name,
+                declared_name,
+                base_table,
+                declared_table,
+                of,
+                dialect,
+                read_back,
+            ) {
+                Ok(Attached {
+                    table,
+                    defaultless,
+                    displaced,
+                    released,
+                }) => {
+                    changes.extend(released);
+                    // Gone before the attach, so the engine adopts the one
+                    // index left for each of its parent's or builds it; one
+                    // the declaration keeps as its own is added after.
+                    for name in displaced {
+                        changes.push(Change::DropIndex {
+                            table: declared_name.clone(),
+                            name,
+                        });
+                    }
+                    changes.push(Change::AttachPartition {
+                        uid: uid.clone(),
+                        table: declared_name.clone(),
+                        parent: of.parent.clone(),
+                        bound: of.bound.clone(),
+                        shape: Box::new(declared_table.clone()),
+                    });
+                    diff_constraints(declared_name, &table, declared_table, &mut changes);
+                    diff_storage_parameters(
+                        uid,
+                        declared_name,
+                        &table,
+                        declared_table,
+                        &mut changes,
+                    );
+                    if table.unlogged != declared_table.unlogged {
+                        changes.push(Change::SetTablePersistence {
+                            uid: uid.clone(),
+                            table: declared_name.clone(),
+                            unlogged: declared_table.unlogged,
+                        });
+                    }
+                    diff_partition_columns(
+                        uid,
+                        declared_name,
+                        &table,
+                        declared_table,
+                        declared.schema,
+                        &mut changes,
+                    );
+                    // A column without a default where its parent's has one:
+                    // the attach gives it none, which no declaration can say
+                    // and the reader does not hold, so it takes its parent's
+                    // unless it declares its own, which the comparison above
+                    // sets (measured on 16 and 18).
+                    let parent = declared.schema.tables.get(&of.parent);
+                    for column in defaultless {
+                        let own = of.columns.get(&column).and_then(|c| c.default.as_ref());
+                        let fallback = parent
+                            .and_then(|p| p.columns.get(&column))
+                            .and_then(|c| c.default.clone());
+                        if let (None, Some(fallback)) = (own, fallback) {
+                            changes.push(Change::SetPartitionDefault {
+                                uid: uid.clone(),
+                                table: declared_name.clone(),
+                                parent: of.parent.clone(),
+                                column,
+                                from: None,
+                                to: None,
+                                fallback: Some(fallback),
+                            });
+                        }
+                    }
+                }
+                Err(what) => errs.push(DiffError::AttachedShape {
+                    table: declared_name.clone(),
+                    parent: of.parent.clone(),
+                    what,
+                }),
+            }
+            continue;
+        }
+
         diff_columns(
             base,
             declared,
@@ -685,6 +832,7 @@ fn diff_partial_rebuilding(
             Change::RenameTable { to, .. } => Some(ModuleId::Named(to.clone())),
             Change::DropTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
             | Change::RenameColumn { .. }
@@ -733,6 +881,7 @@ fn diff_partial_rebuilding(
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -849,7 +998,39 @@ fn diff_partial_rebuilding(
     // Rows follow the foreign keys among the tables that declare them. The
     // declared side is the right one to read: a row being inserted is going
     // into the schema as it will be, not as it was.
-    let data_rank = rank_of_tables(&pbps_model::data::insertion_order(declared.schema));
+    //
+    // An attach brings rows into its parent and validates the parent's
+    // foreign keys over them, so the parents this plan attaches to are
+    // ordered with the tables that receive rows: a parent after every table
+    // it references, whether rows or another attach fill that one (#1642
+    // review).
+    let attach_parents: BTreeMap<TableName, TableName> = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::AttachPartition { table, parent, .. } = &p.change {
+                Some((table.clone(), parent.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let data_rank = rank_of_tables(&if attach_parents.is_empty() {
+        pbps_model::data::insertion_order(declared.schema)
+    } else {
+        pbps_model::data::supply_order(
+            declared.schema,
+            declared
+                .schema
+                .tables
+                .iter()
+                .filter(|(_, t)| t.data.is_some())
+                .map(|(n, _)| n.clone())
+                .chain(attach_parents.values().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        )
+    });
     // Roles that are dropped together are ordered parent before member.
     let role_rank = member_depth(&planned);
     // The tables a `RenameColumn` in this plan claims a column name on. Both
@@ -887,6 +1068,7 @@ fn diff_partial_rebuilding(
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -938,6 +1120,7 @@ fn diff_partial_rebuilding(
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::RenameColumn { .. }
@@ -1122,6 +1305,43 @@ fn diff_partial_rebuilding(
         .iter()
         .filter_map(|p| row_table(&p.change).cloned())
         .collect();
+    // An attach validates its parent's foreign keys over the rows it brings,
+    // as `ADD FOREIGN KEY` does, so one whose parent references a table this
+    // plan writes rows into, or attaches a table to, waits for them: among
+    // the row changes, at its parent's rank, after every table the parent
+    // references and before the rows of a table that references the parent.
+    // Its own changes follow it there. Any other attach stays in class 7
+    // (#1642 review).
+    let late_attach: BTreeMap<TableName, isize> = attach_parents
+        .iter()
+        .filter(|(_, parent)| {
+            declared.schema.tables.get(*parent).is_some_and(|t| {
+                t.foreign_keys.values().any(|fk| {
+                    fk.references_table != **parent
+                        && (row_tables.contains(&fk.references_table)
+                            || attach_parents.values().any(|p| *p == fk.references_table))
+                })
+            })
+        })
+        .map(|(table, parent)| {
+            (
+                table.clone(),
+                data_rank.get(parent).map_or(0, |r| *r as isize),
+            )
+        })
+        .collect();
+    let follows_late_attach = |c: &Change| -> bool {
+        if let Change::SetPartitionDefault { table, .. }
+        | Change::SetPartitionNotNull { table, .. }
+        | Change::SetTablePersistence { table, .. }
+        | Change::SetStorageParameters { table, .. }
+        | Change::SetIndexStorageParameters { table, .. } = c
+        {
+            late_attach.contains_key(table)
+        } else {
+            false
+        }
+    };
     // A function a computed column calls is dropped after the column, by a
     // connected plan's pass over the catalog's own edges
     // (`order_computed_by_edges`, DEC-1431.1). An offline plan is never
@@ -1171,6 +1391,14 @@ fn diff_partial_rebuilding(
     };
     let deepest = depth_of.values().copied().max().unwrap_or(0);
     let sort_class = |c: &Change| -> (u8, usize) {
+        if let Change::AttachPartition { table, .. } = c
+            && late_attach.contains_key(table)
+        {
+            return (ROW_DELETIONS - 1, 1);
+        }
+        if follows_late_attach(c) {
+            return (ROW_DELETIONS - 1, 2);
+        }
         if let Change::SetTablePersistence {
             table, unlogged, ..
         } = c
@@ -1287,7 +1515,13 @@ fn diff_partial_rebuilding(
         (
             class,
             within,
-            dependency_rank(&p.change, &create_rank, &drop_rank, &data_rank, &role_rank),
+            if let Change::AttachPartition { table, .. } = &p.change
+                && let Some(rank) = late_attach.get(table)
+            {
+                *rank
+            } else {
+                dependency_rank(&p.change, &create_rank, &drop_rank, &data_rank, &role_rank)
+            },
             p.change.subject(),
             format!("{:?}", p.change),
         )
@@ -1584,6 +1818,7 @@ fn recreate_referenced_foreign_keys(
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -1874,6 +2109,7 @@ fn recreate_retyped_dependents(
         Change::CreateTable { .. }
         | Change::DropTable { .. }
         | Change::DetachPartition { .. }
+        | Change::AttachPartition { .. }
         | Change::RenameTable { .. }
         | Change::AddColumn { .. }
         | Change::DropColumn { .. }
@@ -2378,6 +2614,447 @@ fn detached_names(
     }
 }
 
+/// A table being attached as declared (#1545): itself as a partition the
+/// moment the attach has run, holding only what the engine leaves it of its
+/// own, and its columns without a default where the parent's has one.
+struct Attached {
+    table: Table,
+    defaultless: Vec<String>,
+    /// The table's indexes dropped before the attach: every one the engine
+    /// could adopt but for the one left to it.
+    displaced: Vec<String>,
+    /// The table's key and unique constraints dropped before the attach,
+    /// whose index a plain unique index of the parent's could take.
+    released: Vec<Change>,
+}
+
+/// What the ordinary table `table` is once attached to `of.parent`, or what
+/// keeps it from being attached into a tree the model holds (#1545,
+/// DEC-1545.1). Measured on 16 and 18:
+///
+/// - its columns must be its parent's, in its parent's order, with the same
+///   types, collations, identities and generations, and NOT NULL wherever
+///   the parent's are, or the engine refuses the attach; the order is the
+///   reader's, which leaves a tree out over a partition in another;
+/// - each of the parent's checks must be on it under the same name, and
+///   becomes the inherited copy; the rest of its checks stay its own;
+/// - an index, a key or a foreign key matching one of the parent's is
+///   adopted as its clone, and the engine builds whichever is missing; a key
+///   or a foreign key of its own would stay its own, which a partition does
+///   not hold yet, while an index of its own stays as one;
+/// - its defaults stay, and none of the parent's is given to a column
+///   without one.
+#[allow(clippy::too_many_arguments)]
+fn attached(
+    base: Side<'_>,
+    base_name: &TableName,
+    declared_name: &TableName,
+    table: &Table,
+    declared: &Table,
+    of: &pbps_model::PartitionOf,
+    dialect: &dyn Dialect,
+    read_back: Option<&Schema>,
+) -> Result<Attached, Vec<String>> {
+    let mut what = Vec::new();
+    let Some(parent) = base
+        .schema
+        .tables
+        .get(&of.parent)
+        .filter(|p| p.partition_by.is_some() && p.partition_of.is_none())
+    else {
+        return Err(vec![format!(
+            "its parent {} is not a partitioned table before this plan; create the partition \
+             with its parent, or attach the table in a later plan",
+            of.parent
+        )]);
+    };
+    if base_name != declared_name {
+        what.push(format!(
+            "it is renamed from {base_name} in the same plan; rename it in one plan and attach it \
+             in another"
+        ));
+    }
+    if table.partition_by.is_some() {
+        what.push("it is partitioned itself".to_owned());
+    }
+    if of.bound == pbps_model::PartitionBound::Default {
+        what.push(
+            "it would be the DEFAULT partition, which only a range is attached as here; create \
+             the DEFAULT partition and move the rows into it"
+                .to_owned(),
+        );
+    }
+    // Types in the engine's spelling, as `diff_columns` compares them. A
+    // default and NOT NULL may be its own, and are compared below.
+    let columns = |t: &Table| -> Vec<(String, pbps_model::Column)> {
+        t.columns
+            .iter()
+            .map(|(name, c)| {
+                let ty = dialect
+                    .normalize_type(&c.ty)
+                    .unwrap_or_else(|_| c.ty.clone());
+                // A deprecation is an annotation the catalog does not
+                // hold, as a description is.
+                let column = pbps_model::Column {
+                    ty,
+                    nullable: true,
+                    default: None,
+                    description: None,
+                    deprecated: None,
+                    ..c.clone()
+                };
+                (name.clone(), column)
+            })
+            .collect()
+    };
+    // The engine matches a check and a generation expression on what they
+    // parse to, which the recorded texts do not show: `n>0` and `n > 0` are
+    // one. A connected plan has the engine's own spelling of both standing
+    // objects, under the overlay of the recorded texts, and compares that;
+    // the recorded texts stay the shape's. Offline there is no such spelling,
+    // so the texts are left out and the two are matched by name and kind:
+    // an offline plan is never applied (SPEC §7.3), and refusing there would
+    // also keep it from writing the identities the connected plan needs
+    // (#1642 review).
+    let spelled = |t: &Table, name: &TableName| -> Table {
+        let mut t = t.clone();
+        let read = read_back.map(|r| r.tables.get(name));
+        for (check, spec) in &mut t.checks {
+            match read {
+                Some(read) => {
+                    if let Some(engine) = read.and_then(|r| r.checks.get(check)) {
+                        spec.expression = engine.expression.clone();
+                    }
+                }
+                None => spec.expression.clear(),
+            }
+        }
+        for (column, spec) in &mut t.columns {
+            let Some(generated) = &mut spec.generated else {
+                continue;
+            };
+            match read {
+                Some(read) => {
+                    if let Some(engine) = read
+                        .and_then(|r| r.columns.get(column))
+                        .and_then(|c| c.generated.as_ref())
+                    {
+                        generated.expression = engine.expression.clone();
+                    }
+                }
+                None => generated.expression.clear(),
+            }
+        }
+        t
+    };
+    let (table_spelled, parent_spelled) = (spelled(table, base_name), spelled(parent, &of.parent));
+    let (mine, theirs) = (columns(&table_spelled), columns(&parent_spelled));
+    let names = |c: &[(String, pbps_model::Column)]| {
+        c.iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // The names themselves, not their joined spelling, which two lists can
+    // share when a name holds `, ` (#1642 review).
+    if !mine
+        .iter()
+        .map(|(n, _)| n)
+        .eq(theirs.iter().map(|(n, _)| n))
+    {
+        what.push(format!(
+            "its columns are ({}), and its parent's are ({}), in that order",
+            names(&mine),
+            names(&theirs)
+        ));
+    } else {
+        for ((name, a), (_, b)) in mine.iter().zip(&theirs) {
+            if a != b {
+                what.push(format!(
+                    "its column `{name}` is not its parent's in type, collation, identity or \
+                     generation"
+                ));
+            } else if a.generated.is_some() && base_name.schema != of.parent.schema {
+                // The engine does not compare generation expressions as it
+                // attaches, and keeps the table's: in another schema the same
+                // text may call another function, and each partition would
+                // then compute the column its own way (measured on 18, #1642
+                // review).
+                what.push(format!(
+                    "its column `{name}` is generated, and in another schema than its parent \
+                     the same expression may call another function; move the table to its \
+                     parent's schema first"
+                ));
+            }
+        }
+    }
+    let mut own_columns = BTreeMap::new();
+    let mut defaultless = Vec::new();
+    for (name, c) in &table.columns {
+        let Some(p) = parent.columns.get(name) else {
+            continue;
+        };
+        if c.nullable && !p.nullable {
+            what.push(format!(
+                "its column `{name}` is nullable, and its parent's is NOT NULL"
+            ));
+        }
+        let own = pbps_model::PartitionColumn {
+            // The same text as the parent's is the parent's, as the reader
+            // reads it back, but only in the parent's schema: elsewhere an
+            // unqualified name in it may be another schema's object, so it
+            // is the table's own, and taking the parent's back sets the
+            // parent's under the parent's path (DEC-1581.1).
+            default: c
+                .default
+                .clone()
+                .filter(|d| base_name.schema != of.parent.schema || Some(d) != p.default.as_ref()),
+            not_null: !c.nullable && p.nullable,
+        };
+        if c.default.is_none() && p.default.is_some() {
+            defaultless.push(name.clone());
+        }
+        if own != pbps_model::PartitionColumn::default() {
+            own_columns.insert(name.clone(), own);
+        }
+    }
+    match (&table.primary_key, &parent.primary_key) {
+        (None, _) => {}
+        (Some(own), Some(p)) if own.columns == p.columns => {}
+        (Some(_), _) => what.push("its primary key is not its parent's".to_owned()),
+    }
+    // One to one: a second match would stay its own.
+    fn unmatched<'a, V: PartialEq>(
+        own: &'a BTreeMap<String, V>,
+        parent: &BTreeMap<String, V>,
+    ) -> Vec<&'a String> {
+        let mut free: Vec<&V> = parent.values().collect();
+        own.iter()
+            .filter(|(_, d)| match free.iter().position(|p| p == d) {
+                Some(at) => {
+                    free.remove(at);
+                    false
+                }
+                None => true,
+            })
+            .map(|(n, _)| n)
+            .collect()
+    }
+    // By definition, storage parameters aside: measured on 16 and 18, the
+    // engine adopts a key or an index whatever its own, which it keeps, and a
+    // clone's are not held.
+    let unique = |t: &Table| -> BTreeMap<String, pbps_model::UniqueConstraint> {
+        t.unique
+            .iter()
+            .map(|(n, u)| {
+                let mut u = u.clone();
+                u.storage_parameters.clear();
+                (n.clone(), u)
+            })
+            .collect()
+    };
+    // An index as the engine matches it to adopt it: storage parameters
+    // and sort order aside, measured on 16 and 18 (`DESC` and `NULLS FIRST`
+    // adopted, another collation, operator class, `INCLUDE` or method not).
+    let index = |t: &Table| -> BTreeMap<String, Index> {
+        t.indexes
+            .iter()
+            .map(|(n, i)| {
+                let mut i = i.clone();
+                i.storage_parameters.clear();
+                for c in &mut i.columns {
+                    c.descending = false;
+                }
+                (n.clone(), i)
+            })
+            .collect()
+    };
+    for name in unmatched(&unique(table), &unique(parent)) {
+        what.push(format!(
+            "its unique constraint `{name}` is not its parent's, and a partition holds none of \
+             its own yet"
+        ));
+    }
+    for name in unmatched(&table.foreign_keys, &parent.foreign_keys) {
+        what.push(format!(
+            "its foreign key `{name}` is not its parent's, and a partition holds none of its own \
+             yet"
+        ));
+    }
+    let mut checks = table.checks.clone();
+    for (name, p) in &parent_spelled.checks {
+        checks.remove(name);
+        if table_spelled.checks.get(name) != Some(p) {
+            what.push(format!(
+                "its parent's check `{name}` is not on it under that name, which the engine \
+                 requires"
+            ));
+        }
+    }
+    // Which of several matches the engine adopts is the first by oid, which
+    // no plan knows (`RelationGetIndexList`). So at most one is left for
+    // each of the parent's indexes, and one the declaration does not keep
+    // as its own; the others are dropped before the attach. An adopted
+    // index keeps its name as the clone, so one whose name the declaration
+    // gives an index of its own is never the one left (#1642 review).
+    let (own_indexes, parents_indexes) = (index(table), index(parent));
+    let mut taken: BTreeSet<&String> = BTreeSet::new();
+    let mut displaced = Vec::new();
+    // An expression or a filter is matched by the engine on what it is
+    // bound to and how it parses, which its text does not say: `n+1` and
+    // `n + 1` are one, and in another schema the same text may call another
+    // function. So every such index is dropped before the attach, and one
+    // the declaration keeps added after it, in any schema (#1642 review).
+    for (name, index) in &table.indexes {
+        if index.filter.is_some()
+            || index
+                .columns
+                .iter()
+                .any(|c| matches!(c.key, pbps_model::IndexKey::Expression(_)))
+        {
+            taken.insert(name);
+            displaced.push(name.clone());
+        }
+    }
+    for definition in parents_indexes.values() {
+        let matches: Vec<&String> = own_indexes
+            .iter()
+            .filter(|(n, d)| *d == definition && !taken.contains(n))
+            .map(|(n, _)| n)
+            .collect();
+        let left = matches
+            .iter()
+            .find(|n| !declared.indexes.contains_key(n.as_str()))
+            .copied();
+        for n in matches {
+            taken.insert(n);
+            if Some(n) != left {
+                displaced.push(n.clone());
+            }
+        }
+    }
+    let indexes = table
+        .indexes
+        .iter()
+        .filter(|(n, _)| !taken.contains(n))
+        .map(|(n, i)| (n.clone(), i.clone()))
+        .collect();
+    // A parent's plain index adopts a matching index whether or not a
+    // constraint stands on it, while a parent's key or unique constraint
+    // adopts only one that has one. Measured on 16 and 18, a parent's
+    // `UNIQUE INDEX (a)` made before its `UNIQUE (a)` takes the index of the
+    // table's `UNIQUE (a)`, the constraint stays the table's own, and the
+    // parent's constraint is built a clone beside it: a tree the reader
+    // refuses. Which comes first is the oid order no plan knows, so the
+    // table's key or unique constraint such an index could take is dropped
+    // before the attach, and the engine builds both clones (#1642 review).
+    let backing = |columns: &[String]| Index {
+        columns: columns
+            .iter()
+            .map(|c| pbps_model::IndexColumn {
+                key: pbps_model::IndexKey::Column(c.clone()),
+                descending: false,
+                opclass: None,
+            })
+            .collect(),
+        include: Vec::new(),
+        unique: true,
+        filter: None,
+        method: Default::default(),
+        storage_parameters: Default::default(),
+    };
+    let contested = |columns: &[String]| parents_indexes.values().any(|i| *i == backing(columns));
+    let mut released = Vec::new();
+    if let Some(key) = &table.primary_key
+        && contested(&key.columns)
+    {
+        released.push(Change::SetPrimaryKey {
+            table: declared_name.clone(),
+            from: Some(key.clone()),
+            to: None,
+            nonclustered: false,
+        });
+    }
+    for (name, u) in &table.unique {
+        if contested(&u.columns) {
+            released.push(Change::DropUnique {
+                table: declared_name.clone(),
+                name: name.clone(),
+            });
+        }
+    }
+    if table.replica_identity.is_some() {
+        what.push(
+            "it has a replica identity of its own, which a partition does not hold yet".to_owned(),
+        );
+    }
+    if table.data.is_some() {
+        what.push("it declares `data:`, which a partition does not".to_owned());
+    }
+    // Neither engine's other settings: SQL Server's, which a partition never
+    // has, since the dialect holds no partitions.
+    let rest = Table {
+        description: None,
+        columns: Default::default(),
+        primary_key: None,
+        unique: Default::default(),
+        foreign_keys: Default::default(),
+        checks: Default::default(),
+        indexes: Default::default(),
+        replica_identity: None,
+        storage_parameters: Default::default(),
+        unlogged: false,
+        partition_by: None,
+        partition_of: None,
+        data: None,
+        ..table.clone()
+    };
+    if rest != Table::default() {
+        what.push("it holds a setting a partition does not".to_owned());
+    }
+    // Held by the schema rather than the table: what reaches it from
+    // elsewhere would then reach a partition, which the model does not hold.
+    for id in base.schema.modules.keys() {
+        if let pbps_model::ModuleId::Trigger { on, name } = id
+            && on == base_name
+        {
+            what.push(format!(
+                "the trigger `{name}` is on it, and a partition holds none yet"
+            ));
+        }
+    }
+    for (other, t) in &base.schema.tables {
+        for (name, fk) in &t.foreign_keys {
+            if &fk.references_table == base_name {
+                what.push(format!(
+                    "the foreign key `{name}` of {other} references it, and nothing references a \
+                     partition yet"
+                ));
+            }
+        }
+    }
+    if !what.is_empty() {
+        return Err(what);
+    }
+    Ok(Attached {
+        table: Table {
+            checks,
+            indexes,
+            storage_parameters: table.storage_parameters.clone(),
+            unlogged: table.unlogged,
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: of.parent.clone(),
+                bound: of.bound.clone(),
+                columns: own_columns,
+            }),
+            ..Table::default()
+        },
+        defaultless,
+        displaced,
+        released,
+    })
+}
+
 fn refuse_partition_changes(
     base: Side<'_>,
     declared: Side<'_>,
@@ -2406,13 +3083,19 @@ fn refuse_partition_changes(
             base.schema.tables.get(base_name),
             declared.schema.tables.get(declared_name),
         ) {
-            // A partition declared as an ordinary table is detached (#1544).
+            // A partition declared as an ordinary table is detached (#1544),
+            // and an ordinary table declared as a partition attached (#1545):
+            // each is its own change, or its own refusal.
             let detached =
                 b.partition_of.is_some() && d.partition_of.is_none() && d.partition_by.is_none();
+            let attached = b.partition_of.is_none() && d.partition_of.is_some();
             fn where_(t: &Table) -> Option<(&TableName, &pbps_model::PartitionBound)> {
                 t.partition_of.as_ref().map(|of| (&of.parent, &of.bound))
             }
-            if (b.partition_by != d.partition_by || where_(b) != where_(d)) && !detached {
+            if (b.partition_by != d.partition_by || where_(b) != where_(d))
+                && !detached
+                && !attached
+            {
                 refuse(declared_name, "change its partitioning".to_owned());
             }
         }
@@ -2425,6 +3108,16 @@ fn refuse_partition_changes(
         .filter_map(|c| {
             if let Change::CreateTable { name, .. } = c {
                 Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let attaching: BTreeSet<&TableName> = changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::AttachPartition { table, .. } = c {
+                Some(table)
             } else {
                 None
             }
@@ -2446,6 +3139,7 @@ fn refuse_partition_changes(
                 detach_from: Some(_),
                 ..
             } | Change::DetachPartition { .. }
+                | Change::AttachPartition { .. }
         ) {
             continue;
         }
@@ -2470,10 +3164,22 @@ fn refuse_partition_changes(
                 .get(name)
                 .is_some_and(|t| t.partition_of.is_some() && t.partition_by.is_none())
         };
+        // A table this plan attaches is a partition from the attach on, and
+        // its own are brought to the declaration after it (#1545).
         if own
-            && change
-                .table()
-                .is_some_and(|t| standing(base.schema, t) && standing(declared.schema, t))
+            && change.table().is_some_and(|t| {
+                (standing(base.schema, t) || attaching.contains(t)) && standing(declared.schema, t)
+            })
+        {
+            continue;
+        }
+        // Before the attach, still the ordinary table's: a key or unique
+        // constraint whose index a parent's plain index could take (#1642
+        // review). On a standing partition it is the parent's clone.
+        if matches!(
+            change,
+            Change::DropUnique { .. } | Change::SetPrimaryKey { to: None, .. }
+        ) && change.table().is_some_and(|t| attaching.contains(t))
         {
             continue;
         }
@@ -2651,6 +3357,7 @@ fn refuse_computed_dependencies(
                     Change::CreateTable { .. }
                     | Change::DropTable { .. }
                     | Change::DetachPartition { .. }
+                    | Change::AttachPartition { .. }
                     | Change::RenameTable { .. }
                     | Change::AddColumn { .. }
                     | Change::DropColumn { .. }
@@ -3648,6 +4355,7 @@ fn dependency_rank(
         Change::CreateTable { .. }
         | Change::DropTable { .. }
         | Change::DetachPartition { .. }
+        | Change::AttachPartition { .. }
         | Change::RenameTable { .. }
         | Change::AddColumn { .. }
         | Change::DropColumn { .. }
@@ -4287,7 +4995,9 @@ fn order_key(c: &Change) -> u8 {
         // A detach frees its range, as a drop does, before a partition is
         // created over it in class 7 (#1544).
         Change::DropTable { .. } | Change::DetachPartition { .. } => 6,
-        Change::CreateTable { .. } => 7,
+        // An attach takes its range as a created partition does, and once
+        // a detach or a drop has freed it (#1545).
+        Change::CreateTable { .. } | Change::AttachPartition { .. } => 7,
         Change::AddColumn { .. } => 8,
         Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
@@ -4820,6 +5530,7 @@ mod tests {
                 &BTreeSet::new(),
                 Rebinding::Candidates,
                 screen,
+                None,
             )
             .err()
             .unwrap_or_default()
@@ -5581,6 +6292,940 @@ mod tests {
             "{:?}",
             kinds(&planned)
         );
+    }
+
+    /// An ordinary table declared as a partition of a standing parent is
+    /// attached and keeps its rows (#1545, DEC-1545.1). Its matching key,
+    /// foreign key and index become the parent's clones and the parent's
+    /// check its inherited copy, so none of them is planned; what it keeps of
+    /// its own is brought to the declaration after the attach, a column with
+    /// no default taking its parent's back. Its column uids leave the ids
+    /// file, and its parent's stay. Every shape the engine would refuse, or
+    /// would attach into something the model does not hold, is refused by
+    /// name before anything is planned.
+    #[test]
+    fn an_ordinary_table_declared_as_a_partition_is_attached() {
+        use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+        let index_on = |column: &str| Index {
+            columns: vec![pbps_model::IndexColumn {
+                key: pbps_model::IndexKey::Column(column.to_owned()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
+        let fk = pbps_model::ForeignKey {
+            columns: vec!["n".into()],
+            references_table: "app.r".parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete: pbps_model::ReferentialAction::NoAction,
+            on_update: pbps_model::ReferentialAction::NoAction,
+        };
+        let check = |expression: &str| pbps_model::CheckConstraint {
+            expression: expression.into(),
+        };
+        let key = |name: &str, columns: &[&str]| PrimaryKey {
+            name: Some(name.into()),
+            columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+            storage_parameters: Default::default(),
+        };
+        let columns = || {
+            table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("ts", Column::new(ty("date")).not_null()),
+                ("n", Column::new(ty("int"))),
+            ])
+        };
+        let mut parent = columns();
+        parent.columns["n"].default = Some("0".into());
+        parent.primary_key = Some(key("ev_pk", &["id", "ts"]));
+        parent.checks.insert("ev_n_ck".into(), check("n > 0"));
+        parent.indexes.insert("ev_n".into(), index_on("n"));
+        parent.foreign_keys.insert("ev_n_fk".into(), fk.clone());
+        let unique = |fillfactor: Option<&str>| pbps_model::UniqueConstraint {
+            columns: vec!["n".into(), "ts".into()],
+            storage_parameters: fillfactor
+                .map(|f| ("fillfactor".to_owned(), f.to_owned()))
+                .into_iter()
+                .collect(),
+        };
+        parent.unique.insert("ev_u".into(), unique(None));
+        parent.partition_by = Some(PartitionBy {
+            columns: vec!["ts".into()],
+        });
+        let range = |from: &str, to: &str| PartitionBound::Range {
+            from: vec![BoundDatum::Value(from.into())],
+            to: vec![BoundDatum::Value(to.into())],
+        };
+        let mut tree = schema_of("app.ev", parent);
+        let mut referenced = table(&[("id", Column::new(ty("int")).not_null())]);
+        referenced.primary_key = Some(key("r_pk", &["id"]));
+        tree.tables.insert("app.r".parse().unwrap(), referenced);
+        tree.tables.insert(
+            "app.ev_2025".parse().unwrap(),
+            Table {
+                partition_of: Some(PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: range("2025-01-01", "2026-01-01"),
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            },
+        );
+        // The table as it stands: the parent's columns in the parent's
+        // order, `n` NOT NULL of its own and without the parent's default,
+        // the parent's key, foreign key, check and index under names of its
+        // own, plus a check and an index of its own.
+        let ordinary = |f: &dyn Fn(&mut Table)| {
+            let mut t = columns();
+            t.columns["n"].nullable = false;
+            t.primary_key = Some(key("t_pk", &["id", "ts"]));
+            t.foreign_keys.insert("t_fk".into(), fk.clone());
+            t.unique.insert("t_u".into(), unique(None));
+            t.checks.insert("ev_n_ck".into(), check("n > 0"));
+            t.checks.insert("t_small".into(), check("n < 100"));
+            t.indexes.insert("t_n".into(), index_on("n"));
+            t.indexes.insert("t_id".into(), index_on("id"));
+            f(&mut t);
+            let mut base = tree.clone();
+            base.tables.insert("app.t".parse().unwrap(), t);
+            base
+        };
+        // Declared as a partition keeping its own check and NOT NULL, and
+        // not its own index.
+        let attached = |bound: PartitionBound| {
+            let mut declared = tree.clone();
+            declared.tables.insert(
+                "app.t".parse().unwrap(),
+                Table {
+                    checks: [("t_small".to_owned(), check("n < 100"))].into(),
+                    partition_of: Some(PartitionOf {
+                        parent: "app.ev".parse().unwrap(),
+                        bound,
+                        columns: [(
+                            "n".to_owned(),
+                            PartitionColumn {
+                                default: None,
+                                not_null: true,
+                            },
+                        )]
+                        .into(),
+                    }),
+                    ..Default::default()
+                },
+            );
+            declared
+        };
+        let declared = attached(range("2024-01-01", "2025-01-01"));
+        let outcome = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            let cs = diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            );
+            (base_ids, declared_ids, cs)
+        };
+        let refused = |base: &Schema, declared: &Schema, intents: &[Intent]| -> Vec<String> {
+            match outcome(base, declared, intents).2 {
+                Ok(cs) => panic!("planned {:?}", kinds(&cs)),
+                Err(errors) => errors.iter().map(ToString::to_string).collect(),
+            }
+        };
+
+        let base = ordinary(&|_| {});
+        let (base_ids, declared_ids, planned) = outcome(&base, &declared, &[]);
+        let planned = planned.expect("an attach is planned");
+        assert_eq!(
+            kinds(&planned),
+            ["DropIndex", "AttachPartition", "SetPartitionDefault"],
+            "{:?}",
+            planned.changes
+        );
+        let Change::AttachPartition {
+            table: t,
+            parent: p,
+            bound,
+            shape,
+            ..
+        } = &planned.changes[1].change
+        else {
+            panic!("{:?}", planned.changes)
+        };
+        assert_eq!(
+            (t.to_string(), p.to_string()),
+            ("app.t".into(), "app.ev".into())
+        );
+        assert_eq!(*bound, range("2024-01-01", "2025-01-01"));
+        assert_eq!(
+            **shape,
+            declared.tables[&"app.t".parse::<TableName>().unwrap()]
+        );
+        assert!(matches!(
+            &planned.changes[0].change,
+            Change::DropIndex { name, .. } if name == "t_id"
+        ));
+        assert!(matches!(
+            &planned.changes[2].change,
+            Change::SetPartitionDefault { column, from: None, to: None, fallback: Some(f), .. }
+                if column == "n" && f == "0"
+        ));
+        assert!(planned.changes[1].risks.contains(&RiskClass::Constraint));
+        // The table keeps its uid, its columns' leave, and the parent's stay.
+        let on = |ids: &IdsFile, name: &str| -> Vec<Uid> {
+            ids.columns
+                .iter()
+                .filter(|(_, c)| c.table.to_string() == name)
+                .map(|(u, _)| u.clone())
+                .collect()
+        };
+        assert_eq!(on(&base_ids, "app.t").len(), 3);
+        assert!(on(&declared_ids, "app.t").is_empty());
+        assert_eq!(on(&base_ids, "app.ev"), on(&declared_ids, "app.ev"));
+        assert_eq!(
+            base_ids
+                .tables
+                .iter()
+                .find(|(_, n)| n.to_string() == "app.t")
+                .map(|(u, _)| u),
+            declared_ids
+                .tables
+                .iter()
+                .find(|(_, n)| n.to_string() == "app.t")
+                .map(|(u, _)| u),
+        );
+
+        // A default of its own is kept, and none is asked of the parent.
+        let own_default = ordinary(&|t| t.columns["n"].default = Some("7".into()));
+        let mut keeps = declared.clone();
+        keeps
+            .tables
+            .get_mut(&"app.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .columns
+            .get_mut("n")
+            .unwrap()
+            .default = Some("7".into());
+        let kept = outcome(&own_default, &keeps, &[])
+            .2
+            .expect("its own default is kept");
+        assert_eq!(kinds(&kept), ["DropIndex", "AttachPartition"]);
+
+        // A key or an index of the parent's under other storage parameters
+        // is adopted all the same, as the engine adopts it.
+        let tuned = ordinary(&|t| {
+            t.unique.insert("t_u".into(), unique(Some("70")));
+            t.indexes.get_mut("t_n").unwrap().storage_parameters =
+                [("fillfactor".to_owned(), "60".to_owned())].into();
+        });
+        let adopted = outcome(&tuned, &declared, &[]).2.expect("adopted");
+        // An index of its own declared under the name of one the attach
+        // would adopt, as another index or the same: the adopted one goes
+        // before the attach, which builds the parent's clone under a name of
+        // the engine's, and the declared one is added after.
+        for definition in [index_on("id"), index_on("n")] {
+            let mut reusing = declared.clone();
+            reusing
+                .tables
+                .get_mut(&"app.t".parse::<TableName>().unwrap())
+                .unwrap()
+                .indexes
+                .insert("t_n".into(), definition);
+            let reclaimed = outcome(&base, &reusing, &[]).2.expect("the name is freed");
+            let order: Vec<String> = reclaimed
+                .changes
+                .iter()
+                .map(|p| match &p.change {
+                    Change::DropIndex { name, .. } => format!("drop {name}"),
+                    Change::AddIndex { name, .. } => format!("add {name}"),
+                    other => format!("{other:?}").split(' ').next().unwrap().to_owned(),
+                })
+                .collect();
+            assert_eq!(
+                order,
+                [
+                    "drop t_id",
+                    "drop t_n",
+                    "AttachPartition",
+                    "SetPartitionDefault",
+                    "add t_n"
+                ],
+                "{:?}",
+                reclaimed.changes
+            );
+        }
+        // The attach validates the parent's foreign key over the rows it
+        // brings, so it waits for the rows the plan writes into the table that
+        // key references, and goes before the rows of a table referencing
+        // the parent; its own changes after it (#1642 review).
+        let with_rows = |schema: &Schema| {
+            let mut schema = schema.clone();
+            let rows = |entries: Vec<(&str, Row)>| pbps_model::TableData {
+                mode: pbps_model::DataMode::Ensure,
+                rows: entries
+                    .into_iter()
+                    .map(|(k, row)| (pbps_model::RowKey::from(k), row))
+                    .collect(),
+            };
+            schema
+                .tables
+                .get_mut(&"app.r".parse::<TableName>().unwrap())
+                .unwrap()
+                .data = Some(rows(vec![("7", Row::default())]));
+            let mut q = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("eid", Column::new(ty("int"))),
+                ("ets", Column::new(ty("date"))),
+            ]);
+            q.primary_key = Some(key("q_pk", &["id"]));
+            q.foreign_keys.insert(
+                "q_ev".into(),
+                pbps_model::ForeignKey {
+                    columns: vec!["eid".into(), "ets".into()],
+                    references_table: "app.ev".parse().unwrap(),
+                    references_columns: vec!["id".into(), "ts".into()],
+                    on_delete: pbps_model::ReferentialAction::NoAction,
+                    on_update: pbps_model::ReferentialAction::NoAction,
+                },
+            );
+            q.data = Some(rows(vec![(
+                "1",
+                [
+                    ("eid".to_owned(), Value::Int(1)),
+                    ("ets".to_owned(), Value::Text("2024-06-01".into())),
+                ]
+                .into_iter()
+                .collect(),
+            )]));
+            schema.tables.insert("app.q".parse().unwrap(), q);
+            schema
+        };
+        let mut base_with_q = with_rows(&base);
+        for t in ["app.r", "app.q"] {
+            let t = base_with_q
+                .tables
+                .get_mut(&t.parse::<TableName>().unwrap())
+                .unwrap();
+            t.data.as_mut().unwrap().rows.clear();
+        }
+        let waits = outcome(&base_with_q, &with_rows(&declared), &[])
+            .2
+            .expect("attached after the rows");
+        let order: Vec<String> = waits
+            .changes
+            .iter()
+            .map(|p| {
+                if let Change::InsertRow { table, .. } = &p.change {
+                    format!("insert {table}")
+                } else {
+                    format!("{:?}", p.change)
+                        .split([' ', '{'])
+                        .next()
+                        .unwrap()
+                        .to_owned()
+                }
+            })
+            .filter(|k| k != "SetDataMode")
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "DropIndex",
+                "insert app.r",
+                "AttachPartition",
+                "insert app.q",
+                "SetPartitionDefault"
+            ],
+            "{:?}",
+            waits.changes
+        );
+        // Negative: with no rows to wait for, it stays with the creates.
+        assert_eq!(
+            kinds(&outcome(&base, &declared, &[]).2.expect("attached")),
+            ["DropIndex", "AttachPartition", "SetPartitionDefault"]
+        );
+
+        // A parent's plain unique index over the columns of the table's
+        // unique constraint or key could take its index: both go before the
+        // attach, and the engine builds the clones (#1642 review).
+        let unique_on = |columns: &[&str]| Index {
+            columns: columns
+                .iter()
+                .map(|c| pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Column((*c).to_owned()),
+                    descending: false,
+                    opclass: None,
+                })
+                .collect(),
+            unique: true,
+            ..index_on("n")
+        };
+        let contested = |schema: &Schema| {
+            let mut schema = schema.clone();
+            let parent = schema
+                .tables
+                .get_mut(&"app.ev".parse::<TableName>().unwrap())
+                .unwrap();
+            parent
+                .indexes
+                .insert("ev_n_ts".into(), unique_on(&["n", "ts"]));
+            parent
+                .indexes
+                .insert("ev_id_ts".into(), unique_on(&["id", "ts"]));
+            schema
+        };
+        let released = outcome(&contested(&base), &contested(&declared), &[])
+            .2
+            .expect("released");
+        let before: Vec<String> = released
+            .changes
+            .iter()
+            .take_while(|p| !matches!(p.change, Change::AttachPartition { .. }))
+            .map(|p| {
+                if let Change::DropUnique { name, .. } = &p.change {
+                    format!("drop unique {name}")
+                } else if let Change::SetPrimaryKey { to: None, .. } = &p.change {
+                    "drop key".to_owned()
+                } else if let Change::DropIndex { name, .. } = &p.change {
+                    format!("drop {name}")
+                } else {
+                    format!("{:?}", p.change)
+                }
+            })
+            .collect();
+        assert_eq!(
+            before,
+            ["drop t_id", "drop unique t_u", "drop key"],
+            "{:?}",
+            released.changes
+        );
+        // Negative: with no such index, the key and constraint are adopted.
+        let plain = outcome(&base, &declared, &[]).2.expect("adopted");
+        assert!(
+            !plain.changes.iter().any(|p| matches!(
+                p.change,
+                Change::DropUnique { .. } | Change::SetPrimaryKey { to: None, .. }
+            )),
+            "{:?}",
+            plain.changes
+        );
+
+        // An attach that fills the table another attach's parent references
+        // goes first, whatever the names: `app.z` into `app.r`, which `app.ev`
+        // references, before `app.t` into `app.ev` (#1642 review).
+        let r_partitioned = |schema: &Schema| {
+            let mut schema = schema.clone();
+            schema
+                .tables
+                .get_mut(&"app.r".parse::<TableName>().unwrap())
+                .unwrap()
+                .partition_by = Some(PartitionBy {
+                columns: vec!["id".into()],
+            });
+            schema
+        };
+        let mut z = table(&[("id", Column::new(ty("int")).not_null())]);
+        z.primary_key = Some(key("z_pk", &["id"]));
+        let mut both_base = r_partitioned(&base);
+        both_base.tables.insert("app.z".parse().unwrap(), z);
+        let mut both_declared = r_partitioned(&declared);
+        both_declared.tables.insert(
+            "app.z".parse().unwrap(),
+            Table {
+                partition_of: Some(PartitionOf {
+                    parent: "app.r".parse().unwrap(),
+                    bound: PartitionBound::Range {
+                        from: vec![BoundDatum::Value("0".into())],
+                        to: vec![BoundDatum::Value("100".into())],
+                    },
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            },
+        );
+        let attaches: Vec<String> = outcome(&both_base, &both_declared, &[])
+            .2
+            .expect("both attached")
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::AttachPartition { table, .. } = &p.change {
+                    Some(table.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(attaches, ["app.z", "app.t"]);
+
+        // The engine's match: a descending index is its parent's all the
+        // same, and of two matches neither is assumed adopted. One is left,
+        // one the declaration does not keep, and the other goes first.
+        let order_of = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .filter_map(|p| {
+                    if let Change::DropIndex { name, .. } = &p.change {
+                        Some(format!("drop {name}"))
+                    } else if let Change::AddIndex { name, .. } = &p.change {
+                        Some(format!("add {name}"))
+                    } else if let Change::AttachPartition { .. } = &p.change {
+                        Some("attach".to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let descending = ordinary(&|t| {
+            t.indexes.get_mut("t_n").unwrap().columns[0].descending = true;
+        });
+        let planned = outcome(&descending, &declared, &[]).2.expect("adopted");
+        assert_eq!(order_of(&planned), ["drop t_id", "attach"]);
+        let twice = ordinary(&|t| {
+            t.indexes.insert("a_n".into(), index_on("n"));
+        });
+        let planned = outcome(&twice, &declared, &[]).2.expect("one is left");
+        assert_eq!(order_of(&planned), ["drop t_id", "drop t_n", "attach"]);
+        let mut keeps_a_n = declared.clone();
+        keeps_a_n
+            .tables
+            .get_mut(&"app.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .indexes
+            .insert("a_n".into(), index_on("n"));
+        let planned = outcome(&twice, &keeps_a_n, &[])
+            .2
+            .expect("the other is left");
+        assert_eq!(
+            order_of(&planned),
+            ["drop a_n", "drop t_id", "attach", "add a_n"]
+        );
+
+        // A deprecation is an annotation, not the column's shape.
+        let annotated = ordinary(&|t| t.columns["n"].deprecated = Some("old".into()));
+        outcome(&annotated, &declared, &[])
+            .2
+            .expect("a deprecated column attaches");
+        assert_eq!(
+            kinds(&adopted),
+            ["DropIndex", "AttachPartition", "SetPartitionDefault"]
+        );
+
+        // Negative: every shape the engine refuses, or that would attach
+        // into something the model does not hold, is refused by name.
+        let mut r2 = table(&[
+            ("t_id", Column::new(ty("int"))),
+            ("t_ts", Column::new(ty("date"))),
+        ]);
+        r2.foreign_keys.insert(
+            "r2_t".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["t_id".into(), "t_ts".into()],
+                references_table: "app.t".parse().unwrap(),
+                references_columns: vec!["id".into(), "ts".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        let mut referencing_base = ordinary(&|_| {});
+        referencing_base
+            .tables
+            .insert("app.r2".parse().unwrap(), r2.clone());
+        let mut referencing_declared = declared.clone();
+        referencing_declared
+            .tables
+            .insert("app.r2".parse().unwrap(), r2);
+        let trigger = (
+            pbps_model::ModuleId::Trigger {
+                on: "app.t".parse().unwrap(),
+                name: "audit".to_owned(),
+            },
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::Trigger,
+                description: None,
+                definition: "AFTER INSERT AS SELECT 1".to_owned(),
+            },
+        );
+        let mut triggered_base = ordinary(&|_| {});
+        triggered_base.modules.extend([trigger.clone()]);
+        let mut triggered = declared.clone();
+        triggered.modules.extend([trigger]);
+        let mut unpartitioned = ordinary(&|_| {});
+        unpartitioned
+            .tables
+            .get_mut(&"app.ev".parse::<TableName>().unwrap())
+            .unwrap()
+            .partition_by = None;
+        let mut renamed = declared.clone();
+        let moved = renamed
+            .tables
+            .remove(&"app.t".parse::<TableName>().unwrap())
+            .unwrap();
+        renamed.tables.insert("app.t2".parse().unwrap(), moved);
+        let rename = [Intent::RenameTable {
+            from: "app.t".parse().unwrap(),
+            to: "app.t2".parse().unwrap(),
+        }];
+        let swap = |t: &mut Table| {
+            let n = t.columns.shift_remove("n").unwrap();
+            t.columns.shift_insert(0, "n".into(), n);
+        };
+        for (base, declared, intents, expected) in [
+            (
+                ordinary(&swap),
+                &declared,
+                &[][..],
+                "its columns are (n, id, ts), and its parent's are (id, ts, n)",
+            ),
+            (
+                ordinary(&|t| {
+                    t.columns.insert("extra".into(), Column::new(ty("text")));
+                }),
+                &declared,
+                &[][..],
+                "its columns are (id, ts, n, extra)",
+            ),
+            (
+                ordinary(&|t| t.columns["n"].ty = ty("bigint")),
+                &declared,
+                &[][..],
+                "its column `n` is not its parent's in type",
+            ),
+            (
+                ordinary(&|t| t.columns["id"].nullable = true),
+                &declared,
+                &[][..],
+                "its column `id` is nullable",
+            ),
+            (
+                ordinary(&|t| t.primary_key = Some(key("t_pk", &["id"]))),
+                &declared,
+                &[][..],
+                "its primary key is not its parent's",
+            ),
+            (
+                ordinary(&|t| {
+                    t.unique.insert(
+                        "t_u".into(),
+                        pbps_model::UniqueConstraint {
+                            columns: vec!["n".into()],
+                            storage_parameters: Default::default(),
+                        },
+                    );
+                }),
+                &declared,
+                &[][..],
+                "its unique constraint `t_u` is not its parent's",
+            ),
+            (
+                ordinary(&|t| {
+                    t.foreign_keys.get_mut("t_fk").unwrap().on_delete =
+                        pbps_model::ReferentialAction::Cascade;
+                }),
+                &declared,
+                &[][..],
+                "its foreign key `t_fk` is not its parent's",
+            ),
+            (
+                ordinary(&|t| {
+                    t.checks.remove("ev_n_ck");
+                }),
+                &declared,
+                &[][..],
+                "its parent's check `ev_n_ck` is not on it",
+            ),
+            (
+                ordinary(&|t| {
+                    t.replica_identity = Some(pbps_model::ReplicaIdentity::Full);
+                }),
+                &declared,
+                &[][..],
+                "replica identity",
+            ),
+            (
+                ordinary(&|t| {
+                    t.data = Some(pbps_model::TableData {
+                        mode: pbps_model::DataMode::Exact,
+                        rows: Default::default(),
+                    });
+                }),
+                &declared,
+                &[][..],
+                "`data:`",
+            ),
+            (
+                ordinary(&|_| {}),
+                &attached(PartitionBound::Default),
+                &[][..],
+                "DEFAULT partition",
+            ),
+            (
+                unpartitioned,
+                &declared,
+                &[][..],
+                "is not a partitioned table before this plan",
+            ),
+            (
+                ordinary(&|_| {}),
+                &renamed,
+                &rename[..],
+                "renamed from app.t",
+            ),
+            (
+                triggered_base,
+                &triggered,
+                &[][..],
+                "the trigger `audit` is on it",
+            ),
+            (
+                referencing_base,
+                &referencing_declared,
+                &[][..],
+                "the foreign key `r2_t` of app.r2 references it",
+            ),
+        ] {
+            let found = refused(&base, declared, intents);
+            assert!(
+                found
+                    .iter()
+                    .any(|e| e.contains("is attached to app.ev") && e.contains(expected)),
+                "{expected}: {found:?}"
+            );
+        }
+
+        // In another schema, a default of the parent's text may name another
+        // schema's object: it is the table's own, and the parent's is set
+        // back, under the parent's path.
+        let elsewhere = |schema: &Schema| {
+            let mut moved = schema.clone();
+            let t = moved
+                .tables
+                .remove(&"app.t".parse::<TableName>().unwrap())
+                .unwrap();
+            moved.tables.insert("x.t".parse().unwrap(), t);
+            moved
+        };
+        let other = elsewhere(&ordinary(&|t| t.columns["n"].default = Some("0".into())));
+        let other_declared = elsewhere(&declared);
+        let set_back = outcome(&other, &other_declared, &[]).2.expect("attached");
+        assert!(
+            set_back.changes.iter().any(|p| matches!(
+                &p.change,
+                Change::SetPartitionDefault { table, column, from: Some(f), to: None, .. }
+                    if table.to_string() == "x.t" && column == "n" && f == "0"
+            )),
+            "{:?}",
+            set_back.changes
+        );
+        // Negative: in the parent's schema the same text is the parent's.
+        let same = outcome(
+            &ordinary(&|t| t.columns["n"].default = Some("0".into())),
+            &declared,
+            &[],
+        )
+        .2
+        .expect("attached");
+        assert_eq!(kinds(&same), ["DropIndex", "AttachPartition"]);
+        // A check or a generation expression the table spells otherwise than
+        // its parent, as `n>0` beside `n > 0`: offline matched by name and
+        // kind, the texts unseen; connected, compared in the engine's own
+        // spelling of both, which is one text (#1642 review).
+        let connected = |base: &Schema, declared: &Schema, read_back: &Schema| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+                .unwrap()
+                .ids;
+            crate::diff_read_back(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+                &BTreeSet::new(),
+                Screen::Text,
+                read_back,
+            )
+        };
+        let respelled = ordinary(&|t| {
+            t.checks.insert("ev_n_ck".into(), check("n>0"));
+        });
+        outcome(&respelled, &declared, &[])
+            .2
+            .expect("offline, matched by name");
+        let mut engine = respelled.clone();
+        for t in ["app.ev", "app.t"] {
+            engine
+                .tables
+                .get_mut(&t.parse::<TableName>().unwrap())
+                .unwrap()
+                .checks
+                .insert("ev_n_ck".into(), check("(n > 0)"));
+        }
+        connected(&respelled, &declared, &engine).expect("one check to the engine");
+        // Negative: a read-back that spells them apart still refuses.
+        let mut apart = engine.clone();
+        apart
+            .tables
+            .get_mut(&"app.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .checks
+            .insert("ev_n_ck".into(), check("(n > 1)"));
+        let e = connected(&respelled, &declared, &apart).expect_err("another check");
+        assert!(
+            e.iter().any(|m| m
+                .to_string()
+                .contains("its parent's check `ev_n_ck` is not on it")),
+            "{e:?}"
+        );
+        // The same for a generation expression, in the parent's schema.
+        let generate = |schema: &Schema, spellings: &[(&str, &str)]| {
+            let mut schema = schema.clone();
+            for (t, expression) in spellings {
+                let mut g = Column::new(ty("int"));
+                g.generated = Some(pbps_model::Generated {
+                    expression: (*expression).into(),
+                    stored: true,
+                });
+                schema
+                    .tables
+                    .get_mut(&t.parse::<TableName>().unwrap())
+                    .unwrap()
+                    .columns
+                    .insert("g".into(), g);
+            }
+            schema
+        };
+        let g_respelled = generate(&base, &[("app.ev", "n + 1"), ("app.t", "n+1")]);
+        let g_declared = generate(&declared, &[("app.ev", "n + 1")]);
+        outcome(&g_respelled, &g_declared, &[])
+            .2
+            .expect("offline, matched by kind");
+        let g_engine = generate(&base, &[("app.ev", "(n + 1)"), ("app.t", "(n + 1)")]);
+        connected(&g_respelled, &g_declared, &g_engine).expect("one expression to the engine");
+        // Column names are compared as names: `a, b` then `c` is not `a`
+        // then `b, c`, though both lists join to one text.
+        let names = |schema: &Schema, table: &str, columns: &[&str]| {
+            let mut schema = schema.clone();
+            let t = schema
+                .tables
+                .get_mut(&table.parse::<TableName>().unwrap())
+                .unwrap();
+            for c in columns {
+                t.columns.insert((*c).into(), Column::new(ty("int")));
+            }
+            schema
+        };
+        let e = refused(
+            &names(
+                &names(&base, "app.ev", &["a, b", "c"]),
+                "app.t",
+                &["a", "b, c"],
+            ),
+            &names(&declared, "app.ev", &["a, b", "c"]),
+            &[],
+        );
+        assert!(e.iter().any(|m| m.contains("in that order")), "{e:?}");
+
+        // A generated column: the engine keeps the table's expression, so in
+        // another schema the attach is refused, and in the parent's it plans.
+        let generated = |schema: &Schema, tables: &[&str]| {
+            let mut schema = schema.clone();
+            for t in tables {
+                let mut g = Column::new(ty("int"));
+                g.generated = Some(pbps_model::Generated {
+                    expression: "f(n)".into(),
+                    stored: true,
+                });
+                schema
+                    .tables
+                    .get_mut(&t.parse::<TableName>().unwrap())
+                    .unwrap()
+                    .columns
+                    .insert("g".into(), g);
+            }
+            schema
+        };
+        let g_base = generated(&base, &["app.ev", "app.t"]);
+        let g_declared = generated(&declared, &["app.ev"]);
+        let e = refused(&elsewhere(&g_base), &elsewhere(&g_declared), &[]);
+        assert!(
+            e.iter()
+                .any(|m| m.contains("its column `g` is generated, and in another schema")),
+            "{e:?}"
+        );
+        outcome(&g_base, &g_declared, &[])
+            .2
+            .expect("a generated column attaches in its parent's schema");
+        // An expression index kept as its own is dropped before the attach
+        // and built again after, in another schema and in the parent's.
+        let expression = |t: &mut Table| {
+            t.indexes.insert(
+                "t_f".into(),
+                Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        key: pbps_model::IndexKey::Expression("f(n)".into()),
+                        descending: false,
+                        opclass: None,
+                    }],
+                    ..index_on("n")
+                },
+            );
+        };
+        let mut keeps_t_f = declared.clone();
+        expression(
+            keeps_t_f
+                .tables
+                .get_mut(&"app.t".parse::<TableName>().unwrap())
+                .unwrap(),
+        );
+        let with_t_f = ordinary(&|t| expression(t));
+        let rebuilt = outcome(&elsewhere(&with_t_f), &elsewhere(&keeps_t_f), &[])
+            .2
+            .expect("rebuilt");
+        assert_eq!(
+            order_of(&rebuilt),
+            ["drop t_f", "drop t_id", "attach", "add t_f"]
+        );
+        // In the parent's schema too: `f(n)` and the engine's own spelling of
+        // it are not told apart by text.
+        let kept = outcome(&with_t_f, &keeps_t_f, &[]).2.expect("kept");
+        assert_eq!(
+            order_of(&kept),
+            ["drop t_f", "drop t_id", "attach", "add t_f"]
+        );
+
+        // Negative: an ordinary table that stays one keeps its column uids,
+        // and plans nothing.
+        let (_, stay_ids, stays) = outcome(&base, &base, &[]);
+        assert!(stays.expect("nothing changes").changes.is_empty());
+        assert_eq!(on(&stay_ids, "app.t").len(), 3);
     }
 
     /// A partition declared as an ordinary table of its parent's shape is
@@ -10019,6 +11664,7 @@ mod tests {
             &BTreeSet::new(),
             Rebinding::Candidates,
             Screen::Text,
+            None,
         )
     }
 

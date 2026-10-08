@@ -322,6 +322,7 @@ fn role_of(change: &Change) -> Option<&str> {
         Change::RenameRole { from, .. } => Some(from.as_str()),
         Change::CreateTable { .. }
         | Change::DetachPartition { .. }
+        | Change::AttachPartition { .. }
         | Change::DropTable { .. }
         | Change::RenameTable { .. }
         | Change::AddColumn { .. }
@@ -378,6 +379,7 @@ fn renames(cs: &ChangeSet) -> Renames {
             }
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
@@ -712,6 +714,9 @@ pub fn describe(c: &Change) -> String {
                 .filter(|n| n.name.as_ref() != Some(&n.parent))
                 .count()
         ),
+        Change::AttachPartition { table, parent, .. } => {
+            format!("~ attach table {table} to {parent} as a partition, keeping its rows")
+        }
         // Said, because the detach is a statement of its own and locks the
         // parent (#1171).
         Change::DropTable {
@@ -1078,6 +1083,17 @@ mod tests {
         assert_eq!(
             super::describe(&detach),
             "~ detach table app.p1 from app.ev, keeping its rows, with 1 name(s) of its own"
+        );
+        let attach = Change::AttachPartition {
+            uid: "t_aaaaaa".parse().unwrap(),
+            table: "app.t".parse().unwrap(),
+            parent: "app.ev".parse().unwrap(),
+            bound: pbps_model::PartitionBound::Default,
+            shape: Box::default(),
+        };
+        assert_eq!(
+            super::describe(&attach),
+            "~ attach table app.t to app.ev as a partition, keeping its rows"
         );
     }
 

@@ -304,9 +304,17 @@ indexes:
   shape is refused, to be changed in a later revision (DEC-1544.1). A standing
   partition's own indexes, checks, column defaults, NOT NULLs, storage
   parameters and persistence are changed on it alone; a parent's default the
-  plan sets is followed by each partition's own (DEC-1581.1). Every other
-  change stays refused by name: the parent's own changes until #1546, and
-  attaching an existing table until #1545.
+  plan sets is followed by each partition's own (DEC-1581.1). An ordinary
+  table moved into its parent's `partitions:` under its own name is attached
+  and keeps its rows, `constraint` since the engine checks every row against
+  the range. The table must already hold its parent's columns, in order, and
+  none of the keys or constraints a partition does not hold, or it is refused
+  by name. What it keeps of its own is then brought to the declaration in the
+  same plan, and its column uids leave the ids file. The apply's pre-flight
+  refuses rows of the table outside the range, and DEFAULT-partition rows
+  inside it (DEC-1545.1). Every other change stays refused by name: the
+  parent's own changes until #1546, attaching as the DEFAULT partition until
+  #1639.
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

@@ -349,6 +349,7 @@ impl Reconstruction {
                 // alterations; one that does is not a bootstrap.
                 Change::DropTable { .. }
                 | Change::DetachPartition { .. }
+                | Change::AttachPartition { .. }
                 | Change::RenameTable { .. }
                 | Change::AddColumn { .. }
                 | Change::DropColumn { .. }

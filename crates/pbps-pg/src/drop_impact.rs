@@ -201,6 +201,7 @@ pub async fn drop_blockers(
             }
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::RenameColumn { .. }
@@ -352,6 +353,7 @@ fn stored(
             } if on == &table && column.as_ref() == Some(name) => return None,
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -521,6 +523,7 @@ async fn removal(
         }
         Change::CreateTable { .. }
         | Change::DetachPartition { .. }
+        | Change::AttachPartition { .. }
         | Change::RenameTable { .. }
         | Change::AddColumn { .. }
         | Change::RenameColumn { .. }

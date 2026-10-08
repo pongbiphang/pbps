@@ -495,6 +495,11 @@ struct AsStored {
     /// new values cannot be computed here without running the operator's
     /// expression before approval (DEC-1168.1).
     recomputed: BTreeSet<ColumnRef>,
+    /// Tables this plan attaches, by the parent they are attached to. The
+    /// attach runs before every row change and key addition a probe stands
+    /// for, so the parent's rows are its own and these tables' together
+    /// (DEC-1545.1).
+    attached: BTreeMap<TableName, Vec<TableName>>,
 }
 
 /// A column this plan adds, as the pre-delete probe needs it.
@@ -819,6 +824,12 @@ impl AsStored {
                 | Change::SetReplicaIdentity { .. }
                 | Change::DetachPartition { .. }
                 | Change::PublicExecution { .. } => {}
+                Change::AttachPartition { table, parent, .. } => {
+                    this.attached
+                        .entry(parent.clone())
+                        .or_default()
+                        .push(table.clone());
+                }
             }
         }
         this
@@ -2908,6 +2919,23 @@ fn rows_after(
     // side of the constraint it is on: on the parent side a child matching the
     // missing row reads as an orphan and a valid foreign key is refused; on the
     // child side an orphan hidden in the missing row is not counted at all.
+    // A parent's rows once this plan has attached a table to it are that
+    // table's too, read through the same columns, which the attach required
+    // to be its parent's. Left out, every child row the attached rows satisfy
+    // reads as an orphan and a valid plan is refused (#1642 review). The
+    // filter of a partial key is never asked of a parent, whose own keys a
+    // plan does not change; where it is, nothing is assumed.
+    if let Some(incoming) = names.attached.get(table) {
+        if filter.is_some() {
+            return Ok(None);
+        }
+        for attached in incoming {
+            match rows_after(names, attached, columns, alias, &Applies::AllRows)? {
+                Some(rows) => branches.push(rows),
+                None => return Ok(None),
+            }
+        }
+    }
     if unspellable {
         return Ok(None);
     }
@@ -3418,6 +3446,7 @@ fn build(
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::DetachPartition { .. }
+        | Change::AttachPartition { .. }
         | Change::PublicExecution { .. } => Ok(Vec::new()),
     }
 }
@@ -3666,6 +3695,7 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::PublicExecution { .. } => Vec::new(),
         };
         for (table, name, constraint) in keys {
@@ -3794,7 +3824,7 @@ fn partition_probes(
             && !created.contains(&of.parent)
         {
             let leaving = dropped.get(&of.parent).map_or(&[][..], Vec::as_slice);
-            partition_range_probe(name, &of.parent, from, to, leaving)
+            partition_range_probe(name, &of.parent, from, to, leaving, "create a partition")
         } else if let Change::DropTable {
             name,
             detach_from: Some(parent),
@@ -3810,6 +3840,32 @@ fn partition_probes(
             // partition's key becomes its own on the detach, and still
             // references the parent (#1544).
             partition_reference_probe(table, parent, names, &dropped_before)
+        } else if let Change::AttachPartition {
+            table,
+            parent,
+            bound: pbps_model::PartitionBound::Range { from, to },
+            ..
+        } = &p.change
+        {
+            // Four questions, a created partition's one among them: the
+            // table's own rows outside the range, which the engine refuses to
+            // attach over; its triggers and its column grants, which it does
+            // not refuse and the reader does; and the DEFAULT partition's
+            // rows inside it (#1545).
+            let leaving = dropped.get(parent).map_or(&[][..], Vec::as_slice);
+            for probe in [
+                attach_range_probe(table, parent, from, to),
+                attach_trigger_probe(table),
+                attach_column_grant_probe(table),
+            ] {
+                match probe {
+                    Ok(probe) => out.push(probe),
+                    Err(error) => {
+                        unchecked.push(Unchecked::for_change(&p.change, error.to_string()));
+                    }
+                }
+            }
+            partition_range_probe(table, parent, from, to, leaving, "attach a table")
         } else {
             continue;
         };
@@ -3882,6 +3938,7 @@ fn partition_range_probe(
     from: &[pbps_model::BoundDatum],
     to: &[pbps_model::BoundDatum],
     leaving: &[&TableName],
+    making: &str,
 ) -> Result<Probe, DialectError> {
     let not_null = "(SELECT pg_catalog.string_agg('r.' || pg_catalog.quote_ident(a.attname) || \
                     ' IS NOT NULL', ' AND ' ORDER BY k.n) \
@@ -3908,8 +3965,8 @@ fn partition_range_probe(
     Ok(Probe::new(
         format!(
             "rows of {parent} inside the range of its new partition {partition}: they are in its \
-             DEFAULT partition now, and the engine will not create a partition over them; move \
-             or delete them first, then plan again"
+             DEFAULT partition now, and the engine will not {making} over them; move or delete \
+             them first, then plan again"
         ),
         format!(
             "SELECT {}",
@@ -3919,6 +3976,100 @@ fn partition_range_probe(
                  FROM pg_catalog.pg_partitioned_table pt \
                  WHERE pt.partrelid = pg_catalog.to_regclass({})), 0)",
                 value_literal(&qualified(parent)?)
+            ))
+        ),
+    ))
+}
+
+/// The rows of `table`, about to be attached to `parent` over the range from
+/// `from` to `to`, that the range does not take: outside it, or with a NULL
+/// in any key column. The engine scans for them and refuses the attach on the
+/// first (`partition constraint of relation … is violated by some row`),
+/// measured on 16 and 18 (#1545). The key is the parent's, and the table's
+/// columns are its parent's by name.
+fn attach_range_probe(
+    table: &TableName,
+    parent: &TableName,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+) -> Result<Probe, DialectError> {
+    let not_null = "(SELECT pg_catalog.string_agg('r.' || pg_catalog.quote_ident(a.attname) || \
+                    ' IS NOT NULL', ' AND ' ORDER BY k.n) \
+                    FROM pg_catalog.unnest(pt.partattrs::int2[]) WITH ORDINALITY AS k(attnum, n) \
+                    JOIN pg_catalog.pg_attribute a \
+                    ON a.attrelid = pt.partrelid AND a.attnum = k.attnum)";
+    let text = format!(
+        "{} || {not_null} || ' AND ' || {} || ' AND ' || {} || ')'",
+        value_literal(&format!(
+            "SELECT count(*) AS n FROM {} AS r WHERE NOT (",
+            qualified(table)?
+        )),
+        range_end(from, true),
+        range_end(to, false),
+    );
+    Ok(Probe::new(
+        format!(
+            "rows of {table} outside the range it takes under {parent}, or with a NULL in its \
+             partition key: the engine will not attach it over them; move or delete them first, \
+             then plan again"
+        ),
+        format!(
+            "SELECT {}",
+            saturated_count(&format!(
+                "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()', \
+                 pg_catalog.query_to_xml({text}, false, true, '')))[1]::text::numeric \
+                 FROM pg_catalog.pg_partitioned_table pt \
+                 WHERE pt.partrelid = pg_catalog.to_regclass({})), 0)",
+                value_literal(&qualified(parent)?)
+            ))
+        ),
+    ))
+}
+
+/// The triggers on `table`, managed or not. The engine attaches a table with
+/// triggers, but the reader takes a partition that holds one for a tree it
+/// cannot hold and refuses the whole tree (`partition_tree`'s purity). Left
+/// to the closing read, a staged attach commits first and its checkpoint
+/// fails. An unmanaged trigger is not in the declarations the differ refuses
+/// by, so it is counted here, from the catalog, before the first statement
+/// (#1642 review).
+fn attach_trigger_probe(table: &TableName) -> Result<Probe, DialectError> {
+    Ok(Probe::new(
+        format!(
+            "triggers on {table}, which a partition does not hold yet: drop them before it is \
+             attached, then plan again"
+        ),
+        format!(
+            "SELECT {}",
+            saturated_count(&format!(
+                "(SELECT count(*) FROM pg_catalog.pg_trigger tg \
+                 WHERE tg.tgrelid = pg_catalog.to_regclass({}) AND NOT tg.tgisinternal)",
+                value_literal(&qualified(table)?)
+            ))
+        ),
+    ))
+}
+
+/// The columns of `table` with an ACL, granted to anyone. The engine keeps
+/// them as it attaches, and the reader refuses a partition column with one
+/// (`partition_tree`'s purity), so a staged attach would commit and its
+/// checkpoint fail, as with a trigger; a revoke leaves `attacl` NULL again,
+/// measured on 16 and 18. A column-level
+/// grant is never declared (SPEC §5, left alone), so no change of the plan
+/// removes one and every one is counted, whoever holds it (#1642 review).
+fn attach_column_grant_probe(table: &TableName) -> Result<Probe, DialectError> {
+    Ok(Probe::new(
+        format!(
+            "columns of {table} with grants of their own, which a partition does not hold: \
+             revoke them before it is attached, then plan again"
+        ),
+        format!(
+            "SELECT {}",
+            saturated_count(&format!(
+                "(SELECT count(*) FROM pg_catalog.pg_attribute a \
+                 WHERE a.attrelid = pg_catalog.to_regclass({}) AND a.attnum > 0 \
+                 AND NOT a.attisdropped AND a.attacl IS NOT NULL)",
+                value_literal(&qualified(table)?)
             ))
         ),
     ))
@@ -4259,6 +4410,70 @@ mod tests {
         });
         assert_eq!(dropped.len(), 1, "{dropped:?}");
         assert!(dropped[0].description.contains("reference app.ev_1"));
+        // An attach asks three (#1545): the table's own rows outside its
+        // range, counted against the parent's key; its triggers, managed or
+        // not; and the DEFAULT partition's rows inside it, which a create
+        // asks too.
+        let attach = |bound: B| {
+            probes(&ChangeSet {
+                changes: vec![pbps_model::PlannedChange::new(Change::AttachPartition {
+                    uid: "t_cccccc".parse().unwrap(),
+                    table: "app.t".parse().unwrap(),
+                    parent: "app.ev".parse().unwrap(),
+                    bound,
+                    shape: Box::default(),
+                })],
+            })
+        };
+        let attached = attach(B::Range {
+            from: vec![pbps_model::BoundDatum::Value("2024-01-01".into())],
+            to: vec![pbps_model::BoundDatum::Value("2025-01-01".into())],
+        });
+        assert_eq!(attached.len(), 4, "{attached:?}");
+        assert!(
+            attached[0]
+                .description
+                .contains("rows of app.t outside the range it takes under app.ev"),
+            "{attached:?}"
+        );
+        let sql = &attached[0].sql;
+        assert!(sql.contains("FROM \"app\".\"t\" AS r WHERE NOT ("), "{sql}");
+        assert!(sql.contains("IS NOT NULL"), "{sql}");
+        assert!(sql.contains("to_regclass(E'\"app\".\"ev\"')"), "{sql}");
+        assert!(sql.starts_with("SELECT LEAST("), "{sql}");
+        assert!(
+            attached[1].description.contains("triggers on app.t"),
+            "{attached:?}"
+        );
+        assert!(
+            attached[1].sql.contains(
+                "tgrelid = pg_catalog.to_regclass(E'\"app\".\"t\"') AND NOT tg.tgisinternal"
+            ),
+            "{}",
+            attached[1].sql
+        );
+        assert!(
+            attached[2]
+                .description
+                .contains("columns of app.t with grants of their own"),
+            "{attached:?}"
+        );
+        assert!(
+            attached[2].sql.contains(
+                "attrelid = pg_catalog.to_regclass(E'\"app\".\"t\"') AND a.attnum > 0 AND NOT \
+                 a.attisdropped AND a.attacl IS NOT NULL"
+            ),
+            "{}",
+            attached[2].sql
+        );
+        assert!(
+            attached[3]
+                .description
+                .contains("will not attach a table over them"),
+            "{attached:?}"
+        );
+        // Negative: a DEFAULT bound, which the differ refuses, asks nothing.
+        assert!(attach(B::Default).is_empty());
     }
 
     #[test]

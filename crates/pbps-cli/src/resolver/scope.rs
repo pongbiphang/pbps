@@ -283,6 +283,7 @@ pub(crate) fn planned_schema_grants(
             } => Some((role, schema, permissions)),
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }

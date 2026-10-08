@@ -301,7 +301,8 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             detach_from: Some(parent),
             ..
         }
-        | Change::DetachPartition { table, parent, .. } => Err(DialectError::Invalid {
+        | Change::DetachPartition { table, parent, .. }
+        | Change::AttachPartition { table, parent, .. } => Err(DialectError::Invalid {
             dialect: crate::types::DIALECT,
             message: format!(
                 "{table} is a partition of {parent}, which SQL Server's model does not hold"

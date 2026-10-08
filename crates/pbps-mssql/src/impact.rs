@@ -149,6 +149,7 @@ pub async fn key_drop_blockers(
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
                 | Change::DetachPartition { .. }
+                | Change::AttachPartition { .. }
                 | Change::SetPartitionDefault { .. }
                 | Change::SetPartitionNotNull { .. }
                 | Change::PublicExecution { .. } => return None,
@@ -315,6 +316,7 @@ pub async fn key_drop_blockers(
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
             | Change::PublicExecution { .. } => continue,
@@ -509,6 +511,7 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
             | Change::PublicExecution { .. } => None,
