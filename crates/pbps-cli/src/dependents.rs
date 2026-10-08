@@ -637,6 +637,11 @@ fn taken_by_its_parent(changes: &[PlannedChange], holds: &Holds, drop_at: usize)
     else {
         return false;
     };
+    // Attached after the drop, the copy is still the table's own when the
+    // module goes, and nothing of the parent's takes it.
+    if attach >= drop_at {
+        return false;
+    }
     let Change::AttachPartition { parent, .. } = &changes[attach].change else {
         return false;
     };
@@ -4354,6 +4359,25 @@ mod tests {
         let woven = cs.changes.len();
         weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect("woven again");
         assert_eq!(cs.changes.len(), woven, "a fixed point");
+        // Negative: attached after the module's drop, a copy nothing removes
+        // is reported for the apply to refuse, not taken for the parent's.
+        let late = plan(vec![
+            alter(&s, "app.f(integer)"),
+            cs.changes
+                .iter()
+                .find(|p| matches!(p.change, Change::AttachPartition { .. }))
+                .unwrap()
+                .change
+                .clone(),
+        ]);
+        assert_eq!(
+            unaccounted(&late, &found),
+            [
+                "constraint own on table app.t depends on `app.f(integer)`",
+                "constraint ck on table app.t depends on `app.f(integer)`",
+                "constraint ck on table app.p depends on `app.f(integer)`"
+            ]
+        );
         // Negative: without the attach, the same undeclared check is refused.
         let mut alone = plan(vec![alter(&s, "app.f(integer)")]);
         weave(&mut alone, &found, &s, &[&ids], pg().as_ref()).expect_err("not declared");
