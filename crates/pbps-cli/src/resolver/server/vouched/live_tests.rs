@@ -279,9 +279,6 @@ async fn vouched_runs_in_a_precreated_database_with_a_confined_account() {
             .await
             .unwrap();
         fixture.roles.insert(0, creator);
-        // Owning another database is outside `DROP OWNED`'s reach: no
-        // refusal for it.
-        fixture.database("o", Some(&login.0)).await;
         let inputs = Inputs::overload();
         let key = ProjectKey::new(true);
         let result = produce(
@@ -370,6 +367,26 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
         fixture.roles.insert(0, program);
         fixture.roles.insert(0, slots);
         let reaching = fixture.database("x", Some(&reacher)).await;
+        // And authority over shared objects of the target's cluster: a
+        // database owned by a role it inherits from, `ADMIN OPTION` on a
+        // role, a grant option on another database (#1678 review).
+        let owner = format!("pbps_v1672_w_{}", fixture.token);
+        let admin_of = format!("pbps_v1672_v_{}", fixture.token);
+        fixture
+            .admin()
+            .await
+            .execute(&format!(
+                "CREATE ROLE {owner} NOLOGIN; \
+                 GRANT {owner} TO {reacher} WITH INHERIT TRUE, SET FALSE; \
+                 CREATE ROLE {admin_of} NOLOGIN; \
+                 GRANT {admin_of} TO {reacher} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE; \
+                 GRANT CONNECT ON DATABASE {other} TO {reacher} WITH GRANT OPTION"
+            ))
+            .await
+            .unwrap();
+        fixture.roles.insert(0, owner.clone());
+        fixture.roles.insert(0, admin_of.clone());
+        let owned_elsewhere = fixture.database("w", Some(&owner)).await;
         let before = fixture.inventory().await;
         let superuser = vouched_refusal(
             produce(&fixture.on(&other), &fixture.on(&target_db), &inputs, &key).await,
@@ -400,7 +417,10 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
         assert!(member.contains("NOCREATEDB"), "{server}: {member}");
         assert!(
             reach.contains("no membership in pg_execute_server_program")
-                && reach.contains("NOREPLICATION"),
+                && reach.contains("NOREPLICATION")
+                && reach.contains(&format!("no ownership of database {owned_elsewhere}"))
+                && reach.contains(&format!("no admin option on role {admin_of}"))
+                && reach.contains(&format!("no grant option on database {other}")),
             "{server}: {reach}"
         );
         assert_eq!(
@@ -436,6 +456,11 @@ async fn vouched_refuses_a_scratch_that_is_not_empty() {
             .await,
         );
         let left = fixture.foreign_objects(&scratch_db).await;
+        // On the target's cluster, owning another database is a reach out
+        // of the scratch database, so each case's database is handed back
+        // before the next one is made.
+        let owner_back = format!("ALTER DATABASE {} OWNER TO CURRENT_USER", scratch_db);
+        fixture.run(&target_db, &[&owner_back]).await;
         // A subscription is not in the database's own catalogs but belongs
         // to it all the same: a database holding only one is not empty.
         let subscribed = fixture.database("b", Some(&login.0)).await;
@@ -460,6 +485,8 @@ async fn vouched_refuses_a_scratch_that_is_not_empty() {
         );
         // A large object's OID is the creator's to choose, so no cutoff
         // tells it from initdb's, which made none.
+        let owner_back = format!("ALTER DATABASE {} OWNER TO CURRENT_USER", subscribed);
+        fixture.run(&target_db, &[&owner_back]).await;
         let lob = fixture.database("l", Some(&login.0)).await;
         fixture.run(&lob, &["SELECT pg_catalog.lo_create(1)"]).await;
         let large_object = vouched_refusal(
@@ -472,6 +499,8 @@ async fn vouched_refuses_a_scratch_that_is_not_empty() {
             .await,
         );
         let lob_left = fixture.foreign_objects(&lob).await;
+        let owner_back = format!("ALTER DATABASE {} OWNER TO CURRENT_USER", lob);
+        fixture.run(&target_db, &[&owner_back]).await;
         // A database holding a subscription cannot be dropped.
         fixture
             .run(&subscribed, &["DROP SUBSCRIPTION leftover_sub"])
@@ -636,6 +665,9 @@ async fn vouched_compiles_as_a_non_superuser_provisioner_in_its_own_database() {
         .await
         .unwrap();
     let scratch_db = scratch.database("s", Some(&login.0)).await;
+    // On another cluster, owning another database there is nothing of the
+    // target's, and it is outside `DROP OWNED`'s reach: no refusal for it.
+    scratch.database("o", Some(&login.0)).await;
     let before = scratch.inventory().await;
     let inputs = Inputs::overload();
     let key = ProjectKey::new(true);
@@ -822,70 +854,73 @@ async fn vouched_provisions_as_the_superuser_login_whatever_its_default_role() {
 async fn vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_memberships_it_granted() {
     // The login holds `ADMIN OPTION` on a role and granted it to another
     // role. `DROP OWNED` would remove that membership, which lives outside
-    // the scratch database (#1678 review).
-    for server in SERVERS {
-        let mut fixture = Fixture::new(server);
-        let target_db = fixture.target().await;
-        let (login, scratch_db) = fixture.confined().await;
-        let app = format!("pbps_v1672_a_{}", fixture.token);
-        let user = format!("pbps_v1672_u_{}", fixture.token);
-        fixture
+    // the scratch database (#1678 review). On the target's cluster the
+    // `ADMIN OPTION` alone already refuses, and a grantor cannot lose it
+    // while its grants stand, so this is a scratch server's own case.
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let mut fixture = Fixture::new(SCRATCH_SERVER);
+    let server = SCRATCH_SERVER;
+    let target_db = target.target().await;
+    let (login, scratch_db) = fixture.confined().await;
+    let app = format!("pbps_v1672_a_{}", fixture.token);
+    let user = format!("pbps_v1672_u_{}", fixture.token);
+    fixture
+        .admin()
+        .await
+        .execute(&format!(
+            "CREATE ROLE {app} NOLOGIN; CREATE ROLE {user} NOLOGIN; \
+             GRANT {app} TO {login} WITH ADMIN OPTION, INHERIT FALSE; \
+             SET ROLE {login}; GRANT {app} TO {user}; \
+             GRANT {app} TO {login} WITH INHERIT TRUE GRANTED BY {login}; RESET ROLE",
+            login = login.0
+        ))
+        .await
+        .unwrap();
+    fixture.roles.insert(0, user.clone());
+    fixture.roles.insert(0, app.clone());
+    let granted = || async {
+        let rows = fixture
             .admin()
             .await
-            .execute(&format!(
-                "CREATE ROLE {app} NOLOGIN; CREATE ROLE {user} NOLOGIN; \
-                 GRANT {app} TO {login} WITH ADMIN OPTION, INHERIT FALSE; \
-                 SET ROLE {login}; GRANT {app} TO {user}; \
-                 GRANT {app} TO {login} WITH INHERIT TRUE GRANTED BY {login}; RESET ROLE",
+            .query(&format!(
+                "SELECT count(*)::text AS n FROM pg_catalog.pg_auth_members a \
+                 JOIN pg_catalog.pg_roles m ON m.oid = a.member \
+                 JOIN pg_catalog.pg_roles g ON g.oid = a.grantor \
+                 WHERE m.rolname = '{user}' \
+                    OR (m.rolname = '{login}' AND g.rolname = '{login}')",
                 login = login.0
             ))
             .await
             .unwrap();
-        fixture.roles.insert(0, user.clone());
-        fixture.roles.insert(0, app.clone());
-        let granted = || async {
-            let rows = fixture
-                .admin()
-                .await
-                .query(&format!(
-                    "SELECT count(*)::text AS n FROM pg_catalog.pg_auth_members a \
-                     JOIN pg_catalog.pg_roles m ON m.oid = a.member \
-                     JOIN pg_catalog.pg_roles g ON g.oid = a.grantor \
-                     WHERE m.rolname = '{user}' \
-                        OR (m.rolname = '{login}' AND g.rolname = '{login}')",
-                    login = login.0
-                ))
-                .await
-                .unwrap();
-            rows[0].try_get::<&str>("n").unwrap().unwrap().to_owned()
-        };
-        let before = granted().await;
-        let inputs = Inputs::overload();
-        let key = ProjectKey::new(true);
-        let reason = vouched_refusal(
-            produce(
-                &fixture.as_login(&scratch_db, &login),
-                &fixture.on(&target_db),
-                &inputs,
-                &key,
-            )
-            .await,
-        );
-        let after = granted().await;
-        let left = fixture.foreign_objects(&scratch_db).await;
-        fixture.drop().await;
-        // The membership it granted another role, and the one it granted
-        // itself: `DROP OWNED` removes both by grantor.
-        assert!(
-            reason.contains(&format!("membership of {user} in {app}"))
-                && reason.contains(&format!("membership of {} in {app}", login.0)),
-            "{server}: {reason}"
-        );
-        assert_eq!(
-            (before.as_str(), after.as_str()),
-            ("2", "2"),
-            "{server}: both memberships are kept"
-        );
-        assert_eq!(left.1, 0, "{server}: nothing was written: {left:?}");
-    }
+        rows[0].try_get::<&str>("n").unwrap().unwrap().to_owned()
+    };
+    let before = granted().await;
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let reason = vouched_refusal(
+        produce(
+            &fixture.as_login(&scratch_db, &login),
+            &target.on(&target_db),
+            &inputs,
+            &key,
+        )
+        .await,
+    );
+    let after = granted().await;
+    let left = fixture.foreign_objects(&scratch_db).await;
+    target.drop().await;
+    fixture.drop().await;
+    // The membership it granted another role, and the one it granted
+    // itself: `DROP OWNED` removes both by grantor.
+    assert!(
+        reason.contains(&format!("membership of {user} in {app}"))
+            && reason.contains(&format!("membership of {} in {app}", login.0)),
+        "{server}: {reason}"
+    );
+    assert_eq!(
+        (before.as_str(), after.as_str()),
+        ("2", "2"),
+        "{server}: both memberships are kept"
+    );
+    assert_eq!(left.1, 0, "{server}: nothing was written: {left:?}");
 }

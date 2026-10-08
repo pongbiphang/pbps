@@ -1785,6 +1785,21 @@ by the engines, and the scratch account decides the layout.** Implemented by
     privileges are inherited, so inheriting one counts: measured on 16 and
     18, an `INHERIT TRUE, SET FALSE` membership of
     `pg_execute_server_program` runs `COPY ... TO PROGRAM`.
+  - **Shared objects.** Neither it nor any role it inherits from or can
+    become holds authority over a shared object other than the database it
+    is in:
+    - ownership of another database or a tablespace;
+    - `ADMIN OPTION` on a role;
+    - a grant option on a database or tablespace;
+    - `ALTER SYSTEM`, or a grant option, on a parameter.
+
+    Each lets a compiled definition write outside the database:
+    `ALTER DATABASE` through an inherited membership of its owner, `GRANT`
+    of the role, `GRANT` on the database (measured on 16 and 18; #1678
+    review). A subscription is the exception: only a session in its own
+    database can alter or drop it (measured), and one in this database is
+    the emptiness check's. On another cluster none of these is the
+    target's, so they are not checked there.
 - Reproducing the deployer's authorization creates roles server-wide, some
   possibly `SUPERUSER`. On a shared cluster that is a write to the target's
   cluster, and only an account that cannot make it is safe there.

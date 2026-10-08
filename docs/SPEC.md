@@ -1427,8 +1427,10 @@ entry implemented by #1672, Docker by #1674).**
       it nor any role it can `SET ROLE` to has `SUPERUSER`, `CREATEROLE`,
       `CREATEDB` or `REPLICATION`. It neither inherits nor can become a
       predefined role whose privileges act outside the database, such as
-      `pg_execute_server_program`. An unconfined account there refuses,
-      naming the attributes and memberships to remove.
+      `pg_execute_server_program`. Nor does it hold authority over another
+      shared object: another database or tablespace it owns, `ADMIN OPTION`
+      on a role, a grant option, `ALTER SYSTEM` on a parameter. An
+      unconfined account there refuses, naming what to remove.
     - **The account decides the layout.**
       - **Run-owned.** A login that is itself a superuser, on another
         cluster, gets:

@@ -107,6 +107,13 @@ pub struct Account {
     /// subscription. A compiled definition can use any of them before the
     /// plan is approved (#1678 security review).
     pub predefined: Vec<String>,
+    /// Authority over a shared object other than the database it is in,
+    /// held by it or a role it inherits or may `SET ROLE` to: owning
+    /// another database or a tablespace, `ADMIN OPTION` on a role, a grant
+    /// option on a shared object, `ALTER SYSTEM` on a parameter. Each is a
+    /// write outside the database a compiled definition can make (#1678
+    /// review). Named as what to remove.
+    pub shared: Vec<String>,
 }
 
 /// The predefined roles whose privileges stay inside the database the
@@ -161,6 +168,11 @@ impl Account {
             self.predefined
                 .iter()
                 .map(|role| format!("no membership in {role}")),
+        )
+        .chain(
+            self.shared
+                .iter()
+                .map(|authority| format!("no {authority}")),
         )
         .collect()
     }
@@ -362,6 +374,54 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
         .iter()
         .map(|row| text(row, "role"))
         .collect::<Result<Vec<_>, _>>()?;
+    // A subscription is the exception among shared objects: only a session
+    // in its own database can alter or drop it (measured on 16 and 18), and
+    // one in this database is the emptiness check's. An owner's, a role
+    // admin's and a grantor's authority pass to every
+    // role that inherits from it, as well as to one that can become it
+    // (measured on 16 and 18: `ALTER DATABASE` through an `INHERIT TRUE,
+    // SET FALSE` membership of its owner).
+    let shared = conn
+        .query(
+            "WITH reach AS (SELECT r.oid FROM pg_catalog.pg_roles r \
+                             WHERE pg_catalog.pg_has_role(session_user, r.oid, 'USAGE') \
+                                OR pg_catalog.pg_has_role(session_user, r.oid, 'SET')), \
+                  here AS (SELECT d.oid FROM pg_catalog.pg_database d \
+                            WHERE d.datname = pg_catalog.current_database()) \
+             SELECT 'ownership of ' || pg_catalog.pg_describe_object(s.classid, s.objid, 0) \
+                    AS authority \
+               FROM pg_catalog.pg_shdepend s, here \
+              WHERE s.dbid = 0 AND s.deptype = 'o' \
+                AND s.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass \
+                AND s.refobjid IN (SELECT oid FROM reach) \
+                AND NOT (s.classid = 'pg_catalog.pg_database'::pg_catalog.regclass \
+                         AND s.objid = here.oid) \
+                AND s.classid <> 'pg_catalog.pg_subscription'::pg_catalog.regclass \
+             UNION \
+             SELECT 'admin option on role ' || r.rolname \
+               FROM pg_catalog.pg_auth_members a \
+               JOIN pg_catalog.pg_roles r ON r.oid = a.roleid \
+              WHERE a.admin_option AND a.member IN (SELECT oid FROM reach) \
+             UNION \
+             SELECT 'grant option on database ' || d.datname \
+               FROM pg_catalog.pg_database d, pg_catalog.aclexplode(d.datacl) x \
+              WHERE x.is_grantable AND x.grantee IN (SELECT oid FROM reach) \
+             UNION \
+             SELECT 'grant option on tablespace ' || t.spcname \
+               FROM pg_catalog.pg_tablespace t, pg_catalog.aclexplode(t.spcacl) x \
+              WHERE x.is_grantable AND x.grantee IN (SELECT oid FROM reach) \
+             UNION \
+             SELECT x.privilege_type || CASE WHEN x.is_grantable THEN ' with grant option' \
+                                             ELSE '' END || ' on parameter ' || p.parname \
+               FROM pg_catalog.pg_parameter_acl p, pg_catalog.aclexplode(p.paracl) x \
+              WHERE (x.is_grantable OR x.privilege_type = 'ALTER SYSTEM') \
+                AND x.grantee IN (SELECT oid FROM reach) \
+             ORDER BY 1",
+        )
+        .await?
+        .iter()
+        .map(|row| text(row, "authority"))
+        .collect::<Result<Vec<_>, _>>()?;
     let row = one(rows, "the scratch account's attributes")?;
     let flag = |field: &str| -> Result<bool, DbError> {
         match text(&row, field)?.as_str() {
@@ -379,6 +439,7 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
         replication: flag("replication")?,
         login_superuser: flag("login_superuser")?,
         predefined,
+        shared,
     })
 }
 
@@ -606,6 +667,7 @@ mod tests {
             replication: false,
             login_superuser: false,
             predefined: Vec::new(),
+            shared: Vec::new(),
         };
         assert!(none.confined() && !none.provisions());
         assert!(none.excess().is_empty());
@@ -632,6 +694,13 @@ mod tests {
             program.excess(),
             ["no membership in pg_execute_server_program"]
         );
+        // Negative: authority over another shared object, with no
+        // attribute and no predefined role.
+        let owner = Account {
+            shared: vec!["ownership of database other".into()],
+            ..none.clone()
+        };
+        assert_eq!(owner.excess(), ["no ownership of database other"]);
         // Negative: both attributes without superuser cannot act as the
         // roles it would create, so it does not provision.
         let both = Account {
