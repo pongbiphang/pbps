@@ -1608,9 +1608,16 @@ compared with the target.** Leaving them out (managed-only) fails every
 partial adoption, which is #1616's finding. Reconstructing them by reading
 their full definitions sends routine source no reviewer approved.
 - The baseline is a SQL file in the repository. It runs on scratch only.
-- Every external object it creates is compared with the target, by
-  relation columns, types and order, type definitions, routine signatures
-  and extension versions. The compared shapes are sealed into the manifest.
+- Staging is dependency-ordered. An external routine taking a managed
+  table's row type is created after pbps creates that table from its
+  declaration, so the baseline never has to create a managed object.
+- Every external object it creates is compared with the target. That means:
+  - a relation's columns, types and order;
+  - a type's definition;
+  - a routine's header properties that name resolution reads (signature,
+    return type, argument names and modes, defaults, variadic), but never
+    its body. A default alone decides whether `ext.f(1)` is callable;
+  - an extension's version. The compared shapes are sealed into the manifest.
   So a wrong or stale baseline refuses instead of answering for a database
   that does not exist.
 - A baseline object in the managed set refuses: the declarations stay the

@@ -706,8 +706,10 @@ carries the normative text, and DEC-1528.1 the reasons.
     reviewer can always tell a vouched answer from a measured one.
 - **Decision 5, for the operator-vouched resolver.**
   - Objects outside the managed set come from a reviewed baseline in the
-    repository, run on scratch only. Every external object it creates is
-    compared with the target and sealed into the manifest. A mismatch, a
+    repository, run on scratch only. Staging is dependency-ordered with the
+    managed declarations. Every external object it creates is compared with
+    the target and sealed into the manifest. For a routine, that is every
+    header property name resolution reads, but never its body. A mismatch, a
     missing object, or a baseline object in the managed set refuses.
   - pbps sends no routine source of its own. A question needing routine
     source the baseline lacks refuses with the finding and two remedies.

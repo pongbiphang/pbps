@@ -1541,8 +1541,11 @@ scratch compile (#1616).
 
 - **The baseline is a SQL file in the repository**, named by the resolver
   entry's `baseline`. It is reviewed history like the declarations. It runs on
-  scratch only, never on the target: after the two checks, before the
-  managed declarations compile.
+  scratch only, never on the target, after the two checks.
+- **Staging is dependency-ordered.** An external object that needs a managed
+  one, such as a routine taking a managed table's row type, is created after
+  pbps has created that managed object from its declaration. The baseline
+  itself still creates no managed object.
 - **Each external object it creates is compared with the target before any
   binding question is answered.** A mismatch, or an object the target does
   not have, refuses and names the object.
@@ -1550,7 +1553,9 @@ scratch compile (#1616).
     decides `*` expansion).
   - A type is compared by its definition: a composite's attributes, an
     enum's labels in order, a domain's base type.
-  - A routine is compared by its signature and return type; its body is not
+  - A routine is compared by every header property name resolution reads:
+    its signature and return type, its argument names and modes, which
+    arguments have defaults, and whether it is variadic. Its body is not
     compared.
   - An extension is compared by its name and version.
 - **The compared shapes are sealed into the evidence manifest** and rechecked
