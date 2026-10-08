@@ -3224,15 +3224,23 @@ fn refuse_partition_changes(
             }
         })
         .collect();
-    let retyped_parents: BTreeSet<&TableName> = changes
+    // A partition dropped under its parent is a transition too: its rows
+    // still stand when the pre-flight probes the parent's column (#1692
+    // review).
+    for change in changes {
+        if let Change::DropTable {
+            name,
+            detach_from: Some(parent),
+            ..
+        } = change
+        {
+            moving.entry(parent.clone()).or_default().push(name.clone());
+        }
+    }
+    let parents_changing_columns: BTreeSet<&TableName> = changes
         .iter()
-        .filter_map(|c| {
-            if let Change::AlterColumnType { column, .. } = c {
-                Some(&column.table)
-            } else {
-                None
-            }
-        })
+        .filter(|c| parent_column(c).is_some() && !matches!(c, Change::SetColumnDeprecated { .. }))
+        .filter_map(Change::table)
         .collect();
     for change in changes {
         // A partition is created with its parent, or under a parent that
@@ -3283,12 +3291,13 @@ fn refuse_partition_changes(
             })
         {
             // Its own check, or a unique or filtered index, is probed over
-            // its stored rows before the plan runs, and a retype of its
-            // parent's column converts them first. The probe knows the plan's
-            // retypes by table and not which table is whose partition, so it
-            // would test values the engine never checks, and refuse a valid
-            // plan (DECISIONS 410, #1692 review). Two plans keep each probe
-            // over the rows it judges.
+            // its stored rows before the plan runs, and its parent's column
+            // change reaches those rows first: a retype converts them, a
+            // rename moves a name to another column. The probe knows the
+            // plan's column changes by table and not which table is whose
+            // partition, so it would test values or columns the engine never
+            // checks, and refuse a valid plan (DECISIONS 410, #1692 review,
+            // until #1699). Two plans keep each probe over the rows it judges.
             let probed = if let Change::AddIndex { index, .. } = change {
                 index.unique || index.filter.is_some()
             } else {
@@ -3301,13 +3310,13 @@ fn refuse_partition_changes(
                     .tables
                     .get(t)
                     .and_then(|t| t.partition_of.as_ref())
-                && retyped_parents.contains(&of.parent)
+                && parents_changing_columns.contains(&of.parent)
             {
                 refuse(
                     t,
                     format!(
-                        "{} while this plan retypes a column of its parent {}; retype the \
-                         parent's column and add the partition's own in separate plans",
+                        "{} while this plan changes a column of its parent {}; change the \
+                         parent's columns and add the partition's own in separate plans",
                         change_in_words(change),
                         of.parent
                     ),
@@ -3396,7 +3405,7 @@ fn refuse_partition_changes(
                 refuse(
                     table,
                     format!(
-                        "{} while this plan attaches or detaches {}; change the columns and the \
+                        "{} while this plan attaches, detaches or drops {}; change the columns and the \
                          partitions in separate plans",
                         change_in_words(change),
                         tables.join(", ")
@@ -7090,16 +7099,51 @@ mod tests {
         own_check(&mut checked);
         let mut unique = with(&retype_n, &keep_a, &keep_b);
         own_unique(&mut unique, true);
-        for declared in [&checked, &unique] {
-            let errors = refused(declared, &[]);
+        // A rename moves a name the probe reads to another column (round 7).
+        let mut renamed_checked = with(
+            &|p| rename(p, "m", "m2"),
+            &[("m2", own_default("7"))],
+            &[("m2", own_not_null.clone())],
+        );
+        own_check(&mut renamed_checked);
+        let rename_m = [renaming("m", "m2")];
+        for (declared, intents) in [
+            (&checked, &[][..]),
+            (&unique, &[][..]),
+            (&renamed_checked, &rename_m[..]),
+        ] {
+            let errors = refused(declared, intents);
             assert!(
                 errors.iter().any(|e| e.contains(
-                    "while this plan retypes a column of its parent app.ev; retype the parent's \
-                     column and add the partition's own in separate plans"
+                    "while this plan changes a column of its parent app.ev; change the parent's \
+                     columns and add the partition's own in separate plans"
                 )),
                 "{errors:?}"
             );
         }
+        // A partition dropped while its parent's column tightens: the
+        // pre-flight would count the doomed partition's rows (round 7).
+        let mut dropped_b = with(
+            &|p| p.columns.get_mut("m").unwrap().nullable = false,
+            &[("m", own_default("7"))],
+            &[],
+        );
+        dropped_b
+            .tables
+            .remove(&"app.b".parse::<TableName>().unwrap());
+        let errors = refused(
+            &dropped_b,
+            &[Intent::DropTable {
+                table: "app.b".parse().unwrap(),
+                reason: "gone".into(),
+            }],
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("while this plan attaches, detaches or drops app.b")),
+            "{errors:?}"
+        );
         // Negative: a plain index is not probed, and a check without the
         // retype is probed over the rows it judges.
         let mut plain = with(&retype_n, &keep_a, &keep_b);
@@ -8795,7 +8839,7 @@ mod tests {
                 .collect();
             assert!(
                 errors.iter().any(|e| e.contains(
-                    "while this plan attaches or detaches app.p; change the columns and the \
+                    "while this plan attaches, detaches or drops app.p; change the columns and the \
                      partitions in separate plans"
                 )) && !errors.iter().any(|e| e.contains("not its parent's")),
                 "{errors:?}"

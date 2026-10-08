@@ -316,9 +316,9 @@ indexes:
   do: added, dropped, retyped, renamed, a default or NOT NULL changed, the
   engine recursing each into every partition, whose own defaults and NOT
   NULLs follow (DEC-1687.1). A key column is never dropped or retyped, and the
-  columns do not change in a plan that attaches or detaches under the
-  parent, nor a column retype beside a partition's own new check or unique
-  or filtered index. Every other change stays refused by name: the parent's indexes,
+  columns do not change in a plan that attaches, detaches or drops under the
+  parent, nor beside a partition's own new check or unique or filtered
+  index. Every other change stays refused by name: the parent's indexes,
   keys, checks and foreign keys, and its rename, until #1688–#1690, and
   attaching as the DEFAULT partition until #1639.
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and

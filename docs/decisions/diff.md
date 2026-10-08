@@ -3933,16 +3933,18 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
 - an identity column added, whose partitions cannot be read back yet (#1681);
 - a generation expression changed in place;
 - any of these but a deprecation while the same plan attaches a table under
-  the parent or detaches one from it. The transition meets the parent's
+  the parent, or detaches or drops one of its partitions. A dropped
+  partition's rows still stand when the pre-flight probes the parent's column. The transition meets the parent's
   columns as they stand at its statement, and the table on its other side
   holds them as declared at the other end of the plan, so each column change
   would need its own place against each transition. The remedy is two plans,
   the columns first or the partitions first;
 - a partition's own check, or unique or filtered index, added while the plan
-  retypes a column of its parent. Its pre-flight probe reads the stored rows
-  before the retype converts them, and the probe knows the plan's retypes by
-  table, not which table is whose partition, so it would test values the
-  engine never checks (DECISIONS 410). The remedy is two plans;
+  changes a column of its parent. Its pre-flight probe reads the stored rows
+  before the parent's change reaches them: a retype converts them and a rename
+  moves a name to another column. The probe knows the plan's column changes
+  by table, not which table is whose partition, so it would test values or
+  columns the engine never checks (DECISIONS 410). The remedy is two plans;
 - a rename into a name the same plan drops. The apply guard builds no undo
   for a dropped name taken again (DEC-541.1), and the pre-flight and the
   guard key a partition's probes and carried indexes by the partition's own
@@ -3952,8 +3954,9 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
   partition's name and cannot follow the parent's column change into it. The
   remedy is two plans.
 
-These last three, and the conservative same-name rule in
-`after_their_functions` below, stand until #1699. That issue gives every
+The last three, the partition drop among the transitions, and the
+conservative same-name rule in `after_their_functions` below, stand until
+#1699. That issue gives every
 consumer the partition-to-parent relation, so that a partition's column is
 looked up as its parent's (leon, 2026-10-09).
 
