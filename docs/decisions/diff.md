@@ -3529,6 +3529,18 @@ and in another schema the same text may call another function. So every such
 index is dropped before the attach, and one the declaration keeps is added
 after.
 
+**A key or unique constraint is not left to compete** with a parent's plain
+index either. A parent's plain index adopts a matching index whether or not
+a constraint stands on it, while a parent's key or unique constraint adopts
+only one that has one. Measured on 16 and 18, a parent's `UNIQUE INDEX (a)`
+made before its `UNIQUE (a)` takes the index of the table's `UNIQUE (a)`. The
+constraint stays the table's own, and the parent's is built a clone beside
+it, a tree the reader refuses. Which comes first is the oid order no plan
+knows. So the table's key or unique constraint whose index a parent's plain
+unique index could take is dropped before the attach, and the engine builds
+both clones; `refuse_partition_changes` admits those two drops on a table
+the plan attaches, and only there.
+
 **A function rebuilt in the same plan** reaches the attached table's checks.
 Measured on 16 and 18, a check the table holds as its parent's becomes the
 parent's inherited copy once attached (`conislocal` false), which the engine

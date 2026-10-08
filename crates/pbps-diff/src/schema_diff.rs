@@ -626,7 +626,9 @@ fn diff_partial_rebuilding(
                     table,
                     defaultless,
                     displaced,
+                    released,
                 }) => {
+                    changes.extend(released);
                     // Gone before the attach, so the engine adopts the one
                     // index left for each of its parent's or builds it; one
                     // the declaration keeps as its own is added after.
@@ -2585,6 +2587,9 @@ struct Attached {
     /// The table's indexes dropped before the attach: every one the engine
     /// could adopt but for the one left to it.
     displaced: Vec<String>,
+    /// The table's key and unique constraints dropped before the attach,
+    /// whose index a plain unique index of the parent's could take.
+    released: Vec<Change>,
 }
 
 /// What the ordinary table `table` is once attached to `of.parent`, or what
@@ -2848,6 +2853,50 @@ fn attached(
         .filter(|(n, _)| !taken.contains(n))
         .map(|(n, i)| (n.clone(), i.clone()))
         .collect();
+    // A parent's plain index adopts a matching index whether or not a
+    // constraint stands on it, while a parent's key or unique constraint
+    // adopts only one that has one. Measured on 16 and 18, a parent's
+    // `UNIQUE INDEX (a)` made before its `UNIQUE (a)` takes the index of the
+    // table's `UNIQUE (a)`, the constraint stays the table's own, and the
+    // parent's constraint is built a clone beside it: a tree the reader
+    // refuses. Which comes first is the oid order no plan knows, so the
+    // table's key or unique constraint such an index could take is dropped
+    // before the attach, and the engine builds both clones (#1642 review).
+    let backing = |columns: &[String]| Index {
+        columns: columns
+            .iter()
+            .map(|c| pbps_model::IndexColumn {
+                key: pbps_model::IndexKey::Column(c.clone()),
+                descending: false,
+                opclass: None,
+            })
+            .collect(),
+        include: Vec::new(),
+        unique: true,
+        filter: None,
+        method: Default::default(),
+        storage_parameters: Default::default(),
+    };
+    let contested = |columns: &[String]| parents_indexes.values().any(|i| *i == backing(columns));
+    let mut released = Vec::new();
+    if let Some(key) = &table.primary_key
+        && contested(&key.columns)
+    {
+        released.push(Change::SetPrimaryKey {
+            table: declared_name.clone(),
+            from: Some(key.clone()),
+            to: None,
+            nonclustered: false,
+        });
+    }
+    for (name, u) in &table.unique {
+        if contested(&u.columns) {
+            released.push(Change::DropUnique {
+                table: declared_name.clone(),
+                name: name.clone(),
+            });
+        }
+    }
     if table.replica_identity.is_some() {
         what.push(
             "it has a replica identity of its own, which a partition does not hold yet".to_owned(),
@@ -2916,6 +2965,7 @@ fn attached(
         },
         defaultless,
         displaced,
+        released,
     })
 }
 
@@ -3034,6 +3084,16 @@ fn refuse_partition_changes(
             && change.table().is_some_and(|t| {
                 (standing(base.schema, t) || attaching.contains(t)) && standing(declared.schema, t)
             })
+        {
+            continue;
+        }
+        // Before the attach, still the ordinary table's: a key or unique
+        // constraint whose index a parent's plain index could take (#1642
+        // review). On a standing partition it is the parent's clone.
+        if matches!(
+            change,
+            Change::DropUnique { .. } | Change::SetPrimaryKey { to: None, .. }
+        ) && change.table().is_some_and(|t| attaching.contains(t))
         {
             continue;
         }
@@ -6515,6 +6575,71 @@ mod tests {
         assert_eq!(
             kinds(&outcome(&base, &declared, &[]).2.expect("attached")),
             ["DropIndex", "AttachPartition", "SetPartitionDefault"]
+        );
+
+        // A parent's plain unique index over the columns of the table's
+        // unique constraint or key could take its index: both go before the
+        // attach, and the engine builds the clones (#1642 review).
+        let unique_on = |columns: &[&str]| Index {
+            columns: columns
+                .iter()
+                .map(|c| pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Column((*c).to_owned()),
+                    descending: false,
+                    opclass: None,
+                })
+                .collect(),
+            unique: true,
+            ..index_on("n")
+        };
+        let contested = |schema: &Schema| {
+            let mut schema = schema.clone();
+            let parent = schema
+                .tables
+                .get_mut(&"app.ev".parse::<TableName>().unwrap())
+                .unwrap();
+            parent
+                .indexes
+                .insert("ev_n_ts".into(), unique_on(&["n", "ts"]));
+            parent
+                .indexes
+                .insert("ev_id_ts".into(), unique_on(&["id", "ts"]));
+            schema
+        };
+        let released = outcome(&contested(&base), &contested(&declared), &[])
+            .2
+            .expect("released");
+        let before: Vec<String> = released
+            .changes
+            .iter()
+            .take_while(|p| !matches!(p.change, Change::AttachPartition { .. }))
+            .map(|p| {
+                if let Change::DropUnique { name, .. } = &p.change {
+                    format!("drop unique {name}")
+                } else if let Change::SetPrimaryKey { to: None, .. } = &p.change {
+                    "drop key".to_owned()
+                } else if let Change::DropIndex { name, .. } = &p.change {
+                    format!("drop {name}")
+                } else {
+                    format!("{:?}", p.change)
+                }
+            })
+            .collect();
+        assert_eq!(
+            before,
+            ["drop t_id", "drop unique t_u", "drop key"],
+            "{:?}",
+            released.changes
+        );
+        // Negative: with no such index, the key and constraint are adopted.
+        let plain = outcome(&base, &declared, &[]).2.expect("adopted");
+        assert!(
+            !plain.changes.iter().any(|p| matches!(
+                p.change,
+                Change::DropUnique { .. } | Change::SetPrimaryKey { to: None, .. }
+            )),
+            "{:?}",
+            plain.changes
         );
 
         // An attach that fills the table another attach's parent references
