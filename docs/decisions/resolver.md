@@ -1789,8 +1789,9 @@ by the engines, and the scratch account decides the layout.** Implemented by
     account unconfined on the target's cluster.
 - **Supplied.** Any other account compiles as itself in the database its
   connection names.
-  - "As itself" is enforced: the run's first statement on the scratch
-    session is `SET ROLE NONE`. A role set by the login's defaults or its
+  - "As itself" is enforced: the first statement on every connection the
+    run opens as the scratch login is `SET ROLE NONE`, the run-owned
+    layout's provisioning connection included. A role set by the login's defaults or its
     connection options would own what the run creates, out of reach of
     `DROP OWNED BY SESSION_USER`. It would also hide the session's own
     backend timings (#1678 review).

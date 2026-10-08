@@ -664,3 +664,42 @@ async fn vouched_compiles_as_the_login_whatever_its_session_defaults() {
         assert_answers_the_overload(&plan.unwrap());
     }
 }
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_provisions_as_the_superuser_login_whatever_its_default_role() {
+    // A superuser login whose default role cannot create roles: every
+    // connection the run opens as it must act as the login itself.
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let mut scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = target.target().await;
+    let login = scratch.login("a", "SUPERUSER").await;
+    let worker = format!("pbps_v1672_r_{}", scratch.token);
+    scratch
+        .admin()
+        .await
+        .execute(&format!(
+            "CREATE ROLE {worker} NOLOGIN NOCREATEROLE NOCREATEDB; GRANT {worker} TO {login}; \
+             ALTER ROLE {login} SET role = {worker}",
+            login = login.0
+        ))
+        .await
+        .unwrap();
+    scratch.roles.insert(0, worker);
+    let before = scratch.inventory().await;
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let result = produce(
+        &scratch.as_login("pbps_test", &login),
+        &target.on(&target_db),
+        &inputs,
+        &key,
+    )
+    .await;
+    let after = scratch.inventory().await;
+    target.drop().await;
+    scratch.drop().await;
+    let plan = result.map_err(|error| error.to_string());
+    assert_eq!(before, after, "the run-owned objects are all dropped");
+    assert_answers_the_overload(&plan.unwrap());
+}

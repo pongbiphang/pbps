@@ -491,6 +491,12 @@ impl Run<'_> {
         let mut owner = Conn::connect_with(driver, self.scratch, names.database(), None)
             .await
             .map_err(db("the run-owned scratch database"))?;
+        // A new connection reloads the login's default role, which the
+        // first one dropped: provisioning is the login's own (#1678 review).
+        owner
+            .execute("SET ROLE NONE")
+            .await
+            .map_err(db("the run-owned scratch session's role"))?;
         refuse_foreign_objects(&mut owner).await?;
         scope::prepare(
             &mut owner,
