@@ -9,6 +9,10 @@
   binding comparison through a qualified run (#613). Planning integration,
   source handling and the evidence a plan may rest on remain unimplemented,
   and no qualification yet changes what a plan is allowed to claim. See [delivery tracking](RESOLVER-DELIVERY.md).
+- Amended by #1528 (DEC-1528.1): an operator-vouched resolver becomes the
+  default selection. The measured profiles this record designs are frozen,
+  and their removal is tracked in #1636. See "Amendment: the operator-vouched
+  resolver" below.
 - Date: 2026-09-15
 - Related: [SPEC §9.3](SPEC.md#93-the-dev-database-optional), §7.3, §7.6,
   §8.2, §9.8 and §11.5; [ARCHITECTURE.md](ARCHITECTURE.md);
@@ -683,6 +687,49 @@ delivery, not silently downgraded to weaker evidence.
 from the artifact without a project, credentials or a resolver. Approval stays
 file-based and the final emitter remains the only source of deployment SQL.
 
+## Amendment: the operator-vouched resolver (#1528)
+
+This amends decisions 4 and 5. [SPEC §9.3.2](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
+carries the normative text, and DEC-1528.1 the reasons.
+
+- **Two environments.** The resolver environments designed above are the
+  *measured profiles*. They are frozen, and their removal is tracked in #1636.
+  Selecting a resolver without naming one gives the *operator-vouched
+  resolver* (`vouched`). The cases, the assessment, the fingerprint key, the
+  sealing and the refusal classes are shared. Only the producer differs.
+- **Decision 4, for the operator-vouched resolver.**
+  - "Verify the chosen environment" means two checks before any scratch DDL:
+    scratch is never the target, and scratch is empty in the connected scope.
+  - The run-owned scratch takes the target's encoding and locale.
+  - Isolation, containment, log handling and channel protection are vouched
+    for by the operator, not measured. The evidence names the profile, so a
+    reviewer can always tell a vouched answer from a measured one.
+- **Decision 5, for the operator-vouched resolver.**
+  - Objects outside the managed set come from a reviewed baseline in the
+    repository, run on scratch only. Every external object it creates is
+    compared with the target and sealed into the manifest. A mismatch, a
+    missing object, or a baseline object in the managed set refuses.
+  - pbps sends no routine source of its own. A question needing routine
+    source the baseline lacks refuses with the finding and two remedies.
+  - The private-source requirements apply only to the measured profiles'
+    retained definitions.
+  - Two later steps reuse the same comparison: a reviewed baseline draft from
+    the target, then automatic fill of missing shapes.
+- **Reading this record.** Its "resolver" means the measured profiles wherever
+  it describes containment, process or socket observation, executable
+  identity or verified channels. Acceptance tests 12, 13, 19 and 20 are
+  measured profiles only.
+- **Acceptance tests for the operator-vouched resolver (live, PostgreSQL):**
+  - `vouched_refuses_the_target_as_scratch`
+  - `vouched_refuses_a_scratch_that_is_not_empty`
+  - `vouched_answers_a_managed_question_without_root_or_observation`
+  - `vouched_compiles_a_managed_view_over_a_baseline_table`
+  - `vouched_refuses_a_baseline_that_differs_from_the_target`
+  - `vouched_refuses_a_baseline_that_creates_a_managed_object`
+  - `vouched_refuses_a_question_that_needs_routine_source_the_baseline_lacks`
+  - `vouched_recheck_binds_the_target_by_engine_identity`
+  - `vouched_recheck_refuses_an_external_shape_changed_after_planning`
+
 ## Architectural placement
 
 The existing [crate boundaries](ARCHITECTURE.md#architectural-boundaries) remain:
@@ -765,7 +812,7 @@ protection under test is removed.
     identity facts and a reconnect or failover to the target also fail closed.
     A separately identified, compatible scratch instance passes, with only
     run-owned resources created and removed; the target remains read-only.
-12. **`resolver_source_logging_is_qualified_before_transfer` (planned):** use
+12. **`resolver_source_logging_is_qualified_before_transfer` (planned; measured profiles only):** use
     a confidential marker in a retained external definition and exercise server
     statement/audit/trace and failure logging, container stderr collection and
     forwarding. A persistent source collector or unknown controls refuse before
@@ -777,7 +824,7 @@ protection under test is removed.
     pre-existing audit policy is disabled. Qualify Docker and supplied-server
     paths independently for each supported engine/platform; removing the
     pre-transfer gate must make the negative case fail.
-13. **`resolver_compilation_cannot_escape_its_run` (planned):** exercise
+13. **`resolver_compilation_cannot_escape_its_run` (planned; measured profiles only):** exercise
     engine-supported creation-time evaluation from managed and retained
     external definitions, including extension/subprocess paths where supported.
     Use disposable network and filesystem sentinels, never real production
@@ -847,7 +894,7 @@ protection under test is removed.
     than passing because CLI output was masked. Cover failure paths, unknown
     historical classification and normal non-confidential plan behavior. Removing
     a consumer's protection must expose the fixture verifier and fail its test.
-19. **`private_resolver_inputs_require_verified_transport` (planned):** cover
+19. **`private_resolver_inputs_require_verified_transport` (planned; measured profiles only):** cover
     both target capture/recheck and scratch transfer with disposable endpoints.
     Plaintext, downgrade, an untrusted/wrong peer and an unprotected backend hop
     must refuse before a private definition or property crosses the channel;
@@ -857,7 +904,7 @@ protection under test is removed.
     setup and apply-time target re-reads without any scratch connection. A
     certificate-validation bypass or localhost-only exemption must fail the
     negative control, independently for each supported engine/transport.
-20. **`managed_only_resolution_authenticates_every_exchange` (planned):** use
+20. **`managed_only_resolution_authenticates_every_exchange` (planned; measured profiles only):** use
     only managed declarations with no private external prerequisites. A controlled
     intermediary relays qualification reads but attempts to alter DDL, replace
     a binding result or substitute a prior run's response; no forged input may

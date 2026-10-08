@@ -1389,6 +1389,33 @@ whether desired declarations bind differently from the objects already on the
 target. [ADR-0016](ADR-0016-engine-assisted-planning.md) records the rationale,
 evidence contract, implementation boundaries and acceptance tests.
 
+**Two kinds of resolver environment (#1528, DEC-1528.1; design accepted, not
+implemented).**
+
+- **The operator-vouched resolver** is what selecting a resolver gives unless a
+  measured profile is named. Users see it simply as the resolver. Internally,
+  and in this specification, it is always the *operator-vouched resolver*
+  (`vouched`).
+  - pbps does not measure or enforce its scratch's isolation, containment, log
+    handling or channels. The operator vouches for them, and the evidence and
+    `explain` say so: `resolver: operator-vouched scratch (not measured)`.
+  - Before any scratch DDL, the baseline's included, it checks two things.
+    Scratch is never the target: its host, port and database, and its
+    credential variable, differ from the target's, with no fallback to target
+    credentials. And scratch is empty in the connected scope, `template1`
+    included.
+  - The run-owned scratch database takes the target's encoding and locale.
+    The encoding decides how a name is cut to the identifier limit, so a
+    scratch in another one would answer for another database.
+- **The measured profiles** (`linux-amd64-v1`, `linux-dedicated-v1`,
+  `linux-dedicated-pg16-v1`) are frozen and to be removed (#1636). They stay
+  selectable by name until then.
+- **Reading this section:** a paragraph marked **Measured profiles only**
+  binds them alone. Text written before #1528 that says "resolver" while
+  describing containment, process observation, executable identity or
+  verified channels means the measured profiles, and none of it carries over
+  to the operator-vouched resolver.
+
 - Plain `plan`, `plan --check` and offline `explain` keep their no-target,
   no-resolver paths. Offline binding uncertainty is reported as unverified,
   not as successful validation; it does not add a resolver requirement to
@@ -1445,7 +1472,12 @@ first, then runs it. Until #1516, its answer is reported and refused as
 `resolver.publication-unavailable`, writing neither file. Selection does not
 replace or waive any existing planning check.
 
-`pbps.yml` can declare trusted Docker or dedicated-server profiles:
+`pbps.yml` can declare Docker or dedicated-server resolvers. Without a
+`profile` field an entry is the operator-vouched resolver, and its optional
+`baseline` names the baseline file (below). `profile: linux-amd64-v1` on a
+Docker entry, or `profile=` in a server value, selects a frozen measured
+profile instead. Until the operator-vouched resolver is implemented, an entry
+without `profile` keeps today's measured meaning:
 
 ```yaml
 resolve_with: pg_local
@@ -1478,11 +1510,12 @@ string. No fallback to target credentials exists. The value is
 whitespace-separated `key=value` fields; `user` and `password` are
 percent-encoded (`%20` for a space, `%25` for `%`), so any credential can be
 spelled, and a malformed escape is refused rather than taken literally
-(#677). That variable's value also
+(#677). **Measured profiles only:** that variable's value also
 carries the externally enforced runtime profile the supplied server is claimed
-to meet and the container that provides it: those describe a running
-deployment, so nothing checked in claims a server meets a profile pbps has not
-measured. An unimplemented profile name is refused by name, per engine, and a
+to meet and the container that provides it. For the operator-vouched resolver
+it is an ordinary connection string. The profile and container describe a
+running deployment, so nothing checked in claims a server meets a profile pbps
+has not measured. An unimplemented profile name is refused by name, per engine, and a
 named one stays a claim until #609's admission measures the actual runtime.
 
 A missing selected profile is a named finding (exit 2) before target access or
@@ -1500,6 +1533,43 @@ The desired namespace includes retained external prerequisites and relevant
 candidate sets, not just managed objects. Missing definitions, unreadable
 metadata or an environment that cannot be reproduced remain unresolved;
 fabricated stubs never constitute binding evidence.
+
+**The operator-vouched resolver stages objects outside the managed set from a
+reviewed baseline, compared with the target (#1528).** A managed view or routine
+that references anything outside the managed set otherwise fails the whole
+scratch compile (#1616).
+
+- **The baseline is a SQL file in the repository**, named by the resolver
+  entry's `baseline`. It is reviewed history like the declarations. It runs on
+  scratch only, never on the target: after the two checks, before the
+  managed declarations compile.
+- **Each external object it creates is compared with the target before any
+  binding question is answered.** A mismatch, or an object the target does
+  not have, refuses and names the object.
+  - A relation is compared by its column names, types and order (order
+    decides `*` expansion).
+  - A type is compared by its definition: a composite's attributes, an
+    enum's labels in order, a domain's base type.
+  - A routine is compared by its signature and return type; its body is not
+    compared.
+  - An extension is compared by its name and version.
+- **The compared shapes are sealed into the evidence manifest** and rechecked
+  like any other external input.
+- **A baseline object in the managed set refuses.** The declarations stay the
+  one source of truth.
+- **pbps itself never sends routine source to scratch.** A routine is there
+  only if the operator put it in the baseline. A binding question that needs
+  routine source the baseline lacks refuses with a finding naming the
+  surface, and two remedies: add the routine to the baseline, or select no
+  resolver and keep ADR-0013's conservative rebuild.
+
+A baseline object compared with the target is not a fabricated stub; an
+uncompared one never reaches binding evidence. Two later steps are planned:
+1. a command that drafts a baseline from the target's external shapes, for
+   review (a view is drafted as a table of its output columns, and a routine
+   is listed but never written);
+2. filling, at plan time, the shapes a baseline lacks, by the same rules;
+   the baseline wins on overlap.
 
 Resolved dependencies also become cross-kind ordering edges in the final typed
 plan: remove dependents before their old inputs, and establish desired inputs
@@ -1520,8 +1590,8 @@ of no dependencies. Runtime-bound bodies and dynamic SQL keep their existing
 limitations and impact warnings; the resolver does not execute routines to
 discover those dependencies or claim whole-program validation.
 
-Compilation itself may evaluate expressions or extension code. Before resolver
-DDL or declaration transfer, verify and enforce an engine/platform containment
+**Measured profiles only.** Compilation itself may evaluate expressions or
+extension code. Before resolver DDL or declaration transfer, verify and enforce an engine/platform containment
 profile for all compiled source, not just retained external definitions. Deny
 workload-initiated network access and access to host files, credentials, devices
 or runtime sockets outside the isolated run; allow only the bounded incoming
@@ -1529,7 +1599,9 @@ pbps control channel and qualified runtime inputs/private disposable storage.
 Controls live outside SQL privileges and bound resource use and lifetime.
 Image acquisition is a separate trusted phase, not workload egress permission.
 Unknown controls refuse compilation; violations abort without evidence or a
-broader-access retry. Supplied scratch servers must meet the same contract.
+broader-access retry. Supplied scratch servers under a measured profile must
+meet the same contract. The operator-vouched resolver measures none of this;
+its operator vouches for it.
 Required semantics that cannot run within it remain unsupported, not stubbed;
 ADR-0016 defines the trusted-runtime boundary and negative acceptance cases.
 
@@ -1562,8 +1634,8 @@ Closing checks use a post-apply manifest derived and sealed from the approved
 typed changes, so planned candidate/grant changes are distinguished from drift.
 An unprovable transition refuses at planning, never becomes an apply-time choice.
 
-Retained external definitions are private, ephemeral reconstruction inputs,
-not additional source shipped to reviewers. Saved evidence records their
+**Measured profiles only.** Retained external definitions are private,
+ephemeral reconstruction inputs, not additional source shipped to reviewers. Saved evidence records their
 logical identities and versioned canonical fingerprints, never the full text.
 Publication/apply checks re-read and hash the target definitions; a changed,
 missing or unreadable prerequisite cannot pass. `explain`, generated SQL,
@@ -1576,10 +1648,12 @@ and disposable, without persistent/exported copies. Unknown or unenforceable
 controls refuse reconstruction before transfer; client redaction or deleting a
 scratch database is not proof, and pre-existing audit policies are not disabled
 to satisfy the check. ADR-0016 defines the trusted-runtime boundary and lifecycle.
+The operator-vouched resolver retains no external source of its own. Its
+baseline is reviewed repository content the operator chose to send.
 
-Every resolver qualification, target-evidence read (including apply rechecks),
-scratch DDL/control exchange and binding result requires authenticated integrity
-and peer validation, including managed-only analysis without private inputs.
+**Measured profiles only.** Every resolver qualification, target-evidence read
+(including apply rechecks), scratch DDL/control exchange and binding result
+requires authenticated integrity and peer validation, including managed-only analysis without private inputs.
 Qualify the actual channels before accepting evidence or sending declarations;
 private inputs additionally require confidentiality. The initial remote profile
 uses authenticated encryption for all these exchanges; plaintext, downgrade and
@@ -1587,7 +1661,8 @@ disabled peer checks refuse. Local channels require qualified peer/host
 isolation, not merely localhost. Reconnects requalify and results stay bound to
 the actual peer/run. Private-source logging controls remain conditional.
 Existing unrelated connection defaults are unchanged; apply does not contact
-a resolver.
+a resolver. The operator-vouched resolver uses whatever TLS the operator
+configured on each connection.
 
 The user's managed declarations and explicit deployment changes remain ordinary
 reviewable plan contents. A bare hash of a definition would be a guessing

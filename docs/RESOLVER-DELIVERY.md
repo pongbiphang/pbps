@@ -8,6 +8,18 @@ The parent stays open until both engine adapters and the confidential-path
 prerequisite are delivered. Each bounded child follows the repository's full
 local verification, review and CI gates.
 
+**Re-planned by #1528 (DEC-1528.1).** The sections below deliver the measured
+profiles, which are now frozen; #1636 removes them. The order is now:
+1. this amendment;
+2. the operator-vouched resolver's producer, with its two checks and the
+   baseline comparison;
+3. #1516's, #1517's and #616's tier-neutral cores;
+4. the baseline draft command, then automatic fill;
+5. #1636.
+
+Read "resolver" in the sections below as the measured profiles where it
+describes containment, observation or verified channels.
+
 ## First implementation: read-only discovery (#597)
 
 Connected `doctor`, in human and JSON output, now reports:

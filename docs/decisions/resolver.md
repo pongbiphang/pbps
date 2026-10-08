@@ -1561,3 +1561,80 @@ and the refusal classes hold for every profile; only the producer behind
 profiles, which bind the target by observing its engine service
 (DEC-1514.1); that same-host premise is theirs, not resolution's. An
 operator-trusted profile plugs in beside them without reshaping the cases.
+
+<a id="dec-1528-1"></a>
+
+**DEC-1528.1. Selecting a resolver gives the operator-vouched resolver; the
+measured profiles are frozen.** The measured profiles were built to prove
+their own isolation. That needs root, a same-host engine observed through its
+socket, executable identity and verified channels, and it still fails on any
+existing database whose managed objects reference anything outside the
+managed set. #1616 measured three real schemas: no tier answered any of them,
+because the scratch compile itself failed. So the default must be one an
+ordinary CI runner or laptop can use, and it must answer partial adoptions.
+
+**Three tiers.**
+1. No resolver: ADR-0013's conservative rebuild. This stays the default
+   (ADR-0013).
+2. The operator-vouched resolver: the selection whenever a resolver is
+   selected without naming a profile.
+3. The measured profiles: frozen now, and to be removed by #1636 once the
+   operator-vouched resolver covers every path.
+
+**The operator vouches for what pbps does not measure:** the scratch's
+isolation, the confidentiality of what it compiles, and its channels. Both
+connections use whatever TLS the operator configured. The evidence names the
+profile, so a reviewer can always tell a vouched answer from a measured one.
+
+**It keeps exactly two checks, run before any scratch DDL.**
+- **Scratch is never the target:** a different host, port and database, a
+  different credential variable, and no fallback to target credentials. That
+  is the mistake an operator can make by accident, and it is cheap to catch.
+- **Scratch is empty in the connected scope, `template1` included:** a
+  polluted scratch changes what the declarations bind to.
+
+A third check, that scratch is another engine instance (`system_identifier`),
+was dropped. It needs a privileged read, and it guards against a choice the
+operator already vouched for. So a scratch database on the target's own
+cluster is allowed.
+
+**The scratch database takes the target's encoding and locale.** The encoding
+decides how a name is cut to the 63-byte identifier limit (#1627, #1640). A
+scratch in another encoding would answer for another database. This is not a
+user option.
+
+**Objects outside the managed set are staged from a reviewed baseline,
+compared with the target.** Leaving them out (managed-only) fails every
+partial adoption, which is #1616's finding. Reconstructing them by reading
+their full definitions sends routine source no reviewer approved.
+- The baseline is a SQL file in the repository. It runs on scratch only.
+- Every external object it creates is compared with the target, by
+  relation columns, types and order, type definitions, routine signatures
+  and extension versions. The compared shapes are sealed into the manifest.
+  So a wrong or stale baseline refuses instead of answering for a database
+  that does not exist.
+- A baseline object in the managed set refuses: the declarations stay the
+  one source of truth.
+- pbps itself never sends routine source. A routine reaches scratch only
+  through the baseline, under what the operator vouches for.
+- Two later steps reuse the same comparison: a reviewed draft generated from
+  the target (shapes only; a view as a table of its output columns), then
+  automatic fill of missing shapes, where the baseline wins on overlap.
+
+**Naming.**
+- Users see the operator-vouched resolver as plain "resolver".
+- SPEC, ADR, DEC text and code always call it the operator-vouched resolver,
+  `vouched` (the `Vouched` variant, tests prefixed `vouched_`).
+- The frozen tier is "the measured profiles". Containment, process and socket
+  observation, executable identity and verified channels belong to them
+  alone.
+- Text written before this entry that says "resolver" for those means the
+  measured profiles. That covers SPEC §9.3.2 and ADR-0016 as first written,
+  and issues and entries such as DEC-1514.1, #1541, #1542, #1404, #1411, #617,
+  #619, #620 and #1381.
+- A reused bare word would let a later reader carry a measured guarantee over
+  to a profile that makes none.
+
+Recorded in SPEC §9.3.2 and ADR-0016's amendment. The design and the
+maintainer's decisions are on #1528. Pinned by the acceptance tests ADR-0016's
+amendment lists, which land with the producer.
