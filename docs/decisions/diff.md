@@ -3537,7 +3537,8 @@ module's dependents leave it out (`its_parents_once_attached`): the parent's
 own check, declared, is removed and restored around the rebuild, and both
 reach the partition as they recurse. Only when the module's drop comes
 before the attach is the table's copy removed by itself, and it is never
-put back.
+put back. A check the partition declaration keeps as its own is no copy:
+it stays the table's across the attach and is woven as any declared check.
 
 **The attach validates the parent's foreign keys** over the rows it brings,
 as `ADD FOREIGN KEY` does. So the parents a plan attaches to are ordered

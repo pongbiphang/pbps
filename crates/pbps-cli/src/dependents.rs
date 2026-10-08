@@ -645,18 +645,22 @@ fn taken_by_its_parent(changes: &[PlannedChange], holds: &Holds, drop_at: usize)
     })
 }
 
-/// Where this plan attaches the table holding `holds`, a check.
+/// Where this plan attaches the table holding `holds`, a check its
+/// partition declaration does not keep as its own. One it keeps stays the
+/// table's across the attach, is no copy of the parent's, and is woven around
+/// the rebuild as any declared check (#1642 review).
 fn attached_at(changes: &[PlannedChange], holds: &Holds) -> Option<usize> {
     let Holds::TablePart {
         table,
-        part: Part::Check(_),
+        part: Part::Check(name),
     } = holds
     else {
         return None;
     };
-    changes
-        .iter()
-        .position(|p| matches!(&p.change, Change::AttachPartition { table: t, .. } if t == table))
+    changes.iter().position(|p| {
+        matches!(&p.change, Change::AttachPartition { table: t, shape, .. }
+            if t == table && !shape.checks.contains_key(name))
+    })
 }
 
 /// Puts every dependent of every module this plan drops on the right side of
@@ -4281,45 +4285,49 @@ mod tests {
             from: vec![pbps_model::BoundDatum::Value("0".into())],
             to: vec![pbps_model::BoundDatum::Value("10".into())],
         };
-        // Declared as the partition it becomes: the check is its parent's.
-        s.tables.insert(
-            TableName::new("app", "t"),
-            Table {
-                partition_of: Some(pbps_model::PartitionOf {
-                    parent: TableName::new("app", "p"),
-                    bound: bound.clone(),
-                    columns: Default::default(),
-                }),
-                ..Table::default()
-            },
-        );
+        // Declared as the partition it becomes: `ck` is its parent's, and
+        // `own`, which calls the same function, its own.
+        let partition = Table {
+            checks: [("own".to_owned(), check())].into(),
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: TableName::new("app", "p"),
+                bound: bound.clone(),
+                columns: Default::default(),
+            }),
+            ..Table::default()
+        };
+        s.tables
+            .insert(TableName::new("app", "t"), partition.clone());
         let mut cs = plan(vec![
             Change::AttachPartition {
                 uid: "t_cccccc".parse().unwrap(),
                 table: TableName::new("app", "t"),
                 parent: TableName::new("app", "p"),
                 bound,
-                shape: Box::default(),
+                shape: Box::new(partition),
             },
             alter(&s, "app.f(integer)"),
         ]);
-        let on = |table: &str| Dependent {
-            described: format!("constraint ck on table {table}"),
+        let on = |table: &str, name: &str| Dependent {
+            described: format!("constraint {name} on table {table}"),
             holds: Holds::TablePart {
                 table: table.parse().unwrap(),
-                part: Part::Check("ck".into()),
+                part: Part::Check(name.into()),
             },
         };
-        let found = BTreeMap::from([(id("app.f(integer)"), vec![on("app.t"), on("app.p")])]);
+        let found = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![on("app.t", "own"), on("app.t", "ck"), on("app.p", "ck")],
+        )]);
         weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect("woven");
         let touched: Vec<String> = cs
             .changes
             .iter()
             .filter_map(|p| {
-                if let Change::DropCheck { table, .. } = &p.change {
-                    Some(format!("drop {table}"))
-                } else if let Change::AddCheck { table, .. } = &p.change {
-                    Some(format!("add {table}"))
+                if let Change::DropCheck { table, name } = &p.change {
+                    Some(format!("drop {table} {name}"))
+                } else if let Change::AddCheck { table, name, .. } = &p.change {
+                    Some(format!("add {table} {name}"))
                 } else if let Change::AttachPartition { .. } = &p.change {
                     Some("attach".to_owned())
                 } else if let Change::AlterModule { .. } = &p.change {
@@ -4329,8 +4337,19 @@ mod tests {
                 }
             })
             .collect();
-        // Attached before the rebuild: the parent's drop takes the copy.
-        assert_eq!(touched, ["attach", "drop app.p", "alter", "add app.p"]);
+        // Attached before the rebuild: the parent's drop takes the copy, and
+        // its own goes and comes back as any declared check.
+        assert_eq!(
+            touched,
+            [
+                "attach",
+                "drop app.t own",
+                "drop app.p ck",
+                "alter",
+                "add app.p ck",
+                "add app.t own"
+            ]
+        );
         assert!(unaccounted(&cs, &found).is_empty());
         let woven = cs.changes.len();
         weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect("woven again");
