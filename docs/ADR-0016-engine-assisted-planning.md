@@ -720,8 +720,8 @@ carries the normative text, and DEC-1528.1 the reasons.
     compares the target's complete fingerprints.
   - The baseline runs in its own session. Afterwards, every managed object
     already staged must be unchanged, and every object it created must be
-    compared; otherwise it refuses. A mismatch, a
-    missing object, or a baseline object in the managed set refuses.
+    compared; otherwise it refuses. A mismatch, a missing object, or a
+    baseline object in the managed set refuses too.
   - pbps sends no routine source of its own. A question needing routine
     source the baseline lacks refuses with the finding and two remedies.
   - The private-source requirements apply only to the measured profiles'
@@ -730,8 +730,15 @@ carries the normative text, and DEC-1528.1 the reasons.
     the target, then automatic fill of missing shapes.
 - **Reading this record.** Its "resolver" means the measured profiles wherever
   it describes containment, process or socket observation, executable
-  identity or verified channels. Acceptance tests 12, 13, 19 and 20 are
-  measured profiles only.
+  identity or verified channels.
+  - Acceptance tests 10, 11, 12, 13, 19, 20 and 23 are measured profiles
+    only: they test retained external source, instance separation,
+    containment, verified channels and executable identity.
+  - Test 14 holds for the operator-vouched resolver for its compatibility
+    inputs only.
+  - Test 11's same-cluster refusal is replaced, for the operator-vouched
+    resolver, by `vouched_refuses_the_target_as_scratch`: another database
+    on the target's cluster passes there.
 - **Acceptance tests for the operator-vouched resolver (live, PostgreSQL):**
   - `vouched_refuses_the_target_as_scratch`
   - `vouched_refuses_a_scratch_that_is_not_empty`
@@ -739,6 +746,8 @@ carries the normative text, and DEC-1528.1 the reasons.
   - `vouched_compiles_a_managed_view_over_a_baseline_table`
   - `vouched_refuses_a_baseline_that_differs_from_the_target`
   - `vouched_refuses_a_baseline_that_creates_a_managed_object`
+  - `vouched_refuses_a_baseline_that_alters_a_managed_object_or_leaves_one_uncompared`
+  - `vouched_compiles_a_managed_view_over_an_external_view_staged_as_a_table`
   - `vouched_refuses_a_question_that_needs_routine_source_the_baseline_lacks`
   - `vouched_recheck_binds_the_target_by_engine_identity`
   - `vouched_recheck_refuses_an_external_shape_changed_after_planning`
@@ -808,7 +817,7 @@ protection under test is removed.
    and prove the closing read sees the apply's own DDL and uses the existing
    revalidation boundary. Qualify each engine independently; this test does not
    promise to prevent external DDL after the last observation.
-10. **`external_definition_evidence_keeps_source_private` (planned):** use a
+10. **`external_definition_evidence_keeps_source_private` (planned; measured profiles only):** use a
     retained external function/view whose source contains a confidential marker.
     Reconstruction can use its full definition, but the marker and source never
     appear in plan/SQL artifacts, `explain`, human/JSON diagnostics,
@@ -818,7 +827,7 @@ protection under test is removed.
     same object identity and candidate set. Missing/unreadable definitions and
     unsupported fingerprint versions do not pass; an unchanged prerequisite
     verifies without Docker or the original source in the saved plan.
-11. **`resolver_rejects_the_target_instance_before_writes` (planned):** on both
+11. **`resolver_rejects_the_target_instance_before_writes` (planned; measured profiles only):** on both
     engines, point the resolver at another database on the target instance or
     cluster, including through an alias and different credentials. Refuse before
     database creation, source transfer or other scratch DDL. Missing/unreadable
@@ -851,7 +860,7 @@ protection under test is removed.
     negative control showing the sentinel is reachable when containment is
     removed in the test fixture. Compilation requiring a blocked effect is
     refused without stubs or a less restrictive retry.
-14. **`resolver_reconnect_requalifies_all_evidence` (planned):** replace a
+14. **`resolver_reconnect_requalifies_all_evidence` (planned; for the operator-vouched resolver, its compatibility inputs only):** replace a
     qualified resolver connection with a separate backend that still passes
     target-instance separation but differs in a required version, extension,
     collation or effective session setting. Each mismatch or unknown fact must
@@ -945,7 +954,7 @@ protection under test is removed.
     or grant and the sealed post-apply manifest matches. Neither case starts a
     resolver during apply. Omitting the closing manifest check must fail the
     negative control; do not claim to catch writes after the last observation.
-23. **`same_version_builds_do_not_imply_resolver_equivalence` (planned):** use
+23. **`same_version_builds_do_not_imply_resolver_equivalence` (planned; measured profiles only):** use
     real-engine fixtures with distinct same-version engine or extension builds,
     including a parser-hook library that changes creation-time binding while
     reported versions, candidate identities and retained bindings still match.
