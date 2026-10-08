@@ -968,8 +968,9 @@ and the principal's name holds a quote character.
 
 **DEC-1644.1. SQL Server reads what depends on what through the per-object
 dependency functions under the managed-schema grant; only the hidden-referrer
-proof reads `sys.sql_expression_dependencies`, so `doctor` advises its two
-grants instead of requiring them (#1644; amends SPEC §7.4 and §9.5).**
+proof, and the rename impact report on SQL Server 2008 to 2012, read
+`sys.sql_expression_dependencies`, so `doctor` advises its two grants instead
+of requiring them (#1644; amends SPEC §7.4 and §9.5).**
 
 **Context.** SPEC §9.5 asks for `VIEW DEFINITION` on each managed schema,
 never on the database, and #1359 added `SELECT` on
@@ -1011,6 +1012,22 @@ schema the login cannot see is dropped silently, with no row.
   `SCHEMABINDING` module reading the table refused the rename of a column it
   never reads — which SQL Server performs (15336 only for a column the module
   reads).
+- Both reads keep only a row naming no database, or this one by a three-part
+  name. The functions keep another database's `referenced_id` for a reference
+  into it, where the view has `NULL`, and ids repeat across databases: the
+  first table of two fresh databases measured with one id on 17.0. Read as
+  local, such a row bound a view over the other database's table to a local
+  ledger table, and the pull left the view out.
+- On SQL Server 2008 to 2012, `sys.dm_sql_referencing_entities` wants
+  `CONTROL` on the referenced table (Microsoft's documented permission for
+  those versions; no image older than 2017 runs here to measure it), which
+  §9.5 does not ask. There the rename impact report reads the view behind the
+  guard below, with the rule the view allows: every referrer that is not
+  schema-bound, as before #1644, and a schema-bound one only for a column it
+  names. Azure SQL, whose banner says 12.x, reads the functions. The pull's
+  module dependencies ask `sys.dm_sql_referenced_entities`, which wants
+  `VIEW DEFINITION` on the referencing module in every version, and are the
+  same everywhere.
 - The hidden-referrer proof of DEC-1462.1, and `expression_edges`, which runs
   only behind it, keep the view: only the view keeps the edge of a referrer
   the login cannot see. Both start at one guard,
@@ -1034,9 +1051,12 @@ in the report, as it was not before. For a plan it could block, the proof
 refuses; for a report, it is the report of what this login can see.
 
 Pinned by:
-- `a_schema_scoped_account_reads_what_depends_on_what` and
+- `a_schema_scoped_account_reads_what_depends_on_what`,
+  `a_reference_into_another_database_is_not_a_local_edge` and
   `a_schema_scoped_grant_satisfies_the_readiness_check`
   (`crates/pbps-mssql/tests/live.rs`);
+- `only_servers_before_2014_read_a_renames_referrers_from_the_view`
+  (`crates/pbps-mssql/src/impact.rs`);
 - `a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge` and
   `doctor_asks_for_the_dml_a_declared_data_block_needs`
   (`crates/pbps-cli/tests/flow.rs`);

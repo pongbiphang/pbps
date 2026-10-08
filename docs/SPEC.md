@@ -2007,7 +2007,8 @@ or module refers to what a connected plan alters or drops reads
 database `VIEW DEFINITION`, and whose `SELECT` the engine gives only to
 `db_owner` (#1359). Those two are **advised**, a warning that leaves the
 account ready, not asked for: without them that one kind of plan is refused by
-name, and every other command works (DEC-1644.1). The probes' `SELECT` is asked for on
+name, and so is a rename on SQL Server 2008 to 2012, whose referrers are read
+from the view there; every other command works (DEC-1644.1). The probes' `SELECT` is asked for on
 each **managed table**, accepting an object grant or grants on every catalog
 column. Its schema is the fallback only while the table does not exist yet.
 Declared tables are resolved to their current names in each environment, and

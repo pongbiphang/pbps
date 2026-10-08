@@ -6862,7 +6862,7 @@ async fn doctor_requires_alter_only_until_the_existing_ledger_is_migrated() {
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 async fn a_schema_scoped_account_reads_what_depends_on_what() {
     use pbps_model::TableName;
-    use pbps_mssql::impact::{RenameTarget, rename_impact};
+    use pbps_mssql::impact::{DependencyRead, RenameTarget, rename_impact, rename_impact_reading};
     let mut db = TestDb::create("deps1644").await;
     for statement in [
         "CREATE TABLE dbo.acct (id int NOT NULL CONSTRAINT pk_acct PRIMARY KEY, bal int NULL)
@@ -7002,6 +7002,50 @@ async fn a_schema_scoped_account_reads_what_depends_on_what() {
         ["dbo.rp_gone", "dbo.rp_stale"],
         "{report:?}"
     );
+    // The view's read, which SQL Server 2008 to 2012 take: refused by name
+    // for this account, which the view answers with nothing.
+    let refused = rename_impact_reading(
+        &mut lp,
+        &RenameTarget::Column("dbo.k.b".parse().unwrap()),
+        DependencyRead::Catalog,
+    )
+    .await
+    .expect_err("the view's read without database VIEW DEFINITION");
+    assert!(
+        refused.to_string().contains("database VIEW DEFINITION"),
+        "{refused}"
+    );
+    // With it (`sa`), every referrer that is not schema-bound is counted, as
+    // the view records no columns for them, and the schema-bound one only for
+    // the column it names.
+    for (column, blocking) in [("b", &[][..]), ("a", &["dbo.k_sb"][..])] {
+        let report = rename_impact_reading(
+            &mut db.conn,
+            &RenameTarget::Column(format!("dbo.k.{column}").parse().unwrap()),
+            DependencyRead::Catalog,
+        )
+        .await
+        .expect("the view's read as sa");
+        assert_eq!(
+            names(&report.advisory),
+            ["dbo.k_a", "dbo.k_pb", "dbo.k_star"],
+            "{column}: {report:?}"
+        );
+        assert_eq!(names(&report.blocking), blocking, "{column}: {report:?}");
+    }
+    let report = rename_impact_reading(
+        &mut db.conn,
+        &RenameTarget::Table("dbo.k".parse().unwrap()),
+        DependencyRead::Catalog,
+    )
+    .await
+    .expect("the view's read of the table as sa");
+    assert_eq!(
+        names(&report.advisory),
+        ["dbo.k_a", "dbo.k_pb", "dbo.k_star"],
+        "{report:?}"
+    );
+    assert_eq!(names(&report.blocking), ["dbo.k_sb"], "{report:?}");
     // The engine agrees about `b`: renamed under the schema-bound `k_sb`.
     db.conn
         .execute("EXEC sp_rename 'dbo.k.b', 'b2', 'COLUMN';")
@@ -7016,6 +7060,84 @@ async fn a_schema_scoped_account_reads_what_depends_on_what() {
             "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
         ))
         .await;
+}
+
+/// A module's reference into another database is not an edge to the local
+/// object that happens to hold the same id (#1644). The dependency functions
+/// keep the other database's `referenced_id` where the catalog view has
+/// `NULL`, and ids repeat across databases: the first table of each fresh one
+/// gets the same id. Read as local, the reference made a view over the other
+/// database's table look bound to a local ledger table, and the pull left it
+/// out; and a view joining both tables read as naming the ledger table's
+/// column with the other table's column id. A three-part name into this
+/// database still is a reference.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_reference_into_another_database_is_not_a_local_edge() {
+    use pbps_model::TableName;
+    use pbps_mssql::impact::{RenameTarget, rename_impact};
+    let mut far = TestDb::create("deps1644far").await;
+    far.conn
+        .execute("CREATE TABLE dbo.far (id int NOT NULL, c int NULL);")
+        .await
+        .expect("the other database's table");
+    let mut db = TestDb::create("deps1644near").await;
+    let other = far.name.clone();
+    let near = db.name.clone();
+    for statement in [
+        "CREATE TABLE dbo.acct (id int NOT NULL CONSTRAINT pk_acct PRIMARY KEY, bal int NULL)
+             WITH (SYSTEM_VERSIONING = ON, LEDGER = ON);"
+            .to_owned(),
+        format!("CREATE VIEW dbo.v_far AS SELECT id, c FROM [{other}].dbo.far;"),
+        format!(
+            "CREATE VIEW dbo.v_both AS SELECT a.id FROM dbo.acct a \
+             JOIN [{other}].dbo.far f ON f.id = a.id WHERE f.c > 0;"
+        ),
+        format!("CREATE VIEW dbo.v_self AS SELECT id, bal FROM [{near}].dbo.acct;"),
+    ] {
+        db.conn.execute(&statement).await.expect(&statement);
+    }
+    let ids = db
+        .conn
+        .query(&format!(
+            "SELECT CASE WHEN OBJECT_ID(N'[{other}].dbo.far') = OBJECT_ID(N'dbo.acct') \
+             THEN 1 ELSE 0 END AS same;"
+        ))
+        .await
+        .expect("compare the ids");
+    assert_eq!(
+        ids[0].try_get::<i32>("same").unwrap(),
+        Some(1),
+        "the test's premise is wrong: the two tables no longer share an id"
+    );
+
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let omitted = |name: &str| {
+        pulled.unmanaged_modules.iter().any(|module| {
+            module.target.object_name() == TableName::new("dbo", name)
+                && module.why.contains("create-time-bound dependency")
+        })
+    };
+    assert!(!omitted("v_far"), "{:?}", pulled.unmanaged_modules);
+    assert!(omitted("v_self"), "{:?}", pulled.unmanaged_modules);
+
+    // `far.c` is column 2, as `acct.bal` is.
+    let report = rename_impact(
+        &mut db.conn,
+        &RenameTarget::Column("dbo.acct.bal".parse().unwrap()),
+    )
+    .await
+    .expect("impact of bal");
+    let mut advisory: Vec<_> = report.advisory.iter().map(|r| r.name.as_str()).collect();
+    advisory.sort();
+    // `acct_Ledger` is the ledger view SQL Server made for the table.
+    assert_eq!(advisory, ["dbo.acct_Ledger", "dbo.v_self"], "{report:?}");
+    assert!(report.blocking.is_empty(), "{report:?}");
+
+    db.drop().await;
+    far.drop().await;
 }
 
 /// The permission check against a real least-privilege login.

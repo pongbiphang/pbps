@@ -343,6 +343,12 @@ SELECT o.object_id, NULLIF(o.parent_object_id, 0) AS parent_object_id,
 // control is a read that failed, never one that found nothing. With
 // `RAISERROR` rather than `THROW`, which SQL Server 2008 cannot parse, and the
 // pull still reads a server that old.
+//
+// A reference into another database keeps that database's `referenced_id`,
+// where the view has `NULL`, and object ids repeat across databases: two fresh
+// databases measured with the same id for their first table on 17.0. Such a row
+// would read as an edge to whatever local object holds the number, so only
+// rows naming no database, or this one by a three-part name, are edges.
 const MODULE_DEPENDENCIES: &str = "\
 BEGIN TRY
 SELECT DISTINCT o.object_id AS referencing_id, r.referenced_id
@@ -353,6 +359,7 @@ SELECT DISTINCT o.object_id AS referencing_id, r.referenced_id
  WHERE o.is_ms_shipped = 0
    AND o.type IN ('V', 'P', 'FN', 'IF', 'TF', 'TR', 'D', 'C')
    AND r.referenced_id IS NOT NULL
+   AND (r.referenced_database_name IS NULL OR DB_ID(r.referenced_database_name) = DB_ID())
  ORDER BY referencing_id, r.referenced_id;
 END TRY
 BEGIN CATCH
@@ -1010,9 +1017,11 @@ pub async fn prove_referrers_visible(
 /// edge" only behind this proof. Only the hidden-referrer proof and the edges
 /// it covers read the view: it alone keeps the edge of a referrer this login
 /// cannot see, with a `NULL` referrer, where `sys.dm_sql_referenc*_entities`
-/// drop it. Every other dependency read asks those functions, which answer
-/// under the managed-schema grant.
-async fn require_dependency_catalog(conn: &mut Conn) -> Result<(), DbError> {
+/// drop it. So does a rename's impact on SQL Server 2008 to 2012, where those
+/// functions want `CONTROL` on the table ([`crate::impact::DependencyRead`]).
+/// Every other dependency read asks those functions, which answer under the
+/// managed-schema grant.
+pub(crate) async fn require_dependency_catalog(conn: &mut Conn) -> Result<(), DbError> {
     let granted = conn
         .query("SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION') AS granted;")
         .await?;

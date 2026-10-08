@@ -339,8 +339,9 @@ const fn req(name: &'static str, why: &'static str, needed: Needed) -> Requireme
 /// cannot see refers to a function the plan alters or drops, or to a
 /// computed column it drops. Only `sys.sql_expression_dependencies` keeps
 /// such a referrer's edge, and only under database `VIEW DEFINITION` does it
-/// return any row. Without these, that plan is refused by name, and every
-/// other command works: the dependency reads of `pull`, `plan --db` and
+/// return any row. Without these, that plan is refused by name, and so is a
+/// rename on SQL Server 2008 to 2012, which reads its referrers from the view
+/// (`impact::DependencyRead`). Every other command works: the dependency reads of `pull`, `plan --db` and
 /// `verify` ask `sys.dm_sql_referenc*_entities`, which answer under the
 /// managed-schema grant. So `doctor` names them as advice, never as a gap:
 /// database-wide `VIEW DEFINITION` is the broad ask this list avoids.
@@ -348,12 +349,13 @@ pub const ADVISED: [Requirement; 2] = [
     req(
         "VIEW DEFINITION",
         "proving no hidden computed column or module refers to a function a connected plan \
-         alters or drops, or to a computed column it drops; without it, such a plan is refused",
+         alters or drops, or to a computed column it drops, and on SQL Server 2008 to 2012 \
+         reading what a rename affects; without it, such a plan is refused",
         Needed::Database,
     ),
     req(
         "SELECT",
-        "the same proof, which reads this view",
+        "the same reads, which ask this view",
         Needed::CatalogView,
     ),
 ];
