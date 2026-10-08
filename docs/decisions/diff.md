@@ -3168,8 +3168,12 @@ and the engine refused it at apply (3729).
 | both, object `DENY VIEW DEFINITION` or `DENY CONTROL` on the referrer | the edge's row | absent |
 | `db_owner`, with the same schema `DENY` | the edge's row | present: the owner's override |
 
-**Decision.** Before the edges are read, `prove_referrers_visible` asks for
-database `VIEW DEFINITION`, the grant without which the view answers nothing.
+**Decision.** The edges are read only for a plan with a change they decide:
+a column's rename, drop, retype or nullability change, a function's alter, a
+module's drop, or a computed column's drop. A plan that only adds a computed
+column or drops a table reads none, and needs no grant for them. Before the
+edges are read, `prove_referrers_visible` asks for database
+`VIEW DEFINITION`, the grant without which the view answers nothing.
 It then looks for an edge whose referencing object `sys.objects` does not
 show, onto what a hidden referrer could block: a function the plan alters or
 drops, which a computed column anywhere may call, and a computed column the
@@ -3196,4 +3200,6 @@ referrer's schema is refused by name; as `sa`, and as the login once the
 `DENY` is revoked, the edge itself refuses the alter. A hidden schema-bound
 view over `dbo.k.c` refuses that column's drop by name, and a computed column
 added beside it plans. A hidden plain view over `dbo.k.c`, or a hidden
-procedure calling `dbo.h`, refuses neither the drop nor the alter.
+procedure calling `dbo.h`, refuses neither the drop nor the alter. With
+managed-schema `VIEW DEFINITION` only, the alter is refused for the database
+grant, and adding a computed column plans.

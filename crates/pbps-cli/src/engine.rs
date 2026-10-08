@@ -678,6 +678,26 @@ pub async fn order_computed_by_edges(conn: &mut Conn, cs: &mut ChangeSet) -> any
     if objects.is_empty() {
         return Ok(());
     }
+    // The edges refuse or move only these: a column a computed column reads,
+    // a function one calls, a computed column a module is bound to, and the
+    // drops `release` orders. A plan with none of them, such as one adding a
+    // computed column or dropping a table, needs no edge read and so no grant
+    // that makes one complete (#1643 review).
+    let decides = cs.changes.iter().any(|p| match &p.change {
+        pbps_model::Change::RenameColumn { .. }
+        | pbps_model::Change::DropColumn { .. }
+        | pbps_model::Change::AlterColumnType { .. }
+        | pbps_model::Change::AlterColumnNullability { .. }
+        | pbps_model::Change::DropComputedColumn { .. }
+        | pbps_model::Change::DropModule { .. } => true,
+        pbps_model::Change::AlterModule { module, .. } => {
+            module.kind == pbps_model::ModuleKind::Function
+        }
+        _ => false,
+    });
+    if !decides {
+        return Ok(());
+    }
     // An empty read is "no edge" only where no referrer the pass decides by
     // can be hidden (#1462).
     let mut targets = pbps_mssql::catalog::ReferrerTargets::default();

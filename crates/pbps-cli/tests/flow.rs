@@ -3211,7 +3211,9 @@ fn computed_function_drops_follow_the_catalogs_edges() {
 /// and not a computed column added beside it, which it cannot block (#1643
 /// review). A hidden plain view over `dbo.k.c`, or a hidden procedure calling
 /// `dbo.h`, blocks neither the drop nor the function's alter, and refuses
-/// nothing (#1643 ready review).
+/// nothing (#1643 ready review). Without database `VIEW DEFINITION` the
+/// function's alter is refused for the grant, and adding a computed column,
+/// which no edge decides, plans.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
@@ -3355,6 +3357,31 @@ fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
     assert_ne!(code(&o), 0, "{}", stdout(&o));
     assert!(
         stderr(&o).contains("a referrer of `dbo.k.c` is hidden from this login"),
+        "{}",
+        stderr(&o)
+    );
+
+    // Managed-schema VIEW DEFINITION only.
+    on_server(
+        own.connection(),
+        &format!("REVOKE VIEW DEFINITION TO [{login}];"),
+    );
+    std::fs::write(
+        &table,
+        pulled.replacen(&line, &format!("{line}\n{added}"), 1),
+    )
+    .unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", &as_login]));
+    std::fs::write(&table, &pulled).unwrap();
+    std::fs::write(&callee, callee_text.replacen("@x * 5", "@x * 6", 1)).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &as_login]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("this login does not hold database VIEW DEFINITION"),
         "{}",
         stderr(&o)
     );
