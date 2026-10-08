@@ -4742,12 +4742,28 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
             ),
         ] {
             let probes = pg.preflight(&step).probes;
-            assert_eq!(probes.len(), 3, "{probes:?}");
+            assert_eq!(probes.len(), 4, "{probes:?}");
             assert!(
                 probes[0].description.contains("outside the range"),
                 "{probes:?}"
             );
             assert_eq!(counted(&mut conn, &probes[0].sql).await, outside, "{table}");
+            assert_eq!(counted(&mut conn, &probes[3].sql).await, 0, "{table}");
+            // A column grant, which the engine keeps as it attaches and the
+            // reader refuses a partition for, is counted, whoever holds it;
+            // a revoked one is gone (#1642 review).
+            assert!(
+                probes[2].description.contains("with grants of their own"),
+                "{probes:?}"
+            );
+            assert_eq!(counted(&mut conn, &probes[2].sql).await, 0, "{table}");
+            conn.execute(&format!("GRANT SELECT (a) ON {s}.{table} TO PUBLIC"))
+                .await
+                .expect("a column grant");
+            assert_eq!(counted(&mut conn, &probes[2].sql).await, 1, "{table}");
+            conn.execute(&format!("REVOKE SELECT (a) ON {s}.{table} FROM PUBLIC"))
+                .await
+                .expect("the column grant revoked");
             assert_eq!(counted(&mut conn, &probes[2].sql).await, 0, "{table}");
             // An unmanaged trigger, which the engine attaches over and the
             // reader refuses the tree for, is counted; an internal one, as a

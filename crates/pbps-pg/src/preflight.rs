@@ -3847,14 +3847,16 @@ fn partition_probes(
             ..
         } = &p.change
         {
-            // Three questions, a created partition's one among them: the
+            // Four questions, a created partition's one among them: the
             // table's own rows outside the range, which the engine refuses to
-            // attach over; its triggers, which it does not refuse and the
-            // reader does; and the DEFAULT partition's rows inside it (#1545).
+            // attach over; its triggers and its column grants, which it does
+            // not refuse and the reader does; and the DEFAULT partition's
+            // rows inside it (#1545).
             let leaving = dropped.get(parent).map_or(&[][..], Vec::as_slice);
             for probe in [
                 attach_range_probe(table, parent, from, to),
                 attach_trigger_probe(table),
+                attach_column_grant_probe(table),
             ] {
                 match probe {
                     Ok(probe) => out.push(probe),
@@ -4042,6 +4044,31 @@ fn attach_trigger_probe(table: &TableName) -> Result<Probe, DialectError> {
             saturated_count(&format!(
                 "(SELECT count(*) FROM pg_catalog.pg_trigger tg \
                  WHERE tg.tgrelid = pg_catalog.to_regclass({}) AND NOT tg.tgisinternal)",
+                value_literal(&qualified(table)?)
+            ))
+        ),
+    ))
+}
+
+/// The columns of `table` with an ACL, granted to anyone. The engine keeps
+/// them as it attaches, and the reader refuses a partition column with one
+/// (`partition_tree`'s purity), so a staged attach would commit and its
+/// checkpoint fail, as with a trigger; a revoke leaves `attacl` NULL again,
+/// measured on 16 and 18. A column-level
+/// grant is never declared (SPEC §5, left alone), so no change of the plan
+/// removes one and every one is counted, whoever holds it (#1642 review).
+fn attach_column_grant_probe(table: &TableName) -> Result<Probe, DialectError> {
+    Ok(Probe::new(
+        format!(
+            "columns of {table} with grants of their own, which a partition does not hold: \
+             revoke them before it is attached, then plan again"
+        ),
+        format!(
+            "SELECT {}",
+            saturated_count(&format!(
+                "(SELECT count(*) FROM pg_catalog.pg_attribute a \
+                 WHERE a.attrelid = pg_catalog.to_regclass({}) AND a.attnum > 0 \
+                 AND NOT a.attisdropped AND a.attacl IS NOT NULL)",
                 value_literal(&qualified(table)?)
             ))
         ),
@@ -4402,7 +4429,7 @@ mod tests {
             from: vec![pbps_model::BoundDatum::Value("2024-01-01".into())],
             to: vec![pbps_model::BoundDatum::Value("2025-01-01".into())],
         });
-        assert_eq!(attached.len(), 3, "{attached:?}");
+        assert_eq!(attached.len(), 4, "{attached:?}");
         assert!(
             attached[0]
                 .description
@@ -4427,6 +4454,20 @@ mod tests {
         );
         assert!(
             attached[2]
+                .description
+                .contains("columns of app.t with grants of their own"),
+            "{attached:?}"
+        );
+        assert!(
+            attached[2].sql.contains(
+                "attrelid = pg_catalog.to_regclass(E'\"app\".\"t\"') AND a.attnum > 0 AND NOT \
+                 a.attisdropped AND a.attacl IS NOT NULL"
+            ),
+            "{}",
+            attached[2].sql
+        );
+        assert!(
+            attached[3]
                 .description
                 .contains("will not attach a table over them"),
             "{attached:?}"

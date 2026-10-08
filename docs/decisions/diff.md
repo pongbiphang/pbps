@@ -3506,6 +3506,12 @@ plan. The table must hold:
   would commit before its checkpoint failed. The pre-flight therefore counts
   every non-internal trigger on the table from the catalog, before the first
   statement, as the reader's purity does (#1642 review).
+- no column grant on it. A column-level grant is never declared (SPEC §5),
+  so no plan removes one, and the engine keeps it as it attaches, measured on
+  16 and 18, while the reader refuses a partition column that holds one. For
+  the reason the triggers are counted, the pre-flight counts every column of
+  the table with an ACL, whoever holds it (#1642 review). A revoke leaves the
+  ACL NULL again.
 
 The parent must be a partitioned table before the plan. A DEFAULT bound is
 refused: attaching as the DEFAULT partition is #1639.

@@ -7180,12 +7180,13 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
         stdout(&o)
     );
     // Refused by the pre-flight, by name, and nothing changed. An unmanaged
-    // trigger, which the declarations do not see and the engine attaches
-    // over, is counted from the catalog (#1642 review).
+    // trigger and a column grant, which the declarations do not see and the
+    // engine attaches over, are counted from the catalog (#1642 review).
     on_server(
         &connection,
         "CREATE FUNCTION app.noop() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
-         CREATE TRIGGER noop BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.noop()",
+         CREATE TRIGGER noop BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.noop();
+         GRANT SELECT (n) ON app.t TO PUBLIC",
     );
     let o = approved_apply(
         &d,
@@ -7199,6 +7200,7 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
         said.contains("1 rows of app.t outside the range it takes under app.ev")
             && said.contains("1 rows of app.ev inside the range of its new partition app.t")
             && said.contains("1 triggers on app.t, which a partition does not hold yet")
+            && said.contains("1 columns of app.t with grants of their own")
             && said.contains("nothing has been changed"),
         "{said}"
     );
@@ -7216,7 +7218,8 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
     on_server(
         &connection,
         "DELETE FROM app.t WHERE id = 2; DELETE FROM app.ev WHERE id = 9;
-         DROP TRIGGER noop ON app.t; DROP FUNCTION app.noop()",
+         DROP TRIGGER noop ON app.t; DROP FUNCTION app.noop();
+         REVOKE SELECT (n) ON app.t FROM PUBLIC",
     );
     succeeds(approved_apply(
         &d,
