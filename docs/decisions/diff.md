@@ -3927,14 +3927,18 @@ Measured on 16.15 and 18.6, on a populated tree:
 following are admitted with no new change kind: `AddColumn`, `DropColumn`,
 `RenameColumn`, `AlterColumnType`, `AlterColumnNullability`,
 `AlterColumnDefault` and `SetColumnDeprecated`. These stay refused by name:
-- a key column's drop or retype;
+- a key column's drop or retype, a drop asked of the base key and a retype of
+  the declared one, since one plan can move a name off the key's column and
+  another column into it;
 - an identity column added, whose partitions cannot be read back yet (#1681);
 - a generation expression changed in place.
 
 A key column renamed is not a change of the partitioning.
 
 **The partitions' own** (`diff_partition_columns`), compared through the
-parent's renames and drops in the same plan:
+parent's renames and drops in the same plan, matched by the column's identity
+rather than its name, since one plan can drop a column and rename another into
+its name:
 - **A rename** carries a partition's own entry with it, and plans nothing.
 - **A drop** takes the partition's own entries on that column, and plans
   nothing.
@@ -3949,7 +3953,11 @@ parent's renames and drops in the same plan:
   which validation then forbids the declaration to keep, is left to it rather
   than dropped after.
 
-These partition changes sort at (9, 4), after their parent's change of class 9.
+These partition changes sort at (9, 4), after their parent's change of class 9,
+which includes a retype that changes the column's nullability with it. A
+partition the same plan creates under a parent whose columns change sorts at
+(9, 5): it is created with its own default or NOT NULL on a column the parent
+may only now add or retype.
 
 **Why not drop the partition's own NOT NULL before the parent's tightening.**
 It would leave no local NOT NULL behind on 18, but it orders a partition

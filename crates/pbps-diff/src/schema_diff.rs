@@ -1398,14 +1398,38 @@ fn diff_partial_rebuilding(
     let parent_moved: BTreeSet<(TableName, String)> = planned
         .iter()
         .filter_map(|p| {
+            // A retype carries its NOT NULL change with it (#1692 review).
             if let Change::AlterColumnDefault { column, .. }
             | Change::AlterColumnNullability { column, .. } = &p.change
+            {
+                Some((column.table.clone(), column.name.clone()))
+            } else if let Change::AlterColumnType {
+                column,
+                from_nullable,
+                to_nullable,
+                ..
+            } = &p.change
+                && from_nullable != to_nullable
             {
                 Some((column.table.clone(), column.name.clone()))
             } else {
                 None
             }
         })
+        .collect();
+    // The parents whose columns this plan changes (#1687).
+    let parent_columns_change: BTreeSet<TableName> = planned
+        .iter()
+        .filter(|p| parent_column(&p.change).is_some())
+        .filter_map(|p| p.change.table())
+        .filter(|t| {
+            declared
+                .schema
+                .tables
+                .get(*t)
+                .is_some_and(|t| t.partition_by.is_some())
+        })
+        .cloned()
         .collect();
     let follows_its_parent = |c: &Change| -> bool {
         let (Change::SetPartitionDefault { table, column, .. }
@@ -1527,10 +1551,16 @@ fn diff_partial_rebuilding(
             return (order_key(c), 2);
         }
         // A partition is created after every parent, whose columns, keys and
-        // indexes the engine gives it as it is made (#1170).
+        // indexes the engine gives it as it is made (#1170). Under a parent
+        // whose columns this plan changes, after those changes too: its own
+        // default may name a column the parent adds, and a parent's default
+        // set or dropped afterwards would overwrite its own (#1692 review).
         if let Change::CreateTable { table, .. } = c
-            && table.partition_of.is_some()
+            && let Some(of) = &table.partition_of
         {
+            if parent_columns_change.contains(&of.parent) {
+                return (COLUMN_ALTERATIONS, 5);
+            }
             return (order_key(c), 2);
         }
         if let Change::RenameColumn { table, from, .. } = c {
@@ -3251,10 +3281,11 @@ fn refuse_partition_changes(
                     .and_then(|t| t.partition_by.as_ref())
                     .is_some_and(|by| by.columns.iter().any(|c| c == column))
             };
-            if matches!(
-                change,
-                Change::DropColumn { .. } | Change::AlterColumnType { .. }
-            ) && (key(base.schema) || key(declared.schema))
+            // A drop names the base column and a retype the declared one, so
+            // each is asked of its own side's key: across one plan a name
+            // can leave the key's column for another (#1692 review).
+            if (matches!(change, Change::DropColumn { .. }) && key(base.schema))
+                || (matches!(change, Change::AlterColumnType { .. }) && key(declared.schema))
             {
                 refuse(
                     table,
@@ -3376,24 +3407,31 @@ fn diff_partition_columns(
     };
     let parent = declared.schema.tables.get(&now.parent);
     let base_parent = base.schema.tables.get(&was.parent);
-    let renamed = renamed_columns(base.ids, &was.parent, declared.ids, &now.parent);
-    let is_now = |c: &String| renamed.get(c).unwrap_or(c).clone();
-    // A column the parent keeps, under its declared name, with what it was.
-    let kept = |c: &String| -> Option<&pbps_model::Column> {
-        let p = parent?.columns.get(&is_now(c));
-        p.and(base_parent?.columns.get(c))
+    // What became of each of the parent's base columns, by uid: its declared
+    // name, or `None` where the plan drops it. By uid and not by name, since
+    // one plan can drop a column and rename another into its name (#1692
+    // review). A column no identity names is taken as it stands.
+    let now_by_uid = columns_of(declared.ids, &now.parent);
+    let fate: BTreeMap<String, Option<String>> = columns_of(base.ids, &was.parent)
+        .into_iter()
+        .map(|(uid, c)| (c.name, now_by_uid.get(&uid).map(|d| d.name.clone())))
+        .collect();
+    let is_now = |c: &String| -> Option<String> {
+        match fate.get(c) {
+            Some(now) => now.clone(),
+            None => Some(c.clone()),
+        }
     };
     let was_columns: BTreeMap<String, &pbps_model::PartitionColumn> = was
         .columns
         .iter()
-        .filter(|(c, _)| kept(c).is_some() || base_parent.is_none())
-        .map(|(c, own)| (is_now(c), own))
+        .filter_map(|(c, own)| Some((is_now(c)?, own)))
         .collect();
     let base_of: BTreeMap<String, &pbps_model::Column> = base_parent
         .map(|p| {
             p.columns
                 .iter()
-                .map(|(c, column)| (is_now(c), column))
+                .filter_map(|(c, column)| Some((is_now(c)?, column)))
                 .collect()
         })
         .unwrap_or_default();
@@ -6634,6 +6672,249 @@ mod tests {
             e.iter()
                 .any(|m| m.contains("an identity column") && m.contains("#1681")),
             "{e:?}"
+        );
+
+        // From another base, through revisions: one revision cannot rename
+        // into a name it also drops, so a swap takes two.
+        let from = |base: &Schema, revisions: &[(&Schema, &[Intent])]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let mut declared_ids = base_ids.clone();
+            for (schema, intents) in revisions {
+                declared_ids = crate::resolve(schema, &declared_ids, intents, &ctx())
+                    .unwrap()
+                    .ids;
+            }
+            let declared = revisions.last().unwrap().0;
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap_or_else(|e| panic!("refused: {e:?}"))
+            .changes
+            .into_iter()
+            .map(|p| p.change)
+            .collect::<Vec<_>>()
+        };
+        // `n` dropped and `m` renamed into its name (#1692 review): `a`'s own
+        // default on the surviving column is compared with its own on `m`,
+        // not with the dropped `n`'s.
+        let handoff_base = tree(
+            parent(),
+            &[("m", own_default("7")), ("n", own_default("8"))],
+            &[],
+        );
+        let handoff = with(
+            &|p| {
+                p.columns.shift_remove("n");
+                p.columns = std::mem::take(&mut p.columns)
+                    .into_iter()
+                    .map(|(c, col)| (if c == "m" { "n".to_owned() } else { c }, col))
+                    .collect();
+            },
+            &[("n", own_default("8"))],
+            &[],
+        );
+        let without_n = with(
+            &|p| {
+                p.columns.shift_remove("n");
+            },
+            &[("m", own_default("7"))],
+            &[],
+        );
+        let planned_handoff = from(
+            &handoff_base,
+            &[
+                (
+                    &without_n,
+                    &[Intent::DropColumn {
+                        column: ColumnRef {
+                            table: ev.clone(),
+                            name: "n".into(),
+                        },
+                        reason: "gone".into(),
+                    }],
+                ),
+                (
+                    &handoff,
+                    &[Intent::RenameColumn {
+                        table: ev.clone(),
+                        from: "m".into(),
+                        to: "n".into(),
+                    }],
+                ),
+            ],
+        );
+        assert!(
+            planned_handoff.iter().any(|c| matches!(c,
+                Change::SetPartitionDefault { table, column, from: Some(f), to: Some(t), .. }
+                    if table.to_string() == "app.a" && column == "n" && f == "7" && t == "8")),
+            "{planned_handoff:?}"
+        );
+        // A retype that drops NOT NULL with it: the partitions' NOT NULLs
+        // follow the retype, which carries the parent's change (#1692
+        // review).
+        let retype_loosened = planned(
+            &with(
+                &|p| {
+                    let n = p.columns.get_mut("n").unwrap();
+                    n.ty = ty("bigint");
+                    n.nullable = true;
+                },
+                &keep_a,
+                &[("m", own_not_null.clone()), ("n", own_not_null.clone())],
+            ),
+            &[],
+        );
+        let retype_at = retype_loosened
+            .iter()
+            .position(|c| matches!(c, Change::AlterColumnType { .. }))
+            .expect("the retype");
+        assert!(
+            retype_loosened
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| matches!(c, Change::SetPartitionNotNull { .. }))
+                .all(|(i, _)| i > retype_at)
+                && retype_loosened
+                    .iter()
+                    .filter(|c| matches!(c, Change::SetPartitionNotNull { .. }))
+                    .count()
+                    == 2,
+            "{retype_loosened:?}"
+        );
+        // A partition created with its own default on a column its parent
+        // adds in the same plan comes after the addition (#1692 review).
+        let mut grown = with(
+            &|p| {
+                p.columns.insert("extra".into(), Column::new(ty("int")));
+            },
+            &keep_a,
+            &keep_b,
+        );
+        grown.tables.insert(
+            "app.c".parse().unwrap(),
+            partition("2026-01-01", "2027-01-01", &[("extra", own_default("5"))]),
+        );
+        let grew = planned(&grown, &[]);
+        let at = |kind: &dyn Fn(&Change) -> bool| grew.iter().position(kind).unwrap();
+        assert!(
+            at(&|c| matches!(c, Change::AddColumn { .. }))
+                < at(&|c| matches!(c, Change::CreateTable { .. })),
+            "{grew:?}"
+        );
+        // A non-key column dropped and the key column renamed into its name
+        // is planned: the drop is the old occupant's (#1692 review).
+        let spare_base = with(
+            &|p| {
+                p.columns.insert("spare".into(), Column::new(ty("int")));
+            },
+            &keep_a,
+            &keep_b,
+        );
+        let spare = with(
+            &|p| {
+                p.columns = std::mem::take(&mut p.columns)
+                    .into_iter()
+                    .map(|(c, col)| (if c == "ts" { "spare".to_owned() } else { c }, col))
+                    .collect();
+                p.partition_by = Some(PartitionBy {
+                    columns: vec!["spare".into()],
+                });
+            },
+            &keep_a,
+            &keep_b,
+        );
+        let without_spare = with(&|_| {}, &keep_a, &keep_b);
+        let swapped = from(
+            &spare_base,
+            &[
+                (
+                    &without_spare,
+                    &[Intent::DropColumn {
+                        column: ColumnRef {
+                            table: ev.clone(),
+                            name: "spare".into(),
+                        },
+                        reason: "gone".into(),
+                    }],
+                ),
+                (
+                    &spare,
+                    &[Intent::RenameColumn {
+                        table: ev.clone(),
+                        from: "ts".into(),
+                        to: "spare".into(),
+                    }],
+                ),
+            ],
+        );
+        assert!(
+            swapped
+                .iter()
+                .any(|c| matches!(c, Change::DropColumn { .. }))
+                && swapped
+                    .iter()
+                    .any(|c| matches!(c, Change::RenameColumn { .. })),
+            "{swapped:?}"
+        );
+        // The key column moved out of `ts` and a non-key column into it,
+        // then retyped: the retype is the non-key column's (#1692 review).
+        let rename = |p: &mut Table, from: &str, to: &str| {
+            p.columns = std::mem::take(&mut p.columns)
+                .into_iter()
+                .map(|(c, col)| (if c == from { to.to_owned() } else { c }, col))
+                .collect();
+        };
+        let moved_key = with(
+            &|p| {
+                p.columns.insert("spare".into(), Column::new(ty("int")));
+                rename(p, "ts", "k");
+                p.partition_by = Some(PartitionBy {
+                    columns: vec!["k".into()],
+                });
+            },
+            &keep_a,
+            &keep_b,
+        );
+        let moved_in = with(
+            &|p| {
+                p.columns.insert("spare".into(), Column::new(ty("int")));
+                rename(p, "ts", "k");
+                rename(p, "spare", "ts");
+                p.columns.get_mut("ts").unwrap().ty = ty("bigint");
+                p.partition_by = Some(PartitionBy {
+                    columns: vec!["k".into()],
+                });
+            },
+            &keep_a,
+            &keep_b,
+        );
+        let renaming = |from: &str, to: &str| Intent::RenameColumn {
+            table: ev.clone(),
+            from: from.into(),
+            to: to.into(),
+        };
+        let retyped = from(
+            &spare_base,
+            &[
+                (&moved_key, &[renaming("ts", "k")]),
+                (&moved_in, &[renaming("spare", "ts")]),
+            ],
+        );
+        assert!(
+            retyped.iter().any(|c| matches!(c,
+                Change::AlterColumnType { column, .. } if column.name == "ts")),
+            "{retyped:?}"
         );
     }
 
