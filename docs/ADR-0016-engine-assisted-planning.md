@@ -715,9 +715,9 @@ carries the normative text, and DEC-1528.1 the reasons.
   - Objects outside the managed set come from a reviewed baseline in the
     repository, run on scratch only. It runs whole and first (#1664), as the
     setup role in its own session, before pbps stages any managed object.
-    So it can change nothing pbps staged, and needs no privilege rule. It
-    therefore holds only objects that depend on nothing managed; a statement
-    naming a managed object fails with the remedy to leave it out.
+    So it can change nothing pbps staged, and needs no privilege rule. Its
+    statements therefore name nothing managed: a view over managed tables
+    is written as a shape view.
   - Every object it creates is compared with the target, and sealed into
     the manifest. A mismatch, a missing object, an uncompared object or a
     baseline object in the managed set refuses. The comparison covers what
@@ -729,9 +729,11 @@ carries the normative text, and DEC-1528.1 the reasons.
     shape view of its output columns (typed NULLs, no row), never as a
     table, whose system columns change name resolution. The recheck still
     compares the target's complete fingerprints.
-  - A managed → external → managed chain of creation-time bindings refuses,
-    naming the chain, with two remedies: adopt the middle object, or select
-    no resolver. No adoption split by kind or by schema produced one across
+  - A chain refuses, naming it, with two remedies: adopt the middle object,
+    or select no resolver. A chain is a managed object binding to an
+    external one whose compared shape names a managed object, such as a
+    column of a managed type; a view's query or a routine's body never forms
+    one. No adoption split by kind or by schema produced one across
     three measured real schemas.
   - pbps sends no routine source of its own. A question needing routine
     source the baseline lacks refuses with the finding and two remedies.

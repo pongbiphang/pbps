@@ -1637,21 +1637,24 @@ their full definitions sends routine source no reviewer approved.
     and each grant opened a path back into managed state.
   - Run first, the baseline meets no managed object, so no privilege rule
     is needed, and any SQL may be written.
-  - The same order is its contract: a baseline holds only objects that
-    depend on nothing managed. An external object over a managed one, such
-    as a legacy view over an adopted table, is left out. Scratch needs it
-    only when a managed object binds to it, which is the chain below, and
-    the draft command and fill omit it from `pg_depend`. A statement that
-    fails names itself and the remedy (#1652 review).
+  - The same order is its contract: a baseline's statements name nothing
+    managed. A legacy view over an adopted table is written as a shape
+    view. An object whose own shape uses a managed type is left out:
+    scratch needs it only in the chain below. A statement that fails names
+    itself and the remedy (#1652 review).
 - **The cost is a chain through the boundary.** A managed object binds to an
-  external one that binds to a managed one. Such a chain refuses, naming it,
-  with two remedies: adopt the middle object, or select no resolver.
+  external one whose compared shape names a managed object: a column,
+  attribute or argument of a managed type, or a cast over one. Such a chain
+  refuses, naming it, with two remedies: adopt the middle object, or select
+  no resolver. A view's query and a routine's body never form a chain, since
+  neither is compared; a view over managed tables is staged as a shape view
+  (#1652 review).
   - Measured on pagila, AdventureWorks and GitLab: no adoption split by
     kind (tables first; tables and types; views and routines) or by schema
     produced one. Only foreign keys and triggers pointed back, and neither
     is compared.
-  - Random half-splits do produce them, as view-on-view stacks adopted from
-    the middle.
+  - Random half-splits do produce them, through columns typed with a
+    shared managed domain.
   - Automatic fill, the third step, generates each object itself. It can
     order them between managed objects from the target's `pg_depend`,
     without parsing SQL, which lifts the refusal for what it fills.

@@ -1564,14 +1564,15 @@ scratch compile (#1616).
     the declarations.
   - No privilege rule is needed, so any SQL may be written: an extension, a
     cast, an operator, a `DO` block.
-  - **So a baseline holds only objects that depend on nothing managed.** An
-    object that does, such as a legacy view over a managed table, cannot be
-    created that early, and scratch needs it only when a managed object
-    binds to it, which is a chain (below). A statement that fails is
-    reported with the engine's error and the statement. When the object it
-    names is managed, the remedy is to leave it out of the baseline. The
-    planned draft command and fill never write one: they read the target's
-    `pg_depend`.
+  - **So a baseline's statements name nothing managed.** A legacy view over
+    a managed table is written as a shape view (below), which names nothing.
+    An object whose own shape uses a managed type, such as a column or an
+    argument of a managed domain, cannot be written that early, and scratch
+    needs it only in a chain (below). A statement that fails is reported
+    with the engine's error and the statement; when what it names is
+    managed, the remedy is a shape view or leaving the object out. The
+    planned draft command and fill write shape views, and order by the
+    target's `pg_depend`.
 - **Everything it leaves behind must be accounted for.**
   - Each object it creates is compared with the target before any binding
     question is answered. A mismatch, an object the target does not have,
@@ -1613,14 +1614,19 @@ scratch compile (#1616).
 - **The compared shapes are sealed into the evidence manifest** and rechecked
   like any other external input.
 - **A chain through the boundary refuses.** In such a chain, a managed object
-  binds to an external one that itself binds to a managed one, and that
-  external object cannot be staged before anything managed exists.
+  binds to an external one whose compared *shape* names a managed object:
+  a column, attribute or argument of a managed type, or a cast over one.
+  That shape cannot be staged before anything managed exists.
+  - A view's query and a routine's body never form a chain, because neither
+    is compared. A view whose query reads managed tables is staged as a
+    shape view.
   - The finding names the chain and gives two remedies: adopt the middle
     object too, or select no resolver and keep ADR-0013's conservative
     rebuild.
   - Measured on three real schemas, no adoption split by kind or by schema
     produced such a chain. Only foreign keys and triggers pointed back, and
-    neither is compared.
+    neither is compared. Random half-splits did, through columns typed with
+    a shared managed domain.
 - **pbps itself never sends routine source to scratch.** A routine is there
   only if the operator put it in the baseline. A binding question that needs
   routine source the baseline lacks refuses with a finding naming the
@@ -1771,7 +1777,11 @@ historical bindings and complete requested prerequisites; see
 compile managed declarations on its scratch database and compare what they bind
 with the target's observed bindings, surface by surface (#613). CLI resolution, saved binding evidence
 and the remaining steps stay planned under #595; the requirements below still
-govern their delivery. See [delivery tracking](RESOLVER-DELIVERY.md).
+govern their delivery. Paragraphs marked **Measured profiles only** bind the
+frozen measured profiles alone, as in §9.3.2. The operator-vouched resolver
+follows §9.3.2: its two separation checks, the shared compatibility and
+authorization qualification, and its baseline. See
+[delivery tracking](RESOLVER-DELIVERY.md).
 
 `pbps doctor --env prod` (or `--db`, with optional `--format json`) now reports
 database locale/encoding and installed extension metadata on PostgreSQL;
@@ -1807,8 +1817,9 @@ edition limits remain independent checks. A Developer scratch run cannot waive
 target edition checks, and Azure products cannot be mapped to boxed SQL Server
 by comparing version numbers alone.
 
-Require qualified provenance/content identity for the actual target and resolver
-engine plus analysis-relevant loaded or required native libraries, including
+**Measured profiles only** (the operator-vouched resolver compares reported
+builds, #1657). Require qualified provenance/content identity for the actual
+target and resolver engine plus analysis-relevant loaded or required native libraries, including
 extensions and parser hooks. Matching reported versions or catalog fingerprints
 do not establish equivalence between vendor-patched or locally rebuilt binaries.
 Accept identical qualified content or a versioned, real-engine-tested mapping
@@ -1843,8 +1854,10 @@ Merely connecting to production does not download or start anything. After
 explicit resolver opt-in, acquisition follows a configured pull policy, supports
 preloaded images/internal registries and records the actual image digest and
 platform. The container runs on the pbps host/CI runner, not on production.
-The resolver must be outside the target PostgreSQL cluster or SQL Server
-instance, not merely in another database. Before any scratch DDL or external
+**Measured profiles only** (the operator-vouched resolver allows another
+database on the target's cluster, §9.3.2, #1667): the resolver must be
+outside the target PostgreSQL cluster or SQL Server instance, not merely in
+another database. Before any scratch DDL or external
 source transfer, use qualified read-only identity and provisioning/endpoint
 evidence to prove separation; different names, credentials or connection URLs
 are insufficient. Reject the target instance/cluster and unknown or ambiguous
@@ -1857,12 +1870,14 @@ available.
 Qualification is pinned to the actual backend/session, not its connection URL.
 Reconnects, failovers and pooled-session/runtime replacements invalidate all
 previous qualification and partial binding results. Recheck full environment
-compatibility, effective session settings, isolation and applicable source
-controls before further DDL/source transfer or evidence publication. Even a
+compatibility and effective session settings before further DDL/source
+transfer or evidence publication, and, for the measured profiles, isolation
+and applicable source controls. Even a
 compatible replacement restarts complete compilation in fresh run-owned scratch
 resources; never combine old-session results with new-session evidence.
 
-The same connection can still observe in-place changes. Keep all relevant
+**Measured profiles only** (scratch stability is part of what the operator
+vouches for). The same connection can still observe in-place changes. Keep all relevant
 resolver settings, authorization and reconstructed namespace stable throughout
 qualification, compilation and evidence capture, using qualified exclusivity
 or mutation detection that catches every relevant intervening change, including
