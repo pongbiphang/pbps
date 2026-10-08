@@ -631,5 +631,6 @@ other numbers before landing. Some records still mention them as proposals.
 | DEC-1515.1 | [resolver](decisions/resolver.md#dec-1515-1) | A selected resolver runs only when the coarse typed-plan assessment needs it; with none selected ADR-0013 decides; evidence replaces the candidate rebuild. |
 | DEC-1274.2 | [modules](decisions/modules.md#dec-1274-2) | A new table whose generated column calls a function the plan creates follows that create whole, in the plan and on scratch. |
 | DEC-1576.1 | [modules](decisions/modules.md#dec-1576-1) | A connected PostgreSQL plan whose expression names, in a literal, a relation the plan creates later is refused with a two-plan remedy, not reordered. |
+| DEC-1528.1 | [resolver](decisions/resolver.md#dec-1528-1) | Selecting a resolver gives the operator-vouched resolver: two separation checks plus the shared compatibility qualification, and a reviewed baseline, run first and compared with the target; the measured profiles are frozen. |
 | DEC-822.1 | [doctor](decisions/doctor.md#dec-822-1) | A refused lock read is remedied with the one statement for the gap a fresh session can see, or a recheck when it sees none. |
 | DEC-829.1 | [connection](decisions/connection.md#dec-829-1) | A defaulted PostgreSQL TLS failure is classified from the driver's typed cause chain: a certificate failure is never told to disable TLS. |

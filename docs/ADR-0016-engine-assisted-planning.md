@@ -9,6 +9,10 @@
   binding comparison through a qualified run (#613). Planning integration,
   source handling and the evidence a plan may rest on remain unimplemented,
   and no qualification yet changes what a plan is allowed to claim. See [delivery tracking](RESOLVER-DELIVERY.md).
+- Amended by #1528 (DEC-1528.1): an operator-vouched resolver becomes the
+  default selection. The measured profiles this record designs are frozen,
+  and their removal is tracked in #1636. See "Amendment: the operator-vouched
+  resolver" below.
 - Date: 2026-09-15
 - Related: [SPEC §9.3](SPEC.md#93-the-dev-database-optional), §7.3, §7.6,
   §8.2, §9.8 and §11.5; [ARCHITECTURE.md](ARCHITECTURE.md);
@@ -683,6 +687,95 @@ delivery, not silently downgraded to weaker evidence.
 from the artifact without a project, credentials or a resolver. Approval stays
 file-based and the final emitter remains the only source of deployment SQL.
 
+## Amendment: the operator-vouched resolver (#1528)
+
+This amends decisions 4 and 5. [SPEC §9.3.2](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
+carries the normative text, and DEC-1528.1 the reasons.
+
+- **Two environments.** The resolver environments designed above are the
+  *measured profiles*. They are frozen, and their removal is tracked in #1636.
+  Selecting a resolver without naming one gives the *operator-vouched
+  resolver* (`vouched`). The cases, the assessment, the fingerprint key, the
+  sealing and the refusal classes are shared. Only the producer differs.
+- **Decision 4, for the operator-vouched resolver.**
+  - "Verify the chosen environment" keeps the shared compatibility
+    qualification (version and build, extensions, encoding, collation,
+    deployment context), which decides whether scratch binds as the target
+    would. For separation, it means two checks:
+    - scratch is never the target (host, port and database are not all the
+      target's, and the credential variable differs), before anything is
+      created;
+    - scratch is empty, read in the run-owned database once created, before
+      any other DDL.
+  - The run-owned scratch takes the target's encoding and locale.
+  - Isolation, containment, log handling and channel protection are vouched
+    for by the operator, not measured. The evidence names the profile, so a
+    reviewer can always tell a vouched answer from a measured one.
+- **Decision 5, for the operator-vouched resolver.**
+  - Objects outside the managed set come from a reviewed baseline in the
+    repository, run on scratch only. It runs whole and first (#1664), as the
+    setup role in its own session, before pbps stages any managed object.
+    So it can change nothing pbps staged, and needs no privilege rule. Its
+    statements therefore name nothing managed: a view over managed tables
+    is written as a shape view.
+  - Every object it creates is compared with the target, and sealed into
+    the manifest. A mismatch, a missing object, an uncompared object or a
+    baseline object in the managed set refuses. The comparison covers what
+    a creation-time binding can read: an object's own class properties, and
+    a relation's columns, its primary-key and unique constraints and
+    indexes, and its inheritance and partition parents. It skips foreign
+    keys, CHECKs, defaults, triggers, policies, rules and non-unique
+    indexes, and the source text of a routine's body or a view's query. A view may therefore be staged as a
+    shape view of its output columns (typed NULLs, no row), never as a
+    table, whose system columns change name resolution. The recheck still
+    compares the target's complete fingerprints.
+  - A chain refuses, naming it, with two remedies: adopt the middle object,
+    or select no resolver. A chain is a managed object binding to an
+    external one whose compared shape names a managed object, such as a
+    column of a managed type; a view's query or a routine's body never forms
+    one. No adoption split by kind or by schema produced one across
+    three measured real schemas.
+  - pbps sends no routine source of its own. A question needing routine
+    source the baseline lacks refuses with the finding and two remedies.
+  - The private-source requirements apply only to the measured profiles'
+    retained definitions.
+  - Two later steps reuse the same comparison: a reviewed baseline draft from
+    the target, then automatic fill of missing shapes. Fill orders each
+    generated object from the target's `pg_depend`, between managed
+    objects, which lifts the chain refusal for what it fills.
+- **Reading this record.** Its "resolver" means the measured profiles wherever
+  it describes containment, process or socket observation, executable
+  identity or verified channels.
+  - Acceptance tests 10, 11, 12, 13, 19, 20, 21 and 23 are measured
+    profiles only: they test retained external source, instance separation,
+    containment, verified channels, scratch exclusion against a concurrent
+    session, and executable identity. All of these are scratch-side
+    guarantees the operator vouches for instead.
+  - Test 14 holds for the operator-vouched resolver for its compatibility
+    inputs only.
+  - Test 11's same-cluster refusal is replaced, for the operator-vouched
+    resolver, by `vouched_refuses_the_target_as_scratch`: another database
+    on the target's cluster passes there.
+- **Acceptance tests for the operator-vouched resolver (live, PostgreSQL):**
+  - `vouched_refuses_the_target_as_scratch`
+  - `vouched_refuses_a_scratch_that_is_not_empty`
+  - `vouched_answers_a_managed_question_without_root_or_observation`
+  - `vouched_compiles_a_managed_view_over_a_baseline_table`
+  - `vouched_refuses_a_baseline_that_differs_from_the_target`
+  - `vouched_refuses_a_baseline_that_creates_a_managed_object`
+  - `vouched_runs_the_baseline_before_any_managed_object` (its `SET`s do
+    not reach the compile; a setting it changes is read by the compatibility
+    qualification)
+  - `vouched_refuses_a_baseline_object_left_uncompared`
+  - `vouched_compares_an_external_table_without_its_foreign_keys_and_triggers`
+  - `vouched_refuses_a_chain_through_an_external_object_naming_it`
+  - `vouched_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view`
+  - `vouched_refuses_an_external_view_staged_as_a_table` (the computed-field
+    `xmin(ext.v)` case binds differently on a table)
+  - `vouched_refuses_a_question_that_needs_routine_source_the_baseline_lacks`
+  - `vouched_recheck_binds_the_target_by_engine_identity`
+  - `vouched_recheck_refuses_an_external_shape_changed_after_planning`
+
 ## Architectural placement
 
 The existing [crate boundaries](ARCHITECTURE.md#architectural-boundaries) remain:
@@ -748,7 +841,7 @@ protection under test is removed.
    and prove the closing read sees the apply's own DDL and uses the existing
    revalidation boundary. Qualify each engine independently; this test does not
    promise to prevent external DDL after the last observation.
-10. **`external_definition_evidence_keeps_source_private` (planned):** use a
+10. **`external_definition_evidence_keeps_source_private` (planned; measured profiles only):** use a
     retained external function/view whose source contains a confidential marker.
     Reconstruction can use its full definition, but the marker and source never
     appear in plan/SQL artifacts, `explain`, human/JSON diagnostics,
@@ -758,14 +851,14 @@ protection under test is removed.
     same object identity and candidate set. Missing/unreadable definitions and
     unsupported fingerprint versions do not pass; an unchanged prerequisite
     verifies without Docker or the original source in the saved plan.
-11. **`resolver_rejects_the_target_instance_before_writes` (planned):** on both
+11. **`resolver_rejects_the_target_instance_before_writes` (planned; measured profiles only):** on both
     engines, point the resolver at another database on the target instance or
     cluster, including through an alias and different credentials. Refuse before
     database creation, source transfer or other scratch DDL. Missing/unreadable
     identity facts and a reconnect or failover to the target also fail closed.
     A separately identified, compatible scratch instance passes, with only
     run-owned resources created and removed; the target remains read-only.
-12. **`resolver_source_logging_is_qualified_before_transfer` (planned):** use
+12. **`resolver_source_logging_is_qualified_before_transfer` (planned; measured profiles only):** use
     a confidential marker in a retained external definition and exercise server
     statement/audit/trace and failure logging, container stderr collection and
     forwarding. A persistent source collector or unknown controls refuse before
@@ -777,7 +870,7 @@ protection under test is removed.
     pre-existing audit policy is disabled. Qualify Docker and supplied-server
     paths independently for each supported engine/platform; removing the
     pre-transfer gate must make the negative case fail.
-13. **`resolver_compilation_cannot_escape_its_run` (planned):** exercise
+13. **`resolver_compilation_cannot_escape_its_run` (planned; measured profiles only):** exercise
     engine-supported creation-time evaluation from managed and retained
     external definitions, including extension/subprocess paths where supported.
     Use disposable network and filesystem sentinels, never real production
@@ -791,7 +884,7 @@ protection under test is removed.
     negative control showing the sentinel is reachable when containment is
     removed in the test fixture. Compilation requiring a blocked effect is
     refused without stubs or a less restrictive retry.
-14. **`resolver_reconnect_requalifies_all_evidence` (planned):** replace a
+14. **`resolver_reconnect_requalifies_all_evidence` (planned; for the operator-vouched resolver, its compatibility inputs only):** replace a
     qualified resolver connection with a separate backend that still passes
     target-instance separation but differs in a required version, extension,
     collation or effective session setting. Each mismatch or unknown fact must
@@ -847,7 +940,7 @@ protection under test is removed.
     than passing because CLI output was masked. Cover failure paths, unknown
     historical classification and normal non-confidential plan behavior. Removing
     a consumer's protection must expose the fixture verifier and fail its test.
-19. **`private_resolver_inputs_require_verified_transport` (planned):** cover
+19. **`private_resolver_inputs_require_verified_transport` (planned; measured profiles only):** cover
     both target capture/recheck and scratch transfer with disposable endpoints.
     Plaintext, downgrade, an untrusted/wrong peer and an unprotected backend hop
     must refuse before a private definition or property crosses the channel;
@@ -857,7 +950,7 @@ protection under test is removed.
     setup and apply-time target re-reads without any scratch connection. A
     certificate-validation bypass or localhost-only exemption must fail the
     negative control, independently for each supported engine/transport.
-20. **`managed_only_resolution_authenticates_every_exchange` (planned):** use
+20. **`managed_only_resolution_authenticates_every_exchange` (planned; measured profiles only):** use
     only managed declarations with no private external prerequisites. A controlled
     intermediary relays qualification reads but attempts to alter DDL, replace
     a binding result or substitute a prior run's response; no forged input may
@@ -865,7 +958,7 @@ protection under test is removed.
     including reconnects and peer substitution. Valid authenticated exchanges
     still resolve without imposing private-source logging prerequisites on this
     case; removing channel authentication must fail the negative control.
-21. **`resolver_in_place_mutations_cannot_seal_mixed_evidence` (planned):** keep
+21. **`resolver_in_place_mutations_cannot_seal_mixed_evidence` (planned; measured profiles only):** keep
     the resolver connection alive while a second session attempts relevant
     extension/settings, authorization or reconstructed candidate changes between
     compilation steps. Include a change restored before the final fingerprint
@@ -885,7 +978,7 @@ protection under test is removed.
     or grant and the sealed post-apply manifest matches. Neither case starts a
     resolver during apply. Omitting the closing manifest check must fail the
     negative control; do not claim to catch writes after the last observation.
-23. **`same_version_builds_do_not_imply_resolver_equivalence` (planned):** use
+23. **`same_version_builds_do_not_imply_resolver_equivalence` (planned; measured profiles only):** use
     real-engine fixtures with distinct same-version engine or extension builds,
     including a parser-hook library that changes creation-time binding while
     reported versions, candidate identities and retained bindings still match.

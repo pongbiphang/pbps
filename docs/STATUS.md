@@ -246,6 +246,16 @@ unaffected, rebuild or unresolved; sealing (#614) and planning integration
 (#615) remain required. See [the capture contract and fixtures](RESOLVER-CAPTURE.md)
 and [delivery tracking](RESOLVER-DELIVERY.md).
 
+**Re-planned by #1528 (DEC-1528.1, design accepted, not implemented).**
+Selecting a resolver will give the operator-vouched resolver. It keeps two
+separation checks plus the shared compatibility qualification, and stages
+external objects from a reviewed baseline compared with the target. The
+measured profiles, whose stages are described below, are frozen; #1636
+removes them. In stage 1 below, instance separation, containment,
+source-handling controls and executable identity are measured-profile
+qualifications only. [Delivery tracking](RESOLVER-DELIVERY.md) has the new
+order.
+
 Delivery is split into three stages:
 
 1. Environment discovery, trusted candidate suggestions and compatibility

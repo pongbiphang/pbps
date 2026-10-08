@@ -1561,3 +1561,153 @@ and the refusal classes hold for every profile; only the producer behind
 profiles, which bind the target by observing its engine service
 (DEC-1514.1); that same-host premise is theirs, not resolution's. An
 operator-trusted profile plugs in beside them without reshaping the cases.
+
+<a id="dec-1528-1"></a>
+
+**DEC-1528.1. Selecting a resolver gives the operator-vouched resolver; the
+measured profiles are frozen.** The measured profiles were built to prove
+their own isolation. That needs root, a same-host engine observed through its
+socket, executable identity and verified channels, and it still fails on any
+existing database whose managed objects reference anything outside the
+managed set. #1616 measured three real schemas: no tier answered any of them,
+because the scratch compile itself failed. So the default must be one an
+ordinary CI runner or laptop can use, and it must answer partial adoptions.
+
+**Three tiers.**
+1. No resolver: ADR-0013's conservative rebuild. This stays the default
+   (ADR-0013).
+2. The operator-vouched resolver: the selection whenever a resolver is
+   selected without naming a profile.
+3. The measured profiles: frozen now, and to be removed by #1636 once the
+   operator-vouched resolver covers every path.
+
+**The operator vouches for what pbps does not measure:** the scratch's
+isolation, the confidentiality of what it compiles, and its channels. Both
+connections use whatever TLS the operator configured. The evidence names the
+profile, so a reviewer can always tell a vouched answer from a measured one.
+
+**It keeps exactly two separation checks.** The first runs before the
+run-owned database is created; the second reads that database once it is
+created, before any other DDL.
+- **Scratch is never the target:** its host, port and database are not all the
+  target's, its credential variable differs, and there is no fallback to
+  target credentials. That is the mistake an operator can make by accident,
+  and it is cheap to catch.
+- **Scratch is empty, read in the run-owned database as created rather
+  than in a template** (scratch is cloned from `template0`, not `template1`): a
+  polluted scratch changes what the declarations bind to.
+
+A third check, that scratch is another engine instance (`system_identifier`),
+was dropped. It needs a privileged read, and it guards against a choice the
+operator already vouched for. So a scratch database on the target's own
+cluster is allowed.
+
+**The shared compatibility qualification is not one of the things vouched
+for** (#610, #611). It compares the facts both engines report: version and
+build string, extensions, encoding, collation and the deployment context.
+These decide whether scratch binds a name the way the target would. That
+is a question about meaning, not about isolation, and every reported fact
+can be compared. So it runs for the operator-vouched resolver as for every
+other, and an incompatible or unreadable fact refuses (#1652 review).
+
+What it cannot compare is executable content. Reading it needs the
+observed process (DEC-1514.1, DECISIONS 520), and the target may be remote.
+So two builds that report the same facts are taken to bind alike, for
+example a same-version build with a parser hook. That much is vouched for
+(#1657).
+
+**The scratch database takes the target's encoding and locale.** The encoding
+decides how a name is cut to the 63-byte identifier limit (#1627, #1640). A
+scratch in another encoding would answer for another database. This is not a
+user option.
+
+**Objects outside the managed set are staged from a reviewed baseline,
+compared with the target.** Leaving them out (managed-only) fails every
+partial adoption, which is #1616's finding. Reconstructing them by reading
+their full definitions sends routine source no reviewer approved.
+- The baseline is a SQL file in the repository. It runs on scratch only.
+- **It runs whole and first, before any managed object is staged** (#1664).
+  It runs as the setup role, in its own session.
+  - An earlier draft interleaved it with the managed declarations, so that
+    an external routine could take a managed table's row type. That forced
+    a confined role to keep the baseline away from objects already staged.
+    Review then found, one round at a time, a legitimate external object
+    the role could not create: a foreign key, a routine over a managed
+    type, a cast, an operator or aggregate. Each needed one more privilege,
+    and each grant opened a path back into managed state.
+  - Run first, the baseline meets no managed object, so no privilege rule
+    is needed, and any SQL may be written.
+  - The same order is its contract: a baseline's statements name nothing
+    managed. A legacy view over an adopted table is written as a shape
+    view. An object whose own shape uses a managed type is left out:
+    scratch needs it only in the chain below. A statement that fails names
+    itself and the remedy (#1652 review).
+- **The cost is a chain through the boundary.** A managed object binds to an
+  external one whose compared shape names a managed object: a column,
+  attribute or argument of a managed type, a managed parent relation, or a
+  cast over a managed type. Such a chain
+  refuses, naming it, with two remedies: adopt the middle object, or select
+  no resolver. A view's query and a routine's body never form a chain, since
+  neither is compared; a view over managed tables is staged as a shape view
+  (#1652 review).
+  - Measured on pagila, AdventureWorks and GitLab: no adoption split by
+    kind (tables first; tables and types; views and routines) or by schema
+    produced one. Only foreign keys and triggers pointed back, and neither
+    is compared.
+  - Random half-splits do produce them, through columns typed with a
+    shared managed domain.
+  - Automatic fill, the third step, generates each object itself. It can
+    order them between managed objects from the target's `pg_depend`,
+    without parsing SQL, which lifts the refusal for what it fills.
+- **Every object it creates is compared with the target, by what a
+  creation-time binding can read.**
+  - Compared: an object's own class properties as the manifest
+    fingerprints them; of a relation's children, its columns, the
+    primary-key and unique constraints and indexes a `GROUP BY` or
+    `ON CONFLICT` relies on, and its inheritance and partition parents, which
+    a row-type coercion such as `c::ext.parent` relies on (#1652 review).
+  - Not compared: foreign keys, CHECKs, defaults, triggers, policies, rules,
+    non-unique indexes, nor the source text of a routine's
+    body or a view's query.
+  - So a baseline may omit what only guards or computes, and the common
+    back-pointing foreign key and trigger need not be staged. Earlier
+    drafts listed compared properties of their own and missed one per
+    review (routine defaults, column collations); the manifest's
+    definition, cut to what binds, ends that. The recheck still compares
+    the target's complete fingerprints.
+- **A view is staged as a shape view** (its output columns over typed NULLs,
+  returning no row), **never as a table.** A table's system columns change
+  what a name binds to. Measured on 18: `v.xmin`, with a function
+  `xmin(ext.v)` in scope, binds the function on a view and on a shape view,
+  but the system column on a table of the same columns. This replaces "a
+  view becomes a table of its output columns" in the design on #1528; the
+  point, shapes only and never the original SQL, is unchanged.
+- **Everything the baseline leaves behind is accounted for.** An uncompared
+  object, a mismatch or a baseline object in the managed set refuses. The
+  compatibility qualification reads scratch after the baseline, so a
+  setting it changed must match the target too. A wrong or stale baseline
+  therefore refuses instead of answering for a database that does not
+  exist.
+- pbps itself never sends routine source. A routine reaches scratch only
+  through the baseline, under what the operator vouches for.
+- Two later steps reuse the same comparison: a reviewed draft generated from
+  the target (shapes only; a view as a shape view of its output columns), then
+  automatic fill of missing shapes, where the baseline wins on overlap.
+
+**Naming.**
+- Users see the operator-vouched resolver as plain "resolver".
+- SPEC, ADR, DEC text and code always call it the operator-vouched resolver,
+  `vouched` (the `Vouched` variant, tests prefixed `vouched_`).
+- The frozen tier is "the measured profiles". Containment, process and socket
+  observation, executable identity and verified channels belong to them
+  alone.
+- Text written before this entry that says "resolver" for those means the
+  measured profiles. That covers SPEC §9.3.2 and ADR-0016 as first written,
+  and issues and entries such as DEC-1514.1, #1541, #1542, #1404, #1411, #617,
+  #619, #620 and #1381.
+- A reused bare word would let a later reader carry a measured guarantee over
+  to a profile that makes none.
+
+Recorded in SPEC §9.3.2 and ADR-0016's amendment. The design and the
+maintainer's decisions are on #1528. Pinned by the acceptance tests ADR-0016's
+amendment lists, which land with the producer.
