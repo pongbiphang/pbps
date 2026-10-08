@@ -88,11 +88,25 @@ async fn verified_round_trips_reject_wrong_peers_and_corrupted_replies() {
             .await
             .unwrap();
         assert_eq!(rows[0].try_get::<i32>("value").unwrap(), Some(1));
+        let Err(refused) = pbps_db::Conn::connect(Driver::Postgres, &unnamed("127.0.0.1")).await
+        else {
+            panic!("a certificate for localhost accepted for 127.0.0.1 under the default");
+        };
+        // #829: the server speaks TLS and its certificate does not name this
+        // host, so the advice is about the certificate — never to turn TLS
+        // off, which the same handshake text used to earn. The driver's own
+        // error is still underneath, unchanged.
+        let pbps_db::DbError::Context { message, source } = &refused else {
+            panic!("a certificate failure is explained: {refused:?}");
+        };
         assert!(
-            pbps_db::Conn::connect(Driver::Postgres, &unnamed("127.0.0.1"))
-                .await
-                .is_err(),
-            "a certificate for localhost accepted for 127.0.0.1 under the default"
+            message.contains("certificate was not accepted") && message.contains("keep TLS on"),
+            "{message}"
+        );
+        assert!(!message.contains("sslmode=disable"), "{message}");
+        assert!(
+            matches!(**source, pbps_db::DbError::Driver { code: None, .. }),
+            "{source:?}"
         );
     }
     if driver() == Driver::Mssql {

@@ -632,3 +632,4 @@ other numbers before landing. Some records still mention them as proposals.
 | DEC-1274.2 | [modules](decisions/modules.md#dec-1274-2) | A new table whose generated column calls a function the plan creates follows that create whole, in the plan and on scratch. |
 | DEC-1576.1 | [modules](decisions/modules.md#dec-1576-1) | A connected PostgreSQL plan whose expression names, in a literal, a relation the plan creates later is refused with a two-plan remedy, not reordered. |
 | DEC-822.1 | [doctor](decisions/doctor.md#dec-822-1) | A refused lock read is remedied with the one statement for the gap a fresh session can see, or a recheck when it sees none. |
+| DEC-829.1 | [connection](decisions/connection.md#dec-829-1) | A defaulted PostgreSQL TLS failure is classified from the driver's typed cause chain: a certificate failure is never told to disable TLS. |

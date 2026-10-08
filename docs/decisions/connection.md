@@ -890,8 +890,8 @@ here.
      people to a different tool rather than to TLS. What changes is that the
      insecure choice has to be spelled out where a reviewer can see it; the
      error for a server that refuses TLS under the default says to add
-     `sslmode=disable`, and only on that failure, not on a refused socket or
-     a timeout.
+     `sslmode=disable`, and only on that failure, not on a refused socket, a
+     timeout or a certificate the host does not accept (DEC-829.1).
 
      "Names" is the driver's parser's answer, not a second parser here: the
      string is parsed again with `sslmode=disable` placed before its own
@@ -959,3 +959,38 @@ Pinned by `the_statement_text_pbps_writes_is_ascii` and
 (`crates/pbps-pg/tests/statement_text_is_ascii.rs`), and the live
 `a_database_in_a_non_utf8_encoding_is_bootstrapped_and_deployed`
 (`crates/pbps-cli/tests/flow_pg.rs`, `LATIN1` and `EUC_JP`).
+
+<a id="dec-829-1"></a>
+
+**DEC-829.1. A defaulted PostgreSQL TLS failure is classified from the
+driver's typed cause chain, not its flattened text.** The driver renders a
+server refusing TLS and a certificate this host does not accept with the same
+"error performing TLS handshake" message, and the advice for the first --
+`sslmode=disable` on a network you trust -- is the opposite of the fix for the
+second, whose server does speak TLS. So the failure is read in
+`postgres::tls_connect_error`, before `DbError::from` flattens it:
+- a `rustls::Error::InvalidCertificate` anywhere in the chain is a
+  certificate failure, and gets advice to keep TLS on and check the
+  certificate's validity, issuer trust and host name. It is reached through
+  `io::Error::get_ref`, because `io::Error::source` skips the error it wraps;
+- the driver's own refusal, its fixed sentence as the first cause and not
+  inside an `io::Error`, keeps the `sslmode=disable` hint;
+- anything else gets no TLS advice.
+
+The advice is fixed text in a `Context` over the driver's error, which stays
+underneath unchanged. It is given only when the string named no `sslmode`,
+since it is about a mode nobody wrote; a named `require` and
+`connect_verified` are unchanged.
+
+Accepted gap: the driver returns the same refusal for any reply other than `S`
+to the SSL request, so a malformed reply also gets the `sslmode=disable` hint,
+as it did before. Telling those apart would need an observer on the socket
+beneath the driver -- one transparent to partial writes and reads -- for a
+reply real servers do not send. That was weighed and not chosen.
+
+Pinned by `certificate_causes_survive_io_wrappers_without_text_matching`
+(`crates/pbps-db/src/postgres.rs`), the existing
+`an_unnamed_sslmode_cannot_be_downgraded_to_a_cleartext_login` for the
+refusal, and the live wrong-host case in
+`verified_round_trips_reject_wrong_peers_and_corrupted_replies`
+(`crates/pbps-db/tests/live_transport.rs`).
