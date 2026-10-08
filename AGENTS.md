@@ -119,6 +119,20 @@ checksum-pinned, and state lives in the database itself.
   approved `ci-gate` is pending and the pull request cannot be queued. The
   merge group, `master` and dispatched runs name no environment and start by
   themselves.
+- After an actual PR base edit, refresh OPEN/base/head/diff and review
+  evidence (DEC-1457.1). When fresh associated CI is required, add the
+  `ci-retest` label to that owned PR; if already present, remove only that label
+  and add it again. Verify the unchanged reviewed head and intended base before
+  and after the label event, then select its new PR-associated run. Every label
+  addition uses the approval/full-matrix route; label removal and title/body
+  edits do not trigger CI. Never approve merely because a label was added.
+  Verify approval bootstraps its immutable defining workflow and selects a
+  merge SHA with the intended base and reviewed head as parents. Every job must
+  use that pinned SHA, and its base parent must include the event base and
+  belong to the intended base branch. Same-base advancement needs no rebase.
+  Require the complete approved matrix and actual required-check admission;
+  a retained green run alone is insufficient. Do not select a run merely
+  because it is newest or green in Actions.
 - Wait for `ci-gate` on the approved run and read the run, not `check-runs`,
   which lists only the jobs created so far. Retry a transient failure with
   `gh run rerun <run-id>`

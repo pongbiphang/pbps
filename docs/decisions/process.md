@@ -856,3 +856,74 @@ selection must hide the late-closed control; removing the window distinction
 must turn the older-closed control into a false alarm. #1463's real closeout
 supplies the successfully enumerated empty-dependent all-state control, without
 creating a throwaway production PR.
+
+
+<a id="dec-1457-1"></a>
+
+**DEC-1457.1. Request fresh retargeted CI with a PR label event; exclude
+metadata edits at the trigger.** GitHub's default `pull_request` activity types
+are `opened`, `synchronize` and `reopened`. Add `labeled` as an explicit,
+head-preserving request for a new PR-associated run on the current base's
+merge ref. After refreshing OPEN/base/head/remaining diff and existing review
+evidence, the primary agent adds `ci-retest` to the owned PR. If it is already
+present, remove only that label before adding it again. Removal is not a CI
+activity type. Verify head/base around the event and select the newly created
+associated run, including when the head has no passing required check. The
+label grants no approval: the current reviewed head must qualify before its
+`ci-approval` deployment is approved, and the full matrix must pass.
+
+Every label addition uses the same route, including ordinary triage labels;
+there is no label-name condition that can replace the required gate with a
+skipped check. Label additions start an approval-held run and cancel older PR
+runs through the existing concurrency group. Title/body edits and base edits
+alone do not trigger this workflow. A base change that requires fresh evidence
+therefore needs the explicit label action; unrelated description edits need
+nothing and spend no matrix. The gate remains the literal `ci-gate`, requires
+every job through `always()`, and treats failure, cancellation and unexpected
+skips as failure. Master, merge groups and dispatch remain uncancelled and
+need no approval environment.
+
+The rejected alternative admitted `edited` and skipped/renamed the metadata
+gate in a separate concurrency group. Real #1535 evidence disproved it: after
+run 37293158064 passed the entire matrix on head
+`fe2f7a4839c957929c664a6127b41097fe75527f`, a body-only edit created skipped
+run 37298874061. The successful run and its `ci-gate` check remained, but the
+PR changed from `clean` to `blocked`. Ordinary queue admission returned
+`Required status check "ci-gate" is expected.` The metadata suite had a literal
+expression as its skipped name. Preserving the run or seeing green required
+checks through the check API did not establish merge-box admission. Excluding
+`edited` prevents that replacement at event ingestion instead of trying to
+hide it with conditions or supply a passing gate for tests that never ran.
+
+A PR event SHA is not accepted as proof of the tested combined tree. The
+historical edited run 37273424527 was associated with the right PR/head/base,
+yet checkout `b66f67da589c5fc5ba2eb0ffcd5e7a755b61844d` had the former base
+as its first parent. Approval bootstraps the immutable defining workflow
+revision (`github.workflow_sha`), so reviewed heads predating a new selector
+need no rebase to acquire it. Select the live `refs/pull/N/merge` only when
+stable complete PR/ref snapshots and both commit parents match the event's
+reviewed head and intended base ref. The event base SHA is an ancestry floor:
+the selected base parent includes it and belongs to the intended branch.
+GitHub can retain a stable earlier merge ref while the same base advances;
+ancestry checks allow that valid movement without rebasing. Pin the selected
+SHA as an approval output for every execution job. Missing, unreadable, changed
+or ambiguous evidence fails the bounded selector. Non-PR events retain their
+exact event SHA.
+
+A transient failure reruns its PR-associated run with `gh run rerun`; dispatch
+cannot supply the PR check (Decision 206). A rerun keeps the original event
+head/base intent, so use a new label event for a newly retargeted base. Missing
+retry evidence stops admission; it never permits close/reopen, rewriting the
+head or bypassing required checks. Moving master alone needs no rebase or
+new review (Decision 502); the merge group tests the exact integrated tree.
+
+Permanent tests use GitHub's pinned expression parser and verify trigger
+activity types as well as approval, cancellation, complete fan-in, bootstrap
+and per-job checkout contracts. Actual owned-PR controls must prove that
+metadata edits create no run both while CI is pending and after success, and
+that the complete current-head run remains admissible after the latter edit.
+Retain actual label/base/run/ref/parent evidence, including missing-check
+recovery; no throwaway production PR is needed. See
+[GitHub's pull-request events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request),
+[rerun identity](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs),
+and [required check troubleshooting](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks).

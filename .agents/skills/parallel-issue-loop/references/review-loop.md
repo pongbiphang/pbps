@@ -114,6 +114,21 @@ request, so it goes green in the Actions tab while the required check stays
 unsatisfied (DECISIONS 206, 501). A red CI result requires a fix, push, and
 return to the draft loop.
 
+After an actual base edit, refresh OPEN/base/unchanged head/remaining diff and
+review evidence (DEC-1457.1). When fresh CI is required, add `ci-retest` to the
+owned PR; remove only that label first if it is already present. Verify the
+head/base around the event, then select its new PR-associated run and approve
+only after the existing review gate qualifies. Every label addition enters
+approval and the full matrix; removing a label or editing title/body triggers
+nothing. Require the complete matrix and actual required-check admission, not
+just a retained green run. Verify the immutable defining-workflow bootstrap,
+intended-base/reviewed-head merge parents and every job's identical pinned SHA.
+The base parent includes the event base and belongs to the intended branch;
+a stable merge ref may precede later same-base advancement. A rerun keeps its
+original event head/base intent and cannot manufacture a newly retargeted
+event. Missing associated evidence stops admission; it does not permit
+close/reopen, head rewrites, dispatch or a bypass.
+
 `master` moving before merge needs no action: the queue rebuilds the PR against
 current `master` when it is enqueued.
 
