@@ -7846,7 +7846,9 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         // What the previous state declared, advanced by what this plan wrote:
         // from the plan alone, since `apply --plan` needs nothing else.
         snapshot.declared = entry.snapshot.declared.clone();
-        snapshot.declared.advance(&plan.changes);
+        snapshot
+            .declared
+            .advance_with_partitions(&plan.changes, &snapshot.schema);
         Ok::<_, anyhow::Error>(crate::engine::record(conn, &snapshot).await?)
     }
     .await;
@@ -8465,7 +8467,9 @@ async fn apply_staged_under_lock(
     // What the previous state declared, advanced by what this plan wrote: from
     // the plan alone, since `apply --plan` needs nothing else (SPEC §7.3).
     snapshot.declared = entry.snapshot.declared.clone();
-    snapshot.declared.advance(&plan.changes);
+    snapshot
+        .declared
+        .advance_with_partitions(&plan.changes, &snapshot.schema);
     Ok(crate::engine::record(conn, &snapshot).await?)
 }
 

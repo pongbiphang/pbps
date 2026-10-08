@@ -4018,6 +4018,13 @@ leaves instead, as the parent's columns are. A partition held field by field for
 alone is still held to being there: one dropped or created by another session
 is movement, as the whole-table comparison would have called it.
 
+**The recorded spellings.** A partition's own default is recorded in its
+declared spelling under the partition (DEC-1581.1), and the plan names only
+the parent's rename or drop. So the apply carries the parent's column rename
+or drop into its partitions' records, reading the partitions from the state it
+records. Otherwise the next plan overlays nothing on the engine's respelling,
+and plans the default again.
+
 **The cost estimate** names the recursion. On a partitioned table it says the
 statement recurses into its partitions, how many, and the lock it takes on
 each. Rows and rewrite stay unknown, since ADR-0012 did not measure

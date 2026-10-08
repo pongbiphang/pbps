@@ -19327,6 +19327,22 @@ fn parent_columns_flow(server: &str, slug: &str) {
     );
     applied("loosen-again.json");
     assert_eq!(not_null("m2"), [0, 0, 0]);
+    // A partition's own default in a spelling the engine rewrites, then its
+    // column renamed on the parent: the recorded spelling follows the rename
+    // into the partition, so the next plan has nothing to do (#1692 review).
+    edit(
+        "      note: {default: \"'own'::text\"}",
+        "      note: {default: \"'own2'\"}",
+    );
+    applied("own-spelling.json");
+    edit("  note:\n", "  label:\n");
+    edit(
+        "      note: {default: \"'own2'\"}",
+        "      label: {default: \"'own2'\"}",
+    );
+    succeeds(d.run(&["rename", "app.ev.note", "label"]));
+    applied("rename-own.json");
+    assert_eq!(default_is("label", "'''own2''::text'"), [1, 0, 0]);
     // Dropped.
     edit("  extra:\n    type: integer\n    default: \"3\"\n", "");
     succeeds(d.run(&["drop", "app.ev.extra", "--reason", "gone"]));
