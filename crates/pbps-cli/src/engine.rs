@@ -738,12 +738,19 @@ pub async fn refuse_unlogged_partition_referencers(
 /// DEC-1431.1). Reads the edges of the tables and modules the plan touches,
 /// under the names the catalog has them by. PostgreSQL has no computed
 /// columns, and its generated ones are `release_generated_inputs`'s.
+///
+/// Returns which drop waits for which by those edges, for the rename search
+/// that runs after it ([`order_created_object_names`], #1680): empty where
+/// no edge was read.
 // The complement is every change that touches no object an expression edge
 // can name: a computed column, a column it reads, its table, or a module.
 #[allow(clippy::wildcard_enum_match_arm)]
-pub async fn order_computed_by_edges(conn: &mut Conn, cs: &mut ChangeSet) -> anyhow::Result<()> {
+pub async fn order_computed_by_edges(
+    conn: &mut Conn,
+    cs: &mut ChangeSet,
+) -> anyhow::Result<Vec<(pbps_model::Change, pbps_model::Change)>> {
     if conn.driver() != Driver::Mssql {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut renamed: BTreeMap<pbps_model::TableName, pbps_model::TableName> = BTreeMap::new();
     for p in &cs.changes {
@@ -775,7 +782,7 @@ pub async fn order_computed_by_edges(conn: &mut Conn, cs: &mut ChangeSet) -> any
         }
     }
     if objects.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // The edges refuse or move only these: a column a computed column of its
     // own table reads, a function one calls, a computed column a module is
@@ -820,7 +827,7 @@ pub async fn order_computed_by_edges(conn: &mut Conn, cs: &mut ChangeSet) -> any
             })?;
     }
     if !decides {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // An empty read is "no edge" only where no referrer the pass decides by
     // can be hidden (#1462).
@@ -853,7 +860,7 @@ pub async fn order_computed_by_edges(conn: &mut Conn, cs: &mut ChangeSet) -> any
         })?;
     let edges = pbps_mssql::catalog::expression_edges(conn, &objects).await?;
     if edges.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // One group: whether two strings are one name is the collation's, not
     // the kind of object they name.
@@ -868,8 +875,8 @@ pub async fn order_computed_by_edges(conn: &mut Conn, cs: &mut ChangeSet) -> any
             .map(|(a, b)| (spellings[a].clone(), spellings[b].clone())),
     );
     crate::computed_order::order_by_edges(cs, &edges, &alike)
-        .map(|_| ())
-        .map_err(|why| anyhow::anyhow!("computed_dependencies (SQL Server): {why}"))
+        .map_err(|why| anyhow::anyhow!("computed_dependencies (SQL Server): {why}"))?;
+    Ok(crate::computed_order::drop_precedence(cs, &edges, &alike))
 }
 
 /// Refuses a SQL Server computed column this plan adds, new or again, whose
@@ -915,6 +922,7 @@ pub async fn order_created_object_names(
     conn: &mut Conn,
     cs: &mut ChangeSet,
     label: &str,
+    precedence: &[(pbps_model::Change, pbps_model::Change)],
 ) -> anyhow::Result<()> {
     if conn.driver() != Driver::Mssql {
         return Ok(());
@@ -976,7 +984,7 @@ pub async fn order_created_object_names(
     // collation (#1215).
     let candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
     let alike = pbps_mssql::catalog::object_names_alike(conn, &candidates).await?;
-    crate::object_order::order_occupied_objects_under(cs, &occupants, &alike, label)
+    crate::object_order::order_occupied_objects_under(cs, &occupants, &alike, label, precedence)
 }
 
 /// Proves the tables a catalog read did not return are absent, not hidden,

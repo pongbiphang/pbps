@@ -477,6 +477,79 @@ pub(crate) fn refuse_added_calls(
     Err(refused.join("\n"))
 }
 
+/// What a change drops, by its catalog name: a module or a table.
+fn dropped_object(change: &Change) -> Option<TableName> {
+    if let Change::DropModule { id, .. } = change {
+        Some(id.object_name())
+    } else if let Change::DropTable { name, .. } = change {
+        Some(name.clone())
+    } else {
+        None
+    }
+}
+
+/// The positions the drop at `at` waits for, by the edges: for a function,
+/// each removal of a computed column that calls it; for any module or table,
+/// each drop of something schema-bound to it, which reaches it through its
+/// own release. Empty for a change that drops neither.
+fn waits_for(
+    changes: &[PlannedChange],
+    at: usize,
+    edges: &[ExpressionEdge],
+    names: &CatalogNames,
+    alike: &Alike,
+) -> Vec<usize> {
+    let Some(object) = dropped_object(&changes[at].change) else {
+        return Vec::new();
+    };
+    let is_function = matches!(changes[at].change, Change::DropModule { .. });
+    // Whether a change removes a computed column that calls `object`.
+    let releases = |change: &Change| {
+        edges.iter().any(|e| {
+            e.from_column.is_some()
+                && alike.object(&e.to, &object)
+                && (matches!(change, Change::DropComputedColumn { table, name, .. }
+                    if alike.object(&names.table(table), &e.from)
+                        && e.from_column.as_deref().is_some_and(|c| alike.same(c, name)))
+                    || matches!(change, Change::DropTable { name, .. } if alike.object(name, &e.from)))
+        })
+    };
+    let bound = |change: &Change| {
+        dropped_object(change).is_some_and(|dependent| {
+            edges.iter().any(|e| {
+                e.from_column.is_none()
+                    && e.from_schema_bound
+                    && alike.object(&e.from, &dependent)
+                    && alike.object(&e.to, &object)
+            })
+        })
+    };
+    (0..changes.len())
+        .filter(|&p| {
+            p != at && ((is_function && releases(&changes[p].change)) || bound(&changes[p].change))
+        })
+        .collect()
+}
+
+/// Which drop runs before which, as `release` ordered them: each pair is a
+/// change and a drop that waits for it. The rename search reads these to
+/// move a module drop only where its edges allow (#1680), instead of
+/// keeping the place `release` gave it among every drop.
+pub(crate) fn drop_precedence(
+    cs: &ChangeSet,
+    edges: &[ExpressionEdge],
+    alike: &Alike,
+) -> Vec<(Change, Change)> {
+    let names = CatalogNames::of(cs);
+    let mut out = Vec::new();
+    for at in 0..cs.changes.len() {
+        for p in waits_for(&cs.changes, at, edges, &names, alike) {
+            out.push((cs.changes[p].change.clone(), cs.changes[at].change.clone()));
+        }
+    }
+    out
+}
+
 /// Moves each function drop to right after the last removal of a computed
 /// column calling it, and what it is schema-bound to after it.
 fn release(
@@ -485,27 +558,6 @@ fn release(
     names: &CatalogNames,
     alike: &Alike,
 ) -> Result<usize, String> {
-    // What a change drops, by its catalog name: a module or a table.
-    let drops = |change: &Change| -> Option<TableName> {
-        if let Change::DropModule { id, .. } = change {
-            Some(id.object_name())
-        } else if let Change::DropTable { name, .. } = change {
-            Some(name.clone())
-        } else {
-            None
-        }
-    };
-    // Whether a change removes a computed column that calls `function`.
-    let releases = |change: &Change, function: &TableName| {
-        edges.iter().any(|e| {
-            e.from_column.is_some()
-                && alike.object(&e.to, function)
-                && (matches!(change, Change::DropComputedColumn { table, name, .. }
-                    if alike.object(&names.table(table), &e.from)
-                        && e.from_column.as_deref().is_some_and(|c| alike.same(c, name)))
-                    || matches!(change, Change::DropTable { name, .. } if alike.object(name, &e.from)))
-        })
-    };
     let mut moved = 0;
     // Bounded: each move puts one drop after another, and a plan whose drops
     // would have to keep chasing each other has no order to settle on.
@@ -514,31 +566,13 @@ fn release(
     loop {
         let mut changed = false;
         for at in 0..cs.changes.len() {
-            let Some(object) = drops(&cs.changes[at].change) else {
+            let Some(object) = dropped_object(&cs.changes[at].change) else {
                 continue;
             };
-            let is_function = matches!(cs.changes[at].change, Change::DropModule { .. });
-            // After the last removal of a computed column that calls it.
-            let after_release = is_function
-                .then(|| {
-                    cs.changes
-                        .iter()
-                        .rposition(|p| releases(&p.change, &object))
-                })
-                .flatten();
-            // After every drop of something schema-bound to it, which reaches
-            // it through its own release.
-            let after_dependents = cs.changes.iter().rposition(|p| {
-                drops(&p.change).is_some_and(|dependent| {
-                    edges.iter().any(|e| {
-                        e.from_column.is_none()
-                            && e.from_schema_bound
-                            && alike.object(&e.from, &dependent)
-                            && alike.object(&e.to, &object)
-                    })
-                })
-            });
-            let Some(last) = after_release.max(after_dependents) else {
+            let Some(last) = waits_for(&cs.changes, at, edges, names, alike)
+                .into_iter()
+                .max()
+            else {
                 continue;
             };
             if last <= at {
@@ -832,6 +866,33 @@ mod tests {
         assert!(at("dbo.u") < at("dbo.f"), "{ran:?}");
         assert!(at("dbo.f") < at("dbo.g"), "{ran:?}");
         assert!(at("dbo.f") < at("dbo.lookup"), "{ran:?}");
+
+        // The same order, as the pairs the rename search keeps (#1680): `f`
+        // after `u`, and `g` and `lookup` after `f`; nothing about `g` and
+        // `lookup`, which the edges do not relate.
+        let cs = ChangeSet {
+            changes: vec![
+                drop_table("dbo.u"),
+                drop_module("dbo.f"),
+                drop_module("dbo.g"),
+                drop_table("dbo.lookup"),
+            ],
+        };
+        let subject = |c: &Change| c.subject().to_string();
+        let mut pairs: Vec<(String, String)> = drop_precedence(&cs, &edges, &Alike::default())
+            .iter()
+            .map(|(a, b)| (subject(a), subject(b)))
+            .collect();
+        pairs.sort();
+        let ab = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(
+            pairs,
+            [
+                ab("dbo.f", "dbo.g"),
+                ab("dbo.f", "dbo.lookup"),
+                ab("dbo.u", "dbo.f"),
+            ]
+        );
     }
 
     /// Names are one where the catalog's collation says so, and only there:

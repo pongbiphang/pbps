@@ -6489,15 +6489,22 @@ pub fn cmd_plan_db(
             // change, and before the checks that read the order.
             crate::engine::release_generated_inputs(&mut conn, &mut cs).await?;
             // A computed column's function drops after it, by the catalog's
-            // edges (DEC-1431.1): before the rename walk, which reads drops
-            // but moves no module.
-            crate::engine::order_computed_by_edges(&mut conn, &mut cs).await?;
+            // edges (DEC-1431.1): before the rename walk, which moves a
+            // module drop only between the drops these edges order it
+            // among (#1680).
+            let precedence = crate::engine::order_computed_by_edges(&mut conn, &mut cs).await?;
             // What an added computed column calls has no edge yet; its names
             // are compared under the collation instead (#1459).
             crate::engine::refuse_added_computed_calls(&mut conn, &cs, &declared).await?;
             // Last of the passes that order the plan, so the order it settles
             // from the catalog is the one checked below and saved (#1366).
-            crate::engine::order_created_object_names(&mut conn, &mut cs, &target.label).await?;
+            crate::engine::order_created_object_names(
+                &mut conn,
+                &mut cs,
+                &target.label,
+                &precedence,
+            )
+            .await?;
             let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
             let drops = crate::engine::check_drop_blockers(&mut conn, &cs).await?;
             crate::engine::prepare_data_writes(&mut conn, &cs, &entry.snapshot, &resolved.ids)
