@@ -960,7 +960,39 @@ fn diff_partial_rebuilding(
     // Rows follow the foreign keys among the tables that declare them. The
     // declared side is the right one to read: a row being inserted is going
     // into the schema as it will be, not as it was.
-    let data_rank = rank_of_tables(&pbps_model::data::insertion_order(declared.schema));
+    //
+    // An attach brings rows into its parent and validates the parent's
+    // foreign keys over them, so the parents this plan attaches to are
+    // ordered with the tables that receive rows: a parent after every table
+    // it references, whether rows or another attach fill that one (#1642
+    // review).
+    let attach_parents: BTreeMap<TableName, TableName> = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::AttachPartition { table, parent, .. } = &p.change {
+                Some((table.clone(), parent.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let data_rank = rank_of_tables(&if attach_parents.is_empty() {
+        pbps_model::data::insertion_order(declared.schema)
+    } else {
+        pbps_model::data::supply_order(
+            declared.schema,
+            declared
+                .schema
+                .tables
+                .iter()
+                .filter(|(_, t)| t.data.is_some())
+                .map(|(n, _)| n.clone())
+                .chain(attach_parents.values().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        )
+    });
     // Roles that are dropped together are ordered parent before member.
     let role_rank = member_depth(&planned);
     // The tables a `RenameColumn` in this plan claims a column name on. Both
@@ -1237,26 +1269,27 @@ fn diff_partial_rebuilding(
         .collect();
     // An attach validates its parent's foreign keys over the rows it brings,
     // as `ADD FOREIGN KEY` does, so one whose parent references a table this
-    // plan writes rows into waits for them: among the row changes, just after
-    // the latest of those tables, and so before the rows of a table that
-    // references the parent, which rank after every table the parent does.
-    // Its own changes follow it there (#1642 review).
-    let late_attach: BTreeMap<TableName, isize> = planned
+    // plan writes rows into, or attaches a table to, waits for them: among
+    // the row changes, at its parent's rank, after every table the parent
+    // references and before the rows of a table that references the parent.
+    // Its own changes follow it there. Any other attach stays in class 7
+    // (#1642 review).
+    let late_attach: BTreeMap<TableName, isize> = attach_parents
         .iter()
-        .filter_map(|p| {
-            let Change::AttachPartition { table, parent, .. } = &p.change else {
-                return None;
-            };
-            let after = declared
-                .schema
-                .tables
-                .get(parent)?
-                .foreign_keys
-                .values()
-                .filter(|fk| row_tables.contains(&fk.references_table))
-                .filter_map(|fk| data_rank.get(&fk.references_table))
-                .max()?;
-            Some((table.clone(), 2 * *after as isize + 1))
+        .filter(|(_, parent)| {
+            declared.schema.tables.get(*parent).is_some_and(|t| {
+                t.foreign_keys.values().any(|fk| {
+                    fk.references_table != **parent
+                        && (row_tables.contains(&fk.references_table)
+                            || attach_parents.values().any(|p| *p == fk.references_table))
+                })
+            })
+        })
+        .map(|(table, parent)| {
+            (
+                table.clone(),
+                data_rank.get(parent).map_or(0, |r| *r as isize),
+            )
         })
         .collect();
     let follows_late_attach = |c: &Change| -> bool {
@@ -4272,12 +4305,10 @@ fn dependency_rank(
         Change::SetPartitionNotNull { not_null: true, .. } => 1,
         // Rows follow the foreign keys between their tables: a referenced
         // table's rows go in first, and out last.
-        // Doubled, so an attach that waits for rows ranks between two tables
-        // (`late_attach`).
         Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
-            data_rank.get(table).map_or(0, |r| 2 * *r as isize)
+            data_rank.get(table).map_or(0, |r| *r as isize)
         }
-        Change::DeleteRow { table, .. } => -(data_rank.get(table).map_or(0, |r| 2 * *r as isize)),
+        Change::DeleteRow { table, .. } => -(data_rank.get(table).map_or(0, |r| *r as isize)),
         // Two roles dropped together are ordered by membership: see
         // [`member_depth`].
         Change::DropRole { name, .. } => role_rank.get(name).map_or(0, |r| *r as isize),
@@ -6476,6 +6507,54 @@ mod tests {
             kinds(&outcome(&base, &declared, &[]).2.expect("attached")),
             ["DropIndex", "AttachPartition", "SetPartitionDefault"]
         );
+
+        // An attach that fills the table another attach's parent references
+        // goes first, whatever the names: `app.z` into `app.r`, which `app.ev`
+        // references, before `app.t` into `app.ev` (#1642 review).
+        let r_partitioned = |schema: &Schema| {
+            let mut schema = schema.clone();
+            schema
+                .tables
+                .get_mut(&"app.r".parse::<TableName>().unwrap())
+                .unwrap()
+                .partition_by = Some(PartitionBy {
+                columns: vec!["id".into()],
+            });
+            schema
+        };
+        let mut z = table(&[("id", Column::new(ty("int")).not_null())]);
+        z.primary_key = Some(key("z_pk", &["id"]));
+        let mut both_base = r_partitioned(&base);
+        both_base.tables.insert("app.z".parse().unwrap(), z);
+        let mut both_declared = r_partitioned(&declared);
+        both_declared.tables.insert(
+            "app.z".parse().unwrap(),
+            Table {
+                partition_of: Some(PartitionOf {
+                    parent: "app.r".parse().unwrap(),
+                    bound: PartitionBound::Range {
+                        from: vec![BoundDatum::Value("0".into())],
+                        to: vec![BoundDatum::Value("100".into())],
+                    },
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            },
+        );
+        let attaches: Vec<String> = outcome(&both_base, &both_declared, &[])
+            .2
+            .expect("both attached")
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::AttachPartition { table, .. } = &p.change {
+                    Some(table.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(attaches, ["app.z", "app.t"]);
 
         // The engine's match: a descending index is its parent's all the
         // same, and of two matches neither is assumed adopted. One is left,

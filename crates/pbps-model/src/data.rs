@@ -696,13 +696,22 @@ pub fn plan_base(
 ///
 /// Deletes run in the reverse of this order, for the mirror-image reason.
 pub fn insertion_order(schema: &crate::schema::Schema) -> Vec<TableName> {
-    let names: Vec<TableName> = schema
-        .tables
-        .iter()
-        .filter(|(_, t)| t.data.is_some())
-        .map(|(n, _)| n.clone())
-        .collect();
+    supply_order(
+        schema,
+        schema
+            .tables
+            .iter()
+            .filter(|(_, t)| t.data.is_some())
+            .map(|(n, _)| n.clone())
+            .collect(),
+    )
+}
 
+/// [`insertion_order`] over any set of tables that receive rows, each after
+/// every table of the set it references: the `data:` tables, and with them
+/// the partitioned parents a plan attaches a table to, whose rows the attach
+/// brings and whose foreign keys it validates over them (DEC-1545.1).
+pub fn supply_order(schema: &crate::schema::Schema, names: Vec<TableName>) -> Vec<TableName> {
     // Transitive, so a table between two data tables does not break the chain.
     let mut needs: BTreeMap<&TableName, BTreeSet<TableName>> = BTreeMap::new();
     for name in &names {

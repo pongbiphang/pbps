@@ -3525,11 +3525,12 @@ each is bound to, which the text does not say. So every such index is dropped
 before the attach, and one the declaration keeps is added after.
 
 **The attach validates the parent's foreign keys** over the rows it brings,
-as `ADD FOREIGN KEY` does. One whose parent references a table the plan
-writes rows into therefore runs among the row changes, at (11, 1), ranked
-just after the latest of those tables. That puts it before the rows of a
-table referencing the parent, which rank after every table the parent
-references. Its own alterations of classes 9 and 10 follow it to (11, 2). A
+as `ADD FOREIGN KEY` does. So the parents a plan attaches to are ordered
+with the tables that receive rows (`supply_order`), each after every table
+it references. An attach whose parent references a table the plan writes
+rows into, or attaches a table to, runs among the row changes at (11, 1), at
+its parent's rank. That puts it after what fills the tables its parent
+references, and before the rows of a table referencing the parent. Its own alterations of classes 9 and 10 follow it to (11, 2). A
 staged plan never holds both, being one logical change. Pre-flight reads a
 parent's rows, once a table is attached to it in the plan, as its own and
 that table's together, so a foreign key into the parent is not refused for
