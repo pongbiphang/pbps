@@ -1600,12 +1600,18 @@ operator already vouched for. So a scratch database on the target's own
 cluster is allowed.
 
 **The shared compatibility qualification is not one of the things vouched
-for** (#610, #611). It checks version and build, extensions, encoding,
-collation and the deployment context. These decide whether scratch binds a
-name the way the target would. That is a question about meaning, not about
-isolation, and an operator cannot vouch it true. So it runs for the
-operator-vouched resolver as for every other, and an incompatible or
-unreadable fact refuses (#1652 review).
+for** (#610, #611). It compares the facts both engines report: version and
+build string, extensions, encoding, collation and the deployment context.
+These decide whether scratch binds a name the way the target would. That
+is a question about meaning, not about isolation, and every reported fact
+can be compared. So it runs for the operator-vouched resolver as for every
+other, and an incompatible or unreadable fact refuses (#1652 review).
+
+What it cannot compare is executable content. Reading it needs the
+observed process (DEC-1514.1, DECISIONS 520), and the target may be remote.
+So two builds that report the same facts are taken to bind alike, for
+example a same-version build with a parser hook. That much is vouched for
+(#1657).
 
 **The scratch database takes the target's encoding and locale.** The encoding
 decides how a name is cut to the 63-byte identifier limit (#1627, #1640). A
@@ -1649,8 +1655,11 @@ their full definitions sends routine source no reviewer approved.
   - Each check would have had a neighbour. Without ownership or table
     privileges, the engine refuses all of them. Without superuser, it also
     refuses event triggers.
-  - Re-reading the staged managed objects and refusing an uncompared
-    object remain as a backstop.
+  - Three checks afterwards catch the indirect paths privilege cannot,
+    such as a staged `SECURITY DEFINER` routine executable by `PUBLIC`:
+    - the staged managed objects are re-read;
+    - managed tables, staged without rows, must still have none;
+    - an uncompared object refuses.
   - Otherwise the evidence could describe declarations nobody wrote. The compared shapes are sealed into the manifest.
   So a wrong or stale baseline refuses instead of answering for a database
   that does not exist.

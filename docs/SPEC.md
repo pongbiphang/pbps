@@ -1407,10 +1407,13 @@ implemented).**
       fallback to target credentials.
     - Scratch is empty in the connected scope, `template1` included.
   - The shared compatibility qualification (#610, #611) still runs, as for
-    every resolver environment. It checks engine version and build,
-    extensions, encoding, collation and the deployment context. It decides
-    whether scratch would bind the same way as the target, which no operator
-    can vouch for, so an incompatible or unreadable fact refuses.
+    every resolver environment. It compares the facts both engines report:
+    version and build string, extensions and their versions, encoding,
+    collation and the deployment context. An incompatible or unreadable
+    fact refuses.
+  - Executable identity is not measured, because no process is observed.
+    Two builds that report the same facts are taken to bind alike, and
+    that is part of what the operator vouches for (#1657).
   - The run-owned scratch database takes the target's encoding and locale.
     The encoding decides how a name is cut to the identifier limit, so a
     scratch in another one would answer for another database.
@@ -1601,10 +1604,12 @@ scratch compile (#1616).
     included, never reach the session that compiles the declarations.
   - Its `CREATE EXTENSION` statements, which may need more, are run by pbps
     itself, as the setup role, before any managed object is staged.
-  - Two checks remain as a backstop. Every managed object already staged is
-    re-read afterwards and must be exactly what pbps staged. An object the
-    baseline creates that is neither managed nor compared with the target
-    refuses.
+  - Three checks afterwards catch what privilege cannot, such as a staged
+    `SECURITY DEFINER` routine the baseline may execute:
+    - every managed object already staged must be exactly what pbps staged;
+    - every managed table, staged without rows, must still have none;
+    - an object the baseline creates that is neither managed nor compared
+      with the target refuses.
 - **pbps itself never sends routine source to scratch.** A routine is there
   only if the operator put it in the baseline. A binding question that needs
   routine source the baseline lacks refuses with a finding naming the

@@ -723,9 +723,11 @@ carries the normative text, and DEC-1528.1 the reasons.
     a run-owned non-superuser role that owns nothing managed and holds no
     privilege on it beyond schema `USAGE`, so the engine refuses any change
     to managed objects or their rows. pbps runs its `CREATE EXTENSION`
-    statements first, as the setup role. As a backstop, every managed
-    object already staged must be unchanged afterwards, and every object
-    the baseline created must be compared. A mismatch, a missing object, or
+    statements first, as the setup role. As a backstop, afterwards every
+    managed object already staged must be unchanged, every managed table
+    must still be empty, and every object the baseline created must be
+    compared. The emptiness check catches indirect writes, such as through
+    a staged `SECURITY DEFINER` routine. A mismatch, a missing object, or
     a baseline object in the managed set refuses.
   - pbps sends no routine source of its own. A question needing routine
     source the baseline lacks refuses with the finding and two remedies.
@@ -752,7 +754,8 @@ carries the normative text, and DEC-1528.1 the reasons.
   - `vouched_refuses_a_baseline_that_differs_from_the_target`
   - `vouched_refuses_a_baseline_that_creates_a_managed_object`
   - `vouched_baseline_cannot_change_a_managed_object_or_its_rows` (`ALTER`,
-    `DROP`, DML, `TRUNCATE` and a trigger are each refused by the engine)
+    `DROP`, DML, `TRUNCATE` and a trigger are each refused by the engine;
+    a row written through a staged `SECURITY DEFINER` routine refuses)
   - `vouched_refuses_a_baseline_object_left_uncompared`
   - `vouched_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view`
   - `vouched_refuses_an_external_view_staged_as_a_table` (the computed-field
