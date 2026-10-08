@@ -101,20 +101,34 @@ pub struct Account {
     /// The login's own `SUPERUSER`. Membership does not pass it on, and the
     /// run never `SET ROLE`s, so only this one acts as a superuser.
     pub login_superuser: bool,
-    /// Predefined roles it inherits or may `SET ROLE` to whose privileges
+    /// Predefined roles in its [`REACH`] whose privileges
     /// act outside the database: running a server program, writing or
     /// reading server files, signalling other backends, a checkpoint, a
     /// subscription. A compiled definition can use any of them before the
     /// plan is approved (#1678 security review).
     pub predefined: Vec<String>,
     /// Authority over a shared object other than the database it is in,
-    /// held by it or a role it inherits or may `SET ROLE` to: owning
+    /// held by a role in its [`REACH`] or by PUBLIC: owning
     /// another database or a tablespace, `ADMIN OPTION` on a role, a grant
     /// option on a shared object, `ALTER SYSTEM` on a parameter. Each is a
     /// write outside the database a compiled definition can make (#1678
     /// review). Named as what to remove.
     pub shared: Vec<String>,
 }
+
+/// Every role whose privileges the scratch login can use: a role it can
+/// `SET ROLE` to, itself included, and every role one of those inherits
+/// from. `SET` chains start at the session user, so a role reached by `SET`
+/// and then inherited counts though neither `USAGE` nor `SET` from the
+/// login reaches it (measured on 16 and 18: `COPY ... TO PROGRAM` after
+/// `SET ROLE` to a role inheriting `pg_execute_server_program`). PUBLIC, as
+/// OID 0, is in it: a privilege granted to PUBLIC is the login's too
+/// (#1678 review).
+const REACH: &str = "SELECT r.oid FROM pg_catalog.pg_roles r \
+                      WHERE EXISTS (SELECT FROM pg_catalog.pg_roles b \
+                                     WHERE pg_catalog.pg_has_role(session_user, b.oid, 'SET') \
+                                       AND pg_catalog.pg_has_role(b.oid, r.oid, 'USAGE')) \
+                     UNION ALL SELECT 0::pg_catalog.oid";
 
 /// The predefined roles whose privileges stay inside the database the
 /// session is in, or only read statistics and settings. Every other one is
@@ -366,8 +380,7 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
             "SELECT r.rolname::text AS role FROM pg_catalog.pg_roles r \
               WHERE r.oid < {FIRST_NORMAL_OBJECT_ID} AND NOT r.rolsuper \
                 AND r.rolname NOT IN ({contained}) \
-                AND (pg_catalog.pg_has_role(session_user, r.oid, 'USAGE') \
-                     OR pg_catalog.pg_has_role(session_user, r.oid, 'SET')) \
+                AND r.oid IN ({REACH}) \
               ORDER BY 1"
         ))
         .await?
@@ -377,15 +390,12 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
     // A subscription is the exception among shared objects: only a session
     // in its own database can alter or drop it (measured on 16 and 18), and
     // one in this database is the emptiness check's. An owner's, a role
-    // admin's and a grantor's authority pass to every
-    // role that inherits from it, as well as to one that can become it
+    // admin's and a grantor's authority pass to every role in [`REACH`]
     // (measured on 16 and 18: `ALTER DATABASE` through an `INHERIT TRUE,
     // SET FALSE` membership of its owner).
     let shared = conn
-        .query(
-            "WITH reach AS (SELECT r.oid FROM pg_catalog.pg_roles r \
-                             WHERE pg_catalog.pg_has_role(session_user, r.oid, 'USAGE') \
-                                OR pg_catalog.pg_has_role(session_user, r.oid, 'SET')), \
+        .query(&format!(
+            "WITH reach AS ({REACH}), \
                   here AS (SELECT d.oid FROM pg_catalog.pg_database d \
                             WHERE d.datname = pg_catalog.current_database()) \
              SELECT 'ownership of ' || pg_catalog.pg_describe_object(s.classid, s.objid, 0) \
@@ -416,8 +426,8 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
                FROM pg_catalog.pg_parameter_acl p, pg_catalog.aclexplode(p.paracl) x \
               WHERE (x.is_grantable OR x.privilege_type = 'ALTER SYSTEM') \
                 AND x.grantee IN (SELECT oid FROM reach) \
-             ORDER BY 1",
-        )
+             ORDER BY 1"
+        ))
         .await?
         .iter()
         .map(|row| text(row, "authority"))

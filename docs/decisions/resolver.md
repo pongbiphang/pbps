@@ -1768,6 +1768,11 @@ by the engines, and the scratch account decides the layout.** Implemented by
   database. A compiled definition runs before the plan is approved, so
   whatever the account can do, a declaration can make it do (#1678
   security review).
+  - **What it can use.** The privileges of every role it can `SET ROLE`
+    to, itself included, of every role one of those inherits from, and of
+    PUBLIC. `SET` chains start at the session user, so a role reached by
+    `SET` and then inherited counts though neither `USAGE` nor `SET` from
+    the login reaches it (measured on 16 and 18; #1678 review).
   - **Attributes.** Neither the account nor any role it can `SET ROLE` to
     has `SUPERUSER`, `CREATEROLE`, `CREATEDB` or `REPLICATION`. A
     replication slot holds WAL for the whole cluster (measured on 16 and 18
@@ -1775,9 +1780,9 @@ by the engines, and the scratch account decides the layout.** Implemented by
     as holding the attribute. The attributes are never inherited, so a
     membership granted `SET FALSE` does not count: the login can neither
     become that role nor use its attribute (#1678 review).
-  - **Predefined roles.** It neither inherits nor can become a predefined
-    role outside a short list whose privileges stay in the database or only
-    read statistics and settings: `pg_database_owner`, `pg_read_all_data`,
+  - **Predefined roles.** It can use no predefined role outside a short
+    list whose privileges stay in the database or only read statistics and
+    settings: `pg_database_owner`, `pg_read_all_data`,
     `pg_write_all_data`, `pg_maintain`, `pg_monitor`,
     `pg_read_all_settings`, `pg_read_all_stats`, `pg_stat_scan_tables` and
     `pg_use_reserved_connections`. Every other one is refused, a role a
@@ -1785,9 +1790,8 @@ by the engines, and the scratch account decides the layout.** Implemented by
     privileges are inherited, so inheriting one counts: measured on 16 and
     18, an `INHERIT TRUE, SET FALSE` membership of
     `pg_execute_server_program` runs `COPY ... TO PROGRAM`.
-  - **Shared objects.** Neither it nor any role it inherits from or can
-    become holds authority over a shared object other than the database it
-    is in:
+  - **Shared objects.** No role it can use, nor PUBLIC, holds authority
+    over a shared object other than the database it is in:
     - ownership of another database or a tablespace;
     - `ADMIN OPTION` on a role;
     - a grant option on a database or tablespace;

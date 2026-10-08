@@ -348,8 +348,9 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
         let owned = fixture.database("e", Some(&creator)).await;
         // And one with none of the three that still reaches outside its
         // database: a predefined role that runs server programs, inherited
-        // without SET, and the replication attribute through a role it can
-        // become, which creates cluster-wide slots (#1678 security review).
+        // by a role it can become though the login itself neither inherits
+        // nor can become it, and the replication attribute through a role
+        // it can become, which creates cluster-wide slots (#1678 review).
         let (reacher, reacher_password) = fixture.login("x", "NOCREATEDB").await;
         let program = format!("pbps_v1672_p_{}", fixture.token);
         let slots = format!("pbps_v1672_q_{}", fixture.token);
@@ -357,8 +358,9 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
             .admin()
             .await
             .execute(&format!(
-                "CREATE ROLE {program} NOLOGIN; GRANT pg_execute_server_program TO {program}; \
-                 GRANT {program} TO {reacher} WITH INHERIT TRUE, SET FALSE; \
+                "CREATE ROLE {program} NOLOGIN; \
+                 GRANT pg_execute_server_program TO {program} WITH INHERIT TRUE, SET FALSE; \
+                 GRANT {program} TO {reacher} WITH INHERIT FALSE, SET TRUE; \
                  CREATE ROLE {slots} NOLOGIN REPLICATION; \
                  GRANT {slots} TO {reacher} WITH INHERIT FALSE, SET TRUE"
             ))
@@ -369,7 +371,9 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
         let reaching = fixture.database("x", Some(&reacher)).await;
         // And authority over shared objects of the target's cluster: a
         // database owned by a role it inherits from, `ADMIN OPTION` on a
-        // role, a grant option on another database (#1678 review).
+        // role, a grant option on another database, and `ALTER SYSTEM` on a
+        // parameter granted to PUBLIC (#1678 review).
+        let parameter = format!("pbps.v1672_{}", fixture.token);
         let owner = format!("pbps_v1672_w_{}", fixture.token);
         let admin_of = format!("pbps_v1672_v_{}", fixture.token);
         fixture
@@ -380,7 +384,8 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
                  GRANT {owner} TO {reacher} WITH INHERIT TRUE, SET FALSE; \
                  CREATE ROLE {admin_of} NOLOGIN; \
                  GRANT {admin_of} TO {reacher} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE; \
-                 GRANT CONNECT ON DATABASE {other} TO {reacher} WITH GRANT OPTION"
+                 GRANT CONNECT ON DATABASE {other} TO {reacher} WITH GRANT OPTION; \
+                 GRANT ALTER SYSTEM ON PARAMETER {parameter} TO PUBLIC"
             ))
             .await
             .unwrap();
@@ -412,6 +417,14 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
         let after = fixture.inventory().await;
         let left = fixture.foreign_objects(&other).await;
         let reaching_left = fixture.foreign_objects(&reaching).await;
+        fixture
+            .admin()
+            .await
+            .execute(&format!(
+                "REVOKE ALTER SYSTEM ON PARAMETER {parameter} FROM PUBLIC"
+            ))
+            .await
+            .unwrap();
         fixture.drop().await;
         assert!(superuser.contains("NOSUPERUSER"), "{server}: {superuser}");
         assert!(member.contains("NOCREATEDB"), "{server}: {member}");
@@ -420,7 +433,8 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
                 && reach.contains("NOREPLICATION")
                 && reach.contains(&format!("no ownership of database {owned_elsewhere}"))
                 && reach.contains(&format!("no admin option on role {admin_of}"))
-                && reach.contains(&format!("no grant option on database {other}")),
+                && reach.contains(&format!("no grant option on database {other}"))
+                && reach.contains(&format!("no ALTER SYSTEM on parameter {parameter}")),
             "{server}: {reach}"
         );
         assert_eq!(
