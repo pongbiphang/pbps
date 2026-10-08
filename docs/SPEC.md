@@ -1447,8 +1447,11 @@ entry implemented by #1672, Docker by #1674).**
       subscriptions included. This is checked before the run's first write
       there, the baseline's included. In the supplied layout every write,
       the cleanup included, goes through the connection the checks were
-      made on. The database itself is read, not a template, so whatever
-      template it was cloned from is covered.
+      made on. The database itself is read, not a template, so an object a
+      template added is found whichever template it was cloned from. A
+      change a superuser made to an object initdb created, such as a
+      `pg_catalog` function, is not: that is part of what the operator
+      vouches for.
   - The shared compatibility qualification (#610, #611) still runs, as for
     every resolver environment, under rule `pg-reported-scope-v1`. It
     compares the facts both engines report: version number,

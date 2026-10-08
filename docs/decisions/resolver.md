@@ -1791,7 +1791,12 @@ by the engines, and the scratch account decides the layout.** Implemented by
   connection names.
   - "As itself" is enforced: the first statement on every connection the
     run opens as the scratch login is `SET ROLE NONE`, the run-owned
-    layout's provisioning connection included. A role set by the login's defaults or its
+    layout's provisioning connection included.
+  - A connection the run opens as a login it created carries none of the
+    operator string's startup `options`. Those are the operator's session
+    settings for its own login: a `-c role=` there would be refused for
+    the new login, and the new login gets the settings the run gives it
+    (#1678 review). A role set by the login's defaults or its
     connection options would own what the run creates, out of reach of
     `DROP OWNED BY SESSION_USER`. It would also hide the session's own
     backend timings (#1678 review).

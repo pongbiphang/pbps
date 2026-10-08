@@ -685,7 +685,7 @@ async fn vouched_provisions_as_the_superuser_login_whatever_its_default_role() {
         ))
         .await
         .unwrap();
-    scratch.roles.insert(0, worker);
+    scratch.roles.insert(0, worker.clone());
     let before = scratch.inventory().await;
     let inputs = Inputs::overload();
     let key = ProjectKey::new(true);
@@ -697,9 +697,23 @@ async fn vouched_provisions_as_the_superuser_login_whatever_its_default_role() {
     )
     .await;
     let after = scratch.inventory().await;
+    // The same role named by the connection string's startup options: the
+    // run's own login must not inherit them.
+    let optioned = format!(
+        "{} options='-c role={worker}'",
+        scratch.as_login("pbps_test", &login)
+    );
+    let through_options = produce(&optioned, &target.on(&target_db), &inputs, &key).await;
+    let after_options = scratch.inventory().await;
     target.drop().await;
     scratch.drop().await;
     let plan = result.map_err(|error| error.to_string());
+    let through_options = through_options.map_err(|error| error.to_string());
     assert_eq!(before, after, "the run-owned objects are all dropped");
+    assert_eq!(
+        before, after_options,
+        "the run-owned objects are all dropped"
+    );
     assert_answers_the_overload(&plan.unwrap());
+    assert_answers_the_overload(&through_options.unwrap());
 }

@@ -163,7 +163,8 @@ impl Conn {
 
     /// [`connect`] to `database` on the same server, as `login` when given:
     /// the string supplies the endpoint and the TLS it asked for, the caller
-    /// the database and credentials it created. The operator-vouched
+    /// the database and credentials it created, and a new login none of the
+    /// string's startup `options`. The operator-vouched
     /// resolver reaches its run-owned scratch database this way, so a
     /// scratch server behind TLS stays behind it (#1672).
     pub(crate) async fn connect_with(
@@ -174,7 +175,12 @@ impl Conn {
         let (mut config, defaulted) = Self::parse(connection_string)?;
         config.dbname(database);
         if let Some((user, password)) = login {
-            config.user(user).password(password);
+            // The string's startup `options` are the operator's session
+            // settings for its own login (`-c role=...`, a path, a timeout).
+            // Carried over, they would refuse or reshape a login the caller
+            // created, which gets the settings the caller gives it instead
+            // (#1678 review). An empty value sends no setting.
+            config.user(user).password(password).options("");
         }
         Self::connect_config(config, cfg!(target_os = "linux"), defaulted).await
     }
