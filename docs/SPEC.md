@@ -1424,9 +1424,11 @@ entry implemented by #1672, Docker by #1674).**
       - The credential variable differs from the target's, and there is no
         fallback to target credentials.
     - **On the target's cluster, the scratch account is confined.** Neither
-      it nor any role it can `SET ROLE` to has `SUPERUSER`, `CREATEROLE` or
-      `CREATEDB`. An unconfined account there refuses, naming the attributes
-      to remove.
+      it nor any role it can `SET ROLE` to has `SUPERUSER`, `CREATEROLE`,
+      `CREATEDB` or `REPLICATION`. It neither inherits nor can become a
+      predefined role whose privileges act outside the database, such as
+      `pg_execute_server_program`. An unconfined account there refuses,
+      naming the attributes and memberships to remove.
     - **The account decides the layout.**
       - **Run-owned.** A login that is itself a superuser, on another
         cluster, gets:

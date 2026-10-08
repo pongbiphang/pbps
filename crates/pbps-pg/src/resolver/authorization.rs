@@ -1180,12 +1180,17 @@ pub async fn verify(
     Ok(differences)
 }
 
-/// A SQL string literal with single quotes doubled: the schema, object and
-/// privilege names reach `has_*_privilege` as text arguments, and the scratch
-/// stream has no parameter binding, so quoting is what keeps a name from
-/// ending the literal.
+/// A SQL string literal no session setting can reinterpret: the schema,
+/// object and privilege names reach `has_*_privilege` as text arguments, and
+/// the scratch stream has no parameter binding, so quoting is what keeps a
+/// name from ending the literal. An `E'…'` with every backslash and quote
+/// doubled, as `emit::value_literal` renders a value: the supplied layout
+/// replays the deployer's stored settings before any framing pins
+/// `standard_conforming_strings`, and the login's own defaults may turn it
+/// off, under which a plain literal's backslash escapes the quote that was
+/// meant to close it (#1678 review).
 fn literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 fn boolean(rows: &[Row], field: &str) -> Result<bool, DbError> {
@@ -1240,21 +1245,28 @@ mod tests {
         // and the literal-per-element form that stores the same text again.
         assert_eq!(
             setting_value("search_path", r#""$user", public, "odd name""#).unwrap(),
-            "'$user', 'public', 'odd name'"
+            "E'$user', E'public', E'odd name'"
         );
         assert_eq!(
             setting_value("session_preload_libraries", r#""foo,bar", auto_explain"#).unwrap(),
-            "'foo,bar', 'auto_explain'"
+            "E'foo,bar', E'auto_explain'"
         );
         // A scalar, and a list the engine does not quote, keep the whole
         // text as one literal; a quote in it cannot end the literal.
         assert_eq!(
             setting_value("DateStyle", "ISO, MDY").unwrap(),
-            "'ISO, MDY'"
+            "E'ISO, MDY'"
         );
         assert_eq!(
             setting_value("default_text_search_config", "it's").unwrap(),
-            "'it''s'"
+            "E'it''s'"
+        );
+        // Nor can a backslash, whatever `standard_conforming_strings` is
+        // (#1678 review); measured on 16 and 18, the E-form stores the same
+        // text.
+        assert_eq!(
+            setting_value("default_text_search_config", r"x\'y").unwrap(),
+            r"E'x\\''y'"
         );
         // A stored list the engine could not read is refused, not replayed.
         assert!(setting_value("search_path", r#""open"#).is_err());
@@ -1265,6 +1277,62 @@ mod tests {
             privilege: privilege.into(),
             grantable,
             grantor: grantor.into(),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn a_replayed_setting_is_one_literal_whatever_the_string_mode() {
+        // The supplied layout replays stored settings before any framing
+        // pins `standard_conforming_strings`, and the login's own default
+        // may turn it off. A configuration name with a backslash before a
+        // quote then ended a plain literal, and the rest ran as SQL (#1678
+        // review).
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &base)
+                .await
+                .unwrap();
+            let schema = format!(
+                "pbps_lit1678_{}",
+                crate::catalog::probe_token().replace('-', "_")
+            );
+            let value = format!(r#"{schema}."x\', false) FROM pbps_no_such_relation --""#);
+            conn.query(&format!("CREATE SCHEMA {schema}"))
+                .await
+                .unwrap();
+            conn.query(&format!(
+                "CREATE TEXT SEARCH CONFIGURATION {value} (COPY = pg_catalog.simple)"
+            ))
+            .await
+            .unwrap();
+            conn.query("SET standard_conforming_strings = off")
+                .await
+                .unwrap();
+            let mut replayed = context();
+            replayed.settings = [(
+                "database:default_text_search_config".to_owned(),
+                value.clone(),
+            )]
+            .into_iter()
+            .collect();
+            let result = apply_session_settings(&mut conn, &replayed).await;
+            let effective = conn
+                .query("SELECT pg_catalog.current_setting('default_text_search_config') AS v")
+                .await
+                .unwrap();
+            for reset in ["standard_conforming_strings", "default_text_search_config"] {
+                conn.query(&format!("RESET {reset}")).await.unwrap();
+            }
+            conn.query(&format!("DROP SCHEMA {schema} CASCADE"))
+                .await
+                .unwrap();
+            assert!(result.is_ok(), "{variable}: {result:?}");
+            assert_eq!(
+                effective[0].try_get::<&str>("v").unwrap(),
+                Some(value.as_str()),
+                "{variable}"
+            );
         }
     }
 

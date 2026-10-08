@@ -349,6 +349,27 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
             .unwrap();
         fixture.roles.insert(0, granted);
         let owned = fixture.database("e", Some(&creator)).await;
+        // And one with none of the three that still reaches outside its
+        // database: a predefined role that runs server programs, inherited
+        // without SET, and the replication attribute through a role it can
+        // become, which creates cluster-wide slots (#1678 security review).
+        let (reacher, reacher_password) = fixture.login("x", "NOCREATEDB").await;
+        let program = format!("pbps_v1672_p_{}", fixture.token);
+        let slots = format!("pbps_v1672_q_{}", fixture.token);
+        fixture
+            .admin()
+            .await
+            .execute(&format!(
+                "CREATE ROLE {program} NOLOGIN; GRANT pg_execute_server_program TO {program}; \
+                 GRANT {program} TO {reacher} WITH INHERIT TRUE, SET FALSE; \
+                 CREATE ROLE {slots} NOLOGIN REPLICATION; \
+                 GRANT {slots} TO {reacher} WITH INHERIT FALSE, SET TRUE"
+            ))
+            .await
+            .unwrap();
+        fixture.roles.insert(0, program);
+        fixture.roles.insert(0, slots);
+        let reaching = fixture.database("x", Some(&reacher)).await;
         let before = fixture.inventory().await;
         let superuser = vouched_refusal(
             produce(&fixture.on(&other), &fixture.on(&target_db), &inputs, &key).await,
@@ -362,11 +383,30 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
             )
             .await,
         );
+        let reach = vouched_refusal(
+            produce(
+                &fixture.as_login(&reaching, &(reacher.clone(), reacher_password.clone())),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+            )
+            .await,
+        );
         let after = fixture.inventory().await;
         let left = fixture.foreign_objects(&other).await;
+        let reaching_left = fixture.foreign_objects(&reaching).await;
         fixture.drop().await;
         assert!(superuser.contains("NOSUPERUSER"), "{server}: {superuser}");
         assert!(member.contains("NOCREATEDB"), "{server}: {member}");
+        assert!(
+            reach.contains("no membership in pg_execute_server_program")
+                && reach.contains("NOREPLICATION"),
+            "{server}: {reach}"
+        );
+        assert_eq!(
+            reaching_left.1, 0,
+            "{server}: nothing was written: {reaching_left:?}"
+        );
         assert_eq!(before, after, "{server}: no database or role was created");
         assert_eq!(left.1, 0, "{server}: nothing was written: {left:?}");
     }
@@ -662,8 +702,8 @@ async fn vouched_cleanup_runs_only_on_the_backend_the_run_checked() {
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_compiles_as_the_login_whatever_its_session_defaults() {
-    // The login's own defaults: a time zone and date style the compile
-    // pins away, and a default role it is a member of. The run still binds
+    // The login's own defaults: a time zone, a date style and a string
+    // mode the compile pins away, and a default role it is a member of. The run still binds
     // its backend, compiles as the login and empties the database.
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
@@ -689,7 +729,8 @@ async fn vouched_compiles_as_the_login_whatever_its_session_defaults() {
                  GRANT CREATE ON DATABASE {scratch_db} TO {worker}; \
                  ALTER ROLE {login} IN DATABASE {scratch_db} SET role = {worker}; \
                  ALTER ROLE {login} SET TimeZone = 'Asia/Taipei'; \
-                 ALTER ROLE {login} SET DateStyle = 'SQL, DMY'",
+                 ALTER ROLE {login} SET DateStyle = 'SQL, DMY'; \
+                 ALTER ROLE {login} SET standard_conforming_strings = off",
                 login = login.0
             ))
             .await

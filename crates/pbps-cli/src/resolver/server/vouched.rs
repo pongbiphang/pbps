@@ -89,9 +89,9 @@ pub async fn produce(
         }
         Placement::SameCluster if !account.confined() => {
             return Err(vouched(format!(
-                "the scratch account shares the target's cluster and is not confined to its database; \
-                 run ALTER ROLE ... {} for it, or use a scratch server on another cluster",
-                account.excess().join(" ")
+                "the scratch account shares the target's cluster and is not confined to its database \
+                 ({}); remove them from it, or use a scratch server on another cluster",
+                account.excess().join(", ")
             )));
         }
         Placement::SeparateCluster if account.provisions() => Provisioning::RunOwned,

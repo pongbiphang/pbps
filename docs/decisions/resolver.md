@@ -1764,16 +1764,32 @@ by the engines, and the scratch account decides the layout.** Implemented by
     and 18. It is still not the separation check, for the reason above.
 
 **On the target's cluster, the scratch account must be confined** (#1667).
-- Confined means neither the account nor any role it can `SET ROLE` to
-  has `SUPERUSER`, `CREATEROLE` or `CREATEDB`. A role it can become is as
-  good as holding the attribute. The attributes are never inherited, so a
-  membership granted `SET FALSE` does not count: the login can neither
-  become that role nor use its attribute (#1678 review).
+- Confined means nothing the account can do reaches outside its
+  database. A compiled definition runs before the plan is approved, so
+  whatever the account can do, a declaration can make it do (#1678
+  security review).
+  - **Attributes.** Neither the account nor any role it can `SET ROLE` to
+    has `SUPERUSER`, `CREATEROLE`, `CREATEDB` or `REPLICATION`. A
+    replication slot holds WAL for the whole cluster (measured on 16 and 18
+    for a non-superuser after `SET ROLE`). A role it can become is as good
+    as holding the attribute. The attributes are never inherited, so a
+    membership granted `SET FALSE` does not count: the login can neither
+    become that role nor use its attribute (#1678 review).
+  - **Predefined roles.** It neither inherits nor can become a predefined
+    role outside a short list whose privileges stay in the database or only
+    read statistics and settings: `pg_database_owner`, `pg_read_all_data`,
+    `pg_write_all_data`, `pg_maintain`, `pg_monitor`,
+    `pg_read_all_settings`, `pg_read_all_stats`, `pg_stat_scan_tables` and
+    `pg_use_reserved_connections`. Every other one is refused, a role a
+    later version adds included, until it is known. A predefined role's
+    privileges are inherited, so inheriting one counts: measured on 16 and
+    18, an `INHERIT TRUE, SET FALSE` membership of
+    `pg_execute_server_program` runs `COPY ... TO PROGRAM`.
 - Reproducing the deployer's authorization creates roles server-wide, some
   possibly `SUPERUSER`. On a shared cluster that is a write to the target's
   cluster, and only an account that cannot make it is safe there.
 - An unconfined account on the target's cluster refuses before any write,
-  naming the attributes to remove.
+  naming the attributes and memberships to remove.
 
 **The account decides the layout.**
 - **Run-owned.** A login that is itself a superuser, on another cluster,
@@ -1822,6 +1838,11 @@ by the engines, and the scratch account decides the layout.** Implemented by
     same override. The driver always sends `client_encoding=UTF8`, so a
     stored `LATIN1` never takes effect on the target either (measured on 16
     and 18; #1678 review).
+  - Each replayed value is an `E'…'` literal with its backslashes and
+    quotes doubled. The replay runs before any framing pins
+    `standard_conforming_strings`, and the login's own default may turn it
+    off. Under that, a plain literal's backslash escapes its closing quote,
+    and the rest of a stored value would run as SQL (#1678 review).
   - No role is reproduced. A deployer that differs in schema visibility
     refuses through the compatibility comparison.
   - `DROP OWNED BY SESSION_USER` empties the database afterwards, whether

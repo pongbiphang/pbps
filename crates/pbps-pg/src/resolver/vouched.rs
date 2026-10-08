@@ -83,50 +83,85 @@ pub enum Placement {
 }
 
 /// What the scratch account may do beyond its own database, through itself
-/// or any role it may `SET ROLE` to. `SUPERUSER`, `CREATEROLE` and
-/// `CREATEDB` are never inherited: a role's attribute is the login's to use
-/// only if the login can become that role. A membership granted `SET FALSE`
-/// is still `MEMBER` but cannot be become, so it does not count (measured
-/// on 16 and 18: `SET ROLE` and `CREATE DATABASE` are both refused; #1678
-/// review).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// or any role it may `SET ROLE` to. `SUPERUSER`, `CREATEROLE`, `CREATEDB`
+/// and `REPLICATION` are never inherited: a role's attribute is the login's
+/// to use only if the login can become that role. A membership granted
+/// `SET FALSE` is still `MEMBER` but cannot be become, so it does not count
+/// (measured on 16 and 18: `SET ROLE` and `CREATE DATABASE` are both
+/// refused; #1678 review).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     /// Held by the login or by any role it may `SET ROLE` to.
     pub superuser: bool,
     pub create_role: bool,
     pub create_db: bool,
+    /// Creates replication slots, which hold WAL for the whole cluster
+    /// (measured on 16 and 18 for a non-superuser after `SET ROLE`).
+    pub replication: bool,
     /// The login's own `SUPERUSER`. Membership does not pass it on, and the
     /// run never `SET ROLE`s, so only this one acts as a superuser.
     pub login_superuser: bool,
+    /// Predefined roles it inherits or may `SET ROLE` to whose privileges
+    /// act outside the database: running a server program, writing or
+    /// reading server files, signalling other backends, a checkpoint, a
+    /// subscription. A compiled definition can use any of them before the
+    /// plan is approved (#1678 security review).
+    pub predefined: Vec<String>,
 }
 
+/// The predefined roles whose privileges stay inside the database the
+/// session is in, or only read statistics and settings. Every other one is
+/// refused, so a role a later version adds is refused until it is known.
+/// `pg_database_owner` is the owner of the current database, which the
+/// supplied login is.
+pub const CONTAINED_PREDEFINED: &[&str] = &[
+    "pg_database_owner",
+    "pg_read_all_data",
+    "pg_write_all_data",
+    "pg_maintain",
+    "pg_monitor",
+    "pg_read_all_settings",
+    "pg_read_all_stats",
+    "pg_stat_scan_tables",
+    "pg_use_reserved_connections",
+];
+
 impl Account {
-    /// Confined to the databases it is given: it can create no role and no
-    /// database, and is no superuser (the decision on #1667).
+    /// Confined to the databases it is given: it can create no role, no
+    /// database and no replication slot, is no superuser (the decision on
+    /// #1667), and holds no predefined role that acts outside the database.
     pub fn confined(&self) -> bool {
-        !(self.superuser || self.create_role || self.create_db)
+        self.excess().is_empty()
     }
 
     /// May create the run's own login, roles and database, and act as each
     /// of them. Only a login that is itself a superuser; a member of a
-    /// superuser role runs without it (#1678 review). Not a `CREATEROLE` one: a `CREATEROLE` login is granted `ADMIN` on
-    /// the roles it creates but not `SET` (the default
-    /// `createrole_self_grant`), so it cannot hand them the database or
-    /// replay grants as them, and it cannot reproduce a superuser deployer.
+    /// superuser role runs without it (#1678 review). Not a `CREATEROLE`
+    /// one: a `CREATEROLE` login is granted `ADMIN` on the roles it creates
+    /// but not `SET` (the default `createrole_self_grant`), so it cannot
+    /// hand them the database or replay grants as them, and it cannot
+    /// reproduce a superuser deployer.
     pub fn provisions(&self) -> bool {
         self.login_superuser
     }
 
-    /// The attributes that make it unconfined, as `ALTER ROLE` spells their
-    /// removal.
-    pub fn excess(&self) -> Vec<&'static str> {
+    /// What makes it unconfined: each attribute as `ALTER ROLE` spells its
+    /// removal, then each predefined role it reaches.
+    pub fn excess(&self) -> Vec<String> {
         [
             (self.superuser, "NOSUPERUSER"),
             (self.create_role, "NOCREATEROLE"),
             (self.create_db, "NOCREATEDB"),
+            (self.replication, "NOREPLICATION"),
         ]
         .into_iter()
-        .filter_map(|(held, removal)| held.then_some(removal))
+        .filter(|(held, _)| *held)
+        .map(|(_, removal)| removal.to_owned())
+        .chain(
+            self.predefined
+                .iter()
+                .map(|role| format!("no membership in {role}")),
+        )
         .collect()
     }
 }
@@ -288,21 +323,45 @@ pub fn placement(
     })
 }
 
-/// The scratch login's cluster-wide attributes, through every role it is a
-/// member of: a membership it can `SET ROLE` to, or inherit from, is as good
-/// as holding the attribute.
+/// The scratch login's cluster-wide attributes, through every role it may
+/// `SET ROLE` to, and the predefined roles outside
+/// [`CONTAINED_PREDEFINED`] it inherits or may `SET ROLE` to: a predefined
+/// role's privileges are inherited, so `USAGE` reaches them too (measured
+/// on 16 and 18: `COPY ... TO PROGRAM` through an `INHERIT TRUE, SET FALSE`
+/// membership of `pg_execute_server_program`).
 pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError> {
     let rows = conn
         .query(
             "SELECT coalesce(bool_or(r.rolsuper), false)::text AS superuser, \
                     coalesce(bool_or(r.rolcreaterole), false)::text AS create_role, \
                     coalesce(bool_or(r.rolcreatedb), false)::text AS create_db, \
+                    coalesce(bool_or(r.rolreplication), false)::text AS replication, \
                     coalesce(bool_or(r.rolsuper) FILTER (WHERE r.rolname = session_user), \
                              false)::text AS login_superuser \
                FROM pg_catalog.pg_roles r \
               WHERE pg_catalog.pg_has_role(session_user, r.oid, 'SET')",
         )
         .await?;
+    let contained = CONTAINED_PREDEFINED
+        .iter()
+        .map(|role| format!("'{role}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Predefined roles are those initdb made, below FirstNormalObjectId;
+    // the bootstrap superuser among them is already counted above.
+    let predefined = conn
+        .query(&format!(
+            "SELECT r.rolname::text AS role FROM pg_catalog.pg_roles r \
+              WHERE r.oid < {FIRST_NORMAL_OBJECT_ID} AND NOT r.rolsuper \
+                AND r.rolname NOT IN ({contained}) \
+                AND (pg_catalog.pg_has_role(session_user, r.oid, 'USAGE') \
+                     OR pg_catalog.pg_has_role(session_user, r.oid, 'SET')) \
+              ORDER BY 1"
+        ))
+        .await?
+        .iter()
+        .map(|row| text(row, "role"))
+        .collect::<Result<Vec<_>, _>>()?;
     let row = one(rows, "the scratch account's attributes")?;
     let flag = |field: &str| -> Result<bool, DbError> {
         match text(&row, field)?.as_str() {
@@ -317,7 +376,9 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
         superuser: flag("superuser")?,
         create_role: flag("create_role")?,
         create_db: flag("create_db")?,
+        replication: flag("replication")?,
         login_superuser: flag("login_superuser")?,
+        predefined,
     })
 }
 
@@ -537,34 +598,53 @@ mod tests {
     }
 
     #[test]
-    fn an_account_is_confined_only_without_all_three_attributes() {
+    fn an_account_is_confined_only_without_any_reach_outside_its_database() {
         let none = Account {
             superuser: false,
             create_role: false,
             create_db: false,
+            replication: false,
             login_superuser: false,
+            predefined: Vec::new(),
         };
         assert!(none.confined() && !none.provisions());
         assert!(none.excess().is_empty());
         let db_only = Account {
             create_db: true,
-            ..none
+            ..none.clone()
         };
         assert!(!db_only.confined() && !db_only.provisions());
         assert_eq!(db_only.excess(), ["NOCREATEDB"]);
+        // Negative: a replication slot holds WAL for the whole cluster.
+        let replication = Account {
+            replication: true,
+            ..none.clone()
+        };
+        assert_eq!(replication.excess(), ["NOREPLICATION"]);
+        // Negative: a predefined role acting outside the database, with no
+        // attribute at all.
+        let program = Account {
+            predefined: vec!["pg_execute_server_program".into()],
+            ..none.clone()
+        };
+        assert!(!program.confined() && !program.provisions());
+        assert_eq!(
+            program.excess(),
+            ["no membership in pg_execute_server_program"]
+        );
         // Negative: both attributes without superuser cannot act as the
         // roles it would create, so it does not provision.
         let both = Account {
             create_role: true,
             create_db: true,
-            ..none
+            ..none.clone()
         };
         assert!(!both.provisions() && !both.confined());
         // Negative: a member of a superuser role is not confined, but it does
         // not act as a superuser, so it does not provision either.
         let member = Account {
             superuser: true,
-            ..none
+            ..none.clone()
         };
         assert!(!member.provisions() && !member.confined());
         let superuser = Account {
