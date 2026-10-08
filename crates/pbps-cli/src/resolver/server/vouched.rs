@@ -69,6 +69,14 @@ pub async fn produce(
     let mut admin = Conn::connect(driver, scratch)
         .await
         .map_err(|error| ProduceError::Acquire(format!("the scratch server: {error}")))?;
+    // The scratch account compiles as itself. A role its defaults or its
+    // connection options set would own what the run creates, out of reach
+    // of the cleanup's `DROP OWNED BY SESSION_USER`, and would hide the
+    // session's own backend timings (#1678 review).
+    admin
+        .execute("SET ROLE NONE")
+        .await
+        .map_err(|error| vouched(format!("the scratch session's role: {error}")))?;
     let tokens = Tokens::generate();
     let (placement, account, backend) = separation(&mut target, &mut admin, &tokens)
         .await

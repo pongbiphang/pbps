@@ -619,3 +619,48 @@ async fn vouched_cleanup_runs_only_on_the_backend_the_run_checked() {
         assert_eq!(after_same.1, 0, "{server}: {after_same:?}");
     }
 }
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_compiles_as_the_login_whatever_its_session_defaults() {
+    // The login's own defaults: a time zone and date style the compile
+    // pins away, and a default role it is a member of. The run still binds
+    // its backend, compiles as the login and empties the database.
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        let worker = format!("pbps_v1672_r_{}", fixture.token);
+        fixture
+            .admin()
+            .await
+            .execute(&format!(
+                "CREATE ROLE {worker} NOLOGIN; GRANT {worker} TO {login}; \
+                 GRANT CREATE ON DATABASE {scratch_db} TO {worker}; \
+                 ALTER ROLE {login} IN DATABASE {scratch_db} SET role = {worker}; \
+                 ALTER ROLE {login} SET TimeZone = 'Asia/Taipei'; \
+                 ALTER ROLE {login} SET DateStyle = 'SQL, DMY'",
+                login = login.0
+            ))
+            .await
+            .unwrap();
+        fixture.roles.insert(0, worker);
+        let inputs = Inputs::overload();
+        let key = ProjectKey::new(true);
+        let result = produce(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+        )
+        .await;
+        let left = fixture.foreign_objects(&scratch_db).await;
+        fixture.drop().await;
+        let plan = result.map_err(|error| format!("{server}: {error}"));
+        assert_eq!(
+            left.1, 0,
+            "{server}: the run empties its database: {left:?}"
+        );
+        assert_answers_the_overload(&plan.unwrap());
+    }
+}

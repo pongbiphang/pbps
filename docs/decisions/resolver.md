@@ -1750,6 +1750,9 @@ by the engines, and the scratch account decides the layout.** Implemented by
     session-pooled connection. The cleanup's `DROP OWNED` runs in one
     transaction with that check, so it is never sent to another backend
     (#1678 review).
+  - The identity's times are compared as epochs. Their text follows
+    `TimeZone` and `DateStyle`, which the compile pins, so text would make
+    one backend read as two.
 - **Rejected: a `pg_database` row with the target database's name and
   OID.** Two clusters started from one image with one `POSTGRES_DB` hold
   identical rows, which is an ordinary CI layout. That check would call them
@@ -1786,6 +1789,11 @@ by the engines, and the scratch account decides the layout.** Implemented by
     account unconfined on the target's cluster.
 - **Supplied.** Any other account compiles as itself in the database its
   connection names.
+  - "As itself" is enforced: the run's first statement on the scratch
+    session is `SET ROLE NONE`. A role set by the login's defaults or its
+    connection options would own what the run creates, out of reach of
+    `DROP OWNED BY SESSION_USER`. It would also hide the session's own
+    backend timings (#1678 review).
   - It must own that database.
   - The database must hold nothing initdb did not create: no object at or
     above `FirstNormalObjectId`, a subscription created in it included

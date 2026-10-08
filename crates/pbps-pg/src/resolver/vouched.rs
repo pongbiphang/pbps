@@ -176,9 +176,13 @@ pub async fn mark(conn: &mut impl QueryConnection, token: &str) -> Result<Sessio
 }
 
 /// The server backend a session runs on: its process, when it started, and
-/// when its postmaster started. A session always reads its own row of
-/// `pg_stat_activity`, timings included (measured on 16 and 18). Another
-/// backend, on this cluster or another, does not share all three.
+/// when its postmaster started. A session acting as its own login reads its
+/// own row of `pg_stat_activity`, timings included (measured on 16 and 18);
+/// under another role the timings are hidden, so the run drops any role
+/// first. Another backend, on this cluster or another, does not share all
+/// three. The times are read as epochs: their text follows `TimeZone` and
+/// `DateStyle`, which the compile pins and would make one backend read as
+/// two (#1678 review).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Backend {
     pid: String,
@@ -190,9 +194,11 @@ pub async fn backend(conn: &mut impl QueryConnection) -> Result<Backend, DbError
     let rows = conn
         .query(
             "SELECT pg_catalog.pg_backend_pid()::text AS pid, \
-                    (SELECT a.backend_start FROM pg_catalog.pg_stat_activity a \
+                    (SELECT pg_catalog.extract('epoch', a.backend_start) \
+                       FROM pg_catalog.pg_stat_activity a \
                       WHERE a.pid = pg_catalog.pg_backend_pid())::text AS started, \
-                    pg_catalog.pg_postmaster_start_time()::text AS postmaster",
+                    pg_catalog.extract('epoch', pg_catalog.pg_postmaster_start_time()) \
+                      ::text AS postmaster",
         )
         .await?;
     let row = one(rows, "this session's backend")?;
@@ -423,7 +429,9 @@ pub async fn create_schemas(
 ///
 /// The connection is the one the run compiled on, so it may be inside a
 /// failed transaction or under a role a declaration set; both are ended
-/// first. Neither statement fails when there is nothing to end. The drop
+/// first: `SET ROLE NONE`, not `RESET ROLE`, which returns to a role the
+/// login's defaults set. Neither statement fails when there is nothing to
+/// end. The drop
 /// runs in one transaction with a check that it is on the backend the run
 /// checked, and is never sent anywhere else.
 pub async fn drop_owned(
@@ -431,7 +439,7 @@ pub async fn drop_owned(
     checked: &Backend,
 ) -> Result<(), DbError> {
     conn.execute("ROLLBACK").await?;
-    conn.execute("RESET ROLE").await?;
+    conn.execute("SET ROLE NONE").await?;
     conn.execute("BEGIN").await?;
     let bound = on_backend(conn, checked).await;
     if !matches!(bound, Ok(true)) {
