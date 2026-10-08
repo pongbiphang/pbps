@@ -741,9 +741,11 @@ carries the normative text, and DEC-1528.1 the reasons.
 - **Reading this record.** Its "resolver" means the measured profiles wherever
   it describes containment, process or socket observation, executable
   identity or verified channels.
-  - Acceptance tests 10, 11, 12, 13, 19, 20 and 23 are measured profiles
-    only: they test retained external source, instance separation,
-    containment, verified channels and executable identity.
+  - Acceptance tests 10, 11, 12, 13, 19, 20, 21 and 23 are measured
+    profiles only: they test retained external source, instance separation,
+    containment, verified channels, scratch exclusion against a concurrent
+    session, and executable identity. All of these are scratch-side
+    guarantees the operator vouches for instead.
   - Test 14 holds for the operator-vouched resolver for its compatibility
     inputs only.
   - Test 11's same-cluster refusal is replaced, for the operator-vouched
@@ -952,7 +954,7 @@ protection under test is removed.
     including reconnects and peer substitution. Valid authenticated exchanges
     still resolve without imposing private-source logging prerequisites on this
     case; removing channel authentication must fail the negative control.
-21. **`resolver_in_place_mutations_cannot_seal_mixed_evidence` (planned):** keep
+21. **`resolver_in_place_mutations_cannot_seal_mixed_evidence` (planned; measured profiles only):** keep
     the resolver connection alive while a second session attempts relevant
     extension/settings, authorization or reconstructed candidate changes between
     compilation steps. Include a change restored before the final fingerprint
