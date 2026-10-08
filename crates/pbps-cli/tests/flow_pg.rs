@@ -11441,6 +11441,111 @@ fn a_dropped_view_is_not_reported_as_carried_by_a_column_rename() {
     }
 }
 
+/// #1647: the same as #823's view, for a routine. A plan that drops a
+/// `BEGIN ATOMIC` function and renames the column its body reads does not
+/// report the function as carried; a function of the same name and signature
+/// in another schema, which the plan keeps, is still listed — once, as
+/// carried.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_dropped_function_is_not_reported_as_carried_by_a_column_rename() {
+    let own = OwnDatabase::new(&server(), "dropped_carried_function");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("dropped-carried-function");
+    d.table(TWO_COLUMNS);
+    let function = d.dir.join("schema/reads.yml");
+    std::fs::write(
+        &function,
+        "function: app.reads(integer)\ndefinition: (n integer) RETURNS text LANGUAGE sql \
+         BEGIN ATOMIC SELECT label FROM app.t WHERE id = n; END\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    on_server(
+        connection,
+        "CREATE SCHEMA outside; \
+         CREATE FUNCTION outside.reads(n integer) RETURNS text LANGUAGE sql \
+         BEGIN ATOMIC SELECT label FROM app.t WHERE id = n; END; \
+         INSERT INTO app.t VALUES (1, 'kept');",
+    );
+
+    std::fs::remove_file(&function).unwrap();
+    d.table(&TWO_COLUMNS.replace(
+        "  label: {type: varchar(50)}",
+        "  note: {type: varchar(50), renamed_from: label}",
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    let kinds: Vec<&pbps_model::Change> = saved.changes.changes.iter().map(|p| &p.change).collect();
+    assert!(
+        kinds.iter().any(|c| matches!(
+            c,
+            pbps_model::Change::DropModule {
+                kind: pbps_model::ModuleKind::Function,
+                id: pbps_model::ModuleId::Routine(r),
+            } if r.to_string() == "app.reads(integer)"
+        )),
+        "{kinds:#?}"
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|c| matches!(c, pbps_model::Change::RenameColumn { .. })),
+        "{kinds:#?}"
+    );
+
+    let applied = succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "destructive,rename"],
+    ));
+    let out = stdout(&applied);
+    let heading = out
+        .lines()
+        .position(|l| l.ends_with("affects:"))
+        .unwrap_or_else(|| panic!("the surviving function is reported: {out}"));
+    let body: Vec<&str> = out
+        .lines()
+        .skip(heading + 1)
+        .take_while(|l| l.starts_with("  "))
+        .collect();
+    assert!(
+        !body.iter().any(|l| l.contains("app.reads")),
+        "the dropped function is not carried: {out}"
+    );
+    assert_eq!(
+        body.iter()
+            .filter(|l| l.contains("outside.reads(integer)")
+                && l.contains("carried into the new name, keeps working"))
+            .count(),
+        1,
+        "{out}"
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_catalog.pg_proc p \
+             JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'app' AND p.proname = 'reads'"
+        ),
+        0
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.t WHERE note = outside.reads(1)"
+        ),
+        1
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+    assert!(stdout(&succeeds(d.run(&["plan", "--db", connection]))).contains("No changes"));
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn postgres_rename_impact_reaches_the_cli_as_advisory_and_requires_explicit_approval() {

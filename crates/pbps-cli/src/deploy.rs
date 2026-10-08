@@ -11459,6 +11459,56 @@ mod tests {
         assert_eq!(report.carried, before);
     }
 
+    fn carried_module(kind: pbps_model::ModuleKind, id: &str) -> pbps_db::impact::Referrer {
+        pbps_db::impact::Referrer {
+            removed_with: Some((kind, id.parse().unwrap())),
+            ..referrer(kind.as_str(), id, None)
+        }
+    }
+
+    /// #1647: a routine, a trigger and a user rule on a view are excused by
+    /// the plan's exact drop, as a view is — a routine by its full signature,
+    /// a trigger by its table, a rule by the view it is on. Another overload,
+    /// the same trigger name on another table, the same routine as a
+    /// procedure, and a routine of the same name in another schema all stay.
+    #[test]
+    fn a_carried_routine_or_trigger_is_excused_only_by_its_full_identity() {
+        use pbps_model::ModuleKind::{Function, Procedure, Trigger, View};
+        let changes = pbps_model::ChangeSet {
+            changes: vec![
+                dropping(Function, "app.f(integer, text)"),
+                dropping(Trigger, "app.t.t_of"),
+                dropping(View, "app.v"),
+            ],
+        };
+        let names = dropped_referrer_names(&changes);
+        let modules = dropped_modules(&changes);
+        let survivors = vec![
+            carried_module(Function, "app.f(integer)"),
+            carried_module(Function, "other.f(integer, text)"),
+            carried_module(Procedure, "app.f(integer, text)"),
+            carried_module(Trigger, "app.u.t_of"),
+        ];
+        let mut report = pbps_db::impact::ImpactReport {
+            target: "column app.t.label".to_owned(),
+            carried: [
+                vec![
+                    carried_module(Function, "app.f(integer, text)"),
+                    carried_module(Trigger, "app.t.t_of"),
+                    pbps_db::impact::Referrer {
+                        kind: "rule".to_owned(),
+                        ..carried_module(View, "app.v")
+                    },
+                ],
+                survivors.clone(),
+            ]
+            .concat(),
+            ..Default::default()
+        };
+        excuse_dropped_referrers(&mut report, &names, &modules);
+        assert_eq!(report.carried, survivors);
+    }
+
     /// #307: a PostgreSQL report holding only carried objects printed an
     /// "affects:" heading with nothing under it. Each carried object is now a
     /// line of its own, with the engine's note about what carrying means.
