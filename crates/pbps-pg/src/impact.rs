@@ -243,34 +243,65 @@ SELECT n.nspname AS schema_name,
 /// `_RETURN` rule is the view — and listing them would report the object as its
 /// own dependant.
 ///
-/// A view's edge comes from its `_RETURN` rule, so it is resolved to the view
-/// itself — described as the view, and named by its raw catalog schema and
-/// name so a plan that drops it can excuse it by its typed id (#823). Every
-/// guard is needed: `_RETURN` alone also names a materialized view's rule, and
-/// a user rule on a view is not the view. Anything else keeps the engine's
-/// description and no name, and stays reported. A left join, so resolving one
-/// kind of row never discards another.
+/// Each module a plan can drop is resolved to its typed id, from raw catalog
+/// components, so a plan that drops it first can excuse it exactly (#823,
+/// #1647). Every guard is needed:
+///
+/// - a view's edge comes from its `_RETURN` rule, resolved to the view and
+///   described as it — but `_RETURN` alone also names a materialized view's
+///   rule, which no view drop removes;
+/// - a user rule on a view keeps its own description, and is keyed by the
+///   view: dropping the view removes the rule (`modules` records it, measured)
+///   — a rule on a table is not keyed;
+/// - a function or procedure is keyed by its full signature, its input
+///   argument types read in this same statement so a routine replaced between
+///   two reads cannot come back with a list that is not its own — never
+///   defaulted to none; an aggregate or window function is not a module;
+/// - a user trigger is keyed by its table and name; an internal one is the
+///   engine's and is not.
+///
+/// Anything else keeps the engine's description and no key, and stays
+/// reported. Left joins, so resolving one kind of row never discards another.
 const CARRIED: &str = "\
 SELECT DISTINCT
-       CASE WHEN v.oid IS NULL
-            THEN pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid)
-            ELSE pg_catalog.pg_describe_object('pg_catalog.pg_class'::regclass, v.oid, 0)
+       CASE WHEN r.rulename = '_RETURN' AND v.oid IS NOT NULL
+            THEN pg_catalog.pg_describe_object('pg_catalog.pg_class'::regclass, v.oid, 0)
+            ELSE pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid)
        END AS described,
-       vn.nspname AS view_schema,
-       v.relname AS view_name
+       CASE WHEN v.oid IS NOT NULL
+            THEN CASE WHEN r.rulename = '_RETURN' THEN 'view' ELSE 'rule' END
+            WHEN p.oid IS NOT NULL
+            THEN CASE WHEN p.prokind = 'p' THEN 'procedure' ELSE 'function' END
+            WHEN tg.oid IS NOT NULL THEN 'trigger'
+       END AS what,
+       COALESCE(vn.nspname, pn.nspname, tn.nspname) AS dep_schema,
+       COALESCE(v.relname, p.proname, tc.relname) AS dep_name,
+       tg.tgname AS part,
+       CASE WHEN p.oid IS NOT NULL THEN
+            (SELECT COALESCE(pg_catalog.json_agg(pg_catalog.format_type(u.ty, NULL)
+                                                 ORDER BY u.pos), '[]')::text
+               FROM pg_catalog.unnest(p.proargtypes) WITH ORDINALITY AS u(ty, pos))
+       END AS args
   FROM pg_catalog.pg_depend d
   LEFT JOIN pg_catalog.pg_rewrite r
-    ON d.classid = 'pg_catalog.pg_rewrite'::regclass
-   AND r.oid = d.objid
-   AND r.rulename = '_RETURN'
+    ON d.classid = 'pg_catalog.pg_rewrite'::regclass AND r.oid = d.objid
   LEFT JOIN pg_catalog.pg_class v
     ON v.oid = r.ev_class AND v.relkind = 'v'
   LEFT JOIN pg_catalog.pg_namespace vn ON vn.oid = v.relnamespace
+  LEFT JOIN pg_catalog.pg_proc p
+    ON d.classid = 'pg_catalog.pg_proc'::regclass AND p.oid = d.objid
+   AND p.prokind IN ('f', 'p')
+  LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace
+  LEFT JOIN pg_catalog.pg_trigger tg
+    ON d.classid = 'pg_catalog.pg_trigger'::regclass AND tg.oid = d.objid
+   AND NOT tg.tgisinternal
+  LEFT JOIN pg_catalog.pg_class tc ON tc.oid = tg.tgrelid
+  LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = tc.relnamespace
  WHERE d.refclassid = 'pg_catalog.pg_class'::regclass
    AND d.refobjid = ($1::int8)::oid
    AND d.deptype <> 'i'
    AND ($2 = 0 OR d.refobjsubid IN (0, $2))
- ORDER BY 1, 2, 3";
+ ORDER BY 1, 2, 3, 4, 5, 6";
 
 /// Indexes and constraints on the table whose **name** embeds the old column
 /// name. The objects keep working — measured, `ix_customer_email` is still
@@ -448,33 +479,102 @@ pub async fn rename_impact(
         .query_with(CARRIED, &[relation.into(), attnum.into()])
         .await?
     {
-        let view = match (
-            row.try_get::<&str>("view_schema")?,
-            row.try_get::<&str>("view_name")?,
-        ) {
-            (Some(schema), Some(name)) => Some(ObjectName::new(schema, name)),
-            (None, None) => None,
-            // The join resolved one half of the view and not the other: a
-            // row this reader does not understand, said as one rather than
-            // read as "not a view" (absent is not unreadable).
-            _ => {
-                return Err(ImpactError::Name(DialectError::Invalid {
-                    dialect: crate::types::DIALECT,
-                    message: format!(
-                        "a view carried by the rename of {target} came back without its full \
-                         name, so the report cannot say which view it is"
-                    ),
-                }));
-            }
-        };
+        let (kind, removed_with) = carried_module(&row, target)?;
         report.carried.push(Referrer {
-            kind: if view.is_some() { "view" } else { "carried" }.to_owned(),
+            kind,
             name: text(&row, "described")?,
             detail: None,
-            removed_with: view.map(|v| (ModuleKind::View, ModuleId::Named(v))),
+            removed_with,
         });
     }
     Ok(report)
+}
+
+/// The kind word and the typed module a [`CARRIED`] row names, if any.
+///
+/// A row the query recognized but whose name came back incomplete is an
+/// error, not an unkeyed row: read as "not a module" it would be reported as
+/// carried and working after the plan dropped it (absent is not unreadable).
+/// A routine whose argument types this model cannot hold keeps no key — it
+/// stays reported, which is the safe direction — and is never read as a
+/// routine with no arguments.
+fn carried_module(
+    row: &Row,
+    target: &RenameTarget,
+) -> Result<(String, Option<(ModuleKind, ModuleId)>), ImpactError> {
+    let Some(what) = row.try_get::<&str>("what")? else {
+        return Ok(("carried".to_owned(), None));
+    };
+    let incomplete = |part: &str| {
+        ImpactError::Name(DialectError::Invalid {
+            dialect: crate::types::DIALECT,
+            message: format!(
+                "a {what} carried by the rename of {target} came back without its {part}, so \
+                 the report cannot say which {what} it is"
+            ),
+        })
+    };
+    let schema = row
+        .try_get::<&str>("dep_schema")?
+        .ok_or_else(|| incomplete("schema"))?;
+    let name = row
+        .try_get::<&str>("dep_name")?
+        .ok_or_else(|| incomplete("name"))?;
+    let object = ObjectName::new(schema, name);
+    let key = match what {
+        "view" | "rule" => Some((ModuleKind::View, ModuleId::Named(object))),
+        "trigger" => {
+            let part = row
+                .try_get::<&str>("part")?
+                .ok_or_else(|| incomplete("trigger name"))?;
+            Some((
+                ModuleKind::Trigger,
+                ModuleId::Trigger {
+                    on: object,
+                    name: part.to_owned(),
+                },
+            ))
+        }
+        "function" | "procedure" => {
+            let args = row
+                .try_get::<&str>("args")?
+                .ok_or_else(|| incomplete("argument types"))?;
+            let args: Vec<String> =
+                serde_json::from_str(args).map_err(|_| incomplete("argument types"))?;
+            let kind = if what == "procedure" {
+                ModuleKind::Procedure
+            } else {
+                ModuleKind::Function
+            };
+            // Normalized as a declared argument is: `format_type` quotes an
+            // ordinary type name under `quote_all_identifiers` (measured on
+            // 18.6, `"text"`, `"m"."mood"`), a setting the session pins leave
+            // to the operator, and the plan's id spells it bare.
+            args.iter()
+                .map(|a| {
+                    a.parse::<pbps_model::RoutineArg>()
+                        .map(|a| crate::types::routine_arg(&a))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+                .map(|args| {
+                    (
+                        kind,
+                        ModuleId::Routine(pbps_model::RoutineId::new(object, args)),
+                    )
+                })
+        }
+        other => {
+            return Err(ImpactError::Name(DialectError::Invalid {
+                dialect: crate::types::DIALECT,
+                message: format!(
+                    "a carried referrer of {target} came back as a `{other}`, which this \
+                     reader does not know"
+                ),
+            }));
+        }
+    };
+    Ok((what.to_owned(), key))
 }
 
 /// The lines a caller prints under the report, and the reason they are here

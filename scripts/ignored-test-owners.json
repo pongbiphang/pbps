@@ -1187,6 +1187,7 @@
         "a_definer_routine_a_plan_writes_must_pin_search_path_with_pg_temp_last",
         "a_deployers_own_onward_grant_is_one_it_can_still_narrow",
         "a_dropped_function_follows_what_releases_its_generated_columns",
+        "a_dropped_function_is_not_reported_as_carried_by_a_column_rename",
         "a_dropped_table_frees_a_name_a_moved_table_carries_in_applies",
         "a_dropped_view_is_not_reported_as_carried_by_a_column_rename",
         "a_generated_columns_expression_change_is_refused_by_name_before_postgres_17",
