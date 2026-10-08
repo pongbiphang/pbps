@@ -713,33 +713,32 @@ carries the normative text, and DEC-1528.1 the reasons.
     reviewer can always tell a vouched answer from a measured one.
 - **Decision 5, for the operator-vouched resolver.**
   - Objects outside the managed set come from a reviewed baseline in the
-    repository, run on scratch only. Staging is dependency-ordered with the
-    managed declarations. Every external object it creates is compared with
-    the target by the properties the manifest already fingerprints for its
-    class, and sealed into the manifest. The source text that defines an
-    object is excepted: a routine's body, and a view's query. A view may
-    therefore be staged as a shape view of its output columns (typed NULLs,
-    no row), never as a table, whose system columns change name resolution.
-    The recheck still compares the target's complete fingerprints.
-  - The baseline is confined by privilege. It runs in its own session, as
-    a run-owned non-superuser role that owns nothing managed. On managed
-    objects it holds only the privileges that name one (schema and type
-    `USAGE`, table `REFERENCES`), not `EXECUTE`. So the engine refuses any
-    change to managed objects or their rows. A fixed list (#1658) covers
-    what needs more: extensions, and casts or transforms over a type the
-    baseline does not own, run as the setup role. Anything else refused for
-    privilege refuses the run. As a backstop, afterwards every
-    managed object already staged must be unchanged, every managed table
-    must still be empty, and every object the baseline created must be
-    compared. The emptiness check catches indirect writes, such as through
-    a staged `SECURITY DEFINER` routine. A mismatch, a missing object, or
-    a baseline object in the managed set refuses.
+    repository, run on scratch only. It runs whole and first (#1664), as the
+    setup role in its own session, before pbps stages any managed object.
+    So it can change nothing pbps staged, and needs no privilege rule.
+  - Every object it creates is compared with the target, and sealed into
+    the manifest. A mismatch, a missing object, an uncompared object or a
+    baseline object in the managed set refuses. The comparison covers what
+    a creation-time binding can read: an object's own class properties, and
+    a relation's columns and its primary-key and unique constraints and
+    indexes. It skips foreign keys, CHECKs, defaults, triggers, policies,
+    rules, non-unique indexes and inheritance, and the source text of a
+    routine's body or a view's query. A view may therefore be staged as a
+    shape view of its output columns (typed NULLs, no row), never as a
+    table, whose system columns change name resolution. The recheck still
+    compares the target's complete fingerprints.
+  - A managed → external → managed chain of creation-time bindings refuses,
+    naming the chain, with two remedies: adopt the middle object, or select
+    no resolver. No adoption split by kind or by schema produced one across
+    three measured real schemas.
   - pbps sends no routine source of its own. A question needing routine
     source the baseline lacks refuses with the finding and two remedies.
   - The private-source requirements apply only to the measured profiles'
     retained definitions.
   - Two later steps reuse the same comparison: a reviewed baseline draft from
-    the target, then automatic fill of missing shapes.
+    the target, then automatic fill of missing shapes. Fill orders each
+    generated object from the target's `pg_depend`, between managed
+    objects, which lifts the chain refusal for what it fills.
 - **Reading this record.** Its "resolver" means the measured profiles wherever
   it describes containment, process or socket observation, executable
   identity or verified channels.
@@ -760,13 +759,12 @@ carries the normative text, and DEC-1528.1 the reasons.
   - `vouched_compiles_a_managed_view_over_a_baseline_table`
   - `vouched_refuses_a_baseline_that_differs_from_the_target`
   - `vouched_refuses_a_baseline_that_creates_a_managed_object`
-  - `vouched_baseline_cannot_change_a_managed_object_or_its_rows` (`ALTER`,
-    `DROP`, DML, `TRUNCATE` and a trigger are each refused by the engine;
-    a row written through a staged `SECURITY DEFINER` routine refuses)
+  - `vouched_runs_the_baseline_before_any_managed_object` (its `SET`s do
+    not reach the compile; a setting it changes is read by the compatibility
+    qualification)
   - `vouched_refuses_a_baseline_object_left_uncompared`
-  - `vouched_stages_external_objects_naming_managed_ones_with_public_revoked`
-    (a routine over a managed type, a foreign key, a view calling a managed
-    routine)
+  - `vouched_compares_an_external_table_without_its_foreign_keys_and_triggers`
+  - `vouched_refuses_a_chain_through_an_external_object_naming_it`
   - `vouched_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view`
   - `vouched_refuses_an_external_view_staged_as_a_table` (the computed-field
     `xmin(ext.v)` case binds differently on a table)

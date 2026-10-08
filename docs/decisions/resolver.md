@@ -1626,58 +1626,57 @@ compared with the target.** Leaving them out (managed-only) fails every
 partial adoption, which is #1616's finding. Reconstructing them by reading
 their full definitions sends routine source no reviewer approved.
 - The baseline is a SQL file in the repository. It runs on scratch only.
-- Staging is dependency-ordered. An external routine taking a managed
-  table's row type is created after pbps creates that table from its
-  declaration, so the baseline never has to create a managed object.
-- Every external object it creates is compared with the target, by exactly
-  the class-specific properties the evidence manifest already fingerprints
-  for that class: column collations, routine defaults and the like. The
-  exception is the source text that defines an object, a routine's body or
-  a view's query. A binding reads shape, not computation. That exception is
-  what lets a view be staged as a shape view: the same output columns over
-  typed NULLs, returning no row. The recheck still compares the target's
-  complete fingerprints.
-- A view is never staged as a table, and its relation kind is still
-  compared. A table's system columns change what a name binds to. Measured
-  on 18: `v.xmin`, with a function `xmin(ext.v)` in scope, binds the
-  function on a view (and on a shape view) but the system column on a table
-  of the same columns. This replaces "a view becomes a table of its output
-  columns" in the design on #1528. The point of that wording, shapes only and
-  never the original SQL, is unchanged (#1652 review). A list of properties of its own would miss
-  one per review, as the first drafts of this entry did, with routine
-  defaults and then column collations. Reusing the manifest's list makes
-  the comparison and the recheck one definition.
-- The baseline is arbitrary SQL, so it is confined by privilege rather than
-  checked case by case. It runs in its own session, as a run-owned
-  non-superuser role that owns nothing managed.
-  - On managed objects it holds exactly the privileges that let a
-    definition name one: `USAGE` on schemas and types, `REFERENCES` on
-    tables. Review found these one per round: a foreign key, then a routine
-    whose signature uses a managed type whose `PUBLIC` usage is revoked.
-    "Name, never use or change" is the rule that ends that sequence.
-  - `EXECUTE` is not among them. Creating a view or `BEGIN ATOMIC` body
-    that calls a managed routine does not need it (measured on 16 and 18),
-    and it would let the baseline run a `SECURITY DEFINER` routine.
-  - Statements that need ownership or superuser run as the setup role from
-    a fixed list (#1658): extensions, and casts or transforms over a type
-    the baseline does not own. Each creates one compared object. Anything
-    else refused for privilege refuses the run.
-  - Review found the cases one at a time: a `SET`, then an `ALTER` or
-    `DROP` of a staged managed table, then rows written into one, which
-    could fail a later CHECK or index build and refuse a valid plan.
-  - Each check would have had a neighbour. Without ownership or table
-    privileges, the engine refuses all of them. Without superuser, it also
-    refuses event triggers.
-  - Three checks afterwards catch the indirect paths privilege cannot,
-    such as a staged `SECURITY DEFINER` routine executable by `PUBLIC`:
-    - the staged managed objects are re-read;
-    - managed tables, staged without rows, must still have none;
-    - an uncompared object refuses.
-  - Otherwise the evidence could describe declarations nobody wrote. The compared shapes are sealed into the manifest.
-  So a wrong or stale baseline refuses instead of answering for a database
-  that does not exist.
-- A baseline object in the managed set refuses: the declarations stay the
-  one source of truth.
+- **It runs whole and first, before any managed object is staged** (#1664).
+  It runs as the setup role, in its own session.
+  - An earlier draft interleaved it with the managed declarations, so that
+    an external routine could take a managed table's row type. That forced
+    a confined role to keep the baseline away from objects already staged.
+    Review then found, one round at a time, a legitimate external object
+    the role could not create: a foreign key, a routine over a managed
+    type, a cast, an operator or aggregate. Each needed one more privilege,
+    and each grant opened a path back into managed state.
+  - Run first, the baseline meets no managed object, so no privilege rule
+    is needed, and any SQL may be written.
+- **The cost is a chain through the boundary.** A managed object binds to an
+  external one that binds to a managed one. Such a chain refuses, naming it,
+  with two remedies: adopt the middle object, or select no resolver.
+  - Measured on pagila, AdventureWorks and GitLab: no adoption split by
+    kind (tables first; tables and types; views and routines) or by schema
+    produced one. Only foreign keys and triggers pointed back, and neither
+    is compared.
+  - Random half-splits do produce them, as view-on-view stacks adopted from
+    the middle.
+  - Automatic fill, the third step, generates each object itself. It can
+    order them between managed objects from the target's `pg_depend`,
+    without parsing SQL, which lifts the refusal for what it fills.
+- **Every object it creates is compared with the target, by what a
+  creation-time binding can read.**
+  - Compared: an object's own class properties as the manifest
+    fingerprints them; of a relation's children, its columns and the
+    primary-key and unique constraints and indexes a `GROUP BY` or
+    `ON CONFLICT` relies on.
+  - Not compared: foreign keys, CHECKs, defaults, triggers, policies, rules,
+    non-unique indexes and inheritance, nor the source text of a routine's
+    body or a view's query.
+  - So a baseline may omit what only guards or computes, and the common
+    back-pointing foreign key and trigger need not be staged. Earlier
+    drafts listed compared properties of their own and missed one per
+    review (routine defaults, column collations); the manifest's
+    definition, cut to what binds, ends that. The recheck still compares
+    the target's complete fingerprints.
+- **A view is staged as a shape view** (its output columns over typed NULLs,
+  returning no row), **never as a table.** A table's system columns change
+  what a name binds to. Measured on 18: `v.xmin`, with a function
+  `xmin(ext.v)` in scope, binds the function on a view and on a shape view,
+  but the system column on a table of the same columns. This replaces "a
+  view becomes a table of its output columns" in the design on #1528; the
+  point, shapes only and never the original SQL, is unchanged.
+- **Everything the baseline leaves behind is accounted for.** An uncompared
+  object, a mismatch or a baseline object in the managed set refuses. The
+  compatibility qualification reads scratch after the baseline, so a
+  setting it changed must match the target too. A wrong or stale baseline
+  therefore refuses instead of answering for a database that does not
+  exist.
 - pbps itself never sends routine source. A routine reaches scratch only
   through the baseline, under what the operator vouches for.
 - Two later steps reuse the same comparison: a reviewed draft generated from

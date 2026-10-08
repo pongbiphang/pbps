@@ -1555,77 +1555,64 @@ scratch compile (#1616).
 
 - **The baseline is a SQL file in the repository**, named by the resolver
   entry's `baseline`. It is reviewed history like the declarations. It runs on
-  scratch only, never on the target, after the two checks.
-- **Staging is dependency-ordered.** An external object that needs a managed
-  one, such as a routine taking a managed table's row type, is created after
-  pbps has created that managed object from its declaration. The baseline
-  itself still creates no managed object.
-- **Each external object it creates is compared with the target before any
-  binding question is answered.** A mismatch, or an object the target does
-  not have, refuses and names the object.
-  - **One rule decides what is compared:** every class-specific property the
-    evidence manifest already fingerprints for that class of external input
-    (below), and no property of its own.
-  - **The exception is the source text that defines an object:** a routine's
-    body (#1655) and a view's query. A binding reads the object's shape, not
-    how it computes it.
-  - **So a view may be staged as a shape view:** a view of the same output
-    columns over typed NULLs that returns no row, for example
-    `CREATE VIEW ext.v AS SELECT NULL::integer AS id WHERE false`. Its
-    relation kind is still compared; only its query is not.
-  - **A view is never staged as a table.** A table has system columns and a
-    view has none. Measured on 18: for `SELECT v.xmin FROM ext.v v`, with a
-    function `xmin(ext.v)` in scope, a view binds the function and a table of
-    the same columns binds the system column. A table also cannot have a
-    column named `xmin`, which a view can output.
-  - This narrows only the baseline comparison. The recheck before
-    publication and at apply still compares the target's complete
-    fingerprints.
-  - **Examples:**
-    - a relation's column names, types, collations and order (order decides
-      `*` expansion);
-    - a type's definition: a composite's attributes, an enum's labels in
-      order, a domain's base type and collation;
-    - a routine's header: signature, return type, argument names and modes,
-      defaults, variadic, volatility;
-    - an extension's version.
-  - A property the manifest gains later is compared from then on, without
-    amending this list.
+  scratch only, never on the target.
+- **It runs whole and first** (#1664). It runs after the two separation checks,
+  on the empty run-owned database, as the setup role, in its own session, and
+  before pbps stages any managed object.
+  - So it can change nothing pbps staged, because nothing is staged yet. Its
+    `SET`s, `search_path` included, never reach the session that compiles
+    the declarations.
+  - No privilege rule is needed, so any SQL may be written: an extension, a
+    cast, an operator, a `DO` block.
+- **Everything it leaves behind must be accounted for.**
+  - Each object it creates is compared with the target before any binding
+    question is answered. A mismatch, an object the target does not have,
+    or a baseline object in the managed set refuses, and the finding names
+    the object.
+  - The shared compatibility qualification reads scratch after the
+    baseline, so a setting the baseline changed must match the target too.
+- **What is compared is what a creation-time binding can read:**
+  - an object's own class-specific properties, as the evidence manifest
+    fingerprints them;
+  - of a relation's children, its columns, and the primary-key and unique
+    constraints and indexes that a `GROUP BY` functional dependency or an
+    `ON CONFLICT` inference relies on.
+
+  Examples:
+  - a relation's kind, and its column names, types, collations and order
+    (order decides `*` expansion);
+  - a type's definition: a composite's attributes, an enum's labels in
+    order, a domain's base type and collation;
+  - a routine's header: signature, return type, argument names and modes,
+    defaults, variadic, volatility;
+  - an extension's version.
+- **What is not compared:**
+  - a relation's other children: foreign keys, CHECKs, column defaults,
+    triggers, policies, rules, non-unique indexes and inheritance links;
+  - the source text that defines an object: a routine's body (#1655) and a
+    view's query.
+
+  A binding reads the object's shape, not how it computes or guards it, so
+  a baseline may omit all of these. The recheck before publication and at
+  apply still compares the target's complete fingerprints.
+- **A view may be staged as a shape view:** a view of the same output columns
+  over typed NULLs that returns no row, for example
+  `CREATE VIEW ext.v AS SELECT NULL::integer AS id WHERE false`.
+- **A view is never staged as a table.** A table has system columns and a view
+  has none. Measured on 18: for `SELECT v.xmin FROM ext.v v`, with a function
+  `xmin(ext.v)` in scope, a view binds the function and a table of the same
+  columns binds the system column.
 - **The compared shapes are sealed into the evidence manifest** and rechecked
   like any other external input.
-- **A baseline object in the managed set refuses.** The declarations stay the
-  one source of truth.
-- **The baseline cannot change what pbps staged: it is confined by
-  privilege, not checked case by case.**
-  - It runs in its own scratch session, as a run-owned role that is not a
-    superuser. That role owns no managed object. On managed objects it holds
-    exactly the privileges that let a definition *name* one, never use or
-    change it: `USAGE` on their schemas and types, and `REFERENCES` on their
-    tables. It holds `CREATE` only where an external object it creates
-    lives.
-  - `EXECUTE` on managed routines is not granted. Measured on 16 and 18: a
-    view or a `BEGIN ATOMIC` body calling one creates without it, and with it
-    the baseline could run a `SECURITY DEFINER` routine that writes rows.
-  - So the engine itself refuses every way to touch managed state: `ALTER`,
-    `DROP`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, triggers, rules,
-    policies, grants, and event triggers. Its `SET`s, `search_path`
-    included, never reach the session that compiles the declarations.
-  - **Where an external object needs more than that role holds, pbps grants
-    or runs exactly that, from a fixed list, and nothing else** (#1658):
-    - `CREATE EXTENSION`, and `CREATE CAST` or `CREATE TRANSFORM` over a
-      type the baseline does not own, run as the setup role, after the
-      objects they name;
-    - a baseline foreign key's internal triggers on a managed table belong
-      to that compared constraint.
-  - Each such statement creates one object, compared like any other. Any
-    other statement refused for lack of privilege refuses the run, and the
-    finding names the statement.
-  - Three checks afterwards catch what privilege cannot, such as a staged
-    `SECURITY DEFINER` routine the baseline may execute:
-    - every managed object already staged must be exactly what pbps staged;
-    - every managed table, staged without rows, must still have none;
-    - an object the baseline creates that is neither managed nor compared
-      with the target refuses.
+- **A chain through the boundary refuses.** In such a chain, a managed object
+  binds to an external one that itself binds to a managed one, and that
+  external object cannot be staged before anything managed exists.
+  - The finding names the chain and gives two remedies: adopt the middle
+    object too, or select no resolver and keep ADR-0013's conservative
+    rebuild.
+  - Measured on three real schemas, no adoption split by kind or by schema
+    produced such a chain. Only foreign keys and triggers pointed back, and
+    neither is compared.
 - **pbps itself never sends routine source to scratch.** A routine is there
   only if the operator put it in the baseline. A binding question that needs
   routine source the baseline lacks refuses with a finding naming the
@@ -1638,7 +1625,10 @@ uncompared one never reaches binding evidence. Two later steps are planned:
    review (a view is drafted as a shape view of its output columns, and a
    routine is listed but never written);
 2. filling, at plan time, the shapes a baseline lacks, by the same rules;
-   the baseline wins on overlap.
+   the baseline wins on overlap. pbps generates each object itself, so it
+   can order them one by one from the target's recorded dependencies
+   (`pg_depend`), between managed objects, without parsing SQL. That lifts
+   the chain refusal for filled objects.
 
 Resolved dependencies also become cross-kind ordering edges in the final typed
 plan: remove dependents before their old inputs, and establish desired inputs
