@@ -259,12 +259,14 @@ async fn rehearse_in(
     // Under the names the rehearsal database has: the baseline was built from
     // the *previous* revision, so a table or key column this plan renames is
     // still spelt the old way here too (DECISIONS 148).
-    crate::deploy::refuse_misspelt(
-        conn,
-        declared,
-        &crate::deploy::catalogued_as(declared, declared_ids, baseline_ids),
-    )
-    .await?;
+    crate::deploy::warn_unasked(
+        &crate::deploy::refuse_misspelt(
+            conn,
+            declared,
+            &crate::deploy::catalogued_as(declared, declared_ids, baseline_ids),
+        )
+        .await?,
+    );
 
     for (i, stmt) in build.iter().enumerate() {
         conn.execute(&stmt.sql).await.map_err(|e| {

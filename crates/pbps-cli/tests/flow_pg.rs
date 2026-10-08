@@ -19734,6 +19734,90 @@ fn a_ddl_event_trigger_leaves_the_partition_default_probe_unrun() {
     }
 }
 
+/// A partition's own default the probe could not ask about is a typed
+/// warning in a JSON plan's one envelope, with nothing beside it on stderr
+/// (SPEC §9.8; #1660). Human output keeps the warning line. Negative: a pair
+/// that was asked adds no such finding. On 18 and 16.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn an_unasked_partition_default_is_a_warning_in_the_json_plan() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (version, server) in [("18", server()), ("16", old)] {
+        let db = OwnDatabase::new(&server, &format!("parts-1660-{version}"));
+        let conn = db.connection().to_owned();
+        on_server(
+            &conn,
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.ev (k integer NOT NULL, v integer DEFAULT 1) \
+                 PARTITION BY RANGE (k); \
+             CREATE TABLE app.ev_a PARTITION OF app.ev FOR VALUES FROM (0) TO (10); \
+             ALTER TABLE app.ev_a ALTER COLUMN v SET DEFAULT 7",
+        );
+        let d = Demo::new(&format!("parts-1660-{version}"));
+        succeeds(d.run(&["pull", "--db", &conn]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+        let path = d.dir.join("schema/app.ev.yml");
+        let pulled = std::fs::read_to_string(&path).unwrap();
+        let own = "      v: {default: \"7\"}\n";
+        assert!(pulled.contains(own), "{pulled}");
+        std::fs::write(&path, pulled.replace(own, "      v: {default: \"8\"}\n")).unwrap();
+        d.commit();
+        let unasked = |report: &serde_json::Value| -> Vec<serde_json::Value> {
+            report["findings"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no findings: {report}"))
+                .iter()
+                .filter(|f| f["id"] == "plan.partition-default-unasked")
+                .cloned()
+                .collect()
+        };
+
+        // Negative first: asked, so no such finding.
+        let report = json_output(succeeds(
+            d.run(&["plan", "--db", &conn, "--format", "json"]),
+        ));
+        assert!(unasked(&report).is_empty(), "{version}: {report}");
+
+        // An enabled DDL event trigger leaves the pair unasked (#1669).
+        on_server(
+            &conn,
+            "CREATE FUNCTION public.pbps_1660_noop() RETURNS event_trigger LANGUAGE plpgsql AS \
+                 $$ BEGIN END $$; \
+             CREATE EVENT TRIGGER pbps_1660_watch ON ddl_command_end \
+                 EXECUTE FUNCTION public.pbps_1660_noop()",
+        );
+        let o = succeeds(d.run(&["plan", "--db", &conn, "--format", "json"]));
+        assert!(
+            !stderr(&o).contains("not checked before the plan"),
+            "{version}: {}",
+            stderr(&o)
+        );
+        let report = json_output(o);
+        let found = unasked(&report);
+        assert_eq!(found.len(), 1, "{version}: {report}");
+        assert_eq!(found[0]["severity"], "warning", "{version}: {report}");
+        let message = found[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("partition app.ev_a column `v`")
+                && message.contains("`pbps_1660_watch`"),
+            "{version}: {message}"
+        );
+
+        // Human output keeps the line.
+        let o = succeeds(d.run(&["plan", "--db", &conn]));
+        assert!(
+            stderr(&o).contains(
+                "warning: not checked before the plan whether the engine stores it as the \
+                 parent's default: partition app.ev_a column `v`"
+            ),
+            "{version}: {}",
+            stderr(&o)
+        );
+        on_server(&conn, "DROP EVENT TRIGGER pbps_1660_watch");
+    }
+}
+
 /// Operators a user who may create in a schema could add, each raising when
 /// it is called. Every one has a built-in that pbps's own SQL reaches only
 /// through a cast or a polymorphic argument, and an operator whose argument

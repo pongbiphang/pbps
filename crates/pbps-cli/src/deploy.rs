@@ -2121,6 +2121,14 @@ pub(crate) fn catalogued_as(
     out
 }
 
+/// Prints what [`refuse_misspelt`] could not ask, for a command whose
+/// warnings go to stderr.
+pub(crate) fn warn_unasked(unasked: &[String]) {
+    for w in unasked {
+        eprintln!("warning: {w}");
+    }
+}
+
 /// Refuses a declaration whose text the engine would not read back as
 /// written, before anything is written (DECISIONS 101).
 ///
@@ -2129,28 +2137,40 @@ pub(crate) fn catalogued_as(
 /// and a text the type cannot read at all comes back as a failed insert —
 /// each a plan that never converges or never applies, and each a question
 /// only the engine answers the same way it will answer at read time.
+///
+/// Returns, as warnings, what it could not ask: a partition's own default it
+/// could not deparse (DEC-1609.1). Not a finding and not a pass — the apply's
+/// closing check still refuses one stored as the parent's, after its
+/// statement — so each caller reports them where its other warnings go: a
+/// connected plan in its JSON envelope (#1660), the rest on stderr through
+/// [`warn_unasked`].
 pub(crate) async fn refuse_misspelt(
     conn: &mut Conn,
     schema: &Schema,
     at: &pbps_db::catalog::CatalogNames,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let found = crate::engine::misspelt(conn, schema, at)
         .await
         .context("cannot ask the engine how it reads the declared rows")?;
-    // Not a finding and not a pass: the apply's closing check still refuses
-    // what this could not ask, after its statement (DEC-1609.1).
-    for why in &found.defaults_unasked {
-        eprintln!(
-            "warning: not checked before the plan whether the engine stores it as the parent's default: {why}"
-        );
-    }
+    let unasked = found
+        .defaults_unasked
+        .iter()
+        .map(|why| {
+            format!(
+                "not checked before the plan whether the engine stores it as the parent's \
+                 default: {why}"
+            )
+        })
+        .collect();
     if found.misspelt.is_empty()
         && found.conflicts.is_empty()
         && found.bounds.is_empty()
         && found.defaults_as_parents.is_empty()
     {
-        return Ok(());
+        return Ok(unasked);
     }
+    // Refused for what was asked: what was not still says so, beside it.
+    warn_unasked(&unasked);
     // Two keys the engine reads as one row would insert twice and fail on
     // the second; the alias check (74) cannot see them on a table that holds
     // neither yet (DECISIONS 106).
@@ -5779,7 +5799,7 @@ pub fn cmd_bootstrap(
             // from the declaration on the next plan (DECISIONS 101).
             // Into an empty database, so nothing is under an older name: the
             // declared names are the only ones the catalog could have.
-            refuse_misspelt(&mut conn, &loaded.schema, &Default::default()).await?;
+            warn_unasked(&refuse_misspelt(&mut conn, &loaded.schema, &Default::default()).await?);
             refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
 
             // The empty-target check is protected by the same lock as the
@@ -6183,12 +6203,23 @@ pub fn cmd_plan_db(
         // Every declared text, as the engine reads it: a spelling it would
         // read back differently is refused before a plan is written that
         // could never converge (DECISIONS 101).
-        refuse_misspelt(
+        let unasked = refuse_misspelt(
             &mut conn,
             &loaded.schema,
             &catalogued_as(&loaded.schema, &resolved.ids, &recorded_ids),
         )
         .await?;
+        // In the envelope, not beside it: a warning-only result of a
+        // read-only command stays in its one JSON report (SPEC §9.8; #1660).
+        for w in unasked {
+            if !json {
+                eprintln!("warning: {w}");
+            }
+            findings.push(crate::output::Finding::warning(
+                "plan.partition-default-unasked",
+                w,
+            ));
+        }
         refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
         let managed = managed_state_full(
             &mut conn,
