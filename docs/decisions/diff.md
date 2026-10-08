@@ -3717,12 +3717,15 @@ table drops ruled out that order, and the plan was refused at `plan --db`.
   others.
 - `order_computed_by_edges` returns the pairs. The plan pipeline passes them
   to the rename search. Nothing reorders the plan between the two passes.
-- In the search, a module drop in the region that a pair names moves like a
-  rename. Every candidate, renames, these module drops and the region's next
+- In the search, a module drop in the region moves like a rename when a pair
+  names it and the catalog read found an object under its name. Only then can
+  its drop free a name the walk tracks. One that frees nothing walks the same
+  in every place, and made movable, a table's drop releasing a dozen such
+  functions multiplied the orders past the search's bound. Every candidate, renames, these module drops and the region's next
   fixed drop alike, is tried only once everything it waits for in the region
   has run. A pair whose earlier change ran before the region is met.
-- A module drop no pair names keeps DEC-1461.1's place among the drops. So
-  does every drop when no edge was read.
+- Any other module drop keeps DEC-1461.1's place among the drops. So does
+  every drop when no edge was read.
 
 **Why the pairs and not the edges.** The search orders positions in one plan;
 the pairs say exactly which positions must precede which, by change, and the
@@ -3736,6 +3739,9 @@ Pinned by:
   refused rather than moved past that drop.
 - `a_module_drop_among_the_drops_keeps_its_place_in_the_search`, now also
   with its pairs.
+- `a_module_drop_that_frees_no_name_keeps_its_place`: eleven function drops a
+  table's drop releases, none under a name the catalog holds, leave the
+  rename free to run first. Made movable, they exhausted the search.
 - `what_a_released_function_is_bound_to_follows_it`
   (`crates/pbps-cli/src/computed_order.rs`), on the pairs themselves.
 - `a_computed_drop_follows_the_module_bound_to_it_and_its_inputs_follow_it`

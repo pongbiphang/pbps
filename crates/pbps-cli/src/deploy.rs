@@ -972,6 +972,14 @@ impl NameFacts {
     fn one<'n>(&'n self, name: &'n TableName) -> &'n TableName {
         self.first.get(name).unwrap_or(name)
     }
+
+    /// Whether the catalog read found an object under `id`'s name: the only
+    /// way the walk's step for its drop frees anything (`Walk::step`), so the
+    /// only way where that drop runs can matter to a name (#1680 review).
+    pub(crate) fn holds_module(&self, id: &ModuleId) -> bool {
+        let name = module_object(id);
+        self.occupants.iter().any(|o| o.name == name)
+    }
 }
 
 /// An entry a change puts into the namespace.

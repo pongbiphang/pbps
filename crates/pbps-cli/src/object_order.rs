@@ -65,7 +65,7 @@ pub(crate) fn order_occupied_objects_under(
     if walk.is_clear() {
         return Ok(());
     }
-    let mut search = Search::new(&cs.changes, precedence);
+    let mut search = Search::new(&cs.changes, precedence, &facts);
     let Some(order) = search.run(&facts) else {
         let refusal = walk.refusal(&cs.changes, label);
         if search.trials > TRIALS {
@@ -295,14 +295,22 @@ struct Search<'c> {
 impl<'c> Search<'c> {
     // The complement is every change that is not a table rename.
     #[allow(clippy::wildcard_enum_match_arm)]
-    fn new(changes: &'c [PlannedChange], precedence: &[(Change, Change)]) -> Self {
+    fn new(
+        changes: &'c [PlannedChange],
+        precedence: &[(Change, Change)],
+        facts: &NameFacts,
+    ) -> Self {
         // A module drop after the first rename or drop is one the computed
         // edges placed among the drops (DEC-1431.1): after the removal of a
         // computed column that calls it, and before a table it is
         // schema-bound to. It moves between those, by the pairs the edges
         // gave (#1680); moved past them, `DROP TABLE` would run while the
         // module still binds the table (#1461). One no pair names keeps its
-        // place among the drops, as the drops keep theirs. A module drop the
+        // place among the drops, as the drops keep theirs; so does one whose
+        // name the catalog read found nothing under, since its drop frees no
+        // name and every place it may take walks the same. Made movable, a
+        // table's drop releasing a dozen such functions multiplied the
+        // orders past the search's bound (#1680 review). A module drop the
         // edges left alone runs in class 0, before the first of them.
         let first = (0..changes.len()).find(|&i| part(&changes[i].change).is_some());
         let at = |c: &Change| (0..changes.len()).find(|&i| changes[i].change == *c);
@@ -314,12 +322,14 @@ impl<'c> Search<'c> {
             part(&changes[i].change).or_else(|| {
                 (first.is_some_and(|f| i > f)
                     && matches!(changes[i].change, Change::DropModule { .. }))
-                .then(|| {
-                    if pairs.iter().any(|&(a, b)| a == i || b == i) {
+                .then(|| match &changes[i].change {
+                    Change::DropModule { id, .. }
+                        if facts.holds_module(id)
+                            && pairs.iter().any(|&(a, b)| a == i || b == i) =>
+                    {
                         Part::Module
-                    } else {
-                        Part::Drop
                     }
+                    _ => Part::Drop,
                 })
             })
         };
@@ -1048,7 +1058,10 @@ mod tests {
             drop_table("dbo.u"),
             rename("s1.a", "s1.c", &[]),
         ];
-        assert_eq!(Search::new(&ahead, &[]).region, [1, 2]);
+        assert_eq!(
+            Search::new(&ahead, &[], &NameFacts::new(&[], &[])).region,
+            [1, 2]
+        );
     }
 
     /// #1680: a module drop the edges ordered moves between what it waits
@@ -1168,6 +1181,72 @@ mod tests {
         );
     }
 
+    /// #1680 review: a module drop whose name the catalog read found nothing
+    /// under frees no name wherever it runs, so it keeps its place. `dbo.z`'s
+    /// drop releases eleven such functions and frees a check's name the
+    /// rename's default would then take; the rename runs first and parks the
+    /// default at its fallback. Movable, the eleven drops multiplied the
+    /// orders past the search's bound and the plan was refused.
+    #[test]
+    fn a_module_drop_that_frees_no_name_keeps_its_place() {
+        let new = name("dbo.new");
+        let generated = default_constraint_name(&new, "x");
+        let functions: Vec<PlannedChange> = (0..11)
+            .map(|k| {
+                PlannedChange::new(Change::DropModule {
+                    id: pbps_model::ModuleId::Named(name(&format!("dbo.f{k}"))),
+                    kind: pbps_model::ModuleKind::Function,
+                })
+            })
+            .collect();
+        let z = PlannedChange::new(Change::DropTable {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.z", 0),
+            name: name("dbo.z"),
+            detach_from: None,
+        });
+        let mut changes = vec![z.clone()];
+        changes.extend(functions.iter().cloned());
+        changes.push(rename("dbo.old", "dbo.new", &["x"]));
+        changes.push(PlannedChange::new(Change::AddCheck {
+            table: name("dbo.t"),
+            name: generated.clone(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "a > 0".into(),
+            },
+        }));
+        let occupants = [
+            held(
+                &format!("dbo.{}", default_constraint_name(&name("dbo.old"), "x")),
+                "default constraint",
+                Some("dbo.old"),
+                Some("x"),
+            ),
+            held(
+                &format!("dbo.{generated}"),
+                "check constraint",
+                Some("dbo.z"),
+                None,
+            ),
+        ];
+        let precedence: Vec<(Change, Change)> = functions
+            .iter()
+            .map(|f| (z.change.clone(), f.change.clone()))
+            .collect();
+        let mut cs = ChangeSet { changes };
+        order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &precedence).unwrap();
+        assert!(
+            matches!(cs.changes[0].change, Change::RenameTable { .. }),
+            "{:?}",
+            cs.changes
+        );
+        let facts = NameFacts::new(&occupants, &[]);
+        assert!(
+            Search::new(&cs.changes, &precedence, &facts)
+                .modules
+                .is_empty()
+        );
+    }
+
     /// A drop on a renamed table names the table as it is called where the
     /// drop runs, whichever side of the rename the order puts it.
     #[test]
@@ -1196,20 +1275,20 @@ mod tests {
             },
         });
         let after = [rename("s1.old", "s2.new", &[]), computed];
-        let search = Search::new(&after, &[]);
+        let search = Search::new(&after, &[], &NameFacts::new(&[], &[]));
         assert_eq!(table(&search.reordered(&[0, 1])), ["s2.new"]);
         assert_eq!(table(&search.reordered(&[1, 0])), ["s1.old"]);
         let before = [drop_check("s1.old", "c"), rename("s1.old", "s2.new", &[])];
-        let search = Search::new(&before, &[]);
+        let search = Search::new(&before, &[], &NameFacts::new(&[], &[]));
         assert_eq!(table(&search.reordered(&[0, 1])), ["s1.old"]);
         assert_eq!(table(&search.reordered(&[1, 0])), ["s2.new"]);
         let after = [rename("s1.old", "s2.new", &[]), drop_check("s2.new", "c")];
-        let search = Search::new(&after, &[]);
+        let search = Search::new(&after, &[], &NameFacts::new(&[], &[]));
         assert_eq!(table(&search.reordered(&[0, 1])), ["s2.new"]);
         assert_eq!(table(&search.reordered(&[1, 0])), ["s1.old"]);
         // A table no rename moves keeps its name.
         let other = [drop_check("dbo.t", "c"), rename("s1.old", "s2.new", &[])];
-        let search = Search::new(&other, &[]);
+        let search = Search::new(&other, &[], &NameFacts::new(&[], &[]));
         assert_eq!(table(&search.reordered(&[1, 0])), ["dbo.t"]);
     }
 }
