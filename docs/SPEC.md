@@ -1399,11 +1399,18 @@ implemented).**
   - pbps does not measure or enforce its scratch's isolation, containment, log
     handling or channels. The operator vouches for them, and the evidence and
     `explain` say so: `resolver: operator-vouched scratch (not measured)`.
-  - Before any scratch DDL, the baseline's included, it checks two things.
-    Scratch is never the target: its host, port and database, and its
-    credential variable, differ from the target's, with no fallback to target
-    credentials. And scratch is empty in the connected scope, `template1`
-    included.
+  - Before any scratch DDL, the baseline's included, it checks two things
+    about separation.
+    - Scratch is never the target. Its host, port and database are not all
+      the target's, so another database on the target's cluster qualifies.
+      Its credential variable differs from the target's, and there is no
+      fallback to target credentials.
+    - Scratch is empty in the connected scope, `template1` included.
+  - The shared compatibility qualification (#610, #611) still runs, as for
+    every resolver environment. It checks engine version and build,
+    extensions, encoding, collation and the deployment context. It decides
+    whether scratch would bind the same way as the target, which no operator
+    can vouch for, so an incompatible or unreadable fact refuses.
   - The run-owned scratch database takes the target's encoding and locale.
     The encoding decides how a name is cut to the identifier limit, so a
     scratch in another one would answer for another database.
@@ -1503,8 +1510,9 @@ environments:
 `pull: never` is the default and requires a preloaded image when acquisition
 is implemented; `if_missing` authorizes acquisition of the configured source
 only when absent. It is not permission for compiled code to access a network.
-Actual digest/platform, build compatibility, instance separation, transport
-and containment still require qualification in the dependent steps. A server
+Build compatibility still requires qualification for every resolver
+environment. A measured profile also qualifies its actual digest/platform,
+instance separation, transport and containment. A server
 profile names a separate credential variable, never an inline connection
 string. No fallback to target credentials exists. The value is
 whitespace-separated `key=value` fields; `user` and `password` are

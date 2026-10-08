@@ -106,10 +106,13 @@ through `pbps-cli::engine`, not I/O on the pure `Dialect` trait or in the differ
 Shared deterministic plan evidence belongs beside semantic `Schema`, never in
 its equality or as driver-specific types. The final typed ChangeSet remains the
 only input to deployment SQL emission. Target reads and scratch writes use
-separate instances/clusters, connections and credentials. Engine identity checks
-and trusted provisioning evidence must establish separation before scratch DDL;
-a different database name is insufficient. CLI lifecycle and engine-specific
-profiles also qualify runtime-enforced network/filesystem containment before
+separate connections and credentials. The operator-vouched resolver needs only
+another database, empty, behind another credential variable; the operator
+vouches for the rest (DEC-1528.1). **Measured profiles only:** target and
+scratch use separate instances/clusters, engine identity checks and trusted
+provisioning evidence must establish separation before scratch DDL, and a
+different database name is insufficient. Their CLI lifecycle and
+engine-specific profiles also qualify runtime-enforced network/filesystem containment before
 any compiled source is sent, plus source handling for external definitions,
 including server/container log capture and disposable storage (ADR-0016).
 Containment is enforced outside SQL privileges by the qualified runtime, not by

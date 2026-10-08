@@ -698,8 +698,13 @@ carries the normative text, and DEC-1528.1 the reasons.
   resolver* (`vouched`). The cases, the assessment, the fingerprint key, the
   sealing and the refusal classes are shared. Only the producer differs.
 - **Decision 4, for the operator-vouched resolver.**
-  - "Verify the chosen environment" means two checks before any scratch DDL:
-    scratch is never the target, and scratch is empty in the connected scope.
+  - "Verify the chosen environment" keeps the shared compatibility
+    qualification (version and build, extensions, encoding, collation,
+    deployment context), which decides whether scratch binds as the target
+    would. For separation, it means two checks before any scratch DDL:
+    - scratch is never the target (host, port and database are not all the
+      target's, and the credential variable differs);
+    - scratch is empty in the connected scope.
   - The run-owned scratch takes the target's encoding and locale.
   - Isolation, containment, log handling and channel protection are vouched
     for by the operator, not measured. The evidence names the profile, so a

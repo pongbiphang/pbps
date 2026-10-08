@@ -1586,10 +1586,11 @@ isolation, the confidentiality of what it compiles, and its channels. Both
 connections use whatever TLS the operator configured. The evidence names the
 profile, so a reviewer can always tell a vouched answer from a measured one.
 
-**It keeps exactly two checks, run before any scratch DDL.**
-- **Scratch is never the target:** a different host, port and database, a
-  different credential variable, and no fallback to target credentials. That
-  is the mistake an operator can make by accident, and it is cheap to catch.
+**It keeps exactly two separation checks, run before any scratch DDL.**
+- **Scratch is never the target:** its host, port and database are not all the
+  target's, its credential variable differs, and there is no fallback to
+  target credentials. That is the mistake an operator can make by accident,
+  and it is cheap to catch.
 - **Scratch is empty in the connected scope, `template1` included:** a
   polluted scratch changes what the declarations bind to.
 
@@ -1597,6 +1598,14 @@ A third check, that scratch is another engine instance (`system_identifier`),
 was dropped. It needs a privileged read, and it guards against a choice the
 operator already vouched for. So a scratch database on the target's own
 cluster is allowed.
+
+**The shared compatibility qualification is not one of the things vouched
+for** (#610, #611). It checks version and build, extensions, encoding,
+collation and the deployment context. These decide whether scratch binds a
+name the way the target would. That is a question about meaning, not about
+isolation, and an operator cannot vouch it true. So it runs for the
+operator-vouched resolver as for every other, and an incompatible or
+unreadable fact refuses (#1652 review).
 
 **The scratch database takes the target's encoding and locale.** The encoding
 decides how a name is cut to the 63-byte identifier limit (#1627, #1640). A
