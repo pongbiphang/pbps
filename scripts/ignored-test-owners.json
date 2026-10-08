@@ -1027,6 +1027,7 @@
         "a_hidden_role_is_not_recorded_as_missing",
         "a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge",
         "a_hidden_table_is_not_recorded_as_missing",
+        "a_connected_plan_does_not_fold_case_for_a_standing_computed_column",
         "a_name_metadata_visibility_hides_is_not_read_as_free",
         "a_nullable_column_is_added_to_a_populated_temporal_table",
         "a_panicking_test_leaves_no_database_behind",

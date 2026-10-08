@@ -1575,6 +1575,10 @@ live `renames_only_the_catalog_can_order_apply_or_are_refused_at_plan`.
 column: declared under `computed:`, changed by a drop and an add, and
 refused by name where a change would need it out of the way (#1174).**
 
+*Amended by [DEC-1460.1](#dec-1460-1): on a connected plan the catalog's
+edges, not this entry's text screen, judge a computed column that stands
+throughout.*
+
 Measured on 17.0.4075.5:
 
 - The engine infers a computed column's type and nullability:
@@ -3212,3 +3216,42 @@ managed-schema `VIEW DEFINITION` only, the alter and a nullability change on a
 table with a computed column are refused for the database grant, and adding a
 computed column, the same change on a table with none, and dropping one view
 plan.
+
+<a id="dec-1460-1"></a>
+
+**DEC-1460.1. A connected SQL Server plan leaves a standing computed column to
+the catalog's edges, not the differ's text screen (#1460; amends DEC-1174.1).**
+
+**Context.** DEC-1174.1's screen refuses a change to a column a standing
+computed column may read, or to a function it may call, by a text scan that
+folds case. That over-approximation is safe offline, where a plan is never
+applied (SPEC §7.3). Since DEC-1431.1 a connected plan also reads the
+engine's own edges, matched under the database's collation. The screen ran
+first, so in a `Latin1_General_100_CS_AS` database a retype of `A`, beside a
+computed column reading `a`, was refused although SQL Server accepts it.
+
+**Decision.** The differ takes a `Screen`. Offline paths keep `Screen::Text`.
+A connected SQL Server plan diffs with `Screen::Catalog`, which skips the
+screen for a computed column that stands throughout the plan, for both its
+inputs and the functions it calls. `order_computed_by_edges` then judges
+those columns by the edges. Since DEC-1462.1, every change the screen skips
+there is one the pass reads the edges for, or refuses without the grant that
+makes them complete.
+
+**Why not for an added column.** A computed column the plan adds, new or
+again, has no edge for its new text until the plan stores it, so the screen
+still judges what it calls (#1459). PostgreSQL has no computed columns and
+keeps `Screen::Text`.
+
+**Why a parameter, not a hint.** `Hints` come from the declarations and never
+take part in a comparison. Whether a catalog will be read is the caller's
+fact, so the caller passes it.
+
+Pinned by the live `a_connected_plan_does_not_fold_case_for_a_standing_computed_column`
+(`crates/pbps-cli/tests/flow.rs`): in a case-sensitive database, retyping `A`
+is refused by an offline `plan` and plans and applies connected, and retyping
+`a` is refused by the edge. Also by the unit
+`a_connected_plan_leaves_a_standing_computed_column_to_the_catalog`: the
+catalog screen lets a standing column's input retype and its function's alter
+through, the text screen refuses both, and a re-added column's call is refused
+under either.

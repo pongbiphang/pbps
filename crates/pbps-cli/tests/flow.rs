@@ -3548,6 +3548,81 @@ fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
     on_server(&server, &format!("DROP LOGIN [{login}];"));
 }
 
+/// A connected plan judges a standing computed column by the catalog's
+/// edges, under the database's collation, not by the text screen, which
+/// folds case (#1460). In a case-sensitive database `A` is not the `a` that
+/// `c` reads: retyping it plans and applies connected, while an offline plan
+/// still refuses it. Retyping `a` itself is refused by the edge.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_connected_plan_does_not_fold_case_for_a_standing_computed_column() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let cs = OwnDatabase::collated(&server, "computed1460_cs", "Latin1_General_100_CS_AS");
+    on_server(
+        cs.connection(),
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, a int NULL,
+             A int NULL, c AS (a * 2));",
+    );
+    let d = Demo::new("computed1460-cs");
+    ok(&d.run(&["pull", "--db", cs.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", cs.connection(), "--reason", "adopt"]));
+    let path = d.dir.join("schema/dbo.t.yml");
+    let pulled = std::fs::read_to_string(&path).unwrap();
+    let retype = |column: &str| {
+        let from = format!("  {column}:\n    type: int\n");
+        assert!(pulled.contains(&from), "{pulled}");
+        pulled.replacen(&from, &format!("  {column}:\n    type: bigint\n"), 1)
+    };
+
+    std::fs::write(&path, retype("A")).unwrap();
+    // Offline, the text screen still folds case and refuses it.
+    let o = d.run(&["plan"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("computed column dbo.t.c may read `A`"),
+        "{}",
+        stderr(&o)
+    );
+    d.commit();
+    let plan = d.dir.join("plan-1460.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        cs.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    ok(&d.run(&[
+        "apply",
+        "--db",
+        cs.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+    ]));
+    std::fs::remove_file(&plan).unwrap();
+    ok(&d.run(&["verify", "--db", cs.connection()]));
+
+    // `a` itself: the edge refuses it.
+    let applied = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        applied.replacen("  a:\n    type: int\n", "  a:\n    type: bigint\n", 1),
+    )
+    .unwrap();
+    d.commit();
+    let o = d.run(&["plan", "--db", cs.connection()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("computed column dbo.t.c reads `a`"),
+        "{}",
+        stderr(&o)
+    );
+}
+
 /// A connected plan refuses what the catalog's edges say SQL Server would,
 /// where a text scan could not tell (#1431, DEC-1431.1): a retype of `café`,
 /// which `[cafe]` binds under an accent-insensitive collation (#1426); and a

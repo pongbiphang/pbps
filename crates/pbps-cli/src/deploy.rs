@@ -6281,19 +6281,43 @@ pub fn cmd_plan_db(
                 hints.module_deps.insert(name.clone(), dependencies.clone());
             }
         }
-        let mut cs = pbps_diff::diff(
-            pbps_diff::Side {
-                schema: &base,
-                ids: &recorded_ids,
-            },
-            pbps_diff::Side {
-                schema: &declared,
-                ids: &resolved.ids,
-            },
-            dialect.as_ref(),
-            &hints,
-        )
-        .map_err(|errs| {
+        // SQL Server's computed columns that stand throughout are judged by
+        // the catalog's edges below (`order_computed_by_edges`), under the
+        // database's collation, not by the text screen (#1460).
+        let screen = if conn.driver() == pbps_db::Driver::Mssql {
+            pbps_diff::Screen::Catalog
+        } else {
+            pbps_diff::Screen::Text
+        };
+        let diff_here = |also: &std::collections::BTreeSet<pbps_model::ModuleId>| match screen {
+            pbps_diff::Screen::Catalog => pbps_diff::diff_connected(
+                pbps_diff::Side {
+                    schema: &base,
+                    ids: &recorded_ids,
+                },
+                pbps_diff::Side {
+                    schema: &declared,
+                    ids: &resolved.ids,
+                },
+                dialect.as_ref(),
+                &hints,
+                also,
+            ),
+            pbps_diff::Screen::Text => pbps_diff::diff_rebuilding(
+                pbps_diff::Side {
+                    schema: &base,
+                    ids: &recorded_ids,
+                },
+                pbps_diff::Side {
+                    schema: &declared,
+                    ids: &resolved.ids,
+                },
+                dialect.as_ref(),
+                &hints,
+                also,
+            ),
+        };
+        let mut cs = diff_here(&std::collections::BTreeSet::new()).map_err(|errs| {
             for e in &errs {
                 eprintln!("  {e}");
             }
@@ -6386,20 +6410,8 @@ pub fn cmd_plan_db(
             // view this plan now drops and recreates takes `before_a_rebuild`
             // like one the declarations edit (#314, ADR-0009 §4).
             let rediff = |also: &std::collections::BTreeSet<pbps_model::ModuleId>| {
-                pbps_diff::diff_rebuilding(
-                    pbps_diff::Side {
-                        schema: &base,
-                        ids: &recorded_ids,
-                    },
-                    pbps_diff::Side {
-                        schema: &declared,
-                        ids: &resolved.ids,
-                    },
-                    dialect.as_ref(),
-                    &hints,
-                    also,
-                )
-                .map_err(|errs| anyhow::anyhow!("{} change(s) cannot be expressed", errs.len()))
+                diff_here(also)
+                    .map_err(|errs| anyhow::anyhow!("{} change(s) cannot be expressed", errs.len()))
             };
             let dependents = crate::engine::account_for_module_dependents(
                 &mut conn,

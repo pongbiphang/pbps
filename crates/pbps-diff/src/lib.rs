@@ -19,7 +19,8 @@ pub use identity::{
 };
 pub use managed::{Scoped, observed_ids, scope};
 pub use schema_diff::{
-    DiffError, Diffed, Side, diff, diff_partial, diff_rebuilding, order_role_drops,
+    DiffError, Diffed, Screen, Side, diff, diff_connected, diff_partial, diff_rebuilding,
+    order_role_drops,
 };
 
 #[cfg(test)]
