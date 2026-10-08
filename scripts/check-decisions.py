@@ -51,10 +51,17 @@ RESERVED = frozenset({523, 524, 525, 526})
 # comma, `and` or `, and`. A separator is taken only when a number follows, so
 # `DECISIONS 267, and the difference` and `DECISIONS 311, DEC-942.1` end at the
 # first number; a dash with no number after it ends the group too.
-ITEM = r"\d+(?:[ \t]*[-–][ \t]*\d+)?"
-CITE_LEGACY = re.compile(
-    rf"\bDECISIONS ({ITEM}(?:(?:,[ \t]*(?:and[ \t]+)?|[ \t]+and[ \t]+){ITEM})*)\b"
-)
+#
+# A number after a separator, and the second end of a range, belong to the
+# group only when the group could end there: before punctuation, the end of
+# the line, or another `and`/`or`. Otherwise the number is the prose's, not
+# the citation's — `DECISIONS 1, 900 rows are rejected`, `DECISIONS 4, 2026
+# was`, a date `2026-10-08` — and reading it as one would fail CI on a valid
+# document. The first number is always the citation's.
+END = r"(?=[ \t]*(?:[,;:.)\]}|*`'\"]|$)|[ \t]+(?:and|or)\b|[ \t]+[(—–-])"
+RANGE = rf"(?:[ \t]*[-–][ \t]*\d+{END})?"
+SEPARATOR = r"(?:,[ \t]*(?:and[ \t]+)?|[ \t]+and[ \t]+)"
+CITE_LEGACY = re.compile(rf"\bDECISIONS (\d+{RANGE}(?:{SEPARATOR}\d+{RANGE}{END})*)")
 CITE_ITEM = re.compile(r"(\d+)(?:[ \t]*[-–][ \t]*(\d+))?")
 CITE_NEW = re.compile(r"\bDEC-(\d+)\.(\d+)\b")
 
@@ -87,17 +94,19 @@ def cited_numbers(group, closed):
     the closed sequence is listed one by one; past it, the range's end alone is
     named, so a typo of `1–900000000` reports one number, not most of them.
     """
-    numbers, problems = [], []
+    # A set: a group may repeat a range, and each repeat must not grow what is
+    # held — at most the closed sequence, plus the ends past it.
+    numbers, problems = set(), []
     for item in CITE_ITEM.finditer(group):
         low = int(item[1])
         high = int(item[2]) if item[2] else low
         if high < low:
             problems.append(f"DECISIONS {item[0]} is a range that runs backwards")
             continue
-        numbers.extend(range(low, min(high, closed) + 1))
+        numbers.update(range(low, min(high, closed) + 1))
         if high > closed:
-            numbers.append(high if low <= closed else low)
-    return numbers, problems
+            numbers.add(high if low <= closed else low)
+    return sorted(numbers), problems
 
 
 def check(topic_files, index_text, cited_in, closed=CLOSED):

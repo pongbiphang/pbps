@@ -241,6 +241,11 @@ class TheRecord(unittest.TestCase):
             "DECISIONS 4–, issue 9",
             "(DECISIONS 1, 2), 9",
             "DECISIONS 1 and the 9 others",
+            # A number the prose goes on with is the prose's, not the citation's.
+            "Following DECISIONS 1, 900 rows are rejected before applying the plan.",
+            "DECISIONS 4, 2026 was the year",
+            "DECISIONS 2, 2026-10-08",
+            "DECISIONS 1 and 9 rows",
         ]:
             self.assertEqual(
                 run({"docs/decisions/identity.md": IDENTITY + new_entry(737, 1)}, {"src/a.rs": line}),
@@ -252,6 +257,18 @@ class TheRecord(unittest.TestCase):
             ["src/a.rs:1: DEC-800.1 names no entry"],
         )
         self.assertEqual(run(cited={"scripts/check-decisions.py": "DECISIONS 1, 9"}), [])
+        # Where a group can end, a later number is still the citation's.
+        for line in ["DECISIONS 1, 9.", "(DECISIONS 1, 9)", "DECISIONS 1, 9 or 2", "DECISIONS 1, 9 (see)"]:
+            self.assertEqual(
+                run(cited={"src/a.rs": line}), ["src/a.rs:1: DECISIONS 9 names no entry"], line
+            )
+
+    def test_a_repeated_range_holds_each_number_once(self):
+        # Twenty thousand repeats of the whole sequence used to be expanded
+        # and held one by one: millions of integers for one long line.
+        group = ", ".join(["1-543"] * 20000)
+        numbers, problems = cd.cited_numbers(group, cd.CLOSED)
+        self.assertEqual((numbers, problems), (list(range(1, 544)), []))
 
     def test_the_index_is_not_read_as_a_citation(self):
         self.assertEqual(run(cited={"docs/DECISIONS.md": "e.g. `DEC-737.1`"}), [])
