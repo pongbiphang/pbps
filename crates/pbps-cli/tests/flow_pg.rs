@@ -19657,6 +19657,83 @@ fn a_partitions_own_default_stored_as_its_parents_is_refused_before_the_plan() {
     }
 }
 
+/// The partition-default probe runs no DDL while the target has an enabled
+/// DDL event trigger: a rollback would not take back what the trigger did
+/// outside its transaction, and a connected plan is read-only (SPEC §9.8;
+/// #1669, DEC-1609.1). The pair is left to the apply's closing check, with a
+/// warning naming the trigger. On 18 and 16. Negative: with the trigger
+/// disabled the pair is asked, and refused as the parent's.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_ddl_event_trigger_leaves_the_partition_default_probe_unrun() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (version, server) in [("18", server()), ("16", old)] {
+        let db = OwnDatabase::new(&server, &format!("parts-1669-{version}"));
+        let conn = db.connection().to_owned();
+        on_server(
+            &conn,
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.ev (k integer NOT NULL, v integer DEFAULT 1) \
+                 PARTITION BY RANGE (k); \
+             CREATE TABLE app.ev_a PARTITION OF app.ev FOR VALUES FROM (0) TO (10); \
+             ALTER TABLE app.ev_a ALTER COLUMN v SET DEFAULT 7",
+        );
+        let d = Demo::new(&format!("parts-1669-{version}"));
+        succeeds(d.run(&["pull", "--db", &conn]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+        // Outside the managed schema, so the plan does not declare it away.
+        on_server(
+            &conn,
+            "CREATE SCHEMA watch; CREATE SEQUENCE watch.fired; \
+             CREATE FUNCTION watch.on_ddl() RETURNS event_trigger LANGUAGE plpgsql AS \
+                 $$ BEGIN PERFORM pg_catalog.nextval('watch.fired'); END $$; \
+             CREATE EVENT TRIGGER pbps_1669_watch ON ddl_command_end \
+                 EXECUTE FUNCTION watch.on_ddl()",
+        );
+        let path = d.dir.join("schema/app.ev.yml");
+        let pulled = std::fs::read_to_string(&path).unwrap();
+        let own = "      v: {default: \"7\"}\n";
+        assert!(pulled.contains(own), "{pulled}");
+        std::fs::write(&path, pulled.replace(own, "      v: {default: \"(1)\"}\n")).unwrap();
+        d.commit();
+
+        let fired = "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM watch.fired";
+        let before = scalar(&conn, fired);
+        let plan = d.dir.join("unasked.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        assert_eq!(
+            scalar(&conn, fired),
+            before,
+            "{version}: the plan fired the event trigger"
+        );
+        let err = stderr(&o);
+        assert!(
+            err.contains(
+                "warning: not checked before the plan whether the engine stores it as the \
+                 parent's default: partition app.ev_a column `v`: the target has the enabled \
+                 DDL event trigger(s) `pbps_1669_watch`"
+            ),
+            "{version}: {}{err}",
+            stdout(&o)
+        );
+
+        // Negative: disabled, the pair is asked and refused as the parent's.
+        on_server(&conn, "ALTER EVENT TRIGGER pbps_1669_watch DISABLE");
+        let plan = d.dir.join("asked.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 1, "{version}: {}{}", stdout(&o), stderr(&o));
+        assert!(
+            stderr(&o).contains(
+                "partition app.ev_a column `v`: its own default \"(1)\" is stored as \"1\""
+            ),
+            "{version}: {}",
+            stderr(&o)
+        );
+        on_server(&conn, "DROP EVENT TRIGGER pbps_1669_watch");
+    }
+}
+
 /// Operators a user who may create in a schema could add, each raising when
 /// it is called. Every one has a built-in that pbps's own SQL reaches only
 /// through a cast or a polymorphic argument, and an operator whose argument

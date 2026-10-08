@@ -2557,9 +2557,10 @@ struct OwnDefault<'a> {
 /// Its own transaction, since the spelling read's is `READ ONLY` and the
 /// engine refuses `CREATE TEMP TABLE` in one. Asked only for a partition that
 /// overrides a column whose parent declares a default, so a plan with none
-/// creates nothing. What cannot be asked — no `TEMP` privilege, an event
-/// trigger that refuses the `CREATE` (one fires on it, measured), a text that
-/// names an object the plan has yet to create — is listed in
+/// creates nothing. What cannot be asked — no `TEMP` privilege, an enabled
+/// DDL event trigger (one fires on the `CREATE`, measured, so none is run
+/// under one; #1669), a text that names an object the plan has yet to
+/// create — is listed in
 /// `defaults_unasked`, never read as an answer.
 async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mut Spellings) {
     let mut asked: Vec<OwnDefault<'_>> = Vec::new();
@@ -2602,6 +2603,34 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
     if asked.is_empty() {
         return;
     }
+    // The probe's DDL fires the target's DDL event triggers, and a rollback
+    // takes back only what they wrote: a `nextval` they call, a session lock
+    // they take, a message they send stays. A connected plan is read-only
+    // (SPEC §9.8), so with one enabled nothing is stored and each pair stays
+    // to the apply's closing check (#1669). A failed read is no answer either.
+    match enabled_ddl_event_triggers(conn).await {
+        Ok(names) if names.is_empty() => {}
+        found => {
+            let why = match found {
+                Ok(names) => format!(
+                    "the target has the enabled DDL event trigger(s) {}, which this check's \
+                     temporary table would fire",
+                    names
+                        .iter()
+                        .map(|n| format!("`{n}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Err(e) => format!("cannot read the target's event triggers: {e}"),
+            };
+            out.defaults_unasked.extend(
+                asked
+                    .iter()
+                    .map(|d| format!("partition {} column `{}`: {why}", d.partition, d.column)),
+            );
+            return;
+        }
+    }
     let result = store_and_read(conn, &asked).await;
     // Rolled back whatever happened: nothing this asks may outlive it.
     let _ = conn.execute("ROLLBACK").await;
@@ -2632,6 +2661,29 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
                 .map(|d| format!("partition {} column `{}`: {why}", d.partition, d.column)),
         ),
     }
+}
+
+/// Every event trigger that DDL could fire: any not disabled, since one
+/// enabled for replicas only still fires under a session that runs as one.
+async fn enabled_ddl_event_triggers(conn: &mut Conn) -> Result<Vec<String>, DbError> {
+    let rows = conn
+        .query(
+            "SELECT evtname::text AS name FROM pg_catalog.pg_event_trigger
+              WHERE evtenabled OPERATOR(pg_catalog.<>) 'D'
+                AND evtevent::text IN ('ddl_command_start', 'ddl_command_end', 'sql_drop')
+              ORDER BY 1",
+        )
+        .await?;
+    // `evtname` is NOT NULL; a NULL read still counts as a trigger, never
+    // as none.
+    rows.iter()
+        .map(|row| {
+            Ok(row
+                .try_get::<&str>("name")?
+                .unwrap_or("<unnamed>")
+                .to_owned())
+        })
+        .collect()
 }
 
 /// Stores one declared text as `column`'s default, under `under`'s path, in a
