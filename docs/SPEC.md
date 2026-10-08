@@ -884,8 +884,8 @@ dependencies and prints a report:
 
 | Source (MSSQL) | How | Consequence |
 |---|---|---|
-| views / SPs / functions / triggers | `sys.sql_expression_dependencies` | Lists every referrer |
-| SCHEMABINDING views | As above plus `is_schema_bound` | **Blocks the rename outright**; must be dropped first |
+| views / SPs / functions / triggers | `sys.dm_sql_referencing_entities`, and for a column `sys.dm_sql_referenced_entities` (DEC-1644.1) | Lists every referrer this login can see; for a column, those that read it or every column |
+| SCHEMABINDING views | As above plus `is_schema_bound` | **Blocks the rename outright** when it reads the renamed column or the table is renamed; must be dropped first |
 | Computed columns | `sys.computed_columns` | The engine refuses the rename (15336). A plan renaming a column a standing computed column may read is refused offline by name (DEC-1174.1) |
 | DEFAULT / CHECK definitions | `sys.check_constraints` | The definition text holds the old name |
 | Index / constraint names | `sys.indexes` | The objects are fine, but names may embed the old column name (naming drift) |
@@ -1999,10 +1999,16 @@ organization say no to the tool.
 **Each is asked for at the securable where it is actually needed**, and the
 report names that securable. The four `CREATE` permissions cannot be granted
 below the database, so they are asked for there; `ALTER` and `VIEW DEFINITION`
-are asked for on each **managed** schema. Reading the catalog also reads
-`sys.sql_expression_dependencies`, whose `SELECT` the engine gives only to
-`db_owner` and database `VIEW DEFINITION` does not carry, so it is asked for on
-that object (#1359). The probes' `SELECT` is asked for on
+are asked for on each **managed** schema. What depends on what is read through
+`sys.dm_sql_referencing_entities` and `sys.dm_sql_referenced_entities`, which
+answer under that schema grant. Only the proof that no hidden computed column
+or module refers to what a connected plan alters or drops reads
+`sys.sql_expression_dependencies`, which returns no row at all without
+database `VIEW DEFINITION`, and whose `SELECT` the engine gives only to
+`db_owner` (#1359). Those two are **advised**, a warning that leaves the
+account ready, not asked for: without them that one kind of plan is refused by
+name, and so is a rename on SQL Server 2008 to 2012, whose referrers are read
+from the view there; every other command works (DEC-1644.1). The probes' `SELECT` is asked for on
 each **managed table**, accepting an object grant or grants on every catalog
 column. Its schema is the fallback only while the table does not exist yet.
 Declared tables are resolved to their current names in each environment, and

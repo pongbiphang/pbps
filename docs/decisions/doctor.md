@@ -963,3 +963,102 @@ Pinned by:
 
 Each live test runs the emitted statement with only the placeholder replaced,
 and the principal's name holds a quote character.
+
+<a id="dec-1644-1"></a>
+
+**DEC-1644.1. SQL Server reads what depends on what through the per-object
+dependency functions under the managed-schema grant; only the hidden-referrer
+proof, and the rename impact report on SQL Server 2008 to 2012, read
+`sys.sql_expression_dependencies`, so `doctor` advises its two grants instead
+of requiring them (#1644; amends SPEC §7.4 and §9.5).**
+
+**Context.** SPEC §9.5 asks for `VIEW DEFINITION` on each managed schema,
+never on the database, and #1359 added `SELECT` on
+`sys.sql_expression_dependencies` to the required list. But that view returns
+**no row at all**, silently, to a login without database `VIEW DEFINITION`:
+schema-scoped `VIEW DEFINITION`, or owning the schema, still reads it empty.
+So for exactly the account §9.5 describes, the pull's omission closure, the
+rename impact report and its `SCHEMABINDING` refusal all read "nothing
+depends on anything".
+
+**Measured**, identically on SQL Server 2017, 2019, 2022 and 2025, with a
+login holding `VIEW DEFINITION` and `SELECT` on `SCHEMA::dbo` only:
+
+| Read | Rows |
+|---|---|
+| `sys.sql_expression_dependencies` | none, no error |
+| `sys.dm_sql_referenced_entities`, one `CROSS APPLY` over `sys.objects` | every edge between visible objects: the view's own edges as `sa`, less the referrer in a schema it cannot see |
+| the same over a module whose column was renamed or dropped | Msg 207 and 2020, the read fails |
+| the same inside `BEGIN TRY … END TRY BEGIN CATCH THROW; END CATCH` | every row, the stale module's table edge included, no error sent; also under `XACT_ABORT ON` inside a transaction, which stays committable |
+
+As `sa`, the only edges of the view the functions over modules and default
+and check constraints do not return are a table's own, from its computed
+columns, which none of the readers below consumes.
+`public` holds `SELECT` on both functions in `master`; `CONTROL` is not
+needed. A stale module's row has `is_all_columns_found = 0`. A referrer in a
+schema the login cannot see is dropped silently, with no row.
+
+**Decision.**
+- `catalog`'s module dependencies (the pull's omission closure and its
+  default- and check-constraint checks) and the rename impact report ask the functions,
+  inside `TRY`, with a `CATCH` that raises the error again: a read that fails
+  is never one that found nothing. It raises with `RAISERROR`, not `THROW`,
+  which SQL Server 2008 cannot parse, and the pull still reads a server that
+  old.
+- A column rename reports a referrer by its own rows: one that reads the column
+  by id, reads every column (`is_select_all`), or could not bind all its
+  columns (`is_all_columns_found = 0`). The view kept column rows only for a
+  schema-bound referrer, and a row of `0` for every one, so every
+  `SCHEMABINDING` module reading the table refused the rename of a column it
+  never reads — which SQL Server performs (15336 only for a column the module
+  reads).
+- Both reads keep only a row naming no database, or this one by a three-part
+  name. The functions keep another database's `referenced_id` for a reference
+  into it, where the view has `NULL`, and ids repeat across databases: the
+  first table of two fresh databases measured with one id on 17.0. Read as
+  local, such a row bound a view over the other database's table to a local
+  ledger table, and the pull left the view out.
+- On SQL Server 2008 to 2012, `sys.dm_sql_referencing_entities` wants
+  `CONTROL` on the referenced table (Microsoft's documented permission for
+  those versions; no image older than 2017 runs here to measure it), which
+  §9.5 does not ask. There the rename impact report reads the view behind the
+  guard below, with the rule the view allows: every referrer that is not
+  schema-bound, as before #1644, and a schema-bound one only for a column it
+  names. Azure SQL, whose banner says 12.x, reads the functions. The pull's
+  module dependencies ask `sys.dm_sql_referenced_entities`, which wants
+  `VIEW DEFINITION` on the referencing module in every version, and are the
+  same everywhere.
+- The hidden-referrer proof of DEC-1462.1, and `expression_edges`, which runs
+  only behind it, keep the view: only the view keeps the edge of a referrer
+  the login cannot see. Both start at one guard,
+  `catalog::require_dependency_catalog`, which refuses by name a login without
+  database `VIEW DEFINITION`.
+- `doctor` moves the view's `SELECT` out of the required list and advises it
+  beside database `VIEW DEFINITION`, each with what it allows, as a
+  `permission.advised` warning. The account stays ready.
+
+**Why not require database `VIEW DEFINITION`.** It is the database-wide grant
+§9.5 exists to avoid, asked of every account for the one kind of plan that
+alters or drops a function or a computed column. DECISIONS 460 and 505 ask for
+it only where it decides something; this does the same.
+
+**Why not the functions without `TRY`.** One module broken by an earlier
+rename anywhere in the database would stop every pull, plan and verify.
+Databases carry such modules.
+
+**What it does not see.** A referrer in a schema the login cannot see is not
+in the report, as it was not before. For a plan it could block, the proof
+refuses; for a report, it is the report of what this login can see.
+
+Pinned by:
+- `a_schema_scoped_account_reads_what_depends_on_what`,
+  `a_reference_into_another_database_is_not_a_local_edge` and
+  `a_schema_scoped_grant_satisfies_the_readiness_check`
+  (`crates/pbps-mssql/tests/live.rs`);
+- `only_servers_before_2014_read_a_renames_referrers_from_the_view`
+  (`crates/pbps-mssql/src/impact.rs`);
+- `a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge` and
+  `doctor_asks_for_the_dml_a_declared_data_block_needs`
+  (`crates/pbps-cli/tests/flow.rs`);
+- `the_dependency_view_and_database_view_definition_are_advice_not_gaps`
+  (`crates/pbps-mssql/src/doctor.rs`).

@@ -2127,6 +2127,9 @@ pub struct PermissionGap {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Permissions {
     pub gaps: Vec<PermissionGap>,
+    /// What the account lacks that only some plans need, each with what it
+    /// would allow: advice, never a gap (#1644).
+    pub advised: Vec<PermissionGap>,
     /// The managed schemas the database does not have yet.
     pub absent_schemas: BTreeSet<String>,
 }
@@ -2158,15 +2161,18 @@ pub async fn permissions(
                 project_ids,
             )
             .await?;
-            Ok(Permissions {
-                gaps: pbps_mssql::doctor::missing(&held)
-                    .into_iter()
+            let render = |gaps: Vec<pbps_mssql::doctor::Gap>| -> Vec<PermissionGap> {
+                gaps.into_iter()
                     .map(|g| PermissionGap {
                         permission: g.permission,
                         securable: g.securable(),
                         why: g.why.into(),
                     })
-                    .collect(),
+                    .collect()
+            };
+            Ok(Permissions {
+                gaps: render(pbps_mssql::doctor::missing(&held)),
+                advised: render(pbps_mssql::doctor::advised(&held)),
                 absent_schemas: held.absent_schemas,
             })
         }
@@ -2181,6 +2187,9 @@ pub async fn permissions(
                         why: g.why,
                     })
                     .collect(),
+                // PostgreSQL's dependency reads need nothing the required
+                // list does not ask.
+                advised: Vec::new(),
                 absent_schemas: held.absent_schemas,
             })
         }

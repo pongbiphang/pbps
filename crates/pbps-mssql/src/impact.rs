@@ -519,15 +519,90 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
         .collect()
 }
 
-/// `DISTINCT` is not tidiness: the catalog holds one row per referenced
-/// *column*, so a view naming three columns of the table appears three times,
-/// and a report that listed it three times would read like three problems.
+/// What refers to the object, asked of `sys.dm_sql_referencing_entities`
+/// rather than `sys.sql_expression_dependencies`: the view returns no row at
+/// all without database `VIEW DEFINITION`, which SPEC §9.5 does not ask for,
+/// so a schema-scoped account's report read "nothing depends on this"
+/// (#1644, DEC-1644.1). The function answers under the managed-schema grant.
+/// A referrer in a schema this login cannot see is not listed by either:
+/// the report is of what it can see, as it was.
+///
+/// Both run inside `TRY`, as `catalog`'s module dependencies do and for the
+/// same reason: `sys.dm_sql_referenced_entities` raises Msg 207 and 2020 for a
+/// referrer that no longer binds, and inside `TRY` returns its rows instead
+/// (measured on SQL Server 2017 to 2025). The `CATCH` raises the error again,
+/// with `RAISERROR` as there, so a read that failed is a failed read.
 ///
 /// The type filter keeps constraints out. A check constraint genuinely depends
 /// on its table, so it turns up here — but whether it is affected depends on
 /// which column its text names, which is what [`EXPRESSIONS`] decides. Letting
 /// both report it would flag every constraint on the table for every rename.
-const DEPENDENCIES_TABLE: &str = "\
+pub(crate) const DEPENDENCIES_TABLE: &str = "\
+BEGIN TRY
+SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_name,
+       CONVERT(bit, ISNULL(m.is_schema_bound, 0)) AS schema_bound
+  FROM sys.dm_sql_referencing_entities(@P1, N'OBJECT') r
+  JOIN sys.objects o ON o.object_id = r.referencing_id
+  JOIN sys.schemas s ON s.schema_id = o.schema_id
+  LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
+ WHERE r.referencing_class = 1
+   AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
+ ORDER BY s.name, o.name;
+END TRY
+BEGIN CATCH
+    DECLARE @error nvarchar(2048) = ERROR_MESSAGE();
+    RAISERROR(N'%s', 16, 1, @error);
+END CATCH;";
+
+/// The same, narrowed to modules that read *this column*, by each referrer's
+/// own `sys.dm_sql_referenced_entities` rows.
+///
+/// A column rename breaks a module that names the column, or reads every
+/// column (`SELECT *`, `is_select_all`), and one whose columns the engine
+/// could not all bind (`is_all_columns_found = 0`) is counted as naming it.
+/// A module naming only other columns keeps working, and SQL Server renames
+/// such a column even under a `SCHEMABINDING` module (measured on 17.0: 15336
+/// only for a column the module reads). `DISTINCT` is not tidiness: there is a
+/// row per referenced column.
+///
+/// Not the view's `referenced_minor_id = 0`: it records columns only for a
+/// schema-bound referrer, and a row of 0 for every referrer, so every module
+/// reading the table matched, and a `SCHEMABINDING` one refused the rename of
+/// a column it never reads (#1644).
+///
+/// A referrer's row for a table in another database carries that database's
+/// id, and ids repeat across databases, so only a row naming no database, or
+/// this one, is a reference to the table (as in `catalog`'s module
+/// dependencies).
+pub(crate) const DEPENDENCIES_COLUMN: &str = "\
+BEGIN TRY
+SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_name,
+       CONVERT(bit, ISNULL(m.is_schema_bound, 0)) AS schema_bound
+  FROM sys.dm_sql_referencing_entities(@P1, N'OBJECT') r
+  JOIN sys.objects o ON o.object_id = r.referencing_id
+  JOIN sys.schemas s ON s.schema_id = o.schema_id
+  LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
+ CROSS APPLY sys.dm_sql_referenced_entities(
+       QUOTENAME(s.name) + N'.' + QUOTENAME(o.name), N'OBJECT') e
+ WHERE r.referencing_class = 1
+   AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
+   AND e.referenced_id = OBJECT_ID(@P1)
+   AND (e.referenced_database_name IS NULL OR DB_ID(e.referenced_database_name) = DB_ID())
+   AND (e.referenced_minor_id = COLUMNPROPERTY(OBJECT_ID(@P1), @P2, 'ColumnId')
+        OR e.is_select_all = 1
+        OR e.is_all_columns_found = 0)
+ ORDER BY s.name, o.name;
+END TRY
+BEGIN CATCH
+    DECLARE @error nvarchar(2048) = ERROR_MESSAGE();
+    RAISERROR(N'%s', 16, 1, @error);
+END CATCH;";
+
+/// [`DEPENDENCIES_TABLE`] for SQL Server 2008 to 2012, read from
+/// `sys.sql_expression_dependencies`; [`DependencyRead::Catalog`] says why.
+/// A reference into another database has a `NULL` `referenced_id` in the view
+/// (measured on 17.0), so it cannot match the table.
+pub(crate) const CATALOG_DEPENDENCIES_TABLE: &str = "\
 SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_name,
        CONVERT(bit, ISNULL(m.is_schema_bound, 0)) AS schema_bound
   FROM sys.sql_expression_dependencies d
@@ -538,14 +613,13 @@ SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_nam
    AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
  ORDER BY s.name, o.name;";
 
-/// The same, narrowed to modules that name *this column*.
-///
-/// `referenced_minor_id = 0` is a reference to the object as a whole (`SELECT
-/// *`), which a column rename does affect. Anything else is a specific column,
-/// and a module naming a different one keeps working — reporting it would flag
-/// a rename as risky when it is not, and a report that blocks valid deploys is
-/// one people learn to override.
-const DEPENDENCIES_COLUMN: &str = "\
+/// [`DEPENDENCIES_COLUMN`] from the view. It records the columns of a
+/// schema-bound reference only, plus a row of 0 for every reference (measured
+/// on 17.0). So a referrer that is not schema-bound is counted as reading the
+/// column, as it was before #1644, and a schema-bound one only when it names
+/// the column: its row of 0 is not a reading of every column, since
+/// `SCHEMABINDING` allows no `SELECT *`.
+pub(crate) const CATALOG_DEPENDENCIES_COLUMN: &str = "\
 SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_name,
        CONVERT(bit, ISNULL(m.is_schema_bound, 0)) AS schema_bound
   FROM sys.sql_expression_dependencies d
@@ -554,9 +628,43 @@ SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_nam
   LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
  WHERE d.referenced_id = OBJECT_ID(@P1)
    AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
-   AND (d.referenced_minor_id = 0
-        OR d.referenced_minor_id = COLUMNPROPERTY(OBJECT_ID(@P1), @P2, 'ColumnId'))
+   AND (d.referenced_minor_id = COLUMNPROPERTY(OBJECT_ID(@P1), @P2, 'ColumnId')
+        OR (d.referenced_minor_id = 0 AND d.is_schema_bound_reference = 0))
  ORDER BY s.name, o.name;";
+
+/// Where a rename's referrers are read from (#1644, DEC-1644.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyRead {
+    /// `sys.dm_sql_referencing_entities` and `sys.dm_sql_referenced_entities`,
+    /// which answer under the managed-schema grant SPEC §9.5 asks for.
+    Functions,
+    /// `sys.sql_expression_dependencies`, behind database `VIEW DEFINITION`.
+    /// On SQL Server 2008 to 2012 `sys.dm_sql_referencing_entities` wants
+    /// `CONTROL` on the table, which SPEC §9.5 does not ask for, so the
+    /// functions would fail every rename's pre-flight there; the view answers
+    /// an account holding database `VIEW DEFINITION`, as it did before #1644,
+    /// and refuses by name one that does not, where it used to read nothing.
+    Catalog,
+}
+
+impl DependencyRead {
+    /// The read for a server, from its `ProductVersion` and `Edition`. Azure
+    /// SQL reports 12.x and is not SQL Server 2014's engine, let alone
+    /// 2012's. An unparsable version takes the functions: on an engine that
+    /// cannot answer them the read fails, where the view's guard could only
+    /// refuse.
+    pub fn for_server(product_version: &str, edition: &str) -> Self {
+        let major = product_version
+            .split('.')
+            .next()
+            .and_then(|v| v.parse::<u32>().ok());
+        if !edition.to_ascii_lowercase().contains("azure") && major.is_some_and(|v| v < 12) {
+            Self::Catalog
+        } else {
+            Self::Functions
+        }
+    }
+}
 
 const COMPUTED_COLUMNS: &str = "\
 SELECT c.name AS column_name, c.definition
@@ -597,10 +705,31 @@ fn object_id_argument(target: &RenameTarget) -> Result<String, DialectError> {
     qualified(target.table())
 }
 
-/// Queries every impact of one rename.
+/// Queries every impact of one rename, reading its referrers as
+/// [`DependencyRead::for_server`] chooses for this server.
 pub async fn rename_impact(
     conn: &mut Conn,
     target: &RenameTarget,
+) -> Result<ImpactReport, ImpactError> {
+    let versions = conn
+        .query(
+            "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')) AS version,
+                    CONVERT(nvarchar(128), SERVERPROPERTY('Edition')) AS edition;",
+        )
+        .await?;
+    let version = versions.first().ok_or_else(|| {
+        pbps_db::DbError::BadRow("the server version query returned no row".into())
+    })?;
+    let read = DependencyRead::for_server(get(version, "version")?, get(version, "edition")?);
+    rename_impact_reading(conn, target, read).await
+}
+
+/// [`rename_impact`] with the read given rather than chosen, so the view's read
+/// can be exercised on a server that would not choose it.
+pub async fn rename_impact_reading(
+    conn: &mut Conn,
+    target: &RenameTarget,
+    read: DependencyRead,
 ) -> Result<ImpactReport, ImpactError> {
     // `OBJECT_ID` *parses* its argument as a name, so it is given the quoted
     // form and not `TableName`'s `Display`. It splits on periods, so a name
@@ -628,17 +757,20 @@ pub async fn rename_impact(
         ..Default::default()
     };
 
+    let (by_table, by_column) = match read {
+        DependencyRead::Functions => (DEPENDENCIES_TABLE, DEPENDENCIES_COLUMN),
+        DependencyRead::Catalog => {
+            crate::catalog::require_dependency_catalog(conn).await?;
+            (CATALOG_DEPENDENCIES_TABLE, CATALOG_DEPENDENCIES_COLUMN)
+        }
+    };
     let dependencies = match target {
         RenameTarget::Table(_) | RenameTarget::Module(_) => {
-            conn.query_with(DEPENDENCIES_TABLE, &[table.as_str().into()])
-                .await?
+            conn.query_with(by_table, &[table.as_str().into()]).await?
         }
         RenameTarget::Column(c) => {
-            conn.query_with(
-                DEPENDENCIES_COLUMN,
-                &[table.as_str().into(), c.name.as_str().into()],
-            )
-            .await?
+            conn.query_with(by_column, &[table.as_str().into(), c.name.as_str().into()])
+                .await?
         }
     };
     for row in dependencies {
@@ -986,7 +1118,12 @@ mod tests {
     /// rename.
     #[test]
     fn the_dependency_queries_deduplicate_and_exclude_constraints() {
-        for sql in [DEPENDENCIES_TABLE, DEPENDENCIES_COLUMN] {
+        for sql in [
+            DEPENDENCIES_TABLE,
+            DEPENDENCIES_COLUMN,
+            CATALOG_DEPENDENCIES_TABLE,
+            CATALOG_DEPENDENCIES_COLUMN,
+        ] {
             assert!(sql.contains("SELECT DISTINCT"), "{sql}");
             assert!(sql.contains("o.type IN ("), "{sql}");
             assert!(
@@ -998,6 +1135,57 @@ mod tests {
         // every referrer.
         assert!(DEPENDENCIES_COLUMN.contains("referenced_minor_id"));
         assert!(!DEPENDENCIES_TABLE.contains("referenced_minor_id"));
+        assert!(CATALOG_DEPENDENCIES_COLUMN.contains("referenced_minor_id"));
+        assert!(!CATALOG_DEPENDENCIES_TABLE.contains("referenced_minor_id"));
+    }
+
+    /// SQL Server 2008 to 2012 want `CONTROL` on the table for
+    /// `sys.dm_sql_referencing_entities`, so they read the view; 2014 and every
+    /// Azure SQL, whose banner says 12.x, read the functions. A version that
+    /// does not parse reads the functions, which fail loudly where they cannot
+    /// answer.
+    #[test]
+    fn only_servers_before_2014_read_a_renames_referrers_from_the_view() {
+        for (version, edition, read) in [
+            (
+                "10.0.6000.29",
+                "Standard Edition (64-bit)",
+                DependencyRead::Catalog,
+            ),
+            (
+                "10.50.6000.34",
+                "Enterprise Edition (64-bit)",
+                DependencyRead::Catalog,
+            ),
+            (
+                "11.0.7001.0",
+                "Express Edition (64-bit)",
+                DependencyRead::Catalog,
+            ),
+            (
+                "12.0.6024.0",
+                "Standard Edition (64-bit)",
+                DependencyRead::Functions,
+            ),
+            ("12.0.2000.8", "SQL Azure", DependencyRead::Functions),
+            (
+                "14.0.3550.4",
+                "Developer Edition (64-bit)",
+                DependencyRead::Functions,
+            ),
+            (
+                "17.0.4075.5",
+                "Developer Edition (64-bit)",
+                DependencyRead::Functions,
+            ),
+            ("", "Developer Edition (64-bit)", DependencyRead::Functions),
+        ] {
+            assert_eq!(
+                DependencyRead::for_server(version, edition),
+                read,
+                "{version} {edition}"
+            );
+        }
     }
 
     #[test]
