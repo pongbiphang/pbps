@@ -3942,7 +3942,20 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
   retypes a column of its parent. Its pre-flight probe reads the stored rows
   before the retype converts them, and the probe knows the plan's retypes by
   table, not which table is whose partition, so it would test values the
-  engine never checks (DECISIONS 410). The remedy is two plans.
+  engine never checks (DECISIONS 410). The remedy is two plans;
+- a rename into a name the same plan drops. The apply guard builds no undo
+  for a dropped name taken again (DEC-541.1), and the pre-flight and the
+  guard key a partition's probes and carried indexes by the partition's own
+  name. The remedy is two plans, the drop first;
+- in a connected plan, a function dropped or rebuilt that a part of one of
+  the parent's partitions depends on. The connected passes key parts by the
+  partition's name and cannot follow the parent's column change into it. The
+  remedy is two plans.
+
+These last three, and the conservative same-name rule in
+`after_their_functions` below, stand until #1699. That issue gives every
+consumer the partition-to-parent relation, so that a partition's column is
+looked up as its parent's (leon, 2026-10-09).
 
 A key column renamed is not a change of the partitioning.
 

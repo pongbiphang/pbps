@@ -695,10 +695,57 @@ pub(crate) fn weave(
 ) -> Result<usize, String> {
     let roots = dropped_modules(cs);
     let mut refused: Vec<String> = Vec::new();
+    // The parents whose columns this plan changes (#1687). A partition's
+    // copy of its parent's default, or its own part on the parent's column,
+    // is a dependent this pass cannot follow through the parent's change
+    // yet: it keys parts by the partition's own name (#1692 review, #1699).
+    let parents_changing: BTreeSet<&TableName> = cs
+        .changes
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.change,
+                Change::AddColumn { .. }
+                    | Change::RenameColumn { .. }
+                    | Change::DropColumn { .. }
+                    | Change::AlterColumnType { .. }
+                    | Change::AlterColumnNullability { .. }
+                    | Change::AlterColumnDefault { .. }
+            )
+        })
+        .filter_map(|p| p.change.table())
+        .filter(|t| {
+            declared
+                .tables
+                .get(*t)
+                .is_some_and(|t| t.partition_by.is_some())
+        })
+        .collect();
     for (root, _) in &roots {
         let Some(deps) = found.get(root) else {
             continue;
         };
+        let under_a_changing_parent: Vec<(&TableName, &TableName)> = deps
+            .iter()
+            .filter_map(|d| match &d.holds {
+                Holds::TablePart { table, .. } => declared
+                    .tables
+                    .get(table)
+                    .and_then(|t| t.partition_of.as_ref())
+                    .filter(|of| parents_changing.contains(&of.parent))
+                    .map(|of| (table, &of.parent)),
+                Holds::Module(_) | Holds::Unrepresentable(_) => None,
+            })
+            .collect();
+        if let Some((partition, parent)) = under_a_changing_parent.first() {
+            refused.push(format!(
+                "`{root}` is dropped or rebuilt, and a part of the partition {partition} depends \
+                 on it while this plan changes the columns of its parent {parent}, which this \
+                 plan cannot follow into the partition yet (#1699). Change {parent}'s columns \
+                 and `{root}` in separate plans"
+            ));
+            continue;
+        }
         let blocked: Vec<Dependent> = deps
             .iter()
             .filter(|d| {
@@ -4541,6 +4588,63 @@ mod tests {
         // Negative: without the attach, the same undeclared check is refused.
         let mut alone = plan(vec![alter(&s, "app.f(integer)")]);
         weave(&mut alone, &found, &s, &[&ids], pg().as_ref()).expect_err("not declared");
+    }
+
+    /// A rebuilt function a partition's part depends on, while the plan
+    /// changes its parent's columns: refused by name with the two-plan
+    /// remedy, since this pass keys parts by the partition's own name and
+    /// cannot follow the parent's change into it (#1692 review, #1699). The
+    /// same rebuild without the parent's change is not this refusal.
+    #[test]
+    fn a_rebuild_under_a_partition_whose_parent_changes_columns_is_refused_by_name() {
+        let (mut s, ids) = declared();
+        let mut parent = Table::default();
+        parent
+            .columns
+            .insert("m".into(), Column::new("integer".parse().unwrap()));
+        parent.partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["m".into()],
+        });
+        s.tables.insert(TableName::new("app", "ev"), parent);
+        s.tables.insert(
+            TableName::new("app", "ev_1"),
+            Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: TableName::new("app", "ev"),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Table::default()
+            },
+        );
+        let found = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![Dependent {
+                described: "default value for column m of table app.ev_1".into(),
+                holds: Holds::TablePart {
+                    table: TableName::new("app", "ev_1"),
+                    part: Part::Default("m".into()),
+                },
+            }],
+        )]);
+        let default_change = Change::AlterColumnDefault {
+            uid: "c_a1b2c3".parse().unwrap(),
+            column: pbps_model::ColumnRef::new(TableName::new("app", "ev"), "m"),
+            from: Some("app.f(1)".into()),
+            to: None,
+        };
+        let mut cs = plan(vec![default_change, alter(&s, "app.f(integer)")]);
+        let e = weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect_err("refused");
+        assert!(
+            e.contains("while this plan changes the columns of its parent app.ev")
+                && e.contains("Change app.ev's columns and `app.f(integer)` in separate plans"),
+            "{e}"
+        );
+        // Negative: the rebuild alone is answered as before, not this way.
+        let mut alone = plan(vec![alter(&s, "app.f(integer)")]);
+        if let Err(e) = weave(&mut alone, &found, &s, &[&ids], pg().as_ref()) {
+            assert!(!e.contains("#1699"), "{e}");
+        }
     }
 
     #[test]

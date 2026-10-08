@@ -3214,6 +3214,16 @@ fn refuse_partition_changes(
             }
         })
         .collect();
+    let dropped_columns: BTreeSet<(&TableName, &String)> = changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::DropColumn { column, .. } = c {
+                Some((&column.table, &column.name))
+            } else {
+                None
+            }
+        })
+        .collect();
     let retyped_parents: BTreeSet<&TableName> = changes
         .iter()
         .filter_map(|c| {
@@ -3357,6 +3367,20 @@ fn refuse_partition_changes(
                         "{}, an identity column, which a partitioned table's partitions are not \
                          read back with yet (#1681)",
                         change_in_words(change)
+                    ),
+                );
+            } else if let Change::RenameColumn { to, .. } = change
+                && dropped_columns.contains(&(table, to))
+            {
+                // A name the plan drops, taken by a rename: the apply guard
+                // builds no undo for it (DEC-541.1), and the pre-flight and
+                // the guard key the partitions' carried indexes and probes by
+                // the partition's name (#1692 review, #1699).
+                refuse(
+                    table,
+                    format!(
+                        "rename column `{column}` into `{to}`, a name this plan drops; drop the \
+                         column and rename into its name in separate plans"
                     ),
                 );
             } else if let Some(tables) = moving.get(table)
@@ -6758,7 +6782,7 @@ mod tests {
 
         // From another base, through revisions: one revision cannot rename
         // into a name it also drops, so a swap takes two.
-        let from = |base: &Schema, revisions: &[(&Schema, &[Intent])]| {
+        let from_outcome = |base: &Schema, revisions: &[(&Schema, &[Intent])]| {
             let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
                 .unwrap()
                 .ids;
@@ -6781,15 +6805,25 @@ mod tests {
                 &MinimalDialect,
                 &Hints::default(),
             )
-            .unwrap_or_else(|e| panic!("refused: {e:?}"))
-            .changes
-            .into_iter()
-            .map(|p| p.change)
-            .collect::<Vec<_>>()
+            .map(|cs| cs.changes.into_iter().map(|p| p.change).collect::<Vec<_>>())
+            .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
-        // `n` dropped and `m` renamed into its name (#1692 review): `a`'s own
-        // default on the surviving column is compared with its own on `m`,
-        // not with the dropped `n`'s.
+        let from = |base: &Schema, revisions: &[(&Schema, &[Intent])]| {
+            from_outcome(base, revisions).unwrap_or_else(|e| panic!("refused: {e:?}"))
+        };
+        let reuse_refused = |errors: Vec<String>, from: &str, to: &str| {
+            assert!(
+                errors.iter().any(|e| e.contains(&format!(
+                    "rename column `{from}` into `{to}`, a name this plan drops; drop the column \
+                     and rename into its name in separate plans"
+                ))),
+                "{errors:?}"
+            );
+        };
+        // `n` dropped and `m` renamed into its name: refused by name, since
+        // the apply guard, the pre-flight and the connected passes cannot
+        // follow a dropped name taken again into the partitions yet (#1692
+        // review, #1699).
         let handoff_base = tree(
             parent(),
             &[("m", own_default("7")), ("n", own_default("8"))],
@@ -6813,7 +6847,7 @@ mod tests {
             &[("m", own_default("7"))],
             &[],
         );
-        let planned_handoff = from(
+        let refused_handoff = from_outcome(
             &handoff_base,
             &[
                 (
@@ -6836,11 +6870,10 @@ mod tests {
                 ),
             ],
         );
-        assert!(
-            planned_handoff.iter().any(|c| matches!(c,
-                Change::SetPartitionDefault { table, column, from: Some(f), to: Some(t), .. }
-                    if table.to_string() == "app.a" && column == "n" && f == "7" && t == "8")),
-            "{planned_handoff:?}"
+        reuse_refused(
+            refused_handoff.expect_err("a dropped name reused"),
+            "m",
+            "n",
         );
         // A retype that drops NOT NULL with it: the partitions' NOT NULLs
         // follow the retype, which carries the parent's change (#1692
@@ -6894,8 +6927,8 @@ mod tests {
                 < at(&|c| matches!(c, Change::CreateTable { .. })),
             "{grew:?}"
         );
-        // A non-key column dropped and the key column renamed into its name
-        // is planned: the drop is the old occupant's (#1692 review).
+        // A non-key column dropped and the key column renamed into its name:
+        // the same refusal, which the key's own checks never reach.
         let spare_base = with(
             &|p| {
                 p.columns.insert("spare".into(), Column::new(ty("int")));
@@ -6917,7 +6950,7 @@ mod tests {
             &keep_b,
         );
         let without_spare = with(&|_| {}, &keep_a, &keep_b);
-        let swapped = from(
+        let swapped = from_outcome(
             &spare_base,
             &[
                 (
@@ -6940,14 +6973,10 @@ mod tests {
                 ),
             ],
         );
-        assert!(
-            swapped
-                .iter()
-                .any(|c| matches!(c, Change::DropColumn { .. }))
-                && swapped
-                    .iter()
-                    .any(|c| matches!(c, Change::RenameColumn { .. })),
-            "{swapped:?}"
+        reuse_refused(
+            swapped.expect_err("the key renamed into a dropped name"),
+            "ts",
+            "spare",
         );
         // The key column moved out of `ts` and a non-key column into it,
         // then retyped: the retype is the non-key column's (#1692 review).
