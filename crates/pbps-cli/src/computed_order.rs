@@ -327,10 +327,25 @@ struct AddedCall {
     table: TableName,
     column: String,
     names: Vec<(String, String)>,
+    /// The table's columns when the computed column is added: the declared
+    /// ones, since a column the plan drops is gone first and one it adds
+    /// comes first.
+    columns: Vec<String>,
 }
 
 /// Each computed column this plan adds, new or again, with its names.
-fn added_calls(cs: &ChangeSet, dialect: &dyn pbps_dialect::Dialect) -> Vec<AddedCall> {
+fn added_calls(
+    cs: &ChangeSet,
+    declared: &pbps_model::Schema,
+    dialect: &dyn pbps_dialect::Dialect,
+) -> Vec<AddedCall> {
+    let columns_of = |table: &TableName| {
+        declared
+            .tables
+            .get(table)
+            .map(|t| t.columns.keys().cloned().collect())
+            .unwrap_or_default()
+    };
     let mut out = Vec::new();
     for p in &cs.changes {
         if let Change::AddComputedColumn {
@@ -343,6 +358,7 @@ fn added_calls(cs: &ChangeSet, dialect: &dyn pbps_dialect::Dialect) -> Vec<Added
                 table: table.clone(),
                 column: name.clone(),
                 names: dialect.qualified_calls(&computed.expression),
+                columns: columns_of(table),
             });
         }
         if let Change::CreateTable { name, table, .. } = &p.change {
@@ -351,6 +367,7 @@ fn added_calls(cs: &ChangeSet, dialect: &dyn pbps_dialect::Dialect) -> Vec<Added
                     table: name.clone(),
                     column: column.clone(),
                     names: dialect.qualified_calls(&computed.expression),
+                    columns: table.columns.keys().cloned().collect(),
                 });
             }
         }
@@ -363,10 +380,11 @@ fn added_calls(cs: &ChangeSet, dialect: &dyn pbps_dialect::Dialect) -> Vec<Added
 /// to compare: no function changed, or no added computed column names one.
 pub(crate) fn added_call_spellings(
     cs: &ChangeSet,
+    declared: &pbps_model::Schema,
     dialect: &dyn pbps_dialect::Dialect,
 ) -> BTreeSet<String> {
     let functions = functions_changed(cs);
-    let calls = added_calls(cs, dialect);
+    let calls = added_calls(cs, declared, dialect);
     if functions.is_empty() || calls.iter().all(|c| c.names.is_empty()) {
         return BTreeSet::new();
     }
@@ -376,10 +394,14 @@ pub(crate) fn added_call_spellings(
         out.insert(f.name);
     }
     for call in calls {
+        if call.names.is_empty() {
+            continue;
+        }
         for (schema, name) in call.names {
             out.insert(schema);
             out.insert(name);
         }
+        out.extend(call.columns);
     }
     out
 }
@@ -392,8 +414,17 @@ pub(crate) fn added_call_spellings(
 /// `dbo.café`, which the screen does not see. The column is added before the
 /// function changes (class 9 before 14), and SQL Server then refuses the
 /// alter (3729) or the add, inside the apply.
+///
+/// One exception, measured on 17.0 under `CI_AI` (#1668 review): a call
+/// whose first part is a column of the table may be the column's method,
+/// `geo.STAsText()`. A function the plan drops is gone before the add, which
+/// then binds the method, so that drop refuses nothing. While a function of
+/// that name exists the engine rejects the call as ambiguous (327), and one
+/// created after the add leaves the table's computed columns unloadable
+/// (474), so an alter or a create still refuses.
 pub(crate) fn refuse_added_calls(
     cs: &ChangeSet,
+    declared: &pbps_model::Schema,
     dialect: &dyn pbps_dialect::Dialect,
     alike: &Alike,
 ) -> Result<(), String> {
@@ -403,10 +434,15 @@ pub(crate) fn refuse_added_calls(
         table,
         column,
         names,
-    } in added_calls(cs, dialect)
+        columns,
+    } in added_calls(cs, declared, dialect)
     {
         for (schema, name) in &names {
+            let a_method = columns.iter().any(|c| alike.same(schema, c));
             for (function, what) in &functions {
+                if *what == "drops" && a_method {
+                    continue;
+                }
                 if alike.same(schema, &function.schema) && alike.same(name, &function.name) {
                     refused.push(format!(
                         "computed column {table}.{column} calls `{function}` as `{schema}.{name}` \
@@ -617,10 +653,25 @@ mod tests {
             changes: vec![add(expression), change],
         };
         let dialect = pbps_mssql::Mssql;
+        // dbo.t as declared, with these columns.
+        let declared = |columns: &[&str]| {
+            let mut table = pbps_model::Table::default();
+            for column in columns {
+                table.columns.insert(
+                    (*column).to_owned(),
+                    pbps_model::Column::new("int".parse().unwrap()),
+                );
+            }
+            let mut schema = pbps_model::Schema::default();
+            schema.tables.insert(t("dbo.t"), table);
+            schema
+        };
+        let plain = declared(&["id", "a"]);
         let ai = Alike::from_pairs([("cafe".to_owned(), "café".to_owned())]);
         let ai_geo = || Alike::from_pairs([("geo".to_owned(), "géo".to_owned())]);
         let refused = refuse_added_calls(
             &plan("[dbo].[cafe]([a])", drop_module("dbo.café")),
+            &plain,
             &dialect,
             &ai,
         )
@@ -634,6 +685,7 @@ mod tests {
         assert!(
             refuse_added_calls(
                 &plan("[dbo].[cafe]([a])", drop_module("dbo.café")),
+                &plain,
                 &dialect,
                 &Alike::default()
             )
@@ -643,7 +695,13 @@ mod tests {
         // review).
         for longer in ["dbo.cafe#helper([a])", "dbo.cafe@x([a])", "dbo.cafe$1([a])"] {
             assert!(
-                refuse_added_calls(&plan(longer, drop_module("dbo.café")), &dialect, &ai).is_ok(),
+                refuse_added_calls(
+                    &plan(longer, drop_module("dbo.café")),
+                    &plain,
+                    &dialect,
+                    &ai
+                )
+                .is_ok(),
                 "{longer}"
             );
         }
@@ -651,15 +709,25 @@ mod tests {
         assert!(
             refuse_added_calls(
                 &plan("[geo].Lat", drop_module("géo.Lat")),
+                &plain,
                 &dialect,
                 &ai_geo()
             )
             .is_ok()
         );
+        // A column's method, `geo.STAsText()`, beside a function `géo.STAsText`
+        // the plan drops: gone before the add, which binds the method
+        // (#1668 review). With no such column it is a call to the dropped
+        // function, and refused.
+        let geo = Alike::from_pairs([("geo".to_owned(), "géo".to_owned())]);
+        let method = plan("geo.STAsText()", drop_module("géo.STAsText"));
+        assert!(refuse_added_calls(&method, &declared(&["id", "geo"]), &dialect, &geo).is_ok());
+        assert!(refuse_added_calls(&method, &plain, &dialect, &geo).is_err());
         // Another schema.
         assert!(
             refuse_added_calls(
                 &plan("[x].[cafe]([a])", drop_module("dbo.café")),
+                &plain,
                 &dialect,
                 &ai
             )
@@ -670,13 +738,16 @@ mod tests {
             id: ModuleId::Named(t("dbo.café")),
             kind: ModuleKind::View,
         });
-        assert!(refuse_added_calls(&plan("[dbo].[cafe]([a])", view), &dialect, &ai).is_ok());
+        assert!(
+            refuse_added_calls(&plan("[dbo].[cafe]([a])", view), &plain, &dialect, &ai).is_ok()
+        );
         // Nothing to ask the engine without a function change.
         assert!(
             added_call_spellings(
                 &ChangeSet {
                     changes: vec![add("[dbo].[cafe]([a])")]
                 },
+                &plain,
                 &dialect
             )
             .is_empty()

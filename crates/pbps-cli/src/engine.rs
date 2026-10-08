@@ -778,14 +778,19 @@ pub async fn order_computed_by_edges(conn: &mut Conn, cs: &mut ChangeSet) -> any
 /// the names under the database's collation (#1459, DEC-1459.1). Only the
 /// collation is asked, not `sys.sql_expression_dependencies`, which has no
 /// edge for an expression not yet stored, so no grant beyond reading names.
-pub async fn refuse_added_computed_calls(conn: &mut Conn, cs: &ChangeSet) -> anyhow::Result<()> {
+pub async fn refuse_added_computed_calls(
+    conn: &mut Conn,
+    cs: &ChangeSet,
+    declared: &pbps_model::Schema,
+) -> anyhow::Result<()> {
     if conn.driver() != Driver::Mssql {
         return Ok(());
     }
     let dialect = pbps_mssql::Mssql;
-    let spellings: Vec<String> = crate::computed_order::added_call_spellings(cs, &dialect)
-        .into_iter()
-        .collect();
+    let spellings: Vec<String> =
+        crate::computed_order::added_call_spellings(cs, declared, &dialect)
+            .into_iter()
+            .collect();
     if spellings.is_empty() {
         return Ok(());
     }
@@ -796,7 +801,7 @@ pub async fn refuse_added_computed_calls(conn: &mut Conn, cs: &ChangeSet) -> any
             .into_iter()
             .map(|(a, b)| (spellings[a].clone(), spellings[b].clone())),
     );
-    crate::computed_order::refuse_added_calls(cs, &dialect, &alike)
+    crate::computed_order::refuse_added_calls(cs, declared, &dialect, &alike)
         .map_err(|why| anyhow::anyhow!("computed_dependencies (SQL Server): {why}"))
 }
 

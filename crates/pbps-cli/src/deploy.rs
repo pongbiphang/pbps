@@ -6454,7 +6454,7 @@ pub fn cmd_plan_db(
             crate::engine::order_computed_by_edges(&mut conn, &mut cs).await?;
             // What an added computed column calls has no edge yet; its names
             // are compared under the collation instead (#1459).
-            crate::engine::refuse_added_computed_calls(&mut conn, &cs).await?;
+            crate::engine::refuse_added_computed_calls(&mut conn, &cs, &declared).await?;
             // Last of the passes that order the plan, so the order it settles
             // from the catalog is the one checked below and saved (#1366).
             crate::engine::order_created_object_names(&mut conn, &mut cs, &target.label).await?;

@@ -3354,17 +3354,23 @@ column inside the planning transaction or on a scratch database, would be
 exact, but `plan --db` would then take a schema lock on a live table or need
 `CREATE DATABASE`. A computed column calls a function only by a two-part
 name, so the names it calls and the collation that compares them decide
-which function it calls. The maintainer chose this (2026-10-08). A spatial
-column's method, `geo.STAsText()`, has a call's shape too. Where its column
-and method equal, under the collation, a schema and a function the plan
-changes, the plan is refused, and so is the engine's own statement: SQL
-Server rejects such a call as ambiguous while the function exists (Msg 327,
-measured on 17.0, `[géo]` for `geo` under `CI_AI` included).
+which function it calls. The maintainer chose this (2026-10-08).
+
+**A column's method.** `geo.STAsText()` over a spatial column has a call's
+shape too. Measured on 17.0 under `CI_AI`, where `[géo]` and `geo` are one
+schema: while a function `géo.STAsText` exists the engine rejects the call as
+ambiguous (Msg 327), and a function created after the column leaves the
+table's computed columns unloadable (Msg 474). One dropped before the add is
+gone, and the add binds the method. So a call whose first part is a column of
+the table, as declared, is not refused for a function the plan drops, and
+still is for one it alters or creates.
 
 Pinned by the live `a_readded_computed_columns_calls_are_compared_under_the_collation`
 (`crates/pbps-cli/tests/flow.rs`): under `CI_AI`, re-declaring the column as
 `[dbo].[cafe]` while `café` is altered is refused at `plan --db`, and
-re-declaring it to call `dbo.g` plans. Also by the units
+re-declaring it to call `dbo.g` plans; adding `([geo].[STAsText]())` over a
+geography column while dropping `[géo].[STAsText]` plans, applies and
+verifies. Also by the units
 `an_added_computed_column_is_refused_by_the_collations_reading_of_its_calls`
 (another schema, a spelling the collation keeps apart and a view's drop
 refuse nothing) and `qualified_calls_are_read_from_code_as_written` (no name
