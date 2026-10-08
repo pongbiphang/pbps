@@ -315,10 +315,11 @@ indexes:
   inside it (DEC-1545.1). A standing parent's columns change as a table's
   do: added, dropped, retyped, renamed, a default or NOT NULL changed, the
   engine recursing each into every partition, whose own defaults and NOT
-  NULLs follow (DEC-1687.1). A key column is never dropped or retyped. Every
-  other change stays refused by name: the parent's indexes, keys, checks and
-  foreign keys, and its rename, until #1688–#1690, and attaching as the
-  DEFAULT partition until #1639.
+  NULLs follow (DEC-1687.1). A key column is never dropped or retyped, and the
+  columns do not change in a plan that attaches or detaches under the
+  parent. Every other change stays refused by name: the parent's indexes,
+  keys, checks and foreign keys, and its rename, until #1688–#1690, and
+  attaching as the DEFAULT partition until #1639.
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

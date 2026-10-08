@@ -3131,6 +3131,9 @@ fn refuse_partition_changes(
             .is_some_and(|t| t.partition_by.is_some() || t.partition_of.is_some())
     };
     let mut refused: BTreeMap<TableName, Vec<String>> = BTreeMap::new();
+    // The tables this plan attaches under each parent or detaches from it.
+    let mut moving: BTreeMap<TableName, Vec<TableName>> = BTreeMap::new();
+    let mut columns_meet_moves: BTreeSet<TableName> = BTreeSet::new();
     let mut refuse = |table: &TableName, what: String| {
         let list = refused.entry(table.clone()).or_default();
         if !list.contains(&what) {
@@ -3152,6 +3155,19 @@ fn refuse_partition_changes(
             let detached =
                 b.partition_of.is_some() && d.partition_of.is_none() && d.partition_by.is_none();
             let attached = b.partition_of.is_none() && d.partition_of.is_some();
+            let parent = if detached {
+                b.partition_of.as_ref()
+            } else if attached {
+                d.partition_of.as_ref()
+            } else {
+                None
+            };
+            if let Some(of) = parent {
+                moving
+                    .entry(of.parent.clone())
+                    .or_default()
+                    .push(declared_name.clone());
+            }
             fn where_(t: &Table) -> Option<(&TableName, &pbps_model::PartitionBound)> {
                 t.partition_of.as_ref().map(|of| (&of.parent, &of.bound))
             }
@@ -3302,6 +3318,25 @@ fn refuse_partition_changes(
                         change_in_words(change)
                     ),
                 );
+            } else if let Some(tables) = moving.get(table)
+                && !matches!(change, Change::SetColumnDeprecated { .. })
+            {
+                // An attach or a detach meets the parent's columns as they
+                // stand at that statement, and the table on its other side
+                // holds them as declared at the other end of the plan: each
+                // column change would need its own place against each
+                // transition (#1692 review). Two plans keep each simple.
+                let tables: Vec<String> = tables.iter().map(ToString::to_string).collect();
+                columns_meet_moves.insert(table.clone());
+                refuse(
+                    table,
+                    format!(
+                        "{} while this plan attaches or detaches {}; change the columns and the \
+                         partitions in separate plans",
+                        change_in_words(change),
+                        tables.join(", ")
+                    ),
+                );
             }
             continue;
         }
@@ -3334,6 +3369,12 @@ fn refuse_partition_changes(
             refuse(table, change_in_words(change));
         }
     }
+    // A detach refused above for its parent's column changes is not also a
+    // shape the detach cannot take: its declaration holds the columns as the
+    // refused changes leave them.
+    errs.retain(|e| {
+        !matches!(e, DiffError::DetachedShape { parent, .. } if columns_meet_moves.contains(parent))
+    });
     errs.extend(
         refused
             .into_iter()
@@ -8564,6 +8605,54 @@ mod tests {
                 .any(|e| e.contains("its columns are not its parent's")),
             "{errors:?}"
         );
+        // The parent's columns changed while a partition is detached or
+        // attached in the same plan: refused by name, with the two-plan
+        // remedy, and not also as a detached shape (#1692 review).
+        let mut kept = Column::new(ty("int")).not_null();
+        kept.default = Some("7".into());
+        let grown = |s: &mut Schema| {
+            for t in s.tables.values_mut() {
+                if t.partition_of.is_none() {
+                    t.columns.insert("x".into(), Column::new(ty("int")));
+                }
+            }
+        };
+        let mut detached_grown = detached(kept.clone());
+        grown(&mut detached_grown);
+        // Attached as a range: the DEFAULT partition is not attached here.
+        let mut ranged = tree.clone();
+        if let Some(of) = ranged
+            .tables
+            .get_mut(&p)
+            .and_then(|t| t.partition_of.as_mut())
+        {
+            of.bound = PartitionBound::Range {
+                from: vec![pbps_model::BoundDatum::Value("2024-01-01".into())],
+                to: vec![pbps_model::BoundDatum::Value("2025-01-01".into())],
+            };
+        }
+        let mut grown_tree = ranged.clone();
+        grown(&mut grown_tree);
+        for (base, declared) in [
+            (&tree, &detached_grown),
+            (&detached(kept.clone()), &grown_tree),
+        ] {
+            let errors: Vec<String> = outcome(base, declared)
+                .expect_err("columns changed across an attach or a detach")
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            assert!(
+                errors.iter().any(|e| e.contains(
+                    "while this plan attaches or detaches app.p; change the columns and the \
+                     partitions in separate plans"
+                )) && !errors.iter().any(|e| e.contains("not its parent's")),
+                "{errors:?}"
+            );
+        }
+        // Negative: each half alone is planned.
+        outcome(&ranged, &grown_tree).expect("the parent's column alone");
+        outcome(&detached(kept.clone()), &ranged).expect("the attach alone");
     }
 
     /// A partition's own checks and indexes (#1577) are created with it, are

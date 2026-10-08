@@ -2578,7 +2578,8 @@ fn names_table(id: &ModuleId, definition: &str, table: &TableName) -> bool {
 }
 
 /// Whether a change of a table may name the new column `column` of `table`.
-/// A change of another table names it only as a foreign key's target.
+/// A change of another table names it only as a foreign key's target, or as
+/// a new partition's own entry on its parent's column.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn names_column(change: &Change, table: &TableName, column: &str) -> bool {
     let named = |text: &str| pbps_pg::generated::may_read(text, column);
@@ -2586,6 +2587,16 @@ fn names_column(change: &Change, table: &TableName, column: &str) -> bool {
     if let Change::AddForeignKey { constraint, .. } = change
         && &constraint.references_table == table
         && listed(&constraint.references_columns)
+    {
+        return true;
+    }
+    // A partition created under the table sets its own default or NOT NULL
+    // on the parent's column right after its `CREATE`, so it needs each
+    // column it holds one on (#1692 review).
+    if let Change::CreateTable { table: t, .. } = change
+        && let Some(of) = &t.partition_of
+        && &of.parent == table
+        && of.columns.contains_key(column)
     {
         return true;
     }
@@ -3704,6 +3715,60 @@ mod tests {
         // Negative: the other tree calls nothing and stays ahead.
         assert!(table_at("app.other_1") < function, "{order:?}");
         assert!(table_at("app.other") < table_at("app.other_1"), "{order:?}");
+    }
+
+    /// A column a standing parent adds, held behind the function its default
+    /// calls, takes with it a new partition that sets its own default on that
+    /// column (#1692 review): the partition's `ALTER COLUMN` needs the column.
+    /// A new partition with its own entries on other columns only is free.
+    #[test]
+    fn a_held_parent_column_takes_the_new_partitions_that_set_their_own_on_it() {
+        let partition = |name: &str, column: &str| Change::CreateTable {
+            uid: Uid::derived(UidKind::Table, name, 0),
+            name: name.parse().unwrap(),
+            table: Box::new(Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: [(
+                        column.to_owned(),
+                        pbps_model::PartitionColumn {
+                            default: Some("5".to_owned()),
+                            not_null: false,
+                        },
+                    )]
+                    .into(),
+                }),
+                ..Table::default()
+            }),
+        };
+        let mut extra = Column::new("integer".parse().unwrap());
+        extra.default = Some("app.f()".into());
+        let mut cs = plan(vec![
+            Change::AddColumn {
+                uid: "c_a1b2c3".parse().unwrap(),
+                table: TableName::new("app", "ev"),
+                name: "extra".into(),
+                column: Box::new(extra),
+            },
+            partition("app.ev_new", "extra"),
+            partition("app.ev_plain", "v"),
+            routine("app.f()", "SELECT 1"),
+        ]);
+        rebuilds(&mut cs, &BTreeSet::new());
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let table_at = |name: &str| {
+            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.to_string() == name))
+        };
+        let function =
+            at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f()")));
+        let added = at(&|c| matches!(c, Change::AddColumn { .. }));
+        let order = names(&cs);
+        assert!(function < added, "{order:?}");
+        assert!(added < table_at("app.ev_new"), "{order:?}");
+        // Negative: a partition with nothing of its own on `extra` stays ahead.
+        assert!(table_at("app.ev_plain") < function, "{order:?}");
     }
 
     /// A new table held back for its generation expression does not drag an

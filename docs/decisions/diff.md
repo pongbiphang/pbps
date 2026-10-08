@@ -3931,7 +3931,13 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
   the declared one, since one plan can move a name off the key's column and
   another column into it;
 - an identity column added, whose partitions cannot be read back yet (#1681);
-- a generation expression changed in place.
+- a generation expression changed in place;
+- any of these but a deprecation while the same plan attaches a table under
+  the parent or detaches one from it. The transition meets the parent's
+  columns as they stand at its statement, and the table on its other side
+  holds them as declared at the other end of the plan, so each column change
+  would need its own place against each transition. The remedy is two plans,
+  the columns first or the partitions first.
 
 A key column renamed is not a change of the partitioning.
 
@@ -3957,7 +3963,9 @@ These partition changes sort at (9, 4), after their parent's change of class 9,
 which includes a retype that changes the column's nullability with it. A
 partition the same plan creates under a parent whose columns change sorts at
 (9, 5): it is created with its own default or NOT NULL on a column the parent
-may only now add or retype.
+may only now add or retype. The connected pass that holds an added column
+behind the function its default calls (`after_their_functions`, DEC-1364.1)
+holds such a partition behind the column too.
 
 **Why not drop the partition's own NOT NULL before the parent's tightening.**
 It would leave no local NOT NULL behind on 18, but it orders a partition
@@ -3968,8 +3976,12 @@ rule above already handles.
 **The apply guard.** The undo of a plan's column renames (`Renames::apply`)
 renames a parent's key and a partition's own column entries too, so both
 reads compare under one set of names. A partition of a parent whose column the
-plan drops or makes NOT NULL is held field by field, to what the parent's
-change leaves it. Otherwise it would be compared whole and called moved.
+plan drops, renames or makes NOT NULL is held field by field, to what the
+parent's change leaves it. Otherwise it would be compared whole and called
+moved. Where the parent's column names change hands in the plan (DEC-541.1),
+undoing would put two columns' own entries under one name, so a partition's
+own entries are compared under the names the plan leaves instead, as the
+parent's columns are.
 
 **The cost estimate** names the recursion. On a partitioned table it says the
 statement recurses into its partitions, how many, and the lock it takes on
