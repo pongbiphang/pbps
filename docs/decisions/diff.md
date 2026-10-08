@@ -3522,11 +3522,22 @@ give an index of its own. Every other match is dropped before the attach, and
 one the declaration keeps is added after it. With none left, the engine
 builds the clone under a name of its own choosing (`t_n_idx`, measured on
 18). A declared name that the engine's choice then takes is #1558's class.
-In another schema than its parent, an index with an expression or a filter
-is never left for the engine to choose: the same text may call another
-schema's function, and different text the same one. The engine compares what
-each is bound to, which the text does not say. So every such index is dropped
-before the attach, and one the declaration keeps is added after.
+An index with an expression or a filter is never left for the engine to
+choose, in any schema. The engine matches what each is bound to and how it
+parses, which the text does not say: `n+1` and `n + 1` are one index to it,
+and in another schema the same text may call another function. So every such
+index is dropped before the attach, and one the declaration keeps is added
+after.
+
+**A function rebuilt in the same plan** reaches the attached table's checks.
+Measured on 16 and 18, a check the table holds as its parent's becomes the
+parent's inherited copy once attached (`conislocal` false), which the engine
+refuses to drop on its own and the parent's drop takes with it. So the
+module's dependents leave it out (`its_parents_once_attached`): the parent's
+own check, declared, is removed and restored around the rebuild, and both
+reach the partition as they recurse. Only when the module's drop comes
+before the attach is the table's copy removed by itself, and it is never
+put back.
 
 **The attach validates the parent's foreign keys** over the rows it brings,
 as `ADD FOREIGN KEY` does. So the parents a plan attaches to are ordered

@@ -612,6 +612,53 @@ fn restoration_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Option<
     }
 }
 
+/// A check a table this plan attaches holds as its parent's. The parent's
+/// own, which the declarations hold and which depends on the same module, is
+/// removed and restored around the rebuild, and both reach the partition as
+/// they recurse, so this one is never put back. Measured on 16 and 18, once
+/// attached it is the parent's inherited copy, which the engine refuses to
+/// drop on its own and the parent's drop takes with it; only before the
+/// attach is it the table's to remove (#1642 review).
+fn its_parents_once_attached(changes: &[PlannedChange], holds: &Holds) -> bool {
+    attached_at(changes, holds).is_some()
+}
+
+/// Whether a check of a table this plan attaches goes with its parent's
+/// before `drop_at`: attached first, and the parent's check of its name
+/// dropped after the attach and before `drop_at`.
+fn taken_by_its_parent(changes: &[PlannedChange], holds: &Holds, drop_at: usize) -> bool {
+    let (
+        Some(attach),
+        Holds::TablePart {
+            part: Part::Check(name),
+            ..
+        },
+    ) = (attached_at(changes, holds), holds)
+    else {
+        return false;
+    };
+    let Change::AttachPartition { parent, .. } = &changes[attach].change else {
+        return false;
+    };
+    changes[attach..drop_at].iter().any(|p| {
+        matches!(&p.change, Change::DropCheck { table, name: n } if table == parent && n == name)
+    })
+}
+
+/// Where this plan attaches the table holding `holds`, a check.
+fn attached_at(changes: &[PlannedChange], holds: &Holds) -> Option<usize> {
+    let Holds::TablePart {
+        table,
+        part: Part::Check(_),
+    } = holds
+    else {
+        return None;
+    };
+    changes
+        .iter()
+        .position(|p| matches!(&p.change, Change::AttachPartition { table: t, .. } if t == table))
+}
+
 /// Puts every dependent of every module this plan drops on the right side of
 /// that drop: removed before it, and — when the declarations keep it —
 /// restored after the module's create. Returns how many changes it added.
@@ -649,7 +696,9 @@ pub(crate) fn weave(
                 let accounted = find(&cs.changes, &d.holds, removes).is_some()
                     || find(&cs.changes, &d.holds, removes_with_its_owner).is_some();
                 matches!(d.holds, Holds::Unrepresentable(_))
-                    || (!as_declared(&cs.changes, d).managed(declared) && !accounted)
+                    || (!as_declared(&cs.changes, d).managed(declared)
+                        && !accounted
+                        && !its_parents_once_attached(&cs.changes, &d.holds))
             })
             .cloned()
             .collect();
@@ -675,6 +724,9 @@ pub(crate) fn weave(
             let Some(at) = span(&cs.changes, root) else {
                 continue;
             };
+            if attached_at(&cs.changes, &d.holds).is_some_and(|i| i < at.drop_at) {
+                continue;
+            }
             // Removed before the module's drop: moved there if the plan
             // removes it later, synthesized there if it does not remove it.
             // Taken away with its table or column before the module goes:
@@ -2619,7 +2671,8 @@ pub(crate) fn unaccounted(
         for d in deps {
             let removed_first = find(&cs.changes, &d.holds, removes)
                 .or_else(|| find(&cs.changes, &d.holds, removes_with_its_owner))
-                .is_some_and(|i| i < at.drop_at);
+                .is_some_and(|i| i < at.drop_at)
+                || taken_by_its_parent(&cs.changes, &d.holds, at.drop_at);
             if !removed_first {
                 out.push(format!("{} depends on `{root}`", d.described));
             }
@@ -4209,6 +4262,84 @@ mod tests {
 
     /// The case the issue names: a function edit, and a check and a default
     /// the diff never mentioned. Removed before the rebuild, restored after.
+    #[test]
+    fn a_table_attached_while_its_checks_function_is_rebuilt_takes_its_parents_back() {
+        let (mut s, ids) = declared();
+        let check = || CheckConstraint {
+            expression: "app.f(id) >= 0".into(),
+        };
+        let mut parent = Table {
+            columns: s.tables[&TableName::new("app", "t")].columns.clone(),
+            ..Table::default()
+        };
+        parent.checks.insert("ck".into(), check());
+        parent.partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["id".into()],
+        });
+        s.tables.insert(TableName::new("app", "p"), parent);
+        let bound = pbps_model::PartitionBound::Range {
+            from: vec![pbps_model::BoundDatum::Value("0".into())],
+            to: vec![pbps_model::BoundDatum::Value("10".into())],
+        };
+        // Declared as the partition it becomes: the check is its parent's.
+        s.tables.insert(
+            TableName::new("app", "t"),
+            Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: TableName::new("app", "p"),
+                    bound: bound.clone(),
+                    columns: Default::default(),
+                }),
+                ..Table::default()
+            },
+        );
+        let mut cs = plan(vec![
+            Change::AttachPartition {
+                uid: "t_cccccc".parse().unwrap(),
+                table: TableName::new("app", "t"),
+                parent: TableName::new("app", "p"),
+                bound,
+                shape: Box::default(),
+            },
+            alter(&s, "app.f(integer)"),
+        ]);
+        let on = |table: &str| Dependent {
+            described: format!("constraint ck on table {table}"),
+            holds: Holds::TablePart {
+                table: table.parse().unwrap(),
+                part: Part::Check("ck".into()),
+            },
+        };
+        let found = BTreeMap::from([(id("app.f(integer)"), vec![on("app.t"), on("app.p")])]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect("woven");
+        let touched: Vec<String> = cs
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::DropCheck { table, .. } = &p.change {
+                    Some(format!("drop {table}"))
+                } else if let Change::AddCheck { table, .. } = &p.change {
+                    Some(format!("add {table}"))
+                } else if let Change::AttachPartition { .. } = &p.change {
+                    Some("attach".to_owned())
+                } else if let Change::AlterModule { .. } = &p.change {
+                    Some("alter".to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Attached before the rebuild: the parent's drop takes the copy.
+        assert_eq!(touched, ["attach", "drop app.p", "alter", "add app.p"]);
+        assert!(unaccounted(&cs, &found).is_empty());
+        let woven = cs.changes.len();
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect("woven again");
+        assert_eq!(cs.changes.len(), woven, "a fixed point");
+        // Negative: without the attach, the same undeclared check is refused.
+        let mut alone = plan(vec![alter(&s, "app.f(integer)")]);
+        weave(&mut alone, &found, &s, &[&ids], pg().as_ref()).expect_err("not declared");
+    }
+
     #[test]
     fn a_rebuilt_functions_check_and_default_go_before_it_and_come_back_after() {
         let (s, ids) = declared();

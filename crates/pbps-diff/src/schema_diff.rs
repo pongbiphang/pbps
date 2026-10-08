@@ -2809,22 +2809,20 @@ fn attached(
     let (own_indexes, parents_indexes) = (index(table), index(parent));
     let mut taken: BTreeSet<&String> = BTreeSet::new();
     let mut displaced = Vec::new();
-    // In another schema than its parent, an expression or a filter of the
-    // same text may call another schema's function, and of different text
-    // the same one: the engine compares what each is bound to, which the
-    // text does not say. So every such index is dropped before the attach,
-    // and one the declaration keeps added after it (#1642 review).
-    if base_name.schema != of.parent.schema {
-        for (name, index) in &table.indexes {
-            if index.filter.is_some()
-                || index
-                    .columns
-                    .iter()
-                    .any(|c| matches!(c.key, pbps_model::IndexKey::Expression(_)))
-            {
-                taken.insert(name);
-                displaced.push(name.clone());
-            }
+    // An expression or a filter is matched by the engine on what it is
+    // bound to and how it parses, which its text does not say: `n+1` and
+    // `n + 1` are one, and in another schema the same text may call another
+    // function. So every such index is dropped before the attach, and one
+    // the declaration keeps added after it, in any schema (#1642 review).
+    for (name, index) in &table.indexes {
+        if index.filter.is_some()
+            || index
+                .columns
+                .iter()
+                .any(|c| matches!(c.key, pbps_model::IndexKey::Expression(_)))
+        {
+            taken.insert(name);
+            displaced.push(name.clone());
         }
     }
     for definition in parents_indexes.values() {
@@ -6866,9 +6864,8 @@ mod tests {
         outcome(&g_base, &g_declared, &[])
             .2
             .expect("a generated column attaches in its parent's schema");
-        // An expression index kept as its own: in another schema it is
-        // dropped before the attach and built again after, in the parent's
-        // left alone.
+        // An expression index kept as its own is dropped before the attach
+        // and built again after, in another schema and in the parent's.
         let expression = |t: &mut Table| {
             t.indexes.insert(
                 "t_f".into(),
@@ -6897,8 +6894,13 @@ mod tests {
             order_of(&rebuilt),
             ["drop t_f", "drop t_id", "attach", "add t_f"]
         );
+        // In the parent's schema too: `f(n)` and the engine's own spelling of
+        // it are not told apart by text.
         let kept = outcome(&with_t_f, &keeps_t_f, &[]).2.expect("kept");
-        assert_eq!(order_of(&kept), ["drop t_id", "attach"]);
+        assert_eq!(
+            order_of(&kept),
+            ["drop t_f", "drop t_id", "attach", "add t_f"]
+        );
 
         // Negative: an ordinary table that stays one keeps its column uids,
         // and plans nothing.
