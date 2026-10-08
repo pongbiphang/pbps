@@ -714,7 +714,10 @@ carries the normative text, and DEC-1528.1 the reasons.
     repository, run on scratch only. Staging is dependency-ordered with the
     managed declarations. Every external object it creates is compared with
     the target by the properties the manifest already fingerprints for its
-    class, a routine's body excepted, and sealed into the manifest.
+    class, and sealed into the manifest. The source text that defines an
+    object is excepted: a routine's body, and a view's query. A view may
+    therefore be staged as a table of its output columns. The recheck still
+    compares the target's complete fingerprints.
   - The baseline runs in its own session. Afterwards, every managed object
     already staged must be unchanged, and every object it created must be
     compared; otherwise it refuses. A mismatch, a

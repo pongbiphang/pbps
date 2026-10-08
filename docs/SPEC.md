@@ -1559,8 +1559,15 @@ scratch compile (#1616).
   not have, refuses and names the object.
   - **One rule decides what is compared:** every class-specific property the
     evidence manifest already fingerprints for that class of external input
-    (below), and no property of its own. The one exception is a routine's
-    body, which is never compared (#1655).
+    (below), and no property of its own.
+  - **The exception is the source text that defines an object:** a routine's
+    body (#1655) and a view's query. A binding reads the object's shape, not
+    how it computes it. So a view may be staged as a table of its output
+    columns. It is then compared as a relation, by those columns, and its
+    relation kind and rewrite rule are not compared.
+  - This narrows only the baseline comparison. The recheck before
+    publication and at apply still compares the target's complete
+    fingerprints.
   - **Examples:**
     - a relation's column names, types, collations and order (order decides
       `*` expansion);

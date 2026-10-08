@@ -1622,8 +1622,12 @@ their full definitions sends routine source no reviewer approved.
   declaration, so the baseline never has to create a managed object.
 - Every external object it creates is compared with the target, by exactly
   the class-specific properties the evidence manifest already fingerprints
-  for that class: column collations, routine defaults and the like. The one
-  exception is a routine's body. A list of properties of its own would miss
+  for that class: column collations, routine defaults and the like. The
+  exception is the source text that defines an object, a routine's body or
+  a view's query. A binding reads shape, not computation. That exception is
+  what lets a view be staged as a table of its output columns, compared as
+  a relation without its kind or rewrite rule. The recheck still compares
+  the target's complete fingerprints. A list of properties of its own would miss
   one per review, as the first drafts of this entry did, with routine
   defaults and then column collations. Reusing the manifest's list makes
   the comparison and the recheck one definition.
