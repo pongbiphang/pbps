@@ -3488,7 +3488,15 @@ plan. The table must hold:
 - no unique constraint or foreign key that is not one of the parent's,
   matched one to one by definition, storage parameters aside as the engine
   matches them;
-- each of the parent's checks under the same name;
+- each of the parent's checks under the same name. A check and a generation
+  expression are compared as the engine compares them, by what they parse to.
+  A connected plan reads that from the engine's own spelling of both standing
+  objects (`diff_read_back`, the read-back before the recorded texts are put
+  in its place): measured on 16 and 18, `n>0` and `n > 0` both read
+  `CHECK ((n > 0))`, and the attach accepts them. Offline there is no such
+  spelling, so they are matched by name and kind alone. An offline plan is
+  never applied, and a refusal there would also keep it from writing the
+  identities the connected plan needs;
 - no replica identity, no `data:` and no other setting a partition does not
   hold;
 - no trigger on it, and no foreign key of another table referencing it. A

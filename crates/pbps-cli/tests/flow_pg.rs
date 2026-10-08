@@ -7099,7 +7099,7 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
         &staged,
         "table: app.s\ncolumns:\n  id: {type: integer, nullable: false}\n  \
          ts: {type: date, nullable: false}\n  n: {type: integer, default: \"1\"}\n\
-         primary_key: [id, ts]\nchecks:\n  ev_n_ck: n > 0\n",
+         primary_key: [id, ts]\nchecks:\n  ev_n_ck: n>0\n",
     )
     .unwrap();
     succeeds(d.run(&["plan"]));
@@ -7263,7 +7263,9 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
         1
     );
 
-    // Already its parent's shape: the attach alone, staged.
+    // Already its parent's shape: the attach alone, staged. Its check is
+    // spelled `n>0` beside its parent's `n > 0`, which the engine reads as
+    // one, and so does the connected plan (#1642 review).
     std::fs::remove_file(&staged).unwrap();
     tree(&format!(
         "{p2025}{attached}  s: {{from: [\"2022-01-01\"], to: [\"2023-01-01\"]}}\n{rest}"

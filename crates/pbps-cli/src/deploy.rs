@@ -6318,7 +6318,7 @@ pub fn cmd_plan_db(
             }
             findings.push(crate::output::Finding::note("data.adoption", message));
         }
-        let base = pbps_model::data::plan_base(
+        let read_back = pbps_model::data::plan_base(
             &scoped.schema,
             &managed.rows,
             &recorded_data,
@@ -6332,7 +6332,7 @@ pub fn cmd_plan_db(
         // against what was *declared* when each object was last written,
         // where the ledger recorded it (ADR-0009 §2.2, ADR-0013 §4,
         // DECISIONS 207–208).
-        let base = entry.snapshot.declared.overlay(&base);
+        let base = entry.snapshot.declared.overlay(&read_back);
         // A removed module no longer has a declaration carrying its
         // `depends_on:` edge. The newest snapshot keeps those baseline
         // annotations so connected planning can still drop dependents first.
@@ -6350,8 +6350,11 @@ pub fn cmd_plan_db(
         } else {
             pbps_diff::Screen::Text
         };
-        let diff_here = |also: &std::collections::BTreeSet<pbps_model::ModuleId>| match screen {
-            pbps_diff::Screen::Catalog => pbps_diff::diff_connected(
+        // The read-back goes in beside the overlaid base, for the comparisons
+        // the engine makes by parse tree (an attach's checks and generation
+        // expressions, #1642 review).
+        let diff_here = |also: &std::collections::BTreeSet<pbps_model::ModuleId>| {
+            pbps_diff::diff_read_back(
                 pbps_diff::Side {
                     schema: &base,
                     ids: &recorded_ids,
@@ -6363,20 +6366,9 @@ pub fn cmd_plan_db(
                 dialect.as_ref(),
                 &hints,
                 also,
-            ),
-            pbps_diff::Screen::Text => pbps_diff::diff_rebuilding(
-                pbps_diff::Side {
-                    schema: &base,
-                    ids: &recorded_ids,
-                },
-                pbps_diff::Side {
-                    schema: &declared,
-                    ids: &resolved.ids,
-                },
-                dialect.as_ref(),
-                &hints,
-                also,
-            ),
+                screen,
+                &read_back,
+            )
         };
         let mut cs = diff_here(&std::collections::BTreeSet::new()).map_err(|errs| {
             for e in &errs {

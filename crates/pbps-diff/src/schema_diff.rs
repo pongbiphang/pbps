@@ -305,6 +305,7 @@ pub fn diff_rebuilding(
         also,
         Rebinding::Candidates,
         Screen::Text,
+        None,
     )
 }
 
@@ -336,6 +337,32 @@ pub enum Screen {
     Catalog,
 }
 
+/// [`diff_rebuilding`], or [`diff_connected`] for `Screen::Catalog`, for a
+/// connected plan, which also hands over `read_back`: what it read, before the
+/// recorded declared texts are put in place of the engine's spelling. Only
+/// the comparisons the engine makes by parse tree read it; every other
+/// comparison stays on the recorded texts (#1642 review).
+pub fn diff_read_back(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &dyn Dialect,
+    hints: &Hints,
+    also: &BTreeSet<ModuleId>,
+    screen: Screen,
+    read_back: &Schema,
+) -> Result<ChangeSet, Vec<DiffError>> {
+    rebuilding_by(
+        base,
+        declared,
+        dialect,
+        hints,
+        also,
+        Rebinding::Candidates,
+        screen,
+        Some(read_back),
+    )
+}
+
 /// [`diff_rebuilding`] for a connected SQL Server plan, which judges its
 /// standing computed columns by the catalog's edges (`Screen::Catalog`).
 pub fn diff_connected(
@@ -353,9 +380,11 @@ pub fn diff_connected(
         also,
         Rebinding::Candidates,
         Screen::Catalog,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rebuilding_by(
     base: Side<'_>,
     declared: Side<'_>,
@@ -364,8 +393,11 @@ pub(crate) fn rebuilding_by(
     also: &BTreeSet<ModuleId>,
     rebinding: Rebinding,
     screen: Screen,
+    read_back: Option<&Schema>,
 ) -> Result<ChangeSet, Vec<DiffError>> {
-    let d = diff_partial_rebuilding(base, declared, dialect, hints, also, rebinding, screen);
+    let d = diff_partial_rebuilding(
+        base, declared, dialect, hints, also, rebinding, screen, read_back,
+    );
     if d.errors.is_empty() {
         Ok(d.changes)
     } else {
@@ -400,9 +432,11 @@ pub fn diff_partial(
         &BTreeSet::new(),
         Rebinding::Candidates,
         Screen::Text,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn diff_partial_rebuilding(
     base: Side<'_>,
     declared: Side<'_>,
@@ -411,6 +445,7 @@ fn diff_partial_rebuilding(
     also: &BTreeSet<ModuleId>,
     rebinding: Rebinding,
     screen: Screen,
+    read_back: Option<&Schema>,
 ) -> Diffed {
     let mut changes = Vec::new();
     let mut errs = Vec::new();
@@ -621,6 +656,7 @@ fn diff_partial_rebuilding(
                 declared_table,
                 of,
                 dialect,
+                read_back,
             ) {
                 Ok(Attached {
                     table,
@@ -2608,6 +2644,7 @@ struct Attached {
 ///   not hold yet, while an index of its own stays as one;
 /// - its defaults stay, and none of the parent's is given to a column
 ///   without one.
+#[allow(clippy::too_many_arguments)]
 fn attached(
     base: Side<'_>,
     base_name: &TableName,
@@ -2616,6 +2653,7 @@ fn attached(
     declared: &Table,
     of: &pbps_model::PartitionOf,
     dialect: &dyn Dialect,
+    read_back: Option<&Schema>,
 ) -> Result<Attached, Vec<String>> {
     let mut what = Vec::new();
     let Some(parent) = base
@@ -2669,14 +2707,61 @@ fn attached(
             })
             .collect()
     };
-    let (mine, theirs) = (columns(table), columns(parent));
+    // The engine matches a check and a generation expression on what they
+    // parse to, which the recorded texts do not show: `n>0` and `n > 0` are
+    // one. A connected plan has the engine's own spelling of both standing
+    // objects, under the overlay of the recorded texts, and compares that;
+    // the recorded texts stay the shape's. Offline there is no such spelling,
+    // so the texts are left out and the two are matched by name and kind:
+    // an offline plan is never applied (SPEC §7.3), and refusing there would
+    // also keep it from writing the identities the connected plan needs
+    // (#1642 review).
+    let spelled = |t: &Table, name: &TableName| -> Table {
+        let mut t = t.clone();
+        let read = read_back.map(|r| r.tables.get(name));
+        for (check, spec) in &mut t.checks {
+            match read {
+                Some(read) => {
+                    if let Some(engine) = read.and_then(|r| r.checks.get(check)) {
+                        spec.expression = engine.expression.clone();
+                    }
+                }
+                None => spec.expression.clear(),
+            }
+        }
+        for (column, spec) in &mut t.columns {
+            let Some(generated) = &mut spec.generated else {
+                continue;
+            };
+            match read {
+                Some(read) => {
+                    if let Some(engine) = read
+                        .and_then(|r| r.columns.get(column))
+                        .and_then(|c| c.generated.as_ref())
+                    {
+                        generated.expression = engine.expression.clone();
+                    }
+                }
+                None => generated.expression.clear(),
+            }
+        }
+        t
+    };
+    let (table_spelled, parent_spelled) = (spelled(table, base_name), spelled(parent, &of.parent));
+    let (mine, theirs) = (columns(&table_spelled), columns(&parent_spelled));
     let names = |c: &[(String, pbps_model::Column)]| {
         c.iter()
             .map(|(n, _)| n.as_str())
             .collect::<Vec<_>>()
             .join(", ")
     };
-    if names(&mine) != names(&theirs) {
+    // The names themselves, not their joined spelling, which two lists can
+    // share when a name holds `, ` (#1642 review).
+    if !mine
+        .iter()
+        .map(|(n, _)| n)
+        .eq(theirs.iter().map(|(n, _)| n))
+    {
         what.push(format!(
             "its columns are ({}), and its parent's are ({}), in that order",
             names(&mine),
@@ -2797,8 +2882,9 @@ fn attached(
         ));
     }
     let mut checks = table.checks.clone();
-    for (name, p) in &parent.checks {
-        if checks.remove(name).as_ref() != Some(p) {
+    for (name, p) in &parent_spelled.checks {
+        checks.remove(name);
+        if table_spelled.checks.get(name) != Some(p) {
             what.push(format!(
                 "its parent's check `{name}` is not on it under that name, which the engine \
                  requires"
@@ -5444,6 +5530,7 @@ mod tests {
                 &BTreeSet::new(),
                 Rebinding::Candidates,
                 screen,
+                None,
             )
             .err()
             .unwrap_or_default()
@@ -6959,6 +7046,113 @@ mod tests {
         .2
         .expect("attached");
         assert_eq!(kinds(&same), ["DropIndex", "AttachPartition"]);
+        // A check or a generation expression the table spells otherwise than
+        // its parent, as `n>0` beside `n > 0`: offline matched by name and
+        // kind, the texts unseen; connected, compared in the engine's own
+        // spelling of both, which is one text (#1642 review).
+        let connected = |base: &Schema, declared: &Schema, read_back: &Schema| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+                .unwrap()
+                .ids;
+            crate::diff_read_back(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+                &BTreeSet::new(),
+                Screen::Text,
+                read_back,
+            )
+        };
+        let respelled = ordinary(&|t| {
+            t.checks.insert("ev_n_ck".into(), check("n>0"));
+        });
+        outcome(&respelled, &declared, &[])
+            .2
+            .expect("offline, matched by name");
+        let mut engine = respelled.clone();
+        for t in ["app.ev", "app.t"] {
+            engine
+                .tables
+                .get_mut(&t.parse::<TableName>().unwrap())
+                .unwrap()
+                .checks
+                .insert("ev_n_ck".into(), check("(n > 0)"));
+        }
+        connected(&respelled, &declared, &engine).expect("one check to the engine");
+        // Negative: a read-back that spells them apart still refuses.
+        let mut apart = engine.clone();
+        apart
+            .tables
+            .get_mut(&"app.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .checks
+            .insert("ev_n_ck".into(), check("(n > 1)"));
+        let e = connected(&respelled, &declared, &apart).expect_err("another check");
+        assert!(
+            e.iter().any(|m| m
+                .to_string()
+                .contains("its parent's check `ev_n_ck` is not on it")),
+            "{e:?}"
+        );
+        // The same for a generation expression, in the parent's schema.
+        let generate = |schema: &Schema, spellings: &[(&str, &str)]| {
+            let mut schema = schema.clone();
+            for (t, expression) in spellings {
+                let mut g = Column::new(ty("int"));
+                g.generated = Some(pbps_model::Generated {
+                    expression: (*expression).into(),
+                    stored: true,
+                });
+                schema
+                    .tables
+                    .get_mut(&t.parse::<TableName>().unwrap())
+                    .unwrap()
+                    .columns
+                    .insert("g".into(), g);
+            }
+            schema
+        };
+        let g_respelled = generate(&base, &[("app.ev", "n + 1"), ("app.t", "n+1")]);
+        let g_declared = generate(&declared, &[("app.ev", "n + 1")]);
+        outcome(&g_respelled, &g_declared, &[])
+            .2
+            .expect("offline, matched by kind");
+        let g_engine = generate(&base, &[("app.ev", "(n + 1)"), ("app.t", "(n + 1)")]);
+        connected(&g_respelled, &g_declared, &g_engine).expect("one expression to the engine");
+        // Column names are compared as names: `a, b` then `c` is not `a`
+        // then `b, c`, though both lists join to one text.
+        let names = |schema: &Schema, table: &str, columns: &[&str]| {
+            let mut schema = schema.clone();
+            let t = schema
+                .tables
+                .get_mut(&table.parse::<TableName>().unwrap())
+                .unwrap();
+            for c in columns {
+                t.columns.insert((*c).into(), Column::new(ty("int")));
+            }
+            schema
+        };
+        let e = refused(
+            &names(
+                &names(&base, "app.ev", &["a, b", "c"]),
+                "app.t",
+                &["a", "b, c"],
+            ),
+            &names(&declared, "app.ev", &["a, b", "c"]),
+            &[],
+        );
+        assert!(e.iter().any(|m| m.contains("in that order")), "{e:?}");
+
         // A generated column: the engine keeps the table's expression, so in
         // another schema the attach is refused, and in the parent's it plans.
         let generated = |schema: &Schema, tables: &[&str]| {
@@ -11470,6 +11664,7 @@ mod tests {
             &BTreeSet::new(),
             Rebinding::Candidates,
             Screen::Text,
+            None,
         )
     }
 
