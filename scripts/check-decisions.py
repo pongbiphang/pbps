@@ -102,7 +102,9 @@ def citation_groups(line, closed):
             if not sep:
                 break
             following = CITE_ITEM.match(line, sep.end())
-            beyond = int(following[2] or following[1]) > closed
+            # Either end: a date after a comma (`2026-10-08`) reads as the
+            # range `2026-10`, whose second end is inside the sequence.
+            beyond = max(int(following[1]), int(following[2] or 0)) > closed
             if sep[1] and beyond and not GROUP_END.match(line, following.end()):
                 break
             items.append(following)

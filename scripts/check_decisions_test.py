@@ -277,6 +277,22 @@ class TheRecord(unittest.TestCase):
                 run(cited={"src/a.rs": line}), ["src/a.rs:1: DECISIONS 9 names no entry"], line
             )
 
+    def test_prose_after_a_comma_is_told_apart_under_the_real_sequence(self):
+        # The small fixture's sequence ends at 4, so every number in a date
+        # lies past it there; under the real one, a month and a day do not.
+        for line, cited in [
+            ("DECISIONS 2, 2026-10-08", [2]),
+            ("DECISIONS 2, 900 rows are rejected", [2]),
+            ("DECISIONS 2, 10-12 settled it", [2, 10, 11, 12]),
+            ("DECISIONS 2, 900", [2, 900]),
+        ]:
+            numbers, problems = [], []
+            for group in cd.citation_groups(line, cd.CLOSED):
+                found, wrong = cd.cited_numbers(group, cd.CLOSED)
+                numbers += found
+                problems += wrong
+            self.assertEqual((numbers, problems), (cited, []), line)
+
     def test_a_repeated_range_holds_each_number_once(self):
         # Twenty thousand repeats of the whole sequence used to be expanded
         # and held one by one: millions of integers for one long line.
