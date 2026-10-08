@@ -1779,7 +1779,14 @@ by the engines, and the scratch account decides the layout.** Implemented by
   connection names.
   - It must own that database.
   - The database must hold nothing initdb did not create: no object at or
-    above `FirstNormalObjectId`.
+    above `FirstNormalObjectId`, a subscription created in it included
+    (#1678 review).
+  - **Every write goes through the connection the checks were made on**,
+    the cleanup included. A second connection from the same string need not
+    reach the same server: a name may resolve to several hosts, or to a
+    balancing proxy. `DROP OWNED` there would empty something unchecked
+    (#1678 review). The cleanup first ends a failed transaction and resets
+    the role.
   - The deployer's role and database defaults become session settings. The
     path, the preload lists and any setting the login may not set are left
     for the comparison to report.

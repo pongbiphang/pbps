@@ -102,8 +102,16 @@ impl Fixture {
     /// A login confined to a database it owns: no superuser, no
     /// `CREATEROLE`, no `CREATEDB`. `pg_read_all_settings` lets it read the
     /// settings the compatibility rule compares, as the rule's refusal says.
+    /// A confined login and the database it owns. The login may hold one
+    /// connection at a time: every scratch write, cleanup included, must go
+    /// through the connection the run checked (#1678 review).
     async fn confined(&mut self) -> ((String, String), String) {
-        let login = self.login("c", "NOSUPERUSER NOCREATEDB NOCREATEROLE").await;
+        let login = self
+            .login(
+                "c",
+                "NOSUPERUSER NOCREATEDB NOCREATEROLE CONNECTION LIMIT 1",
+            )
+            .await;
         self.admin()
             .await
             .execute(&format!("GRANT pg_read_all_settings TO {}", login.0))
@@ -371,6 +379,32 @@ async fn vouched_refuses_a_scratch_that_is_not_empty() {
             .await,
         );
         let left = fixture.foreign_objects(&scratch_db).await;
+        // A subscription is not in the database's own catalogs but belongs
+        // to it all the same: a database holding only one is not empty.
+        let subscribed = fixture.database("b", Some(&login.0)).await;
+        fixture
+            .run(
+                &subscribed,
+                &[
+                    "CREATE SUBSCRIPTION leftover_sub CONNECTION 'dbname=nowhere' PUBLICATION p \
+                     WITH (connect = false, enabled = false, slot_name = NONE)",
+                    &format!("ALTER SUBSCRIPTION leftover_sub OWNER TO {}", login.0),
+                ],
+            )
+            .await;
+        let subscription = vouched_refusal(
+            produce(
+                &fixture.as_login(&subscribed, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+            )
+            .await,
+        );
+        // A database holding a subscription cannot be dropped.
+        fixture
+            .run(&subscribed, &["DROP SUBSCRIPTION leftover_sub"])
+            .await;
         // Negative: a database the login does not own is refused too, since
         // emptying it afterwards would revoke what was granted on it.
         let foreign = fixture.database("f", None).await;
@@ -393,6 +427,10 @@ async fn vouched_refuses_a_scratch_that_is_not_empty() {
             "{server}: a refused run removes nothing it did not create: {left:?}"
         );
         assert!(unowned.contains("does not own"), "{server}: {unowned}");
+        assert!(
+            subscription.contains("not empty") && subscription.contains("leftover_sub"),
+            "{server}: {subscription}"
+        );
     }
 }
 
@@ -405,7 +443,10 @@ async fn vouched_empties_the_supplied_database_when_the_run_refuses() {
         // Without pg_read_all_settings the login cannot read the settings
         // the rule compares: the run refuses after it created the schemas.
         let login = fixture
-            .login("u", "NOSUPERUSER NOCREATEDB NOCREATEROLE")
+            .login(
+                "u",
+                "NOSUPERUSER NOCREATEDB NOCREATEROLE CONNECTION LIMIT 1",
+            )
             .await;
         let scratch_db = fixture.database("s", Some(&login.0)).await;
         let inputs = Inputs::overload();

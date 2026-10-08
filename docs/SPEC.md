@@ -1440,9 +1440,11 @@ entry implemented by #1672, Docker by #1674).**
         become session settings, and `DROP OWNED` empties the database
         afterwards, whether the run answered or refused.
     - **Scratch is empty.** The database the run compiles in holds nothing
-      initdb did not create: no object at or above `FirstNormalObjectId`.
-      This is checked before the run's first write there, the baseline's
-      included. The database itself is read, not a template, so whatever
+      initdb did not create: no object at or above `FirstNormalObjectId`,
+      subscriptions included. This is checked before the run's first write
+      there, the baseline's included. In the supplied layout every write,
+      the cleanup included, goes through the connection the checks were
+      made on. The database itself is read, not a template, so whatever
       template it was cloned from is covered.
   - The shared compatibility qualification (#610, #611) still runs, as for
     every resolver environment, under rule `pg-reported-scope-v1`. It

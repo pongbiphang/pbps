@@ -49,6 +49,10 @@ const CATALOGS: &[&str] = &[
     "pg_largeobject_metadata",
 ];
 
+/// Shared catalogs whose rows belong to one database, keyed by that
+/// database's OID: a subscription lives in the database it was created in.
+const DATABASE_KEYED: &[(&str, &str)] = &[("pg_subscription", "subdbid")];
+
 /// How many foreign objects a refusal names. The first few say what is
 /// there; the count says how much.
 const NAMED: usize = 10;
@@ -296,6 +300,14 @@ pub async fn foreign_objects(
                    FROM pg_catalog.{catalog} o WHERE o.oid >= {FIRST_NORMAL_OBJECT_ID}"
             )
         })
+        .chain(DATABASE_KEYED.iter().map(|(catalog, database)| {
+            format!(
+                "SELECT 'pg_catalog.{catalog}'::pg_catalog.regclass AS classid, o.oid AS objid \
+                   FROM pg_catalog.{catalog} o WHERE o.oid >= {FIRST_NORMAL_OBJECT_ID} \
+                    AND o.{database} = (SELECT d.oid FROM pg_catalog.pg_database d \
+                                         WHERE d.datname = pg_catalog.current_database())"
+            )
+        }))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
     let rows = conn
@@ -369,7 +381,13 @@ pub async fn create_schemas(
 /// Removes everything the scratch login owns in the supplied database, so
 /// the next run finds it empty. Shared objects are untouched; the database
 /// itself stays, owned by the login (`owns_database`).
+///
+/// The connection is the one the run compiled on, so it may be inside a
+/// failed transaction or under a role a declaration set; both are ended
+/// first. Neither statement fails when there is nothing to end.
 pub async fn drop_owned(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+    conn.execute("ROLLBACK").await?;
+    conn.execute("RESET ROLE").await?;
     conn.execute("DROP OWNED BY SESSION_USER").await
 }
 

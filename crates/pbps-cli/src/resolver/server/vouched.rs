@@ -220,7 +220,9 @@ struct Run<'a> {
 /// The scratch side, provisioned and qualified: the session the declarations
 /// compile in, the session that captures what they bound, and the scope.
 struct Prepared {
-    compile: Conn,
+    /// `None` when the run compiles on the scratch connection its checks
+    /// were made on.
+    compile: Option<Conn>,
     /// `None` when captures read through the compiling session itself.
     capture: Option<Conn>,
     scratch_catalog: CatalogFacts,
@@ -308,7 +310,11 @@ impl Run<'_> {
         let extras = &request.write_path_extras;
         let mut reconstruction =
             engine::reconstruction(driver, extras, binding.bootstrap).map_err(Error::Binding)?;
-        engine::compile(&mut reconstruction, extras, driver, &mut prepared.compile).await?;
+        let compile = match prepared.compile.as_mut() {
+            Some(compile) => compile,
+            None => &mut *admin,
+        };
+        engine::compile(&mut reconstruction, extras, driver, compile).await?;
         let base_managed = engine::Managed::from_schema(binding.base);
         let desired_managed = engine::Managed::from_schema(binding.desired);
         let dropped = engine::dropped_signatures(extras, base_managed.dropped_by(&desired_managed))
@@ -321,9 +327,9 @@ impl Run<'_> {
             .chain(&request.write_path_extras)
             .cloned()
             .collect();
-        let capture = match prepared.capture.as_mut() {
-            Some(capture) => capture,
-            None => &mut prepared.compile,
+        let capture = match (prepared.capture.as_mut(), prepared.compile.as_mut()) {
+            (Some(capture), _) | (None, Some(capture)) => capture,
+            (None, None) => &mut *admin,
         };
         let (compiled, capture_scope) = engine::capture_desired_for_plan(
             capture,
@@ -505,7 +511,7 @@ impl Run<'_> {
         .await
         .map_err(db("the scratch analysis scope"))?;
         Ok(Prepared {
-            compile: session,
+            compile: Some(session),
             capture: Some(owner),
             scratch_catalog,
             map,
@@ -560,29 +566,24 @@ impl Run<'_> {
         };
         let map =
             scope::Principals::supplied(authorization, &principal.login).map_err(Error::Scope)?;
-        // The compiling session carries the deployer's settings, so it is
-        // its own; the run's checks stay on the session that made them.
-        let mut session = Conn::connect(driver, self.scratch)
-            .await
-            .map_err(db("the scratch compile session"))?;
-        // From the first write on, the run owns objects here to drop.
+        // Every write, the cleanup included, goes through the connection the
+        // checks were made on. Another connection from the same string need
+        // not reach the same server: a name may resolve to several hosts or a
+        // balancing proxy, and `DROP OWNED` there would empty something else
+        // (#1678 review).
         self.created = Created::Supplied { database };
-        sql::create_schemas(&mut session, scope_schemas)
+        sql::create_schemas(admin, scope_schemas)
             .await
             .map_err(db("the in-scope schemas"))?;
-        pbps_pg::resolver::authorization::apply_session_settings(&mut session, context)
+        pbps_pg::resolver::authorization::apply_session_settings(admin, context)
             .await
             .map_err(db("the deployer's settings"))?;
-        let scratch_catalog = scope::read_catalog(
-            &mut session,
-            driver,
-            &request.schemas,
-            &request.write_path_extras,
-        )
-        .await
-        .map_err(db("the scratch analysis scope"))?;
+        let scratch_catalog =
+            scope::read_catalog(admin, driver, &request.schemas, &request.write_path_extras)
+                .await
+                .map_err(db("the scratch analysis scope"))?;
         Ok(Prepared {
-            compile: session,
+            compile: None,
             capture: None,
             scratch_catalog,
             map,
@@ -616,13 +617,8 @@ impl Run<'_> {
                 }
             }
             Created::Supplied { database } => {
-                // A fresh session: the compiling one may have been left in a
-                // failed transaction or under another role.
-                let dropped = match Conn::connect(self.driver, self.scratch).await {
-                    Ok(mut session) => sql::drop_owned(&mut session).await.is_ok(),
-                    Err(_) => false,
-                };
-                if dropped {
+                // The checked connection, never a new one: see `supplied`.
+                if sql::drop_owned(admin).await.is_ok() {
                     Ok(())
                 } else {
                     Err(vec![format!(
