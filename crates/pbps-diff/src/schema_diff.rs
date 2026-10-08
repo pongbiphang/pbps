@@ -282,7 +282,15 @@ pub fn diff_rebuilding(
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
 ) -> Result<ChangeSet, Vec<DiffError>> {
-    rebuilding_by(base, declared, dialect, hints, also, Rebinding::Candidates)
+    rebuilding_by(
+        base,
+        declared,
+        dialect,
+        hints,
+        also,
+        Rebinding::Candidates,
+        Screen::Text,
+    )
 }
 
 /// Who decides which unchanged modules a plan's arrivals rebuild.
@@ -297,6 +305,42 @@ pub(crate) enum Rebinding {
     Evidence,
 }
 
+/// Who judges a standing SQL Server computed column against the plan's
+/// changes to a column it reads or a function it calls (#1460).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    /// The differ, by text, over-approximating (DEC-1174.1): an offline
+    /// plan's only judge, and never applied (SPEC §7.3).
+    Text,
+    /// The catalog's expression edges, which a connected SQL Server plan
+    /// reads and matches under the database's collation (DEC-1431.1). The
+    /// text screen folds case, and refused a retype of `A` beside a computed
+    /// column reading `a` in a case-sensitive database. A computed column the
+    /// plan adds, new or again, has no edge for its new text and is still
+    /// screened here (#1459).
+    Catalog,
+}
+
+/// [`diff_rebuilding`] for a connected SQL Server plan, which judges its
+/// standing computed columns by the catalog's edges (`Screen::Catalog`).
+pub fn diff_connected(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &dyn Dialect,
+    hints: &Hints,
+    also: &BTreeSet<ModuleId>,
+) -> Result<ChangeSet, Vec<DiffError>> {
+    rebuilding_by(
+        base,
+        declared,
+        dialect,
+        hints,
+        also,
+        Rebinding::Candidates,
+        Screen::Catalog,
+    )
+}
+
 pub(crate) fn rebuilding_by(
     base: Side<'_>,
     declared: Side<'_>,
@@ -304,8 +348,9 @@ pub(crate) fn rebuilding_by(
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
     rebinding: Rebinding,
+    screen: Screen,
 ) -> Result<ChangeSet, Vec<DiffError>> {
-    let d = diff_partial_rebuilding(base, declared, dialect, hints, also, rebinding);
+    let d = diff_partial_rebuilding(base, declared, dialect, hints, also, rebinding, screen);
     if d.errors.is_empty() {
         Ok(d.changes)
     } else {
@@ -339,6 +384,7 @@ pub fn diff_partial(
         hints,
         &BTreeSet::new(),
         Rebinding::Candidates,
+        Screen::Text,
     )
 }
 
@@ -349,6 +395,7 @@ fn diff_partial_rebuilding(
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
     rebinding: Rebinding,
+    screen: Screen,
 ) -> Diffed {
     let mut changes = Vec::new();
     let mut errs = Vec::new();
@@ -617,7 +664,14 @@ fn diff_partial_rebuilding(
         dialect,
         &mut changes,
     );
-    refuse_computed_dependencies(base.schema, declared.schema, dialect, &changes, &mut errs);
+    refuse_computed_dependencies(
+        base.schema,
+        declared.schema,
+        dialect,
+        screen,
+        &changes,
+        &mut errs,
+    );
     refuse_temporal_changes(base, declared, &changes, &mut errs);
     refuse_partition_changes(base, declared, &changes, &mut errs);
     // A module declaration can stay byte-for-byte identical while a new
@@ -2528,6 +2582,7 @@ fn refuse_computed_dependencies(
     base: &Schema,
     declared: &Schema,
     dialect: &dyn Dialect,
+    screen: Screen,
     changes: &[Change],
     errs: &mut Vec<DiffError>,
 ) {
@@ -2565,9 +2620,12 @@ fn refuse_computed_dependencies(
             // plan adds, new or again, comes at (9, 3), after every input
             // change, and one it drops is gone at (2, 4), before them.
             let standing = !dropped(table_name, name) && !added(table_name, name);
+            // A connected plan's catalog edges judge a standing column, by
+            // the database's collation (#1460).
+            let screened = standing && screen == Screen::Text;
             let at = table_name.column(name);
             for change in changes {
-                if standing
+                if screened
                     && let Some((column, what)) = input_change(change, table_name)
                     && dialect.may_name(&computed.expression, column)
                 {
@@ -2581,10 +2639,10 @@ fn refuse_computed_dependencies(
                     // Standing, or re-added: either way it calls the module
                     // when the module changes. One only dropped is out of the
                     // way first, its module's drop moved after it.
-                    Change::AlterModule { id, .. } if standing || added(table_name, name) => {
+                    Change::AlterModule { id, .. } if screened || added(table_name, name) => {
                         Some((id, "alters"))
                     }
-                    Change::DropModule { id, .. } if standing || added(table_name, name) => {
+                    Change::DropModule { id, .. } if screened || added(table_name, name) => {
                         Some((id, "drops"))
                     }
                     Change::CreateModule { id, .. } if added(table_name, name) => {
@@ -4734,6 +4792,83 @@ mod tests {
             kinds(&run(&with(computed("a * 2", false, false)), &ordinary, &[])),
             ["DropIndex", "DropComputedColumn", "AddColumn", "AddIndex"]
         );
+    }
+
+    /// A connected SQL Server plan leaves a standing computed column to the
+    /// catalog's edges (`Screen::Catalog`, #1460): the text screen folds
+    /// case, and refused a retype of `A2` beside a column reading `a2` in a
+    /// case-sensitive database. A re-added one has no edge for its new text
+    /// and is still screened, and an offline plan screens both.
+    #[test]
+    fn a_connected_plan_leaves_a_standing_computed_column_to_the_catalog() {
+        let errors_of = |base: &Schema, want: &Schema, screen: Screen| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let ids = crate::resolve(want, &base_ids, &[], &ctx()).unwrap().ids;
+            rebuilding_by(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: want,
+                    ids: &ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+                &BTreeSet::new(),
+                Rebinding::Candidates,
+                screen,
+            )
+            .err()
+            .unwrap_or_default()
+        };
+        let shaped = |a: Column, expression: &str| {
+            let mut t = table(&[("id", Column::new(ty("int")).not_null()), ("A2", a)]);
+            t.computed.insert(
+                "c".into(),
+                pbps_model::ComputedColumn {
+                    expression: expression.into(),
+                    persisted: false,
+                    not_null: false,
+                },
+            );
+            schema_of("dbo.t", t)
+        };
+        let base = shaped(Column::new(ty("int")), "a2 * 2");
+        let retyped = shaped(Column::new(ty("bigint")), "a2 * 2");
+        assert!(errors_of(&base, &retyped, Screen::Catalog).is_empty());
+        assert!(matches!(
+            errors_of(&base, &retyped, Screen::Text).as_slice(),
+            [DiffError::ComputedInputChanged { .. }]
+        ));
+
+        let calls = |expression: &str, definition: &str| {
+            with_functions(
+                shaped(Column::new(ty("int")), expression),
+                &[("dbo.f", definition)],
+            )
+        };
+        // Standing while the function it calls is altered.
+        let before = calls("dbo.f(a2)", "one");
+        let altered = calls("dbo.f(a2)", "two");
+        assert!(errors_of(&before, &altered, Screen::Catalog).is_empty());
+        assert!(errors_of(&before, &altered, Screen::Text).iter().any(
+            |e| matches!(e, DiffError::ComputedFunctionChanged { change, .. }
+                    if *change == "alters")
+        ));
+        // Re-added around the alter: still the screen's, connected or not.
+        let readded = calls("dbo.f(a2) + 1", "two");
+        for screen in [Screen::Catalog, Screen::Text] {
+            assert!(
+                errors_of(&before, &readded, screen).iter().any(
+                    |e| matches!(e, DiffError::ComputedFunctionChanged { change, .. }
+                        if *change == "alters")
+                ),
+                "{screen:?}"
+            );
+        }
     }
 
     /// A plan that renames, drops, retypes or changes the nullability of a
@@ -9883,6 +10018,7 @@ mod tests {
             &Hints::default(),
             &BTreeSet::new(),
             Rebinding::Candidates,
+            Screen::Text,
         )
     }
 

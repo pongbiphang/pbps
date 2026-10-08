@@ -65,6 +65,7 @@ pub fn ordinary(
         hints,
         &BTreeSet::new(),
         crate::schema_diff::Rebinding::Evidence,
+        crate::schema_diff::Screen::Text,
     )
 }
 
@@ -107,6 +108,7 @@ pub fn plan(
         hints,
         &modules,
         crate::schema_diff::Rebinding::Evidence,
+        crate::schema_diff::Screen::Text,
     )
     .map_err(|e| Error::Diff(e.into_iter().map(|e| e.to_string()).collect()))?;
     let (changes, ordinary) = prepare::changes(

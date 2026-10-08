@@ -30,7 +30,11 @@
 //!   refused, not dropped and recreated around it. That is follow-up scope.
 //!
 //! The differ keeps its over-approximating refusals as an offline screen,
-//! where a false yes costs a second plan; the moves are only here.
+//! where a false yes costs a second plan; the moves are only here. A
+//! connected plan leaves the computed columns that stand throughout to these
+//! edges alone (`pbps_diff::Screen::Catalog`, DEC-1460.1): the screen folds
+//! case where the database may not. A computed column the plan adds, new or
+//! again, has no edge for its new text, and the screen still judges it.
 
 use std::collections::BTreeSet;
 
