@@ -66,6 +66,12 @@ impl QueryConnection for StreamConn {
     }
 }
 
+impl super::ExecuteConnection for StreamConn {
+    async fn execute<'a>(&'a mut self, sql: &'a str) -> Result<(), DbError> {
+        StreamConn::execute(self, sql).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

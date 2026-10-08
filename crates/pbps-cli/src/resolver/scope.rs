@@ -252,6 +252,21 @@ pub(crate) fn compare(
     }
 }
 
+/// [`compare`] without executables: the operator-vouched resolver's rule,
+/// which observes no process (#1672). SQL Server has no such rule yet.
+pub(crate) fn compare_reported(
+    driver: Driver,
+    target: &CatalogFacts,
+    resolver: &CatalogFacts,
+) -> Result<ScopeReport, String> {
+    match driver {
+        Driver::Postgres => Ok(pbps_pg::resolver::compatibility::compare_reported(
+            target, resolver,
+        )),
+        Driver::Mssql => Err("the operator-vouched resolver has no SQL Server rule".into()),
+    }
+}
+
 /// The ordered schema-grant sequence whose projection the qualified scope
 /// used. Compare it with the final pure planner changes before persisting
 /// either authorization or target visibility.
@@ -500,6 +515,19 @@ impl Principals {
                 &mssql_planned(planned),
                 token,
             )),
+        }
+    }
+
+    /// The map of a supplied scratch login that reproduces no role: it
+    /// stands for the deployer (#1672).
+    pub(crate) fn supplied(authorization: &Authorization, login: &str) -> Result<Self, String> {
+        match authorization {
+            Authorization::Postgres(context) => {
+                Ok(Self::Postgres(pg_auth::RoleMap::supplied(context, login)))
+            }
+            Authorization::Mssql(_) => {
+                Err("a supplied scratch login is implemented for PostgreSQL only".into())
+            }
         }
     }
 

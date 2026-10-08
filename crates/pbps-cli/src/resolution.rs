@@ -202,6 +202,29 @@ mod producer {
             desired: request.desired.schema,
             base: request.base.schema,
         };
+        // A supplied server is the operator-vouched resolver (DEC-1528.1);
+        // Docker stays the measured profile until #1674 gives it a vouched
+        // runtime.
+        if let pbps_config::resolver::ResolverProfile::Server { url_env } =
+            &request.selection.profile
+        {
+            let scratch = scratch_connection(request, url_env)?;
+            return pbps_cli::resolver::server::vouched::produce(
+                driver,
+                &scratch,
+                request.target.connection(),
+                &binding,
+                request.base,
+                request.desired,
+                request.hints,
+                &[],
+                request.project,
+                request.target.environment(),
+            )
+            .await
+            .map(|resolved| resolved.changes)
+            .map_err(|failure| refused(request, failure));
+        }
         pbps_cli::resolver::server::produce(
             driver,
             &request.selection.profile,
@@ -218,13 +241,44 @@ mod producer {
         )
         .await
         .map(|resolved| resolved.changes)
-        .map_err(|failure| match failure {
+        .map_err(|failure| refused(request, failure))
+    }
+
+    fn refused(request: &Request<'_>, failure: ProduceError) -> Refused {
+        match failure {
             ProduceError::Run(error) if answered(&error) => unresolved(request, error),
             ProduceError::Run(error) => Refused::Unanswerable(error.into()),
             ProduceError::Target(_)
             | ProduceError::Recipe(_)
             | ProduceError::Acquire(_)
             | ProduceError::Cleanup(_) => Refused::Unanswerable(failure.into()),
+        }
+    }
+
+    /// The scratch server's connection string, from the variable the
+    /// resolver names. Never the target's own variable: one string would
+    /// then be both, and nothing after this could tell them apart by name.
+    fn scratch_connection(request: &Request<'_>, url_env: &str) -> Result<String, Refused> {
+        let target_env = request.target.environment().and_then(|name| {
+            request
+                .project
+                .config
+                .environments
+                .get(name)
+                .map(|environment| environment.url_env.as_str())
+        });
+        if target_env == Some(url_env) {
+            return Err(Refused::Unanswerable(anyhow::anyhow!(
+                "the resolver `{}` names the target's own connection variable {url_env}; \
+                 a scratch server needs its own",
+                request.selection.name
+            )));
+        }
+        std::env::var(url_env).map_err(|_| {
+            Refused::Unanswerable(anyhow::anyhow!(
+                "the resolver `{}` reads its scratch server from {url_env}, which is not set",
+                request.selection.name
+            ))
         })
     }
 
@@ -259,7 +313,9 @@ mod producer {
             | Error::Cleanup
             | Error::Consumed
             | Error::Scope(_)
-            | Error::Read(_) => false,
+            | Error::Read(_)
+            // A scratch that cannot be used as configured answered nothing.
+            | Error::Vouched(_) => false,
         }
     }
 }

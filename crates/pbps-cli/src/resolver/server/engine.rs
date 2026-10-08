@@ -134,13 +134,15 @@ pub(super) fn reconstruction(
     }
 }
 
-/// Compiles the reconstruction as whatever role the session is.
+/// Compiles the reconstruction as whatever role the session is, over the
+/// measured run's stream or the operator-vouched run's ordinary connection.
 pub(crate) async fn compile(
     reconstruction: &mut Reconstruction,
     extras: &[String],
-    connection: &mut StreamConn,
+    driver: Driver,
+    connection: &mut impl pbps_db::transport::ExecuteConnection,
 ) -> Result<(), Error> {
-    match connection.driver() {
+    match driver {
         Driver::Postgres => reconstruction
             .compile(
                 &pbps_pg::Postgres::with_write_path_extras(extras.to_vec()),
@@ -237,7 +239,7 @@ pub(crate) async fn capture_desired_sealed(
 /// records and the existing verdict leave this private capability.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn capture_desired_for_plan(
-    connection: &mut StreamConn,
+    connection: &mut impl pbps_db::transport::QueryConnection,
     base: &Managed,
     desired: &Managed,
     paths: &Paths,
@@ -249,8 +251,9 @@ pub(crate) async fn capture_desired_for_plan(
     dropped_signatures: &std::collections::BTreeSet<pbps_pg::resolver::capture::DroppedSignature>,
 ) -> Result<(CompiledCapture, CaptureScope), Error> {
     use pbps_pg::resolver::capture;
-    match (connection.driver(), principals) {
-        (Driver::Postgres, crate::resolver::scope::Principals::Postgres(roles)) => {
+    // The principal map names the engine: only PostgreSQL's has an adapter.
+    match principals {
+        crate::resolver::scope::Principals::Postgres(roles) => {
             let first = capture::capture(connection, &capture::managed_scope(desired))
                 .await
                 .map_err(catalog_read_failed)?;

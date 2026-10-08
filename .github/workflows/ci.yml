@@ -435,9 +435,26 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      # A second PostgreSQL 18 cluster: the operator-vouched resolver's
+      # scratch on another cluster, the one placement where an account that
+      # may create roles and databases is allowed (DEC-1672.1). Same digest
+      # as `postgres`, so the compatibility rule compares equal builds.
+      postgres-scratch:
+        image: postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+        env:
+          POSTGRES_PASSWORD: "Pbps!Ci12345"
+          POSTGRES_DB: pbps_test
+        ports:
+          - 54322:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d pbps_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       PBPS_TEST_PG_DB: "host=localhost port=54320 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
       PBPS_TEST_PG_OLD_DB: "host=localhost port=54321 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
+      PBPS_TEST_PG_SCRATCH_DB: "host=localhost port=54322 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -463,6 +480,10 @@ jobs:
       # clear will run under (DECISIONS 415). `cargo test --workspace` in
       # `quick` builds it and does not run it: it is `#[ignore]`d.
       - run: cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1
+        if: matrix.suite == 'dialect'
+      # The operator-vouched resolver end to end (#1672): no root, no Docker,
+      # only the three servers above.
+      - run: cargo test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::vouched::
         if: matrix.suite == 'dialect'
       # Private capture internals have live snapshot/rendering regressions.
       # Split by module: the binding half rides with the short suites above.

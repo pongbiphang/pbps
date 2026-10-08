@@ -434,6 +434,17 @@ impl RoleMap {
         }
     }
 
+    /// The map of a run that reproduces no role: a supplied scratch database
+    /// whose login is confined to it compiles as that login, which stands
+    /// for the deployer and for nothing else (#1672). Any other role a
+    /// compiled object names is the scratch server's own.
+    pub fn supplied(context: &AuthorizationContext, login: &str) -> Self {
+        Self {
+            to_run_local: BTreeMap::from([(context.principal.effective.clone(), login.to_owned())]),
+            run_login: login.to_owned(),
+        }
+    }
+
     /// The run-local name for a logical role, or `PUBLIC` unchanged. `None`
     /// for a role the map does not cover — a grant to which would silently
     /// not be reproduced, so callers refuse rather than skip it.
@@ -471,6 +482,52 @@ impl RoleMap {
     pub fn deployer(&self, context: &AuthorizationContext) -> Option<String> {
         self.run_local(&context.principal.effective)
     }
+}
+
+/// Gives a supplied scratch session the deployer's role and database
+/// defaults as session settings, where the run-owned path stores them on its
+/// own login and database (`reconstruct`), which a confined login cannot.
+/// Precedence follows the engine's: a database default, then the login's,
+/// then the login's in that database.
+///
+/// Three kinds are left alone, and the comparison that follows reports any
+/// difference they leave as a mismatch rather than this hiding it. The path:
+/// every pbps session pins an empty one (DEC-1564.1), the target's too. The
+/// preload lists: a library loads only when a session starts, so a value set
+/// now would read as loaded when nothing was. And a setting the login may not
+/// set at all.
+pub async fn apply_session_settings(
+    conn: &mut impl QueryConnection,
+    context: &AuthorizationContext,
+) -> Result<(), DbError> {
+    const LOADED_AT_START: &[&str] = &[
+        "session_preload_libraries",
+        "shared_preload_libraries",
+        "local_preload_libraries",
+        "dynamic_library_path",
+    ];
+    for scope in ["database", "role", "database-role"] {
+        for (key, value) in &context.settings {
+            let Some(name) = key.strip_prefix(scope).and_then(|k| k.strip_prefix(':')) else {
+                continue;
+            };
+            if name == "search_path" || LOADED_AT_START.contains(&name) {
+                continue;
+            }
+            let statement = format!(
+                "SELECT pg_catalog.set_config({}, {}, false)",
+                literal(name),
+                literal(value)
+            );
+            match conn.query(&statement).await {
+                Ok(_) => {}
+                // Not settable by this login: left for the comparison.
+                Err(error) if error.server_error_code().as_deref() == Some("42501") => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A planned authorization change the plan performs before its DDL, applied

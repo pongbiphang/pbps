@@ -6,7 +6,7 @@
 # dialect should not have to start the other engine to run its tests.
 #
 # The containers are left running afterwards so re-runs are instant; remove them
-# with: docker rm -f pbps-test-pg pbps-test-pg16
+# with: docker rm -f pbps-test-pg pbps-test-pg16 pbps-test-pg-scratch
 set -euo pipefail
 
 NAME=pbps-test-pg
@@ -50,11 +50,17 @@ start() {
     fi
 }
 
+# A second PostgreSQL 18 cluster, the operator-vouched resolver's scratch on
+# another cluster (DEC-1672.1): same digest, so the builds compare equal.
+SCRATCH_NAME=pbps-test-pg-scratch
+SCRATCH_PORT=${PBPS_TEST_PG_SCRATCH_PORT:-54322}
+
 start "$NAME" "$PORT" "$IMAGE"
 start "$OLD_NAME" "$OLD_PORT" "$OLD_IMAGE"
+start "$SCRATCH_NAME" "$SCRATCH_PORT" "$IMAGE"
 
 echo "waiting for PostgreSQL..."
-for name in "$NAME" "$OLD_NAME"; do
+for name in "$NAME" "$OLD_NAME" "$SCRATCH_NAME"; do
     ready=false
     for _ in $(seq 1 60); do
         # The initialization server accepts sockets but not our clients' TCP
@@ -76,6 +82,7 @@ done
 # does not need the password percent-encoded.
 export PBPS_TEST_PG_DB="host=localhost port=$PORT user=postgres password=$PASSWORD dbname=$DB sslmode=disable"
 export PBPS_TEST_PG_OLD_DB="host=localhost port=$OLD_PORT user=postgres password=$PASSWORD dbname=$DB sslmode=disable"
+export PBPS_TEST_PG_SCRATCH_DB="host=localhost port=$SCRATCH_PORT user=postgres password=$PASSWORD dbname=$DB sslmode=disable"
 # The script-output regression uses this server's psql, including its lexer.
 export PBPS_TEST_PG_CONTAINER="$NAME"
 # The grammar-upgrade regression carries a database from the old server to
@@ -102,6 +109,9 @@ python3 scripts/live-transport.py pg
 # it asks anything (DECISIONS 415). Run here rather than left to
 # `cargo test --workspace`, which does not pass `--ignored`.
 cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1 "$@"
+# The operator-vouched resolver end to end (#1672), with no root or Docker of
+# its own: the three servers above are its targets and scratch servers.
+cargo test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::vouched:: "$@"
 # The CLI end to end on this engine, serially: each test creates and drops a
 # database of its own, and two of those racing is a race the engine can lose.
 cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1 "$@"

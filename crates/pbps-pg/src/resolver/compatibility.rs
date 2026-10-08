@@ -9,12 +9,15 @@
 
 use pbps_db::resolver::Observation;
 use pbps_db::resolver::environment::{
-    BuildMapping, EnvironmentFacts, FactStatus, RuleVersion, ScopeReport, Side,
+    BuildMapping, CatalogFacts, EnvironmentFacts, FactStatus, RuleVersion, ScopeReport, Side,
 };
 use std::collections::BTreeMap;
 
 /// Rule `pg-analysis-scope-v1`, measured on PostgreSQL 16 and 18.
 pub const RULE: &str = "pg-analysis-scope-v1";
+
+/// Rule `pg-reported-scope-v1`, [`RULE`] without the executables.
+pub const REPORTED_RULE: &str = "pg-reported-scope-v1";
 
 /// The major versions the rule was measured on. Anything else is unknown,
 /// not incompatible: PostgreSQL 16 changed role-membership semantics and 15
@@ -93,16 +96,48 @@ pub fn compare(
     mappings: &[BuildMapping],
 ) -> ScopeReport {
     let mut report = ScopeReport::new(RuleVersion::new(RULE));
-    if let Some(gate) = version_gate(target, resolver) {
+    if catalog(RULE, &target.catalog, &resolver.catalog, &mut report) {
+        pbps_db::resolver::environment::compare_executables(
+            RULE,
+            target,
+            resolver,
+            mappings,
+            &mut report,
+        );
+    }
+    report
+}
+
+/// Rule `pg-reported-scope-v1`: every catalog fact [`compare`] compares, and
+/// no executables. It is the operator-vouched resolver's, which observes no
+/// process and so reads no executable; the operator vouches for the build,
+/// and what each engine reports about itself is all that is compared
+/// (DEC-1528.1, #1672). Its own name, so evidence never claims the measured
+/// rule's coverage.
+pub fn compare_reported(target: &CatalogFacts, resolver: &CatalogFacts) -> ScopeReport {
+    let mut report = ScopeReport::new(RuleVersion::new(REPORTED_RULE));
+    catalog(REPORTED_RULE, target, resolver, &mut report);
+    report
+}
+
+/// The catalog facts both rules compare. `false` when the version gate
+/// stopped the comparison before anything else was read.
+fn catalog(
+    rule: &str,
+    target: &CatalogFacts,
+    resolver: &CatalogFacts,
+    report: &mut ScopeReport,
+) -> bool {
+    if let Some(gate) = version_gate(rule, target, resolver) {
         report.facts.insert("server_version_num".into(), gate);
-        return report;
+        return false;
     }
     for key in OBSERVATIONS {
         report.facts.insert(
             (*key).into(),
             observation(
-                target.catalog.observations.get(*key),
-                resolver.catalog.observations.get(*key),
+                target.observations.get(*key),
+                resolver.observations.get(*key),
             ),
         );
     }
@@ -110,31 +145,23 @@ pub fn compare(
         report.facts.insert(
             (*key).into(),
             optional_observation(
-                target.catalog.observations.get(*key),
-                resolver.catalog.observations.get(*key),
+                target.observations.get(*key),
+                resolver.observations.get(*key),
             ),
         );
     }
-    extensions(target, resolver, &mut report);
-    collations(target, resolver, &mut report);
-    settings(target, resolver, &mut report);
-    visibility(target, resolver, &mut report);
-    pbps_db::resolver::environment::compare_executables(
-        RULE,
-        target,
-        resolver,
-        mappings,
-        &mut report,
-    );
-    report
+    extensions(target, resolver, report);
+    collations(target, resolver, report);
+    settings(target, resolver, report);
+    visibility(target, resolver, report);
+    true
 }
 
 /// Both sides must report a version inside the measured range, or the rule
 /// has nothing to say. An unparseable version is unknown, not zero.
-fn version_gate(target: &EnvironmentFacts, resolver: &EnvironmentFacts) -> Option<FactStatus> {
-    let major = |facts: &EnvironmentFacts| -> Option<u32> {
+fn version_gate(rule: &str, target: &CatalogFacts, resolver: &CatalogFacts) -> Option<FactStatus> {
+    let major = |facts: &CatalogFacts| -> Option<u32> {
         facts
-            .catalog
             .observations
             .get("server_version_num")?
             .value()?
@@ -157,7 +184,7 @@ fn version_gate(target: &EnvironmentFacts, resolver: &EnvironmentFacts) -> Optio
             Some(major) if !MEASURED_MAJORS.contains(&major) => {
                 return Some(FactStatus::Unknown {
                     side,
-                    reason: format!("{RULE} was not measured on PostgreSQL {major}"),
+                    reason: format!("{rule} was not measured on PostgreSQL {major}"),
                 });
             }
             Some(_) => {}
@@ -244,18 +271,17 @@ fn optional_observation(
 /// Every extension the target has, at its version, must be installable on
 /// the resolver, and so must everything it requires. The resolver's scratch
 /// database is fresh, so what it has installed is not compared.
-fn extensions(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &mut ScopeReport) {
-    for extension in &target.catalog.extensions {
+fn extensions(target: &CatalogFacts, resolver: &CatalogFacts, report: &mut ScopeReport) {
+    for extension in &target.extensions {
         let key = format!("extension:{}", extension.name);
         let available = resolver
-            .catalog
             .available_extensions
             .get(&extension.name)
             .is_some_and(|versions| versions.contains(&extension.version));
         let missing_requirement = extension
             .requires
             .iter()
-            .find(|name| !resolver.catalog.available_extensions.contains_key(*name));
+            .find(|name| !resolver.available_extensions.contains_key(*name));
         let status = match (available, missing_requirement) {
             (true, None) => FactStatus::Match,
             (false, _) => FactStatus::Mismatch {
@@ -275,14 +301,13 @@ fn extensions(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &m
 /// A target whose recorded version no longer matches its actual one is in
 /// PostgreSQL's own collation-warning state; that is recorded as a named
 /// limitation, not a resolver mismatch.
-fn collations(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &mut ScopeReport) {
+fn collations(target: &CatalogFacts, resolver: &CatalogFacts, report: &mut ScopeReport) {
     let by_key: BTreeMap<_, _> = resolver
-        .catalog
         .collations
         .iter()
         .map(|collation| (collation.key.as_str(), collation))
         .collect();
-    for collation in &target.catalog.collations {
+    for collation in &target.collations {
         // Only the database's own default collation is required to be present:
         // it is fixed at CREATE DATABASE and reproduced by the recipe. A
         // user-defined collation is object DDL the compilation creates, not
@@ -337,13 +362,10 @@ fn collations(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &m
 /// A setting the planning session set on itself is not a deployment
 /// setting: `source = session` on the target is unknown, because the value
 /// apply will run under is whatever that session did not set.
-fn settings(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &mut ScopeReport) {
+fn settings(target: &CatalogFacts, resolver: &CatalogFacts, report: &mut ScopeReport) {
     let compare = |name: &str, optional: bool| -> Option<FactStatus> {
         let key = format!("setting:{name}");
-        let (t, r) = (
-            target.catalog.settings.get(name),
-            resolver.catalog.settings.get(name),
-        );
+        let (t, r) = (target.settings.get(name), resolver.settings.get(name));
         let status = match (t, r) {
             (None, None) if optional => return None,
             (None, None) => FactStatus::Unknown {
@@ -396,9 +418,9 @@ fn settings(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &mut
 /// the target but can on the resolver (or the reverse) binds a competing
 /// object differently. A schema the resolver was not asked about is a
 /// difference, not a gap.
-fn visibility(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &mut ScopeReport) {
-    for (schema, seen) in &target.catalog.visibility {
-        let status = match resolver.catalog.visibility.get(schema) {
+fn visibility(target: &CatalogFacts, resolver: &CatalogFacts, report: &mut ScopeReport) {
+    for (schema, seen) in &target.visibility {
+        let status = match resolver.visibility.get(schema) {
             None => FactStatus::Mismatch {
                 target: seen.value().unwrap_or("?").to_owned(),
                 resolver: "schema not evaluated".into(),
@@ -560,6 +582,38 @@ mod tests {
         assert_eq!(report.verdict(), Verdict::Verified, "{report:?}");
         assert_eq!(report.rule.as_str(), RULE);
         assert!(report.limitations.is_empty());
+    }
+
+    #[test]
+    fn the_reported_rule_compares_every_catalog_fact_and_no_executable() {
+        // Different engine content, which the measured rule refuses, is not
+        // an input to the reported one: it observes no process (#1672).
+        let report = compare_reported(&side("180006", "e1").catalog, &side("180006", "e2").catalog);
+        assert_eq!(report.verdict(), Verdict::Verified, "{report:?}");
+        assert_eq!(report.rule.as_str(), REPORTED_RULE);
+        assert!(!report.facts.keys().any(|key| key.starts_with("executable")));
+        // Negative: every catalog fact still counts, the version gate too.
+        let mut resolver = side("180006", "e1");
+        resolver
+            .catalog
+            .settings
+            .get_mut("lc_numeric")
+            .unwrap()
+            .value = "de_DE".into();
+        assert_eq!(
+            compare_reported(&side("180006", "e1").catalog, &resolver.catalog).verdict(),
+            Verdict::Mismatch(vec!["setting:lc_numeric".into()])
+        );
+        assert_eq!(
+            compare_reported(&side("180006", "e1").catalog, &side("180005", "e1").catalog)
+                .verdict(),
+            Verdict::Mismatch(vec!["server_version_num".into()])
+        );
+        let gated = compare_reported(&side("150013", "e1").catalog, &side("150013", "e1").catalog);
+        assert!(matches!(
+            &gated.facts["server_version_num"],
+            FactStatus::Unknown { reason, .. } if reason.contains(REPORTED_RULE)
+        ));
     }
 
     #[test]

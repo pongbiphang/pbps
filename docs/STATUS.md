@@ -248,7 +248,10 @@ unaffected, rebuild or unresolved; sealing (#614) and planning integration
 (#615) remain required. See [the capture contract and fixtures](RESOLVER-CAPTURE.md)
 and [delivery tracking](RESOLVER-DELIVERY.md).
 
-**Re-planned by #1528 (DEC-1528.1, design accepted, not implemented).**
+**Re-planned by #1528 (DEC-1528.1).** A server resolver entry is the
+operator-vouched resolver for managed declarations (#1672, DEC-1672.1); its
+answer is still refused as `resolver.publication-unavailable` until #1516.
+The baseline (#1673) and the vouched Docker scratch (#1674) follow.
 Selecting a resolver will give the operator-vouched resolver. It keeps two
 separation checks plus the shared compatibility qualification, and stages
 external objects from a reviewed baseline compared with the target. The

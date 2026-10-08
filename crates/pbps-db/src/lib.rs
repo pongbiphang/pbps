@@ -634,6 +634,25 @@ impl Conn {
         }
     }
 
+    /// [`Conn::connect`] to another database on the server the string names,
+    /// as another login when one is given. PostgreSQL only: the resolver
+    /// that needs it has no SQL Server adapter (#1672).
+    pub async fn connect_with(
+        driver: Driver,
+        connection_string: &str,
+        database: &str,
+        login: Option<(&str, &str)>,
+    ) -> Result<Self, DbError> {
+        match driver {
+            Driver::Mssql => Err(DbError::Refused(
+                "a connection to another database is implemented for PostgreSQL only".into(),
+            )),
+            Driver::Postgres => Ok(Conn::Postgres(Box::new(
+                postgres::Conn::connect_with(connection_string, database, login).await?,
+            ))),
+        }
+    }
+
     /// Runs one query with no parameters and returns every row.
     ///
     /// Introspection queries are static SQL against the catalog views; nothing

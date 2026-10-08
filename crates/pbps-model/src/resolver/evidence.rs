@@ -40,6 +40,10 @@ pub enum ResolverRuntime {
         profile: String,
         identity: String,
     },
+    /// A scratch engine the operator vouches for: nothing about it was
+    /// measured, and the evidence claims no image, containment or build
+    /// (DEC-1528.1).
+    Vouched,
 }
 
 /// Environment-keyed fingerprints of the complete qualified observations.
@@ -197,6 +201,7 @@ impl ResolverEvidence {
             ResolverRuntime::Supplied { profile, identity } => {
                 !profile.is_empty() && hex(identity, 64)
             }
+            ResolverRuntime::Vouched => true,
         };
         if !qualified {
             return Err(EvidenceError::Incomplete);

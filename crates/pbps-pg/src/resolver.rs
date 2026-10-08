@@ -5,6 +5,7 @@ pub mod capture;
 pub mod compatibility;
 pub mod environment;
 pub mod reconstruct;
+pub mod vouched;
 
 // Live, and in the library target on purpose: a capture refuses any
 // catalog write it did not make, including another test's on the same
@@ -19,7 +20,7 @@ use pbps_db::resolver::{
     Candidate, Discovery, Extension, Observation, OwnSession, ScratchNames, SessionCounter,
     SessionInventory,
 };
-use pbps_db::transport::{QueryConnection, StreamConn};
+use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{Conn, DbError};
 
 /// Pure reader support for the evidence versions this PostgreSQL adapter
@@ -31,12 +32,23 @@ pub fn validate_evidence(
     use pbps_model::resolver::EvidenceError;
     if evidence.before().adapter() != capture::INPUT_RULE
         || !matches!(evidence.before().engine_major(), 16 | 18)
-        || evidence.qualification().rule != compatibility::RULE
+        || evidence.qualification().rule != rule_of(&evidence.qualification().runtime)
         || evidence.authorization().rule != authorization::RULE
     {
         return Err(EvidenceError::Version);
     }
     Ok(())
+}
+
+/// The compatibility rule a runtime qualifies its scope under: the measured
+/// profiles compare executables, the operator-vouched resolver observes none
+/// (#1672). Evidence naming the other rule claims coverage it does not have.
+fn rule_of(runtime: &pbps_model::resolver::ResolverRuntime) -> &'static str {
+    match runtime {
+        pbps_model::resolver::ResolverRuntime::Vouched => compatibility::REPORTED_RULE,
+        pbps_model::resolver::ResolverRuntime::Container { .. }
+        | pbps_model::resolver::ResolverRuntime::Supplied { .. } => compatibility::RULE,
+    }
 }
 
 /// The cluster identifier is observed alongside, never instead of, qualified
@@ -309,7 +321,7 @@ pub async fn scope_facts(
 /// a transaction block, so each statement is separate and the caller removes
 /// whatever was created when a later one fails.
 pub async fn create_scratch(
-    conn: &mut StreamConn,
+    conn: &mut impl ExecuteConnection,
     names: &ScratchNames,
     recipe: &DatabaseRecipe,
 ) -> Result<(), DbError> {
@@ -389,7 +401,7 @@ pub fn scratch_database_ddl(names: &ScratchNames, recipe: &DatabaseRecipe) -> St
 /// owned is gone. Each drop is independent: a role that cannot be dropped is
 /// returned so the caller can report it, and does not stop the others. Uses
 /// `IF EXISTS` so a role a retry already removed is not an error.
-pub async fn drop_roles(conn: &mut StreamConn, roles: &[String]) -> Vec<String> {
+pub async fn drop_roles(conn: &mut impl ExecuteConnection, roles: &[String]) -> Vec<String> {
     let mut failed = Vec::new();
     for role in roles {
         let statement = format!("DROP ROLE IF EXISTS \"{}\"", role.replace('"', "\"\""));
@@ -400,7 +412,10 @@ pub async fn drop_roles(conn: &mut StreamConn, roles: &[String]) -> Vec<String> 
     failed
 }
 
-pub async fn drop_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Result<(), DbError> {
+pub async fn drop_scratch(
+    conn: &mut impl ExecuteConnection,
+    names: &ScratchNames,
+) -> Result<(), DbError> {
     let database = conn
         .execute(&format!(
             "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",

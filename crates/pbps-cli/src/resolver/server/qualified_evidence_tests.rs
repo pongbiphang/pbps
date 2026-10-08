@@ -21,7 +21,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const ENVIRONMENT: &str = "fixture";
+pub(super) const ENVIRONMENT: &str = "fixture";
 
 #[derive(Clone, Copy)]
 enum Profile {
@@ -29,13 +29,13 @@ enum Profile {
     Supplied,
 }
 
-struct ProjectKey {
+pub(super) struct ProjectKey {
     root: PathBuf,
-    project: pbps_config::Project,
+    pub(super) project: pbps_config::Project,
 }
 
 impl ProjectKey {
-    fn new(with_key: bool) -> Self {
+    pub(super) fn new(with_key: bool) -> Self {
         let root = std::env::temp_dir().join(format!(
             "pbps-1274-evidence-{:032x}",
             rand::random::<u128>()
@@ -89,17 +89,17 @@ fn ids(schema: &Schema, previous: &IdsFile) -> IdsFile {
     .ids
 }
 
-struct Inputs {
+pub(super) struct Inputs {
     base: Schema,
     desired: Schema,
     base_ids: IdsFile,
     desired_ids: IdsFile,
     bootstrap: Vec<Change>,
-    hints: Hints,
+    pub(super) hints: Hints,
 }
 
 impl Inputs {
-    fn overload() -> Self {
+    pub(super) fn overload() -> Self {
         Self::from_pair(cases::pair_with_cross_kind_surfaces())
     }
 
@@ -153,7 +153,7 @@ impl Inputs {
         }
     }
 
-    fn binding(&self) -> BindingRequest<'_> {
+    pub(super) fn binding(&self) -> BindingRequest<'_> {
         BindingRequest {
             bootstrap: &self.bootstrap,
             desired: &self.desired,
@@ -161,14 +161,14 @@ impl Inputs {
         }
     }
 
-    fn base(&self) -> pbps_diff::Side<'_> {
+    pub(super) fn base(&self) -> pbps_diff::Side<'_> {
         pbps_diff::Side {
             schema: &self.base,
             ids: &self.base_ids,
         }
     }
 
-    fn desired(&self) -> pbps_diff::Side<'_> {
+    pub(super) fn desired(&self) -> pbps_diff::Side<'_> {
         pbps_diff::Side {
             schema: &self.desired,
             ids: &self.desired_ids,
@@ -624,7 +624,7 @@ async fn close(run: &mut ScratchRun, owned: &mut Option<ObservedContainers>) {
     closed.expect("a completed producer run removes its owned resources");
 }
 
-fn view<'a>(
+pub(super) fn view<'a>(
     evidence: &'a pbps_model::resolver::ResolverEvidence,
     name: &str,
 ) -> &'a pbps_model::resolver::SurfaceResolution {

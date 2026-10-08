@@ -57,7 +57,8 @@ class LiveExecution(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         commands = [shlex.split(value) for value in
                     re.findall(r'--health-cmd "(pg_isready[^"\n]+)"', workflow)]
-        self.assertEqual(len(commands), 2)
+        # The target, the pre-17 server and the vouched scratch cluster.
+        self.assertEqual(len(commands), 3)
         for command in commands:
             with self.subTest(command=command):
                 # Socket readiness is true while docker-entrypoint.sh is
@@ -68,7 +69,8 @@ class LiveExecution(unittest.TestCase):
 
     def test_local_postgresql_deadlines_stop_before_any_client_suite(self):
         for mode, failing in (("deadline-new", "pbps-test-pg"),
-                              ("deadline-old", "pbps-test-pg16")):
+                              ("deadline-old", "pbps-test-pg16"),
+                              ("deadline-scratch", "pbps-test-pg-scratch")):
             with self.subTest(mode=mode):
                 result, calls = self.local_pg_script(mode)
                 self.assertNotEqual(result.returncode, 0)
@@ -83,7 +85,7 @@ class LiveExecution(unittest.TestCase):
         result, calls = self.local_pg_script("initializing")
         self.assertEqual(result.returncode, 0, result.stderr)
         first_client = next(i for i, c in enumerate(calls) if c[0] == "cargo")
-        for name in ("pbps-test-pg", "pbps-test-pg16"):
+        for name in ("pbps-test-pg", "pbps-test-pg16", "pbps-test-pg-scratch"):
             probes = [c for c in calls[:first_client] if c[:3] == ["docker", "exec", name]]
             self.assertEqual(len(probes), 3)
         self.assertEqual([c for c in calls if c[0] in ("cargo", "python3")], [
@@ -92,6 +94,7 @@ class LiveExecution(unittest.TestCase):
             ["cargo", "test", "-p", "pbps-db", "--test", "live_pg", "--", "--ignored"],
             ["python3", "scripts/live-transport.py", "pg"],
             ["cargo", "test", "-p", "pbps-cli", "--bin", "pbps", "--", "--ignored", "--test-threads=1"],
+            ["cargo", "test", "-p", "pbps-cli", "--lib", "--", "--ignored", "--test-threads=1", "resolver::server::vouched::"],
             ["cargo", "test", "-p", "pbps-cli", "--test", "flow_pg", "--", "--ignored", "--test-threads=1"],
         ])
 
@@ -109,7 +112,7 @@ command = [Path(sys.argv[0]).name, *sys.argv[1:]]
 with (root / "calls").open("a") as log:
     log.write(json.dumps(command) + "\n")
 if command[:2] == ["docker", "ps"]:
-    print("pbps-test-pg\npbps-test-pg16")
+    print("pbps-test-pg\npbps-test-pg16\npbps-test-pg-scratch")
 elif command[:2] == ["docker", "exec"]:
     name = command[2]
     state = root / name
@@ -118,7 +121,8 @@ elif command[:2] == ["docker", "exec"]:
     mode = os.environ["PBPS_ADMISSION_MODE"]
     tcp = "-h" in command and command[command.index("-h") + 1] == "127.0.0.1"
     deadline = (mode == "deadline-new" and name == "pbps-test-pg" or
-                mode == "deadline-old" and name == "pbps-test-pg16")
+                mode == "deadline-old" and name == "pbps-test-pg16" or
+                mode == "deadline-scratch" and name == "pbps-test-pg-scratch")
     sys.exit(2 if tcp and (deadline or mode == "initializing" and count <= 2) else 0)
 elif command[:2] == ["docker", "logs"]:
     print("controlled server still initializing", file=sys.stderr)

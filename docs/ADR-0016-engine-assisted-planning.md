@@ -701,13 +701,16 @@ carries the normative text, and DEC-1528.1 the reasons.
   - "Verify the chosen environment" keeps the shared compatibility
     qualification (version and build, extensions, encoding, collation,
     deployment context), which decides whether scratch binds as the target
-    would. For separation, it means two checks:
-    - scratch is never the target (host, port and database are not all the
-      target's, and the credential variable differs), before anything is
-      created;
-    - scratch is empty, read in the run-owned database once created, before
-      any other DDL.
-  - The run-owned scratch takes the target's encoding and locale.
+    would. For separation, before any write on scratch (DEC-1672.1):
+    - scratch is never the target, decided from session marks both engines
+      report rather than from the connection strings, and its credential
+      variable differs;
+    - on the target's cluster, the scratch account is confined: no
+      `SUPERUSER`, `CREATEROLE` or `CREATEDB` through any role it is a
+      member of (#1667);
+    - the database it compiles in is empty: a run-owned one from
+      `template0` with the target's encoding and locale, or the account's own
+      supplied one, emptied again with `DROP OWNED` afterwards.
   - Isolation, containment, log handling and channel protection are vouched
     for by the operator, not measured. The evidence names the profile, so a
     reviewer can always tell a vouched answer from a measured one.
@@ -754,12 +757,17 @@ carries the normative text, and DEC-1528.1 the reasons.
   - Test 14 holds for the operator-vouched resolver for its compatibility
     inputs only.
   - Test 11's same-cluster refusal is replaced, for the operator-vouched
-    resolver, by `vouched_refuses_the_target_as_scratch`: another database
-    on the target's cluster passes there.
+    resolver, by `vouched_refuses_the_target_as_scratch` and
+    `vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account`:
+    another database on the target's cluster passes there only with a
+    confined account (#1667).
 - **Acceptance tests for the operator-vouched resolver (live, PostgreSQL):**
   - `vouched_refuses_the_target_as_scratch`
   - `vouched_refuses_a_scratch_that_is_not_empty`
   - `vouched_answers_a_managed_question_without_root_or_observation`
+  - `vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account`
+  - `vouched_runs_in_a_precreated_database_with_a_confined_account`
+  - `vouched_empties_the_supplied_database_when_the_run_refuses`
   - `vouched_compiles_a_managed_view_over_a_baseline_table`
   - `vouched_refuses_a_baseline_that_differs_from_the_target`
   - `vouched_refuses_a_baseline_that_creates_a_managed_object`

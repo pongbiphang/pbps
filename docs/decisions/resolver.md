@@ -1586,6 +1586,11 @@ isolation, the confidentiality of what it compiles, and its channels. Both
 connections use whatever TLS the operator configured. The evidence names the
 profile, so a reviewer can always tell a vouched answer from a measured one.
 
+*Amended by [DEC-1672.1](#dec-1672-1): the target is told from scratch by the
+engines rather than the strings, a scratch on the target's cluster needs a
+confined account, and the account decides the layout. The cluster
+identifier read below needs no privilege after all.*
+
 **It keeps exactly two separation checks.** The first runs before the
 run-owned database is created; the second reads that database once it is
 created, before any other DDL.
@@ -1711,3 +1716,82 @@ their full definitions sends routine source no reviewer approved.
 Recorded in SPEC §9.3.2 and ADR-0016's amendment. The design and the
 maintainer's decisions are on #1528. Pinned by the acceptance tests ADR-0016's
 amendment lists, which land with the producer.
+
+<a id="dec-1672-1"></a>
+
+**DEC-1672.1. The operator-vouched resolver tells its scratch from the target
+by the engines, and the scratch account decides the layout.** Implemented by
+#1672 on the maintainer's decision on #1667.
+
+**The target is told from scratch by the engines, not by the strings.**
+- Two connection strings can spell one server two ways (`localhost` and an
+  address, a DNS alias, a pooler), so comparing host, port and database
+  answers the wrong question.
+- **Each session marks itself.** Each sets `application_name` to a
+  run-generated token, and the scratch session reads `pg_stat_activity` for
+  both tokens. Any role sees another session's `pid` and `application_name`
+  there; only its query and timings are hidden (measured on 16 and 18).
+  - A target mark the scratch session sees, on the target's backend, is the
+    same cluster. On the target's own database as well, it is the target, and
+    the run refuses.
+  - The scratch session must see its own mark. Otherwise the view shows
+    nothing on that cluster, and "not seen" would read as "another cluster".
+- **Rejected: a `pg_database` row with the target database's name and
+  OID.** Two clusters started from one image with one `POSTGRES_DB` hold
+  identical rows, which is an ordinary CI layout. That check would call them
+  one cluster and refuse a valid setup.
+- **Rejected: `system_identifier`.** A cluster restored from a physical
+  backup, or an image with its data directory baked in, shares it.
+  - DEC-1528.1 dropped this check because it needs a privileged read. That
+    premise was wrong: `pg_control_system()` is executable by `PUBLIC` on 16
+    and 18. It is still not the separation check, for the reason above.
+
+**On the target's cluster, the scratch account must be confined** (#1667).
+- Confined means neither the account nor any role it is a member of has
+  `SUPERUSER`, `CREATEROLE` or `CREATEDB`. A role it can become is as good
+  as holding the attribute.
+- Reproducing the deployer's authorization creates roles server-wide, some
+  possibly `SUPERUSER`. On a shared cluster that is a write to the target's
+  cluster, and only an account that cannot make it is safe there.
+- An unconfined account on the target's cluster refuses before any write,
+  naming the attributes to remove.
+
+**The account decides the layout.**
+- **Run-owned.** An account on another cluster that may create roles and
+  databases gets the measured run's layout: a run-owned login and a database
+  from `template0` with the target's recipe, the deployer's authorization
+  reproduced, and a compile as the reproduced deployer. All of it is dropped
+  afterwards.
+- **Supplied.** Any other account compiles as itself in the database its
+  connection names.
+  - It must own that database.
+  - The database must hold nothing initdb did not create: no object at or
+    above `FirstNormalObjectId`.
+  - The deployer's role and database defaults become session settings. The
+    path, the preload lists and any setting the login may not set are left
+    for the comparison to report.
+  - No role is reproduced. A deployer that differs in schema visibility
+    refuses through the compatibility comparison.
+  - `DROP OWNED BY SESSION_USER` empties the database afterwards, whether
+    the run answered or refused.
+- **Why ownership is required.** `DROP OWNED` also revokes what was granted
+  to the login on the database, and only an owner keeps its rights through
+  that.
+- **`DROP OWNED` never runs as a superuser.** A superuser either provisions
+  (another cluster) or refuses (the target's), so it never reaches this
+  layout. Run as the bootstrap superuser, `DROP OWNED` would reach every
+  object initdb made.
+- **A run that dies part-way** leaves the supplied database non-empty. The
+  next run then refuses on emptiness instead of compiling over the
+  leftovers.
+
+**The comparison is rule `pg-reported-scope-v1`:** every catalog fact
+`pg-analysis-scope-v1` compares, and no executable.
+- Evidence naming the vouched runtime must name this rule, and measured
+  evidence the other. A rule that claims coverage the run did not have is
+  refused by the artifact reader.
+- The build fields carry keyed fingerprints of what each engine reports: its
+  version and its installed extensions at their versions.
+
+Recorded in SPEC §9.3.2 and ADR-0016's amendment. Pinned by the `vouched_`
+live tests in `resolver::server::vouched`.

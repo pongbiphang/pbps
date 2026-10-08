@@ -42,6 +42,7 @@ pub(crate) mod profile;
 mod resolution;
 mod runtime;
 mod transitions;
+pub mod vouched;
 
 use exclusivity::TcpPair;
 use profile::ServerProfile;
@@ -108,6 +109,11 @@ pub enum Error {
     /// (SPEC 9.8, #1575).
     #[error("a catalog read during resolution failed: {0}")]
     Read(String),
+    /// The operator-vouched scratch cannot be used as configured: it is the
+    /// target, shares its cluster without a confined account, or is not
+    /// empty (#1667, #1672). Nothing was written on it.
+    #[error("the operator-vouched scratch cannot be used: {0}")]
+    Vouched(String),
 }
 
 /// Which premise of the named profile a refusal is about.
@@ -2157,7 +2163,9 @@ impl ScratchRun {
             .map_err(Error::Binding)?;
         let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
         self.in_flight = true;
-        let compiled = engine::compile(reconstruction, extras, scratch.connection_mut()).await;
+        let driver = scratch.connection().driver();
+        let compiled =
+            engine::compile(reconstruction, extras, driver, scratch.connection_mut()).await;
         self.in_flight = false;
         compiled?;
         self.check_held(target).await?;

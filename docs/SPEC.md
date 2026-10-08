@@ -1397,40 +1397,66 @@ whether desired declarations bind differently from the objects already on the
 target. [ADR-0016](ADR-0016-engine-assisted-planning.md) records the rationale,
 evidence contract, implementation boundaries and acceptance tests.
 
-**Two kinds of resolver environment (#1528, DEC-1528.1; design accepted, not
-implemented).**
+**Two kinds of resolver environment (#1528, DEC-1528.1, DEC-1672.1; a server
+entry implemented by #1672, Docker by #1674).**
 
-- **The operator-vouched resolver** is what selecting a resolver gives unless a
-  measured profile is named. Users see it simply as the resolver. Internally,
-  and in this specification, it is always the *operator-vouched resolver*
-  (`vouched`).
+- **The operator-vouched resolver** is what selecting a `kind: server`
+  resolver gives (#1672). A `kind: docker` entry gets it with #1674. Users see
+  it simply as the resolver. Internally, and in this specification, it is
+  always the *operator-vouched resolver* (`vouched`).
   - pbps does not measure or enforce its scratch's isolation, containment, log
     handling or channels. The operator vouches for them, and the evidence and
     `explain` say so: `resolver: operator-vouched scratch (not measured)`.
-  - It checks two things about separation, in this order.
-    - Scratch is never the target, checked before anything is created. Its
-      host, port and database are not all the target's, so another database
-      on the target's cluster qualifies. Its credential variable differs
-      from the target's, and there is no fallback to target credentials.
-    - Scratch is empty, checked after the run-owned database is created and
-      before any other DDL, the baseline's included. The database, as
-      created, holds nothing beyond the engine's own catalog. The new database itself is read, not
-      a template, so whatever template it was cloned from is covered.
-      PostgreSQL scratch is cloned from `template0`.
+  - Before it writes anything on scratch, it establishes where scratch sits
+    and what the scratch account may do (#1667, DEC-1672.1).
+    - **Scratch is never the target.** The engines decide this, not the two
+      connection strings, which can spell one server two ways.
+      - Each session marks itself with a run-generated `application_name`.
+      - A target mark that the scratch session finds in `pg_stat_activity`
+        is a backend of the scratch's own cluster.
+      - The scratch session must find its own mark, or the check could not
+        be made and the run refuses.
+      - Scratch in the target's own database refuses.
+      - The credential variable differs from the target's, and there is no
+        fallback to target credentials.
+    - **On the target's cluster, the scratch account is confined.** Neither
+      it nor any role it is a member of has `SUPERUSER`, `CREATEROLE` or
+      `CREATEDB`. An unconfined account there refuses, naming the attributes
+      to remove.
+    - **The account decides the layout.**
+      - **Run-owned.** On another cluster, an account that may create roles
+        and databases gets:
+        - a run-owned login, and a database cloned from `template0` with the
+          target's encoding and locale;
+        - the deployer's authorization reproduced in that database;
+        - a compile as the reproduced deployer.
+
+        All of it is dropped afterwards.
+      - **Supplied.** Any other account compiles as itself in the database
+        its connection names, which it must own. The deployer's role and
+        database defaults become session settings, and `DROP OWNED` empties
+        the database afterwards, whether the run answered or refused.
+    - **Scratch is empty.** The database the run compiles in holds nothing
+      initdb did not create: no object at or above `FirstNormalObjectId`.
+      This is checked before the run's first write there, the baseline's
+      included. The database itself is read, not a template, so whatever
+      template it was cloned from is covered.
   - The shared compatibility qualification (#610, #611) still runs, as for
-    every resolver environment. It compares the facts both engines report:
-    version and build string, extensions and their versions, encoding,
-    collation and the deployment context. An incompatible or unreadable
-    fact refuses.
+    every resolver environment, under rule `pg-reported-scope-v1`. It
+    compares the facts both engines report: version and build string,
+    extensions and their versions, encoding, collation and the deployment
+    context. An incompatible or unreadable fact refuses. A supplied
+    database in another encoding refuses here, because the encoding decides
+    how a name is cut to the identifier limit, so such a scratch would
+    answer for another database.
   - Executable identity is not measured, because no process is observed.
     Two builds that report the same facts are taken to bind alike, and
     that is part of what the operator vouches for (#1657).
-  - The run-owned scratch database takes the target's encoding and locale.
-    The encoding decides how a name is cut to the identifier limit, so a
-    scratch in another one would answer for another database.
 - **The measured profiles** (`linux-amd64-v1`, `linux-dedicated-v1`,
-  `linux-dedicated-pg16-v1`) are frozen and to be removed (#1636). They stay
-  selectable by name until then.
+  `linux-dedicated-pg16-v1`) are frozen and to be removed (#1636).
+  - A Docker entry is `linux-amd64-v1` until #1674.
+  - The dedicated-server profiles are no longer selectable, since a server
+    entry is the operator-vouched resolver.
 - **Reading this section:** a paragraph marked **Measured profiles only**
   binds them alone. Text written before #1528 that says "resolver" while
   describing containment, process observation, executable identity or
@@ -1493,12 +1519,11 @@ first, then runs it. Until #1516, its answer is reported and refused as
 `resolver.publication-unavailable`, writing neither file. Selection does not
 replace or waive any existing planning check.
 
-`pbps.yml` can declare Docker or dedicated-server resolvers. Without a
-`profile` field an entry is the operator-vouched resolver, and its optional
-`baseline` names the baseline file (below). `profile: linux-amd64-v1` on a
-Docker entry, or `profile=` in a server value, selects a frozen measured
-profile instead. Until the operator-vouched resolver is implemented, an entry
-without `profile` keeps today's measured meaning:
+`pbps.yml` can declare Docker or dedicated-server resolvers.
+- A server entry is the operator-vouched resolver.
+- A Docker entry is the frozen measured `linux-amd64-v1` until #1674.
+- An entry has no `profile` field (#1654).
+- An entry's optional `baseline` names the baseline file (below; #1673).
 
 ```yaml
 resolve_with: pg_local
@@ -1526,19 +1551,11 @@ is implemented; `if_missing` authorizes acquisition of the configured source
 only when absent. It is not permission for compiled code to access a network.
 Build compatibility still requires qualification for every resolver
 environment. A measured profile also qualifies its actual digest/platform,
-instance separation, transport and containment. A server
-profile names a separate credential variable, never an inline connection
-string. No fallback to target credentials exists. The value is
-whitespace-separated `key=value` fields; `user` and `password` are
-percent-encoded (`%20` for a space, `%25` for `%`), so any credential can be
-spelled, and a malformed escape is refused rather than taken literally
-(#677). **Measured profiles only:** that variable's value also
-carries the externally enforced runtime profile the supplied server is claimed
-to meet and the container that provides it. For the operator-vouched resolver
-it is an ordinary connection string. The profile and container describe a
-running deployment, so nothing checked in claims a server meets a profile pbps
-has not measured. An unimplemented profile name is refused by name, per engine, and a
-named one stays a claim until #609's admission measures the actual runtime.
+instance separation, transport and containment. A server entry names a
+separate credential variable, never an inline connection string, and there
+is no fallback to target credentials. The variable holds an ordinary
+connection string, in either form the target's takes and with the TLS it
+asks for. The account it names decides the layout (above).
 
 A missing selected profile is a named finding (exit 2) before target access or
 output writes. An unused profile/default is not resolved by offline commands,
