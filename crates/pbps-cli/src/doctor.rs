@@ -151,12 +151,13 @@ pub struct EnvDiagnosis {
     #[serde(skip)]
     env_name: Option<String>,
 
-    /// How the ledger's tables differ from what pbps creates (issue #313),
-    /// reported as the `ledger.untrusted` finding. Not serialized: the
-    /// finding carries it, and the envelope's published schema stays as it
-    /// was.
+    /// What the check of the ledger's tables against what pbps creates
+    /// established (issue #313): its differences, reported as
+    /// `ledger.untrusted`, or that it could not run, reported as
+    /// `ledger.unknown` (#853). Not serialized: the finding carries it, and
+    /// the envelope's published schema stays as it was.
     #[serde(skip)]
-    untrusted_ledger: Vec<String>,
+    ledger: LedgerCheck,
 
     /// What a fresh session with the same identity could see about why the
     /// lock read failed (#822), which chooses `state.lock-unknown`'s remedy.
@@ -165,6 +166,33 @@ pub struct EnvDiagnosis {
     /// as it was.
     #[serde(skip)]
     lock_gap: Option<pbps_db::doctor::LockReadGap>,
+}
+
+/// What the ledger check established. One of three, because they need three
+/// different answers: a difference established is a ledger no command will
+/// write to, and its remedy is to restore or replace it; a check that could
+/// not run established nothing, and that remedy would destroy a healthy
+/// ledger on the strength of a dropped connection (#853). Absent, empty and
+/// unreadable are three different things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LedgerCheck {
+    /// Nothing was asked: the environment was never reached.
+    NotChecked,
+    /// The check ran; these are the differences it found, none if it found
+    /// none.
+    Checked(Vec<String>),
+    /// The check could not run, for this reason — source-free, as
+    /// [`crate::engine::ledger_safe_reason`] renders it.
+    Unreadable(String),
+}
+
+impl LedgerCheck {
+    fn of(result: Result<Vec<String>, pbps_db::DbError>) -> Self {
+        match result {
+            Ok(problems) => Self::Checked(problems),
+            Err(error) => Self::Unreadable(crate::engine::ledger_safe_reason(&error.into())),
+        }
+    }
 }
 
 impl EnvDiagnosis {
@@ -195,7 +223,7 @@ impl EnvDiagnosis {
             absent_schemas: Vec::new(),
             server_capabilities_unknown: None,
             detail: None,
-            untrusted_ledger: Vec::new(),
+            ledger: LedgerCheck::NotChecked,
             lock_gap: None,
         }
     }
@@ -491,6 +519,7 @@ fn unanswerable(report: &output::Report<Diagnosis>) -> usize {
                     "environment.unreachable"
                         | "environment.unconfigured"
                         | "permission.unknown"
+                        | "ledger.unknown"
                         | "state.lock-unknown"
                         | "server.capabilities-unknown"
                         | "resolver.discovery-unknown"
@@ -971,10 +1000,7 @@ async fn examine(
     }
     // Before the ledger is written to, the question `ensure_tables` refuses
     // on (issue #313). A check that could not run is not a clean ledger.
-    d.untrusted_ledger = match crate::engine::ledger_problems(&mut conn).await {
-        Ok(problems) => problems,
-        Err(e) => vec![format!("the ledger tables could not be checked: {e}")],
-    };
+    d.ledger = LedgerCheck::of(crate::engine::ledger_problems(&mut conn).await);
     // The keys still present when the deletes run, where the differ can say;
     // every declared key otherwise. An unreadable ledger is not "nothing
     // survives": it falls back to the over-demand, never to an all-clear.
@@ -1236,15 +1262,15 @@ fn env_findings(
             ),
         ));
     }
-    if !d.untrusted_ledger.is_empty() {
-        out.push(
+    match &d.ledger {
+        LedgerCheck::Checked(problems) if !problems.is_empty() => out.push(
             output::Finding::error(
                 "ledger.untrusted",
                 format!(
                     "{}: the ledger tables are not the ones pbps creates, so no command will \
                      write to them: {}",
                     d.environment,
-                    d.untrusted_ledger.join("; ")
+                    problems.join("; ")
                 ),
             )
             .remedy(
@@ -1252,7 +1278,23 @@ fn env_findings(
                  them and let pbps create its own, and keep CREATE on the ledger's schema away \
                  from untrusted roles",
             ),
-        );
+        ),
+        // Unanswerable, like `permission.unknown`: nothing about the tables
+        // was established, so nothing about them is to be repaired — the
+        // remedy is to ask again, never to restore or drop.
+        LedgerCheck::Unreadable(why) => out.push(
+            output::Finding::error(
+                "ledger.unknown",
+                format!(
+                    "{}: the ledger tables could not be checked against the ones pbps creates \
+                     ({why}), so whether they can be trusted is undetermined; no difference
+                     was established",
+                    d.environment
+                ),
+            )
+            .remedy("check target connectivity and catalog-read permissions, then rerun doctor"),
+        ),
+        LedgerCheck::Checked(_) | LedgerCheck::NotChecked => {}
     }
     if d.permissions_unknown {
         out.push(
@@ -2287,10 +2329,10 @@ mod tests {
     #[test]
     fn an_untrusted_ledger_is_an_error_naming_each_difference() {
         let mut d = EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready");
-        d.untrusted_ledger = vec![
+        d.ledger = LedgerCheck::of(Ok(vec![
             "public.__pbps_lock has trigger t, which pbps did not create".to_owned(),
             "public.__pbps_state is owned by `mallory`".to_owned(),
-        ];
+        ]));
         let findings = env_findings(
             &d,
             false,
@@ -2305,7 +2347,7 @@ mod tests {
         assert!(ledger.message.contains("trigger t"), "{}", ledger.message);
         assert!(ledger.message.contains("mallory"), "{}", ledger.message);
 
-        d.untrusted_ledger.clear();
+        d.ledger = LedgerCheck::of(Ok(Vec::new()));
         assert!(
             !env_findings(
                 &d,
@@ -2316,6 +2358,72 @@ mod tests {
             .iter()
             .any(|f| f.id == "ledger.untrusted")
         );
+    }
+
+    /// #853: a ledger check that could not run established nothing. It is
+    /// `ledger.unknown`, which `doctor` cannot answer past — never
+    /// `ledger.untrusted`, whose remedy of restoring or dropping the tables
+    /// would destroy a healthy ledger over a dropped connection — and the
+    /// server's own words do not reach the finding.
+    #[test]
+    fn an_unreadable_ledger_check_is_unknown_not_untrusted() {
+        let mut d = EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready");
+        d.ledger = LedgerCheck::of(Err(pbps_db::DbError::Driver {
+            message: "canceling statement: secret-marker".to_owned(),
+            code: Some("57014".to_owned()),
+        }));
+        let findings = env_findings(
+            &d,
+            false,
+            &pbps_pg::Postgres::new(),
+            pbps_db::Driver::Postgres,
+        );
+        assert!(
+            findings.iter().all(|f| f.id != "ledger.untrusted"),
+            "{findings:?}"
+        );
+        let unknown: Vec<_> = findings
+            .iter()
+            .filter(|f| f.id == "ledger.unknown")
+            .collect();
+        assert_eq!(unknown.len(), 1, "{findings:?}");
+        let ledger = unknown[0];
+        assert_eq!(ledger.severity, output::Severity::Error);
+        assert!(ledger.message.contains("57014"), "{}", ledger.message);
+        assert!(
+            !ledger.message.contains("secret-marker"),
+            "{}",
+            ledger.message
+        );
+        let remedy = ledger.remedy.as_deref().unwrap_or_default();
+        assert!(
+            !remedy.contains("drop") && !remedy.contains("restore"),
+            "{remedy}"
+        );
+
+        // Could not look, so the command could not answer: exit 1, not the
+        // 2 of a ledger it looked at and distrusted.
+        let report = output::Report::<Diagnosis>::new("doctor", findings, None);
+        assert_eq!(unanswerable(&report), 1);
+        let error = outcome(&report).unwrap_err();
+        assert!(error.downcast_ref::<crate::Found>().is_none(), "{error}");
+
+        // An established difference still is a finding, not an unknown.
+        d.ledger = LedgerCheck::of(Ok(vec!["public.__pbps_lock has trigger t".to_owned()]));
+        let findings = env_findings(
+            &d,
+            false,
+            &pbps_pg::Postgres::new(),
+            pbps_db::Driver::Postgres,
+        );
+        assert!(
+            findings.iter().all(|f| f.id != "ledger.unknown"),
+            "{findings:?}"
+        );
+        let report = output::Report::<Diagnosis>::new("doctor", findings, None);
+        assert_eq!(unanswerable(&report), 0);
+        let error = outcome(&report).unwrap_err();
+        assert!(error.downcast_ref::<crate::Found>().is_some(), "{error}");
     }
 
     /// The first cause is not decorated: a diagnosis with one thing to say
