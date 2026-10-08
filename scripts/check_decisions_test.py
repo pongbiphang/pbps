@@ -287,17 +287,45 @@ class TheRecord(unittest.TestCase):
             ("DECISIONS 2, 900", [2, 900]),
         ]:
             numbers, problems = [], []
-            for group in cd.citation_groups(line, cd.CLOSED):
+            for _, group in cd.citation_groups([line], cd.CLOSED):
                 found, wrong = cd.cited_numbers(group, cd.CLOSED)
                 numbers += found
                 problems += wrong
             self.assertEqual((numbers, problems), (cited, []), line)
 
+    # #1666: a group wrapped onto the next line goes on there.
+
+    def test_a_group_wrapped_after_a_separator_is_checked_on_its_next_line(self):
+        for text in [
+            "// DECISIONS 1, 2,\n// 9 and 4",
+            "/// DECISIONS 1, 2,\n/// 9 and 4.",
+            "# DECISIONS 1 and\n# 9",
+            "-- DECISIONS 1, and\n-- 9",
+            "the record (DECISIONS 1,\n9).",
+            " * DECISIONS 1,\n * 2,\n * 9",
+        ]:
+            errors = run(cited={"src/a.rs": text})
+            last = text.count("\n") + 1
+            self.assertEqual(errors, [f"src/a.rs:{last}: DECISIONS 9 names no entry"], text)
+        self.assertEqual(run(cited={"src/a.rs": "// DECISIONS 1, 2,\n// 3 and 4"}), [])
+
+    def test_a_wrapped_line_of_prose_is_not_read_as_a_citation(self):
+        for text in [
+            "DECISIONS 2,\nand the reason is 9",
+            "DECISIONS 2,\n9 rows are rejected",
+            "DECISIONS 2 and\n#9's limitation",
+            "DECISIONS 2,\n// 2026 was the year",
+            "DECISIONS 2.\n9",
+            "DECISIONS 2, 3\n9",
+            "DECISIONS 2,\n\n9",
+        ]:
+            self.assertEqual(run(cited={"docs/a.md": text}), [], text)
+
     def test_a_repeated_range_holds_each_number_once(self):
         # Twenty thousand repeats of the whole sequence used to be expanded
         # and held one by one: millions of integers for one long line.
         line = "DECISIONS " + ", ".join(["1-543"] * 20000)
-        (group,) = cd.citation_groups(line, cd.CLOSED)
+        ((_, group),) = cd.citation_groups([line], cd.CLOSED)
         self.assertEqual(len(group), 20000)
         numbers, problems = cd.cited_numbers(group, cd.CLOSED)
         self.assertEqual((numbers, problems), (list(range(1, 544)), []))

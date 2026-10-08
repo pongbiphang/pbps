@@ -19,7 +19,8 @@ It refuses:
     sequence is complete except for the four numbers it never used (523–526),
     and those may not be taken now;
   - a citation, `DECISIONS <n>` or `DEC-<issue>.<k>`, that names no entry —
-    every number of a grouped one (`DECISIONS 70, 87 and 90`, `181–190`). One
+    every number of a grouped one (`DECISIONS 70, 87 and 90`, `181–190`),
+    including one a comment wraps onto its next line. One
     of the four unused numbers is accepted: branches reserved them, and
     records still mention them as proposals.
 """
@@ -60,6 +61,12 @@ CITE_START = re.compile(r"\bDECISIONS (?=\d)")
 # A number, or a range of two.
 CITE_ITEM = re.compile(r"(\d+)(?:[ \t]*[-–][ \t]*(\d+))?")
 SEPARATOR = re.compile(r"(?:(,)[ \t]*(?:and[ \t]+)?|[ \t]+and[ \t]+)(?=\d)")
+# A separator that ends its line: the group runs on to the next one.
+TRAILING = re.compile(r"(?:,[ \t]*(?:and)?|[ \t]+and)[ \t]*$")
+# Where a wrapped group's next line starts: past its indentation and one
+# comment or quote marker, at a number. The marker is followed by a space, as
+# a comment's is: `#1186` at the start of a line is an issue, not a comment.
+CONTINUATION = re.compile(r"[ \t]*(?:(?:///|//!|//|#+|--|\*|>)[ \t]+)?(?=\d)")
 # Where a group can end: punctuation, the end of the line, another and/or.
 GROUP_END = re.compile(r"[ \t]*(?:[,;:.)\]}|*`'\"]|$)|[ \t]+(?:and|or)\b|[ \t]+[(—–-]")
 CITE_NEW = re.compile(r"\bDEC-(\d+)\.(\d+)\b")
@@ -86,8 +93,36 @@ def entries_of(path, text):
         yield ident, i + 1, problem
 
 
-def citation_groups(line, closed):
-    """Yield each legacy citation group on a line, as its list of CITE_ITEM matches.
+def _belongs(line, item, comma, closed):
+    """Whether a number after a separator is the citation's, not the prose's."""
+    # Either end: a date after a comma (`2026-10-08`) reads as the range
+    # `2026-10`, whose second end is inside the sequence.
+    beyond = max(int(item[1]), int(item[2] or 0)) > closed
+    return not (comma and beyond and not GROUP_END.match(line, item.end()))
+
+
+def _scan(line, item, closed):
+    """A group's items on one line from its first, and whether it runs on.
+
+    Runs on means the line ends on a separator, so the group continues on
+    the next line; the second value is then whether that separator was a
+    comma (which `_belongs` asks), and None when the group ended.
+    """
+    items = [item]
+    while True:
+        sep = SEPARATOR.match(line, item.end())
+        if not sep:
+            trailing = TRAILING.match(line, item.end())
+            return items, (trailing[0].lstrip().startswith(",") if trailing else None)
+        following = CITE_ITEM.match(line, sep.end())
+        if not _belongs(line, following, sep[1], closed):
+            return items, None
+        items.append(following)
+        item = following
+
+
+def citation_groups(lines, closed):
+    """Yield (line number, CITE_ITEM matches) for each legacy citation group.
 
     A range's second end and a number after `and` are always the citation's:
     `DECISIONS 403–405 keep uncertainty explicit` and `DECISIONS 225 and 417
@@ -97,23 +132,24 @@ def citation_groups(line, closed):
     the prose's, and reading it as a citation would fail CI on a valid
     document. A number past the sequence where a group can end is still read,
     so a typo of one is still caught.
+
+    A group that ends its line on a separator — a comment wrapped after
+    `DECISIONS 140, 146,` — goes on with the next line's numbers, past that
+    line's comment marker, under the same rules (#1666). Each number is
+    reported at the line it is on.
     """
-    for start in CITE_START.finditer(line):
-        item = CITE_ITEM.match(line, start.end())
-        items = [item]
-        while True:
-            sep = SEPARATOR.match(line, item.end())
-            if not sep:
-                break
-            following = CITE_ITEM.match(line, sep.end())
-            # Either end: a date after a comma (`2026-10-08`) reads as the
-            # range `2026-10`, whose second end is inside the sequence.
-            beyond = max(int(following[1]), int(following[2] or 0)) > closed
-            if sep[1] and beyond and not GROUP_END.match(line, following.end()):
-                break
-            items.append(following)
-            item = following
-        yield items
+    runs_on = None
+    for number, line in enumerate(lines, 1):
+        carried, runs_on = runs_on, None
+        if carried is not None:
+            start = CONTINUATION.match(line)
+            first = start and CITE_ITEM.match(line, start.end())
+            if first and _belongs(line, first, carried, closed):
+                items, runs_on = _scan(line, first, closed)
+                yield number, items
+        for start in CITE_START.finditer(line):
+            items, runs_on = _scan(line, CITE_ITEM.match(line, start.end()), closed)
+            yield number, items
 
 
 def cited_numbers(items, closed):
@@ -187,13 +223,14 @@ def check(topic_files, index_text, cited_in, closed=CLOSED):
     for path, text in sorted(cited_in.items()):
         if path in NOT_CITATIONS:
             continue
-        for number, line in enumerate(text.split("\n"), 1):
-            for group in citation_groups(line, closed):
-                numbers, problems = cited_numbers(group, closed)
-                errors.extend(f"{path}:{number}: {p}" for p in problems)
-                for n in numbers:
-                    if str(n) not in legacy and n not in reserved:
-                        errors.append(f"{path}:{number}: DECISIONS {n} names no entry")
+        lines = text.split("\n")
+        for number, group in citation_groups(lines, closed):
+            numbers, problems = cited_numbers(group, closed)
+            errors.extend(f"{path}:{number}: {p}" for p in problems)
+            for n in numbers:
+                if str(n) not in legacy and n not in reserved:
+                    errors.append(f"{path}:{number}: DECISIONS {n} names no entry")
+        for number, line in enumerate(lines, 1):
             for issue, k in CITE_NEW.findall(line):
                 if f"DEC-{issue}.{k}" not in where:
                     errors.append(f"{path}:{number}: DEC-{issue}.{k} names no entry")
