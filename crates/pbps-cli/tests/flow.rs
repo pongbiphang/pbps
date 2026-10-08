@@ -3220,6 +3220,87 @@ fn a_computed_column_and_the_function_it_calls_drop_together() {
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
 }
 
+/// #1625: a foreign key to a declared history under a case variant of its
+/// name passes the offline check, which compares names as written, and is
+/// refused at `plan --db` on a case-insensitive database, naming both
+/// spellings: there the engine refuses its `ADD FOREIGN KEY` (13565) after
+/// the statements before it. On a case-sensitive database the variant is
+/// another table, which a key may reference, and the plan is not refused.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_key_to_a_case_variant_of_a_history_is_refused_under_the_collation() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let declare = |slug: &str| {
+        let d = Demo::new(slug);
+        std::fs::write(
+            d.dir.join("schema/dbo.t.yml"),
+            "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  \
+             vf: {type: datetime2(7), nullable: false}\n  \
+             vt: {type: datetime2(7), nullable: false}\n\nprimary_key: [id]\n\n\
+             system_time:\n  period: [vf, vt]\n  versioning:\n    history: dbo.T_History\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.dir.join("schema/dbo.child.yml"),
+            "table: dbo.child\ncolumns:\n  id: {type: int, nullable: false}\n  t_id: {type: int}\n\
+             primary_key: [id]\nforeign_keys:\n  fk_child_history:\n    columns: [t_id]\n    \
+             references: dbo.t_history(id)\n",
+        )
+        .unwrap();
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "offline: {}{}", stdout(&o), stderr(&o));
+        d.commit();
+        d
+    };
+
+    let insensitive = OwnDatabase::collated(&server, "history1625_ci", "Latin1_General_100_CI_AS");
+    let d = declare("history1625-ci");
+    let refused = |args: &[&str]| {
+        let o = d.run(args);
+        assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
+        let e = stderr(&o);
+        for said in [
+            "foreign key the engine refuses (13565)",
+            "`fk_child_history` on `dbo.child` references `dbo.t_history`",
+            "the history table of `dbo.t`",
+            "(declared as `dbo.T_History`",
+        ] {
+            assert!(e.contains(said), "{args:?}: {said}: {e}");
+        }
+    };
+    // Into the empty database, and then into it adopted as it stands.
+    refused(&["bootstrap", "--db", insensitive.connection()]);
+    let o = d.run(&[
+        "baseline",
+        "--db",
+        insensitive.connection(),
+        "--reason",
+        "adopt",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    refused(&["plan", "--db", insensitive.connection()]);
+
+    // Negative: under a case-sensitive collation `dbo.t_history` is a table
+    // of its own, here one the key can reference.
+    let sensitive = OwnDatabase::collated(&server, "history1625_cs", "Latin1_General_100_CS_AS");
+    on_server(
+        sensitive.connection(),
+        "CREATE TABLE dbo.t_history (id int NOT NULL CONSTRAINT pk_th PRIMARY KEY);",
+    );
+    let d = declare("history1625-cs");
+    let o = d.run(&[
+        "baseline",
+        "--db",
+        sensitive.connection(),
+        "--reason",
+        "adopt",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", sensitive.connection()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(!stderr(&o).contains("13565"), "{}", stderr(&o));
+}
+
 /// A connected plan orders a SQL Server computed column's function drops by
 /// the catalog's own edges (#1431, DEC-1431.1). A dropped table's computed
 /// columns call the schema-bound `dbo.g` over `dbo.lookup`, and `x.f`; a

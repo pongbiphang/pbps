@@ -5724,6 +5724,9 @@ pub fn cmd_bootstrap(
         // by the `CREATE TABLE` that names it after the ones before it ran
         // (#1175).
         crate::engine::refuse_unknown_collations(&mut conn, &loaded.schema).await?;
+        // A key to a declared history under another spelling (#1625).
+        crate::engine::refuse_history_references_alike(&mut conn, &loaded.schema, dialect.as_ref())
+            .await?;
         // A history retention or a cascading key the server lacks (#1502).
         crate::engine::refuse_unsupported_temporal(&mut conn, &cs).await?;
         crate::engine::permission_support(&mut conn, &cs).await?;
@@ -6171,6 +6174,10 @@ pub fn cmd_plan_db(
         let declared =
             declarations_as_compared(&loaded.schema, managed.database_collation.as_deref());
         crate::engine::refuse_unknown_collations(&mut conn, &declared).await?;
+        // A key to a declared history under another spelling of its name,
+        // which only the database's collation can join (#1625).
+        crate::engine::refuse_history_references_alike(&mut conn, &declared, dialect.as_ref())
+            .await?;
         // And now that the default is known, an absent collation facing a
         // named one on a foreign key is decidable (#1247 review).
         let mismatched =

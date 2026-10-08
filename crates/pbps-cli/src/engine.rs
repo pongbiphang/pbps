@@ -489,6 +489,62 @@ pub async fn refuse_unknown_collations(conn: &mut Conn, schema: &Schema) -> anyh
     Ok(())
 }
 
+/// Refuses a foreign key to a declared history the database reads as one
+/// name with it (#1625). Offline the check compares names as written
+/// (`check_history_references`), since the collation is the server's
+/// (DEC-1243.1); on a case-insensitive database a key to `dbo.t_history`
+/// references the history `dbo.T_History`, and the engine refuses its
+/// `ADD FOREIGN KEY` (13565) once the statements before it have run. The
+/// database answers which spellings are one, as for every other name a plan
+/// compares (`object_names_alike`). PostgreSQL has no system-versioned
+/// table.
+pub async fn refuse_history_references_alike(
+    conn: &mut Conn,
+    schema: &Schema,
+    dialect: &dyn pbps_dialect::Dialect,
+) -> anyhow::Result<()> {
+    if conn.driver() != Driver::Mssql {
+        return Ok(());
+    }
+    let histories: Vec<&TableName> = schema
+        .tables
+        .values()
+        .filter_map(|t| t.system_time.as_ref()?.versioning.as_ref())
+        .map(|v| &v.history)
+        .collect();
+    // A key to a history as written is the offline check's, already refused.
+    let referenced: BTreeSet<&TableName> = schema
+        .tables
+        .values()
+        .flat_map(|t| t.foreign_keys.values())
+        .map(|fk| &fk.references_table)
+        .filter(|r| !histories.contains(r))
+        .collect();
+    if histories.is_empty() || referenced.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<TableName> = histories
+        .iter()
+        .copied()
+        .chain(referenced)
+        .cloned()
+        .collect();
+    let alike = pbps_mssql::catalog::object_names_alike(conn, &names).await?;
+    let problems = pbps_dialect::history_references_under(schema, dialect, |a, b| {
+        a == b
+            || alike
+                .iter()
+                .any(|(x, y)| (x == a && y == b) || (x == b && y == a))
+    });
+    if !problems.is_empty() {
+        anyhow::bail!(
+            "the declarations have a foreign key the engine refuses (13565):\n  {}",
+            problems.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
 /// Refuses what this server cannot take of a system-versioned table, before
 /// the first statement (#1502): SQL Server 2016 has no history retention and
 /// no cascading key from a system-versioned table, and refuses either only
