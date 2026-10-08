@@ -1827,6 +1827,11 @@ by the engines, and the scratch account decides the layout.** Implemented by
     of the role that granted it does (measured on 18), and that is a write
     outside the run's database. The run refuses while any exists, naming
     them (#1678 review).
+  - **Nor has the login granted a role membership**, through an
+    `ADMIN OPTION`. `DROP OWNED` removes the membership row whose grantor
+    is the login, so another role would lose it (measured on 16 and 18).
+    A grant the login made on another database's ACL, and a membership
+    granted to the login, are untouched and need no check.
 - **Why ownership is required.** `DROP OWNED` also revokes what was granted
   to the login on the database, and only an owner keeps its rights through
   that.

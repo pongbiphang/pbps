@@ -638,8 +638,9 @@ impl Run<'_> {
             .map_err(db("the scratch account's grants elsewhere"))?;
         if !grants.is_empty() {
             return Err(Error::Vouched(format!(
-                "the scratch account {} holds privileges outside its database ({}), which \
-                 emptying the database with DROP OWNED could revoke; use an account with none",
+                "the scratch account {} holds or granted privileges outside its database ({}), \
+                 which emptying the database with DROP OWNED could revoke; use an account \
+                 with none",
                 principal.login,
                 grants.join(", ")
             )));

@@ -1438,8 +1438,8 @@ entry implemented by #1672, Docker by #1674).**
         All of it is dropped afterwards.
       - **Supplied.** Any other account compiles as itself in the database
         its connection names, which it must own. The account may hold no
-        direct grant on another database, tablespace or parameter, which
-        `DROP OWNED` could revoke. The deployer's role and database defaults
+        direct grant on another database, tablespace or parameter, and may
+        have granted no role membership, which `DROP OWNED` could revoke. The deployer's role and database defaults
         become session settings, and `DROP OWNED` empties the database
         afterwards, whether the run answered or refused.
     - **Scratch is empty.** The database the run compiles in holds nothing

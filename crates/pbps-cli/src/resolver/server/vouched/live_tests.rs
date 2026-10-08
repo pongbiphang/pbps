@@ -739,3 +739,69 @@ async fn vouched_provisions_as_the_superuser_login_whatever_its_default_role() {
     assert_answers_the_overload(&plan.unwrap());
     assert_answers_the_overload(&through_options.unwrap());
 }
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_memberships_it_granted() {
+    // The login holds `ADMIN OPTION` on a role and granted it to another
+    // role. `DROP OWNED` would remove that membership, which lives outside
+    // the scratch database (#1678 review).
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        let app = format!("pbps_v1672_a_{}", fixture.token);
+        let user = format!("pbps_v1672_u_{}", fixture.token);
+        fixture
+            .admin()
+            .await
+            .execute(&format!(
+                "CREATE ROLE {app} NOLOGIN; CREATE ROLE {user} NOLOGIN; \
+                 GRANT {app} TO {login} WITH ADMIN OPTION; \
+                 SET ROLE {login}; GRANT {app} TO {user}; RESET ROLE",
+                login = login.0
+            ))
+            .await
+            .unwrap();
+        fixture.roles.insert(0, user.clone());
+        fixture.roles.insert(0, app.clone());
+        let granted = || async {
+            let rows = fixture
+                .admin()
+                .await
+                .query(&format!(
+                    "SELECT count(*)::text AS n FROM pg_catalog.pg_auth_members a \
+                     JOIN pg_catalog.pg_roles m ON m.oid = a.member \
+                     WHERE m.rolname = '{user}'"
+                ))
+                .await
+                .unwrap();
+            rows[0].try_get::<&str>("n").unwrap().unwrap().to_owned()
+        };
+        let before = granted().await;
+        let inputs = Inputs::overload();
+        let key = ProjectKey::new(true);
+        let reason = vouched_refusal(
+            produce(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+            )
+            .await,
+        );
+        let after = granted().await;
+        let left = fixture.foreign_objects(&scratch_db).await;
+        fixture.drop().await;
+        assert!(
+            reason.contains(&format!("membership of {user} in {app}")),
+            "{server}: {reason}"
+        );
+        assert_eq!(
+            (before.as_str(), after.as_str()),
+            ("1", "1"),
+            "{server}: the membership is kept"
+        );
+        assert_eq!(left.1, 0, "{server}: nothing was written: {left:?}");
+    }
+}

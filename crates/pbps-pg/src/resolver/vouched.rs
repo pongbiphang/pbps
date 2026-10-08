@@ -385,8 +385,15 @@ pub async fn foreign_objects(
 /// configuration parameter. `DROP OWNED`, which empties the supplied
 /// database, revokes such a grant wherever the login has the authority to,
 /// as a member of the granting role can (measured on 18), and that is a
-/// write outside the run's own database. The supplied layout refuses while
-/// any exists.
+/// write outside the run's own database. A role membership the login
+/// granted, through its `ADMIN OPTION`, is revoked as well: measured on 16
+/// and 18, `DROP OWNED` removes the `pg_auth_members` row whose grantor is
+/// the login, so another role loses a membership (#1678 review). The
+/// supplied layout refuses while any of these exists.
+///
+/// What `DROP OWNED` leaves alone needs no check, as measured: a grant the
+/// login made on another database's ACL, and a membership granted to the
+/// login itself.
 pub async fn shared_grants(conn: &mut impl QueryConnection) -> Result<Vec<String>, DbError> {
     let rows = conn
         .query(
@@ -402,6 +409,12 @@ pub async fn shared_grants(conn: &mut impl QueryConnection) -> Result<Vec<String
              SELECT 'parameter ' || p.parname \
                FROM pg_catalog.pg_parameter_acl p, pg_catalog.aclexplode(p.paracl) a, login \
               WHERE a.grantee = login.oid \
+             UNION \
+             SELECT 'membership of ' || m.rolname || ' in ' || r.rolname || ' it granted' \
+               FROM pg_catalog.pg_auth_members a \
+               JOIN pg_catalog.pg_roles r ON r.oid = a.roleid \
+               JOIN pg_catalog.pg_roles m ON m.oid = a.member, login \
+              WHERE a.grantor = login.oid AND a.member <> login.oid \
              ORDER BY 1",
         )
         .await?;
