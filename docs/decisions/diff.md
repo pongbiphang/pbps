@@ -3380,6 +3380,14 @@ gone, and the add binds the method. So a call whose first part is a column of
 the table, as declared, is not refused for a function the plan drops, and
 still is for one it alters or creates.
 
+Only a column of a type with methods is such a receiver (#1677): `geography`,
+`geometry`, `hierarchyid` and `xml`, all there are, since the model's type
+catalogue has no user-defined CLR type. On an `int` column `xe`, the call
+`[xe].[f]([a])` beside a dropped `[xé].[f]` is the function's, and is
+refused; before #1677 any declared column exempted it, and the add failed
+inside the apply. Pinned by the live
+`a_call_on_a_column_without_methods_is_a_call_to_the_function`.
+
 Pinned by the live `a_readded_computed_columns_calls_are_compared_under_the_collation`
 (`crates/pbps-cli/tests/flow.rs`): under `CI_AI`, re-declaring the column as
 `[dbo].[cafe]` while `café` is altered is refused at `plan --db`, and

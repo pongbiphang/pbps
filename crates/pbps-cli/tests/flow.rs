@@ -3911,6 +3911,54 @@ fn a_readded_computed_columns_calls_are_compared_under_the_collation() {
     ok(&d.run(&["plan", "--db", ai.connection()]));
 }
 
+/// #1677: only a column of a type with methods can be a call's receiver. On
+/// an accent-insensitive database a computed column added as
+/// `[xe].[f]([a])`, over an `int` column `xe`, while the plan drops the
+/// function `[xé].[f]`, calls that function: `int` has no method `f`. It is
+/// refused at `plan --db` by name, where the text screen, which keeps
+/// accents apart, let it through and the add failed inside the apply.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_call_on_a_column_without_methods_is_a_call_to_the_function() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let ai = OwnDatabase::collated(&server, "computed1677_ai", "SQL_Latin1_General_CP1_CI_AI");
+    for sql in [
+        "CREATE SCHEMA [xé];",
+        "CREATE FUNCTION [xé].[f] (@x int) RETURNS int AS BEGIN RETURN @x * 7 END;",
+        "CREATE TABLE dbo.n (id int NOT NULL CONSTRAINT pk_n PRIMARY KEY, a int NULL, xe int NULL);",
+    ] {
+        on_server(ai.connection(), sql);
+    }
+    let d = Demo::new("computed1677-ai");
+    ok(&d.run(&["pull", "--db", ai.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", ai.connection(), "--reason", "adopt"]));
+    let function = walk(&d.dir.join("schema"))
+        .into_iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("@x * 7")))
+        .expect("[xé].[f]'s declaration");
+    std::fs::remove_file(&function).unwrap();
+    let table = d.dir.join("schema/dbo.n.yml");
+    let declared = std::fs::read_to_string(&table).unwrap();
+    assert!(!declared.contains("computed:"), "{declared}");
+    std::fs::write(
+        &table,
+        format!("{declared}computed:\n  c: {{expression: \"([xe].[f]([a]))\"}}\n"),
+    )
+    .unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", ai.connection()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("computed column dbo.n.c calls `xé.f` as `xe.f`"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(stderr(&o).contains("this plan drops it"), "{}", stderr(&o));
+}
+
 /// A connected plan refuses what the catalog's edges say SQL Server would,
 /// where a text scan could not tell (#1431, DEC-1431.1): a retype of `café`,
 /// which `[cafe]` binds under an accent-insensitive collation (#1426); and a

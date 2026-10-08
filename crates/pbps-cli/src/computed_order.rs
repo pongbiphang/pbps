@@ -327,10 +327,26 @@ struct AddedCall {
     table: TableName,
     column: String,
     names: Vec<(String, String)>,
-    /// The table's columns when the computed column is added: the declared
-    /// ones, since a column the plan drops is gone first and one it adds
-    /// comes first.
-    columns: Vec<String>,
+    /// The table's columns a call can be a method of, when the computed
+    /// column is added: the declared ones, since a column the plan drops is
+    /// gone first and one it adds comes first, of a type with methods.
+    receivers: Vec<String>,
+}
+
+/// The types SQL Server gives methods, which a call `column.method()` binds
+/// to (#1677). The type catalogue is closed, with no user-defined CLR type
+/// (`pbps_mssql::types`), so these are all of them; an `int` column `x` has
+/// no `x.f()`, and a call of that shape is a function's.
+const METHOD_TYPES: [&str; 4] = ["geography", "geometry", "hierarchyid", "xml"];
+
+/// `table`'s columns of a type with methods.
+fn method_receivers(table: &pbps_model::Table) -> Vec<String> {
+    table
+        .columns
+        .iter()
+        .filter(|(_, c)| METHOD_TYPES.contains(&c.ty.base.as_str()))
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// Each computed column this plan adds, new or again, with its names.
@@ -339,11 +355,11 @@ fn added_calls(
     declared: &pbps_model::Schema,
     dialect: &dyn pbps_dialect::Dialect,
 ) -> Vec<AddedCall> {
-    let columns_of = |table: &TableName| {
+    let receivers_of = |table: &TableName| {
         declared
             .tables
             .get(table)
-            .map(|t| t.columns.keys().cloned().collect())
+            .map(method_receivers)
             .unwrap_or_default()
     };
     let mut out = Vec::new();
@@ -358,7 +374,7 @@ fn added_calls(
                 table: table.clone(),
                 column: name.clone(),
                 names: dialect.qualified_calls(&computed.expression),
-                columns: columns_of(table),
+                receivers: receivers_of(table),
             });
         }
         if let Change::CreateTable { name, table, .. } = &p.change {
@@ -367,7 +383,7 @@ fn added_calls(
                     table: name.clone(),
                     column: column.clone(),
                     names: dialect.qualified_calls(&computed.expression),
-                    columns: table.columns.keys().cloned().collect(),
+                    receivers: method_receivers(table),
                 });
             }
         }
@@ -401,7 +417,7 @@ pub(crate) fn added_call_spellings(
             out.insert(schema);
             out.insert(name);
         }
-        out.extend(call.columns);
+        out.extend(call.receivers);
     }
     out
 }
@@ -416,8 +432,8 @@ pub(crate) fn added_call_spellings(
 /// alter (3729) or the add, inside the apply.
 ///
 /// One exception, measured on 17.0 under `CI_AI` (#1668 review): a call
-/// whose first part is a column of the table may be the column's method,
-/// `geo.STAsText()`. A function the plan drops is gone before the add, which
+/// whose first part is a column of the table, of a type with methods
+/// (#1677), may be the column's method, `geo.STAsText()`. A function the plan drops is gone before the add, which
 /// then binds the method, so that drop refuses nothing. While a function of
 /// that name exists the engine rejects the call as ambiguous (327), and one
 /// created after the add leaves the table's computed columns unloadable
@@ -434,11 +450,11 @@ pub(crate) fn refuse_added_calls(
         table,
         column,
         names,
-        columns,
+        receivers,
     } in added_calls(cs, declared, dialect)
     {
         for (schema, name) in &names {
-            let a_method = columns.iter().any(|c| alike.same(schema, c));
+            let a_method = receivers.iter().any(|c| alike.same(schema, c));
             for (function, what) in &functions {
                 if *what == "drops" && a_method {
                     continue;
@@ -653,13 +669,14 @@ mod tests {
             changes: vec![add(expression), change],
         };
         let dialect = pbps_mssql::Mssql;
-        // dbo.t as declared, with these columns.
+        // dbo.t as declared, with these columns, `int` unless typed.
         let declared = |columns: &[&str]| {
             let mut table = pbps_model::Table::default();
             for column in columns {
+                let (name, ty) = column.split_once(' ').unwrap_or((column, "int"));
                 table.columns.insert(
-                    (*column).to_owned(),
-                    pbps_model::Column::new("int".parse().unwrap()),
+                    name.to_owned(),
+                    pbps_model::Column::new(ty.parse().unwrap()),
                 );
             }
             let mut schema = pbps_model::Schema::default();
@@ -721,8 +738,25 @@ mod tests {
         // function, and refused.
         let geo = Alike::from_pairs([("geo".to_owned(), "géo".to_owned())]);
         let method = plan("geo.STAsText()", drop_module("géo.STAsText"));
-        assert!(refuse_added_calls(&method, &declared(&["id", "geo"]), &dialect, &geo).is_ok());
+        for ty in ["geography", "geometry", "hierarchyid", "xml"] {
+            let typed = declared(&["id", &format!("geo {ty}")]);
+            assert!(
+                refuse_added_calls(&method, &typed, &dialect, &geo).is_ok(),
+                "{ty}"
+            );
+        }
         assert!(refuse_added_calls(&method, &plain, &dialect, &geo).is_err());
+        // #1677: a column of a type with no methods is no receiver, so
+        // `x.f(a)` on an `int` column `x` calls the dropped function `x.f`,
+        // and is refused; so is one of `nvarchar`.
+        let x = Alike::from_pairs([("x".to_owned(), "X".to_owned())]);
+        let call = plan("x.f([a])", drop_module("X.f"));
+        for ty in ["int", "nvarchar(50)"] {
+            let refused =
+                refuse_added_calls(&call, &declared(&["a", &format!("x {ty}")]), &dialect, &x)
+                    .unwrap_err();
+            assert!(refused.contains("calls `X.f` as `x.f`"), "{ty}: {refused}");
+        }
         // Another schema.
         assert!(
             refuse_added_calls(
