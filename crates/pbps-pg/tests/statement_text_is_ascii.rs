@@ -64,19 +64,20 @@ fn non_ascii_in_code(source: &str) -> Vec<(usize, char)> {
                     i += 1;
                 }
             }
-        } else if (c == 'r' || (c == 'b' && at(i + 1) == 'r'))
+        } else if (c == 'r' || (matches!(c, 'b' | 'c') && at(i + 1) == 'r'))
             && !at(i.wrapping_sub(1)).is_alphanumeric()
             && at(i.wrapping_sub(1)) != '_'
             && {
-                let mut k = i + if c == 'b' { 2 } else { 1 };
+                let mut k = i + if c == 'r' { 1 } else { 2 };
                 while at(k) == '#' {
                     k += 1;
                 }
                 at(k) == '"'
             }
         {
-            // A raw string: `r"…"`, `r#"…"#`, `br"…"`.
-            i += if c == 'b' { 2 } else { 1 };
+            // A raw string: `r"…"`, `r#"…"#`, `br"…"`, `cr"…"`. Its body holds
+            // no escapes, so a `\u{...}` in it is read as the ASCII it spells.
+            i += if c == 'r' { 1 } else { 2 };
             let mut hashes = 0;
             while at(i) == '#' {
                 hashes += 1;
@@ -305,4 +306,9 @@ fn the_ascii_scan_reads_literals_and_skips_comments_and_test_code() {
     assert_eq!(caught("const C: char = '\\n';"), "");
     assert_eq!(caught("const C: char = '\\u{7f}';"), "");
     assert_eq!(caught("const A: &str = \"\\\\u{2014}\";"), "");
+    // A raw C string holds no escapes, so its `\u{...}` is ASCII (#1697),
+    // while a non-ASCII character written into it is still caught.
+    assert_eq!(caught("const A: &CStr = cr\"\\u{2014}\";"), "");
+    assert_eq!(caught("const A: &CStr = cr#\"\\u{2014}\"#;"), "");
+    assert_eq!(caught("const A: &CStr = cr\"—\";"), "—");
 }
