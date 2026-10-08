@@ -70,12 +70,9 @@ pub async fn produce(
         .await
         .map_err(|error| ProduceError::Acquire(format!("the scratch server: {error}")))?;
     let tokens = Tokens::generate();
-    let placement = separation(&mut target, &mut admin, &tokens)
+    let (placement, account, backend) = separation(&mut target, &mut admin, &tokens)
         .await
         .map_err(ProduceError::Run)?;
-    let account = sql::account(&mut admin)
-        .await
-        .map_err(|error| read("the scratch account's attributes", error))?;
     let provisioning = match placement {
         Placement::Target => {
             return Err(vouched(
@@ -101,6 +98,7 @@ pub async fn produce(
         key: &key,
         request: &request,
         tokens: &tokens,
+        backend: &backend,
         created: Created::Nothing,
     };
     let result = run
@@ -126,10 +124,6 @@ fn vouched(reason: impl Into<String>) -> ProduceError {
     ProduceError::Run(Error::Vouched(reason.into()))
 }
 
-fn read(what: &str, error: pbps_db::DbError) -> ProduceError {
-    ProduceError::Run(Error::Read(format!("{what}: {error}")))
-}
-
 /// The run's two session tokens: run-generated, so a token found in
 /// `pg_stat_activity` is this run's session and no other.
 struct Tokens {
@@ -150,11 +144,13 @@ impl Tokens {
 /// Where the scratch session is relative to the target's. Each session marks
 /// itself, and the scratch session looks for both marks: one it can see is a
 /// backend of its own cluster (#1672's refinement of the decision on #1667).
+/// Where the scratch sits, what its account may do, and the backend both
+/// were read on, all from one scratch transaction.
 async fn separation(
     target: &mut Conn,
     scratch: &mut Conn,
     tokens: &Tokens,
-) -> Result<Placement, Error> {
+) -> Result<(Placement, sql::Account, sql::Backend), Error> {
     let failed = |error: pbps_db::DbError| Error::Read(format!("the session marks: {error}"));
     // Both sessions hold a transaction across the whole check. A
     // transaction-pooling proxy releases a backend between transactions, and
@@ -167,7 +163,9 @@ async fn separation(
         let target_mark = sql::mark(target, &tokens.target).await?;
         let scratch_mark = sql::mark(scratch, &tokens.scratch).await?;
         let seen = sql::marked(scratch, &[&tokens.target, &tokens.scratch]).await?;
-        Ok::<_, pbps_db::DbError>((target_mark, scratch_mark, seen))
+        let account = sql::account(scratch).await?;
+        let backend = sql::backend(scratch).await?;
+        Ok::<_, pbps_db::DbError>((target_mark, scratch_mark, seen, account, backend))
     }
     .await;
     // Nothing was written in either transaction; rolling back only ends it.
@@ -175,15 +173,32 @@ async fn separation(
         target.execute("ROLLBACK").await,
         scratch.execute("ROLLBACK").await,
     );
-    let (target_mark, scratch_mark, seen) = observed.map_err(failed)?;
+    let (target_mark, scratch_mark, seen, account, backend) = observed.map_err(failed)?;
     ended.0.map_err(failed)?;
     ended.1.map_err(failed)?;
-    sql::placement(
+    let placement = sql::placement(
         (&tokens.target, target_mark),
         (&tokens.scratch, scratch_mark),
         &seen,
     )
-    .map_err(|reason| Error::Vouched(reason.into()))
+    .map_err(|reason| Error::Vouched(reason.into()))?;
+    Ok((placement, account, backend))
+}
+
+/// Refuses unless `conn`'s current transaction runs on the backend the run
+/// checked: the scratch connection must keep one backend, as a direct or a
+/// session-pooled one does (#1678 review).
+async fn pinned(conn: &mut Conn, checked: &sql::Backend) -> Result<(), Error> {
+    match sql::on_backend(conn, checked).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Error::Vouched(
+            "the scratch connection reached another server backend than the one the run \
+             checked; connect to the scratch server directly or through session pooling, \
+             not transaction pooling"
+                .into(),
+        )),
+        Err(error) => Err(Error::Read(format!("the scratch backend: {error}"))),
+    }
 }
 
 /// How the run provisions its scratch database.
@@ -214,6 +229,8 @@ struct Run<'a> {
     key: &'a pbps_db::fingerprint::EnvironmentFingerprintKey,
     request: &'a super::ScopeRequest,
     tokens: &'a Tokens,
+    /// The scratch backend the separation was read on.
+    backend: &'a sql::Backend,
     created: Created,
 }
 
@@ -533,6 +550,61 @@ impl Run<'_> {
         let db = |what: &'static str| {
             move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
         };
+        // The checks read on the backend the separation was read on, in one
+        // transaction, so a pooler cannot answer them from elsewhere.
+        admin
+            .execute("BEGIN")
+            .await
+            .map_err(db("the scratch checks"))?;
+        let checked = self.supplied_checks(admin).await;
+        let ended = admin.execute("ROLLBACK").await;
+        let (principal, database) = checked?;
+        ended.map_err(db("the scratch checks"))?;
+        let scope::Authorization::Postgres(context) = authorization else {
+            return Err(Error::Scope(
+                "the operator-vouched resolver is implemented for PostgreSQL only".into(),
+            ));
+        };
+        let map =
+            scope::Principals::supplied(authorization, &principal.login).map_err(Error::Scope)?;
+        // Every write, the cleanup included, goes through the connection the
+        // checks were made on. Another connection from the same string need
+        // not reach the same server: a name may resolve to several hosts or a
+        // balancing proxy, and `DROP OWNED` there would empty something else
+        // (#1678 review).
+        self.created = Created::Supplied { database };
+        sql::create_schemas(admin, scope_schemas)
+            .await
+            .map_err(db("the in-scope schemas"))?;
+        pbps_pg::resolver::authorization::apply_session_settings(admin, context)
+            .await
+            .map_err(db("the deployer's settings"))?;
+        let scratch_catalog =
+            scope::read_catalog(admin, driver, &request.schemas, &request.write_path_extras)
+                .await
+                .map_err(db("the scratch analysis scope"))?;
+        // A pooler that moved the connection since the checks is caught here,
+        // before anything compiles; the cleanup checks again on its own.
+        pinned(admin, self.backend).await?;
+        Ok(Prepared {
+            compile: None,
+            capture: None,
+            scratch_catalog,
+            map,
+            differences: Vec::new(),
+        })
+    }
+
+    /// What the supplied layout requires of the scratch account and its
+    /// database, before the run's first write there.
+    async fn supplied_checks(
+        &self,
+        admin: &mut Conn,
+    ) -> Result<(pbps_db::resolver::environment::DeploymentPrincipal, String), Error> {
+        let db = |what: &'static str| {
+            move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
+        };
+        pinned(admin, self.backend).await?;
         let principal = pbps_pg::resolver::authorization::principal(admin)
             .await
             .map_err(db("the scratch account"))?;
@@ -559,36 +631,7 @@ impl Run<'_> {
             )));
         }
         let database = current_database(admin).await?;
-        let scope::Authorization::Postgres(context) = authorization else {
-            return Err(Error::Scope(
-                "the operator-vouched resolver is implemented for PostgreSQL only".into(),
-            ));
-        };
-        let map =
-            scope::Principals::supplied(authorization, &principal.login).map_err(Error::Scope)?;
-        // Every write, the cleanup included, goes through the connection the
-        // checks were made on. Another connection from the same string need
-        // not reach the same server: a name may resolve to several hosts or a
-        // balancing proxy, and `DROP OWNED` there would empty something else
-        // (#1678 review).
-        self.created = Created::Supplied { database };
-        sql::create_schemas(admin, scope_schemas)
-            .await
-            .map_err(db("the in-scope schemas"))?;
-        pbps_pg::resolver::authorization::apply_session_settings(admin, context)
-            .await
-            .map_err(db("the deployer's settings"))?;
-        let scratch_catalog =
-            scope::read_catalog(admin, driver, &request.schemas, &request.write_path_extras)
-                .await
-                .map_err(db("the scratch analysis scope"))?;
-        Ok(Prepared {
-            compile: None,
-            capture: None,
-            scratch_catalog,
-            map,
-            differences: Vec::new(),
-        })
+        Ok((principal, database))
     }
 
     /// Drops what the run created. `Err` names exactly what may remain.
@@ -617,14 +660,13 @@ impl Run<'_> {
                 }
             }
             Created::Supplied { database } => {
-                // The checked connection, never a new one: see `supplied`.
-                if sql::drop_owned(admin).await.is_ok() {
-                    Ok(())
-                } else {
-                    Err(vec![format!(
-                        "every object the scratch account owns in database {database}"
-                    )])
-                }
+                // The checked connection, never a new one, and only on the
+                // checked backend: see `supplied`.
+                sql::drop_owned(admin, self.backend).await.map_err(|error| {
+                    vec![format!(
+                        "every object the scratch account owns in database {database} ({error})"
+                    )]
+                })
             }
         }
     }

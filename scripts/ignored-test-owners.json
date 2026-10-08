@@ -2117,6 +2117,7 @@
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
         "resolver::server::vouched::live_tests::vouched_answers_a_managed_question_without_root_or_observation",
+        "resolver::server::vouched::live_tests::vouched_cleanup_runs_only_on_the_backend_the_run_checked",
         "resolver::server::vouched::live_tests::vouched_compiles_as_a_non_superuser_provisioner_in_its_own_database",
         "resolver::server::vouched::live_tests::vouched_empties_the_supplied_database_when_the_run_refuses",
         "resolver::server::vouched::live_tests::vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account",

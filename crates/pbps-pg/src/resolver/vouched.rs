@@ -175,6 +175,45 @@ pub async fn mark(conn: &mut impl QueryConnection, token: &str) -> Result<Sessio
     })
 }
 
+/// The server backend a session runs on: its process, when it started, and
+/// when its postmaster started. A session always reads its own row of
+/// `pg_stat_activity`, timings included (measured on 16 and 18). Another
+/// backend, on this cluster or another, does not share all three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backend {
+    pid: String,
+    started: String,
+    postmaster: String,
+}
+
+pub async fn backend(conn: &mut impl QueryConnection) -> Result<Backend, DbError> {
+    let rows = conn
+        .query(
+            "SELECT pg_catalog.pg_backend_pid()::text AS pid, \
+                    (SELECT a.backend_start FROM pg_catalog.pg_stat_activity a \
+                      WHERE a.pid = pg_catalog.pg_backend_pid())::text AS started, \
+                    pg_catalog.pg_postmaster_start_time()::text AS postmaster",
+        )
+        .await?;
+    let row = one(rows, "this session's backend")?;
+    Ok(Backend {
+        pid: text(&row, "pid")?,
+        started: text(&row, "started")?,
+        postmaster: text(&row, "postmaster")?,
+    })
+}
+
+/// Whether this transaction runs on `checked`. A connection keeps its socket
+/// to whatever it reached, not its backend: a transaction-pooling proxy may
+/// hand each transaction another backend, possibly on another cluster, so
+/// what the run checked holds only on the backend it was checked on.
+pub async fn on_backend(
+    conn: &mut impl QueryConnection,
+    checked: &Backend,
+) -> Result<bool, DbError> {
+    Ok(backend(conn).await? == *checked)
+}
+
 /// The backends this session can see carrying each of `tokens`. Any role
 /// sees every session's `pid` and `application_name` in `pg_stat_activity`;
 /// only the query text and timings are hidden (measured on 16 and 18).
@@ -384,11 +423,26 @@ pub async fn create_schemas(
 ///
 /// The connection is the one the run compiled on, so it may be inside a
 /// failed transaction or under a role a declaration set; both are ended
-/// first. Neither statement fails when there is nothing to end.
-pub async fn drop_owned(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+/// first. Neither statement fails when there is nothing to end. The drop
+/// runs in one transaction with a check that it is on the backend the run
+/// checked, and is never sent anywhere else.
+pub async fn drop_owned(
+    conn: &mut impl ExecuteConnection,
+    checked: &Backend,
+) -> Result<(), DbError> {
     conn.execute("ROLLBACK").await?;
     conn.execute("RESET ROLE").await?;
-    conn.execute("DROP OWNED BY SESSION_USER").await
+    conn.execute("BEGIN").await?;
+    let bound = on_backend(conn, checked).await;
+    if !matches!(bound, Ok(true)) {
+        conn.execute("ROLLBACK").await?;
+        bound?;
+        return Err(DbError::BadRow(
+            "the connection now reaches another backend than the one the run checked".into(),
+        ));
+    }
+    conn.execute("DROP OWNED BY SESSION_USER").await?;
+    conn.execute("COMMIT").await
 }
 
 #[cfg(test)]

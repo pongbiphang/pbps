@@ -1741,6 +1741,15 @@ by the engines, and the scratch account decides the layout.** Implemented by
     between transactions, so without one the scratch session could be handed
     the target's backend, overwrite its mark and read "another cluster"
     (#1678 review).
+  - **The run keeps the scratch backend it checked.** The same transaction
+    records that backend: its process ID, its start time and its
+    postmaster's start time, which a session reads about itself. A
+    connection keeps its socket, not its backend, so the supplied layout
+    rechecks it in the transaction that holds its checks, and again before
+    compiling. It refuses if the backend moved, and asks for a direct or
+    session-pooled connection. The cleanup's `DROP OWNED` runs in one
+    transaction with that check, so it is never sent to another backend
+    (#1678 review).
 - **Rejected: a `pg_database` row with the target database's name and
   OID.** Two clusters started from one image with one `POSTGRES_DB` hold
   identical rows, which is an ordinary CI layout. That check would call them

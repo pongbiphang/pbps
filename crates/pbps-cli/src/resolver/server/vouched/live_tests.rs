@@ -575,3 +575,47 @@ async fn vouched_compiles_as_a_non_superuser_provisioner_in_its_own_database() {
     assert_eq!(before, after, "no run-owned database or role was created");
     assert_eq!(left.1, 0, "{left:?}");
 }
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_cleanup_runs_only_on_the_backend_the_run_checked() {
+    // A transaction pooler can hand the cleanup another backend than the one
+    // the run checked. Two connections stand in for it: the cleanup is
+    // bound to the first one's backend and runs on the second.
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let login = fixture
+            .login("k", "NOSUPERUSER NOCREATEDB NOCREATEROLE")
+            .await;
+        let scratch_db = fixture.database("s", Some(&login.0)).await;
+        let leftover = format!(
+            "CREATE TABLE public.kept (i integer); ALTER TABLE public.kept OWNER TO {}",
+            login.0
+        );
+        fixture.run(&scratch_db, &[&leftover]).await;
+        let as_login = fixture.as_login(&scratch_db, &login);
+        let mut checked = Conn::connect(Driver::Postgres, &as_login).await.unwrap();
+        let mut other = Conn::connect(Driver::Postgres, &as_login).await.unwrap();
+        let backend = pbps_pg::resolver::vouched::backend(&mut checked)
+            .await
+            .unwrap();
+        let moved = pbps_pg::resolver::vouched::drop_owned(&mut other, &backend).await;
+        let after_moved = fixture.foreign_objects(&scratch_db).await;
+        let same = pbps_pg::resolver::vouched::drop_owned(&mut checked, &backend).await;
+        let after_same = fixture.foreign_objects(&scratch_db).await;
+        drop((checked, other));
+        fixture.drop().await;
+        assert!(
+            moved
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("another backend")),
+            "{server}: {moved:?}"
+        );
+        assert!(
+            after_moved.0.iter().any(|object| object.contains("kept")),
+            "{server}: nothing was dropped on the other backend: {after_moved:?}"
+        );
+        assert!(same.is_ok(), "{server}: {same:?}");
+        assert_eq!(after_same.1, 0, "{server}: {after_same:?}");
+    }
+}

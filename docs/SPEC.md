@@ -1415,6 +1415,9 @@ entry implemented by #1672, Docker by #1674).**
       - A target mark that the scratch session finds in `pg_stat_activity`
         is a backend of the scratch's own cluster. Both sessions hold a
         transaction across the check, so a pooler cannot swap their backends.
+        The run then keeps the scratch backend it checked and refuses a
+        connection that moves to another, such as one through transaction
+        pooling; the cleanup runs only on that backend.
       - The scratch session must find its own mark, or the check could not
         be made and the run refuses.
       - Scratch in the target's own database refuses.
