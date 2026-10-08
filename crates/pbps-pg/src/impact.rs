@@ -546,8 +546,15 @@ fn carried_module(
             } else {
                 ModuleKind::Function
             };
+            // Normalized as a declared argument is: `format_type` quotes an
+            // ordinary type name under `quote_all_identifiers` (measured on
+            // 18.6, `"text"`, `"m"."mood"`), a setting the session pins leave
+            // to the operator, and the plan's id spells it bare.
             args.iter()
-                .map(|a| a.parse::<pbps_model::RoutineArg>())
+                .map(|a| {
+                    a.parse::<pbps_model::RoutineArg>()
+                        .map(|a| crate::types::routine_arg(&a))
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .ok()
                 .map(|args| {

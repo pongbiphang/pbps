@@ -25700,6 +25700,9 @@ async fn a_rename_is_carried_into_what_the_catalog_holds_and_not_into_a_text_bod
              BEGIN ATOMIC SELECT email FROM {s}.customer LIMIT 1; END;
          CREATE FUNCTION {s}.f_atomic(a integer, b text) RETURNS text LANGUAGE sql
              BEGIN ATOMIC SELECT email FROM {s}.customer WHERE id = a; END;
+         CREATE TYPE {s}.mood AS ENUM ('ok');
+         CREATE FUNCTION {s}.f_mood(m {s}.mood, t text) RETURNS text LANGUAGE sql
+             BEGIN ATOMIC SELECT email FROM {s}.customer WHERE m = 'ok' AND email <> t; END;
          CREATE PROCEDURE {s}.p_atomic(x integer) LANGUAGE sql
              BEGIN ATOMIC SELECT email FROM {s}.customer WHERE id = x; END;
          CREATE FUNCTION {s}.t_keep() RETURNS trigger LANGUAGE plpgsql AS
@@ -25771,6 +25774,11 @@ async fn a_rename_is_carried_into_what_the_catalog_holds_and_not_into_a_text_bod
             id(format!("{s}.f_atomic(integer, text)")),
         ),
         (
+            "function".to_owned(),
+            pbps_model::ModuleKind::Function,
+            id(format!("{s}.f_mood({s}.mood, text)")),
+        ),
+        (
             "procedure".to_owned(),
             pbps_model::ModuleKind::Procedure,
             id(format!("{s}.p_atomic(integer)")),
@@ -25793,6 +25801,28 @@ async fn a_rename_is_carried_into_what_the_catalog_holds_and_not_into_a_text_bod
     ];
     expected.sort();
     assert_eq!(keyed, expected, "{report:#?}");
+    // The same keys under the deparse setting the session pins leave to the
+    // operator: quoted type names would make the plan's drop miss them.
+    conn.execute("SET quote_all_identifiers = on")
+        .await
+        .expect("the setting");
+    let quoted = rename_impact(&mut conn, &target)
+        .await
+        .expect("the impact report under quote_all_identifiers");
+    conn.execute("RESET quote_all_identifiers")
+        .await
+        .expect("the reset");
+    let mut quoted_keys: Vec<_> = quoted
+        .carried
+        .iter()
+        .filter_map(|r| {
+            r.removed_with
+                .clone()
+                .map(|(kind, id)| (r.kind.clone(), kind, id))
+        })
+        .collect();
+    quoted_keys.sort();
+    assert_eq!(quoted_keys, expected, "{quoted:#?}");
     assert!(
         report
             .carried
