@@ -3310,6 +3310,244 @@ fn computed_function_drops_follow_the_catalogs_edges() {
     ]));
 }
 
+/// The connected pass reads "no edge" as none only where no referrer can be
+/// hidden (#1462). A login denied `VIEW DEFINITION` on schema `hidden` does
+/// not see `hidden.t`, whose computed column calls `dbo.f`, so its plan to
+/// alter `dbo.f` is refused by name rather than read as free to run. The same
+/// plan as `sa`, and as the login once the `DENY` is gone, is refused by the
+/// edge itself, as the engine would refuse the alter (3729). A hidden
+/// schema-bound view reading `dbo.k.c` refuses that column's drop, by name,
+/// and not a computed column added beside it, which it cannot block (#1643
+/// review). A hidden plain view over `dbo.k.c`, or a hidden procedure calling
+/// `dbo.h`, blocks neither the drop nor the function's alter, and refuses
+/// nothing (#1643 ready review). Without database `VIEW DEFINITION` the
+/// function's alter is refused for the grant, and so is a nullability change
+/// on a table with a computed column; adding a computed column, the same
+/// change on a table with none, or dropping one view, which no edge decides,
+/// plans.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "edges1462_hidden");
+    let login = format!("pbps_flow_referrer_{}", std::process::id());
+    // Not a secret: this login exists for one test inside a throwaway container.
+    let password = "pbpsLeastPrivilege!1";
+    on_server(
+        &server,
+        &format!(
+            "IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ),
+    );
+    on_server(own.connection(), "EXEC(N'CREATE SCHEMA hidden;');");
+    on_server(
+        own.connection(),
+        "CREATE FUNCTION dbo.f (@x int) RETURNS int AS BEGIN RETURN @x * 3 END;",
+    );
+    on_server(
+        own.connection(),
+        "CREATE FUNCTION dbo.h (@x int) RETURNS int AS BEGIN RETURN @x * 5 END;",
+    );
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.k (id int NOT NULL CONSTRAINT pk_k PRIMARY KEY, c AS (id * 2), \
+             b int NULL); \
+         CREATE TABLE dbo.p (id int NOT NULL CONSTRAINT pk_p PRIMARY KEY, a int NULL);",
+    );
+    on_server(
+        own.connection(),
+        "CREATE VIEW dbo.vw AS SELECT id FROM dbo.p;",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("edges1462-hidden");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    // Made after the baseline: somebody else's table, which the project
+    // does not manage and this login cannot see.
+    on_server(
+        own.connection(),
+        &format!(
+            "CREATE TABLE hidden.t (id int NOT NULL, c AS (dbo.f(id))); \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, UPDATE, DELETE, ALTER, REFERENCES \
+                 ON SCHEMA::dbo TO [{login}]; \
+             GRANT VIEW DEFINITION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}]; \
+             DENY VIEW DEFINITION ON SCHEMA::hidden TO [{login}];"
+        ),
+    );
+    let module = walk(&d.dir.join("schema"))
+        .into_iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("@x * 3")))
+        .expect("the function's declaration");
+    let text = std::fs::read_to_string(&module).unwrap();
+    std::fs::write(&module, text.replacen("@x * 3", "@x * 4", 1)).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let as_login = with_key(
+        &with_key(own.connection(), "User Id", &login),
+        "Password",
+        password,
+    );
+
+    let o = d.run(&["plan", "--db", &as_login]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("a referrer of `dbo.f` is hidden from this login"),
+        "{}",
+        stderr(&o)
+    );
+
+    // Everything visible: the edge refuses the alter, by the column.
+    let refused_by_edge = |o: &Output| {
+        assert_ne!(code(o), 0, "{}", stdout(o));
+        assert!(
+            stderr(o).contains("computed column hidden.t.c calls"),
+            "{}",
+            stderr(o)
+        );
+    };
+    refused_by_edge(&d.run(&["plan", "--db", own.connection()]));
+    on_server(
+        own.connection(),
+        &format!("REVOKE VIEW DEFINITION ON SCHEMA::hidden TO [{login}];"),
+    );
+    refused_by_edge(&d.run(&["plan", "--db", &as_login]));
+
+    // Hidden plain referrers, with `dbo.f` declared as it stands again: a
+    // procedure calling `dbo.h` and a view reading `dbo.k.c` block neither
+    // the function's alter nor the column's drop, so they refuse nothing.
+    std::fs::write(&module, &text).unwrap();
+    on_server(
+        own.connection(),
+        &format!(
+            "EXEC(N'CREATE PROCEDURE hidden.p AS SELECT dbo.h(1) AS h;'); \
+             EXEC(N'CREATE VIEW hidden.plain AS SELECT c FROM dbo.k;'); \
+             DENY VIEW DEFINITION ON SCHEMA::hidden TO [{login}];"
+        ),
+    );
+    let callee = walk(&d.dir.join("schema"))
+        .into_iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("@x * 5")))
+        .expect("dbo.h's declaration");
+    let callee_text = std::fs::read_to_string(&callee).unwrap();
+    std::fs::write(&callee, callee_text.replacen("@x * 5", "@x * 6", 1)).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", &as_login]));
+    std::fs::write(&callee, &callee_text).unwrap();
+    let table = d.dir.join("schema/dbo.k.yml");
+    let pulled = std::fs::read_to_string(&table).unwrap();
+    let line = pulled
+        .lines()
+        .find(|l| l.starts_with("  c: {expression:"))
+        .unwrap_or_else(|| panic!("the computed column's entry: {pulled}"))
+        .to_owned();
+    std::fs::write(&table, pulled.replacen(&format!("{line}\n"), "", 1)).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", &as_login]));
+
+    // A hidden schema-bound view over `dbo.k.c`.
+    on_server(
+        own.connection(),
+        "EXEC(N'CREATE VIEW hidden.v WITH SCHEMABINDING AS SELECT c FROM dbo.k;');",
+    );
+    // A column added beside it: the view cannot block that, and the login
+    // plans it.
+    let added = line.replacen("  c: ", "  d: ", 1).replacen('2', "3", 1);
+    std::fs::write(
+        &table,
+        pulled.replacen(&line, &format!("{line}\n{added}"), 1),
+    )
+    .unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", &as_login]));
+    // The column itself dropped: the view could block it, unseen.
+    std::fs::write(&table, pulled.replacen(&format!("{line}\n"), "", 1)).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &as_login]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("a referrer of `dbo.k.c` is hidden from this login"),
+        "{}",
+        stderr(&o)
+    );
+
+    // Managed-schema VIEW DEFINITION only.
+    on_server(
+        own.connection(),
+        &format!("REVOKE VIEW DEFINITION TO [{login}];"),
+    );
+    std::fs::write(
+        &table,
+        pulled.replacen(&line, &format!("{line}\n{added}"), 1),
+    )
+    .unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", &as_login]));
+    std::fs::write(&table, &pulled).unwrap();
+    std::fs::write(&callee, callee_text.replacen("@x * 5", "@x * 6", 1)).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &as_login]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("this login does not hold database VIEW DEFINITION"),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::write(&callee, &callee_text).unwrap();
+    // A nullability change: a retype also asks for the database grant, for
+    // the keys outside the managed tables (DECISIONS 460).
+    let not_null = |file: &std::path::Path, column: &str| {
+        let text = std::fs::read_to_string(file).unwrap();
+        let from = format!("  {column}:\n    type: int\n");
+        assert!(text.contains(&from), "{text}");
+        std::fs::write(
+            file,
+            text.replacen(
+                &from,
+                &format!("  {column}:\n    type: int\n    nullable: false\n"),
+                1,
+            ),
+        )
+        .unwrap();
+        text
+    };
+    let plain = d.dir.join("schema/dbo.p.yml");
+    let plain_text = not_null(&plain, "a");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", &as_login]));
+    std::fs::write(&plain, &plain_text).unwrap();
+    not_null(&table, "b");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &as_login]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("this login does not hold database VIEW DEFINITION"),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::write(&table, &pulled).unwrap();
+    let view = walk(&d.dir.join("schema"))
+        .into_iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("view: dbo.vw")))
+        .expect("dbo.vw's declaration");
+    std::fs::remove_file(&view).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", &as_login]));
+    on_server(&server, &format!("DROP LOGIN [{login}];"));
+}
+
 /// A connected plan refuses what the catalog's edges say SQL Server would,
 /// where a text scan could not tell (#1431, DEC-1431.1): a retype of `café`,
 /// which `[cafe]` binds under an accent-insensitive collation (#1426); and a

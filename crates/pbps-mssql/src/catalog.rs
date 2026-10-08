@@ -868,6 +868,175 @@ pub async fn expression_edges(
     Ok(out)
 }
 
+/// Whether any of `tables` may hold a computed column that reads a column
+/// the plan changes (#1462). Only such a table's own computed columns can
+/// refuse a column's rename, drop or retype, and `sys.computed_columns` shows
+/// them to a login holding `VIEW DEFINITION` on the table's schema, which
+/// `sys.sql_expression_dependencies` does not. A table this login cannot see
+/// answers yes: absent is not "no computed column".
+pub async fn may_hold_computed_columns(
+    conn: &mut Conn,
+    tables: &[TableName],
+) -> Result<bool, DbError> {
+    if tables.is_empty() {
+        return Ok(false);
+    }
+    let values = tables
+        .iter()
+        .map(|n| {
+            format!(
+                "({}, {})",
+                crate::ident::literal(&n.schema),
+                crate::ident::literal(&n.name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT COUNT(*) AS n
+           FROM (VALUES {values}) AS w(schema_name, table_name)
+          WHERE NOT EXISTS (
+                  SELECT 1 FROM sys.tables t
+                    JOIN sys.schemas s ON s.schema_id = t.schema_id
+                   WHERE s.name = w.schema_name COLLATE CATALOG_DEFAULT
+                     AND t.name = w.table_name COLLATE CATALOG_DEFAULT)
+             OR EXISTS (
+                  SELECT 1 FROM sys.computed_columns c
+                    JOIN sys.tables t ON t.object_id = c.object_id
+                    JOIN sys.schemas s ON s.schema_id = t.schema_id
+                   WHERE s.name = w.schema_name COLLATE CATALOG_DEFAULT
+                     AND t.name = w.table_name COLLATE CATALOG_DEFAULT);"
+    );
+    let rows = conn.query(&sql).await?;
+    let row = rows
+        .first()
+        .ok_or_else(|| DbError::Refused("the computed-column count returned no row".into()))?;
+    Ok(get::<i32>(row, "n")? > 0)
+}
+
+/// What a hidden referrer can keep the connected pass of DEC-1431.1 from
+/// deciding (#1462, #1643 review): a function the plan alters or drops, which
+/// a computed column anywhere may call, and a computed column the plan drops,
+/// which a schema-bound module anywhere may read. A column change is judged
+/// by the computed columns of its own table, which are visible with it, so a
+/// hidden referrer elsewhere decides nothing there.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReferrerTargets {
+    pub functions: Vec<TableName>,
+    pub computed_columns: Vec<(TableName, String)>,
+}
+
+/// Proves the connected pass may read [`expression_edges`] as complete
+/// before it does (#1462). An empty read is otherwise "no edge" whether there
+/// is none or this login cannot see it, and the pass would neither refuse an
+/// alter or drop of a function a hidden computed column calls nor move it
+/// (3729 at apply).
+///
+/// Measured on 17.0 (DEC-1462.1): `sys.sql_expression_dependencies` returns
+/// no row at all without database `VIEW DEFINITION`, so that grant is asked
+/// whenever the edges are read. With it, the edge from an object hidden by a
+/// schema or object `DENY` stays, and only its referencing object is missing
+/// from `sys.objects`: such an edge onto one of `targets` refuses the plan,
+/// naming the target. A `db_owner` member's override shows the object, and
+/// passes.
+pub async fn prove_referrers_visible(
+    conn: &mut Conn,
+    targets: &ReferrerTargets,
+) -> Result<(), DbError> {
+    let granted = conn
+        .query("SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION') AS granted;")
+        .await?;
+    if granted
+        .first()
+        .map(|row| opt::<i32>(row, "granted"))
+        .transpose()?
+        .flatten()
+        != Some(1)
+    {
+        return Err(DbError::Refused(
+            "this login does not hold database VIEW DEFINITION, so \
+             sys.sql_expression_dependencies returns no edge at all and a computed column or \
+             module that calls what this plan changes cannot be seen"
+                .into(),
+        ));
+    }
+    let Some(sql) = hidden_referrers_query(targets) else {
+        return Ok(());
+    };
+    let hidden: Vec<String> = conn
+        .query(&sql)
+        .await?
+        .iter()
+        .map(|row| {
+            let object =
+                TableName::new(get::<&str>(row, "to_schema")?, get::<&str>(row, "to_name")?);
+            Ok(match opt::<&str>(row, "to_column")? {
+                Some(column) => format!("`{object}.{column}`"),
+                None => format!("`{object}`"),
+            })
+        })
+        .collect::<Result<_, DbError>>()?;
+    if !hidden.is_empty() {
+        return Err(DbError::Refused(format!(
+            "a referrer of {} is hidden from this login: a DENY of VIEW DEFINITION or CONTROL \
+             on its schema or object keeps the catalog from saying whether it calls what this \
+             plan changes",
+            hidden.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// The targets an edge this login cannot attribute refers to: the engine's
+/// row is there, and `sys.objects` does not show its referencing object. A
+/// function is matched whole; a computed column only by an edge naming it.
+/// Only a schema-bound reference can block either change: a computed
+/// column's call and a `WITH SCHEMABINDING` module's read are, and the row
+/// says so when its referrer is hidden; a plain procedure or view calling the
+/// function, or reading the column, lets both run (measured on 17.0).
+fn hidden_referrers_query(targets: &ReferrerTargets) -> Option<String> {
+    let lit = crate::ident::literal;
+    let values = targets
+        .functions
+        .iter()
+        .map(|n| {
+            format!(
+                "({}, {}, CONVERT(sysname, NULL))",
+                lit(&n.schema),
+                lit(&n.name)
+            )
+        })
+        .chain(targets.computed_columns.iter().map(|(n, c)| {
+            format!(
+                "({}, {}, CONVERT(sysname, {}))",
+                lit(&n.schema),
+                lit(&n.name),
+                lit(c)
+            )
+        }))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "SELECT DISTINCT es.name AS to_schema, eo.name AS to_name, w.column_name AS to_column
+           FROM sys.sql_expression_dependencies d
+           JOIN sys.objects eo ON eo.object_id = d.referenced_id
+           JOIN sys.schemas es ON es.schema_id = eo.schema_id
+           JOIN (VALUES {}) AS w(schema_name, object_name, column_name)
+             ON w.schema_name = es.name COLLATE CATALOG_DEFAULT
+            AND w.object_name = eo.name COLLATE CATALOG_DEFAULT
+            AND (w.column_name IS NULL
+                 OR w.column_name = COL_NAME(d.referenced_id, d.referenced_minor_id)
+                                    COLLATE CATALOG_DEFAULT)
+          WHERE d.referencing_class = 1 AND d.referenced_class = 1
+            AND d.is_schema_bound_reference = 1
+            AND NOT EXISTS (SELECT 1 FROM sys.objects ro WHERE ro.object_id = d.referencing_id)
+          ORDER BY to_schema, to_name, to_column;",
+        values.join(", ")
+    ))
+}
+
 /// An object at a name a plan creates (#1077). SQL Server keeps tables,
 /// views, routines, triggers, sequences, synonyms and constraints in one
 /// `sys.objects` namespace per schema, so `CREATE TABLE` at any of their

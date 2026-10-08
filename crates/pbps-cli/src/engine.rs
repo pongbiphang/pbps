@@ -678,6 +678,80 @@ pub async fn order_computed_by_edges(conn: &mut Conn, cs: &mut ChangeSet) -> any
     if objects.is_empty() {
         return Ok(());
     }
+    // The edges refuse or move only these: a column a computed column of its
+    // own table reads, a function one calls, a computed column a module is
+    // bound to, and drops `release` orders, which takes two. A plan with none
+    // of them, such as one adding a computed column or dropping one view,
+    // needs no edge read and so no grant that makes one complete (#1643
+    // review).
+    let mut inputs: Vec<pbps_model::TableName> = Vec::new();
+    let mut drops = 0;
+    let mut decides = false;
+    for p in &cs.changes {
+        match &p.change {
+            pbps_model::Change::RenameColumn { table, .. } => inputs.push(catalog(table)),
+            pbps_model::Change::DropColumn { column, .. }
+            | pbps_model::Change::AlterColumnType { column, .. }
+            | pbps_model::Change::AlterColumnNullability { column, .. } => {
+                inputs.push(catalog(&column.table));
+            }
+            pbps_model::Change::DropComputedColumn { .. } => decides = true,
+            pbps_model::Change::AlterModule { module, .. } => {
+                decides |= module.kind == pbps_model::ModuleKind::Function;
+            }
+            pbps_model::Change::DropModule { kind, .. } => {
+                decides |= *kind == pbps_model::ModuleKind::Function;
+                drops += 1;
+            }
+            pbps_model::Change::DropTable { .. } => drops += 1,
+            _ => {}
+        }
+    }
+    let modules_dropped = cs
+        .changes
+        .iter()
+        .any(|p| matches!(p.change, pbps_model::Change::DropModule { .. }));
+    decides |= modules_dropped && drops > 1;
+    if !decides {
+        decides = pbps_mssql::catalog::may_hold_computed_columns(conn, &inputs)
+            .await
+            .map_err(|e| {
+                anyhow::Error::new(e)
+                    .context("cannot read whether a changed column's table has computed columns")
+            })?;
+    }
+    if !decides {
+        return Ok(());
+    }
+    // An empty read is "no edge" only where no referrer the pass decides by
+    // can be hidden (#1462).
+    let mut targets = pbps_mssql::catalog::ReferrerTargets::default();
+    for p in &cs.changes {
+        match &p.change {
+            pbps_model::Change::AlterModule { id, module }
+                if module.kind == pbps_model::ModuleKind::Function =>
+            {
+                targets.functions.push(id.object_name());
+            }
+            pbps_model::Change::DropModule {
+                id,
+                kind: pbps_model::ModuleKind::Function,
+            } => targets.functions.push(id.object_name()),
+            pbps_model::Change::DropComputedColumn { table, name, .. } => {
+                targets
+                    .computed_columns
+                    .push((catalog(table), name.clone()));
+            }
+            _ => {}
+        }
+    }
+    pbps_mssql::catalog::prove_referrers_visible(conn, &targets)
+        .await
+        .map_err(|e| {
+            anyhow::Error::new(e).context(
+                "cannot prove the catalog shows everything that calls what this plan changes",
+            )
+        })?;
     let edges = pbps_mssql::catalog::expression_edges(conn, &objects).await?;
     if edges.is_empty() {
         return Ok(());

@@ -1708,6 +1708,9 @@ Pinned by:
 by the catalog's own expression edges, not by text (#1431; absorbs #1426,
 #1432, #1437, #1439).**
 
+*Amended by [DEC-1462.1](#dec-1462-1): the edges are read as complete only
+once no referrer of what the plan changes is hidden from the login.*
+
 **Context.** DEC-1174.1 decided offline, by text, which column a computed
 column reads and which function it calls. A text match answers by spelling,
 and #1423's review found it wrong in one shape after another: `dbo.f` for
@@ -3145,3 +3148,67 @@ Pinned on 16 and 18 by the CLI's
   partition plans, applies and verifies.
 
 Also by the unit `an_unlogged_partition_under_a_permanent_key_is_refused_by_name`.
+
+<a id="dec-1462-1"></a>
+
+**DEC-1462.1. A connected SQL Server plan proves that no referrer of what it
+changes is hidden before it reads the catalog's expression edges as complete
+(#1462; amends DEC-1431.1).**
+
+**Context.** DEC-1431.1 reads `sys.sql_expression_dependencies` and refuses
+or moves a change by the edges it finds. An empty read meant "no edge" whether
+there was none or this login could not see the referrer, so an alter of a
+function that a hidden computed column calls planned as if nothing called it,
+and the engine refused it at apply (3729).
+
+**Measured** on 17.0 with a login that is not `db_owner`:
+
+| The login holds | `sys.sql_expression_dependencies` | the referencing `sys.objects` row |
+|---|---|---|
+| no `SELECT` on the view (`db_ddladmin` included) | Msg 229 | — |
+| `SELECT` on it, no database `VIEW DEFINITION` | no row at all, no error | absent |
+| both, schema `DENY VIEW DEFINITION` on the referrer's schema | the edge's row | absent |
+| both, object `DENY VIEW DEFINITION` or `DENY CONTROL` on the referrer | the edge's row | absent |
+| `db_owner`, with the same schema `DENY` | the edge's row | present: the owner's override |
+
+**Decision.** The edges are read only for a plan with a change they decide:
+a function's alter or drop, a computed column's drop, a module's drop beside
+another drop `release` may order, or a column's rename, drop, retype or
+nullability change on a table with a computed column. `sys.computed_columns`
+answers the last for a login holding `VIEW DEFINITION` on the table's schema,
+and a table it cannot see counts as having one. A plan that only adds a
+computed column, drops a table or one view, or changes a column of a table
+with no computed column reads none, and needs no grant for them. Before the
+edges are read, `prove_referrers_visible` asks for database
+`VIEW DEFINITION`, the grant without which the view answers nothing.
+It then looks for an edge whose referencing object `sys.objects` does not
+show, onto what a hidden referrer could block: a function the plan alters or
+drops, which a computed column anywhere may call, and a computed column the
+plan drops, matched by that column, which a schema-bound module may read.
+Only a schema-bound reference counts (`is_schema_bound_reference`, which the
+row keeps when its referrer is hidden): a computed column's call and a
+`WITH SCHEMABINDING` module's read block the change, a plain procedure or view
+does not. Either refuses the plan by name: "a referrer of `dbo.f` is hidden from this
+login". A column change or a computed column added is judged by the computed
+columns of its own table, which are visible with it, so a hidden view over
+another column of that table refuses nothing. A `db_owner` member sees through
+the `DENY` and passes, as the engine lets it.
+
+**Why not a permission check alone.** DEC-1192.1's schema-level proof answers
+for the schemas a plan creates names in; a referrer can be in any schema. A
+database grant does not override a schema or object `DENY` (DECISIONS 460),
+and the denial's own row leaves which object it hides unsaid. The engine's
+own edge row, whose referencing object this login cannot see, names exactly
+the object that has a hidden referrer.
+
+Pinned by the live `a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge`
+(`crates/pbps-cli/tests/flow.rs`): the login denied `VIEW DEFINITION` on the
+referrer's schema is refused by name; as `sa`, and as the login once the
+`DENY` is revoked, the edge itself refuses the alter. A hidden schema-bound
+view over `dbo.k.c` refuses that column's drop by name, and a computed column
+added beside it plans. A hidden plain view over `dbo.k.c`, or a hidden
+procedure calling `dbo.h`, refuses neither the drop nor the alter. With
+managed-schema `VIEW DEFINITION` only, the alter and a nullability change on a
+table with a computed column are refused for the database grant, and adding a
+computed column, the same change on a table with none, and dropping one view
+plan.
