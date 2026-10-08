@@ -553,25 +553,68 @@ pub async fn refuse_unsupported_temporal(
     conn: &mut Conn,
     changes: &ChangeSet,
 ) -> anyhow::Result<()> {
+    match temporal_refusal(&unsupported_temporal(conn, changes).await?) {
+        Some(refusal) => Err(anyhow::anyhow!(refusal)),
+        None => Ok(()),
+    }
+}
+
+/// What [`refuse_unsupported_temporal`] refuses, each named: the answer to
+/// the capability question, apart from a failure to ask it. `plan --db`
+/// reports the answer as a finding and the failure as unanswerable (#1630).
+pub async fn unsupported_temporal(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+) -> anyhow::Result<Vec<String>> {
     if conn.driver() != Driver::Mssql || !pbps_mssql::temporal::needs_the_question(changes) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     if pbps_mssql::temporal::has_history_retention(conn).await? {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let versioned = if pbps_mssql::temporal::needs_the_catalog(changes) {
         pbps_mssql::temporal::system_versioned_tables(conn).await?
     } else {
         Default::default()
     };
-    let problems = pbps_mssql::temporal::refused_without_retention(changes, &versioned);
-    if !problems.is_empty() {
-        anyhow::bail!(
+    Ok(pbps_mssql::temporal::refused_without_retention(
+        changes, &versioned,
+    ))
+}
+
+/// The refusal [`unsupported_temporal`]'s problems make, if there are any.
+pub fn temporal_refusal(problems: &[String]) -> Option<String> {
+    (!problems.is_empty()).then(|| {
+        format!(
             "this server cannot take the plan's system-versioned tables as declared:\n  {}",
             problems.join("\n  ")
+        )
+    })
+}
+
+/// Ends a connected plan on what [`unsupported_temporal`] answered, if it
+/// refused anything. The question was asked and answered, so a JSON plan
+/// reports the refusal as a finding with exit 2, like the online edition's
+/// (DECISIONS 485, #574), rather than as `plan.failed` with exit 1 (#1630).
+/// A failure to ask never reaches here: it is `unsupported_temporal`'s error.
+pub fn refuse_answered_temporal(
+    problems: &[String],
+    json: bool,
+    findings: &mut Vec<crate::output::Finding>,
+) -> anyhow::Result<()> {
+    let Some(refusal) = temporal_refusal(problems) else {
+        return Ok(());
+    };
+    if json {
+        findings.push(
+            crate::output::Finding::error("plan.temporal-unsupported", refusal).remedy(
+                "leave `retention` out of these tables and use `no_action` on these keys, or \
+                 deploy to SQL Server 2017 or later",
+            ),
         );
+        return crate::output::Report::plain("plan", findings.clone()).emit_json();
     }
-    Ok(())
+    anyhow::bail!(refusal)
 }
 
 pub async fn read_rows(
@@ -2997,6 +3040,80 @@ pub fn validate_plan_analysis(plan: &pbps_model::SavedPlan) -> anyhow::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1630: what a server without history retention refuses is an
+    /// answered question. A connected JSON plan reports it as an error
+    /// finding of its own id, with the remedy, so the envelope says
+    /// `findings` and the command ends on exit 2, not as `plan.failed`. A
+    /// plan with nothing refused makes no refusal. No 2016 server is in the
+    /// live matrix, so the problems come from the pure function the
+    /// connected check feeds.
+    #[test]
+    fn an_answered_temporal_refusal_is_a_finding_with_exit_two() {
+        use pbps_model::{
+            Change, PlannedChange, Retention, RetentionUnit, SystemTime, SystemVersioning, Table,
+        };
+        let table = Table {
+            system_time: Some(SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: false,
+                versioning: Some(SystemVersioning {
+                    history: "dbo.t_history".parse().unwrap(),
+                    retention: Some(Retention {
+                        count: 3,
+                        unit: RetentionUnit::Day,
+                    }),
+                }),
+            }),
+            ..Default::default()
+        };
+        let cs = ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: "dbo.t".parse().unwrap(),
+                table: Box::new(table),
+            })],
+        };
+        let problems = pbps_mssql::temporal::refused_without_retention(&cs, &Default::default());
+        let refusal = temporal_refusal(&problems).expect("a finite retention is refused");
+        assert!(
+            refusal.contains("`dbo.t` declares a history retention"),
+            "{refusal}"
+        );
+
+        // As JSON: the refusal joins the findings as an error of its own id,
+        // with the remedy, and the command ends on `Found`, exit 2.
+        let mut findings = vec![crate::output::Finding::warning("plan.edition", "w")];
+        let exit = refuse_answered_temporal(&problems, true, &mut findings).unwrap_err();
+        assert!(exit.downcast_ref::<crate::Found>().is_some(), "{exit:?}");
+        let json = serde_json::to_value(crate::output::Report::plain("plan", findings)).unwrap();
+        assert_eq!(json["result"], "findings", "{json}");
+        let finding = &json["findings"][1];
+        assert_eq!(finding["id"], "plan.temporal-unsupported", "{json}");
+        assert_eq!(finding["severity"], "error", "{json}");
+        assert!(
+            finding["message"].as_str().unwrap().contains("`dbo.t`"),
+            "{json}"
+        );
+        assert!(
+            finding["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("leave `retention` out"),
+            "{json}"
+        );
+        // Human output: the refusal itself, an ordinary error.
+        let exit = refuse_answered_temporal(&problems, false, &mut Vec::new()).unwrap_err();
+        assert!(exit.downcast_ref::<crate::Found>().is_none(), "{exit:?}");
+        assert_eq!(exit.to_string(), refusal);
+
+        // Negative: nothing refused, no refusal, and the findings untouched.
+        assert!(temporal_refusal(&[]).is_none());
+        let mut kept = vec![crate::output::Finding::warning("plan.edition", "w")];
+        refuse_answered_temporal(&[], true, &mut kept).unwrap();
+        assert_eq!(kept.len(), 1);
+    }
 
     /// #822: when the follow-up question cannot be asked — here, nothing
     /// answers the connection — the answer is "unexplained", which names no

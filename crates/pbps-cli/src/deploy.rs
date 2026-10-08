@@ -6603,8 +6603,11 @@ pub fn cmd_plan_db(
         // here. An offline plan has to assume the conservative answer.
         let verdict = crate::engine::edition_verdict(&mut conn, &cs).await?;
         // A server fact like the edition: 2016 has no history retention and
-        // no cascading key from a system-versioned table (#1502).
-        crate::engine::refuse_unsupported_temporal(&mut conn, &cs).await?;
+        // no cascading key from a system-versioned table (#1502). Answered,
+        // it is a finding, as the edition's below is; a failure to ask stays
+        // an error (#1630).
+        let temporal = crate::engine::unsupported_temporal(&mut conn, &cs).await?;
+        crate::engine::refuse_answered_temporal(&temporal, json, &mut findings)?;
         if !verdict.refused_online.is_empty() {
             let refusal = format!(
                 "`strategy: online` is declared for {}, and `{}` runs {}, which has no online \
