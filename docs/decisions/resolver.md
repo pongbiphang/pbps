@@ -1644,7 +1644,8 @@ their full definitions sends routine source no reviewer approved.
     itself and the remedy (#1652 review).
 - **The cost is a chain through the boundary.** A managed object binds to an
   external one whose compared shape names a managed object: a column,
-  attribute or argument of a managed type, or a cast over one. Such a chain
+  attribute or argument of a managed type, a managed parent relation, or a
+  cast over a managed type. Such a chain
   refuses, naming it, with two remedies: adopt the middle object, or select
   no resolver. A view's query and a routine's body never form a chain, since
   neither is compared; a view over managed tables is staged as a shape view
@@ -1661,11 +1662,12 @@ their full definitions sends routine source no reviewer approved.
 - **Every object it creates is compared with the target, by what a
   creation-time binding can read.**
   - Compared: an object's own class properties as the manifest
-    fingerprints them; of a relation's children, its columns and the
+    fingerprints them; of a relation's children, its columns, the
     primary-key and unique constraints and indexes a `GROUP BY` or
-    `ON CONFLICT` relies on.
+    `ON CONFLICT` relies on, and its inheritance and partition parents, which
+    a row-type coercion such as `c::ext.parent` relies on (#1652 review).
   - Not compared: foreign keys, CHECKs, defaults, triggers, policies, rules,
-    non-unique indexes and inheritance, nor the source text of a routine's
+    non-unique indexes, nor the source text of a routine's
     body or a view's query.
   - So a baseline may omit what only guards or computes, and the common
     back-pointing foreign key and trigger need not be staged. Earlier

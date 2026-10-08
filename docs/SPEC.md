@@ -1583,9 +1583,10 @@ scratch compile (#1616).
 - **What is compared is what a creation-time binding can read:**
   - an object's own class-specific properties, as the evidence manifest
     fingerprints them;
-  - of a relation's children, its columns, and the primary-key and unique
+  - of a relation's children, its columns, the primary-key and unique
     constraints and indexes that a `GROUP BY` functional dependency or an
-    `ON CONFLICT` inference relies on.
+    `ON CONFLICT` inference relies on, and its inheritance and partition
+    parents, which a row-type coercion such as `c::ext.parent` relies on.
 
   Examples:
   - a relation's kind, and its column names, types, collations and order
@@ -1597,7 +1598,7 @@ scratch compile (#1616).
   - an extension's version.
 - **What is not compared:**
   - a relation's other children: foreign keys, CHECKs, column defaults,
-    triggers, policies, rules, non-unique indexes and inheritance links;
+    triggers, policies, rules and non-unique indexes;
   - the source text that defines an object: a routine's body (#1655) and a
     view's query.
 
@@ -1615,7 +1616,8 @@ scratch compile (#1616).
   like any other external input.
 - **A chain through the boundary refuses.** In such a chain, a managed object
   binds to an external one whose compared *shape* names a managed object:
-  a column, attribute or argument of a managed type, or a cast over one.
+  a column, attribute or argument of a managed type, a managed parent
+  relation, or a cast over a managed type.
   That shape cannot be staged before anything managed exists.
   - A view's query and a routine's body never form a chain, because neither
     is compared. A view whose query reads managed tables is staged as a

@@ -722,10 +722,10 @@ carries the normative text, and DEC-1528.1 the reasons.
     the manifest. A mismatch, a missing object, an uncompared object or a
     baseline object in the managed set refuses. The comparison covers what
     a creation-time binding can read: an object's own class properties, and
-    a relation's columns and its primary-key and unique constraints and
-    indexes. It skips foreign keys, CHECKs, defaults, triggers, policies,
-    rules, non-unique indexes and inheritance, and the source text of a
-    routine's body or a view's query. A view may therefore be staged as a
+    a relation's columns, its primary-key and unique constraints and
+    indexes, and its inheritance and partition parents. It skips foreign
+    keys, CHECKs, defaults, triggers, policies, rules and non-unique
+    indexes, and the source text of a routine's body or a view's query. A view may therefore be staged as a
     shape view of its output columns (typed NULLs, no row), never as a
     table, whose system columns change name resolution. The recheck still
     compares the target's complete fingerprints.
