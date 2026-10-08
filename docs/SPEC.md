@@ -1405,7 +1405,10 @@ implemented).**
       the target's, so another database on the target's cluster qualifies.
       Its credential variable differs from the target's, and there is no
       fallback to target credentials.
-    - Scratch is empty in the connected scope, `template1` included.
+    - Scratch is empty: the run-owned database, as created, holds nothing
+      beyond the engine's own catalog. The new database itself is read, not
+      a template, so whatever template it was cloned from is covered.
+      PostgreSQL scratch is cloned from `template0`.
   - The shared compatibility qualification (#610, #611) still runs, as for
     every resolver environment. It compares the facts both engines report:
     version and build string, extensions and their versions, encoding,

@@ -704,7 +704,7 @@ carries the normative text, and DEC-1528.1 the reasons.
     would. For separation, it means two checks before any scratch DDL:
     - scratch is never the target (host, port and database are not all the
       target's, and the credential variable differs);
-    - scratch is empty in the connected scope.
+    - scratch is empty, read in the run-owned database as created.
   - The run-owned scratch takes the target's encoding and locale.
   - Isolation, containment, log handling and channel protection are vouched
     for by the operator, not measured. The evidence names the profile, so a

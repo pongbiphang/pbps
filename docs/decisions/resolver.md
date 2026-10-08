@@ -1591,7 +1591,8 @@ profile, so a reviewer can always tell a vouched answer from a measured one.
   target's, its credential variable differs, and there is no fallback to
   target credentials. That is the mistake an operator can make by accident,
   and it is cheap to catch.
-- **Scratch is empty in the connected scope, `template1` included:** a
+- **Scratch is empty, read in the run-owned database as created rather
+  than in a template** (scratch is cloned from `template0`, not `template1`): a
   polluted scratch changes what the declarations bind to.
 
 A third check, that scratch is another engine instance (`system_identifier`),
