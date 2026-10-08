@@ -2875,8 +2875,24 @@ pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String
 /// and refuses the foreign key itself (13565, measured on 17.0). The referenced
 /// table is declared nowhere, which a foreign key may otherwise do, so without
 /// this the engine refuses `ADD FOREIGN KEY` mid-apply.
+///
+/// Offline, a name is the history only as written: the collation that says
+/// which spellings are one is the server's, not the file's (DEC-1243.1). The
+/// connected plan asks it, through [`history_references_under`] (#1625).
 pub fn check_history_references(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
-    let histories: BTreeMap<&TableName, &TableName> = schema
+    history_references_under(schema, dialect, |a, b| a == b)
+}
+
+/// [`check_history_references`], with `same` saying which two names the
+/// database reads as one (#1625): on a case-insensitive SQL Server database
+/// a key to `dbo.t_history` references the history declared as
+/// `dbo.T_History`, and the engine refuses it as it would the exact spelling.
+pub fn history_references_under(
+    schema: &Schema,
+    dialect: &dyn Dialect,
+    same: impl Fn(&TableName, &TableName) -> bool,
+) -> Vec<String> {
+    let histories: Vec<(&TableName, &TableName)> = schema
         .tables
         .iter()
         .filter_map(|(name, t)| {
@@ -2889,15 +2905,25 @@ pub fn check_history_references(schema: &Schema, dialect: &dyn Dialect) -> Vec<S
     let mut problems = Vec::new();
     for (table_name, table) in &schema.tables {
         for (fk_name, fk) in &table.foreign_keys {
-            if let Some(versioned) = histories.get(&fk.references_table) {
-                problems.push(format!(
-                    "foreign key `{fk_name}` on `{table_name}` references `{}`, the history \
-                     table of `{versioned}`; a history table has no key a foreign key can \
-                     reference, and {} refuses one there",
-                    fk.references_table,
-                    dialect.name()
-                ));
-            }
+            let referenced = &fk.references_table;
+            let Some((history, versioned)) = histories
+                .iter()
+                .find(|(history, _)| same(referenced, history))
+            else {
+                continue;
+            };
+            // A spelling only the collation joins says which history it is.
+            let declared = if referenced == *history {
+                String::new()
+            } else {
+                format!(" (declared as `{history}`, one name under the database's collation)")
+            };
+            problems.push(format!(
+                "foreign key `{fk_name}` on `{table_name}` references `{referenced}`, the \
+                 history table of `{versioned}`{declared}; a history table has no key a \
+                 foreign key can reference, and {} refuses one there",
+                dialect.name()
+            ));
         }
     }
     problems
@@ -4293,6 +4319,30 @@ mod tests {
                 && problems[0].contains("no key a foreign key can reference"),
             "{problems:?}"
         );
+        assert!(!problems[0].contains("declared as"), "{problems:?}");
+        // A case variant is one name only where the database says so
+        // (#1625): offline it is not refused, and under a `same` that joins
+        // it, it is, naming the history as declared.
+        let variant = with("hist.A_History");
+        assert!(check_history_references(&variant, &MinimalDialect).is_empty());
+        let folded = |a: &TableName, b: &TableName| {
+            a.to_string().to_lowercase() == b.to_string().to_lowercase()
+        };
+        let problems = history_references_under(&variant, &MinimalDialect, folded);
+        assert!(
+            problems.len() == 1
+                && problems[0]
+                    .contains("references `hist.A_History`, the history table of `app.a`")
+                && problems[0].contains("(declared as `hist.a_history`"),
+            "{problems:?}"
+        );
+        // Negative: a `same` that joins nothing else refuses nothing else.
+        for to in ["app.a", "app.elsewhere", "hist.other_history"] {
+            assert!(
+                history_references_under(&with(to), &MinimalDialect, folded).is_empty(),
+                "{to}"
+            );
+        }
         // A versioned table's own key to its history is refused the same way.
         versioned
             .foreign_keys

@@ -2096,7 +2096,7 @@ review):
 | Period columns of two precisions (an omitted one is 7) | refused (13513) | validation refuses it |
 | A history name over 124 characters | its `ix_` index name is cut at 127 | validation refuses it |
 | An INSTEAD OF trigger on a versioned table | refused (13569) | validation refuses it |
-| A foreign key to a history table (which takes no key: 13558, 13583, 13741) | refused (13565) | validation refuses it (#1513) |
+| A foreign key to a history table (which takes no key: 13558, 13583, 13741) | refused (13565) | validation refuses it (#1513); one to a spelling the database's collation reads as the history is refused when connected (#1625, DEC-1243.1) |
 | An AFTER trigger on it, or either kind with a period alone | accepted | held |
 | A cascading foreign key from or to a versioned table | accepted | held; a key from one is refused when connected to 2016, which refuses it (#1502) |
 | A finite history retention | accepted (2017 added it) | held; refused when connected to 2016, which has none (#1502) |
