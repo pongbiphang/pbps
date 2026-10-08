@@ -3723,7 +3723,9 @@ table drops ruled out that order, and the plan was refused at `plan --db`.
   - the catalog read found an object under its name, so its drop frees one;
   - a table rename can claim that name under the collation: its target, a
     transfer's stop, a moved default's generated or fallback name, or a
-    carried child's name (`NameFacts::module_drop_matters`).
+    carried child's name, which is the read's child of the renamed table
+    itself, as `carried_destinations` reads it
+    (`NameFacts::module_drop_matters`).
 
   The renames are the only claims among the drops. A claim after them runs
   after every module drop in any order, so no other place can differ. Made
@@ -3754,7 +3756,8 @@ Pinned by:
   first test and claimed only by added checks in the second. In both, the
   rename is still free to run first; made movable, the drops exhausted the
   search. The example test's negative keeps a function the catalog does not
-  hold out of the movable set.
+  hold out of the movable set, and `a_transfer_claims_only_its_own_tables_children`
+  counts only the renamed table's children as a transfer's claims.
 - `what_a_released_function_is_bound_to_follows_it`
   (`crates/pbps-cli/src/computed_order.rs`), on the pairs themselves.
 - `a_computed_drop_follows_the_module_bound_to_it_and_its_inputs_follow_it`

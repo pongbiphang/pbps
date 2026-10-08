@@ -1017,10 +1017,12 @@ impl NameFacts {
             }
             if from.schema != to.schema {
                 claims.push(in_schema(to, &from.name));
+                // The children the read found on this table, as
+                // `carried_destinations` reads them.
                 claims.extend(
                     self.occupants
                         .iter()
-                        .filter(|o| o.parent.is_some())
+                        .filter(|o| o.parent.as_ref() == Some(from))
                         .map(|o| in_schema(to, &o.name.name)),
                 );
             }

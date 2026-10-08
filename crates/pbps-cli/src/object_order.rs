@@ -1329,6 +1329,28 @@ mod tests {
         );
     }
 
+    /// #1680 review: across schemas a rename claims the names of the children
+    /// it carries, which are the read's children of its own table, and not
+    /// those of another table. Counted as claimed, a function sharing an
+    /// unrelated constraint's name moved and multiplied the orders.
+    #[test]
+    fn a_transfer_claims_only_its_own_tables_children() {
+        let function = |n: &str| pbps_model::ModuleId::Named(name(n));
+        let occupants = [
+            held("s1.c1", "check constraint", Some("s1.old"), None),
+            held("dbo.c2", "check constraint", Some("dbo.other"), None),
+            held("s2.c1", "sql scalar function", None, None),
+            held("s2.c2", "sql scalar function", None, None),
+        ];
+        let facts = NameFacts::new(&occupants, &[]);
+        let changes = [rename("s1.old", "s2.new", &[])];
+        assert!(facts.module_drop_matters(&changes, &function("s2.c1")));
+        assert!(!facts.module_drop_matters(&changes, &function("s2.c2")));
+        // Within a schema nothing is carried.
+        let changes = [rename("s1.old", "s1.new", &[])];
+        assert!(!facts.module_drop_matters(&changes, &function("s1.c1")));
+    }
+
     /// A drop on a renamed table names the table as it is called where the
     /// drop runs, whichever side of the rename the order puts it.
     #[test]
