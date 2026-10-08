@@ -3937,7 +3937,12 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
   columns as they stand at its statement, and the table on its other side
   holds them as declared at the other end of the plan, so each column change
   would need its own place against each transition. The remedy is two plans,
-  the columns first or the partitions first.
+  the columns first or the partitions first;
+- a partition's own check, or unique or filtered index, added while the plan
+  retypes a column of its parent. Its pre-flight probe reads the stored rows
+  before the retype converts them, and the probe knows the plan's retypes by
+  table, not which table is whose partition, so it would test values the
+  engine never checks (DECISIONS 410). The remedy is two plans.
 
 A key column renamed is not a change of the partitioning.
 
@@ -3980,8 +3985,11 @@ the leftover is harmless until the parent drops its NOT NULL again, which the
 rule above already handles.
 
 **The apply guard.** The undo of a plan's column renames (`Renames::apply`)
-renames a parent's key and a partition's own column entries too, so both
-reads compare under one set of names. A partition of a parent whose column the
+renames a parent's key and a partition's own column entries too, and a
+partition's own index columns, all looked up under its parent's name, so both
+reads compare under one set of names. The differ brings the base forward
+through the same function, so a partition's own index the engine's rename
+carries is not dropped and added again. A partition of a parent whose column the
 plan drops, renames or makes NOT NULL is held field by field, to what the
 parent's change leaves it. Otherwise it would be compared whole and called
 moved. Where the parent's column names change hands in the plan (DEC-541.1), or a

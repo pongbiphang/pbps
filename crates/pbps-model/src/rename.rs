@@ -75,6 +75,11 @@ impl Renames {
             return Cow::Borrowed(table);
         }
         let mut t = table.clone();
+        // A partition's columns are its parent's, which the engine renames in
+        // the partition's own indexes too (#1692 review), so they are looked
+        // up under the parent's name.
+        let parent = t.partition_of.as_ref().map(|of| of.parent.clone());
+        let name = parent.as_ref().unwrap_or(name);
         if let Some(pk) = t.primary_key.as_mut() {
             pk.columns = self.column_list(name, &pk.columns);
         }
@@ -102,14 +107,14 @@ impl Renames {
         }
         // A parent's key and a partition's own columns are its parent's
         // columns, which the engine renames in both (measured on 16 and 18,
-        // #1687); the partition's are looked up under the parent's name.
+        // #1687).
         if let Some(by) = t.partition_by.as_mut() {
             by.columns = self.column_list(name, &by.columns);
         }
         if let Some(of) = t.partition_of.as_mut() {
             of.columns = std::mem::take(&mut of.columns)
                 .into_iter()
-                .map(|(c, own)| (self.column(&of.parent, &c), own))
+                .map(|(c, own)| (self.column(name, &c), own))
                 .collect();
         }
         Cow::Owned(t)
@@ -235,6 +240,27 @@ mod tests {
         let out = r.apply(&partition, &t("app.ev_rest"));
         let keys: Vec<&String> = out.partition_of.as_ref().unwrap().columns.keys().collect();
         assert_eq!(keys, ["m2", "n"]);
+        // Its own index's key and `INCLUDE` columns too (#1692 review).
+        let mut indexed = partition.clone();
+        indexed.indexes.insert(
+            "ev_rest_m".into(),
+            crate::schema::Index {
+                columns: vec![crate::schema::IndexColumn {
+                    key: crate::IndexKey::Column("m".into()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: vec!["n".into(), "ts".into()],
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            },
+        );
+        let out = r.apply(&indexed, &t("app.ev_rest"));
+        let index = &out.indexes["ev_rest_m"];
+        assert_eq!(index.columns[0].key.column(), Some("m2"));
+        assert_eq!(index.include, ["n", "at"]);
     }
 
     /// The negative case, and the one that matters: a filtered index's

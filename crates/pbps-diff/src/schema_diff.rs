@@ -3214,6 +3214,16 @@ fn refuse_partition_changes(
             }
         })
         .collect();
+    let retyped_parents: BTreeSet<&TableName> = changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::AlterColumnType { column, .. } = c {
+                Some(&column.table)
+            } else {
+                None
+            }
+        })
+        .collect();
     for change in changes {
         // A partition is created with its parent, or under a parent that
         // already stands (#1171); either way it is a creation, and whether
@@ -3262,6 +3272,37 @@ fn refuse_partition_changes(
                 (standing(base.schema, t) || attaching.contains(t)) && standing(declared.schema, t)
             })
         {
+            // Its own check, or a unique or filtered index, is probed over
+            // its stored rows before the plan runs, and a retype of its
+            // parent's column converts them first. The probe knows the plan's
+            // retypes by table and not which table is whose partition, so it
+            // would test values the engine never checks, and refuse a valid
+            // plan (DECISIONS 410, #1692 review). Two plans keep each probe
+            // over the rows it judges.
+            let probed = if let Change::AddIndex { index, .. } = change {
+                index.unique || index.filter.is_some()
+            } else {
+                matches!(change, Change::AddCheck { .. })
+            };
+            if probed
+                && let Some(t) = change.table()
+                && let Some(of) = declared
+                    .schema
+                    .tables
+                    .get(t)
+                    .and_then(|t| t.partition_of.as_ref())
+                && retyped_parents.contains(&of.parent)
+            {
+                refuse(
+                    t,
+                    format!(
+                        "{} while this plan retypes a column of its parent {}; retype the \
+                         parent's column and add the partition's own in separate plans",
+                        change_in_words(change),
+                        of.parent
+                    ),
+                );
+            }
             continue;
         }
         // Before the attach, still the ordinary table's: a key or unique
@@ -6957,6 +6998,87 @@ mod tests {
                 Change::AlterColumnType { column, .. } if column.name == "ts")),
             "{retyped:?}"
         );
+        // A partition's own index on the renamed column is carried by the
+        // engine's rename, and not dropped and added again (#1692 review).
+        let own_index = |s: &mut Schema, column: &str| {
+            s.tables
+                .get_mut(&"app.a".parse::<TableName>().unwrap())
+                .unwrap()
+                .indexes
+                .insert(
+                    "a_m".into(),
+                    Index {
+                        columns: vec![pbps_model::IndexColumn {
+                            key: pbps_model::IndexKey::Column(column.into()),
+                            descending: false,
+                            opclass: None,
+                        }],
+                        include: Vec::new(),
+                        unique: false,
+                        filter: None,
+                        method: Default::default(),
+                        storage_parameters: Default::default(),
+                    },
+                );
+        };
+        let mut indexed_base = with(&|_| {}, &keep_a, &keep_b);
+        own_index(&mut indexed_base, "m");
+        let mut indexed_renamed = with(
+            &|p| rename(p, "m", "m2"),
+            &[("m2", own_default("7"))],
+            &[("m2", own_not_null.clone())],
+        );
+        own_index(&mut indexed_renamed, "m2");
+        let carried = from(&indexed_base, &[(&indexed_renamed, &[renaming("m", "m2")])]);
+        assert!(
+            matches!(carried.as_slice(), [Change::RenameColumn { .. }]),
+            "{carried:?}"
+        );
+        // A partition's own check or unique index, probed over its stored
+        // rows, beside a retype of its parent's column that converts them
+        // first: refused by name (DECISIONS 410, #1692 review).
+        let retype_n = |p: &mut Table| p.columns.get_mut("n").unwrap().ty = ty("bigint");
+        let a: TableName = "app.a".parse().unwrap();
+        let own_check = |s: &mut Schema| {
+            s.tables.get_mut(&a).unwrap().checks.insert(
+                "a_n".into(),
+                pbps_model::CheckConstraint {
+                    expression: "n > 0".into(),
+                },
+            );
+        };
+        let own_unique = |s: &mut Schema, unique: bool| {
+            own_index(s, "n");
+            s.tables
+                .get_mut(&a)
+                .unwrap()
+                .indexes
+                .get_mut("a_m")
+                .unwrap()
+                .unique = unique;
+        };
+        let mut checked = with(&retype_n, &keep_a, &keep_b);
+        own_check(&mut checked);
+        let mut unique = with(&retype_n, &keep_a, &keep_b);
+        own_unique(&mut unique, true);
+        for declared in [&checked, &unique] {
+            let errors = refused(declared, &[]);
+            assert!(
+                errors.iter().any(|e| e.contains(
+                    "while this plan retypes a column of its parent app.ev; retype the parent's \
+                     column and add the partition's own in separate plans"
+                )),
+                "{errors:?}"
+            );
+        }
+        // Negative: a plain index is not probed, and a check without the
+        // retype is probed over the rows it judges.
+        let mut plain = with(&retype_n, &keep_a, &keep_b);
+        own_unique(&mut plain, false);
+        planned(&plain, &[]);
+        let mut unretyped = with(&|_| {}, &keep_a, &keep_b);
+        own_check(&mut unretyped);
+        planned(&unretyped, &[]);
     }
 
     #[test]
