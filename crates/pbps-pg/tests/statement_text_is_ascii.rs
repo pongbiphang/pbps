@@ -124,8 +124,7 @@ fn non_ascii_in_code(source: &str) -> Vec<(usize, char)> {
         } else if starts(i, "#[cfg(") && {
             let end = (i..chars.len()).find(|&k| chars[k] == ']').unwrap_or(i);
             let attr: String = chars[i..end].iter().collect();
-            attr.split(|c: char| !c.is_alphanumeric() && c != '_')
-                .any(|w| w == "test")
+            test_only(&attr)
         } {
             if skipping.is_none() {
                 pending = true;
@@ -155,6 +154,44 @@ fn non_ascii_in_code(source: &str) -> Vec<(usize, char)> {
         }
     }
     found
+}
+
+/// Whether a `#[cfg(...)` attribute compiles its item into test builds only:
+/// `cfg(test)`, or `cfg(all(...))` with `test` among its own arguments.
+/// `not(test)` and `any(test, ...)` reach other builds too, so they are
+/// checked (#1649 review).
+fn test_only(attr: &str) -> bool {
+    let predicate: String = attr
+        .trim_start_matches("#[cfg(")
+        .trim_end_matches(')')
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if predicate == "test" {
+        return true;
+    }
+    let Some(args) = predicate.strip_prefix("all(") else {
+        return false;
+    };
+    let mut depth = 0usize;
+    let mut arg = String::new();
+    for c in args.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 0 => break,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                if arg == "test" {
+                    return true;
+                }
+                arg.clear();
+                continue;
+            }
+            _ => {}
+        }
+        arg.push(c);
+    }
+    arg == "test"
 }
 
 /// Every `.rs` file under `dir` that is not a test-only module file.
@@ -224,4 +261,12 @@ fn the_ascii_scan_reads_literals_and_skips_comments_and_test_code() {
         ""
     );
     assert_eq!(caught("const A: &str = \"plain ascii -- ...\";"), "");
+    // A `cfg` that also reaches non-test builds is checked.
+    assert_eq!(caught("#[cfg(not(test))]\nfn p() { \"—\"; }"), "—");
+    assert_eq!(caught("#[cfg(any(test, unix))]\nfn p() { \"…\"; }"), "…");
+    assert_eq!(
+        caught("#[cfg(all(unix, not(test)))]\nfn p() { \"§\"; }"),
+        "§"
+    );
+    assert_eq!(caught("#[cfg(all(unix, test))]\nfn t() { \"—\"; }"), "");
 }
