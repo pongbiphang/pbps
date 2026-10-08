@@ -482,8 +482,9 @@ jobs:
       - run: cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1
         if: matrix.suite == 'dialect'
       # The operator-vouched resolver end to end (#1672): no root, no Docker,
-      # only the three servers above.
-      - run: cargo test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::vouched::
+      # only the three servers above. The filter must not end in `:`, which
+      # YAML reads as a mapping and rejects the whole file.
+      - run: cargo test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::vouched::live_tests
         if: matrix.suite == 'dialect'
       # Private capture internals have live snapshot/rendering regressions.
       # Split by module: the binding half rides with the short suites above.

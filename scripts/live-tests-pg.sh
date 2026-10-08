@@ -111,7 +111,7 @@ python3 scripts/live-transport.py pg
 cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1 "$@"
 # The operator-vouched resolver end to end (#1672), with no root or Docker of
 # its own: the three servers above are its targets and scratch servers.
-cargo test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::vouched:: "$@"
+cargo test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::vouched::live_tests "$@"
 # The CLI end to end on this engine, serially: each test creates and drops a
 # database of its own, and two of those racing is a race the engine can lose.
 cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1 "$@"

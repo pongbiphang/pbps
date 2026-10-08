@@ -94,7 +94,7 @@ class LiveExecution(unittest.TestCase):
             ["cargo", "test", "-p", "pbps-db", "--test", "live_pg", "--", "--ignored"],
             ["python3", "scripts/live-transport.py", "pg"],
             ["cargo", "test", "-p", "pbps-cli", "--bin", "pbps", "--", "--ignored", "--test-threads=1"],
-            ["cargo", "test", "-p", "pbps-cli", "--lib", "--", "--ignored", "--test-threads=1", "resolver::server::vouched::"],
+            ["cargo", "test", "-p", "pbps-cli", "--lib", "--", "--ignored", "--test-threads=1", "resolver::server::vouched::live_tests"],
             ["cargo", "test", "-p", "pbps-cli", "--test", "flow_pg", "--", "--ignored", "--test-threads=1"],
         ])
 
