@@ -1804,6 +1804,12 @@ by the engines, and the scratch account decides the layout.** Implemented by
     database can alter or drop it (measured), and one in this database is
     the emptiness check's. On another cluster none of these is the
     target's, so they are not checked there.
+  - **Other sessions.** It can use no login role but its own, and it is
+    not the target session's login. A backend may be cancelled or
+    terminated by any role with its login role's privileges, from any
+    database (measured on 16 and 18 through an `INHERIT TRUE, SET FALSE`
+    membership; #1678 review). The scratch login's own sessions elsewhere
+    are the operator's to keep apart: it is the scratch database's login.
 - Reproducing the deployer's authorization creates roles server-wide, some
   possibly `SUPERUSER`. On a shared cluster that is a write to the target's
   cluster, and only an account that cannot make it is safe there.
@@ -1882,6 +1888,14 @@ by the engines, and the scratch account decides the layout.** Implemented by
     - Left out, as measured: ownership of another database, which
       `DROP OWNED` keeps, a grant the login made on another database's ACL,
       and a membership granted to the login.
+- **The cleanup confirms the database is empty.** After `DROP OWNED`, the
+  emptiness inventory is read again, and anything left fails the run,
+  named, instead of returning a plan. A compiled definition may `SET ROLE`
+  to a role the login can become and create objects that role owns, which
+  `DROP OWNED BY SESSION_USER` does not reach. `pg_database_owner` is such
+  a role for every owner, and `DROP OWNED BY pg_database_owner` is refused
+  ("required by the database system"; measured on 16 and 18), so refusing
+  such roles up front cannot cover it (#1678 review).
 - **Why ownership is required.** `DROP OWNED` also revokes what was granted
   to the login on the database, and only an owner keeps its rights through
   that.

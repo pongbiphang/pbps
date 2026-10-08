@@ -171,7 +171,9 @@ async fn separation(
         let target_mark = sql::mark(target, &tokens.target).await?;
         let scratch_mark = sql::mark(scratch, &tokens.scratch).await?;
         let seen = sql::marked(scratch, &[&tokens.target, &tokens.scratch]).await?;
-        let account = sql::account(scratch).await?;
+        let mut account = sql::account(scratch).await?;
+        account.target_login =
+            sql::session_login(target).await? == sql::session_login(scratch).await?;
         let backend = sql::backend(scratch).await?;
         Ok::<_, pbps_db::DbError>((target_mark, scratch_mark, seen, account, backend))
     }
@@ -677,11 +679,20 @@ impl Run<'_> {
             Created::Supplied { database } => {
                 // The checked connection, never a new one, and only on the
                 // checked backend: see `supplied`.
-                sql::drop_owned(admin, self.backend).await.map_err(|error| {
-                    vec![format!(
+                match sql::drop_owned(admin, self.backend).await {
+                    Ok((_, 0)) => Ok(()),
+                    // Owned by another role a definition switched to, which
+                    // `DROP OWNED BY SESSION_USER` does not reach; never an
+                    // empty database (see `sql::drop_owned`).
+                    Ok((named, total)) => Err(vec![format!(
+                        "{total} object(s) in database {database} owned by a role other than \
+                         the scratch account ({})",
+                        named.join(", ")
+                    )]),
+                    Err(error) => Err(vec![format!(
                         "every object the scratch account owns in database {database} ({error})"
-                    )]
-                })
+                    )]),
+                }
             }
         }
     }

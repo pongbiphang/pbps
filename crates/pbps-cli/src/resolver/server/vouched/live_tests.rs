@@ -378,6 +378,9 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
         // role, a grant option on another database, and `ALTER SYSTEM` on a
         // parameter granted to PUBLIC (#1678 review).
         let parameter = format!("pbps.v1672_{}", fixture.token);
+        // And another login role it inherits from, whose sessions in any
+        // database it could cancel or terminate (#1678 review).
+        let (signalled, _) = fixture.login("y", "").await;
         let owner = format!("pbps_v1672_w_{}", fixture.token);
         let admin_of = format!("pbps_v1672_v_{}", fixture.token);
         fixture
@@ -389,7 +392,8 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
                  CREATE ROLE {admin_of} NOLOGIN; \
                  GRANT {admin_of} TO {reacher} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE; \
                  GRANT CONNECT ON DATABASE {other} TO {reacher} WITH GRANT OPTION; \
-                 GRANT ALTER SYSTEM ON PARAMETER {parameter} TO PUBLIC"
+                 GRANT ALTER SYSTEM ON PARAMETER {parameter} TO PUBLIC; \
+                 GRANT {signalled} TO {reacher} WITH INHERIT TRUE, SET FALSE"
             ))
             .await
             .unwrap();
@@ -438,7 +442,8 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
                 && reach.contains(&format!("no ownership of database {owned_elsewhere}"))
                 && reach.contains(&format!("no admin option on role {admin_of}"))
                 && reach.contains(&format!("no grant option on database {other}"))
-                && reach.contains(&format!("no ALTER SYSTEM on parameter {parameter}")),
+                && reach.contains(&format!("no ALTER SYSTEM on parameter {parameter}"))
+                && reach.contains(&format!("no use of login role {signalled}")),
             "{server}: {reach}"
         );
         assert_eq!(

@@ -1429,8 +1429,10 @@ entry implemented by #1672, Docker by #1674).**
       predefined role whose privileges act outside the database, such as
       `pg_execute_server_program`. Nor does it hold authority over another
       shared object: another database or tablespace it owns, `ADMIN OPTION`
-      on a role, a grant option, `ALTER SYSTEM` on a parameter. An
-      unconfined account there refuses, naming what to remove.
+      on a role, a grant option, `ALTER SYSTEM` on a parameter. It can use
+      no other login role, and is not the target's login, whose sessions it
+      could signal. An unconfined account there refuses, naming what to
+      remove.
     - **The account decides the layout.**
       - **Run-owned.** A login that is itself a superuser, on another
         cluster, gets:
@@ -1446,7 +1448,9 @@ entry implemented by #1672, Docker by #1674).**
         the login other than an ownership, such as a privilege on another
         database or a membership the login granted. The deployer's role and
         database defaults become session settings, and `DROP OWNED` empties
-        the database afterwards, whether the run answered or refused.
+        the database afterwards, whether the run answered or refused. What
+        another role owns survives it, so the run then reads the database
+        again and fails, naming what remains.
     - **Scratch is empty.** The database the run compiles in holds nothing
       initdb did not create: no object at or above `FirstNormalObjectId`,
       subscriptions included, and no large object, whose OID may be

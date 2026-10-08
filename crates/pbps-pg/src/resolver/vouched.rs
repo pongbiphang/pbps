@@ -114,6 +114,16 @@ pub struct Account {
     /// write outside the database a compiled definition can make (#1678
     /// review). Named as what to remove.
     pub shared: Vec<String>,
+    /// Login roles it can use other than itself. A backend may be cancelled
+    /// or terminated by any role with its login role's privileges (measured
+    /// on 16 and 18 through an `INHERIT TRUE, SET FALSE` membership), so a
+    /// compiled definition could signal that role's sessions in any
+    /// database (#1678 review).
+    pub logins: Vec<String>,
+    /// The scratch login is the target session's own login, whose sessions
+    /// it may signal for the same reason. Set by the caller, which reads
+    /// the target session.
+    pub target_login: bool,
 }
 
 /// Every role whose privileges the scratch login can use: a role it can
@@ -187,6 +197,16 @@ impl Account {
             self.shared
                 .iter()
                 .map(|authority| format!("no {authority}")),
+        )
+        .chain(
+            self.logins.iter().map(|login| {
+                format!("no use of login role {login}, whose sessions it could signal")
+            }),
+        )
+        .chain(
+            self.target_login.then(|| {
+                "a login other than the target's, whose sessions it could signal".to_owned()
+            }),
         )
         .collect()
     }
@@ -433,6 +453,16 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
         .iter()
         .map(|row| text(row, "authority"))
         .collect::<Result<Vec<_>, _>>()?;
+    let logins = conn
+        .query(&format!(
+            "SELECT r.rolname::text AS role FROM pg_catalog.pg_roles r \
+              WHERE r.rolcanlogin AND r.rolname <> session_user AND r.oid IN ({REACH}) \
+              ORDER BY 1"
+        ))
+        .await?
+        .iter()
+        .map(|row| text(row, "role"))
+        .collect::<Result<Vec<_>, _>>()?;
     let row = one(rows, "the scratch account's attributes")?;
     let flag = |field: &str| -> Result<bool, DbError> {
         match text(&row, field)?.as_str() {
@@ -451,7 +481,15 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
         login_superuser: flag("login_superuser")?,
         predefined,
         shared,
+        logins,
+        target_login: false,
     })
+}
+
+/// The session's login.
+pub async fn session_login(conn: &mut impl QueryConnection) -> Result<String, DbError> {
+    let rows = conn.query("SELECT session_user::text AS login").await?;
+    text(&one(rows, "the session's login")?, "login")
 }
 
 /// Whether the scratch login owns the database it is connected to. The
@@ -606,10 +644,18 @@ pub async fn create_schemas(
 /// end. The drop
 /// runs in one transaction with a check that it is on the backend the run
 /// checked, and is never sent anywhere else.
+///
+/// Returns what the database still holds afterwards, as
+/// [`foreign_objects`] reads it: a compiled definition may `SET ROLE` to
+/// another role and create objects that role owns, which `DROP OWNED BY
+/// SESSION_USER` does not reach. `pg_database_owner` is such a role for
+/// every database owner, and `DROP OWNED` refuses it outright (measured on
+/// 16 and 18), so this cannot be refused up front. The run fails naming
+/// them instead of reporting an empty database (#1678 review).
 pub async fn drop_owned(
     conn: &mut impl ExecuteConnection,
     checked: &Backend,
-) -> Result<(), DbError> {
+) -> Result<(Vec<String>, usize), DbError> {
     conn.execute("ROLLBACK").await?;
     conn.execute("SET ROLE NONE").await?;
     conn.execute("BEGIN").await?;
@@ -622,7 +668,8 @@ pub async fn drop_owned(
         ));
     }
     conn.execute("DROP OWNED BY SESSION_USER").await?;
-    conn.execute("COMMIT").await
+    conn.execute("COMMIT").await?;
+    foreign_objects(conn).await
 }
 
 #[cfg(test)]
@@ -679,6 +726,8 @@ mod tests {
             login_superuser: false,
             predefined: Vec::new(),
             shared: Vec::new(),
+            logins: Vec::new(),
+            target_login: false,
         };
         assert!(none.confined() && !none.provisions());
         assert!(none.excess().is_empty());
@@ -712,6 +761,18 @@ mod tests {
             ..none.clone()
         };
         assert_eq!(owner.excess(), ["no ownership of database other"]);
+        // Negative: a login role's sessions, its own on the target included,
+        // can be signalled from any database.
+        let signaller = Account {
+            logins: vec!["deployer".into()],
+            ..none.clone()
+        };
+        assert!(!signaller.confined());
+        let shared_login = Account {
+            target_login: true,
+            ..none.clone()
+        };
+        assert!(!shared_login.confined() && !shared_login.provisions());
         // Negative: both attributes without superuser cannot act as the
         // roles it would create, so it does not provision.
         let both = Account {
@@ -733,6 +794,66 @@ mod tests {
             ..none
         };
         assert!(superuser.provisions() && !superuser.confined());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn the_cleanup_names_what_another_role_still_owns() {
+        // A definition may `SET ROLE` to a role the login can become, every
+        // database owner's `pg_database_owner` among them, and create there
+        // an object `DROP OWNED BY SESSION_USER` does not reach. The cleanup
+        // reports it rather than an empty database (#1678 review).
+        use pbps_db::{Conn, Driver};
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+            let name = format!(
+                "pbps_drop1678_{}",
+                crate::catalog::probe_token().replace('-', "_")
+            );
+            let password = crate::catalog::probe_token().replace('-', "");
+            let mut admin = Conn::connect(Driver::Postgres, &base).await.unwrap();
+            admin
+                .execute(&format!("CREATE ROLE {name} LOGIN PASSWORD '{password}'"))
+                .await
+                .unwrap();
+            admin
+                .execute(&format!(
+                    "CREATE DATABASE {name} OWNER {name} TEMPLATE template0"
+                ))
+                .await
+                .unwrap();
+            let result = async {
+                let mut login = Conn::connect(
+                    Driver::Postgres,
+                    &format!("{base} dbname={name} user={name} password={password}"),
+                )
+                .await?;
+                // Read before any role switch, as the run reads it.
+                let checked = backend(&mut login).await?;
+                for statement in [
+                    "CREATE TABLE public.mine (i integer)",
+                    "SET ROLE pg_database_owner",
+                    "CREATE TABLE public.escaped (i integer)",
+                ] {
+                    login.execute(statement).await?;
+                }
+                drop_owned(&mut login, &checked).await
+            }
+            .await;
+            admin
+                .execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+                .await
+                .unwrap();
+            admin.execute(&format!("DROP ROLE {name}")).await.unwrap();
+            let (named, total) = result.unwrap();
+            // The table, with its row type and that type's array.
+            assert!(total > 0, "{variable}: {named:?}");
+            assert!(
+                named.iter().any(|object| object == "table public.escaped")
+                    && !named.iter().any(|object| object.contains("mine")),
+                "{variable}: {named:?}"
+            );
+        }
     }
 
     #[test]
