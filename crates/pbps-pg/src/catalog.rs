@@ -2608,28 +2608,48 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
     // they take, a message they send stays. A connected plan is read-only
     // (SPEC §9.8), so with one enabled nothing is stored and each pair stays
     // to the apply's closing check (#1669). A failed read is no answer either.
-    match enabled_ddl_event_triggers(conn).await {
-        Ok(names) if names.is_empty() => {}
-        found => {
-            let why = match found {
-                Ok(names) => format!(
-                    "the target has the enabled DDL event trigger(s) {}, which this check's \
-                     temporary table would fire",
-                    names
-                        .iter()
-                        .map(|n| format!("`{n}`"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                Err(e) => format!("cannot read the target's event triggers: {e}"),
-            };
-            out.defaults_unasked.extend(
-                asked
-                    .iter()
-                    .map(|d| format!("partition {} column `{}`: {why}", d.partition, d.column)),
-            );
-            return;
-        }
+    let listed = |names: Vec<String>| {
+        names
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut refused = match enabled_ddl_event_triggers(conn).await {
+        Ok(names) if names.is_empty() => None,
+        Ok(names) => Some(format!(
+            "the target has the enabled DDL event trigger(s) {}, which this check's \
+             temporary table would fire",
+            listed(names)
+        )),
+        Err(e) => Some(format!("cannot read the target's event triggers: {e}")),
+    };
+    // A domain's CHECK runs when the parse reads a literal as a composite,
+    // array or range over that domain, and it runs as this role: storing
+    // `'(5)'::app.c` runs it, measured on 16 and 18. A check another role
+    // can rewrite would run that role's code with the deployer's privileges
+    // during a plan that is read-only, and an error it raises can carry what
+    // it read (#1663). Which domains a declared text reaches is the parse's
+    // to find, so any such domain leaves every pair unasked.
+    if refused.is_none() {
+        refused = match untrusted_domain_checks(conn).await {
+            Ok(names) if names.is_empty() => None,
+            Ok(names) => Some(format!(
+                "the target has the domain(s) {} whose CHECK runs code a role other than \
+                 this one or a superuser can change, and storing a default can run it as \
+                 this role",
+                listed(names)
+            )),
+            Err(e) => Some(format!("cannot read the target's domains: {}", redacted(e))),
+        };
+    }
+    if let Some(why) = refused {
+        out.defaults_unasked.extend(
+            asked
+                .iter()
+                .map(|d| format!("partition {} column `{}`: {why}", d.partition, d.column)),
+        );
+        return;
     }
     let result = store_and_read(conn, &asked).await;
     // Rolled back whatever happened: nothing this asks may outlive it.
@@ -2686,6 +2706,69 @@ async fn enabled_ddl_event_triggers(conn: &mut Conn) -> Result<Vec<String>, DbEr
         .collect()
 }
 
+/// Every domain with a CHECK that a role other than this one or a superuser
+/// can change: one it owns, or one whose check calls a function or operator
+/// it owns, which it can replace. A function a trusted one calls by name
+/// inside its body is not recorded in the catalog and is not seen; that body
+/// is its trusted owner's to write.
+async fn untrusted_domain_checks(conn: &mut Conn) -> Result<Vec<String>, DbError> {
+    let rows = conn
+        .query(
+            "WITH trusted AS (
+                 SELECT r.oid FROM pg_catalog.pg_roles r
+                  WHERE r.rolsuper OR r.rolname OPERATOR(pg_catalog.=) CURRENT_USER)
+             SELECT DISTINCT pg_catalog.format('%I.%I', n.nspname, t.typname) AS name
+               FROM pg_catalog.pg_type t
+               JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.typnamespace
+               JOIN pg_catalog.pg_constraint c ON c.contypid OPERATOR(pg_catalog.=) t.oid
+              WHERE t.typtype OPERATOR(pg_catalog.=) 'd'
+                AND c.contype OPERATOR(pg_catalog.=) 'c'
+                AND (NOT EXISTS (SELECT FROM trusted
+                                  WHERE trusted.oid OPERATOR(pg_catalog.=) t.typowner)
+                     OR EXISTS (
+                         SELECT FROM pg_catalog.pg_depend d
+                           LEFT JOIN pg_catalog.pg_operator o
+                             ON d.refclassid OPERATOR(pg_catalog.=)
+                                    'pg_catalog.pg_operator'::pg_catalog.regclass
+                            AND o.oid OPERATOR(pg_catalog.=) d.refobjid
+                           JOIN pg_catalog.pg_proc p
+                             ON p.oid OPERATOR(pg_catalog.=) CASE
+                                    WHEN d.refclassid OPERATOR(pg_catalog.=)
+                                         'pg_catalog.pg_proc'::pg_catalog.regclass
+                                    THEN d.refobjid
+                                    ELSE o.oprcode::pg_catalog.oid END
+                          WHERE d.classid OPERATOR(pg_catalog.=)
+                                    'pg_catalog.pg_constraint'::pg_catalog.regclass
+                            AND d.objid OPERATOR(pg_catalog.=) c.oid
+                            AND NOT EXISTS (SELECT FROM trusted
+                                             WHERE trusted.oid OPERATOR(pg_catalog.=)
+                                                   p.proowner)))
+              ORDER BY 1",
+        )
+        .await?;
+    // `typname` is NOT NULL; a NULL read still counts as a domain, never as
+    // none.
+    rows.iter()
+        .map(|row| {
+            Ok(row
+                .try_get::<&str>("name")?
+                .unwrap_or("<unnamed>")
+                .to_owned())
+        })
+        .collect()
+}
+
+/// What a failure inside the probe tells the user: the engine's SQLSTATE,
+/// never its text. The text is whatever the code the parse reached chose to
+/// raise, and that code ran with this role's privileges (#1663). A failure
+/// with no server code is the driver's own and is told as it is.
+fn redacted(e: DbError) -> String {
+    match e.server_error_code() {
+        Some(code) => format!("the engine refused it (SQLSTATE {code})"),
+        None => e.to_string(),
+    }
+}
+
 /// Stores one declared text as `column`'s default, under `under`'s path, in a
 /// savepoint of its own.
 ///
@@ -2696,7 +2779,7 @@ async fn enabled_ddl_event_triggers(conn: &mut Conn) -> Result<Vec<String>, DbEr
 async fn store_one(conn: &mut Conn, column: &str, under: &str, text: &str) -> Result<(), String> {
     let path =
         crate::emit::write_path(&crate::Postgres::new(), under).map_err(|e| e.to_string())?;
-    let fail = |e: DbError| e.to_string();
+    let fail = redacted;
     conn.execute("SAVEPOINT pbps_1609").await.map_err(fail)?;
     let result = async {
         conn.query(&format!(
@@ -2726,7 +2809,7 @@ async fn store_one(conn: &mut Conn, column: &str, under: &str, text: &str) -> Re
             conn.execute("ROLLBACK TO SAVEPOINT pbps_1609")
                 .await
                 .map_err(fail)?;
-            Err(e.to_string())
+            Err(redacted(e))
         }
     }
 }
@@ -2738,7 +2821,7 @@ async fn store_and_read(
     conn: &mut Conn,
     asked: &[OwnDefault<'_>],
 ) -> Result<Vec<Result<(String, String), String>>, String> {
-    let fail = |e: DbError| e.to_string();
+    let fail = redacted;
     conn.execute("BEGIN").await.map_err(fail)?;
     // Every parser setting the apply pins, not only the deparse's: a role's
     // `transform_null_equals = on` would store `FALSE = NULL` as `FALSE IS

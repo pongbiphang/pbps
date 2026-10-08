@@ -3797,3 +3797,53 @@ Pinned by:
   computed column reads, and checks their pairs. Its negative: unbound, both
   drops keep their place. The search test above also refuses to move the
   function past a computed drop bound to it.
+
+<a id="dec-1663-1"></a>
+
+**DEC-1663.1. The partition-default probe runs no domain CHECK another role
+can change, and tells a failure by its SQLSTATE, never the engine's words
+(#1663; amends DEC-1609.1).** Storing a declared default parses it as the
+deployer. Measured on 16 and 18, the parse runs neither a domain's CHECK
+for a literal of the domain itself nor a user cast's function. It does run a
+domain's CHECK when it reads a literal as a composite, array or range over
+that domain: `record_in` and `array_in` call the element's input function,
+which for a domain is `domain_in`. A role with `CREATE` in any schema can
+own such a domain, and a check that calls its PL/pgSQL function ran with the
+deployer's privileges and raised a table only the deployer could read. The
+rollback took back no read, and the error text carried it to the output.
+
+The issue offered two fixes: run the probes as a role with no data access,
+or refuse types whose functions an untrusted role owns. The first needs a
+role pbps would provision in every target, with `USAGE` on whatever schemas
+the declared texts name. The second, as written, reads the wrong functions.
+Measured, a non-superuser cannot create a base type or a shell type, so
+neither a range's `canonical` nor a type modifier function. Every input
+function the parse reaches is a superuser's; what another role can write is
+a domain's CHECK. So before storing anything the probe reads every domain with a CHECK
+whose owner, or the owner of a function or operator its expression calls,
+is neither a superuser nor the current role. With one, nothing is stored and
+each pair stays unasked with a warning naming the domains, as under an event
+trigger (#1669); the apply's closing check still refuses a wrong recording.
+Which domains a declared text reaches is the parse's to find, so the read
+covers the database. A function a trusted one calls by name inside its body
+is not in the catalog's dependencies and is not seen. That body is its
+trusted owner's to write, and the apply would run it all the same.
+
+A failure inside the probe is reported as "the engine refused it (SQLSTATE
+22P02)", never the server's text. That text is whatever the code the parse
+reached chose to raise, with what it read. The row and bound spelling reads
+(DECISIONS 101, 106; DEC-1170.1) cast only to the types pbps spells, under
+an empty `search_path`. They run built-in input functions only and keep
+their text.
+
+Pinned on 16 and 18 by the CLI's
+`an_untrusted_domain_check_leaves_the_partition_default_probe_unrun`:
+
+- a role's domain whose check counts its runs and raises a deployer-only
+  table, reached through a composite literal in a declared default, leaves
+  the pair unasked with the domain named; the check never runs and the
+  table's contents appear nowhere in the output;
+- without it, and beside a domain the deployer owns that calls only
+  built-ins, the pair is asked and refused as the parent's;
+- a default the engine refuses is told as `SQLSTATE 22P02`, without the
+  server's words.

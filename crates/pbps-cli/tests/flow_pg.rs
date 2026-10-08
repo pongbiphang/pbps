@@ -20083,3 +20083,119 @@ fn an_unlogged_partition_under_an_undeclared_permanent_key_is_refused() {
     assert_eq!(absent(), 0);
     succeeds(d.run(&["verify", "--db", &conn]));
 }
+
+/// A domain whose CHECK another role can change leaves every partition
+/// default pair unasked: storing a literal of a composite over it runs the
+/// check as the deployer, and that role's function could read and raise what
+/// only the deployer can (#1663). Its function never runs, and nothing it
+/// would have read reaches the output. Negatives: without it, the pair is
+/// asked and refused as the parent's, a domain the deployer owns calling only
+/// built-ins does not stop it, and a text the engine refuses is told by its
+/// SQLSTATE alone. On 18 and 16.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (version, server) in [("18", server()), ("16", old)] {
+        let db = OwnDatabase::new(&server, &format!("parts-1663-{version}"));
+        let conn = db.connection().to_owned();
+        on_server(
+            &conn,
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.ev (k integer NOT NULL, v integer DEFAULT 1) \
+                 PARTITION BY RANGE (k); \
+             CREATE TABLE app.ev_a PARTITION OF app.ev FOR VALUES FROM (0) TO (10); \
+             ALTER TABLE app.ev_a ALTER COLUMN v SET DEFAULT 7",
+        );
+        let d = Demo::new(&format!("parts-1663-{version}"));
+        succeeds(d.run(&["pull", "--db", &conn]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+        // A role with CREATE in a schema of its own writes a check that
+        // counts its runs and raises what only the deployer can read.
+        on_server(
+            &conn,
+            "DO $$ BEGIN CREATE ROLE pbps_1663_low; \
+                 EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
+             CREATE TABLE public.pbps_1663_secret (s text); \
+             INSERT INTO public.pbps_1663_secret VALUES ('pbps-1663-secret'); \
+             CREATE SCHEMA evil; CREATE SEQUENCE evil.ran; \
+             GRANT CREATE, USAGE ON SCHEMA evil TO pbps_1663_low; \
+             SET ROLE pbps_1663_low; \
+             CREATE FUNCTION evil.peek(integer) RETURNS boolean LANGUAGE plpgsql AS \
+                 $$ BEGIN PERFORM pg_catalog.nextval('evil.ran'); \
+                    RAISE EXCEPTION 'leaked %', \
+                        (SELECT pg_catalog.string_agg(s, ',') FROM public.pbps_1663_secret); \
+                 END $$; \
+             CREATE DOMAIN evil.d AS integer CHECK (evil.peek(VALUE)); \
+             CREATE TYPE evil.c AS (v evil.d); \
+             RESET ROLE",
+        );
+        let path = d.dir.join("schema/app.ev.yml");
+        let pulled = std::fs::read_to_string(&path).unwrap();
+        let own = "      v: {default: \"7\"}\n";
+        assert!(pulled.contains(own), "{pulled}");
+        let declare = |text: &str| {
+            std::fs::write(
+                &path,
+                pulled.replace(own, &format!("      v: {{default: {text:?}}}\n")),
+            )
+            .unwrap();
+            d.commit();
+        };
+        declare("pg_catalog.length((('(5)')::evil.c)::text)");
+
+        let ran = "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM evil.ran";
+        let plan = d.dir.join("unasked.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        assert_eq!(scalar(&conn, ran), 0, "{version}: the plan ran the check");
+        let (out, err) = (stdout(&o), stderr(&o));
+        assert!(
+            !out.contains("pbps-1663-secret") && !err.contains("pbps-1663-secret"),
+            "{version}: {out}{err}"
+        );
+        assert!(
+            err.contains(
+                "warning: not checked before the plan whether the engine stores it as the \
+                 parent's default: partition app.ev_a column `v`: the target has the \
+                 domain(s) `evil.d` whose CHECK runs code"
+            ),
+            "{version}: {out}{err}"
+        );
+
+        // Negative: without it, and beside a domain the deployer owns that
+        // calls only built-ins, the pair is asked and refused as the parent's.
+        on_server(
+            &conn,
+            "DROP SCHEMA evil CASCADE; \
+             CREATE DOMAIN public.pbps_1663_ok AS integer CHECK (VALUE > 0)",
+        );
+        declare("(1)");
+        let plan = d.dir.join("asked.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 1, "{version}: {}{}", stdout(&o), stderr(&o));
+        assert!(
+            stderr(&o).contains(
+                "partition app.ev_a column `v`: its own default \"(1)\" is stored as \"1\""
+            ),
+            "{version}: {}",
+            stderr(&o)
+        );
+
+        // A text the engine refuses is told by its SQLSTATE, not its words.
+        declare("('pbps-1663-text')::integer");
+        let plan = d.dir.join("refused.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        let err = stderr(&o);
+        assert!(
+            err.contains("partition app.ev_a column `v`: the engine refused it (SQLSTATE 22P02)")
+                && !err.contains("invalid input syntax"),
+            "{version}: {}{err}",
+            stdout(&o)
+        );
+        on_server(
+            &conn,
+            "DROP OWNED BY pbps_1663_low; DROP ROLE pbps_1663_low",
+        );
+    }
+}
