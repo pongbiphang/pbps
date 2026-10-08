@@ -669,10 +669,18 @@ async fn vouched_compiles_as_the_login_whatever_its_session_defaults() {
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_provisions_as_the_superuser_login_whatever_its_default_role() {
     // A superuser login whose default role cannot create roles: every
-    // connection the run opens as it must act as the login itself.
+    // connection the run opens as it must act as the login itself, and so
+    // must every step that switches role and back, such as replaying a
+    // schema's grant as its grantor (#1678 review).
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let mut scratch = Fixture::new(SCRATCH_SERVER);
     let target_db = target.target().await;
+    target
+        .run(
+            &target_db,
+            &["GRANT USAGE ON SCHEMA pbps_evidence1274 TO PUBLIC"],
+        )
+        .await;
     let login = scratch.login("a", "SUPERUSER").await;
     let worker = format!("pbps_v1672_r_{}", scratch.token);
     scratch

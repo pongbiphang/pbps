@@ -760,7 +760,10 @@ pub async fn reconstruct(
                         }
                     ))
                     .await;
-                admin.query("RESET ROLE").await?;
+                // `SET ROLE NONE`, not `RESET ROLE`: a reset returns to the
+                // role the login's defaults name, not to the login (#1678
+                // review).
+                admin.query("SET ROLE NONE").await?;
                 outcome?;
                 if grant.grantable && grantee != "PUBLIC" {
                     able.insert((grantee.clone(), grant.privilege.clone()));
@@ -845,7 +848,7 @@ pub async fn apply_planned(
         .query(&format!("SET ROLE {}", quote_ident(deployer)))
         .await?;
     let outcome = apply_planned_grants(admin, map, grants).await;
-    admin.query("RESET ROLE").await?;
+    admin.query("SET ROLE NONE").await?;
     outcome
 }
 
