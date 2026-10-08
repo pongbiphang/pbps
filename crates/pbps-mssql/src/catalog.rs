@@ -868,6 +868,52 @@ pub async fn expression_edges(
     Ok(out)
 }
 
+/// Whether any of `tables` may hold a computed column that reads a column
+/// the plan changes (#1462). Only such a table's own computed columns can
+/// refuse a column's rename, drop or retype, and `sys.computed_columns` shows
+/// them to a login holding `VIEW DEFINITION` on the table's schema, which
+/// `sys.sql_expression_dependencies` does not. A table this login cannot see
+/// answers yes: absent is not "no computed column".
+pub async fn may_hold_computed_columns(
+    conn: &mut Conn,
+    tables: &[TableName],
+) -> Result<bool, DbError> {
+    if tables.is_empty() {
+        return Ok(false);
+    }
+    let values = tables
+        .iter()
+        .map(|n| {
+            format!(
+                "({}, {})",
+                crate::ident::literal(&n.schema),
+                crate::ident::literal(&n.name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT COUNT(*) AS n
+           FROM (VALUES {values}) AS w(schema_name, table_name)
+          WHERE NOT EXISTS (
+                  SELECT 1 FROM sys.tables t
+                    JOIN sys.schemas s ON s.schema_id = t.schema_id
+                   WHERE s.name = w.schema_name COLLATE CATALOG_DEFAULT
+                     AND t.name = w.table_name COLLATE CATALOG_DEFAULT)
+             OR EXISTS (
+                  SELECT 1 FROM sys.computed_columns c
+                    JOIN sys.tables t ON t.object_id = c.object_id
+                    JOIN sys.schemas s ON s.schema_id = t.schema_id
+                   WHERE s.name = w.schema_name COLLATE CATALOG_DEFAULT
+                     AND t.name = w.table_name COLLATE CATALOG_DEFAULT);"
+    );
+    let rows = conn.query(&sql).await?;
+    let row = rows
+        .first()
+        .ok_or_else(|| DbError::Refused("the computed-column count returned no row".into()))?;
+    Ok(get::<i32>(row, "n")? > 0)
+}
+
 /// What a hidden referrer can keep the connected pass of DEC-1431.1 from
 /// deciding (#1462, #1643 review): a function the plan alters or drops, which
 /// a computed column anywhere may call, and a computed column the plan drops,

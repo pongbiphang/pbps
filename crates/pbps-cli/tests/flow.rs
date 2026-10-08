@@ -3212,8 +3212,10 @@ fn computed_function_drops_follow_the_catalogs_edges() {
 /// review). A hidden plain view over `dbo.k.c`, or a hidden procedure calling
 /// `dbo.h`, blocks neither the drop nor the function's alter, and refuses
 /// nothing (#1643 ready review). Without database `VIEW DEFINITION` the
-/// function's alter is refused for the grant, and adding a computed column,
-/// which no edge decides, plans.
+/// function's alter is refused for the grant, and so is a nullability change
+/// on a table with a computed column; adding a computed column, the same
+/// change on a table with none, or dropping one view, which no edge decides,
+/// plans.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
@@ -3240,7 +3242,13 @@ fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
     );
     on_server(
         own.connection(),
-        "CREATE TABLE dbo.k (id int NOT NULL CONSTRAINT pk_k PRIMARY KEY, c AS (id * 2));",
+        "CREATE TABLE dbo.k (id int NOT NULL CONSTRAINT pk_k PRIMARY KEY, c AS (id * 2), \
+             b int NULL); \
+         CREATE TABLE dbo.p (id int NOT NULL CONSTRAINT pk_p PRIMARY KEY, a int NULL);",
+    );
+    on_server(
+        own.connection(),
+        "CREATE VIEW dbo.vw AS SELECT id FROM dbo.p;",
     );
     let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
     let d = Demo::new("edges1462-hidden");
@@ -3385,6 +3393,49 @@ fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
         "{}",
         stderr(&o)
     );
+    std::fs::write(&callee, &callee_text).unwrap();
+    // A nullability change: a retype also asks for the database grant, for
+    // the keys outside the managed tables (DECISIONS 460).
+    let not_null = |file: &std::path::Path, column: &str| {
+        let text = std::fs::read_to_string(file).unwrap();
+        let from = format!("  {column}:\n    type: int\n");
+        assert!(text.contains(&from), "{text}");
+        std::fs::write(
+            file,
+            text.replacen(
+                &from,
+                &format!("  {column}:\n    type: int\n    nullable: false\n"),
+                1,
+            ),
+        )
+        .unwrap();
+        text
+    };
+    let plain = d.dir.join("schema/dbo.p.yml");
+    let plain_text = not_null(&plain, "a");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", &as_login]));
+    std::fs::write(&plain, &plain_text).unwrap();
+    not_null(&table, "b");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &as_login]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("this login does not hold database VIEW DEFINITION"),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::write(&table, &pulled).unwrap();
+    let view = walk(&d.dir.join("schema"))
+        .into_iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("view: dbo.vw")))
+        .expect("dbo.vw's declaration");
+    std::fs::remove_file(&view).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", &as_login]));
     on_server(&server, &format!("DROP LOGIN [{login}];"));
 }
 

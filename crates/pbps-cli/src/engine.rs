@@ -678,23 +678,48 @@ pub async fn order_computed_by_edges(conn: &mut Conn, cs: &mut ChangeSet) -> any
     if objects.is_empty() {
         return Ok(());
     }
-    // The edges refuse or move only these: a column a computed column reads,
-    // a function one calls, a computed column a module is bound to, and the
-    // drops `release` orders. A plan with none of them, such as one adding a
-    // computed column or dropping a table, needs no edge read and so no grant
-    // that makes one complete (#1643 review).
-    let decides = cs.changes.iter().any(|p| match &p.change {
-        pbps_model::Change::RenameColumn { .. }
-        | pbps_model::Change::DropColumn { .. }
-        | pbps_model::Change::AlterColumnType { .. }
-        | pbps_model::Change::AlterColumnNullability { .. }
-        | pbps_model::Change::DropComputedColumn { .. }
-        | pbps_model::Change::DropModule { .. } => true,
-        pbps_model::Change::AlterModule { module, .. } => {
-            module.kind == pbps_model::ModuleKind::Function
+    // The edges refuse or move only these: a column a computed column of its
+    // own table reads, a function one calls, a computed column a module is
+    // bound to, and drops `release` orders, which takes two. A plan with none
+    // of them, such as one adding a computed column or dropping one view,
+    // needs no edge read and so no grant that makes one complete (#1643
+    // review).
+    let mut inputs: Vec<pbps_model::TableName> = Vec::new();
+    let mut drops = 0;
+    let mut decides = false;
+    for p in &cs.changes {
+        match &p.change {
+            pbps_model::Change::RenameColumn { table, .. } => inputs.push(catalog(table)),
+            pbps_model::Change::DropColumn { column, .. }
+            | pbps_model::Change::AlterColumnType { column, .. }
+            | pbps_model::Change::AlterColumnNullability { column, .. } => {
+                inputs.push(catalog(&column.table));
+            }
+            pbps_model::Change::DropComputedColumn { .. } => decides = true,
+            pbps_model::Change::AlterModule { module, .. } => {
+                decides |= module.kind == pbps_model::ModuleKind::Function;
+            }
+            pbps_model::Change::DropModule { kind, .. } => {
+                decides |= *kind == pbps_model::ModuleKind::Function;
+                drops += 1;
+            }
+            pbps_model::Change::DropTable { .. } => drops += 1,
+            _ => {}
         }
-        _ => false,
-    });
+    }
+    let modules_dropped = cs
+        .changes
+        .iter()
+        .any(|p| matches!(p.change, pbps_model::Change::DropModule { .. }));
+    decides |= modules_dropped && drops > 1;
+    if !decides {
+        decides = pbps_mssql::catalog::may_hold_computed_columns(conn, &inputs)
+            .await
+            .map_err(|e| {
+                anyhow::Error::new(e)
+                    .context("cannot read whether a changed column's table has computed columns")
+            })?;
+    }
     if !decides {
         return Ok(());
     }
