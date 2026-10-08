@@ -638,6 +638,14 @@ mod tests {
             )
             .is_ok()
         );
+        // A longer name SQL Server continues with `#`, `@` or `$` (#1668
+        // review).
+        for longer in ["dbo.cafe#helper([a])", "dbo.cafe@x([a])", "dbo.cafe$1([a])"] {
+            assert!(
+                refuse_added_calls(&plan(longer, drop_module("dbo.café")), &dialect, &ai).is_ok(),
+                "{longer}"
+            );
+        }
         // Another schema.
         assert!(
             refuse_added_calls(

@@ -2120,7 +2120,11 @@ pub trait Dialect {
             Other,
         }
         let mut tokens = Vec::new();
-        let code = self.lexicon().code_only(text);
+        let lexicon = self.lexicon();
+        // The engine's own rule: SQL Server continues a name with `@`, `#`
+        // and `$`, so `dbo.cafe#helper` is not `dbo.cafe` (#1668 review).
+        let continues = lexicon.identifier_continues;
+        let code = lexicon.code_only(text);
         let mut chars = code.chars().peekable();
         while let Some(c) = chars.next() {
             let close = match c {
@@ -2138,9 +2142,9 @@ pub trait Dialect {
                     name.push(n);
                 }
                 tokens.push(Token::Name(name));
-            } else if continues_ident(c) {
+            } else if continues(c) {
                 let mut name = String::from(c);
-                while let Some(n) = chars.next_if(|n| continues_ident(*n)) {
+                while let Some(n) = chars.next_if(|n| continues(*n)) {
                     name.push(n);
                 }
                 tokens.push(Token::Name(name));
