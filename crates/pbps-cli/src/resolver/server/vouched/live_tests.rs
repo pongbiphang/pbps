@@ -266,15 +266,19 @@ async fn vouched_runs_in_a_precreated_database_with_a_confined_account() {
         let target_db = fixture.target().await;
         let (login, scratch_db) = fixture.confined().await;
         // A membership it cannot `SET ROLE` through gives it no attribute:
-        // the login stays confined (#1678 review).
+        // the login stays confined (#1678 review). Nor does authority over
+        // its own database: an owner's grant options there once the ACL is
+        // explicit, and a grant option there held by a role it inherits.
         let creator = format!("pbps_v1672_m_{}", fixture.token);
         fixture
             .admin()
             .await
             .execute(&format!(
                 "CREATE ROLE {creator} NOLOGIN CREATEDB CREATEROLE; \
-                 GRANT {creator} TO {} WITH SET FALSE",
-                login.0
+                 GRANT {creator} TO {login} WITH SET FALSE; \
+                 REVOKE TEMPORARY ON DATABASE {scratch_db} FROM PUBLIC; \
+                 GRANT CONNECT ON DATABASE {scratch_db} TO {creator} WITH GRANT OPTION",
+                login = login.0
             ))
             .await
             .unwrap();

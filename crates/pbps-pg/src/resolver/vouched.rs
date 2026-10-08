@@ -414,8 +414,9 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
               WHERE a.admin_option AND a.member IN (SELECT oid FROM reach) \
              UNION \
              SELECT 'grant option on database ' || d.datname \
-               FROM pg_catalog.pg_database d, pg_catalog.aclexplode(d.datacl) x \
+               FROM pg_catalog.pg_database d, pg_catalog.aclexplode(d.datacl) x, here \
               WHERE x.is_grantable AND x.grantee IN (SELECT oid FROM reach) \
+                AND d.oid <> here.oid \
              UNION \
              SELECT 'grant option on tablespace ' || t.spcname \
                FROM pg_catalog.pg_tablespace t, pg_catalog.aclexplode(t.spcacl) x \
