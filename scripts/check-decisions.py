@@ -14,9 +14,13 @@ It refuses:
     row for it (a stale branch appending "N+1."), one the index does not list,
     or one the index places in another file;
   - an entry without the anchor its citations link to, or with the wrong one;
-  - a citation, `DECISIONS <n>` or `DEC-<issue>.<k>`, that names no entry.
-    A number the closed sequence skipped is accepted: branches reserved them,
-    and records still mention them as proposals.
+  - a number of the closed sequence whose entry or index row is gone — the
+    sequence is complete except for the four numbers it never used (523–526),
+    and those may not be taken now;
+  - a citation, `DECISIONS <n>` or `DEC-<issue>.<k>`, that names no entry —
+    every number of a grouped one (`DECISIONS 70, 87 and 90`, `181–190`). One
+    of the four unused numbers is accepted: branches reserved them, and
+    records still mention them as proposals.
 """
 
 import re
@@ -36,8 +40,22 @@ INDEX_ROW = re.compile(r"^\| (\d+) \| \[[^\]]+\]\(decisions/([^)#]+)#decision-(\
 # The last number of the closed sequence. Fixed here rather than read from the
 # index, which is an ordinary file a branch could extend along with its entry.
 CLOSED = 543
+# The numbers the closed sequence never used: branches reserved them and the
+# record still mentions them as proposals (see the index). Fixed here rather
+# than read as "whatever the index does not list", because then deleting an
+# entry together with its index row would turn its number into one of these,
+# and every citation of the lost decision would pass (#848).
+RESERVED = frozenset({523, 524, 525, 526})
 
-CITE_LEGACY = re.compile(r"\bDECISIONS (\d+)\b")
+# One legacy citation group: a number or a range, then more of them after a
+# comma, `and` or `, and`. A separator is taken only when a number follows, so
+# `DECISIONS 267, and the difference` and `DECISIONS 311, DEC-942.1` end at the
+# first number; a dash with no number after it ends the group too.
+ITEM = r"\d+(?:[ \t]*[-–][ \t]*\d+)?"
+CITE_LEGACY = re.compile(
+    rf"\bDECISIONS ({ITEM}(?:(?:,[ \t]*(?:and[ \t]+)?|[ \t]+and[ \t]+){ITEM})*)\b"
+)
+CITE_ITEM = re.compile(r"(\d+)(?:[ \t]*[-–][ \t]*(\d+))?")
 CITE_NEW = re.compile(r"\bDEC-(\d+)\.(\d+)\b")
 
 
@@ -62,6 +80,26 @@ def entries_of(path, text):
         yield ident, i + 1, problem
 
 
+def cited_numbers(group, closed):
+    """The numbers one citation group names, and any problem with its shape.
+
+    A range names both endpoints and everything between. Only the part inside
+    the closed sequence is listed one by one; past it, the range's end alone is
+    named, so a typo of `1–900000000` reports one number, not most of them.
+    """
+    numbers, problems = [], []
+    for item in CITE_ITEM.finditer(group):
+        low = int(item[1])
+        high = int(item[2]) if item[2] else low
+        if high < low:
+            problems.append(f"DECISIONS {item[0]} is a range that runs backwards")
+            continue
+        numbers.extend(range(low, min(high, closed) + 1))
+        if high > closed:
+            numbers.append(high if low <= closed else low)
+    return numbers, problems
+
+
 def check(topic_files, index_text, cited_in, closed=CLOSED):
     """topic_files: {path: text}; cited_in: {path: text}. Returns a list of errors."""
     errors = []
@@ -83,29 +121,41 @@ def check(topic_files, index_text, cited_in, closed=CLOSED):
                 errors.append(f"{INDEX}: row {row[1]} links to decision-{row[3]}")
             indexed[row[1]] = TOPICS + row[2]
     legacy = {i: w for i, w in where.items() if not i.startswith("DEC-")}
+    reserved = {n for n in RESERVED if n <= closed}
     for ident, at in sorted(legacy.items(), key=lambda x: int(x[0])):
         path = at.rsplit(":", 1)[0]
-        if int(ident) > closed or ident not in indexed:
+        if int(ident) > closed or int(ident) in reserved:
             errors.append(
                 f"{at}: {ident} is a new number in the closed sequence; "
                 f"name the entry DEC-<issue>.<k> instead (see {INDEX})"
             )
+        elif ident not in indexed:
+            errors.append(f"{at}: {ident} has no row in {INDEX}")
         elif indexed[ident] != path:
             errors.append(f"{at}: {INDEX} places {ident} in {indexed[ident]}")
     for ident, path in indexed.items():
         if int(ident) > closed:
             errors.append(f"{INDEX}: row {ident} extends the closed sequence, which ends at {closed}")
+        elif int(ident) in reserved:
+            errors.append(f"{INDEX}: row {ident} takes a number the closed sequence never used")
         elif ident not in legacy:
             errors.append(f"{INDEX}: {ident} is indexed but no entry in {path} has it")
+    # Every number the sequence used is still there. An entry deleted with its
+    # index row leaves neither of the checks above anything to compare.
+    for n in range(1, closed + 1):
+        if n not in reserved and str(n) not in legacy and str(n) not in indexed:
+            errors.append(f"{INDEX}: {n} has neither an entry nor an index row; it was lost")
 
-    skipped = set(range(1, closed + 1)) - {int(i) for i in indexed}
     for path, text in sorted(cited_in.items()):
         if path in NOT_CITATIONS:
             continue
         for number, line in enumerate(text.split("\n"), 1):
-            for n in CITE_LEGACY.findall(line):
-                if n not in legacy and int(n) not in skipped:
-                    errors.append(f"{path}:{number}: DECISIONS {n} names no entry")
+            for group in CITE_LEGACY.findall(line):
+                numbers, problems = cited_numbers(group, closed)
+                errors.extend(f"{path}:{number}: {p}" for p in problems)
+                for n in numbers:
+                    if str(n) not in legacy and n not in reserved:
+                        errors.append(f"{path}:{number}: DECISIONS {n} names no entry")
             for issue, k in CITE_NEW.findall(line):
                 if f"DEC-{issue}.{k}" not in where:
                     errors.append(f"{path}:{number}: DEC-{issue}.{k} names no entry")

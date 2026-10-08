@@ -17,6 +17,7 @@ INDEX = """# Decisions
 | ---: | --- | --- |
 | 1 | [identity](decisions/identity.md#decision-1) | One |
 | 2 | [ledger](decisions/ledger.md#decision-2) | Two |
+| 3 | [identity](decisions/identity.md#decision-3) | Three |
 | 4 | [ledger](decisions/ledger.md#decision-4) | Four |
 """
 
@@ -26,6 +27,10 @@ IDENTITY = """# Identity
 
 1. **One.** Body
    continued.
+
+<a id="decision-3"></a>
+
+3. **Three.** Body.
 """
 
 LEDGER = """# Ledger
@@ -124,8 +129,129 @@ class TheRecord(unittest.TestCase):
             ["src/a.rs:1: DECISIONS 9 names no entry", "src/a.rs:2: DEC-800.1 names no entry"],
         )
 
-    def test_a_number_the_sequence_skipped_may_still_be_mentioned(self):
-        self.assertEqual(run(cited={"docs/ADR.md": "the proposed DECISIONS 3"}), [])
+    # #848: the history is fixed, not read off the index.
+
+    def test_deleting_an_entry_and_its_index_row_is_refused(self):
+        ledger = LEDGER.split('<a id="decision-4">')[0]
+        index = INDEX.replace("| 4 | [ledger](decisions/ledger.md#decision-4) | Four |\n", "")
+        errors = run({"docs/decisions/ledger.md": ledger}, index=index)
+        self.assertEqual(
+            errors, ["docs/DECISIONS.md: 4 has neither an entry nor an index row; it was lost"]
+        )
+
+    def test_an_entry_or_a_row_alone_going_missing_is_refused(self):
+        unindexed = INDEX.replace("| 4 | [ledger](decisions/ledger.md#decision-4) | Four |\n", "")
+        self.assertEqual(
+            run(index=unindexed), ["docs/decisions/ledger.md:9: 4 has no row in docs/DECISIONS.md"]
+        )
+        gone = LEDGER.split('<a id="decision-4">')[0]
+        errors = run({"docs/decisions/ledger.md": gone})
+        self.assertEqual(
+            errors, ["docs/DECISIONS.md: 4 is indexed but no entry in docs/decisions/ledger.md has it"]
+        )
+
+    def test_a_jointly_deleted_number_is_not_a_skipped_citation(self):
+        ledger = LEDGER.split('<a id="decision-4">')[0]
+        index = INDEX.replace("| 4 | [ledger](decisions/ledger.md#decision-4) | Four |\n", "")
+        errors = run({"docs/decisions/ledger.md": ledger}, {"src/a.rs": "// DECISIONS 4"}, index)
+        self.assertIn("src/a.rs:1: DECISIONS 4 names no entry", errors)
+
+    def test_only_the_four_historical_holes_can_be_absent(self):
+        # The real closed sequence, every number present except the four the
+        # test names itself rather than reading from the checker.
+        holes = {523, 524, 525, 526}
+        used = [n for n in range(1, 544) if n not in holes]
+
+        def record(numbers):
+            topic = "# All\n" + "".join(
+                f'\n<a id="decision-{n}"></a>\n\n{n}. **N{n}.** Body.\n' for n in numbers
+            )
+            index = "".join(f"| {n} | [all](decisions/all.md#decision-{n}) | N |\n" for n in numbers)
+            return {"docs/decisions/all.md": topic}, index
+
+        topics, index = record(used)
+        mentions = {"docs/ADR.md": "DECISIONS 524\nDECISIONS 522, 523 and 527\nDECISIONS 520–530"}
+        self.assertEqual(cd.check(topics, index, mentions), [])
+
+        topics, index = record([n for n in used if n != 522])
+        self.assertIn(
+            "docs/DECISIONS.md: 522 has neither an entry nor an index row; it was lost",
+            cd.check(topics, index, {}),
+        )
+
+        topics, index = record(used + [524])
+        errors = " ".join(cd.check(topics, index, {}))
+        self.assertIn("524 is a new number in the closed sequence", errors)
+        self.assertIn("row 524 takes a number the closed sequence never used", errors)
+
+        # A small fixture's sequence does not reach them, so they are not holes in it.
+        self.assertEqual(
+            run(cited={"docs/ADR.md": "DECISIONS 523"}),
+            ["docs/ADR.md:1: DECISIONS 523 names no entry"],
+        )
+
+    # #848: every number a grouped citation names is checked.
+
+    def test_every_member_of_a_grouped_legacy_citation_is_checked(self):
+        for line in [
+            "DECISIONS 1, 9",
+            "DECISIONS 1 and 9",
+            "DECISIONS 1, 2, and 9",
+            "DECISIONS 1, 2 and 9",
+            "DECISIONS 2–3, 9",
+            "DECISIONS 9, 1",
+        ]:
+            self.assertEqual(
+                run(cited={"src/a.rs": line}), ["src/a.rs:1: DECISIONS 9 names no entry"], line
+            )
+        self.assertEqual(run(cited={"src/a.rs": "DECISIONS 1, 2 and 4"}), [])
+        self.assertEqual(
+            run(cited={"src/a.rs": "DECISIONS 1, 9 and 4; DECISIONS 2, 7"}),
+            ["src/a.rs:1: DECISIONS 9 names no entry", "src/a.rs:1: DECISIONS 7 names no entry"],
+        )
+
+    def test_range_interiors_and_endpoints_are_checked(self):
+        self.assertEqual(run(cited={"src/a.rs": "DECISIONS 1–4 and 2-3, 4–4"}), [])
+        for line in ["DECISIONS 1–9", "DECISIONS 1-9", "DECISIONS 1 - 9"]:
+            self.assertEqual(
+                run(cited={"src/a.rs": line}), ["src/a.rs:1: DECISIONS 9 names no entry"], line
+            )
+        # A middle number gone: the range's endpoints are there, its interior is not.
+        identity = IDENTITY.split('<a id="decision-3">')[0]
+        index = INDEX.replace("| 3 | [identity](decisions/identity.md#decision-3) | Three |\n", "")
+        errors = run({"docs/decisions/identity.md": identity}, {"src/a.rs": "DECISIONS 2–4"}, index)
+        self.assertIn("src/a.rs:1: DECISIONS 3 names no entry", errors)
+        self.assertEqual(
+            run(cited={"src/a.rs": "DECISIONS 4–2"}),
+            ["src/a.rs:1: DECISIONS 4–2 is a range that runs backwards"],
+        )
+        self.assertEqual(
+            run(cited={"src/a.rs": "DECISIONS 0"}), ["src/a.rs:1: DECISIONS 0 names no entry"]
+        )
+        self.assertEqual(
+            run(cited={"src/a.rs": "DECISIONS 2–900000000"}),
+            ["src/a.rs:1: DECISIONS 900000000 names no entry"],
+        )
+
+    def test_group_boundaries_preserve_prose_and_exclusions(self):
+        for line in [
+            "DECISIONS 2, and the difference is 9 times smaller",
+            "DECISIONS 1, DEC-737.1 and 9",
+            "DECISIONS 4 - the reason, 9",
+            "DECISIONS 4–, issue 9",
+            "(DECISIONS 1, 2), 9",
+            "DECISIONS 1 and the 9 others",
+        ]:
+            self.assertEqual(
+                run({"docs/decisions/identity.md": IDENTITY + new_entry(737, 1)}, {"src/a.rs": line}),
+                [],
+                line,
+            )
+        self.assertEqual(
+            run(cited={"src/a.rs": "DECISIONS 1, DEC-800.1"}),
+            ["src/a.rs:1: DEC-800.1 names no entry"],
+        )
+        self.assertEqual(run(cited={"scripts/check-decisions.py": "DECISIONS 1, 9"}), [])
 
     def test_the_index_is_not_read_as_a_citation(self):
         self.assertEqual(run(cited={"docs/DECISIONS.md": "e.g. `DEC-737.1`"}), [])
