@@ -701,10 +701,12 @@ carries the normative text, and DEC-1528.1 the reasons.
   - "Verify the chosen environment" keeps the shared compatibility
     qualification (version and build, extensions, encoding, collation,
     deployment context), which decides whether scratch binds as the target
-    would. For separation, it means two checks before any scratch DDL:
+    would. For separation, it means two checks:
     - scratch is never the target (host, port and database are not all the
-      target's, and the credential variable differs);
-    - scratch is empty, read in the run-owned database as created.
+      target's, and the credential variable differs), before anything is
+      created;
+    - scratch is empty, read in the run-owned database once created, before
+      any other DDL.
   - The run-owned scratch takes the target's encoding and locale.
   - Isolation, containment, log handling and channel protection are vouched
     for by the operator, not measured. The evidence names the profile, so a

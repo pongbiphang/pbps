@@ -1586,7 +1586,9 @@ isolation, the confidentiality of what it compiles, and its channels. Both
 connections use whatever TLS the operator configured. The evidence names the
 profile, so a reviewer can always tell a vouched answer from a measured one.
 
-**It keeps exactly two separation checks, run before any scratch DDL.**
+**It keeps exactly two separation checks.** The first runs before the
+run-owned database is created; the second reads that database once it is
+created, before any other DDL.
 - **Scratch is never the target:** its host, port and database are not all the
   target's, its credential variable differs, and there is no fallback to
   target credentials. That is the mistake an operator can make by accident,
