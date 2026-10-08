@@ -3397,14 +3397,25 @@ Server refuses while `dbo.g` is bound to it.
 **Decision.** A module drop placed after the region's first rename or drop is
 one of the region's drops. The drops keep their order among themselves in the
 search, so the function stays between the two tables, and a rename may still
-move around it: a module drop claims no name. A module drop the edges left
+move around it: a module drop claims no name, and the walk sees the name it
+frees. A module drop the edges left
 alone runs in class 0, before the first rename or drop, and keeps its place
 outside the region.
 
 **Why not the edges as constraints.** Handing the search the edges would
-order the drops again, which the differ and DEC-1431.1 have already done; the
-search's own rule, that drops keep their order, is enough once the module
-drop is counted among them.
+order the drops again, which the differ and DEC-1431.1 have already done, and
+needs them carried from that pass into this one. The search's own rule, that
+drops keep their order, places the module drop correctly once it is counted
+among them.
+
+**Limit.** That rule is stricter than the edges: the module drop is held
+among *all* the region's drops, where the edges only need it after its
+release and before a table it is bound to. Which name a rename's default
+takes depends on what is free when it runs (DEC-981.1), so a function that
+holds a default's generated name can need to drop later than its fixed place,
+after the rename has taken the fallback. Such a plan is refused at
+`plan --db` with DEC-1366.1's remedy, splitting it, and nothing runs. Giving
+the search the edges' own constraints is #1680.
 
 Pinned by the live `computed_function_drops_keep_their_place_when_the_renames_are_searched`
 (`crates/pbps-cli/tests/flow.rs`): with a default adopted as `s1.c` forcing
