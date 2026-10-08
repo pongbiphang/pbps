@@ -330,6 +330,18 @@ pub struct MisspeltBound {
     pub canonical: Option<String>,
 }
 
+/// A partition's declared own default that the engine stores in the same text
+/// as its parent's, so reads back as no default of its own (#1609).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultAsParents {
+    pub partition: TableName,
+    pub column: String,
+    /// The partition's own default, as declared.
+    pub declared: String,
+    /// The text the engine stores for both.
+    pub stored: String,
+}
+
 /// What the engine says about the declared spellings of every table that
 /// declares rows: the ones it would not read back as written, and the keys
 /// it reads as one row. And of every partition bound's values.
@@ -341,4 +353,10 @@ pub struct Spellings {
     pub conflicts: Vec<RowConflict>,
     /// Declared bound values the engine reads back differently (#1170).
     pub bounds: Vec<MisspeltBound>,
+    /// Partitions' own defaults the engine stores as their parents' (#1609).
+    pub defaults_as_parents: Vec<DefaultAsParents>,
+    /// Partitions' own defaults the engine could not be asked about, each
+    /// with why. Not a finding: the apply's closing check still refuses one
+    /// that reads back as the parent's, after it runs (DEC-1609.1).
+    pub defaults_unasked: Vec<String>,
 }

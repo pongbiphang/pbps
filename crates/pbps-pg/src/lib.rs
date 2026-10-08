@@ -437,6 +437,11 @@ macro_rules! session_pins {
     };
 }
 
+/// [`session_pins!`] as a constant, for a module declared before the macro.
+/// `plan --db` stores a partition's own default under it, so the probe parses
+/// as the apply will (#1609 review).
+pub(crate) const SESSION_PINS: &str = session_pins!();
+
 /// What this engine makes of a column's declared default: one the applying
 /// session would decide, and a NULL it erases. A table's column, and a
 /// partition's own default on its parent's column (#1578 review).

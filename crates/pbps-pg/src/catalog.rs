@@ -2514,16 +2514,225 @@ pub async fn misspelt(
         .map_err(|e| read(&any, e))?;
     conn.execute(BEGIN).await.map_err(|e| read(&any, e))?;
     let out = ask_about_every_spelling(conn, schema, &at).await;
-    match out {
+    let mut out = match out {
         Ok(out) => {
             conn.execute("COMMIT").await.map_err(|e| read(&any, e))?;
-            Ok(out)
+            out
         }
         Err(e) => {
             let _ = conn.execute("ROLLBACK").await;
-            Err(e)
+            return Err(e);
+        }
+    };
+    ask_about_partition_defaults(conn, schema, &mut out).await;
+    Ok(out)
+}
+
+/// One partition's own default to ask about: the column, both declared texts,
+/// and the schemas whose paths the emitter writes each under.
+struct OwnDefault<'a> {
+    partition: &'a TableName,
+    parent: &'a TableName,
+    column: &'a str,
+    own: &'a str,
+    parents: &'a str,
+    ty: String,
+}
+
+/// Which partitions' declared own defaults the engine stores in the same text
+/// as their parents', so a plan that sets one is refused by name before any
+/// statement rather than by the apply's closing check after it (#1609).
+///
+/// DEC-1609.1: the engine's text for a declared expression exists only once it
+/// is stored, so each pair is stored as two column defaults of a temporary
+/// table in a transaction that is always rolled back, and read back with
+/// `pg_get_expr` under the empty path the reader uses. Each text is written
+/// under the path the emitter writes it under: the partition's own under its
+/// schema, its parent's under the parent's (#1607 review). Measured on 16 and
+/// 18, `(1)` and `1` are stored as `1`, and `'other'` as `'other'::text`.
+///
+/// Its own transaction, since the spelling read's is `READ ONLY` and the
+/// engine refuses `CREATE TEMP TABLE` in one. Asked only for a partition that
+/// overrides a column whose parent declares a default, so a plan with none
+/// creates nothing. What cannot be asked — no `TEMP` privilege, an event
+/// trigger that refuses the `CREATE` (one fires on it, measured), a text that
+/// names an object the plan has yet to create — is listed in
+/// `defaults_unasked`, never read as an answer.
+async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mut Spellings) {
+    let mut asked: Vec<OwnDefault<'_>> = Vec::new();
+    for (partition, table) in &schema.tables {
+        let Some(of) = &table.partition_of else {
+            continue;
+        };
+        let Some(parent) = schema.tables.get(&of.parent) else {
+            continue;
+        };
+        for (column, own) in &of.columns {
+            let (Some(own), Some(theirs)) = (own.default.as_deref(), parent.columns.get(column))
+            else {
+                continue;
+            };
+            let Some(parents) = theirs.default.as_deref() else {
+                continue;
+            };
+            // The same text is validation's to refuse (DEC-1578.1).
+            if own == parents {
+                continue;
+            }
+            match crate::types::normalize(&theirs.ty) {
+                Ok(ty) => asked.push(OwnDefault {
+                    partition,
+                    parent: &of.parent,
+                    column,
+                    own,
+                    parents,
+                    ty: ty.to_string(),
+                }),
+                Err(_) => out.defaults_unasked.push(format!(
+                    "partition {partition} column `{column}`: its type `{}` is not one this \
+                     check can create a column of",
+                    theirs.ty
+                )),
+            }
         }
     }
+    if asked.is_empty() {
+        return;
+    }
+    let result = store_and_read(conn, &asked).await;
+    // Rolled back whatever happened: nothing this asks may outlive it.
+    let _ = conn.execute("ROLLBACK").await;
+    match result {
+        Ok(answers) => {
+            for (d, answer) in asked.iter().zip(answers) {
+                match answer {
+                    Ok((own, parents)) if own == parents => {
+                        out.defaults_as_parents
+                            .push(pbps_db::catalog::DefaultAsParents {
+                                partition: d.partition.clone(),
+                                column: d.column.to_owned(),
+                                declared: d.own.to_owned(),
+                                stored: own,
+                            });
+                    }
+                    Ok(_) => {}
+                    Err(why) => out.defaults_unasked.push(format!(
+                        "partition {} column `{}`: {why}",
+                        d.partition, d.column
+                    )),
+                }
+            }
+        }
+        Err(why) => out.defaults_unasked.extend(
+            asked
+                .iter()
+                .map(|d| format!("partition {} column `{}`: {why}", d.partition, d.column)),
+        ),
+    }
+}
+
+/// Stores one declared text as `column`'s default, under `under`'s path, in a
+/// savepoint of its own.
+async fn store_one(conn: &mut Conn, column: &str, under: &str, text: &str) -> Result<(), String> {
+    let path = crate::quote(under).map_err(|e| e.to_string())?;
+    let fail = |e: DbError| e.to_string();
+    conn.execute("SAVEPOINT pbps_1609").await.map_err(fail)?;
+    let result = async {
+        conn.query(&format!(
+            "SELECT pg_catalog.set_config('search_path', '{}', true)",
+            path.replace('\'', "''")
+        ))
+        .await?;
+        // One statement through the extended protocol, never a batch: the
+        // engine refuses a second command in it, so a declared text cannot
+        // end this transaction and commit SQL of its own during a plan that
+        // is read-only (SPEC §9.8; #1609 security review).
+        conn.query(&format!(
+            "ALTER TABLE pg_temp.pbps_1609 ALTER COLUMN {column} SET DEFAULT {}",
+            crate::emit::verbatim(text)
+        ))
+        .await
+        .map(drop)
+    }
+    .await;
+    match result {
+        Ok(_) => conn
+            .execute("RELEASE SAVEPOINT pbps_1609")
+            .await
+            .map(drop)
+            .map_err(fail),
+        Err(e) => {
+            conn.execute("ROLLBACK TO SAVEPOINT pbps_1609")
+                .await
+                .map_err(fail)?;
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Stores each pair in one temporary table and reads both back, one savepoint
+/// per text so one that cannot be stored leaves the rest asked. The caller
+/// rolls the transaction back.
+async fn store_and_read(
+    conn: &mut Conn,
+    asked: &[OwnDefault<'_>],
+) -> Result<Vec<Result<(String, String), String>>, String> {
+    let fail = |e: DbError| e.to_string();
+    conn.execute("BEGIN").await.map_err(fail)?;
+    // Every parser setting the apply pins, not only the deparse's: a role's
+    // `transform_null_equals = on` would store `FALSE = NULL` as `FALSE IS
+    // NULL` here and not at the apply (#1609 review). A `SET` in a
+    // transaction that rolls back is undone with it.
+    conn.execute(crate::SESSION_PINS).await.map_err(fail)?;
+    conn.query(CANONICAL_PATH).await.map_err(fail)?;
+    let columns = asked
+        .iter()
+        .enumerate()
+        .map(|(i, d)| format!("p{i} {ty}, o{i} {ty}", ty = d.ty))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // One statement, as each default below is.
+    conn.query(&format!("CREATE TEMP TABLE pbps_1609 ({columns})"))
+        .await
+        .map_err(fail)?;
+    let mut stored = Vec::with_capacity(asked.len());
+    for (i, d) in asked.iter().enumerate() {
+        let both = match store_one(conn, &format!("p{i}"), &d.parent.schema, d.parents).await {
+            Ok(()) => store_one(conn, &format!("o{i}"), &d.partition.schema, d.own).await,
+            Err(e) => Err(format!("its parent's default cannot be stored here: {e}")),
+        };
+        stored.push(both);
+    }
+    conn.query(CANONICAL_PATH).await.map_err(fail)?;
+    let rows = conn
+        .query(
+            "SELECT a.attname::text AS name, pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS text
+               FROM pg_catalog.pg_attrdef d
+               JOIN pg_catalog.pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+              WHERE d.adrelid = 'pg_temp.pbps_1609'::pg_catalog.regclass",
+        )
+        .await
+        .map_err(fail)?;
+    let mut texts = BTreeMap::new();
+    for row in &rows {
+        let name: Option<&str> = row.try_get("name").map_err(fail)?;
+        let text: Option<&str> = row.try_get("text").map_err(fail)?;
+        // A NULL is no text, which the lookup below reports as such.
+        if let (Some(name), Some(text)) = (name, text) {
+            texts.insert(name.to_owned(), text.to_owned());
+        }
+    }
+    Ok(stored
+        .into_iter()
+        .enumerate()
+        .map(|(i, set)| {
+            set?;
+            match (texts.get(&format!("o{i}")), texts.get(&format!("p{i}"))) {
+                (Some(own), Some(parents)) => Ok((own.clone(), parents.clone())),
+                _ => Err("the engine stored no text for it".to_owned()),
+            }
+        })
+        .collect())
 }
 
 async fn ask_about_every_spelling(

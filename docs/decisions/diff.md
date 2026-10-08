@@ -2820,6 +2820,10 @@ change on a standing partition, and a parent's default set by a plan, around a
 rebuild or split out of a new table, is followed by each partition's own
 instead of refused (#1588).*
 
+*Amended by [DEC-1609.1](#dec-1609-1): a partition's own default the engine
+would store with its parent's text is refused at `plan --db`, before the
+plan, instead of by the apply's closing check (#1609).*
+
 <a id="dec-1579-1"></a>
 
 **DEC-1579.1. A grant on a partition, and one on a partitioned parent, is that
@@ -3255,3 +3259,67 @@ is refused by an offline `plan` and plans and applies connected, and retyping
 catalog screen lets a standing column's input retype and its function's alter
 through, the text screen refuses both, and a re-added column's call is refused
 under either.
+
+<a id="dec-1609-1"></a>
+
+**DEC-1609.1. A partition's own default whose stored text would be its
+parent's is refused at `plan --db`, from a deparse in a temporary table in a
+transaction of its own that is always rolled back (#1609).**
+
+The reader takes a partition's default as the parent's when its
+`pg_get_expr` text equals the parent's (DEC-1578.1). A declared own default
+written differently from the parent's but stored the same, `(1)` beside `1`,
+or `('x'::text)` beside `'x'`, applies, then reads back as no default of its
+own, and the apply's closing check refuses it after every statement ran.
+
+Measured on 16.15 and 18.6:
+- `(1)` and `1` are both stored as `1`; `'other'` on a text column is stored
+  as `'other'::text`. Only the engine knows the stored text.
+- A `READ ONLY` transaction refuses `CREATE TEMP TABLE`, so the deparse cannot
+  share the spelling reads' transaction and gets its own, rolled back whatever
+  happens.
+- Without the `TEMP` privilege on the database `CREATE TEMP TABLE` is refused.
+- An event trigger on `ddl_command_end` fires on `CREATE TEMP TABLE`; its
+  effects roll back with the transaction.
+
+**The deparse.** Only a candidate is asked about: a partition's own declared
+default on a column whose parent declares one, with a declared text that
+differs. None, and no DDL runs. Otherwise one temporary table holds a column
+pair per candidate, typed as the column is, and each pair gets the parent's
+text under the parent's schema path and the partition's under its own, which
+is the path the emitter writes each under, so an unqualified name resolves as
+it will at the apply. The transaction first takes every parser setting the
+apply pins (`session_pins!`), not only the deparse's: measured on 18, a
+database's `transform_null_equals = on` stores `(false = NULL)` as `(false IS
+NULL)`, which the apply, pinned off, stores as `(false = NULL::boolean)`. Equal `pg_get_expr` texts are refused, naming the
+partition, the column, both texts and the remedy: drop the partition's own
+default, it is the parent's.
+
+**One statement, never a batch.** The declared text is the tail of an
+`ALTER TABLE` sent through the extended protocol, which the engine refuses
+when it holds a second command. Through a batch, a text such as `1; COMMIT;
+CREATE TABLE …; COMMIT; BEGIN; SAVEPOINT …` ended the probe's transaction and
+committed SQL of its own (measured on 18), while a connected `plan` is
+read-only (SPEC §9.8). Such a text is unasked, with its warning.
+
+**Why not `EXPLAIN` or `SELECT`.** The planner folds constants, so the text it
+shows is not what `pg_attrdef` stores. Only storing the default gives the
+stored text.
+
+**Unasked is not clean.** A candidate whose type cannot be named, or a deparse
+that fails (no `TEMP`, an event trigger that refuses, an expression that does
+not resolve yet because the plan creates what it names), is not a finding. It
+is printed as a warning that it was not checked before the plan, and the
+apply's closing check still refuses a wrong recording.
+
+Pinned on 16 and 18 by the CLI's
+`a_partitions_own_default_stored_as_its_parents_is_refused_before_the_plan`:
+- an own `(1)` beside the parent's `1`, and a new partition's `('x'::text)`
+  beside `'x'`, refuse `plan --db` naming both and the remedy, write no plan
+  file, and leave no temporary table behind;
+- negatives: own defaults the engine stores differently (`2`, `'other'`, `'y'`)
+  plan, apply and verify, and a row inserted into the partition takes its own;
+  so does an own `(false = NULL)` beside the parent's `(false IS NULL)` under a
+  database that sets `transform_null_equals = on`.
+- a declared text that ends the transaction and creates a table commits
+  nothing, and is warned about as unasked.

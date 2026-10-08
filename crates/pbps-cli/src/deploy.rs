@@ -2129,7 +2129,18 @@ pub(crate) async fn refuse_misspelt(
     let found = crate::engine::misspelt(conn, schema, at)
         .await
         .context("cannot ask the engine how it reads the declared rows")?;
-    if found.misspelt.is_empty() && found.conflicts.is_empty() && found.bounds.is_empty() {
+    // Not a finding and not a pass: the apply's closing check still refuses
+    // what this could not ask, after its statement (DEC-1609.1).
+    for why in &found.defaults_unasked {
+        eprintln!(
+            "warning: not checked before the plan whether the engine stores it as the parent's default: {why}"
+        );
+    }
+    if found.misspelt.is_empty()
+        && found.conflicts.is_empty()
+        && found.bounds.is_empty()
+        && found.defaults_as_parents.is_empty()
+    {
         return Ok(());
     }
     // Two keys the engine reads as one row would insert twice and fail on
@@ -2168,6 +2179,15 @@ pub(crate) async fn refuse_misspelt(
              {canonical:?}; write it that way",
             b.partition, b.column, b.declared
         ),
+    }));
+    // A partition's own default stored as its parent's reads back as none of
+    // its own, so every plan would set it again (#1609).
+    lines.extend(found.defaults_as_parents.iter().map(|d| {
+        format!(
+            "partition {} column `{}`: its own default {:?} is stored as {:?}, which is its \
+             parent's; drop the partition's own default, it is the parent's",
+            d.partition, d.column, d.declared, d.stored
+        )
     }));
     bail!(
         "{} declared value(s) would not come back as written:\n  {}\n\
