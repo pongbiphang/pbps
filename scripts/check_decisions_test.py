@@ -221,6 +221,11 @@ class TheRecord(unittest.TestCase):
         index = INDEX.replace("| 3 | [identity](decisions/identity.md#decision-3) | Three |\n", "")
         errors = run({"docs/decisions/identity.md": identity}, {"src/a.rs": "DECISIONS 2–4"}, index)
         self.assertIn("src/a.rs:1: DECISIONS 3 names no entry", errors)
+        # A number inside the sequence after a comma is the citation's, prose or not.
+        errors = run(
+            {"docs/decisions/identity.md": identity}, {"src/a.rs": "DECISIONS 1, 3 settled it"}, index
+        )
+        self.assertIn("src/a.rs:1: DECISIONS 3 names no entry", errors)
         self.assertEqual(
             run(cited={"src/a.rs": "DECISIONS 4–2"}),
             ["src/a.rs:1: DECISIONS 4–2 is a range that runs backwards"],
@@ -245,7 +250,6 @@ class TheRecord(unittest.TestCase):
             "Following DECISIONS 1, 900 rows are rejected before applying the plan.",
             "DECISIONS 4, 2026 was the year",
             "DECISIONS 2, 2026-10-08",
-            "DECISIONS 1 and 9 rows",
         ]:
             self.assertEqual(
                 run({"docs/decisions/identity.md": IDENTITY + new_entry(737, 1)}, {"src/a.rs": line}),
@@ -257,8 +261,18 @@ class TheRecord(unittest.TestCase):
             ["src/a.rs:1: DEC-800.1 names no entry"],
         )
         self.assertEqual(run(cited={"scripts/check-decisions.py": "DECISIONS 1, 9"}), [])
-        # Where a group can end, a later number is still the citation's.
-        for line in ["DECISIONS 1, 9.", "(DECISIONS 1, 9)", "DECISIONS 1, 9 or 2", "DECISIONS 1, 9 (see)"]:
+        # Where a group can end, a later number is still the citation's; and a
+        # range's end or a number after `and` is the citation's even where prose
+        # runs on from it, as the record writes them.
+        for line in [
+            "DECISIONS 1, 9.",
+            "(DECISIONS 1, 9)",
+            "DECISIONS 1, 9 or 2",
+            "DECISIONS 1, 9 (see)",
+            "DECISIONS 1–9 keep uncertainty explicit",
+            "DECISIONS 1 and 9 subsequently settled",
+            "DECISIONS 1, 2 and 9 rows",
+        ]:
             self.assertEqual(
                 run(cited={"src/a.rs": line}), ["src/a.rs:1: DECISIONS 9 names no entry"], line
             )
@@ -266,7 +280,9 @@ class TheRecord(unittest.TestCase):
     def test_a_repeated_range_holds_each_number_once(self):
         # Twenty thousand repeats of the whole sequence used to be expanded
         # and held one by one: millions of integers for one long line.
-        group = ", ".join(["1-543"] * 20000)
+        line = "DECISIONS " + ", ".join(["1-543"] * 20000)
+        (group,) = cd.citation_groups(line, cd.CLOSED)
+        self.assertEqual(len(group), 20000)
         numbers, problems = cd.cited_numbers(group, cd.CLOSED)
         self.assertEqual((numbers, problems), (list(range(1, 544)), []))
 

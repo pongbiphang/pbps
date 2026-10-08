@@ -47,22 +47,17 @@ CLOSED = 543
 # and every citation of the lost decision would pass (#848).
 RESERVED = frozenset({523, 524, 525, 526})
 
-# One legacy citation group: a number or a range, then more of them after a
-# comma, `and` or `, and`. A separator is taken only when a number follows, so
-# `DECISIONS 267, and the difference` and `DECISIONS 311, DEC-942.1` end at the
-# first number; a dash with no number after it ends the group too.
-#
-# A number after a separator, and the second end of a range, belong to the
-# group only when the group could end there: before punctuation, the end of
-# the line, or another `and`/`or`. Otherwise the number is the prose's, not
-# the citation's — `DECISIONS 1, 900 rows are rejected`, `DECISIONS 4, 2026
-# was`, a date `2026-10-08` — and reading it as one would fail CI on a valid
-# document. The first number is always the citation's.
-END = r"(?=[ \t]*(?:[,;:.)\]}|*`'\"]|$)|[ \t]+(?:and|or)\b|[ \t]+[(—–-])"
-RANGE = rf"(?:[ \t]*[-–][ \t]*\d+{END})?"
-SEPARATOR = r"(?:,[ \t]*(?:and[ \t]+)?|[ \t]+and[ \t]+)"
-CITE_LEGACY = re.compile(rf"\bDECISIONS (\d+{RANGE}(?:{SEPARATOR}\d+{RANGE}{END})*)")
+# A legacy citation group: `DECISIONS ` and a number or a range, then more of
+# them after a comma, `and` or `, and` (`DECISIONS 70, 87 and 90`,
+# `181–190`). A separator is taken only when a number follows, so `DECISIONS
+# 267, and the difference` and `DECISIONS 311, DEC-942.1` end at the first
+# number. Read by `citation_groups`.
+CITE_START = re.compile(r"\bDECISIONS (?=\d)")
+# A number, or a range of two.
 CITE_ITEM = re.compile(r"(\d+)(?:[ \t]*[-–][ \t]*(\d+))?")
+SEPARATOR = re.compile(r"(?:(,)[ \t]*(?:and[ \t]+)?|[ \t]+and[ \t]+)(?=\d)")
+# Where a group can end: punctuation, the end of the line, another and/or.
+GROUP_END = re.compile(r"[ \t]*(?:[,;:.)\]}|*`'\"]|$)|[ \t]+(?:and|or)\b|[ \t]+[(—–-]")
 CITE_NEW = re.compile(r"\bDEC-(\d+)\.(\d+)\b")
 
 
@@ -87,7 +82,35 @@ def entries_of(path, text):
         yield ident, i + 1, problem
 
 
-def cited_numbers(group, closed):
+def citation_groups(line, closed):
+    """Yield each legacy citation group on a line, as its list of CITE_ITEM matches.
+
+    A range's second end and a number after `and` are always the citation's:
+    `DECISIONS 403–405 keep uncertainty explicit` and `DECISIONS 225 and 417
+    subsequently settled` cite both. A number after a comma is the citation's
+    too, unless it is past the closed sequence and prose runs on from it —
+    `DECISIONS 1, 900 rows are rejected`, `DECISIONS 4, 2026 was` — where it is
+    the prose's, and reading it as a citation would fail CI on a valid
+    document. A number past the sequence where a group can end is still read,
+    so a typo of one is still caught.
+    """
+    for start in CITE_START.finditer(line):
+        item = CITE_ITEM.match(line, start.end())
+        items = [item]
+        while True:
+            sep = SEPARATOR.match(line, item.end())
+            if not sep:
+                break
+            following = CITE_ITEM.match(line, sep.end())
+            beyond = int(following[2] or following[1]) > closed
+            if sep[1] and beyond and not GROUP_END.match(line, following.end()):
+                break
+            items.append(following)
+            item = following
+        yield items
+
+
+def cited_numbers(items, closed):
     """The numbers one citation group names, and any problem with its shape.
 
     A range names both endpoints and everything between. Only the part inside
@@ -97,7 +120,7 @@ def cited_numbers(group, closed):
     # A set: a group may repeat a range, and each repeat must not grow what is
     # held — at most the closed sequence, plus the ends past it.
     numbers, problems = set(), []
-    for item in CITE_ITEM.finditer(group):
+    for item in items:
         low = int(item[1])
         high = int(item[2]) if item[2] else low
         if high < low:
@@ -159,7 +182,7 @@ def check(topic_files, index_text, cited_in, closed=CLOSED):
         if path in NOT_CITATIONS:
             continue
         for number, line in enumerate(text.split("\n"), 1):
-            for group in CITE_LEGACY.findall(line):
+            for group in citation_groups(line, closed):
                 numbers, problems = cited_numbers(group, closed)
                 errors.extend(f"{path}:{number}: {p}" for p in problems)
                 for n in numbers:
