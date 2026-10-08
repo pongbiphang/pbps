@@ -498,14 +498,21 @@ async fn vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_grants_else
 async fn vouched_compiles_as_a_non_superuser_provisioner_in_its_own_database() {
     // A `CREATEROLE CREATEDB` login on another cluster cannot act as the
     // roles it would create, so it takes the supplied layout, not run-owned.
+    // Neither can a member of a superuser role: `SUPERUSER` is not
+    // inherited, and the run never `SET ROLE`s (#1678 review).
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let mut scratch = Fixture::new(SCRATCH_SERVER);
     let target_db = target.target().await;
     let login = scratch.login("p", "NOSUPERUSER CREATEDB CREATEROLE").await;
+    let superuser = scratch.login("u", "SUPERUSER").await;
     scratch
         .admin()
         .await
-        .execute(&format!("GRANT pg_read_all_settings TO {}", login.0))
+        .execute(&format!(
+            "GRANT pg_read_all_settings TO {login}; GRANT {superuser} TO {login}",
+            login = login.0,
+            superuser = superuser.0
+        ))
         .await
         .unwrap();
     let scratch_db = scratch.database("s", Some(&login.0)).await;

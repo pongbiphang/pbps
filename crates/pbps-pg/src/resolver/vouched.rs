@@ -75,9 +75,13 @@ pub enum Placement {
 /// it is a member of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Account {
+    /// Held by the login or by any role it is a member of.
     pub superuser: bool,
     pub create_role: bool,
     pub create_db: bool,
+    /// The login's own `SUPERUSER`. Membership does not pass it on, and the
+    /// run never `SET ROLE`s, so only this one acts as a superuser.
+    pub login_superuser: bool,
 }
 
 impl Account {
@@ -88,12 +92,13 @@ impl Account {
     }
 
     /// May create the run's own login, roles and database, and act as each
-    /// of them. Only a superuser: a `CREATEROLE` login is granted `ADMIN` on
+    /// of them. Only a login that is itself a superuser; a member of a
+    /// superuser role runs without it (#1678 review). Not a `CREATEROLE` one: a `CREATEROLE` login is granted `ADMIN` on
     /// the roles it creates but not `SET` (the default
     /// `createrole_self_grant`), so it cannot hand them the database or
     /// replay grants as them, and it cannot reproduce a superuser deployer.
     pub fn provisions(&self) -> bool {
-        self.superuser
+        self.login_superuser
     }
 
     /// The attributes that make it unconfined, as `ALTER ROLE` spells their
@@ -230,7 +235,9 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
         .query(
             "SELECT coalesce(bool_or(r.rolsuper), false)::text AS superuser, \
                     coalesce(bool_or(r.rolcreaterole), false)::text AS create_role, \
-                    coalesce(bool_or(r.rolcreatedb), false)::text AS create_db \
+                    coalesce(bool_or(r.rolcreatedb), false)::text AS create_db, \
+                    coalesce(bool_or(r.rolsuper) FILTER (WHERE r.rolname = session_user), \
+                             false)::text AS login_superuser \
                FROM pg_catalog.pg_roles r \
               WHERE pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER')",
         )
@@ -249,6 +256,7 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
         superuser: flag("superuser")?,
         create_role: flag("create_role")?,
         create_db: flag("create_db")?,
+        login_superuser: flag("login_superuser")?,
     })
 }
 
@@ -415,6 +423,7 @@ mod tests {
             superuser: false,
             create_role: false,
             create_db: false,
+            login_superuser: false,
         };
         assert!(none.confined() && !none.provisions());
         assert!(none.excess().is_empty());
@@ -432,8 +441,16 @@ mod tests {
             ..none
         };
         assert!(!both.provisions() && !both.confined());
+        // Negative: a member of a superuser role is not confined, but it does
+        // not act as a superuser, so it does not provision either.
+        let member = Account {
+            superuser: true,
+            ..none
+        };
+        assert!(!member.provisions() && !member.confined());
         let superuser = Account {
             superuser: true,
+            login_superuser: true,
             ..none
         };
         assert!(superuser.provisions() && !superuser.confined());

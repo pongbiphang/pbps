@@ -1425,7 +1425,8 @@ entry implemented by #1672, Docker by #1674).**
       `CREATEDB`. An unconfined account there refuses, naming the attributes
       to remove.
     - **The account decides the layout.**
-      - **Run-owned.** A superuser on another cluster gets:
+      - **Run-owned.** A login that is itself a superuser, on another
+        cluster, gets:
         - a run-owned login, and a database cloned from `template0` with the
           target's encoding and locale;
         - the deployer's authorization reproduced in that database;

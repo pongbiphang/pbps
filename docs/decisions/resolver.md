@@ -1762,7 +1762,8 @@ by the engines, and the scratch account decides the layout.** Implemented by
   naming the attributes to remove.
 
 **The account decides the layout.**
-- **Run-owned.** A superuser on another cluster gets the measured run's
+- **Run-owned.** A login that is itself a superuser, on another cluster,
+  gets the measured run's
   layout: a run-owned login and a database from `template0` with the target's
   recipe, the deployer's authorization reproduced, and a compile as the
   reproduced deployer. All of it is dropped afterwards.
@@ -1771,6 +1772,9 @@ by the engines, and the scratch account decides the layout.** Implemented by
     neither hand them the database nor replay grants as them, and it cannot
     reproduce a superuser deployer at all (#1678 review). It takes the
     supplied layout instead.
+  - Nor a member of a superuser role. `SUPERUSER` is not inherited and the
+    run never `SET ROLE`s, so it runs without it. Membership still makes the
+    account unconfined on the target's cluster.
 - **Supplied.** Any other account compiles as itself in the database its
   connection names.
   - It must own that database.
