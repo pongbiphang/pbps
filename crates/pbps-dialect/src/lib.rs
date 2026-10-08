@@ -2142,6 +2142,11 @@ pub trait Dialect {
                     name.push(n);
                 }
                 tokens.push(Token::Name(name));
+            } else if c.is_ascii_digit() || c == '$' {
+                // A number or a money literal, `1.5e0` or `$1.5`, dot and all:
+                // a bare name never starts with either (#1668 review).
+                while chars.next_if(|n| continues(*n) || *n == '.').is_some() {}
+                tokens.push(Token::Other);
             } else if continues(c) {
                 let mut name = String::from(c);
                 while let Some(n) = chars.next_if(|n| continues(*n)) {
@@ -3481,15 +3486,12 @@ mod tests {
             "f(a).b",
             "a * 2",
             "1.5 * a",
+            "1.5e0 * a",
+            "$1.5 * a",
             "",
         ] {
-            assert!(
-                names(text).iter().all(|(a, _)| a != "dbo" && a != "a"),
-                "{text}"
-            );
+            assert!(names(text).is_empty(), "{text}: {:?}", names(text));
         }
-        assert!(names("f(a).b").is_empty());
-        assert!(names("'dbo.f'").is_empty());
     }
 
     #[test]
