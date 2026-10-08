@@ -19260,6 +19260,92 @@ fn a_partitions_default_taken_back_resolves_under_its_parents_schema() {
     assert_eq!(scalar(&conn, "SELECT v::int8 FROM app.ev WHERE k = 1"), 1);
 }
 
+/// A partition's own default the engine stores in its parent's text is
+/// refused by name at plan time, before any statement (#1609, DEC-1609.1):
+/// `(1)` under a parent's `1` on a standing partition, and `('x'::text)` under
+/// a parent's `'x'::text` on one the plan creates. Before, the standing one
+/// planned a `SetPartitionDefault` that the apply's closing check refused
+/// after it ran, and every plan repeated it. Negative: an own default `2`, and
+/// `'other'`, which the engine only respells as `'other'::text`, plan, apply
+/// and verify clean. On 16 and 18.
+#[test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+fn a_partitions_own_default_stored_as_its_parents_is_refused_before_the_plan() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (version, server) in [("18", server()), ("16", old)] {
+        let db = OwnDatabase::new(&server, &format!("parts-1609-{version}"));
+        let conn = db.connection().to_owned();
+        on_server(
+            &conn,
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.ev (k integer NOT NULL, v integer DEFAULT 1, b text DEFAULT 'x') \
+                 PARTITION BY RANGE (k); \
+             CREATE TABLE app.ev_a PARTITION OF app.ev FOR VALUES FROM (0) TO (10); \
+             ALTER TABLE app.ev_a ALTER COLUMN v SET DEFAULT 7",
+        );
+        let d = Demo::new(&format!("parts-1609-{version}"));
+        succeeds(d.run(&["pull", "--db", &conn]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+        let path = d.dir.join("schema/app.ev.yml");
+        let pulled = std::fs::read_to_string(&path).unwrap();
+        let own = "      v: {default: \"7\"}\n";
+        assert!(pulled.contains(own), "{pulled}");
+
+        let as_parents = pulled.replace(own, "      v: {default: \"(1)\"}\n")
+            + "  ev_b:\n    from: [\"10\"]\n    to: [\"20\"]\n    columns:\n      \
+               b: {default: \"('x'::text)\"}\n";
+        std::fs::write(&path, &as_parents).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("refused.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 1, "{version}: {}{}", stdout(&o), stderr(&o));
+        let err = stderr(&o);
+        assert!(
+            err.contains(
+                "partition app.ev_a column `v`: its own default \"(1)\" is stored as \"1\""
+            ) && err.contains(
+                "partition app.ev_b column `b`: its own default \"('x'::text)\" is stored as"
+            ) && err.contains("drop the partition's own default, it is the parent's"),
+            "{version}: {err}"
+        );
+        assert!(
+            !plan.exists(),
+            "{version}: a refused plan wrote {}",
+            plan.display()
+        );
+        // The probe's temporary table went with its transaction.
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'pbps_1609'"
+            ),
+            0,
+            "{version}"
+        );
+
+        // Negative: a default of its own, and one the engine only respells.
+        let own_defaults = pulled.replace(
+            own,
+            "      v: {default: \"2\"}\n      b: {default: \"'other'\"}\n",
+        ) + "  ev_b:\n    from: [\"10\"]\n    to: [\"20\"]\n    columns:\n      \
+               b: {default: \"'y'\"}\n";
+        std::fs::write(&path, &own_defaults).unwrap();
+        d.commit();
+        let plan = d.dir.join("own.json");
+        succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(&d, &conn, &plan, &[]));
+        succeeds(d.run(&["verify", "--db", &conn]));
+        on_server(&conn, "INSERT INTO app.ev_a (k) VALUES (1)");
+        assert_eq!(
+            scalar(&conn, "SELECT v::int8 FROM app.ev_a WHERE k = 1"),
+            2,
+            "{version}"
+        );
+    }
+}
+
 /// Operators a user who may create in a schema could add, each raising when
 /// it is called. Every one has a built-in that pbps's own SQL reaches only
 /// through a cast or a polymorphic argument, and an operator whose argument
