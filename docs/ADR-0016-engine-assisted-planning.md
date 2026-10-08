@@ -722,8 +722,11 @@ carries the normative text, and DEC-1528.1 the reasons.
   - The baseline is confined by privilege. It runs in its own session, as
     a run-owned non-superuser role that owns nothing managed and holds no
     privilege on it beyond schema `USAGE`, so the engine refuses any change
-    to managed objects or their rows. pbps runs its `CREATE EXTENSION`
-    statements first, as the setup role. As a backstop, afterwards every
+    to managed objects or their rows. An external object that needs more
+    gets exactly that from a fixed list (#1658): extensions, and casts or
+    transforms over a type the baseline does not own, run as the setup
+    role; `REFERENCES` is granted for a baseline foreign key to a managed
+    table. Anything else refused for privilege refuses the run. As a backstop, afterwards every
     managed object already staged must be unchanged, every managed table
     must still be empty, and every object the baseline created must be
     compared. The emptiness check catches indirect writes, such as through

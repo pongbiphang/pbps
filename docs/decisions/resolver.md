@@ -1647,8 +1647,12 @@ their full definitions sends routine source no reviewer approved.
 - The baseline is arbitrary SQL, so it is confined by privilege rather than
   checked case by case. It runs in its own session, as a run-owned
   non-superuser role that owns nothing managed and holds no privilege on it
-  beyond schema `USAGE`. pbps runs the baseline's `CREATE EXTENSION`
-  statements itself, as the setup role, first.
+  beyond schema `USAGE`. Some external objects legitimately need more:
+  an extension, a cast or transform over a type the baseline does not own,
+  a foreign key to a managed table. For these, pbps grants or runs exactly
+  that, from a fixed list (#1658), and each creates one compared object. A
+  fixed list keeps the confinement a rule rather than a judgment. Anything
+  else refused for privilege refuses the run.
   - Review found the cases one at a time: a `SET`, then an `ALTER` or
     `DROP` of a staged managed table, then rows written into one, which
     could fail a later CHECK or index build and refuse a valid plan.

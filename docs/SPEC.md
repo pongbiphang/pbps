@@ -1602,8 +1602,17 @@ scratch compile (#1616).
     `DROP`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, triggers, rules,
     policies, grants, and event triggers. Its `SET`s, `search_path`
     included, never reach the session that compiles the declarations.
-  - Its `CREATE EXTENSION` statements, which may need more, are run by pbps
-    itself, as the setup role, before any managed object is staged.
+  - **Where an external object needs more than that role holds, pbps grants
+    or runs exactly that, from a fixed list, and nothing else** (#1658):
+    - `CREATE EXTENSION`, and `CREATE CAST` or `CREATE TRANSFORM` over a
+      type the baseline does not own, run as the setup role, after the
+      objects they name;
+    - `REFERENCES` is granted on a managed table that a baseline foreign
+      key names, and its internal triggers belong to that compared
+      constraint.
+  - Each such statement creates one object, compared like any other. Any
+    other statement refused for lack of privilege refuses the run, and the
+    finding names the statement.
   - Three checks afterwards catch what privilege cannot, such as a staged
     `SECURITY DEFINER` routine the baseline may execute:
     - every managed object already staged must be exactly what pbps staged;
