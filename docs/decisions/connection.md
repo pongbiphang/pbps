@@ -948,6 +948,10 @@ for the sake of punctuation. So the text changes instead:
   `the_statement_text_pbps_writes_is_ascii`;
 - the rule covers user-facing messages in those crates too, because a scan
   cannot tell which literal reaches the server;
+- a `\u{...}` escape counts as the character it decodes to, so `"\u{2014}"`
+  is refused like `"—"` (#1650). A `\x` escape in a `str` or `char` is ASCII
+  by construction. A character built at runtime (`char::from_u32`,
+  `concat!`) is beyond a scan of literals;
 - comments are free.
 
 What a user declares is sent as declared, and whether the database's encoding
