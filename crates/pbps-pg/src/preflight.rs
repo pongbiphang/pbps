@@ -3847,14 +3847,20 @@ fn partition_probes(
             ..
         } = &p.change
         {
-            // Two questions, as a created partition's one: the table's own
-            // rows outside the range, which the engine refuses to attach
-            // over, and the DEFAULT partition's inside it (#1545).
+            // Three questions, a created partition's one among them: the
+            // table's own rows outside the range, which the engine refuses to
+            // attach over; its triggers, which it does not refuse and the
+            // reader does; and the DEFAULT partition's rows inside it (#1545).
             let leaving = dropped.get(parent).map_or(&[][..], Vec::as_slice);
-            match attach_range_probe(table, parent, from, to) {
-                Ok(probe) => out.push(probe),
-                Err(error) => {
-                    unchecked.push(Unchecked::for_change(&p.change, error.to_string()));
+            for probe in [
+                attach_range_probe(table, parent, from, to),
+                attach_trigger_probe(table),
+            ] {
+                match probe {
+                    Ok(probe) => out.push(probe),
+                    Err(error) => {
+                        unchecked.push(Unchecked::for_change(&p.change, error.to_string()));
+                    }
                 }
             }
             partition_range_probe(table, parent, from, to, leaving, "attach a table")
@@ -4013,6 +4019,30 @@ fn attach_range_probe(
                  FROM pg_catalog.pg_partitioned_table pt \
                  WHERE pt.partrelid = pg_catalog.to_regclass({})), 0)",
                 value_literal(&qualified(parent)?)
+            ))
+        ),
+    ))
+}
+
+/// The triggers on `table`, managed or not. The engine attaches a table with
+/// triggers, but the reader takes a partition that holds one for a tree it
+/// cannot hold and refuses the whole tree (`partition_tree`'s purity). Left
+/// to the closing read, a staged attach commits first and its checkpoint
+/// fails. An unmanaged trigger is not in the declarations the differ refuses
+/// by, so it is counted here, from the catalog, before the first statement
+/// (#1642 review).
+fn attach_trigger_probe(table: &TableName) -> Result<Probe, DialectError> {
+    Ok(Probe::new(
+        format!(
+            "triggers on {table}, which a partition does not hold yet: drop them before it is \
+             attached, then plan again"
+        ),
+        format!(
+            "SELECT {}",
+            saturated_count(&format!(
+                "(SELECT count(*) FROM pg_catalog.pg_trigger tg \
+                 WHERE tg.tgrelid = pg_catalog.to_regclass({}) AND NOT tg.tgisinternal)",
+                value_literal(&qualified(table)?)
             ))
         ),
     ))
@@ -4353,9 +4383,10 @@ mod tests {
         });
         assert_eq!(dropped.len(), 1, "{dropped:?}");
         assert!(dropped[0].description.contains("reference app.ev_1"));
-        // An attach asks two (#1545): the table's own rows outside its
-        // range, counted against the parent's key, and the DEFAULT
-        // partition's inside it, which a create asks too.
+        // An attach asks three (#1545): the table's own rows outside its
+        // range, counted against the parent's key; its triggers, managed or
+        // not; and the DEFAULT partition's rows inside it, which a create
+        // asks too.
         let attach = |bound: B| {
             probes(&ChangeSet {
                 changes: vec![pbps_model::PlannedChange::new(Change::AttachPartition {
@@ -4371,7 +4402,7 @@ mod tests {
             from: vec![pbps_model::BoundDatum::Value("2024-01-01".into())],
             to: vec![pbps_model::BoundDatum::Value("2025-01-01".into())],
         });
-        assert_eq!(attached.len(), 2, "{attached:?}");
+        assert_eq!(attached.len(), 3, "{attached:?}");
         assert!(
             attached[0]
                 .description
@@ -4384,7 +4415,18 @@ mod tests {
         assert!(sql.contains("to_regclass(E'\"app\".\"ev\"')"), "{sql}");
         assert!(sql.starts_with("SELECT LEAST("), "{sql}");
         assert!(
-            attached[1]
+            attached[1].description.contains("triggers on app.t"),
+            "{attached:?}"
+        );
+        assert!(
+            attached[1].sql.contains(
+                "tgrelid = pg_catalog.to_regclass(E'\"app\".\"t\"') AND NOT tg.tgisinternal"
+            ),
+            "{}",
+            attached[1].sql
+        );
+        assert!(
+            attached[2]
                 .description
                 .contains("will not attach a table over them"),
             "{attached:?}"

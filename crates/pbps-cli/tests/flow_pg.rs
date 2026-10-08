@@ -7179,7 +7179,14 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
         "an attach needs its risk allowed: {}",
         stdout(&o)
     );
-    // Refused by the pre-flight, by name, and nothing changed.
+    // Refused by the pre-flight, by name, and nothing changed. An unmanaged
+    // trigger, which the declarations do not see and the engine attaches
+    // over, is counted from the catalog (#1642 review).
+    on_server(
+        &connection,
+        "CREATE FUNCTION app.noop() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TRIGGER noop BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.noop()",
+    );
     let o = approved_apply(
         &d,
         &connection,
@@ -7191,6 +7198,7 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
     assert!(
         said.contains("1 rows of app.t outside the range it takes under app.ev")
             && said.contains("1 rows of app.ev inside the range of its new partition app.t")
+            && said.contains("1 triggers on app.t, which a partition does not hold yet")
             && said.contains("nothing has been changed"),
         "{said}"
     );
@@ -7207,7 +7215,8 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
     // Out of the way: attached.
     on_server(
         &connection,
-        "DELETE FROM app.t WHERE id = 2; DELETE FROM app.ev WHERE id = 9",
+        "DELETE FROM app.t WHERE id = 2; DELETE FROM app.ev WHERE id = 9;
+         DROP TRIGGER noop ON app.t; DROP FUNCTION app.noop()",
     );
     succeeds(approved_apply(
         &d,

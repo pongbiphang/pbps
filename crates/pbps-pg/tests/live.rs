@@ -4742,13 +4742,30 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
             ),
         ] {
             let probes = pg.preflight(&step).probes;
-            assert_eq!(probes.len(), 2, "{probes:?}");
+            assert_eq!(probes.len(), 3, "{probes:?}");
             assert!(
                 probes[0].description.contains("outside the range"),
                 "{probes:?}"
             );
             assert_eq!(counted(&mut conn, &probes[0].sql).await, outside, "{table}");
+            assert_eq!(counted(&mut conn, &probes[2].sql).await, 0, "{table}");
+            // An unmanaged trigger, which the engine attaches over and the
+            // reader refuses the tree for, is counted; an internal one, as a
+            // foreign key's, never is (#1642 review).
+            assert!(probes[1].description.contains("triggers on"), "{probes:?}");
             assert_eq!(counted(&mut conn, &probes[1].sql).await, 0, "{table}");
+            conn.execute(&format!(
+                "CREATE FUNCTION {s}.noop() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+                 CREATE TRIGGER noop BEFORE INSERT ON {s}.{table} FOR EACH ROW EXECUTE FUNCTION {s}.noop();"
+            ))
+            .await
+            .expect("an unmanaged trigger");
+            assert_eq!(counted(&mut conn, &probes[1].sql).await, 1, "{table}");
+            conn.execute(&format!(
+                "DROP TRIGGER noop ON {s}.{table}; DROP FUNCTION {s}.noop();"
+            ))
+            .await
+            .expect("the trigger dropped");
             let sql: String = pg
                 .emit(&step.changes[0].change, Default::default())
                 .expect("emit")

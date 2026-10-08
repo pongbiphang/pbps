@@ -3491,7 +3491,13 @@ plan. The table must hold:
 - each of the parent's checks under the same name;
 - no replica identity, no `data:` and no other setting a partition does not
   hold;
-- no trigger on it, and no foreign key of another table referencing it.
+- no trigger on it, and no foreign key of another table referencing it. A
+  declared trigger is refused as the plan is made. An unmanaged one is not
+  in the declarations under `unmanaged: ignore`, and the engine attaches
+  over it, but the reader then refuses the whole tree, so a staged attach
+  would commit before its checkpoint failed. The pre-flight therefore counts
+  every non-internal trigger on the table from the catalog, before the first
+  statement, as the reader's purity does (#1642 review).
 
 The parent must be a partitioned table before the plan. A DEFAULT bound is
 refused: attaching as the DEFAULT partition is #1639.
