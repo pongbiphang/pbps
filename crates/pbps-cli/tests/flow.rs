@@ -3623,6 +3623,58 @@ fn a_connected_plan_does_not_fold_case_for_a_standing_computed_column() {
     );
 }
 
+/// A computed column the plan re-adds has no edge for its new text, so its
+/// calls are compared with the functions the plan changes under the
+/// database's collation (#1459). Under `CI_AI` the new `[dbo].[cafe]` calls
+/// `dbo.café`, which the plan alters: refused by name at `plan --db`, where
+/// the text screen let it through and SQL Server refused it inside the apply.
+/// Re-declared to call `dbo.g` instead, the same alter plans.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_readded_computed_columns_calls_are_compared_under_the_collation() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let ai = OwnDatabase::collated(&server, "computed1459_ai", "SQL_Latin1_General_CP1_CI_AI");
+    for sql in [
+        "CREATE FUNCTION dbo.[café] (@x int) RETURNS int AS BEGIN RETURN @x * 3 END;",
+        "CREATE FUNCTION dbo.g (@x int) RETURNS int AS BEGIN RETURN @x * 5 END;",
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, a int NULL,
+             c AS ([dbo].[café]([a])));",
+    ] {
+        on_server(ai.connection(), sql);
+    }
+    let d = Demo::new("computed1459-ai");
+    ok(&d.run(&["pull", "--db", ai.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", ai.connection(), "--reason", "adopt"]));
+    let table = d.dir.join("schema/dbo.t.yml");
+    let pulled = std::fs::read_to_string(&table).unwrap();
+    assert!(pulled.contains("[café]([a])"), "{pulled}");
+    let function = walk(&d.dir.join("schema"))
+        .into_iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("@x * 3")))
+        .expect("dbo.café's declaration");
+    let body = std::fs::read_to_string(&function).unwrap();
+    std::fs::write(&function, body.replacen("@x * 3", "@x * 4", 1)).unwrap();
+
+    std::fs::write(&table, pulled.replacen("[café]([a])", "[cafe]([a])", 1)).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", ai.connection()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("computed column dbo.t.c calls `dbo.café` as `dbo.cafe`"),
+        "{}",
+        stderr(&o)
+    );
+
+    // Calling another function: nothing the plan changes.
+    std::fs::write(&table, pulled.replacen("[café]([a])", "[g]([a])", 1)).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", ai.connection()]));
+}
+
 /// A connected plan refuses what the catalog's edges say SQL Server would,
 /// where a text scan could not tell (#1431, DEC-1431.1): a retype of `café`,
 /// which `[cafe]` binds under an accent-insensitive collation (#1426); and a

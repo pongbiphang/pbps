@@ -2107,6 +2107,61 @@ pub trait Dialect {
         names_at_a_boundary(&code, &wanted)
     }
 
+    /// Every two-part name `text` spells in code, undelimited: `[dbo].[cafe]`
+    /// is `("dbo", "cafe")`, and `a.b.c` gives both `(a, b)` and `(b, c)`.
+    /// The names as written, for a caller that compares them the way the
+    /// engine binds them, under the database's collation (#1459): what
+    /// [`may_name_qualified`](Dialect::may_name_qualified) folds by text
+    /// misses an accent- or width-insensitive match.
+    fn qualified_names(&self, text: &str) -> Vec<(String, String)> {
+        enum Token {
+            Name(String),
+            Dot,
+            Other,
+        }
+        let mut tokens = Vec::new();
+        let code = self.lexicon().code_only(text);
+        let mut chars = code.chars().peekable();
+        while let Some(c) = chars.next() {
+            let close = match c {
+                '[' => Some(']'),
+                '"' => Some('"'),
+                _ => None,
+            };
+            if let Some(close) = close {
+                // A delimited name doubles its closing delimiter.
+                let mut name = String::new();
+                while let Some(n) = chars.next() {
+                    if n == close && chars.next_if_eq(&close).is_none() {
+                        break;
+                    }
+                    name.push(n);
+                }
+                tokens.push(Token::Name(name));
+            } else if continues_ident(c) {
+                let mut name = String::from(c);
+                while let Some(n) = chars.next_if(|n| continues_ident(*n)) {
+                    name.push(n);
+                }
+                tokens.push(Token::Name(name));
+            } else if c == '.' {
+                tokens.push(Token::Dot);
+            } else if !c.is_whitespace() {
+                // `f(a).b` is not `a.b`.
+                tokens.push(Token::Other);
+            }
+        }
+        tokens
+            .windows(3)
+            .filter_map(|w| match w {
+                [Token::Name(a), Token::Dot, Token::Name(b)] if !a.is_empty() && !b.is_empty() => {
+                    Some((a.clone(), b.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn may_name(&self, text: &str, name: &str) -> bool {
         // A delimited name doubles its closing delimiter: `a]b` is stored as
         // `[a]]b]` and `a"b` as `"a""b"`, so each spelling is looked for
@@ -3395,6 +3450,42 @@ mod tests {
         // A delimited name is stored with its closing delimiter doubled.
         assert!(d.may_name("[a]]b] * 2", "a]b"));
         assert!(d.may_name("\"a\"\"b\" * 2", "a\"b"));
+    }
+
+    /// The two-part names an expression spells in code, as written, for a
+    /// comparison under the database's collation (#1459); never one in a
+    /// literal or a comment, nor two names that only a call separates.
+    #[test]
+    fn qualified_names_are_read_from_code_as_written() {
+        let d = MinimalDialect;
+        let names = |text: &str| d.qualified_names(text);
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(names("[dbo].[cafe]([a])"), [pair("dbo", "cafe")]);
+        assert_eq!(names("DBO . f(a) + 1"), [pair("DBO", "f")]);
+        assert_eq!(names("\"s\".\"f\"(a)"), [pair("s", "f")]);
+        // A delimited name is stored with its closing delimiter doubled.
+        assert_eq!(names("[a]]b].[c](1)"), [pair("a]b", "c")]);
+        assert_eq!(names("x.y.z"), [pair("x", "y"), pair("y", "z")]);
+        assert_eq!(
+            names("dbo.f(a) * dbo.g(b)"),
+            [pair("dbo", "f"), pair("dbo", "g")]
+        );
+        // Negatives.
+        for text in [
+            "'dbo.f'",
+            "a -- dbo.f\n + 1",
+            "f(a).b",
+            "a * 2",
+            "1.5 * a",
+            "",
+        ] {
+            assert!(
+                names(text).iter().all(|(a, _)| a != "dbo" && a != "a"),
+                "{text}"
+            );
+        }
+        assert!(names("f(a).b").is_empty());
+        assert!(names("'dbo.f'").is_empty());
     }
 
     #[test]

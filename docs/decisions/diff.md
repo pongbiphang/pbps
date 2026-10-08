@@ -3244,7 +3244,10 @@ makes them complete.
 
 **Why not for an added column.** A computed column the plan adds, new or
 again, has no edge for its new text until the plan stores it, so the screen
-still judges what it calls (#1459). PostgreSQL has no computed columns and
+still judges what it calls (#1459).
+
+*Amended by [DEC-1459.1](#dec-1459-1): a connected plan also compares the
+names it calls with the functions the plan changes, under the collation.* PostgreSQL has no computed columns and
 keeps `Screen::Text`.
 
 **Why a parameter, not a hint.** `Hints` come from the declarations and never
@@ -3323,3 +3326,41 @@ Pinned on 16 and 18 by the CLI's
   database that sets `transform_null_equals = on`.
 - a declared text that ends the transaction and creates a table commits
   nothing, and is warned about as unasked.
+
+<a id="dec-1459-1"></a>
+
+**DEC-1459.1. A connected SQL Server plan compares what an added computed
+column calls with the functions it changes under the database's collation
+(#1459; amends DEC-1460.1).**
+
+**Context.** A computed column the plan adds, new or again, has no catalog
+edge for its new expression, so DEC-1460.1 leaves it to the differ's text
+screen. That screen folds case and nothing else. Under
+`SQL_Latin1_General_CP1_CI_AI` a column re-declared as `([dbo].[cafe]([a]))`
+calls `dbo.café`; with `café` altered in the same plan, the screen saw no
+call, the column was re-added before the alter, and SQL Server refused the
+alter inside the apply (3729).
+
+**Decision.** `refuse_added_computed_calls` reads, from each added computed
+column's expression, the two-part names it spells in code
+(`Dialect::qualified_names`), and asks the engine which of them name a
+function the plan creates, alters or drops under the catalog collation, as
+`column_names_alike` does for DEC-1431.1. A match refuses the plan by name:
+"computed column dbo.t.c calls `dbo.café` as `dbo.cafe`". It reads no
+`sys.sql_expression_dependencies` and needs no grant beyond the connection.
+
+**Why not compile the expression.** Binding it by the engine, by adding the
+column inside the planning transaction or on a scratch database, would be
+exact, but `plan --db` would then take a schema lock on a live table or need
+`CREATE DATABASE`. A computed column calls a function only by a two-part
+name, so the names it spells and the collation that compares them decide
+which function it calls. The maintainer chose this (2026-10-08).
+
+Pinned by the live `a_readded_computed_columns_calls_are_compared_under_the_collation`
+(`crates/pbps-cli/tests/flow.rs`): under `CI_AI`, re-declaring the column as
+`[dbo].[cafe]` while `café` is altered is refused at `plan --db`, and
+re-declaring it to call `dbo.g` plans. Also by the units
+`an_added_computed_column_is_refused_by_the_collations_reading_of_its_calls`
+(another schema, a spelling the collation keeps apart and a view's drop
+refuse nothing) and `qualified_names_are_read_from_code_as_written` (no name
+from a literal or a comment, nor across a call).
