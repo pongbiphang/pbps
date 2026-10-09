@@ -489,7 +489,8 @@ pub async fn enforce(
 /// otherwise than declared is named, and nothing is written. The engine
 /// judges each declared value, not a model of it (#1708 review). Each
 /// statement runs under its own savepoint, so one refusal does not hide the
-/// next. Empty when the declared state can be put on whole.
+/// next. Names each refused statement, then each way the database still
+/// differs; empty when the declared state can be put on whole.
 pub async fn trial(
     conn: &mut impl ExecuteConnection,
     standard: &Standard,
@@ -505,7 +506,9 @@ pub async fn trial(
     let ended = conn.execute("ROLLBACK").await;
     let (failed, left) = tried?;
     ended?;
-    Ok(if failed.is_empty() { left } else { failed })
+    // Both: a refused statement does not hide what no statement could
+    // reach, such as a dropped `public` (#1708 review).
+    Ok(failed.into_iter().chain(left).collect())
 }
 
 async fn enforce_in(
@@ -1300,12 +1303,20 @@ mod tests {
             let after_clean = read_state(&mut login).await.unwrap();
             let failed = enforce(&mut login, &right, None).await.unwrap();
             let left = verify(&mut login, &right, None).await.unwrap();
+            // A refused statement and damage no statement reaches are both
+            // named: a dropped `public` is not hidden behind a bad value.
+            login.execute("DROP SCHEMA public").await.unwrap();
+            let damaged = trial(&mut login, &wrong).await.unwrap();
             drop(login);
             fixture.drop().await;
-            assert_eq!(refused.len(), 2, "{variable}: {refused:#?}");
+            let statements = refused
+                .iter()
+                .filter(|r| r.starts_with("ALTER DATABASE"))
+                .collect::<Vec<_>>();
             assert!(
-                refused.iter().any(|r| r.contains("statement_timeout"))
-                    && refused.iter().any(|r| r.contains("work_mem")),
+                statements.len() == 2
+                    && statements.iter().any(|r| r.contains("statement_timeout"))
+                    && statements.iter().any(|r| r.contains("work_mem")),
                 "{variable}: {refused:#?}"
             );
             assert!(
@@ -1318,6 +1329,11 @@ mod tests {
             assert!(
                 failed.is_empty() && left.is_empty(),
                 "{variable}: {failed:#?} {left:#?}"
+            );
+            assert!(
+                damaged.iter().any(|r| r.contains("statement_timeout"))
+                    && damaged.iter().any(|r| r.contains("(OID 2200) is missing")),
+                "{variable}: {damaged:#?}"
             );
         }
     }
