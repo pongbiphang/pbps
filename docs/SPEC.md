@@ -1331,6 +1331,13 @@ full state.
 | `pbps state prune --keep N` | Clean up historical snapshots |
 | `pbps status` | One screen across environments: last apply, git sha, drift state, last verified (see 9.4) |
 
+A target connection string names one endpoint (DECISIONS 229), and the
+connection must reach one database cluster for its whole life. A command spans
+several transactions on it, an apply included, even though an apply's
+statements and its ledger row share one. A proxy that hands those
+transactions to different clusters is unsupported, and ruling one out is the
+operator's (DEC-1720.1).
+
 `pbps pull` is the key to the adoption threshold: every new user's first step is
 "I already have a database". Without it, the cost of adoption is transcribing two
 hundred tables by hand.
@@ -1426,7 +1433,8 @@ entry implemented by #1672, Docker by #1674).**
         connection must report the same one, because one name can reach
         several clusters. A scratch reporting it is on the target's cluster,
         a standby included. An unreadable identifier refuses, naming the
-        `pg_control_system()` grant.
+        `pg_control_system()` grant. The planning connection itself is
+        assumed to stay on one cluster (DEC-1720.1).
       - Each session marks itself with a run-generated `application_name`.
       - A target mark that the scratch session finds in `pg_stat_activity`
         is a backend of the scratch's own cluster. Both sessions hold a

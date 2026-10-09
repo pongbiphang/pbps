@@ -1000,3 +1000,42 @@ Pinned by `certificate_causes_survive_io_wrappers_without_text_matching`
 refusal, and the live wrong-host case in
 `verified_round_trips_reject_wrong_peers_and_corrupted_replies`
 (`crates/pbps-db/tests/live_transport.rs`).
+
+<a id="dec-1720-1"></a>
+
+**DEC-1720.1. A target connection reaches one database cluster for its whole
+life; a proxy that hands its transactions to different clusters is
+unsupported (#1720).** pbps already depends on this. On one target connection
+the planning read is several transactions:
+- the catalog snapshot;
+- the declared-rows read;
+- the read-only name and permission checks.
+
+An apply spans several transactions too. Its checks under the lock run
+first. One transaction then runs the statements, the closing checks and the
+ledger row together, so that part is atomic; a staged apply instead records
+each statement as it completes. Each transaction assumes it reaches the
+cluster the others reached, and nothing in between re-checks.
+
+So a transaction-pooling proxy that hands one connection's successive
+transactions to different clusters is unsupported, even when the clusters
+have the same schema. Examples are a pooler with several backend hosts, or a
+balancing proxy in transaction mode. A plan read through one could be read
+from one cluster, judged against another and applied to a third. Providing a
+target connection that does not do this is the operator's part, beside the
+rest of what the connection string names. DECISIONS 229 already refuses a
+string that names several hosts; one name in front of several clusters is not
+visible in the string, so it is ruled out here instead.
+
+This is the premise DEC-1685.1 builds on, not a change to it. DEC-1685.1 binds
+the resolver's *new* target connection to the cluster the planning connection
+reached, through `system_identifier`. This entry is the assumption that the
+planning connection itself stays on that cluster.
+
+Binding every planning transaction was rejected. It would read the identity
+inside the catalog snapshot and again in each later planning transaction. It
+would touch `Pulled` in both engines, and it would still leave the rows read
+and the checks unbound unless each of them re-read the identity too.
+
+This entry says nothing about transaction pooling in front of one cluster;
+that was not measured, and this decision does not cover it.

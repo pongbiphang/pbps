@@ -2026,7 +2026,8 @@ on another backend behind the same operator-supplied scratch connection,
 never on the target, which the identity check guards. Like the scratch's
 other channels (SPEC §9.3.2), a session-pinned scratch connection, direct or
 session-pooled, is part of what the operator vouches for. The checkpoints
-stay and still refuse a move they see.
+stay and still refuse a move they see. The target side's counterpart, a
+target connection that stays on one cluster, is DEC-1720.1.
 
 Pinned by:
 - `vouched_refuses_a_target_connection_on_another_cluster_than_the_plan_was_read_from`;
