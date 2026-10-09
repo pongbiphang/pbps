@@ -52,6 +52,14 @@ pub enum Needed {
     /// `verify` read dependencies through `sys.dm_sql_referenc*_entities`.
     /// Asked of that one object, where the grant goes.
     CatalogView,
+    /// `SELECT` on each of [`DEPENDENCY_FUNCTIONS`], which `pull`,
+    /// `plan --db` and `verify` read what depends on what through (#1704,
+    /// DEC-1704.1). `public` holds it in `master`, so only a `DENY` there takes
+    /// it away, and then those reads fail with Msg 229. The grant can be set
+    /// only in `master` (Msg 4629 anywhere else), and `HAS_PERMS_BY_NAME`
+    /// asked from the managed database sees it, through `public` too
+    /// (measured on 17.0).
+    DependencyFunction,
     /// Needed on every schema pbps manages.
     Managed,
     /// Probe reads on each managed table, including recorded tables awaiting
@@ -360,6 +368,11 @@ pub const ADVISED: [Requirement; 2] = [
     ),
 ];
 
+/// The per-object dependency functions the catalog reads ask (DEC-1644.1),
+/// each a securable of its own in `master` ([`Needed::DependencyFunction`]).
+pub const DEPENDENCY_FUNCTIONS: [&str; 2] =
+    ["dm_sql_referenced_entities", "dm_sql_referencing_entities"];
+
 /// The schema the ledger and the lock live in, asked of the module whose
 /// statements put them there rather than spelled a second time here.
 pub use crate::state::LEDGER_SCHEMA;
@@ -368,7 +381,7 @@ pub use crate::state::LEDGER_SCHEMA;
 /// absence still requires the create-time permission.
 pub const LEDGER_TABLES: [&str; 2] = [crate::state::STATE_TABLE, crate::state::LOCK_TABLE];
 
-pub const REQUIRED: [Requirement; 25] = [
+pub const REQUIRED: [Requirement; 26] = [
     req(
         "ALTER",
         "adding the timeline columns to an existing pre-migration state ledger",
@@ -378,6 +391,13 @@ pub const REQUIRED: [Requirement; 25] = [
         "VIEW DEFINITION",
         "reading the catalog: pull, plan --db, verify",
         Needed::Managed,
+    ),
+    req(
+        "SELECT",
+        "reading what depends on what: pull, plan --db, verify. `public` holds it in master, \
+         so it is missing only where a DENY in master takes it away, and only there can it be \
+         changed",
+        Needed::DependencyFunction,
     ),
     // `SELECT` twice, because it is needed in two places for two reasons and a
     // single entry made the wrong demand in both directions. The probes count
@@ -607,6 +627,9 @@ pub struct Held {
     /// The permissions effective on `sys.sql_expression_dependencies`
     /// ([`Needed::CatalogView`]).
     pub catalog_view: BTreeSet<String>,
+
+    /// Which of [`DEPENDENCY_FUNCTIONS`] this account may `SELECT` from.
+    pub dependency_functions: BTreeSet<&'static str>,
 
     /// The schema-scoped permissions effective on the ledger's schema.
     ///
@@ -2209,6 +2232,24 @@ pub async fn permissions(
         catalog_view.insert("SELECT".to_owned());
     }
 
+    // Asked of each function, from this database: the answer accounts for a
+    // grant or `DENY` in `master`, whether to this login's user there or to
+    // `public` (measured on 17.0).
+    let mut dependency_functions = BTreeSet::new();
+    for function in DEPENDENCY_FUNCTIONS {
+        let sql =
+            format!("SELECT HAS_PERMS_BY_NAME(N'sys.{function}', N'OBJECT', N'SELECT') AS held;");
+        if conn
+            .query(&sql)
+            .await?
+            .first()
+            .and_then(|row| row.try_get::<i32>("held").ok().flatten())
+            == Some(1)
+        {
+            dependency_functions.insert(function);
+        }
+    }
+
     let ledger_schema = per_schema.get(LEDGER_SCHEMA).cloned().unwrap_or_default();
     // Asked for and not returned by `sys.schemas` means the database does not
     // have it. The ledger's schema is excluded: `dbo` always exists, and if it
@@ -2228,6 +2269,7 @@ pub async fn permissions(
         managed_tables,
         absent_schemas,
         catalog_view,
+        dependency_functions,
         ledger_schema,
         ledger_objects,
         ledger_migration_needed,
@@ -2429,6 +2471,17 @@ fn gaps(requirements: &[Requirement], held: &Held) -> Vec<Gap> {
                             "sql_expression_dependencies",
                         )),
                     });
+                }
+            }
+            Needed::DependencyFunction => {
+                for function in DEPENDENCY_FUNCTIONS {
+                    if !held.dependency_functions.contains(function) {
+                        out.push(Gap {
+                            permission: r.name,
+                            why: r.why,
+                            securable: Securable::Object(ObjectName::new("sys", function)),
+                        });
+                    }
                 }
             }
             Needed::Managed => {
@@ -2806,6 +2859,7 @@ mod tests {
             // its own test below.
             absent_schemas: BTreeSet::new(),
             catalog_view: ["SELECT".to_owned()].into(),
+            dependency_functions: DEPENDENCY_FUNCTIONS.into(),
             // The ledger not existing yet is the default here, so `missing`
             // falls back to the ledger *schema*, which therefore carries the
             // ledger permissions. `ledger_granted_on_the_objects_only` below is
@@ -4042,6 +4096,29 @@ mod tests {
         assert!(advised(&held).is_empty());
     }
 
+    /// #1704: `SELECT` on each dependency function is a gap of its own,
+    /// named at that function, because the reads of `pull`, `plan --db` and
+    /// `verify` fail without it (DEC-1704.1).
+    #[test]
+    fn a_denied_dependency_function_is_a_gap_named_at_that_function() {
+        for denied in DEPENDENCY_FUNCTIONS {
+            let mut held = everything(&["dbo"]);
+            held.dependency_functions.remove(denied);
+            let gaps = missing(&held);
+            assert_eq!(gaps.len(), 1, "{gaps:?}");
+            assert_eq!(gaps[0].permission, "SELECT");
+            assert_eq!(
+                gaps[0].securable,
+                Securable::Object(ObjectName::new("sys", denied))
+            );
+            assert_eq!(gaps[0].securable(), format!("OBJECT::[sys].[{denied}]"));
+            // Not advice: the account is not ready.
+            assert!(advised(&held).is_empty(), "{:?}", advised(&held));
+        }
+        // Negative: holding both, nothing is missing.
+        assert!(missing(&everything(&["dbo"])).is_empty());
+    }
+
     #[test]
     fn an_account_holding_everything_is_missing_nothing() {
         assert!(missing(&everything(&["dbo", "app"])).is_empty());
@@ -4470,6 +4547,7 @@ mod tests {
         let held = Held {
             database: BTreeSet::new(),
             catalog_view: BTreeSet::new(),
+            dependency_functions: BTreeSet::new(),
             schemas: [("dbo".to_owned(), BTreeSet::new())].into_iter().collect(),
             managed_tables: BTreeMap::new(),
             absent_schemas: BTreeSet::new(),
@@ -4513,7 +4591,9 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(missing(&held).len(), applicable);
+        // One entry asks each dependency function, a securable apiece.
+        let securables = applicable + DEPENDENCY_FUNCTIONS.len() - 1;
+        assert_eq!(missing(&held).len(), securables);
     }
 
     /// A table that moves between schemas and carries **no rows** is not asked

@@ -1536,6 +1536,7 @@
         "a_projected_row_from_a_newer_pbps_is_unsupported_not_ordinary_data",
         "a_query_may_bind_two_fewer_parameters_than_the_server_names",
         "a_recorded_module_keeps_its_schema_in_the_readiness_check_until_its_drop",
+        "a_denied_dependency_function_is_a_readiness_gap",
         "a_reference_into_another_database_is_not_a_local_edge",
         "a_refused_ledger_create_leaves_no_transaction_open",
         "a_renamed_and_a_reused_name_keep_their_own_distinct_demands",

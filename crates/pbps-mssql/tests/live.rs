@@ -7140,6 +7140,147 @@ async fn a_reference_into_another_database_is_not_a_local_edge() {
     far.drop().await;
 }
 
+/// #1704: a `DENY SELECT` in `master` on a dependency function is a readiness
+/// gap named at that function (DEC-1704.1). `public` holds the grant there, so
+/// the schema-scoped login is ready until the deny; with it, the pull fails
+/// rather than reading a schema, and `doctor` names the function. With the
+/// deny removed the login is ready again.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_denied_dependency_function_is_a_readiness_gap() {
+    let mut db = TestDb::create("doctordepfn").await;
+    let login = format!("pbps_df_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsDependencyFn!1";
+    db.conn
+        .execute(&format!(
+            "USE master; \
+             IF USER_ID('{login}') IS NOT NULL DROP USER [{login}]; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF; \
+             CREATE USER [{login}] FOR LOGIN [{login}];"
+        ))
+        .await
+        .expect("create login");
+    // What `a_schema_scoped_grant_satisfies_the_readiness_check` grants, and
+    // a view, so the pull has a module whose dependencies it asks.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             CREATE TABLE dbo.t (a int); \
+             EXEC (N'CREATE VIEW dbo.v AS SELECT a FROM dbo.t'); \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER, REFERENCES \
+             ON SCHEMA::dbo TO [{login}]; \
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant");
+    let base = conn_str();
+    let as_login = base
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = format!(
+        "{as_login};User Id={login};Password={password};Database={}",
+        db.name
+    );
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
+    assert_eq!(schema_scoped_gaps(&mut lp).await, Vec::<String>::new());
+    pbps_mssql::catalog::introspect(&mut lp)
+        .await
+        .expect("the pull reads as the login");
+
+    for function in pbps_mssql::doctor::DEPENDENCY_FUNCTIONS {
+        db.conn
+            .execute(&format!(
+                "USE master; DENY SELECT ON sys.{function} TO [{login}];"
+            ))
+            .await
+            .expect("deny");
+        let mut lp = connect_live(&as_login).await.expect("reconnect");
+        assert_eq!(
+            schema_scoped_gaps(&mut lp).await,
+            [format!("SELECT on OBJECT::[sys].[{function}]")]
+        );
+        db.conn
+            .execute(&format!(
+                "USE master; REVOKE SELECT ON sys.{function} FROM [{login}];"
+            ))
+            .await
+            .expect("revoke the deny");
+    }
+    // The pull asks the referenced-entities function, and fails under its
+    // deny rather than reading a schema without the edges.
+    db.conn
+        .execute(&format!(
+            "USE master; DENY SELECT ON sys.dm_sql_referenced_entities TO [{login}];"
+        ))
+        .await
+        .expect("deny");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    let refused = pbps_mssql::catalog::introspect(&mut lp)
+        .await
+        .expect_err("the pull fails under the deny");
+    assert!(
+        refused.to_string().contains("dm_sql_referenced_entities"),
+        "{refused}"
+    );
+    db.conn
+        .execute(&format!(
+            "USE master; REVOKE SELECT ON sys.dm_sql_referenced_entities FROM [{login}];"
+        ))
+        .await
+        .expect("revoke the deny");
+
+    // Negative: with the denies gone, ready again.
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    assert_eq!(schema_scoped_gaps(&mut lp).await, Vec::<String>::new());
+    drop(lp);
+    db.drop().await;
+    let mut admin = connect_live(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF USER_ID('{login}') IS NOT NULL DROP USER [{login}]; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+}
+
+/// `doctor`'s gaps for a login managing `dbo` only, as `permission on securable`.
+async fn schema_scoped_gaps(lp: &mut pbps_db::Conn) -> Vec<String> {
+    let held = pbps_mssql::doctor::permissions(
+        lp,
+        &[],
+        &["dbo".to_owned()],
+        &Default::default(),
+        &pbps_mssql::doctor::GrantTargets::default(),
+        &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
+        &pbps_model::IdsFile::default(),
+    )
+    .await
+    .expect("read permissions");
+    pbps_mssql::doctor::missing(&held)
+        .iter()
+        .map(|g| format!("{} on {}", g.permission, g.securable()))
+        .collect()
+}
+
 /// The permission check against a real least-privilege login.
 ///
 /// This is the shape the check exists for and the shape no unit test can
