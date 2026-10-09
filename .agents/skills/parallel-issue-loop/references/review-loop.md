@@ -186,7 +186,16 @@ merged on the second roll.
 ## 7. Closeout
 
 After an actual merge, verify the PR state, merge commit, and issue closure.
-The primary agent owns this ordered closeout (DEC-1228.1):
+The primary agent owns this ordered closeout (DEC-1228.1). At every dependent
+read in steps 1–4, apply DEC-1475.1 before retargeting, requiring OPEN state or
+classifying closure as failure. Preserve a qualifying independent closed PR;
+only an open dependent proceeds to retargeting and OPEN/base/head/diff checks.
+If closure occurs between reads, evaluate it at the next check before further
+mutation or failure classification. Before a deletion request exists, use the
+completed read as a provisional closure cutoff, retain the evidence and verify
+it again against the actual request through the final read. Unknown or
+incomplete evidence stops the operation; provisional preservation does not
+authorize local cleanup before step 4. Use this same disposition throughout:
 
 1. Start the operation window and record the owned parent ref/head/base.
    Complete an initial repository-wide `state=all` scan, retaining the IDs,
@@ -194,15 +203,21 @@ The primary agent owns this ordered closeout (DEC-1228.1):
    Enumerate all open PRs based on the merged head branch, completing pagination.
    Record each dependent's head and expected remaining diff after removing the
    parent's already merged work. Failed or incomplete reads are not empty sets.
-2. While the parent branch exists, explicitly change each dependent's base to
-   the merged parent's base. Verify OPEN state, the intended base, unchanged
-   recorded head and expected remaining diff. Retain the parent branch if any
-   check fails; do not rebase merely for this cleanup.
+2. While the parent branch exists, explicitly change each open dependent's base
+   to the merged parent's base. Apply the closure disposition at the read before
+   that mutation and at verification, including a closure since step 1. For an
+   open PR, verify OPEN state, the intended base, unchanged recorded head and
+   expected remaining diff. Preserve a qualifying closed PR's base and content.
+   Retain the parent branch if any required check fails; do not rebase merely
+   for this cleanup.
 3. Re-enumerate immediately before deleting the owned remote head; newly found
    dependents must pass steps 1–2. A successfully verified empty set requires no
    base changes. Delete only after these checks, then reverify the recorded
    dependents and complete step 4 before removing the local branch and worktree.
-   Treat unexpected closure or a changed head, base or diff as failed closeout.
+   Apply the same closure disposition at both rechecks before treating closure
+   as failure, including deliberate closure after step 2. Changed head, base or
+   diff still requires the existing failure/investigation checks; a closed state
+   alone is neither failure nor an exemption.
 4. Retain the deletion request and confirmation times; confirmed deletion ends
    the window started in step 1. Complete a
    repository-wide `state=all` PR scan after deletion, with every page, and
@@ -232,10 +247,14 @@ The primary agent owns this ordered closeout (DEC-1228.1):
    window. Failed, incomplete or ambiguous evidence stops local
    cleanup. To restore a deleted parent, use an atomic missing-ref lease for
    the exact recorded owned head; a recreated changed or foreign ref must
-   never be overwritten. Reopen only a PR proven closed by this deletion;
-   explicitly retarget and verify affected open dependents before retrying.
-   Unknown cause or ambiguous ordering stops cleanup and PR recovery mutations;
-   obtain missing evidence or the collaborator's direction before reopening.
+   never be overwritten. Autonomous reopening requires proven closure by this
+   deletion. Explicit collaborator direction may instead authorize reopening
+   the identified PR within that instruction; direction for another PR/action
+   is insufficient. Unknown cause or ambiguous ordering alone authorizes no PR
+   mutation. Obtain missing evidence or scoped direction, then explicitly
+   retarget and verify affected open dependents before retrying. Reopening
+   authorization does not waive unresolved cleanup evidence, owned-ref
+   protection or state/base/head/content and current-head review/CI checks.
    A later reopen, changed head/content or renewed parent association invalidates
    the exemption and requires fresh state/base/head/expected patch checks
    (DEC-1458.1, DEC-1475.1).

@@ -116,11 +116,14 @@ and merge order.
   initial/final scans and recorded dependents, regardless of PR age. Equal
   snapshots and creation/update times do not exclude an intervening parent
   association; incomplete or ambiguous history stops cleanup (DEC-1473.1).
-  For a proven parent association, apply DEC-1475.1's age-independent closure
-  provenance rule in the review reference before classifying failure or changing
-  a closed PR. Preserve a proven deliberate independent pre-request closure;
-  unknown cause stops cleanup and PR recovery mutations, and only deletion-caused
-  closure authorizes reopening. Proven unrelated reopen/close activity needs no
+  At every dependent read, apply DEC-1475.1's closure disposition in the review
+  reference before retargeting, requiring OPEN state or classifying failure.
+  Preserve a qualifying deliberate independent closure; pre-request observations
+  remain provisional until the final audit. Autonomous reopening requires proven
+  deletion damage; explicit collaborator direction may instead authorize the
+  identified PR/action. Unknown cause alone permits no mutation, and reopening
+  authorization waives no cleanup evidence, ownership, content or review/CI gate.
+  Proven unrelated reopen/close activity needs no
   recovery. An open-only scan cannot authorize local cleanup (DEC-1458.1).
   Never rely on automatic retargeting (DEC-1228.1). Refresh each dependent's
   existing review
@@ -182,7 +185,9 @@ verify them again after deletion, completing the operation-window/all-state
 check for newly discovered dependents. DEC-1475.1 preserves proven deliberate
 independent pre-request closures regardless of age, with unchanged closed
 state/base/head/content and complete history. Incomplete or ambiguous evidence
-stops cleanup; do not reopen a PR with unknown closure cause.
+stops cleanup; unknown closure cause alone never authorizes reopening. Explicit
+collaborator direction is scoped to the identified PR/action and does not waive
+the remaining closeout or current-head review/CI gates.
 Retain the parent branch before deletion if any check fails; after deletion,
 stop local cleanup and follow the exact-owned-ref recovery without overwriting
 a changed or foreign ref. Update dependent agents, and report
