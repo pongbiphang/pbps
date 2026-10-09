@@ -616,6 +616,27 @@ pub async fn enforce(
     Ok(failed)
 }
 
+/// Only the declared connection limit, on a database whose other declared
+/// state is already in place and has since been built on: the run-owned
+/// layout sets it once its sessions are open, and a second [`enforce`]
+/// there would undo what the run reproduced in between, such as a rebuilt
+/// `public` and the target's database defaults (#1708 review).
+pub async fn put_connection_limit(
+    conn: &mut impl ExecuteConnection,
+    database: &str,
+    standard: &Standard,
+) -> Result<(), DbError> {
+    if standard.connection_limit == -1 {
+        return Ok(());
+    }
+    conn.execute(&format!(
+        "ALTER DATABASE {} CONNECTION LIMIT {}",
+        ident(database),
+        standard.connection_limit
+    ))
+    .await
+}
+
 /// Runs one statement of [`enforce`], noting the engine's refusal instead
 /// of stopping.
 async fn run(conn: &mut impl ExecuteConnection, failed: &mut Vec<String>, sql: String) {
@@ -628,12 +649,27 @@ async fn run(conn: &mut impl ExecuteConnection, failed: &mut Vec<String>, sql: S
 /// literal the engine stores a single quoted identifier, which never reads
 /// back as the declared list (measured on 16 and 18). [`unappliable`] has
 /// refused a declared list the engine cannot read before any write.
+///
+/// An empty list has no spelling after `TO`: nothing there is a syntax
+/// error, and `''` stores `""`, one empty name. `FROM CURRENT` copies the
+/// session's text verbatim, so the empty list is set for the one batch's
+/// implicit transaction and copied from there, and the session keeps its
+/// own value; it stores `name=` (measured on 16 and 18).
 fn set(database: &str, name: &str, value: &str) -> String {
-    format!(
-        "ALTER DATABASE {database} SET {} TO {}",
-        ident(name),
-        setting_value(name, value).unwrap_or_else(|_| literal(value))
-    )
+    match setting_value(name, value) {
+        Ok(list) if list.is_empty() => format!(
+            "SELECT pg_catalog.set_config({}, '', true); \
+             ALTER DATABASE {database} SET {} FROM CURRENT",
+            literal(name),
+            ident(name)
+        ),
+        Ok(list) => format!("ALTER DATABASE {database} SET {} TO {list}", ident(name)),
+        Err(_) => format!(
+            "ALTER DATABASE {database} SET {} TO {}",
+            ident(name),
+            literal(value)
+        ),
+    }
 }
 
 /// Whether a stored setting is the declared one. A list setting is
@@ -1116,6 +1152,8 @@ mod tests {
                 ("datestyle", "ISO, MDY"),
                 // Written without the spaces the engine stores between elements.
                 ("search_path", "\"$user\",public,pg_catalog"),
+                // An empty list, which has no spelling after `TO`.
+                ("temp_tablespaces", ""),
             ] {
                 standard.settings.insert(name.into(), value.into());
             }
@@ -1123,8 +1161,16 @@ mod tests {
                 .public_grants
                 .insert((PUBLIC_GRANTEE.into(), "CREATE".into()));
             let mut login = fixture.connect(&fixture.name).await;
+            login
+                .execute("SET temp_tablespaces = pg_default")
+                .await
+                .unwrap();
             let refused = unappliable(&mut login, &standard).await.unwrap();
             let failed = enforce(&mut login, &standard, None).await.unwrap();
+            // The empty list is copied from a transaction-local value; the
+            // session's own settings are not the standard's to change.
+            let session = login.query("SHOW temp_tablespaces").await.unwrap();
+            let session = text(&session[0], "temp_tablespaces").unwrap();
             let left = verify(&mut login, &standard, None).await.unwrap();
             let again = unappliable(&mut login, &standard).await.unwrap();
             // Negative: an unknown setting and a list the engine cannot read
@@ -1142,6 +1188,7 @@ mod tests {
             assert!(left.is_empty(), "{variable}: {left:#?}");
             assert!(again.is_empty(), "{variable}: {again:#?}");
             assert_eq!(named.len(), 2, "{variable}: {named:#?}");
+            assert_eq!(session, "pg_default", "{variable}");
         }
     }
 }

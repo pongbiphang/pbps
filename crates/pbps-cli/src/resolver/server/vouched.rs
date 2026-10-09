@@ -564,7 +564,8 @@ impl Run<'_> {
         // limit waits for the run login's session: this superuser session
         // counts toward a database's limit though it is not held to it, so a
         // declared limit of 1 would refuse that session (measured on 16 and
-        // 18).
+        // 18). It then goes on alone, since the reproduction builds on this
+        // state in between.
         put_into_standard(
             &mut owner,
             &Standard {
@@ -593,7 +594,9 @@ impl Run<'_> {
         )
         .await
         .map_err(db("the run login's scratch session"))?;
-        put_into_standard(&mut owner, self.standard).await?;
+        standard::put_connection_limit(&mut owner, names.database(), self.standard)
+            .await
+            .map_err(db("the scratch database's connection limit"))?;
         let deployer = map
             .deployer(authorization)
             .map_err(|reason| Error::Scope(reason.into()))?;

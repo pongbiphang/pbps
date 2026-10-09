@@ -1368,6 +1368,74 @@ async fn vouched_release_puts_a_supplied_scratch_back_and_names_what_it_cannot()
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_run_owned_keeps_what_the_reproduction_put_on_its_database() {
+    // The declared limit goes on after the run login's session opens, and
+    // only the limit: the reproduction has by then rebuilt an in-scope
+    // `public` and stored the target's database defaults, which a second
+    // full standardization would refuse and reset (#1708 review).
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = target.target().await;
+    target
+        .run(
+            &target_db,
+            &[&format!(
+                r#"ALTER DATABASE "{target_db}" SET work_mem = '8MB'"#
+            )],
+        )
+        .await;
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let before = scratch.inventory().await;
+    let target_url = target.on(&target_db);
+    let mut planning = Conn::connect(Driver::Postgres, &target_url).await.unwrap();
+    let identity = pbps_pg::resolver::vouched::cluster_identity(&mut planning)
+        .await
+        .unwrap();
+    // `public` on the write path puts it in the reproduction's scope.
+    let extras = ["public".to_owned()];
+    let mut answers = Vec::new();
+    for standard in [
+        Standard {
+            connection_limit: 1,
+            ..Standard::default()
+        },
+        Standard::default(),
+    ] {
+        answers.push(
+            super::produce(
+                Driver::Postgres,
+                &scratch.server,
+                &target_url,
+                &identity,
+                &inputs.binding(),
+                inputs.base(),
+                inputs.desired(),
+                &inputs.hints,
+                &extras,
+                &key.project,
+                Some(ENVIRONMENT),
+                &standard,
+            )
+            .await,
+        );
+    }
+    let unlimited = answers.pop().unwrap();
+    let limited = answers.pop().unwrap();
+    let after = scratch.inventory().await;
+    target.drop().await;
+    assert_answers_the_overload(&limited.unwrap());
+    // Negative: without a declared limit nothing is put on after the
+    // reproduction either.
+    assert_answers_the_overload(&unlimited.unwrap());
+    assert_eq!(
+        before, after,
+        "the run-owned database and roles are dropped"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_run_owned_compiles_under_the_declared_standard() {
     // The database a superuser scratch creates gets the same declared state
     // as a supplied one (#1708): a declared grant to a role the scratch

@@ -2072,8 +2072,9 @@ otherwise under `standard:`.
   that.
 - **The run-owned layout** applies the same declared state to the database
   it creates, so both layouts compile under one state. Its connection limit
-  goes on last, once the run login's session is open: the superuser's own
-  session counts toward the limit though it is not held to it.
+  goes on last and alone, once the run login's session is open: the
+  superuser's own session counts toward the limit though it is not held to
+  it, and the reproduction has by then rebuilt what it scopes on that state.
 
 **Why the state is finite.** A persistent change needs ownership of the
 changed object or a grant option on it. The database owner acts as owner of

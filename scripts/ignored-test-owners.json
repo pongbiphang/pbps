@@ -2165,6 +2165,7 @@
         "resolver::server::vouched::live_tests::vouched_release_puts_a_supplied_scratch_back_and_names_what_it_cannot",
         "resolver::server::vouched::live_tests::vouched_repairs_a_supplied_scratch_an_interrupted_run_left_changed",
         "resolver::server::vouched::live_tests::vouched_run_owned_compiles_under_the_declared_standard",
+        "resolver::server::vouched::live_tests::vouched_run_owned_keeps_what_the_reproduction_put_on_its_database",
         "resolver::server::vouched::live_tests::vouched_refuses_the_target_as_scratch",
         "resolver::server::vouched::live_tests::vouched_runs_in_a_precreated_database_with_a_confined_account"
       ]
