@@ -20418,6 +20418,102 @@ fn an_unasked_partition_default_stays_in_the_envelope_beside_a_spelling_refusal(
     }
 }
 
+/// A partition default left unasked keeps its warning when a later planning
+/// step fails, here the drift check: in JSON it is a
+/// `plan.partition-default-unasked` finding in the one `plan.failed`
+/// envelope, with no warning line on stderr; in human mode its line is printed
+/// once, beside the refusal (#1703). On 18 and 16.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn an_unasked_partition_default_stays_in_the_envelope_when_a_later_step_fails() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (version, server) in [("18", server()), ("16", old)] {
+        let db = OwnDatabase::new(&server, &format!("parts-1703-{version}"));
+        let conn = db.connection().to_owned();
+        on_server(
+            &conn,
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.ev (k integer NOT NULL, v integer DEFAULT 1) \
+                 PARTITION BY RANGE (k); \
+             CREATE TABLE app.ev_a PARTITION OF app.ev FOR VALUES FROM (0) TO (10); \
+             ALTER TABLE app.ev_a ALTER COLUMN v SET DEFAULT 7",
+        );
+        let d = Demo::new(&format!("parts-1703-{version}"));
+        succeeds(d.run(&["pull", "--db", &conn]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+        // Drift on a recorded fact refuses the plan after the probe has run,
+        // and an enabled DDL event trigger leaves its pair unasked (#1669).
+        on_server(
+            &conn,
+            "ALTER TABLE app.ev ALTER COLUMN v SET DEFAULT 2; \
+             CREATE FUNCTION public.pbps_1703_noop() RETURNS event_trigger LANGUAGE plpgsql AS \
+                 $$ BEGIN END $$; \
+             CREATE EVENT TRIGGER pbps_1703_watch ON ddl_command_end \
+                 EXECUTE FUNCTION public.pbps_1703_noop()",
+        );
+        let path = d.dir.join("schema/app.ev.yml");
+        let pulled = std::fs::read_to_string(&path).unwrap();
+        let own = "      v: {default: \"7\"}\n";
+        assert!(pulled.contains(own), "{pulled}");
+        std::fs::write(&path, pulled.replace(own, "      v: {default: \"8\"}\n")).unwrap();
+        d.commit();
+        let refused = "has drifted from the state recorded";
+        let warned = "not checked before the plan whether the engine stores it as the parent's \
+                      default: partition app.ev_a column `v`";
+
+        let o = d.run(&["plan", "--db", &conn, "--format", "json"]);
+        assert_eq!(code(&o), 1, "{version}: {}{}", stdout(&o), stderr(&o));
+        // The catalog's own warnings (a superuser here) go to stderr on every
+        // connected plan; the unasked one must not.
+        assert!(
+            !stderr(&o).contains("not checked before the plan"),
+            "{version}: {}",
+            stderr(&o)
+        );
+        let report = json_output(o);
+        let findings = report["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no findings: {report}"));
+        let failed: Vec<_> = findings
+            .iter()
+            .filter(|f| f["id"] == "plan.failed")
+            .collect();
+        assert_eq!(failed.len(), 1, "{version}: {report}");
+        assert!(
+            failed[0]["message"].as_str().unwrap().contains(refused),
+            "{version}: {report}"
+        );
+        let unasked: Vec<_> = findings
+            .iter()
+            .filter(|f| f["id"] == "plan.partition-default-unasked")
+            .collect();
+        assert_eq!(unasked.len(), 1, "{version}: {report}");
+        assert_eq!(unasked[0]["severity"], "warning", "{version}: {report}");
+        let message = unasked[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains(warned) && message.contains("`pbps_1703_watch`"),
+            "{version}: {message}"
+        );
+
+        // Negative: human mode prints the warning line once, beside the
+        // refusal, and not again from the error.
+        let o = d.run(&["plan", "--db", &conn]);
+        assert_eq!(code(&o), 1, "{version}: {}{}", stdout(&o), stderr(&o));
+        let err = stderr(&o);
+        assert!(
+            err.contains(&format!("warning: {warned}")) && err.contains(refused),
+            "{version}: {err}"
+        );
+        assert_eq!(
+            err.matches(&format!("warning: {warned}")).count(),
+            1,
+            "{version}: {err}"
+        );
+        on_server(&conn, "DROP EVENT TRIGGER pbps_1703_watch");
+    }
+}
+
 /// A partition's own default the probe could not ask about is a typed
 /// warning in a JSON plan's one envelope, with nothing beside it on stderr
 /// (SPEC §9.8; #1660). Human output keeps the warning line. Negative: a pair

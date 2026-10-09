@@ -1386,6 +1386,7 @@
         "an_unasked_partition_default_is_a_warning_in_the_json_plan",
         "an_untrusted_domain_check_leaves_the_partition_default_probe_unrun",
         "an_unasked_partition_default_stays_in_the_envelope_beside_a_spelling_refusal",
+        "an_unasked_partition_default_stays_in_the_envelope_when_a_later_step_fails",
         "an_unlogged_partition_under_an_undeclared_permanent_key_is_refused"
       ]
     },

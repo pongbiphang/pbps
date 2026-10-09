@@ -6419,6 +6419,42 @@ pub fn cmd_plan_db(
     json: bool,
     resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
 ) -> anyhow::Result<()> {
+    // The warnings a step after the probe would drop with its error: that
+    // step's `?` or `bail!` leaves the plan's own findings behind, and the
+    // envelope written for the failure would hold the refusal alone (#1703).
+    let mut carried = Vec::new();
+    plan_db(
+        project,
+        target,
+        out,
+        sql_out,
+        staged,
+        json,
+        resolver_selection,
+        &mut carried,
+    )
+    .map_err(|e| {
+        // A typed refusal already wrote its envelope, warnings and all, and
+        // `main` tells it apart by its type (DECISIONS 485).
+        if e.is::<crate::Found>() {
+            e
+        } else {
+            crate::output::warned(e, carried)
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_db(
+    project: &Project,
+    target: &Target,
+    out: Option<&std::path::Path>,
+    sql_out: Option<&std::path::Path>,
+    staged: bool,
+    json: bool,
+    resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
+    carried: &mut Vec<crate::output::Finding>,
+) -> anyhow::Result<()> {
     let dialect = crate::dialect(project)?;
     let loaded = crate::load(project, dialect.as_ref())?;
     let ids = crate::read_ids(project)?;
@@ -6535,6 +6571,11 @@ pub fn cmd_plan_db(
                 "plan.partition-default-unasked",
                 w,
             ));
+        }
+        // Printed already in human mode; in JSON they are carried to the
+        // envelope of any failure from here on (#1703).
+        if json {
+            carried.clone_from(&findings);
         }
         refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
         let managed = managed_state_full(
