@@ -1409,8 +1409,9 @@ Pinned by `a_tightening_runs_after_the_rows_of_its_table` and
 catalog: where the namespace walk refuses the differ's order, the other orders
 of the renames are walked, and the first one it clears is the plan (#1366).**
 
-*Amended by [DEC-1461.1](#dec-1461-1): a module drop the computed edges
-placed among the drops keeps its place among them.*
+*Amended by [DEC-1461.1](#dec-1461-1) and [DEC-1680.1](#dec-1680-1): a
+module drop the computed edges placed among the drops moves only between what
+those edges order it after and before.*
 The differ orders renames and the drops that free their names from the
 declarations alone (DEC-536.1, DEC-981.3). Some of what decides that order is
 only in the target:
@@ -3421,6 +3422,9 @@ a spatial column's property).
 **DEC-1461.1. The rename search keeps a module drop the computed edges placed
 among the drops in its place among them (#1461; amends DEC-1366.1).**
 
+*Amended by [DEC-1680.1](#dec-1680-1): the search now has the edges' own
+constraints, and the place is kept only for a module drop no edge orders.*
+
 **Context.** DEC-1431.1's pass moves a function's drop to after the last
 removal of a computed column that calls it, and so between two table drops
 when the function is schema-bound to the second: `DROP TABLE dbo.u`,
@@ -3686,3 +3690,110 @@ engine's own refusal, and by these unit tests:
 - `a_table_is_attached_in_one_unscoped_statement`;
 - `a_partition_change_under_a_standing_parent_is_probed`;
 - `an_unlogged_partition_under_a_permanent_key_is_refused_by_name`.
+
+<a id="dec-1680-1"></a>
+
+**DEC-1680.1. The rename search moves a module drop the computed edges ordered
+between what it waits for and what waits for it, by the pairs DEC-1431.1's
+pass hands it (#1680; amends DEC-1461.1 and DEC-1366.1).**
+
+**Context.** DEC-1461.1 held such a module drop in its place among *all* the
+region's drops, which is stricter than its edges. A function holding a
+default's generated name can need to drop after a rename into that table's
+name: run first, it frees the name, the rename's default takes it
+(DEC-981.1), and a check claiming it collides. Its fixed place between two
+table drops ruled out that order, and the plan was refused at `plan --db`.
+
+**Decision.**
+- `computed_order::drop_precedence` gives, after DEC-1431.1's pass, each pair
+  of a change and a drop that waits for it. It uses `release`'s own rule,
+  shared through one function: a function's drop waits for each removal of a
+  computed column that calls it; a module's or table's drop waits for each
+  drop of something schema-bound to it.
+- Two waits are added to that rule, because a module drop can now move later.
+  A computed column's drop waits for the drop of each module schema-bound to
+  it: SQL Server refuses it while such a module stands. The class order runs
+  a module drop (class 0) first, but DEC-1431.1's pass, and now the search,
+  can move it later. A column's drop waits for the drop
+  of each computed column of its table that reads it, which a computed drop
+  moved after such a module could otherwise pass, out of the class order
+  (2 before 5) that kept it first. `release` moves them as it moves the
+  others.
+- `order_computed_by_edges` returns the pairs. The plan pipeline passes them
+  to the rename search. Nothing reorders the plan between the two passes.
+- In the search, a module drop in the region moves like a rename only when
+  all three hold:
+  - a pair names it;
+  - the catalog read found an object under its name, so its drop frees one;
+  - a table rename can claim that name under the collation: its target, a
+    transfer's stop, a moved default's generated or fallback name, or a
+    carried child's name, which is the read's child of the renamed table
+    itself, as `carried_destinations` reads it
+    (`NameFacts::module_drop_matters`).
+
+  The renames are the only claims among the drops. A claim after them runs
+  after every module drop in any order, so no other place can differ.
+  A module drop a pair ties to a movable one, directly or through other
+  module drops, moves too. A function the movable one is bound to drops after
+  it, and held fixed it would pin the movable one in front of it.
+  A module drop ahead of the renames and drops (class 0) joins them by the
+  same rule when a pair names it. One that must only precede a table it is
+  bound to is not moved by DEC-1431.1's pass, yet a rename can need to run
+  before it. Every other change ahead of them still runs first.
+- A module drop that moves only through a pair, a follower, is never a
+  choice of its own. It runs as soon as everything it waits for has run. It
+  frees no name a rename claims, so no other place for it can clear what that
+  place does not.
+- This closes the class the review rounds kept finding: drops are free to
+  commute in the walk, since a drop only frees names. So the only drops worth
+  branching over are those a rename can tell apart. The search still branches
+  over the renames, those module drops and the fixed drops' order against
+  them, as DEC-1366.1 does, under its trial bound and its two-plan remedy. Made
+  movable without this, a table's drop releasing a dozen functions
+  multiplied the orders past the search's bound. That happened with names
+  nothing held, and again with names only added checks claimed. A claim the
+  list misses leaves the drop in DEC-1461.1's place. Every candidate, renames, these module drops and the region's next
+  fixed drop alike, is tried only once everything it waits for in the region
+  has run. A pair whose earlier change ran before the region is met.
+- Any other module drop keeps DEC-1461.1's place among the drops. So does
+  every drop when no edge was read.
+
+**Why the pairs and not the edges.** The search orders positions in one plan;
+the pairs say exactly which positions must precede which, by change, and the
+catalog names and collation they were decided under stay in DEC-1431.1's pass.
+
+Pinned by:
+- `a_module_drop_moves_between_what_its_edges_order_it_after_and_before`
+  (`crates/pbps-cli/src/object_order.rs`). It runs #1680's example, and has
+  two negatives: without the pairs the plan is refused as before, and with
+  the function schema-bound to the table dropped before the rename it is
+  refused rather than moved past that drop.
+- `a_module_drop_among_the_drops_keeps_its_place_in_the_search`, now also
+  with its pairs.
+- `a_module_drop_that_frees_no_name_keeps_its_place` and
+  `a_module_drop_whose_name_no_rename_claims_keeps_its_place`: a table's drop
+  releases eleven function drops. Their names are held by nothing in the
+  first test and claimed only by added checks in the second. In both, the
+  rename is still free to run first; made movable, the drops exhausted the
+  search. The example test's negative keeps a function the catalog does not
+  hold out of the movable set, and `a_transfer_claims_only_its_own_tables_children`
+  counts only the renamed table's children as a transfer's claims.
+- `a_module_drop_tied_to_a_movable_one_moves_with_it`: the example's function
+  is bound to another dropped function, which moves with it to after the
+  rename.
+- `a_follower_module_drop_is_placed_not_searched`: a function the rename
+  must run before, bound to eleven functions the plan drops. The followers are
+  placed after it without branching; searched as choices, they exhausted the
+  bound.
+- `a_leading_module_drop_a_pair_names_moves_too`: a class-0 function that
+  must only precede the table it is bound to moves after the rename, while a
+  class-0 drop no pair names stays first. Without the pair the plan is
+  refused.
+- `what_a_released_function_is_bound_to_follows_it`
+  (`crates/pbps-cli/src/computed_order.rs`), on the pairs themselves.
+- `a_computed_drop_follows_the_module_bound_to_it_and_its_inputs_follow_it`
+  (the same file). It orders a table's drop, then the function it releases,
+  then a computed column the function is bound to, then the column that
+  computed column reads, and checks their pairs. Its negative: unbound, both
+  drops keep their place. The search test above also refuses to move the
+  function past a computed drop bound to it.

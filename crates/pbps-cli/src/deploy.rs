@@ -972,6 +972,63 @@ impl NameFacts {
     fn one<'n>(&'n self, name: &'n TableName) -> &'n TableName {
         self.first.get(name).unwrap_or(name)
     }
+
+    /// Whether where the drop of module `id` runs among `changes`' table
+    /// renames can change what the walk finds (#1680 review). Only then may
+    /// the rename search move it. Two things must hold:
+    /// - The catalog read found an object under its name. Otherwise its drop
+    ///   frees nothing (`Walk::step`).
+    /// - A table rename can claim that name, under the collation. The renames
+    ///   are the only changes among the drops that claim a name. Every claim
+    ///   after them runs after every module drop whatever the order, and every
+    ///   claim before them runs before it.
+    ///
+    /// A rename can claim its target, the stop a transfer passes through, the
+    /// generated and fallback names of each default it moves, and, across
+    /// schemas, the name of each child the read found that it carries
+    /// (`Walk::rename_table`). Missing one leaves the drop where it is, as
+    /// before #1680.
+    // The complement is every change that is not a table rename.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub(crate) fn module_drop_matters(
+        &self,
+        changes: &[pbps_model::PlannedChange],
+        id: &ModuleId,
+    ) -> bool {
+        use pbps_mssql::emit::default_constraint_name as generated;
+        use pbps_mssql::emit::fallback_default_constraint_name as fallback_name;
+        let name = module_object(id);
+        if !self.occupants.iter().any(|o| o.name == name) {
+            return false;
+        }
+        let module = self.one(&name);
+        let in_schema = |t: &TableName, n: &str| TableName::new(t.schema.clone(), n);
+        changes.iter().any(|p| {
+            let pbps_model::Change::RenameTable {
+                from, to, defaults, ..
+            } = &p.change
+            else {
+                return false;
+            };
+            let mut claims = vec![to.clone()];
+            for c in defaults {
+                claims.push(in_schema(to, &generated(to, c)));
+                claims.push(in_schema(to, &fallback_name(to, c)));
+            }
+            if from.schema != to.schema {
+                claims.push(in_schema(to, &from.name));
+                // The children the read found on this table, as
+                // `carried_destinations` reads them.
+                claims.extend(
+                    self.occupants
+                        .iter()
+                        .filter(|o| o.parent.as_ref() == Some(from))
+                        .map(|o| in_schema(to, &o.name.name)),
+                );
+            }
+            claims.iter().any(|c| self.one(c) == module)
+        })
+    }
 }
 
 /// An entry a change puts into the namespace.
@@ -6520,15 +6577,22 @@ pub fn cmd_plan_db(
             // change, and before the checks that read the order.
             crate::engine::release_generated_inputs(&mut conn, &mut cs).await?;
             // A computed column's function drops after it, by the catalog's
-            // edges (DEC-1431.1): before the rename walk, which reads drops
-            // but moves no module.
-            crate::engine::order_computed_by_edges(&mut conn, &mut cs).await?;
+            // edges (DEC-1431.1): before the rename walk, which moves a
+            // module drop only between the drops these edges order it
+            // among (#1680).
+            let precedence = crate::engine::order_computed_by_edges(&mut conn, &mut cs).await?;
             // What an added computed column calls has no edge yet; its names
             // are compared under the collation instead (#1459).
             crate::engine::refuse_added_computed_calls(&mut conn, &cs, &declared).await?;
             // Last of the passes that order the plan, so the order it settles
             // from the catalog is the one checked below and saved (#1366).
-            crate::engine::order_created_object_names(&mut conn, &mut cs, &target.label).await?;
+            crate::engine::order_created_object_names(
+                &mut conn,
+                &mut cs,
+                &target.label,
+                &precedence,
+            )
+            .await?;
             let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
             let drops = crate::engine::check_drop_blockers(&mut conn, &cs).await?;
             crate::engine::prepare_data_writes(&mut conn, &cs, &entry.snapshot, &resolved.ids)
