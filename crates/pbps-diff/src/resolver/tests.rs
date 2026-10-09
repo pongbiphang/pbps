@@ -2289,3 +2289,97 @@ fn evidence_replaces_the_candidate_rebuild_of_an_unchanged_module() {
         moved.changes
     );
 }
+
+/// A partitioned parent's new index stays ahead of each partition's own
+/// under the resolver's order (#1737 review, DEC-1688.1): the ordinary
+/// plan's rank is no edge, and built second, the parent's would take the
+/// partition's own as its clone. An unrelated table's index is not tied to
+/// it.
+#[test]
+fn a_parents_new_index_precedes_its_partitions_own_under_the_resolver() {
+    use pbps_model::{
+        Index, IndexColumn, PartitionBound, PartitionBy, PartitionOf, Schema, Table, TableName,
+    };
+    let parent: TableName = "app.ev".parse().unwrap();
+    let partition: TableName = "app.aa".parse().unwrap();
+    let other: TableName = "app.zz".parse().unwrap();
+    let mut desired = Schema::default();
+    desired.tables.insert(
+        parent.clone(),
+        Table {
+            partition_by: Some(PartitionBy {
+                columns: vec!["ts".into()],
+            }),
+            ..Default::default()
+        },
+    );
+    desired.tables.insert(
+        partition.clone(),
+        Table {
+            partition_of: Some(PartitionOf {
+                parent: parent.clone(),
+                bound: PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        },
+    );
+    desired.tables.insert(other.clone(), Table::default());
+    let index = Index {
+        columns: vec![IndexColumn::column("n")],
+        include: Vec::new(),
+        unique: false,
+        filter: None,
+        method: Default::default(),
+        storage_parameters: Default::default(),
+    };
+    let add = |table: &TableName, name: &str| {
+        PlannedChange::new(Change::AddIndex {
+            table: table.clone(),
+            name: name.into(),
+            index: Box::new(index.clone()),
+            clustered: false,
+        })
+    };
+    // In the wrong order, as nothing else would keep them.
+    let changes = ChangeSet {
+        changes: vec![
+            add(&partition, "own"),
+            add(&other, "z_n"),
+            add(&parent, "ev_n"),
+        ],
+    };
+    let ids = pbps_model::IdsFile::default();
+    let side = crate::Side {
+        schema: &desired,
+        ids: &ids,
+    };
+    let edges = graph::constraints(
+        &changes,
+        changes.changes.len(),
+        &[],
+        &Default::default(),
+        side,
+        side,
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.before == 2 && e.after == 0 && e.reason == OrderReason::Structural),
+        "{edges:?}"
+    );
+    // Negative: nothing ties the unrelated table's index to either.
+    assert!(
+        !edges.iter().any(|e| e.before == 1 || e.after == 1),
+        "{edges:?}"
+    );
+    let ordered = order(changes, edges).unwrap();
+    let tables: Vec<&TableName> = ordered
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| p.change.table())
+        .filter(|t| **t != other)
+        .collect();
+    assert_eq!(tables, [&parent, &partition]);
+}

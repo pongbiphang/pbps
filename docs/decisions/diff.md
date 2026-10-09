@@ -4151,3 +4151,85 @@ Pinned by:
 - the CLI's
   `a_partitioned_parents_column_changes_reach_its_partitions_own_through_the_cli`,
   on 18 and on 16.
+
+<a id="dec-1688-1"></a>
+
+**DEC-1688.1. A standing range-partitioned parent's indexes are added and
+dropped as a table's are, the engine recursing each into every partition,
+and three combinations are refused by name (#1688).**
+
+The second of #1546's four slices (leon, 2026-10-08). Measured on 16.15 and
+18.6, on a populated tree:
+- `CREATE INDEX` on the parent recurses and takes SHARE on every partition,
+  each partition getting the engine's clone, which the reader leaves to the
+  parent (DEC-1577.1). `DROP INDEX` takes the clones with it.
+- A storage parameter given at the parent's `CREATE INDEX` reaches every
+  clone. `ALTER INDEX … SET` is refused on a partitioned index, so a change
+  to one stays refused, as every other change to a partitioned parent is.
+- `CONCURRENTLY` is refused on a partitioned table, building or dropping.
+- A unique index lacking a partition-key column is refused: "unique
+  constraint on partitioned table must include all partitioning columns".
+- A new parent index adopts a partition's own index that matches it, which
+  becomes the parent's clone. The method, the keys in order with their
+  classes, uniqueness, the predicate and the `INCLUDE` columns must match. A
+  key's direction and the storage parameters need not: `(id DESC)` and an
+  index `WITH (fillfactor = 70)` were both adopted.
+
+**What is planned.** On a parent standing before and after the plan,
+`AddIndex` and `DropIndex` are admitted with no new change kind. An index
+under a new name is a drop and an add, as on any table. The pre-flight probes
+a new unique index over the parent, which reads every partition's rows. The
+cost estimate names the recursion and the lock on each partition, as it does
+for a column change (DEC-1687.1).
+
+**Refused by name, before any DDL:**
+- **an index change with `strategy: online` on the parent.** The emitter
+  would write `CONCURRENTLY`. Dropping the hint silently would lock every
+  partition the operator asked to keep writable. The remedy is to remove the
+  table's strategy for that plan.
+- **a unique index without every partition-key column.** The engine refuses
+  it, and the refusal names the missing column.
+- **a new index that a declared partition's own index would be adopted
+  into** (leon, 2026-10-08, on #1546). The adoption leaves the partition
+  without its own index on every later read, and the next plan would create
+  it again beside the clone. The remedy is to drop or rename the partition's
+  own index in an earlier plan, or in the same plan, whose drop runs first.
+  Only an own index standing when the parent's is built is asked: one a
+  partition held before the plan and the plan does not drop, and every one of
+  a partition the plan creates, which is created with them. Held, not equal:
+  an own index kept across its parent's column rename is compared as renamed
+  and never dropped, so it stands (#1737 review). One the plan adds to a standing
+  partition is its own, because a partitioned parent's `AddIndex` sorts first
+  in class 13, at (13, 0), before any partition's own (#1737 review). The
+  parent's goes first, not the partition's last: last would put an own index
+  after a replica identity naming it. A rank is no edge, and the resolver
+  keeps only edges, so its graph carries a structural one from a parent's
+  `AddIndex` to each `AddIndex` on its partitions (#1737 review). The
+  dependents' weave keeps the plan's order among what it moves.
+- **an index change in a plan that attaches, detaches or drops a partition
+  under the parent**, the same two plans a column change takes (DEC-1687.1).
+  A detach checks its shape against the parent's indexes as they stood, and
+  a unique index's probe reads the rows of a partition the plan removes
+  before the index is built (#1737 review).
+
+An offline `plan` reads its baseline from git. Until this PR, that baseline
+left out the partitions a parent's file declares. Every standing partition
+then read as absent: its own changes went unplanned, and its own index read
+as one the plan creates (#1737 review). The git baseline now loads them as
+the declarations do.
+
+A predicate or an expression key is a possible match whatever its text, as
+on the attach path (DEC-1545.1). The engine compares what each parses and
+binds to: measured on 16 and 18, `WHERE n > 0` adopted an own `WHERE n>0`,
+and `(n + 1)` adopted an own `(n+1)` (#1737 review). The refusal therefore
+says the index "can take" the partition's own. It also refuses some indexes
+the engine would not adopt, such as different predicates, or the same text
+binding to another function under a partition in another schema. That class
+of ambiguous adoption is #1671's, the resolver's to rehearse.
+
+`ONLY` is not used. It leaves the parent's index invalid until every
+partition's index is attached by hand, which is not one statement.
+
+Pinned by `a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken`
+and by the CLI's `a_partitioned_parents_indexes_change_through_the_cli`, on 18
+and on 16.
