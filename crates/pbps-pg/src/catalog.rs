@@ -2630,19 +2630,20 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
     // can rewrite would run that role's code with the deployer's privileges
     // during a plan that is read-only, and an error it raises can carry what
     // it read (#1663). Which domains a declared text reaches is the parse's
-    // to find, and another role can wire a new check into a type it owns or
-    // create a type a declared text names between this read and the store
-    // (#1706), so any type or schema it can change leaves every pair unasked.
+    // to find, and nothing holds the catalog still between a read and the
+    // store, so any role but a trusted one that can change it at all leaves
+    // every pair unasked (#1707).
     if refused.is_none() {
-        refused = match code_other_roles_can_change(conn).await {
+        refused = match untrusted_catalog_writers(conn).await {
             Ok(names) if names.is_empty() => None,
             Ok(names) => Some(format!(
-                "a role other than this one or a superuser can change {}, and storing a \
-                 default can run a check it writes there as this role",
+                "the role(s) {}, neither a superuser nor able to become this one, can \
+                 change this database's catalog, and storing a default can run a check \
+                 written there as this role",
                 names.join(", ")
             )),
             Err(e) => Some(format!(
-                "cannot read who can change the target's types: {}",
+                "cannot read who can change the target's catalog: {}",
                 redacted(e)
             )),
         };
@@ -2710,94 +2711,75 @@ async fn enabled_ddl_event_triggers(conn: &mut Conn) -> Result<Vec<String>, DbEr
         .collect()
 }
 
-/// What a role other than this one or a superuser could make the parse run
-/// as this role: a domain, composite, range or multirange type it owns, a
-/// schema it can create in, this database when it can create a schema in
-/// it, and a domain whose CHECK calls a function or operator it owns. Ownership is not enough to read alone: between this
-/// read and the store, an owner can add a `NOT VALID` CHECK to a domain that
-/// has none, or give its composite or table a column of a new domain, and a
-/// role that can create in a schema, or create a schema in this database,
-/// can create the type a declared text names. Each ran the new check through the parse, measured on 16 and 18
-/// (#1706). A role acts as another when it can `SET ROLE` to it or inherits
-/// its privileges; a membership granted with neither lets it do nothing as
-/// that role. A role "other" is one that can act neither as this role nor
-/// as a superuser. It reaches every role along memberships granted with
-/// `SET`, `INHERIT` or `ADMIN`: with `ADMIN` it can grant that role, with
-/// `SET`, to a role of its own before the store. That walks more than any one
-/// role can use, which only leaves the probe unrun more often, and it walks
-/// `pg_auth_members` once rather than asking `pg_has_role` of every pair,
-/// which took seconds over a few hundred roles. A type or schema counts when
-/// such a role reaches its owner or holds `CREATE` through a role it reaches. Predefined
-/// roles act only through their members, so `pg_database_owner` counts only
-/// when the database's owner is another role. A function a trusted one calls
-/// by name inside its body is not recorded in the catalog and is not seen;
-/// that body is its trusted owner's to write.
-async fn code_other_roles_can_change(conn: &mut Conn) -> Result<Vec<String>, DbError> {
+/// The roles other than this one or a superuser that can change this
+/// database's catalog, and so what a default's parse reaches, between the
+/// probe's read and its store (#1707). Listing the dangerous kinds of object
+/// failed five ways in review: a check added `NOT VALID` to a domain, a
+/// column of a new domain added to a composite or table, a type created in
+/// a schema or a new schema, a membership granted without `SET`, and one
+/// granted with `ADMIN` alone (#1706). Catalog lookups see DDL other sessions
+/// commit mid-transaction, so the only state that holds until the store is
+/// one no such role can change at all.
+///
+/// A role is trusted when it is a superuser or can `SET ROLE` to this role
+/// or to a superuser. Inheriting this role's privileges is not enough: the
+/// check would run with `current_user` this role, which a row security
+/// policy tells apart from a member that only inherits. From each other
+/// role the read walks `pg_auth_members` along memberships granted with
+/// `SET`, `INHERIT` or `ADMIN` (with `ADMIN` it can grant the role with `SET`
+/// to one of its own), once rather than asking `pg_has_role` of every pair,
+/// which took seconds over a few hundred roles. The catalog is open to it
+/// when anything it reaches is this role or a superuser, owns any object in
+/// this database (whatever its kind: a `pg_shdepend` owner row), or holds
+/// `CREATE` on the database or a schema. Predefined roles act only through
+/// their members, so `pg_database_owner` counts only under another owner.
+async fn untrusted_catalog_writers(conn: &mut Conn) -> Result<Vec<String>, DbError> {
     let rows = conn
         .query(
             "WITH RECURSIVE me AS (
                  SELECT r.oid FROM pg_catalog.pg_roles r
                   WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER),
+             here AS (
+                 SELECT db.oid, db.datdba FROM pg_catalog.pg_database db
+                  WHERE db.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()),
              others AS (
-                 SELECT r.oid FROM pg_catalog.pg_roles r
+                 SELECT r.oid, r.rolname FROM pg_catalog.pg_roles r
                   WHERE r.oid OPERATOR(pg_catalog.>=) 16384::pg_catalog.oid
                     AND NOT r.rolsuper
                     AND NOT pg_catalog.pg_has_role(r.oid, (SELECT oid FROM me), 'SET')
-                    AND NOT pg_catalog.pg_has_role(r.oid, (SELECT oid FROM me), 'USAGE')
                     AND NOT EXISTS (
                         SELECT FROM pg_catalog.pg_roles su
                          WHERE su.rolsuper
                            AND pg_catalog.pg_has_role(r.oid, su.oid, 'SET'))),
-             reach AS (
-                 SELECT oid FROM others
+             walk AS (
+                 SELECT o.oid AS origin, o.oid FROM others o
                  UNION
-                 SELECT m.roleid FROM pg_catalog.pg_auth_members m
-                   JOIN reach r ON r.oid OPERATOR(pg_catalog.=) m.member
+                 SELECT w.origin, m.roleid FROM pg_catalog.pg_auth_members m
+                   JOIN walk w ON w.oid OPERATOR(pg_catalog.=) m.member
                   WHERE m.set_option OR m.inherit_option OR m.admin_option),
-             owners AS (
-                 SELECT oid FROM reach
+             reach AS (
+                 SELECT origin, oid FROM walk
                  UNION
-                 SELECT 'pg_database_owner'::pg_catalog.regrole::pg_catalog.oid
-                  WHERE EXISTS (
-                      SELECT FROM pg_catalog.pg_database db
-                       WHERE db.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
-                         AND db.datdba OPERATOR(pg_catalog.=) ANY (SELECT oid FROM reach)))
-             SELECT pg_catalog.format('type `%I.%I`', n.nspname, t.typname) AS name
-               FROM pg_catalog.pg_type t
-               JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.typnamespace
-              WHERE t.typtype OPERATOR(pg_catalog.=) ANY ('{d,c,r,m}'::pg_catalog.\"char\"[])
-                AND NOT pg_catalog.pg_is_other_temp_schema(n.oid)
-                AND (t.typowner OPERATOR(pg_catalog.=) ANY (SELECT oid FROM owners)
-                     OR EXISTS (
-                         SELECT FROM pg_catalog.pg_constraint c
-                           JOIN pg_catalog.pg_depend d
-                             ON d.classid OPERATOR(pg_catalog.=)
-                                    'pg_catalog.pg_constraint'::pg_catalog.regclass
-                            AND d.objid OPERATOR(pg_catalog.=) c.oid
-                           LEFT JOIN pg_catalog.pg_operator o
-                             ON d.refclassid OPERATOR(pg_catalog.=)
-                                    'pg_catalog.pg_operator'::pg_catalog.regclass
-                            AND o.oid OPERATOR(pg_catalog.=) d.refobjid
-                           JOIN pg_catalog.pg_proc p
-                             ON p.oid OPERATOR(pg_catalog.=) CASE
-                                    WHEN d.refclassid OPERATOR(pg_catalog.=)
-                                         'pg_catalog.pg_proc'::pg_catalog.regclass
-                                    THEN d.refobjid
-                                    ELSE o.oprcode::pg_catalog.oid END
-                          WHERE c.contypid OPERATOR(pg_catalog.=) t.oid
-                            AND c.contype OPERATOR(pg_catalog.=) 'c'
-                            AND p.proowner OPERATOR(pg_catalog.=) ANY (SELECT oid FROM owners)))
-             UNION
-             SELECT pg_catalog.format('schema `%I`', n.nspname)
-               FROM pg_catalog.pg_namespace n
-              WHERE NOT pg_catalog.pg_is_other_temp_schema(n.oid)
-                AND EXISTS (SELECT FROM reach g
-                             WHERE pg_catalog.has_schema_privilege(g.oid, n.oid, 'CREATE'))
-             UNION
-             SELECT pg_catalog.format('database `%I`', pg_catalog.current_database())
-              WHERE EXISTS (SELECT FROM reach g
-                             WHERE pg_catalog.has_database_privilege(
-                                       g.oid, pg_catalog.current_database(), 'CREATE'))
+                 SELECT w.origin, 'pg_database_owner'::pg_catalog.regrole::pg_catalog.oid
+                   FROM walk w JOIN here ON here.datdba OPERATOR(pg_catalog.=) w.oid)
+             SELECT DISTINCT pg_catalog.format('`%I`', o.rolname) AS name
+               FROM others o
+               JOIN reach r ON r.origin OPERATOR(pg_catalog.=) o.oid
+              WHERE r.oid OPERATOR(pg_catalog.=) (SELECT oid FROM me)
+                 OR EXISTS (SELECT FROM pg_catalog.pg_roles su
+                             WHERE su.oid OPERATOR(pg_catalog.=) r.oid AND su.rolsuper)
+                 OR EXISTS (
+                        SELECT FROM pg_catalog.pg_shdepend d
+                         WHERE d.refclassid OPERATOR(pg_catalog.=)
+                                   'pg_catalog.pg_authid'::pg_catalog.regclass
+                           AND d.refobjid OPERATOR(pg_catalog.=) r.oid
+                           AND d.dbid OPERATOR(pg_catalog.=) (SELECT oid FROM here)
+                           AND d.deptype OPERATOR(pg_catalog.=) 'o')
+                 OR pg_catalog.has_database_privilege(r.oid, (SELECT oid FROM here), 'CREATE')
+                 OR EXISTS (
+                        SELECT FROM pg_catalog.pg_namespace n
+                         WHERE NOT pg_catalog.pg_is_other_temp_schema(n.oid)
+                           AND pg_catalog.has_schema_privilege(r.oid, n.oid, 'CREATE'))
               ORDER BY 1",
         )
         .await?;

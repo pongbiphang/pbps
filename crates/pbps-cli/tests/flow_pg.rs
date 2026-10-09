@@ -20084,18 +20084,24 @@ fn an_unlogged_partition_under_an_undeclared_permanent_key_is_refused() {
     succeeds(d.run(&["verify", "--db", &conn]));
 }
 
-/// A domain whose CHECK another role can change leaves every partition
-/// default pair unasked: storing a literal of a composite over it runs the
-/// check as the deployer, and that role's function could read and raise what
-/// only the deployer can (#1663). Its function never runs, and nothing it
-/// would have read reaches the output. A type that role owns with no check
-/// yet does the same: it could add one before the store (#1706). Negatives:
-/// without them, the pair is asked and refused as the parent's, a domain the
-/// deployer owns calling only built-ins does not stop it, and a text the
-/// engine refuses is told by its SQLSTATE alone. On 18 and 16.
+/// A role other than the deployer or a superuser that can change the
+/// database's catalog leaves every partition default pair unasked, naming the
+/// role: storing a literal of a composite over its domain runs the domain's
+/// check as the deployer, and its function could read and raise what only
+/// the deployer can (#1663). Its function never runs, and nothing it would
+/// have read reaches the output. So does each way it could change the
+/// catalog before the store: types it owns with no check yet, `CREATE` on the
+/// database, `ADMIN` on the deploying role, or inheriting it without `SET`
+/// (#1707). Negatives: without it, the pair is asked and refused as the
+/// parent's, a domain the deployer owns calling only built-ins does not stop
+/// it, and a text the engine refuses is told by its SQLSTATE alone. On 18
+/// and 16.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
 fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
+    const LOW: &str = "partition app.ev_a column `v`: the role(s) `pbps_1663_low`, neither \
+                       a superuser nor able to become this one, can change this database's \
+                       catalog";
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
     for (version, server) in [("18", server()), ("16", old)] {
         let db = OwnDatabase::new(&server, &format!("parts-1663-{version}"));
@@ -20158,9 +20164,10 @@ fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
         assert!(
             err.contains(
                 "warning: not checked before the plan whether the engine stores it as the \
-                 parent's default: partition app.ev_a column `v`: a role other than this \
-                 one or a superuser can change schema `evil`, type `evil.c`, type `evil.d`, \
-                 and storing a default can run a check it writes there as this role"
+                 parent's default: partition app.ev_a column `v`: the role(s) \
+                 `pbps_1663_low`, neither a superuser nor able to become this one, can \
+                 change this database's catalog, and storing a default can run a check \
+                 written there as this role"
             ),
             "{version}: {out}{err}"
         );
@@ -20189,14 +20196,7 @@ fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
         let plan = d.dir.join("held.json");
         let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
         let err = stderr(&o);
-        assert!(
-            err.contains(
-                "partition app.ev_a column `v`: a role other than this one or a superuser \
-                 can change type `held.c`, type `held.nc`, type `held.t`, and storing"
-            ),
-            "{version}: {}{err}",
-            stdout(&o)
-        );
+        assert!(err.contains(LOW), "{version}: {}{err}", stdout(&o));
 
         // A role that can create a schema in the database can create the type
         // a declared text names, in a schema no read could have seen (#1706).
@@ -20211,12 +20211,7 @@ fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
         let plan = d.dir.join("creator.json");
         let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
         let err = stderr(&o);
-        assert!(
-            err.contains("a role other than this one or a superuser can change database `")
-                && err.contains("`, and storing a default can run a check"),
-            "{version}: {}{err}",
-            stdout(&o)
-        );
+        assert!(err.contains(LOW), "{version}: {}{err}", stdout(&o));
 
         // Negative: without them, and beside a domain the deployer owns that
         // calls only built-ins, the pair is asked and refused as the parent's.
@@ -20235,12 +20230,22 @@ fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
         let plan = d.dir.join("admin.json");
         let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
         let err = stderr(&o);
-        assert!(
-            err.contains("a role other than this one or a superuser can change ")
-                && err.contains("type `app.ev`"),
-            "{version}: {}{err}",
-            stdout(&o)
+        assert!(err.contains(LOW), "{version}: {}{err}", stdout(&o));
+
+        // A member that inherits the deploying role's privileges but cannot
+        // SET to it is not the deployer: `current_user` tells them apart, so
+        // a check it writes would see what a row policy hides from it (#1706).
+        on_server(
+            &conn,
+            "DO $$ BEGIN EXECUTE pg_catalog.format( \
+                 'GRANT %I TO pbps_1663_low WITH ADMIN FALSE, INHERIT TRUE', \
+                 CURRENT_USER); END $$",
         );
+        declare("(5)");
+        let plan = d.dir.join("inherit.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        let err = stderr(&o);
+        assert!(err.contains(LOW), "{version}: {}{err}", stdout(&o));
 
         on_server(
             &conn,

@@ -3800,17 +3800,18 @@ Pinned by:
 
 <a id="dec-1663-1"></a>
 
-**DEC-1663.1. The partition-default probe runs no domain CHECK another role
-can change, and tells a failure by its SQLSTATE, never the engine's words
-(#1663; amends DEC-1609.1).** Storing a declared default parses it as the
-deployer. Measured on 16 and 18, the parse runs neither a domain's CHECK
-for a literal of the domain itself nor a user cast's function. It does run a
-domain's CHECK when it reads a literal as a composite, array or range over
-that domain: `record_in` and `array_in` call the element's input function,
-which for a domain is `domain_in`. A role with `CREATE` in any schema can
-own such a domain, and a check that calls its PL/pgSQL function ran with the
-deployer's privileges and raised a table only the deployer could read. The
-rollback took back no read, and the error text carried it to the output.
+**DEC-1663.1. The partition-default probe runs only on a catalog no
+untrusted role can change, and tells a failure by its SQLSTATE, never the
+engine's words (#1663, #1707; amends DEC-1609.1).** Storing a declared
+default parses it as the deployer. Measured on 16 and 18, the parse runs
+neither a domain's CHECK for a literal of the domain itself nor a user
+cast's function. It does run a domain's CHECK when it reads a literal as a
+composite, array or range over that domain: `record_in` and `array_in` call
+the element's input function, which for a domain is `domain_in`. A role
+with `CREATE` in any schema can own such a domain, and a check that calls
+its PL/pgSQL function ran with the deployer's privileges and raised a table
+only the deployer could read. The rollback took back no read, and the error
+text carried it to the output.
 
 The issue offered two fixes: run the probes as a role with no data access,
 or refuse types whose functions an untrusted role owns. The first needs a
@@ -3821,35 +3822,34 @@ neither a range's `canonical` nor a type modifier function. Every input
 function the parse reaches is a superuser's; what another role can write is
 a domain's CHECK.
 
-A check present when the probe looks is not the only one it can meet. The
-read and the store are separate statements, and nothing locks a type
-against `ALTER`. Between them, measured on 16 and 18, the owner of a domain
-with no check can add a `NOT VALID` one, the owner of a composite or a table
-can give it a column of a new domain, and a role that can create in a schema
-can create the type a declared text names, and a role that can create in
-the database can create that schema first; each ran its new check through
-the parse (#1706). So the read is of what another role could change, not of
-the checks there now. A role acts as another when it can `SET ROLE` to it
-or inherits its privileges; a membership granted with neither lets it do
-nothing as that role (#1706). A role is another when it can act neither as
-the current role nor as a superuser. It reaches every role along
-memberships granted with `SET`, `INHERIT` or `ADMIN`, since with `ADMIN` it
-can grant that role with `SET` to a role of its own before the store
-(#1706). That walk is wider than any one role can use, which only leaves
-the probe unrun more often. Before
-storing anything the probe reads every domain, composite, range or
-multirange type whose owner such a role reaches, every schema where such a
-role holds `CREATE` through any role it reaches, the database itself when such a role can create a schema
-in it, and every domain whose CHECK calls a function or operator such a
-role owns. Predefined roles act only through their members, so
-`public`, owned by `pg_database_owner`, counts only when the database's
-owner is another role. With any of them, nothing is stored and each pair
-stays unasked with a warning naming them, as under an event trigger
-(#1669); the apply's closing check still refuses a wrong recording. Which
-types a declared text reaches is the parse's to find, so the read covers
-the database. A function a trusted one calls by name inside its body
-is not in the catalog's dependencies and is not seen. That body is its
-trusted owner's to write, and the apply would run it all the same.
+A check present when the probe looks is not the only one it can meet.
+Reading the dangerous kinds of object failed five ways in review (#1706):
+between the read and the store, measured on 16 and 18, the owner of a
+domain with no check can add a `NOT VALID` one; the owner of a composite or
+a table can give it a column of a new domain; a role that can create in a
+schema, or create a schema in the database, can create the type a declared
+text names; a role holding `ADMIN` on another can grant it with `SET` to
+one of its own; and a member that only inherits the deployer was taken for
+it, though `current_user` tells them apart under a row security policy.
+Catalog lookups see what other sessions commit mid-transaction, and nothing
+locks a type against `CREATE` or `ALTER`, so no read of the present state
+holds until the store. The rule is instead that the catalog is closed
+(#1707): a role is trusted when it is a superuser or can `SET ROLE` to the
+current role or to a superuser, and from every other role the probe walks
+`pg_auth_members` along memberships granted with `SET`, `INHERIT` or
+`ADMIN`. When anything a walk reaches is the current role or a superuser,
+owns any object in this database (a `pg_shdepend` owner row, whatever the
+object's kind), or holds `CREATE` on the database or on a schema, nothing is
+stored and each pair stays unasked with a warning naming the untrusted
+roles, as under an event trigger (#1669); the apply's closing check still
+refuses a wrong recording. Predefined roles act only through their members,
+so `pg_database_owner` counts only under another database owner. The walk
+is wider than any one role can use, and it counts a concurrent session's
+temporary objects; both only leave the probe unrun more often, never run it
+where it should not. Under the single-deployer assumption (SPEC §7.6), a
+database pbps manages alone keeps the probe. A function a trusted one calls
+by name inside its body is not seen; that body is its trusted owner's to
+write, and the apply would run it all the same.
 
 A failure inside the probe is reported as "the engine refused it (SQLSTATE
 22P02)", never the server's text. That text is whatever the code the parse
@@ -3863,16 +3863,12 @@ Pinned on 16 and 18 by the CLI's
 
 - a role's domain whose check counts its runs and raises a deployer-only
   table, reached through a composite literal in a declared default, leaves
-  the pair unasked with the domain named; the check never runs and the
+  the pair unasked with the role named; the check never runs and the
   table's contents appear nowhere in the output;
-- a domain with no check, a composite and a table another role owns, in a
-  schema it can no longer create in, leave the pair unasked with each type
-  named, though that role is a member of the deploying role without `SET`
-  or `INHERIT` (#1706);
-- `CREATE` on the database alone leaves the pair unasked with the database
-  named (#1706);
-- `ADMIN` on the deploying role, without `SET` or `INHERIT`, leaves the pair
-  unasked with the deployer's own types named (#1706);
+- each alone leaves the pair unasked with the role named (#1707): a domain
+  with no check, a composite and a table it owns in a schema it can no
+  longer create in; `CREATE` on the database; `ADMIN` on the deploying role
+  without `SET` or `INHERIT`; `INHERIT` on it without `SET`;
 - without it, and beside a domain the deployer owns that calls only
   built-ins, the pair is asked and refused as the parent's;
 - a default the engine refuses is told as `SQLSTATE 22P02`, without the
