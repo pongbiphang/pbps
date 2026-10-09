@@ -5759,11 +5759,13 @@ pub fn cmd_bootstrap(
     crate::dependents::later_relation_refusal(&refused)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
 
-    // Rendered now, written with a target only once every refusal has passed,
-    // just before the build runs: a script written first overwrote the file
-    // with one the same command then refused (#1684). Not only the checks
-    // before the lock: some under it refuse the declarations themselves, two
-    // roles the collation reads as one name among them (DECISIONS 123).
+    // Rendered now; with a target, written as the build's last step inside
+    // its transaction, after the ledger row: a script written first
+    // overwrote the file with one the same command then refused (#1684).
+    // Refusals come before the lock, under it (two roles the collation reads
+    // as one name, DECISIONS 123) and after the build (a definer routine
+    // without a pinned path, #322), so only the end of the build is past all
+    // of them. A write that fails there rolls the build back with it.
     let script = sql_out
         .map(|_| crate::render_sql(&cs, dialect.as_ref(), "an empty database"))
         .transpose()?;
@@ -5923,7 +5925,6 @@ pub fn cmd_bootstrap(
                 );
             }
 
-            write_script()?;
             transaction_attempted = true;
             execute_transaction_body(&mut conn, dialect.as_ref(), &statements).await?;
             // Bootstrap creates routines as `apply` does, so the same form is
@@ -5983,6 +5984,7 @@ pub fn cmd_bootstrap(
             // declared is exactly what bootstrap holds (ADR-0009 §2.2).
             snapshot.declared = pbps_model::Declared::from_schema(&loaded.schema);
             let id = crate::engine::record(&mut conn, &snapshot).await?;
+            write_script()?;
             Ok::<_, anyhow::Error>((id, snapshot))
         }
         .await;

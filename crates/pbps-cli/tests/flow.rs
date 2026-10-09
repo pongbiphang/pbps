@@ -3301,8 +3301,9 @@ fn a_key_to_a_case_variant_of_a_history_is_refused_under_the_collation() {
     assert!(!stderr(&o).contains("13565"), "{}", stderr(&o));
 }
 
-/// #1684: `bootstrap --sql --db` writes its script only once every refusal
-/// has passed. Written first, it replaced the file with a script the same
+/// #1684: `bootstrap --sql --db` writes its script only as the build's last
+/// step, once every refusal has passed (one after the build is pinned in
+/// `flow_pg`'s definer test). Written first, it replaced the file with a script the same
 /// command then refused. #1625's refusal before the lock, and two roles the
 /// collation reads as one name under it (DECISIONS 123), each stop the
 /// command, and an existing file keeps what it held; the same command over a
