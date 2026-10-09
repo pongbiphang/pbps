@@ -2070,14 +2070,17 @@ fn index_step(k: usize) -> Step {
 /// is ASCII; otherwise there is none, and a literal naming it can be missed,
 /// the failed apply DEC-1576.1 accepts, but never refused wrongly.
 fn key_candidate(table: &str, n: u32) -> Option<String> {
-    let name = pbps_pg::implicit_primary_key_fallback(table, n);
     let suffix = if n == 0 {
         "_pkey".len()
     } else {
         "_pkey".len() + n.to_string().len()
     };
-    let kept = name.len() - suffix;
-    (kept == table.len() || table.as_bytes()[..kept].is_ascii()).then_some(name)
+    // Every byte the cut may keep is ASCII, so it falls at the same place in
+    // every encoding; a UTF-8 cut short of a wider character would not
+    // (#1729 review).
+    let room = pbps_pg::MAX_IDENT_BYTES - suffix;
+    (table.len() <= room || table.as_bytes()[..room].is_ascii())
+        .then(|| pbps_pg::implicit_primary_key_fallback(table, n))
 }
 
 /// The `(schema, prefix)` every name [`key_candidate`] may try for each of
@@ -2259,12 +2262,16 @@ fn freed_before(cs: &ChangeSet, holder: &KeyNameHolder, at: (usize, Step)) -> bo
                             && holder.name.schema == from.schema)
                 }
                 // By the table and the name, so an index a rename carried to
-                // another schema is freed there too.
-                Change::DropIndex { table, name }
-                | Change::DropUnique { table, name }
-                | Change::DropCheck { table, name }
-                | Change::DropForeignKey { table, name } => {
+                // another schema is freed there too, and by kind: a unique
+                // constraint is its index and itself, the rest one of them.
+                Change::DropUnique { table, name } => {
                     owned_by(&now(table)) && holder.name.name == *name
+                }
+                Change::DropIndex { table, name } => {
+                    !holder.constraint && owned_by(&now(table)) && holder.name.name == *name
+                }
+                Change::DropCheck { table, name } | Change::DropForeignKey { table, name } => {
+                    holder.constraint && owned_by(&now(table)) && holder.name.name == *name
                 }
                 Change::SetPrimaryKey {
                     table,
@@ -6377,8 +6384,16 @@ mod tests {
             Some(format!("{}_pkey", "u".repeat(58)))
         );
         // Negative: past the cut with other characters inside it, the name
-        // depends on the database's encoding and is not told.
+        // depends on the database's encoding and is not told, even where a
+        // UTF-8 cut would drop the wider character: one byte in LATIN1, it
+        // is kept there (#1729 review).
         assert_eq!(key_candidate(&"ä".repeat(31), 0), None);
+        let tail = format!("{}é", "a".repeat(57));
+        assert_eq!(key_candidate(&tail, 0), None);
+        assert_eq!(
+            key_candidate(&tail, 1),
+            Some(format!("{}_pkey1", "a".repeat(57)))
+        );
         // Negative: a named key's index is its name, not the generated one;
         // a name the plan also declares is the declared relation's, and the
         // key's index is numbered; another table's key is another name.
@@ -6472,6 +6487,7 @@ mod tests {
             name: TableName::new("app", name),
             owner: owner.map(|o| TableName::new("app", o)),
             primary_key,
+            constraint: false,
         };
         // What the planner refuses, with the target asked about nothing:
         // each name told is qualified here, so none is asked.
@@ -6529,9 +6545,10 @@ mod tests {
         assert!(found[0].contains("names app.t_pkey"), "{found:?}");
 
         // Negative: a holder kept numbers the key, so the name stays the
-        // holder's, which the default binds; the same with a constraint of
-        // the schema on another table, one the plan adds earlier, or a holder
-        // dropped only after the key.
+        // holder's, which the default binds; the same with an index of
+        // another table, a holder whose table the plan drops is another, or
+        // a holder dropped only after the key. A check the plan adds earlier
+        // numbers the key too.
         let check = Change::AddCheck {
             table: TableName::new("app", "t"),
             name: "n_pkey".into(),
@@ -6564,9 +6581,38 @@ mod tests {
                 "{changes:?}"
             );
         }
-        // ... and the numbered name is where the key's index arrives.
+        // ... and the numbered name is where the key's index arrives, as
+        // with a check of that name on the target now.
         let found = refused(vec![check, keyed_as("n", &names("n_pkey1"))], &[]);
         assert_eq!(found.len(), 1, "{found:?}");
+        let checked = KeyNameHolder {
+            constraint: true,
+            ..holder("n_pkey", Some("t"), false)
+        };
+        let found = refused(
+            vec![keyed_as("n", &names("n_pkey1"))],
+            std::slice::from_ref(&checked),
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        // A check and an index of one name on one table are two holders:
+        // dropping the check leaves the index, which numbers the key
+        // (measured on 16 and 18, #1729 review).
+        let drop_check = Change::DropCheck {
+            table: TableName::new("app", "t"),
+            name: "n_pkey".into(),
+        };
+        let both = [checked, holder("n_pkey", Some("t"), false)];
+        assert_eq!(
+            refused(
+                vec![drop_check.clone(), keyed_as("n", &names("n_pkey"))],
+                &both
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            refused(vec![drop_check, keyed_as("n", &names("n_pkey1"))], &both).len(),
+            1
+        );
         // Negative: a name the plan declares earlier is that relation's,
         // and the key's index is numbered past it.
         assert_eq!(
@@ -6646,6 +6692,7 @@ mod tests {
             name: TableName::new("app", "old_pkey"),
             owner: Some(TableName::new("app", "old")),
             primary_key: true,
+            constraint: false,
         }];
         assert_eq!(refused(swapped("old_pkey"), &old_key), Vec::<String>::new());
         assert_eq!(refused(swapped("old_pkey1"), &old_key).len(), 1);
@@ -6662,11 +6709,13 @@ mod tests {
                 name: TableName::new("app", "n_pkey"),
                 owner: None,
                 primary_key: false,
+                constraint: false,
             },
             KeyNameHolder {
                 name: TableName::new("archive", "n_pkey1"),
                 owner: Some(TableName::new("archive", "t")),
                 primary_key: false,
+                constraint: false,
             },
         ];
         assert_eq!(refused(moved("n_pkey1"), &held), Vec::<String>::new());

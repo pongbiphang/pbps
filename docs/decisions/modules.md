@@ -1854,7 +1854,12 @@ key's index. A table moved into the key's schema earlier brings its indexes
 and constraints along under their names (measured on 16 and 18), so the
 holders of the schema it leaves are read too, and count from the move on. A
 dropped table goes by the name it has when it is dropped, never by one a
-later rename gives another table (#1729 review). The key takes the first candidate left free, and that name is
+later rename gives another table. A check and an index of one name on one
+table are two holders, and dropping one leaves the other (measured on 16
+and 18). Past the identifier limit a candidate is told only when every byte
+the cut may keep is ASCII, so the cut falls in the same place in every
+encoding: in LATIN1, 57 `a`s and `é` keep the `é` that a UTF-8 cut drops
+(measured on 18, #1729 review). The key takes the first candidate left free, and that name is
 its arrival like any declared one, so the target is no longer asked about
 it.
 

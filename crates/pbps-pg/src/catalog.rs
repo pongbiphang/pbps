@@ -3191,6 +3191,10 @@ pub struct KeyNameHolder {
     pub owner: Option<TableName>,
     /// Whether it is a primary key's index or constraint.
     pub primary_key: bool,
+    /// Whether it is a constraint rather than a relation: a check and an
+    /// index of one name on one table are two holders, and dropping one
+    /// leaves the other.
+    pub constraint: bool,
 }
 
 /// The [`KeyNameHolder`]s whose names start with one of `prefixes`, each a
@@ -3216,7 +3220,8 @@ pub async fn key_name_holders(
         "WITH wanted(schema_name, prefix) AS (VALUES {})\n\
          SELECT n.nspname AS schema_name, c.relname::text AS holder_name,\n       \
                 ownns.nspname AS owner_schema, own.relname AS owner_name,\n       \
-                COALESCE(i.indisprimary, false) AS primary_key\n  \
+                COALESCE(i.indisprimary, false) AS primary_key,\n       \
+                false AS is_constraint\n  \
            FROM pg_catalog.pg_class c\n  \
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n  \
            LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid\n  \
@@ -3226,7 +3231,7 @@ pub async fn key_name_holders(
                          WHERE w.schema_name = n.nspname\n                    \
                            AND starts_with(c.relname::text, w.prefix))\n\
          UNION ALL\n\
-         SELECT n.nspname, con.conname::text, tn.nspname, t.relname, con.contype = 'p'\n  \
+         SELECT n.nspname, con.conname::text, tn.nspname, t.relname, con.contype = 'p', true\n  \
            FROM pg_catalog.pg_constraint con\n  \
            JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace\n  \
            LEFT JOIN pg_catalog.pg_class t ON t.oid = con.conrelid\n  \
@@ -3259,6 +3264,9 @@ pub async fn key_name_holders(
             owner,
             primary_key: row.try_get::<bool>("primary_key")?.ok_or_else(|| {
                 DbError::BadRow("the key-name holder query returned a NULL primary_key".into())
+            })?,
+            constraint: row.try_get::<bool>("is_constraint")?.ok_or_else(|| {
+                DbError::BadRow("the key-name holder query returned a NULL is_constraint".into())
             })?,
         });
     }
