@@ -3301,11 +3301,12 @@ fn a_key_to_a_case_variant_of_a_history_is_refused_under_the_collation() {
     assert!(!stderr(&o).contains("13565"), "{}", stderr(&o));
 }
 
-/// #1684: `bootstrap --sql --db` writes its script only once the target's
-/// refusals before the lock have passed. Written first, it replaced the file
-/// with a script the same command then refused. Here #1625's refusal stops
-/// the command and an existing file keeps what it held; the same command over
-/// a valid declaration writes it.
+/// #1684: `bootstrap --sql --db` writes its script only once every refusal
+/// has passed. Written first, it replaced the file with a script the same
+/// command then refused. #1625's refusal before the lock, and two roles the
+/// collation reads as one name under it (DECISIONS 123), each stop the
+/// command, and an existing file keeps what it held; the same command over a
+/// valid declaration writes it.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn a_refused_bootstrap_leaves_its_sql_file_as_it_was() {
@@ -3328,6 +3329,19 @@ fn a_refused_bootstrap_leaves_its_sql_file_as_it_was() {
          references: dbo.t_history(id)\n",
     )
     .unwrap();
+    // Two roles the collation reads as one name, refused under the lock, after
+    // the key's refusal before it.
+    let roles = d.dir.join("schema").join("roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    // Distinct filenames keep both on a case-insensitive filesystem.
+    let pair = [("first.yml", "Reader"), ("second.yml", "reader")];
+    for (file, role) in pair {
+        std::fs::write(
+            roles.join(file),
+            format!("role: {role}\ngrants:\n  dbo.t: [select]\n"),
+        )
+        .unwrap();
+    }
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "offline: {}{}", stdout(&o), stderr(&o));
     d.commit();
@@ -3354,9 +3368,28 @@ fn a_refused_bootstrap_leaves_its_sql_file_as_it_was() {
     assert!(!stdout(&o).contains("wrote"), "{}", stdout(&o));
     assert_eq!(std::fs::read_to_string(&sql).unwrap(), before);
 
-    // Negative: without the key the refusal does not apply, and the script
-    // is written; the database was left empty by the refused run.
+    // Without the key, the roles' refusal under the lock: one name to this
+    // database.
     std::fs::remove_file(&child).unwrap();
+    d.commit();
+    let o = bootstrap();
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o)
+            .contains("two declared roles are one name to this database: `Reader` and `reader`"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!stdout(&o).contains("wrote"), "{}", stdout(&o));
+    assert_eq!(std::fs::read_to_string(&sql).unwrap(), before);
+
+    // Negative: without either, nothing refuses, and the script is written;
+    // the database was left empty by the refused runs.
+    // Bootstrap reads the declarations as they stand, so neither the key's
+    // table nor the roles need a recorded drop.
+    for (file, _) in pair {
+        std::fs::remove_file(roles.join(file)).unwrap();
+    }
     d.commit();
     let o = bootstrap();
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));

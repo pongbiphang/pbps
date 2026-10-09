@@ -5759,11 +5759,11 @@ pub fn cmd_bootstrap(
     crate::dependents::later_relation_refusal(&refused)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
 
-    // Rendered now, written only once nothing before the lock refuses: with
-    // a target, a script written first overwrote the file with one the same
-    // command then refused (#1684). The checks under the lock still follow
-    // it; they ask whether the target is empty, which the script, a preview
-    // of the build into an empty database, does not depend on.
+    // Rendered now, written with a target only once every refusal has passed,
+    // just before the build runs: a script written first overwrote the file
+    // with one the same command then refused (#1684). Not only the checks
+    // before the lock: some under it refuse the declarations themselves, two
+    // roles the collation reads as one name among them (DECISIONS 123).
     let script = sql_out
         .map(|_| crate::render_sql(&cs, dialect.as_ref(), "an empty database"))
         .transpose()?;
@@ -5801,7 +5801,6 @@ pub fn cmd_bootstrap(
         // A history retention or a cascading key the server lacks (#1502).
         crate::engine::refuse_unsupported_temporal(&mut conn, &cs).await?;
         crate::engine::permission_support(&mut conn, &cs).await?;
-        write_script()?;
         crate::engine::lock(&mut conn, &operator).await?;
         let mut transaction_attempted = false;
         let result = async {
@@ -5924,6 +5923,7 @@ pub fn cmd_bootstrap(
                 );
             }
 
+            write_script()?;
             transaction_attempted = true;
             execute_transaction_body(&mut conn, dialect.as_ref(), &statements).await?;
             // Bootstrap creates routines as `apply` does, so the same form is
