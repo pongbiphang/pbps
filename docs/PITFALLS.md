@@ -2316,14 +2316,23 @@ Three traps sat inside the fix, and each of them is a measurement:
   An open-only post-delete scan still misses a dependent created after the
   final enumeration and then closed by deletion. DEC-1458.1 adds an operation
   window, a complete repository-wide `state=all` scan and recorded-ID reads.
-  Newly discovered parent dependents fail closeout; unchanged PRs demonstrably
-  closed before the window do not. Ambiguous association or an incomplete read
-  stops local cleanup, and recovery must not overwrite a recreated foreign ref.
+  Newly discovered parent dependents fail closeout, subject to DEC-1475.1's
+  independent deliberate closure exemption below. Ambiguous association or an
+  incomplete read stops local cleanup, and recovery must not overwrite a recreated foreign ref.
   Selecting only newly created PRs still misses an older PR whose base changes
   to the parent and back within the window. DEC-1473.1 audits complete base/state
   transitions for the union of initial/final identities and recorded dependents.
   Equal endpoint snapshots and creation/update timestamps cannot prove absence
   of that association; unrelated activity alone does not establish it.
+  Detection is not permission to reopen: a collaborator may deliberately close
+  a dependent during the window but before deletion. DEC-1475.1 preserves a
+  proven independent pre-request closure regardless of age, with complete
+  closure/reopen/base history, deliberate-close evidence and unchanged closed
+  state/base/head/content. Actor, timestamp or current closed state alone cannot
+  prove intent. Unknown cause or ambiguous ordering stops cleanup and PR recovery
+  mutations; only proven deletion damage authorizes reopening. Later reopen,
+  changed content or renewed association needs fresh dependent checks, while
+  proven unrelated reopen/close activity needs no recovery.
 
 ## A pre-delete count includes the row its statement removes
 

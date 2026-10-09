@@ -207,14 +207,28 @@ checksum-pinned, and state lives in the database itself.
   Missing anchors, hidden/incomplete history, inconsistent state or ambiguous
   boundary ordering stop cleanup; do not replace history with a delay or poll
   indefinitely for a favorable snapshot (DEC-1473.1).
-  A newly discovered parent-dependent PR is failed
+  For a proven parent association, apply DEC-1475.1's closure-provenance check
+  before classifying failure or changing a closed PR. Preserve a deliberate
+  closure proven independent and strictly before the deletion request, regardless
+  of PR age. Retain complete closure/reopen/base history, available actors and
+  timestamps, linked evidence of the deliberate close, and its head/content
+  baseline; actor or timestamp alone does not prove intent. Require unchanged
+  closed state/base/head/content through the final read, with no later reopen or
+  renewed parent association. Proven unrelated reopen/close activity needs no
+  recovery. Otherwise a newly discovered parent-dependent PR is failed
   closeout, including one that is now closed. Do not invent a pre-delete head
   or expected diff for it; retain its observed state/base/head/diff and inspect
-  the commit provenance before recovery. An unchanged older PR demonstrably
-  closed before the window is not a failure. Failed, incomplete or ambiguous
+  the commit provenance before recovery. The same independent-closure exemption
+  applies to PRs closed before the window. Failed, incomplete or ambiguous
   reads stop local cleanup. Recover only the exact owned parent ref; an atomic
   missing-ref lease must prevent overwriting a changed or foreign ref, then
-  reopen/explicitly retarget and verify affected dependents before retrying.
+  reopen only a dependent proven closed by this deletion, then explicitly
+  retarget and verify affected open dependents before retrying. Unknown closure
+  cause or ambiguous ordering stops cleanup and PR recovery mutations; obtain
+  missing evidence or the collaborator's direction instead of assuming consent
+  to reopen. A later reopen, changed head/content or renewed parent association
+  invalidates the closure exemption and requires fresh state/base/head/expected
+  patch checks (DEC-1475.1).
   A confirmed empty set must pass both scans. Do not rely on automatic
   retargeting or rebase merely for cleanup. Existing review and current-head CI
   gates still apply to each dependent before enqueueing; refresh them after the

@@ -832,17 +832,20 @@ deletion ends the window. Use inclusive timestamp boundaries and require
 evidence before treating a PR as outside the window. Re-read all recorded dependents by ID and inspect
 PRs created in the window. Current base names do not prove prior association:
 inspect base-ref history when needed, and stop if that evidence cannot decide.
-Every newly discovered parent-dependent PR is failed closeout, including one
-now closed or already retargeted. Record its observed state, base, head and
+Subject to DEC-1475.1's independent deliberate closure exemption, every newly
+discovered parent-dependent PR is failed closeout, including one now closed or
+already retargeted. Record its observed state, base, head and
 remaining diff, and inspect commit provenance to establish expected surviving
 work; no earlier head or patch is fabricated. Recorded dependents must retain
-their expected OPEN/base/head/content checks. An unchanged older PR known to
-have been closed before the window is not a closeout failure.
+their expected OPEN/base/head/content checks unless DEC-1475.1 establishes an
+independent deliberate closure. That exemption also applies to closures before
+the window.
 
 Any failed, incomplete or ambiguous read stops local cleanup. Restore only the
 exact recorded owned parent head using an atomic missing-ref lease; a recreated
 changed or foreign ref is not overwritten. Reopen and explicitly retarget
-affected dependents, verify their state/head/base/expected content, and repeat
+affected dependents only as authorized by DEC-1475.1's closure-provenance rule,
+verify their state/head/base/expected content, and repeat
 the closeout before retrying deletion. Existing review and associated current-
 head CI gates remain required. A verified empty-dependent case needs no base
 changes but still requires the pre-delete and all-state post-delete reads.
@@ -962,13 +965,13 @@ checks. No wait or repeated snapshot can substitute for missing history.
 A newly established parent dependent fails closeout even if it is now closed or
 already retargeted. Retain its observed state/base/head/diff without inventing
 an earlier head or expected patch, then inspect commit provenance and apply
-the existing recovery and verification rules. An unchanged intentionally closed
-older PR remains exempt only with complete evidence that it was closed before
-the window and acquired no new parent association or reopen in it. Unrelated
-activity with a proven absence of parent association requires no recovery.
-This extends association detection; independent closure provenance remains the
-separate #1475 contract. Preserve actual merge, recorded-ID reads, exact-owned-
-head atomic missing-ref restoration, refusal to overwrite a recreated foreign
+the existing recovery and verification rules, subject to DEC-1475.1's deliberate
+independent closure exemption. Proven absence of parent association requires no
+recovery even if an older PR reopens and closes again within the window. A
+reopen or renewed association of an actual dependent instead requires fresh
+checks under DEC-1475.1; PR age does not decide either case. This decision
+extends association detection; DEC-1475.1 supplies closure provenance. Preserve
+actual merge, recorded-ID reads, exact-owned-head atomic missing-ref restoration, refusal to overwrite a recreated foreign
 ref, expected surviving content and associated current-head review/CI gates.
 
 Read-only retained #1226 history supplies real closure, reopen and
@@ -981,3 +984,69 @@ intentional closure, unrelated activity, changed head or missing content,
 incomplete/missing history and boundary ambiguity. Removing only this
 association-history rule must restore the missed-dependency result. These are
 policy qualifications; they do not claim an automated enforcement mechanism.
+
+
+<a id="dec-1475-1"></a>
+
+**DEC-1475.1. Parent association requires investigation, not permission to undo
+an independent deliberate closure.** DEC-1458.1's blanket failure/reopen rule
+can override a collaborator who intentionally closed a dependent during the
+window but before the owned deletion request. DEC-1473.1 detects association
+regardless of age; the closure disposition must also be independent of age.
+
+First establish parent association with the bounded complete history audit.
+Proven unrelated closure or reopen/close activity needs no recovery, including
+an older PR with equal final snapshots. Missing association history remains
+unknown, not unrelated. For an actual dependent, preserve its closed state and
+base without reopening or retargeting only when all of the following hold:
+
+- Complete readable closure, reopen and base-ref history, with a trustworthy
+  anchor and available actors/timestamps, establishes a deliberate closure
+  independent of the owned deletion and strictly before its request. Retain
+  linked evidence of an explicit close action or collaborator confirmation;
+  actor, `closed_at`, state reason and the absence of a deletion event alone do
+  not establish deliberate intent or causation. Timestamp ties or precision
+  insufficient to order closure against the request are ambiguous, not exempt.
+- Record the closure's head and content baseline from retained observations or
+  verifiable event/commit provenance; never invent an earlier head or expected
+  patch for a newly discovered PR. The final closed state, base, head and content
+  must agree with that baseline, with no subsequent reopen or renewed parent
+  association through the post-delete read. Missing content or provenance stops
+  cleanup. Apply this same rule to recorded and newly discovered dependents,
+  whether created before or during the window.
+
+This exception preserves an independent deliberate closure; it does not exempt
+an open dependent, deletion-caused closure, changed head/content, later reopen
+or renewed association. Those cases require fresh current state/base/head and
+expected surviving patch checks. Reopen only when evidence establishes closure
+caused by this owned deletion, then explicitly retarget and verify the open PR.
+For an independent closure that no longer qualifies, or an unknown closure
+cause, stop cleanup and PR recovery mutations: retain the observations and
+obtain missing evidence or the collaborator's direction before changing their closed
+PR. Restoring the exact owned parent ref under an atomic missing-ref lease may
+preserve recoverability; it does not itself authorize reopening. Never overwrite
+a changed or foreign ref. No repeated polling substitutes for missing evidence.
+
+The exemption changes the disposition after association is established, not
+the identity set, operation window or actual-merge prerequisite. Retain both
+all-state scans, recorded-ID reads, complete history including both timestamp
+boundaries, exact-owned-head protection and expected surviving content. Any
+retargeted open dependent still needs existing current-head review and complete
+associated CI before enqueueing. No cleanup executor or new service is added.
+
+Read-only #1226 history retains a `ClosedEvent` and `BaseRefDeletedEvent` at
+2026-09-27T23:37:04Z with the same actor, followed by reopen and base change.
+The closure's `intent` and `closer` fields are null; its `COMPLETED` state reason
+also occurs on the later merged closure. These are actual API observations, not
+proof that an actor name or state reason identifies a deliberate independent
+close. Retain them without creating throwaway production PRs or inferring an
+unobserved intentional-close race.
+
+Offline policy controls cover deliberate pre-request closure of both older and
+in-window PRs, deletion-caused closure, independent-close-then-reopen, renewed
+association, changed head/content, missing baseline, unavailable/incomplete
+history, unrelated closures and timestamp ambiguity. The unrelated older
+reopen/close case must stay clear even with equal endpoint snapshots. Removing
+only the exemption must restore false recovery of intentional-closure controls;
+weakening unknown-history refusal must expose unsafe acceptance. These qualify
+the written policy, not a shipped automated enforcement mechanism.
