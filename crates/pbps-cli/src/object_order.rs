@@ -284,6 +284,11 @@ struct Search<'c> {
     renames: Vec<usize>,
     /// The module drops that move, by position.
     modules: Vec<usize>,
+    /// The module drops among them that move only because a pair ties them
+    /// to one whose name a rename can claim. Their own place matters to no
+    /// rename, so each runs as soon as what it waits for has run, and is never
+    /// a choice of its own (#1680 review).
+    followers: BTreeSet<usize>,
     /// What each change of the region waits for, by position: the edges'
     /// order of the drops (`computed_order::drop_precedence`).
     waits: BTreeMap<usize, BTreeSet<usize>>,
@@ -349,6 +354,7 @@ impl<'c> Search<'c> {
                         Change::DropModule { id, .. } if facts.module_drop_matters(changes, id))
             })
             .collect();
+        let relevant = movable.clone();
         loop {
             let before = movable.len();
             for &(a, b) in &pairs {
@@ -423,6 +429,7 @@ impl<'c> Search<'c> {
             drops,
             renames,
             modules,
+            followers: movable.difference(&relevant).copied().collect(),
             waits,
             moves,
             owners,
@@ -486,8 +493,28 @@ impl<'c> Search<'c> {
         if !self.seen.insert((drop, left.clone(), walk.state())) {
             return None;
         }
-        let mut candidates: Vec<usize> = left.iter().copied().collect();
-        candidates.extend(self.drops.get(drop));
+        // A follower whose waits have run goes next, alone: it frees no name
+        // a rename claims, so no other place for it can clear what this one
+        // does not, and branching over where it goes multiplied the orders
+        // past the bound for a function bound to a dozen others.
+        let ready = |i: &usize| {
+            self.waits
+                .get(i)
+                .is_none_or(|before| before.iter().all(|b| order.contains(b)))
+        };
+        let forced = left
+            .iter()
+            .copied()
+            .find(|i| self.followers.contains(i) && ready(i));
+        let mut candidates: Vec<usize> = match forced {
+            Some(i) => vec![i],
+            None => left
+                .iter()
+                .copied()
+                .filter(|i| !self.followers.contains(i))
+                .chain(self.drops.get(drop).copied())
+                .collect(),
+        };
         candidates.sort_unstable();
         for i in candidates {
             if self
@@ -1547,6 +1574,69 @@ mod tests {
         // clears the plan.
         let mut cs = ChangeSet { changes: plan() };
         order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &[]).unwrap_err();
+    }
+
+    /// #1680 review: a module drop that moves only because a pair ties it to
+    /// a movable one runs as soon as it may, and is never a choice of its
+    /// own. `F` holds the name the rename's default would take and is bound
+    /// to eleven functions the plan drops too. Branching over where each of
+    /// those goes exhausted the search before it tried the rename first.
+    #[test]
+    fn a_follower_module_drop_is_placed_not_searched() {
+        let new = name("dbo.new");
+        let generated = default_constraint_name(&new, "x");
+        let drop_function = |n: &str| {
+            PlannedChange::new(Change::DropModule {
+                id: pbps_model::ModuleId::Named(name(n)),
+                kind: pbps_model::ModuleKind::Function,
+            })
+        };
+        let f = drop_function(&format!("dbo.{generated}"));
+        let followers: Vec<PlannedChange> = (0..11)
+            .map(|k| drop_function(&format!("dbo.g{k}")))
+            .collect();
+        let mut changes = vec![f.clone()];
+        changes.extend(followers.iter().cloned());
+        changes.push(rename("dbo.old", "dbo.new", &["x"]));
+        changes.push(PlannedChange::new(Change::AddCheck {
+            table: name("dbo.t"),
+            name: generated.clone(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "a > 0".into(),
+            },
+        }));
+        let occupants = [
+            held(
+                &format!("dbo.{}", default_constraint_name(&name("dbo.old"), "x")),
+                "default constraint",
+                Some("dbo.old"),
+                Some("x"),
+            ),
+            held(
+                &format!("dbo.{generated}"),
+                "sql scalar function",
+                None,
+                None,
+            ),
+        ];
+        let precedence: Vec<(Change, Change)> = followers
+            .iter()
+            .map(|g| (f.change.clone(), g.change.clone()))
+            .collect();
+        let facts = NameFacts::new(&occupants, &[]);
+        let search = Search::new(&changes, &precedence, &facts);
+        assert_eq!(search.followers.len(), 11);
+        let mut cs = ChangeSet { changes };
+        order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &precedence).unwrap();
+        assert!(
+            matches!(cs.changes[0].change, Change::RenameTable { .. }),
+            "{:?}",
+            cs.changes
+        );
+        let at = |c: &Change| cs.changes.iter().position(|p| p.change == *c).unwrap();
+        for g in &followers {
+            assert!(at(&f.change) < at(&g.change), "{:?}", cs.changes);
+        }
     }
 
     /// A drop on a renamed table names the table as it is called where the
