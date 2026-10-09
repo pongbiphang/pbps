@@ -245,8 +245,12 @@ async fn effective_schemas(
     let rows = conn
         .query(&format!(
             "SELECT pg_catalog.array_to_json(pg_catalog.current_schemas(true))::text AS path \
-             FROM (SELECT pg_catalog.set_config('search_path', '{}', true)) AS s",
-            render_path(schema, extras).replace('\'', "''")
+             FROM (SELECT pg_catalog.set_config('search_path', {}, true)) AS s",
+            // Setting-independent: a supplied scratch session may read this
+            // before any framing pins `standard_conforming_strings`, and a
+            // backslash in a schema name would otherwise be an escape
+            // (#1678 review).
+            super::authorization::setting_literal(&render_path(schema, extras))
         ))
         .await?;
     let [row] = rows.as_slice() else {
@@ -322,7 +326,42 @@ fn required(row: &pbps_db::Row, field: &str, what: &str) -> Result<String, DbErr
 
 #[cfg(test)]
 mod tests {
-    use super::{json_list, render_path, without_temp_schemas};
+    use super::{json_list, render_path, render_visibility, without_temp_schemas};
+
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn a_schema_with_a_backslash_is_on_the_path_whatever_the_string_mode() {
+        // A supplied scratch session reads the path before any framing pins
+        // `standard_conforming_strings`, and the login's own default may
+        // turn it off: a backslash in the name was then an escape, and the
+        // schema left the path (#1678 review).
+        use pbps_db::{Conn, Driver};
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+            let mut conn = Conn::connect(Driver::Postgres, &base).await.unwrap();
+            let schema = format!(
+                r"pbps_path1678\n{}",
+                crate::catalog::probe_token().replace('-', "_")
+            );
+            let quoted = format!("\"{schema}\"");
+            conn.query(&format!("CREATE SCHEMA {quoted}"))
+                .await
+                .unwrap();
+            conn.query("SET standard_conforming_strings = off")
+                .await
+                .unwrap();
+            let path = super::effective_schemas(&mut conn, &schema, &[]).await;
+            conn.query("RESET standard_conforming_strings")
+                .await
+                .unwrap();
+            conn.query(&format!("DROP SCHEMA {quoted}")).await.unwrap();
+            assert_eq!(
+                path.unwrap(),
+                render_visibility(&["pg_catalog".to_owned(), schema.clone()]),
+                "{variable}"
+            );
+        }
+    }
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|name| (*name).to_owned()).collect()

@@ -1193,6 +1193,12 @@ fn literal(value: &str) -> String {
     format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
+/// [`literal`], for the other resolver modules that build statements
+/// before any framing pins the string mode.
+pub(crate) fn setting_literal(value: &str) -> String {
+    literal(value)
+}
+
 fn boolean(rows: &[Row], field: &str) -> Result<bool, DbError> {
     match rows {
         [row] => flag(row, field),

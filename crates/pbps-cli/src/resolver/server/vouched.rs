@@ -232,6 +232,8 @@ enum Created {
     Supplied {
         database: String,
         defaults: std::collections::BTreeSet<(String, String)>,
+        /// The usage of `public` the run took, to grant back.
+        given_up: Vec<sql::GivenUp>,
     },
 }
 
@@ -590,7 +592,11 @@ impl Run<'_> {
         // not reach the same server: a name may resolve to several hosts or a
         // balancing proxy, and `DROP OWNED` there would empty something else
         // (#1678 review).
-        self.created = Created::Supplied { database, defaults };
+        self.created = Created::Supplied {
+            database,
+            defaults,
+            given_up: Vec::new(),
+        };
         sql::create_schemas(admin, scope_schemas)
             .await
             .map_err(db("the in-scope schemas"))?;
@@ -599,9 +605,12 @@ impl Run<'_> {
             .into_iter()
             .filter(|schema| scope_schemas.contains(schema))
             .collect::<Vec<_>>();
-        sql::revoke_usage(admin, &unusable)
+        let given_up = sql::revoke_usage(admin, &unusable)
             .await
             .map_err(db("the schemas the deployer cannot use"))?;
+        if let Created::Supplied { given_up: kept, .. } = &mut self.created {
+            *kept = given_up;
+        }
         pbps_pg::resolver::authorization::apply_session_settings(admin, context)
             .await
             .map_err(db("the deployer's settings"))?;
@@ -696,7 +705,11 @@ impl Run<'_> {
                     Err(remaining)
                 }
             }
-            Created::Supplied { database, defaults } => {
+            Created::Supplied {
+                database,
+                defaults,
+                given_up,
+            } => {
                 // The checked connection, never a new one, and only on the
                 // checked backend: see `supplied`.
                 let mut remaining = match sql::drop_owned(admin, self.backend).await {
@@ -715,6 +728,16 @@ impl Run<'_> {
                 }
                 .err()
                 .unwrap_or_default();
+                match sql::restore_usage(admin, &given_up).await {
+                    Ok(differing) => remaining.extend(differing),
+                    Err(error) => remaining.extend(given_up.iter().map(|given| {
+                        format!(
+                            "usage of schema {} by {}, not granted back ({error})",
+                            given.schema,
+                            given.grantees.join(", ")
+                        )
+                    })),
+                }
                 // A definition may have changed the login's own defaults,
                 // which outlive the database's contents (see
                 // `sql::login_defaults`). Named, never left unread.

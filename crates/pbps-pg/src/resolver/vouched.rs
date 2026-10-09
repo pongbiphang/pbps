@@ -682,26 +682,132 @@ pub async fn create_schemas(
     Ok(())
 }
 
+/// `USAGE` on a schema the run took from roles other than the login, to be
+/// granted back by [`restore_usage`]: the schema, the grantees, and its ACL
+/// as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GivenUp {
+    pub schema: String,
+    pub grantees: Vec<String>,
+    pub acl: String,
+}
+
 /// Gives up the scratch login's `USAGE` on each schema the target's
-/// deployer will not be able to use. An owner may revoke its own
-/// privileges, and the schema then leaves its effective search path, as it
-/// leaves the deployer's (measured on 16 and 18); `DROP OWNED` still drops
-/// it.
+/// deployer will not be able to use. A schema the login owns, it revokes
+/// from itself: an owner may, and the schema then leaves its effective
+/// search path, as it leaves the deployer's (measured on 16 and 18);
+/// `DROP OWNED` still drops it. initdb's `public` is the one other schema a
+/// supplied database holds; the login reaches it through `PUBLIC` and its
+/// membership of `pg_database_owner`, so it revokes those as
+/// `pg_database_owner` and returns them for [`restore_usage`] (#1678
+/// review). A schema the database does not hold is skipped.
 pub async fn revoke_usage(
     conn: &mut impl ExecuteConnection,
     schemas: &[String],
-) -> Result<(), DbError> {
+) -> Result<Vec<GivenUp>, DbError> {
+    let mut given_up = Vec::new();
     for schema in schemas {
         if super::authorization::is_system_schema(schema) {
             continue;
         }
-        conn.execute(&format!(
-            "REVOKE USAGE ON SCHEMA \"{}\" FROM SESSION_USER",
-            schema.replace('"', "\"\"")
-        ))
-        .await?;
+        let quoted = format!("\"{}\"", schema.replace('"', "\"\""));
+        let rows = conn
+            .query(&format!(
+                "SELECT (n.nspowner = (SELECT r.oid FROM pg_catalog.pg_roles r \
+                                        WHERE r.rolname = session_user))::text AS own, \
+                        pg_catalog.pg_get_userbyid(n.nspowner)::text AS owner, \
+                        COALESCE(n.nspacl, \
+                            pg_catalog.acldefault('n', n.nspowner))::text AS acl, \
+                        (SELECT pg_catalog.string_agg(CASE WHEN x.grantee = 0 THEN 'PUBLIC' \
+                                     ELSE pg_catalog.pg_get_userbyid(x.grantee)::text END, \
+                                  ',' ORDER BY x.grantee) \
+                           FROM pg_catalog.aclexplode(COALESCE(n.nspacl, \
+                                    pg_catalog.acldefault('n', n.nspowner))) x \
+                          WHERE x.privilege_type = 'USAGE' \
+                            AND (x.grantee = 0 OR x.grantee = n.nspowner)) AS grantees \
+                   FROM pg_catalog.pg_namespace n WHERE n.nspname = {}",
+                super::authorization::setting_literal(schema)
+            ))
+            .await?;
+        let Some(row) = rows.first() else {
+            continue;
+        };
+        if text(row, "own")? == "true" {
+            conn.execute(&format!(
+                "REVOKE USAGE ON SCHEMA {quoted} FROM SESSION_USER"
+            ))
+            .await?;
+            continue;
+        }
+        let owner = text(row, "owner")?;
+        if owner != "pg_database_owner" {
+            return Err(DbError::BadRow(format!(
+                "schema {schema} is owned by {owner}, whose grants the scratch login cannot give up"
+            )));
+        }
+        let grantees = row
+            .try_get::<&str>("grantees")?
+            .map(|list| list.split(',').map(str::to_owned).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if grantees.is_empty() {
+            continue;
+        }
+        let acl = text(row, "acl")?;
+        conn.execute("SET ROLE pg_database_owner").await?;
+        let revoked = conn
+            .execute(&format!(
+                "REVOKE USAGE ON SCHEMA {quoted} FROM {}",
+                grantees.join(", ")
+            ))
+            .await;
+        conn.execute("SET ROLE NONE").await?;
+        revoked?;
+        given_up.push(GivenUp {
+            schema: schema.clone(),
+            grantees,
+            acl,
+        });
     }
-    Ok(())
+    Ok(given_up)
+}
+
+/// Grants back what [`revoke_usage`] took from roles other than the login,
+/// and names each schema whose ACL is not then as it was.
+pub async fn restore_usage(
+    conn: &mut impl ExecuteConnection,
+    given_up: &[GivenUp],
+) -> Result<Vec<String>, DbError> {
+    let mut differing = Vec::new();
+    for given in given_up {
+        let quoted = format!("\"{}\"", given.schema.replace('"', "\"\""));
+        conn.execute("SET ROLE pg_database_owner").await?;
+        let granted = conn
+            .execute(&format!(
+                "GRANT USAGE ON SCHEMA {quoted} TO {}",
+                given.grantees.join(", ")
+            ))
+            .await;
+        conn.execute("SET ROLE NONE").await?;
+        granted?;
+        let rows = conn
+            .query(&format!(
+                "SELECT COALESCE(n.nspacl, \
+                        pg_catalog.acldefault('n', n.nspowner))::text AS acl \
+                   FROM pg_catalog.pg_namespace n WHERE n.nspname = {}",
+                super::authorization::setting_literal(&given.schema)
+            ))
+            .await?;
+        let acl = rows.first().map(|row| text(row, "acl")).transpose()?;
+        if acl.as_deref() != Some(given.acl.as_str()) {
+            differing.push(format!(
+                "schema {}'s privileges, {} instead of {}",
+                given.schema,
+                acl.as_deref().unwrap_or("absent"),
+                given.acl
+            ));
+        }
+    }
+    Ok(differing)
 }
 
 /// Removes everything the scratch login owns in the supplied database, so
@@ -905,12 +1011,37 @@ mod tests {
                 let before = login_defaults(&mut login).await?;
                 // A schema the deployer will not be able to use leaves the
                 // login's usage too, and still goes with the cleanup.
+                // So does initdb's public, reached through PUBLIC and
+                // pg_database_owner, and it is granted back as it was.
                 login.execute("CREATE SCHEMA given_up").await?;
-                revoke_usage(&mut login, &["given_up".to_owned()]).await?;
+                let given = revoke_usage(
+                    &mut login,
+                    &[
+                        "given_up".to_owned(),
+                        "public".to_owned(),
+                        "absent".to_owned(),
+                    ],
+                )
+                .await?;
                 let usable = login
-                    .query("SELECT pg_catalog.has_schema_privilege('given_up', 'USAGE')::text AS u")
+                    .query(
+                        "SELECT pg_catalog.has_schema_privilege('given_up', 'USAGE')::text AS g, \
+                                pg_catalog.has_schema_privilege('public', 'USAGE')::text AS p",
+                    )
                     .await?;
-                assert_eq!(usable[0].try_get::<&str>("u")?, Some("false"));
+                // Read here and asserted after the fixture is dropped, so a
+                // failing check leaves no role or database behind.
+                let given_up = (
+                    usable[0].try_get::<&str>("g")?.map(str::to_owned),
+                    usable[0].try_get::<&str>("p")?.map(str::to_owned),
+                    given.len(),
+                    restore_usage(&mut login, &given).await?,
+                );
+                let restored = login
+                    .query("SELECT pg_catalog.has_schema_privilege('public', 'USAGE')::text AS p")
+                    .await?[0]
+                    .try_get::<&str>("p")?
+                    .map(str::to_owned);
                 for statement in [
                     "ALTER ROLE CURRENT_USER SET work_mem = '1MB'",
                     "CREATE TABLE public.mine (i integer)",
@@ -921,7 +1052,7 @@ mod tests {
                 }
                 let left = drop_owned(&mut login, &checked).await?;
                 let after = login_defaults(&mut login).await?;
-                Ok::<_, DbError>((left, changed_defaults(&before, &after)))
+                Ok::<_, DbError>((left, changed_defaults(&before, &after), given_up, restored))
             }
             .await;
             admin
@@ -929,7 +1060,13 @@ mod tests {
                 .await
                 .unwrap();
             admin.execute(&format!("DROP ROLE {name}")).await.unwrap();
-            let ((named, total), changed) = result.unwrap();
+            let ((named, total), changed, (given_up, public, granted_back, differing), restored) =
+                result.unwrap();
+            assert_eq!(given_up.as_deref(), Some("false"), "{variable}");
+            assert_eq!(public.as_deref(), Some("false"), "{variable}");
+            assert_eq!(granted_back, 1, "{variable}: only public is granted back");
+            assert!(differing.is_empty(), "{variable}: {differing:?}");
+            assert_eq!(restored.as_deref(), Some("true"), "{variable}");
             assert_eq!(
                 changed,
                 ["work_mem=1MB set in every database"],
