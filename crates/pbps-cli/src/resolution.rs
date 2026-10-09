@@ -127,9 +127,18 @@ pub struct Request<'a> {
 /// target: the planning read's, which the resolver's own target connection
 /// must match, since a target name can reach several clusters (#1685).
 /// Only PostgreSQL is resolved, and resolution refuses the other engines by
-/// name, so they record none.
-pub async fn planning_identity(conn: &mut pbps_db::Conn) -> Result<Option<String>, Refused> {
-    if conn.driver() != pbps_db::Driver::Postgres {
+/// name, so they record none. Only a supplied server is bound by it: the
+/// Docker profile does not read it, and must not demand the grant (#1718
+/// review).
+pub async fn planning_identity(
+    conn: &mut pbps_db::Conn,
+    selection: &ResolverSelection,
+) -> Result<Option<String>, Refused> {
+    let binds = matches!(
+        selection.profile,
+        pbps_config::resolver::ResolverProfile::Server { .. }
+    );
+    if !binds || conn.driver() != pbps_db::Driver::Postgres {
         return Ok(None);
     }
     pbps_pg::resolver::vouched::cluster_identity(conn)
@@ -392,6 +401,70 @@ mod producer {
 mod tests {
     use super::*;
     use pbps_model::{Column, Hints, IdsFile, Module, ModuleKind, Schema, Table};
+
+    /// #1718 review: only a supplied server is bound by the planning
+    /// identity, so a Docker profile plans for a role refused
+    /// `pg_control_system()`, while a server profile refuses it and names the
+    /// grant. Function privileges belong to each database: the revoke stays in
+    /// the fixture's own.
+    #[test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    fn only_a_supplied_server_demands_the_cluster_identity_grant() {
+        use pbps_config::resolver::{ResolverProfile, SelectionSource, SelectionStatus};
+        let selection = |profile| ResolverSelection {
+            name: "r".into(),
+            source: SelectionSource::Cli,
+            profile,
+            status: SelectionStatus::NotAcquired,
+        };
+        let docker = selection(ResolverProfile::Docker {
+            image: "postgres:18".into(),
+            pull: Default::default(),
+        });
+        let server = selection(ResolverProfile::Server {
+            url_env: "PBPS_UNUSED".into(),
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        rt.block_on(async {
+            let database = crate::test_pg::TestDb::create("identity").await;
+            let mut conn = database.connect().await;
+            let role = format!("pbps_bin_identity_{}", std::process::id());
+            conn.execute(&format!(
+                "DROP ROLE IF EXISTS {role};
+                 CREATE ROLE {role} NOLOGIN;
+                 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC;"
+            ))
+            .await
+            .expect("the fixture");
+            let granted = planning_identity(&mut conn, &server).await;
+            conn.execute(&format!("SET ROLE {role}"))
+                .await
+                .expect("set role");
+            let unbound = planning_identity(&mut conn, &docker).await;
+            let refused = planning_identity(&mut conn, &server).await;
+            conn.execute("RESET ROLE").await.expect("reset role");
+            drop(conn);
+            database.drop().await;
+            crate::test_pg::shared()
+                .await
+                .execute(&format!("DROP ROLE {role}"))
+                .await
+                .expect("drop role");
+            assert!(
+                matches!(granted, Ok(Some(ref identity)) if !identity.is_empty()),
+                "a superuser reads it"
+            );
+            assert!(matches!(unbound, Ok(None)), "Docker reads no identity");
+            match refused {
+                Err(Refused::Finding(finding)) => assert_eq!(finding.id, "resolver.identity"),
+                Err(Refused::Unanswerable(error)) => panic!("answered, not: {error}"),
+                Ok(identity) => panic!("a refused role read {identity:?}"),
+            }
+        });
+    }
 
     /// #1685: a role refused `pg_control_system()` is told the grant, as an
     /// answered finding; any other failure to read the identity is

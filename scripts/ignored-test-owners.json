@@ -605,7 +605,8 @@
         "engine::tests::a_failed_cost_query_is_unavailable_not_a_static_guess",
         "engine::tests::a_module_handed_to_the_postgres_rename_impact_is_refused_not_empty",
         "engine::tests::the_postgres_arms_answer_engine_only_questions_by_name",
-        "engine::tests::the_role_questions_refuse_on_postgres_rather_than_answer_none"
+        "engine::tests::the_role_questions_refuse_on_postgres_rather_than_answer_none",
+        "resolution::tests::only_a_supplied_server_demands_the_cluster_identity_grant"
       ]
     },
     {

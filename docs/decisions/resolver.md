@@ -1982,8 +1982,10 @@ names several hosts, but not a single name in front of several clusters.
   the check removed, the run answers).
 
 **The rule.**
-- **The planning read records the target's `system_identifier`.** It comes
-  from `pg_control_system()`, which a plain login may execute by default
+- **The planning read records the target's `system_identifier`** when a
+  supplied server is selected; the Docker profile does not read it and so
+  does not demand its grant (#1718 review). It comes from
+  `pg_control_system()`, which a plain login may execute by default
   (measured on 16 and 18). initdb chooses the identifier, so it names the
   cluster a connection reached, not the address that reached it.
 - **The resolver's target connection must report the same identifier**, or
