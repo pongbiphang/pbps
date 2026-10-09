@@ -728,16 +728,19 @@ pub(crate) fn weave(
     }
     // Whether a partition's part reads one of `names`: a default or a
     // generated column is its column's; a declared check or index is read
-    // whole, a name found anywhere in its text counting. A part the
-    // partition does not declare, a clone of its parent's, is taken to.
+    // whole, a name found anywhere in its text counting, and a
+    // Unicode-escaped identifier (`U&"\0076"`), which can spell any name
+    // without its letters, as every name. A part the partition does not
+    // declare, a clone of its parent's, is taken to.
     let reads_changed = |table: &pbps_model::Table, part: &Part, names: &BTreeSet<&str>| {
         let found = |texts: &[&str]| {
             texts.iter().any(|text| {
                 let text = text.to_lowercase();
-                names.iter().any(|name| {
-                    let name = name.to_lowercase();
-                    text.contains(&name) || text.contains(&name.replace('"', "\"\""))
-                })
+                text.contains("u&")
+                    || names.iter().any(|name| {
+                        let name = name.to_lowercase();
+                        text.contains(&name) || text.contains(&name.replace('"', "\"\""))
+                    })
             })
         };
         match part {
@@ -4847,6 +4850,39 @@ mod tests {
         if let Err(e) = weave(&mut other, &found, &s, &[&ids], pg().as_ref()) {
             assert!(!e.contains("#1699"), "{e}");
         }
+        // A partition's own check whose text holds a Unicode-escaped
+        // identifier may read the changed column: refused as one naming it.
+        let mut escaped = s.clone();
+        escaped
+            .tables
+            .get_mut(&TableName::new("app", "ev_1"))
+            .unwrap()
+            .checks
+            .insert(
+                "ck".into(),
+                pbps_model::CheckConstraint {
+                    expression: r#"U&"\006B" > 0"#.into(),
+                },
+            );
+        let checked = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![Dependent {
+                described: "constraint ck on table app.ev_1".into(),
+                holds: Holds::TablePart {
+                    table: TableName::new("app", "ev_1"),
+                    part: Part::Check("ck".into()),
+                },
+            }],
+        )]);
+        let other_column = Change::AlterColumnDefault {
+            uid: "c_d4e5f6".parse().unwrap(),
+            column: pbps_model::ColumnRef::new(TableName::new("app", "ev"), "k"),
+            from: None,
+            to: Some("0".into()),
+        };
+        let mut cs = plan(vec![other_column, alter(&escaped, "app.f(integer)")]);
+        let e = weave(&mut cs, &checked, &escaped, &[&ids], pg().as_ref()).expect_err("refused");
+        assert!(e.contains("#1699"), "{e}");
         // Negative: the rebuild alone is answered as before, not this way.
         let mut alone = plan(vec![alter(&s, "app.f(integer)")]);
         if let Err(e) = weave(&mut alone, &found, &s, &[&ids], pg().as_ref()) {

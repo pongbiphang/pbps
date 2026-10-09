@@ -3322,7 +3322,9 @@ fn refuse_partition_changes(
             // What the probe reads: an index's or a check's whole text. A
             // changed name found anywhere in it counts, quoted or not, so an
             // index or check on the partition's other columns alone stays
-            // admitted (#1692 review).
+            // admitted (#1692 review). A Unicode-escaped identifier
+            // (`U&"\0076"`) can spell any name without its letters, so a
+            // text holding one counts as reading every changed name.
             let probed: Option<Vec<&str>> = if let Change::AddIndex { index, .. } = change {
                 (index.unique || index.filter.is_some()).then(|| {
                     index
@@ -3346,7 +3348,7 @@ fn refuse_partition_changes(
                 let quoted = name.replace('"', "\"\"");
                 texts.iter().any(|text| {
                     let text = text.to_lowercase();
-                    text.contains(&name) || text.contains(&quoted)
+                    text.contains(&name) || text.contains(&quoted) || text.contains("u&")
                 })
             };
             if let Some(texts) = probed
@@ -7190,9 +7192,13 @@ mod tests {
             );
         };
         reads(&mut renamed_checked, "\"M2\" > 0");
+        // A Unicode-escaped identifier spells `n` without its letter.
+        let mut escaped = with(&retype_n, &keep_a, &keep_b);
+        reads(&mut escaped, r#"U&"\006E" > 0"#);
         let rename_m = [renaming("m", "m2")];
         for (declared, intents) in [
             (&checked, &[][..]),
+            (&escaped, &[][..]),
             (&unique, &[][..]),
             (&renamed_checked, &rename_m[..]),
         ] {

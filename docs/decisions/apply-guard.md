@@ -1208,3 +1208,17 @@ exactly what an operator should look at before running approved DDL.
 The live tests are in `crates/pbps-cli/tests/flow_pg.rs`. Each check was
 disabled in turn, and so was the `READ COMMITTED` framing, and the test for it
 failed each time.
+
+<a id="dec-1687-2"></a>
+
+**DEC-1687.2. A table a change works on, but that no change drops or renames,
+is held to being there at the closing read.** The shape comparison passes over
+every table a change names, since that change moves part of it. Presence was
+answered only by the changes that create, drop, rename, attach or detach a
+table (DECISIONS 161). So a table whose index the plan drops, gone by a DDL
+trigger along with all its rows, was recorded as the plan's success. The
+#1692 review found it through a partition with its own index change beside its
+parent's column rename, but any table with any part change was open to it. The
+check runs where the other presence checks do, once every statement has run.
+So in a staged run it is the closing read that answers for such a table, as
+it does for a table the plan creates or drops.

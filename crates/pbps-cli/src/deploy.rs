@@ -4973,6 +4973,26 @@ fn refuse_unplanned_movement(
             expected_tables.extend(p.change.tables_after());
             expected_roles.extend(p.change.roles_after());
         }
+        // A table a change works on but neither drops nor renames stays: the
+        // shape comparison passes over every table a change names, so
+        // without this a table whose index the plan drops, gone with all its
+        // rows by a DDL trigger, was recorded as success (DEC-1687.2).
+        let mut stays: BTreeSet<&TableName> = BTreeSet::new();
+        for p in &changes.changes {
+            if let Some(t) = p.change.table()
+                && before.tables.contains_key(t)
+                && !expected_tables.contains_key(t)
+            {
+                stays.insert(t);
+            }
+        }
+        for name in stays {
+            if !after.tables.contains_key(name) {
+                moved.push(format!(
+                    "{name} is gone, and no change of this plan drops it"
+                ));
+            }
+        }
         for (name, expected) in expected_tables {
             match (expected, after.tables.contains_key(name)) {
                 (pbps_model::Presence::Present, false) => {
@@ -14260,6 +14280,81 @@ mod tests {
     /// apply (#1581, #1607 review): another session's change to them is
     /// movement; the plan's own is held once the run is whole; mid-run a
     /// column the plan sets may hold either, and another may not.
+    /// A table a change works on but does not drop or rename is held to being
+    /// there at the closing read: the shape comparison passes over every
+    /// table a change names, so a table whose index the plan drops, gone by
+    /// a DDL trigger with all its rows, was recorded as success (#1692
+    /// review).
+    #[test]
+    fn a_table_the_plan_alters_but_does_not_drop_has_to_stay() {
+        use pbps_model::{Change, Column, Index, IndexColumn, IndexKey, PlannedChange, Table};
+        let name = TableName::new("app", "t");
+        let with_table = |indexed: bool| {
+            let mut t = Table::default();
+            t.columns
+                .insert("v".into(), Column::new("integer".parse().unwrap()));
+            if indexed {
+                t.indexes.insert(
+                    "t_v".into(),
+                    Index {
+                        columns: vec![IndexColumn {
+                            key: IndexKey::Column("v".into()),
+                            descending: false,
+                            opclass: None,
+                        }],
+                        include: Vec::new(),
+                        unique: false,
+                        filter: None,
+                        method: Default::default(),
+                        storage_parameters: Default::default(),
+                    },
+                );
+            }
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let plan = |changes: Vec<Change>| pbps_model::ChangeSet {
+            changes: changes.into_iter().map(PlannedChange::new).collect(),
+        };
+        let check = |plan: &pbps_model::ChangeSet, after: &Schema, settled| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                plan,
+                &with_table(true),
+                after,
+                "test",
+                settled,
+            )
+        };
+        let drop_index = plan(vec![Change::DropIndex {
+            table: name.clone(),
+            name: "t_v".into(),
+        }]);
+        let e =
+            check(&drop_index, &Schema::default(), Settled::Whole).expect_err("the table is gone");
+        assert!(
+            format!("{e:#}").contains("app.t is gone, and no change of this plan drops it"),
+            "{e:#}"
+        );
+        // Negative: the table is there without the index.
+        check(&drop_index, &with_table(false), Settled::Whole).expect("as planned");
+        // Negative: a plan that drops the table answers for it as before.
+        let drop_table = plan(vec![
+            Change::DropIndex {
+                table: name.clone(),
+                name: "t_v".into(),
+            },
+            Change::DropTable {
+                uid: "t_a1b2c3".parse().unwrap(),
+                name: name.clone(),
+                detach_from: None,
+            },
+        ]);
+        check(&drop_table, &Schema::default(), Settled::Whole).expect("dropped as planned");
+    }
+
     #[test]
     fn a_partitions_own_columns_set_by_someone_else_are_movement() {
         use pbps_model::{

@@ -3942,7 +3942,9 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
 - a partition's own check, or unique or filtered index, added while the plan
   changes a column of its parent that the check or index reads: a changed
   name, either of a rename's, found anywhere in its text, quoted or not, in
-  any case. One that reads only the partition's other columns is admitted.
+  any case. A text holding a Unicode-escaped identifier (`U&"\0076"`), which
+  spells a name without its letters, counts as reading every changed name.
+  One that reads only the partition's other columns is admitted.
   Its pre-flight probe reads the stored rows
   before the parent's change reaches them: a retype converts them and a rename
   moves a name to another column. The probe knows the plan's column changes
@@ -3957,8 +3959,9 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
 - in a connected plan, a function dropped or rebuilt that a part of one of
   the parent's partitions depends on, where the part is on a column the plan
   changes. A default or generated column counts by its column; a check or
-  index the partition declares counts by a changed name found in its text;
-  any other part, a clone of the parent's, counts. The connected passes key
+  index the partition declares counts by a changed name, or a
+  Unicode-escaped identifier, found in its text; any other part, a clone of
+  the parent's, counts. The connected passes key
   parts by the partition's name and cannot follow the parent's column change
   into it. The remedy is two plans.
 
