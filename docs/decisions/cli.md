@@ -682,8 +682,9 @@ the same binary as the CLI they read (ADR-0015 decision 6), and each addition
 updates them in the same change.
 
 *Amended by [DEC-1734.1](#dec-1734-1): until the first tagged release the
-wire version stays 1, and a change this rule would count as moving it is
-recorded by the schema-set version and DEC-1038.1's archives instead.*
+wire version stays 1. A change this rule would count as moving it is recorded
+by the schema-set version instead, and it raises DEC-1038.1's
+`FIRST_SET_UNDER_THE_WIRE_RULE` to its own set.*
 
 <a id="dec-1038-1"></a>
 
@@ -780,19 +781,33 @@ Before the first release, a move buys nothing and costs something:
 - A move touches `pbps-ui`'s contract and its `app.js`,
   `scripts/findings-to-github.py`, and the snapshots.
 - DEC-1038.1 validates the emitted envelopes only against the archived
-  schema sets that share the current wire version. Right after a move, there
-  are none, so the check holds nothing until new sets are archived.
+  schema sets that share the current wire version. Right after a move, the
+  new set is the only one, so the check holds nothing until more are
+  archived.
 
 So until the first tagged release:
 - The wire version stays 1.
 - A change that DEC-997.1 would count as moving it is recorded instead by
   the schema-set version, which moves for every content change
-  (DECISIONS 465), and by the archived sets DEC-1038.1 validates against.
+  (DECISIONS 465), and by its set's archive, as every set is archived.
+- DEC-1038.1's check runs on, and would refuse that change: an archived set
+  under wire version 1 refuses the envelope it emits. So the same change
+  raises `FIRST_SET_UNDER_THE_WIRE_RULE`
+  (`crates/pbps-cli/tests/support/envelope_archives.rs`) to its own set.
+  DEC-1038.1 starts at set 16 for the same reason: the sets before it
+  predate the rule, DECISIONS 435's `denied` among them. The archives stay
+  as published, and the check holds from that set on. This loses the same
+  history a move would. What it saves is the move's churn, a move the
+  release would undo anyway.
 - From the first tagged release on, DEC-997.1 applies as written. It moves
   the version exactly when an envelope the new build emits could fail the
   envelope schema published before it. The compatibility and upgrade
   contract that release publishes is #1159's to define.
 
+The check is not changed by this entry. A change that needs the floor
+raised raises it, and so says in its own diff that it breaks an archived
+set (#1740 review).
+
 Moving the version now, as DEC-997.1 reads, was the alternative. It pays
-every cost above for a consumer that does not exist, and the release then
+the costs above for a consumer that does not exist, and the release then
 resets it anyway.
