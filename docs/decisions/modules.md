@@ -1845,25 +1845,36 @@ What the engine does, measured on 16 and 18 (`ChooseRelationName`):
   transaction frees the name.
 
 So a connected plan reads the target's holders of every name each unnamed
-key may try, relations and constraints, in the planning transaction, and
-walks the plan to each key. A holder an earlier change frees no longer
-counts: the relation or constraint dropped, its table dropped or moved to
-another schema, the key it belongs to replaced, or a view dropped. An
-earlier arrival does count, as do a constraint added earlier and an earlier
-key's index. A table moved into the key's schema earlier brings its indexes
-and constraints along under their names (measured on 16 and 18), so the
-holders of the schema it leaves are read too, and count from the move on. A
-dropped table goes by the name it has when it is dropped, never by one a
-later rename gives another table. A check and an index of one name on one
-table are two holders, and dropping one leaves the other (measured on 16
-and 18). Past the identifier limit a candidate is told only when every byte
-the cut may keep is ASCII, so the cut falls in the same place in every
-encoding: in LATIN1, 57 `a`s and `é` keep the `é` that a UTF-8 cut drops
-(measured on 18, #1729 review). The key takes the first candidate left free, and that name is
-its arrival like any declared one, so the target is no longer asked about
-it.
+key may try, relations and constraints, in the planning transaction. It
+reads them in the key's schema and in every schema the plan moves a table
+into it from: a table moved to another schema takes its indexes and
+constraints along under their names (measured on 16 and 18).
 
-A holder the walk cannot tell is freed is kept, an index going with a
+The plan is then replayed from those holders, change by change. Each holder
+is followed by its name and its owner's name as they are at that point, so a
+change matches it by the name the change carries. A drop emitted before a
+rename names the table as it was, and one emitted after names it as it is.
+- A rename moves what the table owns, and the table itself.
+- A drop frees what it drops: a relation, an index, a constraint, a key's
+  index and constraint, a table with everything it owns, or a view.
+- A relation and a constraint of one name are two holders. A check and an
+  index of one name on one table can coexist, and dropping one leaves the
+  other (measured on 16 and 18).
+
+Before each key, the holders still there count, as do an earlier arrival,
+an earlier constraint and an earlier key's index. The key takes the first
+candidate left free, and that name is its arrival like any declared one, so
+the target is no longer asked about it. Past the identifier limit, a
+candidate is told only when every byte the cut may keep is ASCII, so the cut
+falls in the same place in every encoding. In LATIN1, 57 `a`s and `é` keep
+the `é` that a UTF-8 cut drops (measured on 18).
+
+An earlier form judged each holder against the whole plan at once. Review
+of #1729 found it applying a drop to a holder that had not yet moved where
+the drop ran, and mapping a drop through a rename that came after it. A
+replay counts each change where it runs, so neither can happen.
+
+A holder the replay cannot tell is freed is kept, an index going with a
 dropped column, for one. The key is then read as numbered where the engine
 may not number it. That can miss a reference, the failed apply DEC-1576.1
 accepts; reading it freed could refuse a valid plan. Offline, as in a

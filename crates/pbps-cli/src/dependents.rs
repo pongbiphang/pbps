@@ -2109,18 +2109,22 @@ pub(crate) fn key_name_prefixes(cs: &ChangeSet) -> Vec<(String, String)> {
                 shared -= 1;
             }
             // The key's schema, and each one a table moves into it from,
-            // which brings the names it holds there along.
-            let from = cs.changes.iter().filter_map(|p| {
-                if let Change::RenameTable { from, to, .. } = &p.change
-                    && to.schema == table.schema
-                    && from.schema != to.schema
-                {
-                    Some(from.schema.clone())
-                } else {
-                    None
+            // directly or through another, which brings the names it holds
+            // along.
+            let mut schemas = vec![table.schema.clone()];
+            let mut k = 0;
+            while let Some(into) = schemas.get(k).cloned() {
+                k += 1;
+                for p in &cs.changes {
+                    if let Change::RenameTable { from, to, .. } = &p.change
+                        && to.schema == into
+                        && !schemas.contains(&from.schema)
+                    {
+                        schemas.push(from.schema.clone());
+                    }
                 }
-            });
-            for schema in std::iter::once(table.schema.clone()).chain(from) {
+            }
+            for schema in schemas {
                 let prefix = (schema, first[..shared].to_owned());
                 if !out.contains(&prefix) {
                     out.push(prefix);
@@ -2134,15 +2138,18 @@ pub(crate) fn key_name_prefixes(cs: &ChangeSet) -> Vec<(String, String)> {
 /// The names the plan's unnamed keys' indexes arrive under, and whether they
 /// are told rather than guessed (#1645, DEC-1645.1).
 ///
-/// With the target's `holders`, the plan is walked in its order: before each
-/// key, a holder an earlier change frees no longer counts, and an earlier
-/// arrival does, an earlier key's index among them. The key takes the first
-/// candidate free then, as the engine does when the statement runs (measured
-/// on 16 and 18: a holder dropped earlier in the transaction frees the name).
-/// A holder this cannot tell is freed is kept: the key is then read as
-/// numbered where the engine may not number it, which can miss a reference,
-/// the failed apply DEC-1576.1 accepts; reading it freed could refuse a
-/// valid plan.
+/// With the target's `holders`, the plan is replayed change by change from
+/// them ([`replay`]): each holder is followed where the plan's renames move
+/// it and dropped where the plan drops it, so a drop or a move counts at the
+/// change it runs at and against the holder as it is then (#1729 review).
+/// Before each key, the holders still there count, as do an earlier arrival,
+/// an earlier constraint and an earlier key's index, and the key takes the
+/// first candidate free, as the engine does when the statement runs
+/// (measured on 16 and 18: a holder dropped earlier in the transaction frees
+/// the name). A holder the replay cannot tell is freed is kept: the key is
+/// then read as numbered where the engine may not number it, which can miss
+/// a reference, the failed apply DEC-1576.1 accepts; reading it freed could
+/// refuse a valid plan.
 ///
 /// Offline, each key's index arrives under `<table>_pkey`, and whether a
 /// relation holds that now is the target's to answer.
@@ -2185,106 +2192,85 @@ fn key_arrivals(
                 .map(move |c| (j, c))
         })
         .collect();
-    // A table moved to another schema takes its indexes and constraints
-    // along under their names, so each holder it owns also arrives there
-    // with the move (#1729 review).
-    let mut placed: Vec<(Option<usize>, KeyNameHolder)> =
-        holders.iter().map(|h| (None, h.clone())).collect();
+    let mut present: Vec<KeyNameHolder> = holders.to_vec();
+    let mut keys = keys.into_iter().peekable();
     for (j, p) in cs.changes.iter().enumerate() {
-        let Change::RenameTable { from, to, .. } = &p.change else {
-            continue;
-        };
-        if from.schema == to.schema {
-            continue;
-        }
-        for h in holders.iter().filter(|h| h.owner.as_ref() == Some(from)) {
-            let mut moved = h.clone();
-            moved.name.schema.clone_from(&to.schema);
-            placed.push((Some(j), moved));
-        }
-    }
-    for (at, table) in keys {
-        let held = |r: &TableName, out: &[Arrival]| {
-            named.iter().any(|(_, n)| n == r)
-                || out.iter().any(|(_, o)| o == r)
-                || constraints.iter().any(|(j, c)| *j < at.0 && c == r)
-                || placed.iter().any(|(arrives, h)| {
-                    arrives.is_none_or(|j| j < at.0) && h.name == *r && !freed_before(cs, h, at)
-                })
-        };
-        let mut n = 0u32;
-        while let Some(name) = key_candidate(&table.name, n) {
-            let r = in_schema(&table, name);
-            if !held(&r, &out) {
-                out.push((at, r));
-                break;
+        // A change's drop runs ahead of what the same change creates: a key
+        // replaced in one change frees its index's name for the new one.
+        replay(&mut present, &p.change);
+        while let Some((at, table)) = keys.next_if(|(at, _)| at.0 == j) {
+            let held = |r: &TableName, out: &[Arrival]| {
+                named.iter().any(|(_, n)| n == r)
+                    || out.iter().any(|(_, o)| o == r)
+                    || constraints.iter().any(|(k, c)| *k < at.0 && c == r)
+                    || present.iter().any(|h| h.name == *r)
+            };
+            let mut n = 0u32;
+            while let Some(name) = key_candidate(&table.name, n) {
+                let r = in_schema(&table, name);
+                if !held(&r, &out) {
+                    out.push((at, r));
+                    break;
+                }
+                n += 1;
             }
-            n += 1;
         }
     }
     (out, true)
 }
 
-/// Whether a change of `cs` ahead of `at` frees `holder`'s name: drops the
-/// relation or constraint holding it, or the table it belongs to, or moves
-/// that table to another schema, which takes its indexes and constraints
-/// along. Changes on a table the plan renames carry its new name, and the
-/// holder's owner its name now, so each is read back to the catalog's name
-/// (as `deploy::refuse_uninventoried_occupants` does); a drop is not, as it
-/// names the table it drops. Anything else, a dropped column's indexes among
-/// them, is kept (see [`key_arrivals`]).
+/// Applies one change to the holders `present` before it: drops what it
+/// drops, and moves and renames what it moves.
+///
+/// Each holder is followed by its name and its owner's name as they are at
+/// that point of the plan, so a change matches it by the name the change
+/// carries: one emitted before a rename names the table as it was, one after
+/// it as it is (`rename_order` emits either). A relation and a constraint of
+/// one name are told apart: a check and an index of one name on one table
+/// are two holders, and dropping one leaves the other (measured on 16 and
+/// 18). Anything else, a dropped column's indexes among them, is kept (see
+/// [`key_arrivals`]).
 #[allow(clippy::wildcard_enum_match_arm)]
-fn freed_before(cs: &ChangeSet, holder: &KeyNameHolder, at: (usize, Step)) -> bool {
-    let now = |t: &TableName| -> TableName {
-        cs.changes
-            .iter()
-            .find_map(|p| match &p.change {
-                Change::RenameTable { from, to, .. } if to == t => Some(from.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| t.clone())
-    };
-    let owned_by = |t: &TableName| holder.owner.as_ref() == Some(t);
-    cs.changes.iter().enumerate().any(|(j, p)| {
-        // A change's drop runs ahead of what the same change creates: a key
-        // replaced in one change frees its index's name for the new one.
-        (j, AT_CREATE) < at
-            && match &p.change {
-                // A dropped table goes by the name it has when it is
-                // dropped, never one a later rename gives another table.
-                Change::DropTable { name, .. } => holder.name == *name || owned_by(name),
-                // The move frees the names in the schema it leaves; in the
-                // one it enters, it brings them ([`key_arrivals`]).
-                Change::RenameTable { from, to, .. } => {
-                    holder.name == *from
-                        || (from.schema != to.schema
-                            && owned_by(from)
-                            && holder.name.schema == from.schema)
+fn replay(present: &mut Vec<KeyNameHolder>, change: &Change) {
+    let owned = |h: &KeyNameHolder, t: &TableName| h.owner.as_ref() == Some(t);
+    match change {
+        // A table moved to another schema takes its indexes and constraints
+        // along under their names (measured on 16 and 18, #1729 review).
+        Change::RenameTable { from, to, .. } => {
+            for h in present.iter_mut() {
+                if !h.constraint && h.name == *from {
+                    h.name = to.clone();
                 }
-                // By the table and the name, so an index a rename carried to
-                // another schema is freed there too, and by kind: a unique
-                // constraint is its index and itself, the rest one of them.
-                Change::DropUnique { table, name } => {
-                    owned_by(&now(table)) && holder.name.name == *name
+                if owned(h, from) {
+                    h.owner = Some(to.clone());
+                    h.name.schema.clone_from(&to.schema);
                 }
-                Change::DropIndex { table, name } => {
-                    !holder.constraint && owned_by(&now(table)) && holder.name.name == *name
-                }
-                Change::DropCheck { table, name } | Change::DropForeignKey { table, name } => {
-                    holder.constraint && owned_by(&now(table)) && holder.name.name == *name
-                }
-                Change::SetPrimaryKey {
-                    table,
-                    from: Some(_),
-                    ..
-                } => owned_by(&now(table)) && holder.primary_key,
-                Change::DropModule {
-                    id: ModuleId::Named(name),
-                    kind: ModuleKind::View,
-                } => holder.name == *name,
-                _ => false,
             }
-    })
+        }
+        Change::DropTable { name, .. } => {
+            present.retain(|h| !(owned(h, name) || (!h.constraint && h.name == *name)));
+        }
+        // A unique constraint is its index and itself.
+        Change::DropUnique { table, name } => {
+            present.retain(|h| !(owned(h, table) && h.name.name == *name));
+        }
+        Change::DropIndex { table, name } => {
+            present.retain(|h| !(!h.constraint && owned(h, table) && h.name.name == *name));
+        }
+        Change::DropCheck { table, name } | Change::DropForeignKey { table, name } => {
+            present.retain(|h| !(h.constraint && owned(h, table) && h.name.name == *name));
+        }
+        Change::SetPrimaryKey {
+            table,
+            from: Some(_),
+            ..
+        } => present.retain(|h| !(owned(h, table) && h.primary_key)),
+        Change::DropModule {
+            id: ModuleId::Named(name),
+            kind: ModuleKind::View,
+        } => present.retain(|h| !(!h.constraint && h.name == *name)),
+        _ => {}
+    }
 }
 
 /// The constraints other than keys a change adds, by name in their table's
@@ -6734,6 +6720,78 @@ mod tests {
             keyed_as("n", &names("n_pkey1")),
         ];
         assert_eq!(refused(dropped, &held).len(), 1);
+        // Dropped before the index moves in, a name is free only until it
+        // does: the moved index holds `n_pkey` then.
+        let refill = |default: &str| {
+            vec![
+                Change::DropTable {
+                    uid: Uid::derived(UidKind::Table, "app.n_pkey", 0),
+                    name: TableName::new("app", "n_pkey"),
+                    detach_from: None,
+                },
+                rename(TableName::new("archive", "t"), TableName::new("app", "t")),
+                keyed_as("n", &names(default)),
+            ]
+        };
+        let refilled = [
+            held[0].clone(),
+            KeyNameHolder {
+                name: TableName::new("archive", "n_pkey"),
+                ..held[1].clone()
+            },
+        ];
+        assert_eq!(refused(refill("n_pkey"), &refilled), Vec::<String>::new());
+        assert_eq!(refused(refill("n_pkey1"), &refilled).len(), 1);
+        // A drop names its table as it is where the drop runs: `s2.b`'s
+        // index dropped before `s2.b` moves on and `s1.a` takes its name
+        // is not `s1.a`'s, which `s1.a` brings into `s2`.
+        let index_of = |schema: &str, table: &str| KeyNameHolder {
+            name: TableName::new(schema, "n_pkey"),
+            owner: Some(TableName::new(schema, table)),
+            primary_key: false,
+            constraint: false,
+        };
+        let mut in_s2 = new_table(Some("('s2.n_pkey'::regclass)::text"), None, &[]);
+        in_s2.primary_key = Some(unnamed());
+        let chain = vec![
+            Change::DropIndex {
+                table: TableName::new("s2", "b"),
+                name: "n_pkey".into(),
+            },
+            rename(TableName::new("s2", "b"), TableName::new("s3", "c")),
+            rename(TableName::new("s1", "a"), TableName::new("s2", "b")),
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, "s2.n", 0),
+                name: TableName::new("s2", "n"),
+                table: Box::new(in_s2),
+            },
+        ];
+        let prefixes = key_name_prefixes(&plan(chain.clone()));
+        assert!(
+            prefixes.contains(&("s1".to_owned(), "n_pkey".to_owned())),
+            "{prefixes:?}"
+        );
+        assert_eq!(
+            refused(chain, &[index_of("s1", "a"), index_of("s2", "b")]),
+            Vec::<String>::new()
+        );
+        // Dropping a table of a name leaves a check of that name, which
+        // still numbers the key.
+        let check_kept = [KeyNameHolder {
+            name: TableName::new("app", "n_pkey"),
+            owner: Some(TableName::new("app", "t")),
+            primary_key: false,
+            constraint: true,
+        }];
+        let after_drop = vec![
+            Change::DropTable {
+                uid: Uid::derived(UidKind::Table, "app.n_pkey", 0),
+                name: TableName::new("app", "n_pkey"),
+                detach_from: None,
+            },
+            keyed_as("n", &names("n_pkey1")),
+        ];
+        assert_eq!(refused(after_drop, &check_kept).len(), 1);
         // Negative: moved after the key, the index is not there yet.
         let late = vec![
             keyed_as("n", &names("n_pkey1")),
@@ -6770,6 +6828,23 @@ mod tests {
                 "{n}"
             );
         }
+        // A table moved into the key's schema through another brings what
+        // it holds from where it starts.
+        let hop = |from: (&str, &str), to: (&str, &str)| Change::RenameTable {
+            uid: Uid::derived(UidKind::Table, "s1.a", 0),
+            from: TableName::new(from.0, from.1),
+            to: TableName::new(to.0, to.1),
+            defaults: Vec::new(),
+        };
+        let prefixes = key_name_prefixes(&plan(vec![
+            hop(("s1", "a"), ("s2", "a")),
+            hop(("s2", "a"), ("app", "a")),
+            create(t.clone()),
+        ]));
+        assert_eq!(
+            prefixes.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+            ["app", "s2", "s1"]
+        );
         // Negative: a named key reads nothing.
         t.primary_key.as_mut().unwrap().name = Some("pk_n".into());
         assert!(key_name_prefixes(&plan(vec![create(t)])).is_empty());
