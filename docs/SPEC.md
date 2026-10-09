@@ -1627,7 +1627,10 @@ key is refused. A declared setting is operational, such as a timeout: the
 settings that decide the answer are the target deployer's, replayed as
 session settings, which override the database's. A grant to a role that
 does not exist, or a setting the scratch account may not store on its
-database, refuses the run before its first write.
+database, refuses the run before its first write. So does anything else the
+engine refuses or stores otherwise than declared, such as a value it cannot
+parse: the run tries the whole declared state in a transaction it rolls back
+before writing any of it.
 
 A missing selected profile is a named finding (exit 2) before target access or
 output writes. An unused profile/default is not resolved by offline commands,

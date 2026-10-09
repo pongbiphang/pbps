@@ -480,6 +480,40 @@ pub async fn enforce(
     standard: &Standard,
     acl: Option<&BTreeSet<Entry>>,
 ) -> Result<Vec<String>, DbError> {
+    enforce_in(conn, standard, acl, false).await
+}
+
+/// Puts `standard` on inside a transaction that is always rolled back, and
+/// reads the database back there: whatever the engine refuses (a value it
+/// cannot parse, a privilege the login lacks) and whatever reads back
+/// otherwise than declared is named, and nothing is written. The engine
+/// judges each declared value, not a model of it (#1708 review). Each
+/// statement runs under its own savepoint, so one refusal does not hide the
+/// next. Empty when the declared state can be put on whole.
+pub async fn trial(
+    conn: &mut impl ExecuteConnection,
+    standard: &Standard,
+) -> Result<Vec<String>, DbError> {
+    conn.execute("BEGIN").await?;
+    let tried = match enforce_in(conn, standard, None, true).await {
+        Ok(failed) => match verify(conn, standard, None).await {
+            Ok(left) => Ok((failed, left)),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    let ended = conn.execute("ROLLBACK").await;
+    let (failed, left) = tried?;
+    ended?;
+    Ok(if failed.is_empty() { left } else { failed })
+}
+
+async fn enforce_in(
+    conn: &mut impl ExecuteConnection,
+    standard: &Standard,
+    acl: Option<&BTreeSet<Entry>>,
+    trial: bool,
+) -> Result<Vec<String>, DbError> {
     let mut failed = Vec::new();
     let state = read_state(conn).await?;
     let database = ident(&state.database);
@@ -487,6 +521,7 @@ pub async fn enforce(
         if public.name != "public" {
             run(
                 conn,
+                trial,
                 &mut failed,
                 format!("ALTER SCHEMA {} RENAME TO public", ident(&public.name)),
             )
@@ -497,6 +532,7 @@ pub async fn enforce(
             // owner's is not the login's to change, and stays named.
             run(
                 conn,
+                trial,
                 &mut failed,
                 format!("ALTER SCHEMA public OWNER TO {PUBLIC_OWNER}"),
             )
@@ -513,6 +549,7 @@ pub async fn enforce(
         failed.extend(
             put_acl(
                 conn,
+                trial,
                 &public.acl,
                 &expected,
                 &format!("SCHEMA {}", ident(&public.name)),
@@ -523,6 +560,7 @@ pub async fn enforce(
         if public.comment != standard.public_comment {
             run(
                 conn,
+                trial,
                 &mut failed,
                 format!(
                     "COMMENT ON SCHEMA {} IS {}",
@@ -539,6 +577,7 @@ pub async fn enforce(
     if state.connection_limit != standard.connection_limit {
         run(
             conn,
+            trial,
             &mut failed,
             format!(
                 "ALTER DATABASE {database} CONNECTION LIMIT {}",
@@ -550,6 +589,7 @@ pub async fn enforce(
     if state.template {
         run(
             conn,
+            trial,
             &mut failed,
             format!("ALTER DATABASE {database} IS_TEMPLATE false"),
         )
@@ -558,6 +598,7 @@ pub async fn enforce(
     if state.comment != standard.comment {
         run(
             conn,
+            trial,
             &mut failed,
             format!(
                 "COMMENT ON DATABASE {database} IS {}",
@@ -575,6 +616,7 @@ pub async fn enforce(
         if !standard.settings.contains_key(name) {
             run(
                 conn,
+                trial,
                 &mut failed,
                 format!("ALTER DATABASE {database} RESET {}", ident(name)),
             )
@@ -582,6 +624,7 @@ pub async fn enforce(
         } else if !same_value(name, value, &standard.settings[name]) {
             run(
                 conn,
+                trial,
                 &mut failed,
                 set(&database, name, &standard.settings[name]),
             )
@@ -590,12 +633,13 @@ pub async fn enforce(
     }
     for (name, value) in &standard.settings {
         if !state.settings.contains_key(name) {
-            run(conn, &mut failed, set(&database, name, value)).await;
+            run(conn, trial, &mut failed, set(&database, name, value)).await;
         }
     }
     if !state.login_settings.is_empty() {
         run(
             conn,
+            trial,
             &mut failed,
             format!("ALTER ROLE SESSION_USER IN DATABASE {database} RESET ALL"),
         )
@@ -605,6 +649,7 @@ pub async fn enforce(
         failed.extend(
             put_acl(
                 conn,
+                trial,
                 &state.acl,
                 kept,
                 &format!("DATABASE {database}"),
@@ -639,9 +684,31 @@ pub async fn put_connection_limit(
 
 /// Runs one statement of [`enforce`], noting the engine's refusal instead
 /// of stopping.
-async fn run(conn: &mut impl ExecuteConnection, failed: &mut Vec<String>, sql: String) {
-    if let Err(error) = conn.execute(&sql).await {
+async fn run(
+    conn: &mut impl ExecuteConnection,
+    trial: bool,
+    failed: &mut Vec<String>,
+    sql: String,
+) {
+    if let Err(error) = execute(conn, trial, &sql).await {
         failed.push(format!("{sql}: {error}"));
+    }
+}
+
+/// One statement; in a trial, under a savepoint, so a refused statement
+/// leaves the transaction usable for the next.
+async fn execute(conn: &mut impl ExecuteConnection, trial: bool, sql: &str) -> Result<(), DbError> {
+    if !trial {
+        return conn.execute(sql).await;
+    }
+    conn.execute("SAVEPOINT pbps_standard_trial").await?;
+    match conn.execute(sql).await {
+        Ok(()) => conn.execute("RELEASE SAVEPOINT pbps_standard_trial").await,
+        Err(error) => {
+            conn.execute("ROLLBACK TO SAVEPOINT pbps_standard_trial")
+                .await?;
+            Err(error)
+        }
     }
 }
 
@@ -692,6 +759,7 @@ fn same_value(name: &str, stored: &str, declared: &str) -> bool {
 /// such entry is named, so the operator removes it.
 async fn put_acl(
     conn: &mut impl ExecuteConnection,
+    trial: bool,
     current: &BTreeSet<Entry>,
     expected: &BTreeSet<Entry>,
     object: &str,
@@ -734,7 +802,7 @@ async fn put_acl(
             )
         }));
     for sql in statements {
-        if let Err(error) = conn.execute(&sql).await {
+        if let Err(error) = execute(conn, trial, &sql).await {
             failed.push(format!("{sql}: {error}"));
         }
     }
@@ -1189,6 +1257,68 @@ mod tests {
             assert!(again.is_empty(), "{variable}: {again:#?}");
             assert_eq!(named.len(), 2, "{variable}: {named:#?}");
             assert_eq!(session, "pg_default", "{variable}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the pinned PostgreSQL servers"]
+    async fn a_trial_names_what_the_engine_refuses_and_writes_nothing() {
+        // The engine, not a model of it, judges a declared value: a value
+        // it cannot parse and a comment it stores otherwise are named, every
+        // refusal and not only the first, and the database is left as it
+        // was (#1708 review).
+        for variable in SERVERS {
+            let fixture = Fixture::new(variable).await;
+            let mut login = fixture.connect(&fixture.name).await;
+            let wrong = Standard {
+                settings: [
+                    ("statement_timeout".to_owned(), "nonsense".to_owned()),
+                    ("work_mem".to_owned(), "lots".to_owned()),
+                ]
+                .into(),
+                comment: Some("ours".into()),
+                ..Standard::default()
+            };
+            // Taken by the engine, but read back otherwise than declared: it
+            // removes a comment given as the empty string.
+            let unreadable = Standard {
+                public_comment: Some(String::new()),
+                ..Standard::default()
+            };
+            let before = read_state(&mut login).await.unwrap();
+            let refused = trial(&mut login, &wrong).await.unwrap();
+            let differs = trial(&mut login, &unreadable).await.unwrap();
+            let after_refused = read_state(&mut login).await.unwrap();
+            // Negative: a declaration the engine takes whole is tried clean,
+            // and still written only by `enforce`.
+            let right = Standard {
+                settings: [("statement_timeout".to_owned(), "5min".to_owned())].into(),
+                comment: Some("ours".into()),
+                ..Standard::default()
+            };
+            let clean = trial(&mut login, &right).await.unwrap();
+            let after_clean = read_state(&mut login).await.unwrap();
+            let failed = enforce(&mut login, &right, None).await.unwrap();
+            let left = verify(&mut login, &right, None).await.unwrap();
+            drop(login);
+            fixture.drop().await;
+            assert_eq!(refused.len(), 2, "{variable}: {refused:#?}");
+            assert!(
+                refused.iter().any(|r| r.contains("statement_timeout"))
+                    && refused.iter().any(|r| r.contains("work_mem")),
+                "{variable}: {refused:#?}"
+            );
+            assert!(
+                differs.len() == 1 && differs[0].contains("public"),
+                "{variable}: {differs:#?}"
+            );
+            assert_eq!(before, after_refused, "{variable}: nothing was written");
+            assert!(clean.is_empty(), "{variable}: {clean:#?}");
+            assert_eq!(before, after_clean, "{variable}: a trial writes nothing");
+            assert!(
+                failed.is_empty() && left.is_empty(),
+                "{variable}: {failed:#?} {left:#?}"
+            );
         }
     }
 }

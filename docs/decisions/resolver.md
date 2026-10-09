@@ -2108,6 +2108,14 @@ exactly four things in its database:
   silently keeps a setting the session may not remove, so only the
   re-read is the verdict.
 - A database already standard costs no statement.
+- At the start of a run, a database that is not standard is first put
+  into its declared state inside a transaction that is rolled back, each
+  statement under a savepoint, and read back there. Anything the engine
+  refuses, or reads back otherwise than declared, refuses the run before
+  its first write. The engine judges each declared value, so a value it
+  cannot parse, or one this code spells or reads back wrongly, is named
+  before any write instead of after a partial one. A release does not try
+  first: its repair is wanted even in part.
 
 **Not covered: a connection limit of 0.** It locks the login out, so a run
 that died after setting it cannot connect again, and only a superuser can

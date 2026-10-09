@@ -1240,6 +1240,44 @@ async fn vouched_refuses_a_declared_setting_the_scratch_account_may_not_set_befo
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_declared_value_the_engine_rejects_before_writing() {
+    // A permitted setting with a value the engine cannot parse: the
+    // declared state is tried and rolled back first, so the run refuses
+    // naming it, and the comment that would have been written first stays
+    // as it was (#1708 review).
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        let declared = Standard {
+            settings: [("statement_timeout".to_owned(), "nonsense".to_owned())].into(),
+            comment: Some("ours".into()),
+            ..Standard::default()
+        };
+        let inputs = Inputs::overload();
+        let key = ProjectKey::new(true);
+        let reason = vouched_refusal(
+            produce_with(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+                &declared,
+            )
+            .await,
+        );
+        let left = not_standard(&fixture, &scratch_db, &login, &Standard::default(), None).await;
+        fixture.drop().await;
+        assert!(
+            reason.contains("statement_timeout") && reason.contains("nothing was written"),
+            "{server}: {reason}"
+        );
+        assert!(left.is_empty(), "{server}: nothing was written: {left:#?}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_refuses_a_public_grant_chain_it_cannot_revoke_and_leaves_the_acl() {
     // A role granted USAGE on public with its grant option passed it on:
     // the onward entry is that role's to revoke, not the login's. The run

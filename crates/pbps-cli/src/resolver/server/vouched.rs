@@ -894,8 +894,9 @@ async fn release_supplied(
 
 /// Puts the scratch database into `standard`, or refuses naming what the
 /// scratch account cannot apply or cannot put back, before anything is
-/// compiled. A declared value the account cannot apply refuses before the
-/// first write.
+/// compiled. Whatever would stop it refuses before the first write: the
+/// whole declared state is first tried in a transaction that is rolled
+/// back, so the engine, not a model of it, judges each declared value.
 async fn put_into_standard(conn: &mut Conn, declared: &Standard) -> Result<(), Error> {
     let db =
         |what: &'static str| move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"));
@@ -906,6 +907,24 @@ async fn put_into_standard(conn: &mut Conn, declared: &Standard) -> Result<(), E
         return Err(Error::Vouched(format!(
             "the scratch account cannot apply the resolver's declared standard: {}",
             unappliable.join("; ")
+        )));
+    }
+    // Already standard, as a release leaves it: no statement, no trial.
+    if standard::verify(conn, declared, None)
+        .await
+        .map_err(db("the scratch database's standard state"))?
+        .is_empty()
+    {
+        return Ok(());
+    }
+    let refused = standard::trial(conn, declared)
+        .await
+        .map_err(db("the scratch database's standard state"))?;
+    if !refused.is_empty() {
+        return Err(Error::Vouched(format!(
+            "the scratch database cannot be put into its declared standard state, so nothing \
+             was written ({}); its operator must repair the database or the declaration",
+            refused.join("; ")
         )));
     }
     let failed = standard::enforce(conn, declared, None)
