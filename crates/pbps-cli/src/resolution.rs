@@ -117,7 +117,9 @@ pub struct Request<'a> {
     pub hints: &'a pbps_model::Hints,
     /// The `system_identifier` of the cluster the planning read reached, for
     /// a PostgreSQL target. The resolver's own target connection must reach
-    /// the same one: a target name can reach several (#1685).
+    /// the same one: a target name can reach several (#1685). Like `base`,
+    /// only a producer reads it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub target_identity: Option<&'a str>,
 }
 
