@@ -26569,6 +26569,77 @@ async fn relation_name_occupants_name_each_kind_and_its_owner() {
         .expect("drop");
 }
 
+/// #1645: what holds a key's candidate names in a schema, read by prefix:
+/// every relation, with the table an index is on or whose column owns a
+/// sequence, and every constraint, with its table. A sequence no column owns
+/// stands alone, and a constraint of the name in another schema is not read.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn key_name_holders_name_each_holder_its_owner_and_its_kind() {
+    use pbps_pg::catalog::key_name_holders;
+    let mut conn = connect().await;
+    let s = probe_schema_9("keyholders");
+    let other = probe_schema_9("keyholders_x");
+    fresh(&mut conn, &s).await;
+    fresh(&mut conn, &other).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (id integer PRIMARY KEY, CONSTRAINT n_pkey3 CHECK (id > 0));
+         CREATE INDEX n_pkey ON {s}.t (id);
+         CREATE SEQUENCE {s}.n_pkey1 OWNED BY {s}.t.id;
+         CREATE SEQUENCE {s}.n_pkey2;
+         CREATE TABLE {s}.n_pkey4 (x integer);
+         CREATE TABLE {s}.unrelated (x integer);
+         CREATE TABLE {other}.u (x integer, CONSTRAINT n_pkey5 CHECK (x > 0))"
+    ))
+    .await
+    .expect("the holders");
+    let mut found = key_name_holders(&mut conn, &[(s.clone(), "n_pkey".to_owned())])
+        .await
+        .expect("the read");
+    found.sort_by(|a, b| (&a.name, a.constraint).cmp(&(&b.name, b.constraint)));
+    let seen: Vec<(String, Option<String>, bool, bool)> = found
+        .iter()
+        .map(|h| {
+            assert_eq!(h.name.schema, s);
+            (
+                h.name.name.clone(),
+                h.owner.as_ref().map(|t| t.name.clone()),
+                h.primary_key,
+                h.constraint,
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("n_pkey".into(), Some("t".into()), false, false),
+            ("n_pkey1".into(), Some("t".into()), false, false),
+            ("n_pkey2".into(), None, false, false),
+            ("n_pkey3".into(), Some("t".into()), false, true),
+            ("n_pkey4".into(), None, false, false),
+        ],
+        "`t_pkey`, `unrelated` and the other schema's check do not start with the prefix there"
+    );
+    // A key's own index and constraint say so.
+    let keyed = key_name_holders(&mut conn, &[(s.clone(), "t_pkey".to_owned())])
+        .await
+        .expect("the key read");
+    assert_eq!(keyed.len(), 2, "{keyed:?}");
+    assert!(keyed.iter().all(|h| h.primary_key), "{keyed:?}");
+    // Negative: nothing to read is no query and no holder.
+    assert!(
+        key_name_holders(&mut conn, &[])
+            .await
+            .expect("an empty read")
+            .is_empty()
+    );
+    conn.execute(&format!(
+        "DROP SCHEMA {s} CASCADE; DROP SCHEMA {other} CASCADE"
+    ))
+    .await
+    .expect("drop");
+}
+
 /// #987: two tables whose unnamed keys generate one `_pkey` get the engine's
 /// first choice and its first fallback, as the dialect predicts. A declared
 /// index at that fallback lands differently by order: created after both

@@ -3178,6 +3178,108 @@ pub async fn relation_name_occupants(
     Ok(out)
 }
 
+/// A name in a schema that an unnamed primary key's index cannot take
+/// (#1645): a relation's of any kind, a composite type's included, or a
+/// constraint's in that schema, on any of its tables. Measured on 16 and 18:
+/// either makes the engine number the key's index (`_pkey1`), and a
+/// constraint of that name in another schema, an enum or a domain does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyNameHolder {
+    pub name: TableName,
+    /// The table an index or a constraint belongs to, or whose column owns a
+    /// sequence, which moves and goes with it (measured on 16 and 18, #1729
+    /// review); `None` for any other relation, a table among them.
+    pub owner: Option<TableName>,
+    /// Whether it is a primary key's index or constraint.
+    pub primary_key: bool,
+    /// Whether it is a constraint rather than a relation: a check and an
+    /// index of one name on one table are two holders, and dropping one
+    /// leaves the other.
+    pub constraint: bool,
+}
+
+/// The [`KeyNameHolder`]s whose names start with one of `prefixes`, each a
+/// `(schema, prefix)`, read in the caller's transaction. A prefix is the part
+/// every name the engine may try for a key's index starts with
+/// (`implicit_primary_key_fallback`), so the rows are a superset the caller
+/// matches whole names against.
+pub async fn key_name_holders(
+    conn: &mut Conn,
+    prefixes: &[(String, String)],
+) -> Result<Vec<KeyNameHolder>, DbError> {
+    if prefixes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let params: Vec<Param<'_>> = prefixes
+        .iter()
+        .flat_map(|(schema, prefix)| [Param::Str(schema.as_str()), Param::Str(prefix.as_str())])
+        .collect();
+    let rows: Vec<String> = (0..prefixes.len())
+        .map(|i| format!("(${}::text, ${}::text)", 2 * i + 1, 2 * i + 2))
+        .collect();
+    let sql = format!(
+        "WITH wanted(schema_name, prefix) AS (VALUES {})\n\
+         SELECT n.nspname AS schema_name, c.relname::text AS holder_name,\n       \
+                ownns.nspname AS owner_schema, own.relname AS owner_name,\n       \
+                COALESCE(i.indisprimary, false) AS primary_key,\n       \
+                false AS is_constraint\n  \
+           FROM pg_catalog.pg_class c\n  \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n  \
+           LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid\n  \
+           LEFT JOIN pg_catalog.pg_depend d\n    \
+             ON c.relkind = 'S'\n   \
+            AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass\n   \
+            AND d.objid = c.oid\n   \
+            AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass\n   \
+            AND d.deptype IN ('a', 'i')\n  \
+           LEFT JOIN pg_catalog.pg_class own ON own.oid = COALESCE(i.indrelid, d.refobjid)\n  \
+           LEFT JOIN pg_catalog.pg_namespace ownns ON ownns.oid = own.relnamespace\n \
+          WHERE EXISTS (SELECT 1 FROM wanted w\n                  \
+                         WHERE w.schema_name = n.nspname\n                    \
+                           AND starts_with(c.relname::text, w.prefix))\n\
+         UNION ALL\n\
+         SELECT n.nspname, con.conname::text, tn.nspname, t.relname, con.contype = 'p', true\n  \
+           FROM pg_catalog.pg_constraint con\n  \
+           JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace\n  \
+           LEFT JOIN pg_catalog.pg_class t ON t.oid = con.conrelid\n  \
+           LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace\n \
+          WHERE EXISTS (SELECT 1 FROM wanted w\n                  \
+                         WHERE w.schema_name = n.nspname\n                    \
+                           AND starts_with(con.conname::text, w.prefix))",
+        rows.join(", ")
+    );
+    let mut out = Vec::new();
+    for row in &conn.query_with(&sql, &params).await? {
+        let text = |column: &str| -> Result<String, DbError> {
+            row.try_get::<&str>(column)?
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    DbError::BadRow(format!(
+                        "the key-name holder query returned a NULL {column}"
+                    ))
+                })
+        };
+        let owner = match (
+            row.try_get::<&str>("owner_schema")?,
+            row.try_get::<&str>("owner_name")?,
+        ) {
+            (Some(schema), Some(name)) => Some(TableName::new(schema, name)),
+            _ => None,
+        };
+        out.push(KeyNameHolder {
+            name: TableName::new(text("schema_name")?, text("holder_name")?),
+            owner,
+            primary_key: row.try_get::<bool>("primary_key")?.ok_or_else(|| {
+                DbError::BadRow("the key-name holder query returned a NULL primary_key".into())
+            })?,
+            constraint: row.try_get::<bool>("is_constraint")?.ok_or_else(|| {
+                DbError::BadRow("the key-name holder query returned a NULL is_constraint".into())
+            })?,
+        });
+    }
+    Ok(out)
+}
+
 /// A permanent table whose foreign key references a partitioned table
 /// (#1595). The engine refuses a permanent table's key to an unlogged table,
 /// but not one through a partitioned table that has, or later gets, an
