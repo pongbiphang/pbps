@@ -995,7 +995,9 @@ As `sa`, the only edges of the view the functions over modules and default
 and check constraints do not return are a table's own, from its computed
 columns, which none of the readers below consumes.
 `public` holds `SELECT` on both functions in `master`; `CONTROL` is not
-needed. A stale module's row has `is_all_columns_found = 0`. A referrer in a
+needed. *Amended by [DEC-1704.1](#dec-1704-1): a `DENY` in `master` takes it
+away, so `doctor` requires it.* A stale module's row has
+`is_all_columns_found = 0`. A referrer in a
 schema the login cannot see is dropped silently, with no row.
 
 **Decision.**
@@ -1061,4 +1063,54 @@ Pinned by:
   `doctor_asks_for_the_dml_a_declared_data_block_needs`
   (`crates/pbps-cli/tests/flow.rs`);
 - `the_dependency_view_and_database_view_definition_are_advice_not_gaps`
+  (`crates/pbps-mssql/src/doctor.rs`).
+
+<a id="dec-1704-1"></a>
+
+**DEC-1704.1. `doctor` requires `SELECT` on each per-object dependency function
+the server's reads ask, asked of that function from the managed database, and
+names the gap at the function (#1704; amends DEC-1644.1).** DEC-1644.1 moved the reads of `pull`,
+`plan --db` and `verify` onto `sys.dm_sql_referenced_entities` and
+`sys.dm_sql_referencing_entities`, and asked nothing of them because `public`
+holds `SELECT` on both in `master`. A `DENY` there takes it away, and the
+login `doctor` called ready then fails those reads with Msg 229.
+
+**Measured** on 17.0, with a login holding `SELECT` and `VIEW DEFINITION` on
+`SCHEMA::dbo` and a view in the managed database:
+
+| In `master` | `HAS_PERMS_BY_NAME(N'sys.<function>', 'OBJECT', 'SELECT')` from the managed database | The read |
+|---|---|---|
+| nothing beyond `public`'s grant | 1 | rows |
+| `DENY SELECT` to the login's user | 0 | Msg 229 |
+| `DENY SELECT` to `public`, the login with no user in `master` | 0 | Msg 229 |
+
+`GRANT` or `DENY` on either function in any database but `master` is Msg 4629.
+
+**Decision.**
+- Each function is its own entry in `REQUIRED`, `SELECT` with
+  `Needed::DependencyFunction`, asked by `HAS_PERMS_BY_NAME` from the managed
+  database and reported at `OBJECT::[sys].[<function>]`, each with the
+  commands that read it. The probe sees the `DENY` whichever principal carries
+  it, so no failure-time diagnosis is needed.
+- Only where the server's reads ask it (`doctor::dependency_functions_read`).
+  `dm_sql_referenced_entities` everywhere: the pull's module dependencies.
+  `dm_sql_referencing_entities` only where `impact::DependencyRead::for_server`
+  chooses the functions; on SQL Server 2008 to 2012 the rename impact report
+  reads the view (DEC-1644.1), so a `DENY` on it there stops nothing and is no
+  gap. `doctor` never sees a plan, so where the function is read it is asked
+  of every project: a rename is an ordinary change, and `public` holds the
+  grant until someone denies it.
+- The reason names `master`, the only place the grant can change, and says it
+  is missing only where a `DENY` there takes it away: the remedy is to remove
+  that `DENY`, not to grant in the managed database.
+
+**Why not advice, like the view.** The view's `SELECT` decides one kind of
+plan, which is refused by name without it. These decide every pull, plan and
+verify, which fail without them.
+
+Pinned by:
+- `a_denied_dependency_function_is_a_readiness_gap`
+  (`crates/pbps-mssql/tests/live.rs`);
+- `a_denied_dependency_function_is_a_gap_named_at_that_function` and
+  `only_the_functions_a_servers_reads_ask_are_required`
   (`crates/pbps-mssql/src/doctor.rs`).
