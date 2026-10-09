@@ -196,9 +196,18 @@ checksum-pinned, and state lives in the database itself.
   and the deletion request and confirmation times; the window ends at confirmed
   deletion. After deletion, complete a
   repository-wide `state=all` PR scan and re-read recorded dependents by ID.
-  Inspect newly created PRs in that window, including timestamp boundary cases;
-  use base-ref history when their current base cannot establish whether they
-  depended on this parent. A newly discovered parent-dependent PR is failed
+  Audit base/state history through that fixed window for the union of IDs in
+  both all-state scans and the recorded dependents, regardless of PR age.
+  Complete pagination and retain a known base/state anchor plus every transition
+  through the post-delete read. Reconstruct whether the owned parent was a base
+  at any point in the window, including either timestamp boundary; use both
+  previous and current refs of a base-change event. Creation time, updated time,
+  current base and equal endpoint snapshots cannot exclude an intervening
+  association. Activity without parent association is not itself a failure.
+  Missing anchors, hidden/incomplete history, inconsistent state or ambiguous
+  boundary ordering stop cleanup; do not replace history with a delay or poll
+  indefinitely for a favorable snapshot (DEC-1473.1).
+  A newly discovered parent-dependent PR is failed
   closeout, including one that is now closed. Do not invent a pre-delete head
   or expected diff for it; retain its observed state/base/head/diff and inspect
   the commit provenance before recovery. An unchanged older PR demonstrably

@@ -2319,6 +2319,11 @@ Three traps sat inside the fix, and each of them is a measurement:
   Newly discovered parent dependents fail closeout; unchanged PRs demonstrably
   closed before the window do not. Ambiguous association or an incomplete read
   stops local cleanup, and recovery must not overwrite a recreated foreign ref.
+  Selecting only newly created PRs still misses an older PR whose base changes
+  to the parent and back within the window. DEC-1473.1 audits complete base/state
+  transitions for the union of initial/final identities and recorded dependents.
+  Equal endpoint snapshots and creation/update timestamps cannot prove absence
+  of that association; unrelated activity alone does not establish it.
 
 ## A pre-delete count includes the row its statement removes
 

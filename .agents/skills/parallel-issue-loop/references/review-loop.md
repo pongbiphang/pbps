@@ -207,10 +207,17 @@ The primary agent owns this ordered closeout (DEC-1228.1):
    the window started in step 1. Complete a
    repository-wide `state=all` PR scan after deletion, with every page, and
    re-read the recorded dependents by ID even after their bases changed.
-   Inspect every PR created within the window, including timestamp boundary
-   cases. Establish parent association from its base-ref history when its
-   current base alone cannot decide; unavailable history is not proof that it
-   was unrelated. A newly discovered parent-dependent PR fails closeout even
+   Audit base/state history for the union of IDs in both all-state scans and
+   recorded dependents, regardless of creation time. Complete pagination and
+   retain a known base/state anchor and every transition through the post-delete
+   read. Reconstruct whether the owned parent was a base at any point in the
+   fixed window; both endpoints are inclusive, and both previous/current refs
+   of a base-change event matter. Neither `updated_at`, the current base nor
+   equal start/end snapshots can exclude an intervening association. Unrelated
+   metadata activity alone is not failed closeout. A missing anchor, hidden or
+   incomplete history, inconsistent state or ambiguous timestamp ordering stops
+   cleanup; do not substitute a delay or unbounded polling (DEC-1473.1).
+   A newly discovered parent-dependent PR fails closeout even
    if it is now closed or already has the intended base. Retain its observed
    state/base/head/diff; do not invent an earlier head or expected patch.
    Inspect commit provenance and expected remaining work before recovery.

@@ -112,8 +112,11 @@ and merge order.
   dependents, record their heads and expected remaining diffs, verify OPEN/base/
   unchanged head/diff before deletion, then reverify after deletion. Record the
   operation window and complete the repository-wide `state=all` post-delete
-  scan, including late-created closed dependents and base-ref history when
-  needed; an open-only scan cannot authorize local cleanup (DEC-1458.1).
+  scan and the bounded base/state history audit for every identity in the
+  initial/final scans and recorded dependents, regardless of PR age. Equal
+  snapshots and creation/update times do not exclude an intervening parent
+  association; incomplete or ambiguous history stops cleanup (DEC-1473.1).
+  An open-only scan cannot authorize local cleanup (DEC-1458.1).
   Never rely on automatic retargeting (DEC-1228.1). Refresh each dependent's
   existing review
   and current-head CI gates before enqueueing. When fresh retargeted CI is
