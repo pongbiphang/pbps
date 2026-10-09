@@ -2623,6 +2623,21 @@ artifact pinning and transactional result checks before existing rebind
 protections are retired. Environment tests cover both engines; PostgreSQL tests
 do not qualify the future SQL Server binding adapter.
 
+The CLI flow suites qualify abrupt apply loss on both engines (#1131). An
+owned session blocked at the ledger INSERT proves the precommit or
+precheckpoint boundary; independent connections inspect the durable rows and
+ledger after process/session termination. A second gate on the existing
+application-lock row proves committed work before caller success. On Linux,
+stdout backpressure armed at the first checkpoint INSERT holds the existing
+checkpoint message before the next staged statement, with an owned-process
+Linux wait-channel receipt proving the blocked pipe write, without production hooks
+or a database protocol proxy. Release controls must complete through the same
+gates. Resume rejects a wrong checksum or changed intermediate state; an
+unrecorded committed step cannot be invented as staged progress. Process death
+is reaped before releasing a gate, and session termination matches both its
+numeric identifier and creation identity. These tests cover the current
+single-change staged contract, not multi-change staging or lost COMMIT replies.
+
 ---
 
 ## 12. Phases

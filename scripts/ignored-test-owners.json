@@ -993,6 +993,10 @@
         "darwin"
       ],
       "cases": [
+        "abrupt_committed_apply_without_caller_success_is_not_replayed",
+        "abrupt_staged_ddl_refuses_unrecorded_progress",
+        "abrupt_staged_row_write_refuses_unproved_replay",
+        "abrupt_transactional_apply_preserves_atomic_recovery",
         "a_cell_returned_to_its_default_applies",
         "a_chain_of_moves_through_an_intermediate_name_applies_together",
         "a_chain_of_renames_into_vacated_names_applies_together",
@@ -1173,6 +1177,10 @@
         "darwin"
       ],
       "cases": [
+        "abrupt_committed_apply_without_caller_success_is_not_replayed",
+        "abrupt_staged_ddl_refuses_unrecorded_progress",
+        "abrupt_staged_row_write_refuses_unproved_replay",
+        "abrupt_transactional_apply_preserves_atomic_recovery",
         "a_carried_only_rename_impact_lists_what_the_rename_carries",
         "a_cascade_lock_denial_keeps_its_remedy_on_the_failed_ledger",
         "a_cascade_reached_table_is_held_until_the_write_finishes",
@@ -2136,6 +2144,24 @@
         "resolver::server::vouched::live_tests::vouched_refuses_a_scratch_that_is_not_empty",
         "resolver::server::vouched::live_tests::vouched_refuses_the_target_as_scratch",
         "resolver::server::vouched::live_tests::vouched_runs_in_a_precreated_database_with_a_confined_account"
+      ]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow"],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": ["linux"],
+      "cases": [
+        "abrupt_staged_apply_resumes_from_a_durable_checkpoint_before_the_next_step"
+      ]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow_pg"],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": ["linux"],
+      "cases": [
+        "abrupt_staged_apply_resumes_from_a_durable_checkpoint_before_the_next_step"
       ]
     }
   ]

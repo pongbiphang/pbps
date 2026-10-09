@@ -20575,3 +20575,96 @@ fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
         );
     }
 }
+
+#[path = "support/abrupt_recovery.rs"]
+mod abrupt_recovery;
+
+#[test]
+#[ignore = "needs a live database"]
+fn abrupt_transactional_apply_preserves_atomic_recovery() {
+    use abrupt_recovery::{Case, Loss};
+    for (index, loss) in [Loss::Release, Loss::Process, Loss::Session]
+        .into_iter()
+        .enumerate()
+    {
+        let own = OwnDatabase::new(&server(), &format!("abrupt1131_transactional_{index}"));
+        abrupt_recovery::run(
+            own.connection(),
+            pbps_db::Driver::Postgres,
+            loss,
+            Case::Transactional,
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a live database"]
+fn abrupt_staged_ddl_refuses_unrecorded_progress() {
+    use abrupt_recovery::{Case, Loss};
+    for (index, loss) in [Loss::Release, Loss::Process, Loss::Session]
+        .into_iter()
+        .enumerate()
+    {
+        let own = OwnDatabase::new(&server(), &format!("abrupt1131_stagedddl_{index}"));
+        abrupt_recovery::run(
+            own.connection(),
+            pbps_db::Driver::Postgres,
+            loss,
+            Case::StagedDdl,
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a live database"]
+fn abrupt_staged_row_write_refuses_unproved_replay() {
+    use abrupt_recovery::{Case, Loss};
+    for (index, loss) in [Loss::Release, Loss::Process, Loss::Session]
+        .into_iter()
+        .enumerate()
+    {
+        let own = OwnDatabase::new(&server(), &format!("abrupt1131_stagedrow_{index}"));
+        abrupt_recovery::run(
+            own.connection(),
+            pbps_db::Driver::Postgres,
+            loss,
+            Case::StagedRow,
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a live database"]
+fn abrupt_committed_apply_without_caller_success_is_not_replayed() {
+    use abrupt_recovery::{Case, Loss};
+    for (index, loss) in [Loss::Release, Loss::Process, Loss::Session]
+        .into_iter()
+        .enumerate()
+    {
+        let own = OwnDatabase::new(&server(), &format!("abrupt1131_committed_{index}"));
+        abrupt_recovery::run(
+            own.connection(),
+            pbps_db::Driver::Postgres,
+            loss,
+            Case::Committed,
+        );
+    }
+}
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a live database"]
+fn abrupt_staged_apply_resumes_from_a_durable_checkpoint_before_the_next_step() {
+    use abrupt_recovery::{Case, Loss};
+    for (index, loss) in [Loss::Release, Loss::Process, Loss::Session]
+        .into_iter()
+        .enumerate()
+    {
+        let own = OwnDatabase::new(&server(), &format!("abrupt1131_checkpoint_{index}"));
+        abrupt_recovery::run(
+            own.connection(),
+            pbps_db::Driver::Postgres,
+            loss,
+            Case::Checkpoint,
+        );
+    }
+}
