@@ -605,11 +605,22 @@ impl Run<'_> {
             .into_iter()
             .filter(|schema| scope_schemas.contains(schema))
             .collect::<Vec<_>>();
-        let given_up = sql::revoke_usage(admin, &unusable)
+        let (given_up, usable) = sql::revoke_usage(admin, &unusable)
             .await
             .map_err(db("the schemas the deployer cannot use"))?;
         if let Created::Supplied { given_up: kept, .. } = &mut self.created {
             *kept = given_up;
+        }
+        // Kept on the login's path while it leaves the deployer's, such a
+        // schema would make every comparison a mismatch; name what keeps it
+        // instead (#1678 review). What was given up is granted back at
+        // cleanup all the same.
+        if !usable.is_empty() {
+            return Err(Error::Vouched(format!(
+                "the scratch account keeps USAGE on what the plan takes from the deployer ({}); \
+                 remove those privileges from the scratch account",
+                usable.join("; ")
+            )));
         }
         pbps_pg::resolver::authorization::apply_session_settings(admin, context)
             .await

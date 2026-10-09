@@ -1911,12 +1911,20 @@ by the engines, and the scratch account decides the layout.** Implemented by
   (measured on 16 and 18). Otherwise the comparison sees a schema the
   deployer will not, and a valid plan is refused (#1678 review).
   - initdb's `public` is the one schema a supplied database holds that the
-    login does not own. The login reaches it through `PUBLIC` and its
-    membership of `pg_database_owner`. It revokes those as
+    login does not own. The login reaches it through `PUBLIC`, its
+    membership of `pg_database_owner`, and any role whose privileges it
+    holds that the owner granted `USAGE`. It revokes all of those as
     `pg_database_owner`, grants them back at cleanup, each with the grant
     option it held, and fails the run, named, if the schema's ACL is not
     then as it was. Measured on 16 and 18, the round trip restores the ACL
     exactly.
+  - What no per-schema revoke reaches refuses the run, named, before
+    anything compiles: `pg_read_all_data` and `pg_write_all_data` grant
+    `USAGE` on every schema (measured on 16 and 18), and an entry another
+    grantor made is not the owner's to revoke. The schema would otherwise
+    stay on the login's path while it leaves the deployer's, and every
+    comparison would be a mismatch (#1678 review). What was given up is
+    still granted back.
   - The path read that compares visibility runs before any framing pins
     the string mode, so its literal is the setting-independent `E'…'`
     form. A backslash in a schema name otherwise took the schema off the
