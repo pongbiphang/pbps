@@ -952,6 +952,8 @@ for the sake of punctuation. So the text changes instead:
   is refused like `"—"` (#1650). A `\x` escape in a `str` or `char` is ASCII
   by construction. A character built at runtime (`char::from_u32`,
   `concat!`) is beyond a scan of literals;
+- a raw string (`r"…"`, `br"…"`, `cr"…"`) holds no escapes, so its
+  `\u{...}` is the ASCII it spells and is not refused (#1697);
 - comments are free.
 
 What a user declares is sent as declared, and whether the database's encoding
