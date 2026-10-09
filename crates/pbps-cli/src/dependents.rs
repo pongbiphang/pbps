@@ -1362,6 +1362,7 @@ pub(crate) fn after_the_rebuilds(
     cs: &mut ChangeSet,
     released: &BTreeSet<ColumnRef>,
     deps: &ModuleDeps,
+    declared: &pbps_model::Schema,
 ) -> Result<usize, String> {
     let Some(last) = last_function_create(cs) else {
         return Ok(0);
@@ -1460,7 +1461,7 @@ pub(crate) fn after_the_rebuilds(
     kept.extend(moved);
     kept.extend(tail);
     cs.changes = kept;
-    Ok(count + after_their_functions(cs, deps)?)
+    Ok(count + after_their_functions(cs, deps, &Partitions::of(declared))?)
 }
 
 /// The literals in the plan's expressions that may name a relation this plan
@@ -2313,6 +2314,28 @@ fn truncated(mut part: String) -> String {
     part
 }
 
+/// Each partitioned table's partitions, as declared: a column added to the
+/// parent is added to each of them, so what reads a partition reads the
+/// column (#1692 review).
+struct Partitions<'a>(BTreeMap<&'a TableName, Vec<&'a TableName>>);
+
+impl<'a> Partitions<'a> {
+    fn of(declared: &'a pbps_model::Schema) -> Self {
+        let mut map: BTreeMap<&TableName, Vec<&TableName>> = BTreeMap::new();
+        for (name, table) in &declared.tables {
+            if let Some(of) = &table.partition_of {
+                map.entry(&of.parent).or_default().push(name);
+            }
+        }
+        Self(map)
+    }
+
+    /// The table and the partitions it holds a column for.
+    fn holding(&self, table: &'a TableName) -> impl Iterator<Item = &'a TableName> + '_ {
+        std::iter::once(table).chain(self.0.get(table).into_iter().flatten().copied())
+    }
+}
+
 /// Places a column this plan adds whose default or generation expression
 /// names a function the plan creates or rebuilds after that function's
 /// create, and whatever may need the column after the column (DEC-1364.1).
@@ -2338,7 +2361,11 @@ fn truncated(mut part: String) -> String {
 /// cannot fire on them. Such a plan is refused, naming the column and the
 /// functions, with the two-plan remedy.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn after_their_functions(cs: &mut ChangeSet, deps: &ModuleDeps) -> Result<usize, String> {
+fn after_their_functions(
+    cs: &mut ChangeSet,
+    deps: &ModuleDeps,
+    partitions: &Partitions,
+) -> Result<usize, String> {
     let functions = function_creates(cs);
     let Some(last) = functions.iter().map(|(_, at)| *at).max() else {
         return Ok(0);
@@ -2392,7 +2419,11 @@ fn after_their_functions(cs: &mut ChangeSet, deps: &ModuleDeps) -> Result<usize,
     // with one side here: a schema of many modules is not lexed pair by pair.
     let mut held: BTreeSet<usize> = waits.keys().map(|at| at - start).collect();
     for i in 0..n {
-        if !held.contains(&i) && held.range(..i).any(|&j| needs(window[i], window[j], deps)) {
+        if !held.contains(&i)
+            && held
+                .range(..i)
+                .any(|&j| needs(window[i], window[j], deps, partitions))
+        {
             held.insert(i);
         }
     }
@@ -2400,11 +2431,11 @@ fn after_their_functions(cs: &mut ChangeSet, deps: &ModuleDeps) -> Result<usize,
     let mut previous_free: Option<usize> = None;
     for i in 0..n {
         if held.contains(&i) {
-            preds[i].extend((0..i).filter(|&j| needs(window[i], window[j], deps)));
+            preds[i].extend((0..i).filter(|&j| needs(window[i], window[j], deps, partitions)));
         } else {
             preds[i].extend(
                 held.range(..i)
-                    .filter(|&&j| needs(window[i], window[j], deps)),
+                    .filter(|&&j| needs(window[i], window[j], deps, partitions)),
             );
             preds[i].extend(previous_free);
             previous_free = Some(i);
@@ -2424,7 +2455,7 @@ fn after_their_functions(cs: &mut ChangeSet, deps: &ModuleDeps) -> Result<usize,
         order.push(i);
     }
     if order.len() < n {
-        return Err(cycle(cs, start, &waits, &done, &window, deps));
+        return Err(cycle(cs, start, &waits, &done, &window, deps, partitions));
     }
     let mut taken: Vec<Option<PlannedChange>> = cs.changes.drain(start..=last).map(Some).collect();
     let placed: Vec<PlannedChange> = order
@@ -2445,6 +2476,7 @@ fn cycle(
     done: &[bool],
     window: &[&Change],
     deps: &ModuleDeps,
+    partitions: &Partitions,
 ) -> String {
     let Some((&at, named)) = waits.iter().find(|(at, _)| !done[**at - start]) else {
         return "a column this plan adds cannot be ordered against the functions it calls; \
@@ -2466,7 +2498,9 @@ fn cycle(
     let module = |i: usize| cs.changes[i].change.module_id().map(|id| format!("`{id}`"));
     let functions: Vec<String> = named.iter().filter_map(|&i| module(i)).collect();
     let blockers: Vec<String> = (0..window.len())
-        .filter(|&i| !done[i] && start + i != at && needs(window[i], window[at - start], deps))
+        .filter(|&i| {
+            !done[i] && start + i != at && needs(window[i], window[at - start], deps, partitions)
+        })
         .filter_map(|i| match window[i] {
             Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
                 Some(format!("a row this plan writes into `{table}`"))
@@ -2500,7 +2534,9 @@ fn cycle(
 ///
 /// - A column added: a module that may read it ([`reads_column`]), a row that
 ///   writes it or takes its default, and another change of its table that
-///   names it. A module drop and a row delete never need a new column.
+///   names it. A module drop and a row delete never need a new column. A
+///   partitioned table's column is each partition's too, so a module or a
+///   row of one of its partitions counts as one of the table's.
 /// - A module created: a module that names it, in code or in a literal an
 ///   OID-alias type may read (`may_call`), is attached to it, shares
 ///   its name (overloads are ordered by `depends_on:` alone, DECISIONS 212) or
@@ -2510,25 +2546,31 @@ fn cycle(
 /// - A row write: everything after it. A trigger the plan creates must not
 ///   fire on a row the plan writes before the modules.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps) -> bool {
+fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps, partitions: &Partitions) -> bool {
     match earlier {
         Change::AddColumn { table, name, .. } => match later {
-            Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
-                reads_column(id, &module.definition, table, name)
-            }
+            Change::CreateModule { id, module } | Change::AlterModule { id, module } => partitions
+                .holding(table)
+                .any(|t| reads_column(id, &module.definition, t, name)),
             Change::DropModule { .. } | Change::DeleteRow { .. } => false,
             Change::InsertRow {
                 table: t,
                 row,
                 defaults,
                 ..
-            } => t == table && (row.get(name).is_some() || defaults.contains_key(name)),
+            } => {
+                partitions.holding(table).any(|p| p == t)
+                    && (row.get(name).is_some() || defaults.contains_key(name))
+            }
             Change::UpdateRow {
                 table: t,
                 columns,
                 unchanged,
                 ..
-            } => t == table && (columns.contains_key(name) || unchanged.contains_key(name)),
+            } => {
+                partitions.holding(table).any(|p| p == t)
+                    && (columns.contains_key(name) || unchanged.contains_key(name))
+            }
             other => names_column(other, table, name),
         },
         Change::CreateModule { id: before, .. } | Change::AlterModule { id: before, .. } => {
@@ -2855,7 +2897,13 @@ mod tests {
     /// `after_the_rebuilds` with no `depends_on:` edges, for an order it
     /// finds.
     fn rebuilds(cs: &mut ChangeSet, released: &BTreeSet<ColumnRef>) -> usize {
-        after_the_rebuilds(cs, released, &ModuleDeps::new()).unwrap()
+        after_the_rebuilds(
+            cs,
+            released,
+            &ModuleDeps::new(),
+            &pbps_model::Schema::default(),
+        )
+        .unwrap()
     }
 
     fn plan(changes: Vec<Change>) -> ChangeSet {
@@ -4211,7 +4259,15 @@ mod tests {
         };
         let deps = ModuleDeps::from([(id("app.b_user()"), BTreeSet::from([id("app.a_reader()")]))]);
         let mut cs = changes();
-        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new(), &deps), Ok(1));
+        assert_eq!(
+            after_the_rebuilds(
+                &mut cs,
+                &BTreeSet::new(),
+                &deps,
+                &pbps_model::Schema::default()
+            ),
+            Ok(1)
+        );
         assert!(
             at(&cs, "app.a_reader()") < at(&cs, "app.b_user()"),
             "{:?}",
@@ -4262,13 +4318,76 @@ mod tests {
         ] {
             let mut cs = plan(changes);
             let before = names(&cs);
-            let why =
-                after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new()).unwrap_err();
+            let why = after_the_rebuilds(
+                &mut cs,
+                &BTreeSet::new(),
+                &ModuleDeps::new(),
+                &pbps_model::Schema::default(),
+            )
+            .unwrap_err();
             assert!(why.contains("`app.t.g`"), "{why}");
             assert!(why.contains("`app.f(integer)`"), "{why}");
             assert!(why.contains("two plans"), "{why}");
             assert_eq!(names(&cs), before);
         }
+    }
+
+    /// A column added to a partitioned table is added to each partition, so
+    /// a view over a partition that a function the column calls reads is the
+    /// same cycle: refused by name, not left to bind the partition's old
+    /// column shape (#1692 review).
+    #[test]
+    fn a_column_of_a_partitioned_table_is_read_through_its_partitions() {
+        use pbps_model::{PartitionBound, PartitionOf, Schema, Table};
+        let mut declared = Schema::default();
+        declared.tables.insert(
+            TableName::new("app", "t_1"),
+            Table {
+                partition_of: Some(PartitionOf {
+                    parent: TableName::new("app", "t"),
+                    bound: PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Table::default()
+            },
+        );
+        let changes = |over: &str| {
+            plan(vec![
+                add_column("g", "app.f(1)", false),
+                new_view("app.v", &format!("SELECT * FROM {over}")),
+                Change::CreateModule {
+                    id: id("app.f(integer)"),
+                    module: Box::new(module(
+                        ModuleKind::Function,
+                        "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT count(*)::int FROM app.v $$",
+                    )),
+                },
+            ])
+        };
+        let mut cs = changes("app.t_1");
+        let why = after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), &declared)
+            .unwrap_err();
+        assert!(why.contains("`app.t.g`"), "{why}");
+        assert!(why.contains("`app.v`"), "{why}");
+        // Negative: a view over a table that is no partition of it is free to
+        // go ahead, and the column follows the function.
+        let mut other = changes("app.u_1");
+        assert_eq!(
+            after_the_rebuilds(&mut other, &BTreeSet::new(), &ModuleDeps::new(), &declared),
+            Ok(1)
+        );
+        // Negative: without the declared partition the same plan orders, as
+        // before the relation was known.
+        let mut unknown = changes("app.t_1");
+        assert_eq!(
+            after_the_rebuilds(
+                &mut unknown,
+                &BTreeSet::new(),
+                &ModuleDeps::new(),
+                &Schema::default()
+            ),
+            Ok(1)
+        );
     }
 
     /// Rows are written before the modules, so a row that writes the column,
@@ -4299,7 +4418,12 @@ mod tests {
                 row,
                 routine("app.f(integer)", "SELECT 1"),
             ]);
-            after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new())
+            after_the_rebuilds(
+                &mut cs,
+                &BTreeSet::new(),
+                &ModuleDeps::new(),
+                &pbps_model::Schema::default(),
+            )
         };
         let why = ordered(insert(&["g"], &[])).unwrap_err();
         assert!(why.contains("a row this plan writes into `app.t`"), "{why}");

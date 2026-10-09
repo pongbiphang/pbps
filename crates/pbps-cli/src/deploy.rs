@@ -5959,6 +5959,7 @@ pub fn cmd_bootstrap(
                     &mut cs,
                     &BTreeSet::new(),
                     &loaded.hints.module_deps,
+                    &loaded.schema,
                 )
             })
             .and_then(|_| {

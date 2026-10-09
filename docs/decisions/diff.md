@@ -3991,10 +3991,16 @@ behind the function its default calls (`after_their_functions`, DEC-1364.1)
 holds such a partition behind the column too, and one whose own index or
 check names the column. So it does a standing partition's own default, NOT
 NULL, index or check on the column. Only the default's change names its
-parent; the pass has no schema to tell a partition from another table by, so
-any table's NOT NULL, index or check naming a column of that name waits as
-well. That holds it longer, short of a cycle, which is refused with its
-two-plan remedy.
+parent, and the rule for the others matches the column's name alone, so any
+table's NOT NULL, index or check naming a column of that name waits as well.
+That holds it longer, short of a cycle, which is refused with its two-plan
+remedy.
+
+The pass reads the declared partitions for what reads the column through a
+partition. A view or routine that names a partition, and a row written into
+one, waits behind the parent's added column as one naming the parent does.
+Otherwise a view's `*` over the partition would be bound before the column is
+added, and would never gain it (measured on 18).
 
 **Why not drop the partition's own NOT NULL before the parent's tightening.**
 It would leave no local NOT NULL behind on 18, but it orders a partition
