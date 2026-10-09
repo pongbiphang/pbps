@@ -2200,7 +2200,8 @@ pub(crate) fn warn_unasked(unasked: &[String]) {
 /// closing check still refuses one stored as the parent's, after its
 /// statement — so each caller reports them where its other warnings go: a
 /// connected plan in its JSON envelope (#1660), the rest on stderr through
-/// [`warn_unasked`].
+/// [`warn_unasked`]. A refusal carries them on its error instead
+/// ([`crate::output::Warned`]), to land beside it in either (#1702).
 pub(crate) async fn refuse_misspelt(
     conn: &mut Conn,
     schema: &Schema,
@@ -2209,7 +2210,7 @@ pub(crate) async fn refuse_misspelt(
     let found = crate::engine::misspelt(conn, schema, at)
         .await
         .context("cannot ask the engine how it reads the declared rows")?;
-    let unasked = found
+    let unasked: Vec<String> = found
         .defaults_unasked
         .iter()
         .map(|why| {
@@ -2226,8 +2227,12 @@ pub(crate) async fn refuse_misspelt(
     {
         return Ok(unasked);
     }
-    // Refused for what was asked: what was not still says so, beside it.
-    warn_unasked(&unasked);
+    // Refused for what was asked: what was not still says so, beside it, in
+    // the envelope or on stderr, wherever the refusal is written (#1702).
+    let unasked: Vec<crate::output::Finding> = unasked
+        .into_iter()
+        .map(|w| crate::output::Finding::warning("plan.partition-default-unasked", w))
+        .collect();
     // Two keys the engine reads as one row would insert twice and fail on
     // the second; the alias check (74) cannot see them on a table that holds
     // neither yet (DECISIONS 106).
@@ -2274,13 +2279,16 @@ pub(crate) async fn refuse_misspelt(
             d.partition, d.column, d.declared, d.stored
         )
     }));
-    bail!(
-        "{} declared value(s) would not come back as written:\n  {}\n\
-         A declaration that disagrees with its own database on every plan is worse than \
-         none; the engine's spelling is the one to write (DECISIONS 101, 106).",
-        lines.len(),
-        lines.join("\n  ")
-    );
+    Err(crate::output::warned(
+        anyhow::anyhow!(
+            "{} declared value(s) would not come back as written:\n  {}\n\
+             A declaration that disagrees with its own database on every plan is worse \
+             than none; the engine's spelling is the one to write (DECISIONS 101, 106).",
+            lines.len(),
+            lines.join("\n  ")
+        ),
+        unasked,
+    ))
 }
 
 /// Every schema name a declaration spells, and one declaration that spells it
