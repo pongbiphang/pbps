@@ -20092,7 +20092,9 @@ fn an_unlogged_partition_under_an_undeclared_permanent_key_is_refused() {
 /// have read reaches the output. So does each way it could change the
 /// catalog before the store: types it owns with no check yet, `CREATE` on the
 /// database, `ADMIN` on the deploying role, or inheriting it without `SET`
-/// (#1707). Negatives: without it, the pair is asked and refused as the
+/// (#1707). A text naming another session's temporary schema is left unasked
+/// whoever holds it, its check unrun (#1706). Negatives: without it, the pair
+/// is asked and refused as the
 /// parent's, a domain the deployer owns calling only built-ins does not stop
 /// it, and a text the engine refuses is told by its SQLSTATE alone. On 18
 /// and 16.
@@ -20264,6 +20266,54 @@ fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
             "{version}: {}",
             stderr(&o)
         );
+
+        // Another session's temporary schema is open to any role with TEMP,
+        // PUBLIC's by default, so a check there can appear after the read;
+        // a superuser reaches it by naming it. Held here by the deployer, so
+        // only the text leaves the pair unasked, and the check never runs
+        // (#1706).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut held = rt
+            .block_on(pbps_db::Conn::connect(pbps_db::Driver::Postgres, &conn))
+            .unwrap();
+        on_server(&conn, "CREATE SEQUENCE public.pbps_1663_temp_ran");
+        rt.block_on(held.execute(
+            "CREATE FUNCTION pg_temp.bump(integer) RETURNS boolean LANGUAGE sql AS \
+                 $$ SELECT pg_catalog.nextval('public.pbps_1663_temp_ran') > 0 $$; \
+             CREATE DOMAIN pg_temp.d AS integer CHECK (pg_temp.bump(VALUE)); \
+             CREATE TYPE pg_temp.c AS (v pg_temp.d)",
+        ))
+        .unwrap();
+        let temp = text_of(
+            &conn,
+            "SELECT n.nspname::text FROM pg_catalog.pg_type t \
+               JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+              WHERE t.typname = 'c' AND n.nspname LIKE 'pg\\_temp\\_%'",
+        );
+        declare(&format!("pg_catalog.length((('(6)')::{temp}.c)::text)"));
+        let plan = d.dir.join("temporary.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        let temp_ran = "SELECT CASE WHEN is_called THEN last_value ELSE 0 END \
+                        FROM public.pbps_1663_temp_ran";
+        assert_eq!(
+            scalar(&conn, temp_ran),
+            0,
+            "{version}: the plan ran the check"
+        );
+        assert!(
+            stderr(&o).contains(
+                "partition app.ev_a column `v`: its declared text may name a temporary \
+                 schema, whose objects another session can change"
+            ),
+            "{version}: {}{}",
+            stdout(&o),
+            stderr(&o)
+        );
+        drop(held);
+        drop(rt);
 
         // A text the engine refuses is told by its SQLSTATE, not its words.
         declare("('pbps-1663-text')::integer");

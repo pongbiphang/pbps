@@ -2560,7 +2560,7 @@ struct OwnDefault<'a> {
 /// creates nothing. What cannot be asked — no `TEMP` privilege, an enabled
 /// DDL event trigger (one fires on the `CREATE`, measured, so none is run
 /// under one; #1669), a text that names an object the plan has yet to
-/// create — is listed in
+/// create, one that may name a temporary schema (#1706) — is listed in
 /// `defaults_unasked`, never read as an answer.
 async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mut Spellings) {
     let mut asked: Vec<OwnDefault<'_>> = Vec::new();
@@ -2581,6 +2581,22 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
             };
             // The same text is validation's to refuse (DEC-1578.1).
             if own == parents {
+                continue;
+            }
+            // Another session's temporary schema is open to any role with
+            // `TEMP`, which `PUBLIC` holds by default, so what is in it can
+            // change after the read below. Only a superuser reaches one,
+            // and only by naming it: a non-superuser is refused `USAGE`
+            // and no path searches one, measured on 16 and 18 (#1706).
+            let declared_ty = theirs.ty.to_string();
+            if [own, parents, declared_ty.as_str()]
+                .into_iter()
+                .any(may_name_a_temporary_schema)
+            {
+                out.defaults_unasked.push(format!(
+                    "partition {partition} column `{column}`: its declared text may name a \
+                     temporary schema, whose objects another session can change"
+                ));
                 continue;
             }
             match crate::types::normalize(&theirs.ty) {
@@ -2686,6 +2702,18 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
                 .map(|d| format!("partition {} column `{}`: {why}", d.partition, d.column)),
         ),
     }
+}
+
+/// Whether a declared text could name a temporary schema (`pg_temp_N`,
+/// `pg_toast_temp_N` or the `pg_temp` alias). Read on the text, not the
+/// parse, since the parse is what runs the check. An identifier cannot be
+/// split by a comment or quoting, and folding case covers both spellings; a
+/// `U&` escape can spell the name without its letters, so any is counted.
+/// A text that only mentions one in a literal is left unasked too: that
+/// costs a warning, never a wrong answer.
+fn may_name_a_temporary_schema(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("pg_temp") || text.contains("pg_toast_temp") || text.contains("u&")
 }
 
 /// Every event trigger that DDL could fire: any not disabled, since one
@@ -3391,6 +3419,35 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_text_that_could_name_a_temporary_schema_is_told_by_any_spelling() {
+        for text in [
+            "('(1)')::pg_temp_3.c",
+            "('(1)')::PG_TEMP_3.c",
+            "('(1)')::\"pg_temp_3\".c",
+            "('(1)')::pg_temp.c",
+            "('(1)')::pg_toast_temp_3.c",
+            "('(1)')::U&\"\\0070g_temp_3\".c",
+            "('(1)')::u&\"pg\\005ftemp_3\".c",
+        ] {
+            assert!(may_name_a_temporary_schema(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_text_naming_no_temporary_schema_is_still_asked() {
+        for text in [
+            "(1)",
+            "'other'::text",
+            "('(1)')::app.c",
+            "app.temperature()",
+            "('(1)')::pg_catalog.int4",
+            "pg_catalog.now()",
+        ] {
+            assert!(!may_name_a_temporary_schema(text), "{text}");
+        }
+    }
 
     #[test]
     fn catalog_guidance_preserves_a_separate_source_only_for_recognized_codes() {

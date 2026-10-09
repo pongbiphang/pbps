@@ -3851,6 +3851,20 @@ database pbps manages alone keeps the probe. A function a trusted one calls
 by name inside its body is not seen; that body is its trusted owner's to
 write, and the apply would run it all the same.
 
+Another session's temporary schema is outside that rule: any role with
+`TEMP` on the database, `PUBLIC`'s by default, creates objects there, and
+the role can empty it before the read and fill it after. Counting `TEMP`
+would leave the probe unrun in nearly every database with a second role.
+Measured on 16 and 18 instead, those schemas belong to the bootstrap
+superuser with no grant, so a non-superuser is refused `USAGE` on one, and
+no `search_path` searches another session's. Only a superuser reaches one,
+and only by naming it. So a pair whose declared texts or column type
+contain `pg_temp`, `pg_toast_temp` or a `U&` escape, in any case, stays
+unasked with a warning (#1706). The text is read, not the parse, since the
+parse is what runs the check. An identifier cannot be split by a comment or
+quoting, and `U&` can spell one without its letters. A literal that only
+mentions the name costs a warning, never a wrong answer.
+
 A failure inside the probe is reported as "the engine refused it (SQLSTATE
 22P02)", never the server's text. That text is whatever the code the parse
 reached chose to raise, with what it read. The row and bound spelling reads
@@ -3871,5 +3885,12 @@ Pinned on 16 and 18 by the CLI's
   without `SET` or `INHERIT`; `INHERIT` on it without `SET`;
 - without it, and beside a domain the deployer owns that calls only
   built-ins, the pair is asked and refused as the parent's;
+- a default naming a composite over a domain in another session's
+  temporary schema, held by the deployer so the catalog is closed, leaves
+  the pair unasked, and that check never runs (#1706);
 - a default the engine refuses is told as `SQLSTATE 22P02`, without the
   server's words.
+
+The text check's spellings are pinned by
+`a_text_that_could_name_a_temporary_schema_is_told_by_any_spelling` and
+`a_text_naming_no_temporary_schema_is_still_asked`.
