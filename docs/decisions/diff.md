@@ -3728,7 +3728,10 @@ table drops ruled out that order, and the plan was refused at `plan --db`.
     (`NameFacts::module_drop_matters`).
 
   The renames are the only claims among the drops. A claim after them runs
-  after every module drop in any order, so no other place can differ. Made
+  after every module drop in any order, so no other place can differ.
+  A module drop a pair ties to a movable one, directly or through other
+  module drops, moves too. A function the movable one is bound to drops after
+  it, and held fixed it would pin the movable one in front of it. Made
   movable without this, a table's drop releasing a dozen functions
   multiplied the orders past the search's bound. That happened with names
   nothing held, and again with names only added checks claimed. A claim the
@@ -3758,6 +3761,9 @@ Pinned by:
   search. The example test's negative keeps a function the catalog does not
   hold out of the movable set, and `a_transfer_claims_only_its_own_tables_children`
   counts only the renamed table's children as a transfer's claims.
+- `a_module_drop_tied_to_a_movable_one_moves_with_it`: the example's function
+  is bound to another dropped function, which moves with it to after the
+  rename.
 - `what_a_released_function_is_bound_to_follows_it`
   (`crates/pbps-cli/src/computed_order.rs`), on the pairs themselves.
 - `a_computed_drop_follows_the_module_bound_to_it_and_its_inputs_follow_it`

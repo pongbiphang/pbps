@@ -311,26 +311,51 @@ impl<'c> Search<'c> {
         // its name is held by nothing, or claimed by no rename, so every
         // place it may take walks the same. Made movable, a table's drop
         // releasing a dozen such functions multiplied the orders past the
-        // search's bound (#1680 review). A module drop the edges left alone
-        // runs in class 0, before the first of them.
+        // search's bound (#1680 review). A module drop a pair ties to a
+        // movable one moves too, through every such pair: a function bound to
+        // the movable one drops after it, and one that must follow it cannot
+        // be held in front of where it has to go. A module drop the edges
+        // left alone runs in class 0, before the first of them.
         let first = (0..changes.len()).find(|&i| part(&changes[i].change).is_some());
         let at = |c: &Change| (0..changes.len()).find(|&i| changes[i].change == *c);
         let pairs: Vec<(usize, usize)> = precedence
             .iter()
             .filter_map(|(before, after)| Some((at(before)?, at(after)?)))
             .collect();
+        let late_module = |i: usize| {
+            first.is_some_and(|f| i > f) && matches!(changes[i].change, Change::DropModule { .. })
+        };
+        let mut movable: BTreeSet<usize> = (0..changes.len())
+            .filter(|&i| {
+                late_module(i)
+                    && pairs.iter().any(|&(a, b)| a == i || b == i)
+                    && matches!(&changes[i].change,
+                        Change::DropModule { id, .. } if facts.module_drop_matters(changes, id))
+            })
+            .collect();
+        loop {
+            let before = movable.len();
+            for &(a, b) in &pairs {
+                if late_module(a)
+                    && late_module(b)
+                    && (movable.contains(&a) || movable.contains(&b))
+                {
+                    movable.insert(a);
+                    movable.insert(b);
+                }
+            }
+            if movable.len() == before {
+                break;
+            }
+        }
         let part_at = |i: usize| -> Option<Part> {
             part(&changes[i].change).or_else(|| {
-                (first.is_some_and(|f| i > f)
-                    && matches!(changes[i].change, Change::DropModule { .. }))
-                .then(|| match &changes[i].change {
-                    Change::DropModule { id, .. }
-                        if pairs.iter().any(|&(a, b)| a == i || b == i)
-                            && facts.module_drop_matters(changes, id) =>
-                    {
+                late_module(i).then(|| {
+                    if movable.contains(&i) {
                         Part::Module
+                    } else {
+                        Part::Drop
                     }
-                    _ => Part::Drop,
                 })
             })
         };
@@ -1349,6 +1374,81 @@ mod tests {
         // Within a schema nothing is carried.
         let changes = [rename("s1.old", "s1.new", &[])];
         assert!(!facts.module_drop_matters(&changes, &function("s1.c1")));
+    }
+
+    /// #1680 review: a module drop tied by a pair to a movable one moves with
+    /// it. The example's function `F` is schema-bound to `dbo.g`, which this
+    /// plan also drops, so `g` drops after `F`. `g`'s name matters to no
+    /// rename, but held fixed between `u` and `z` it pinned `F` before the
+    /// rename, and the plan was refused; `u → z → rename → F → g` clears it.
+    #[test]
+    fn a_module_drop_tied_to_a_movable_one_moves_with_it() {
+        let drop_table = |table: &str| {
+            PlannedChange::new(Change::DropTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, table, 0),
+                name: name(table),
+                detach_from: None,
+            })
+        };
+        let new = name("dbo.new");
+        let generated = default_constraint_name(&new, "x");
+        let drop_function = |n: &str| {
+            PlannedChange::new(Change::DropModule {
+                id: pbps_model::ModuleId::Named(name(n)),
+                kind: pbps_model::ModuleKind::Function,
+            })
+        };
+        let f = drop_function(&format!("dbo.{generated}"));
+        let g = drop_function("dbo.g");
+        let changes = vec![
+            drop_table("dbo.u"),
+            f.clone(),
+            g.clone(),
+            drop_table("dbo.z"),
+            rename("dbo.old", "dbo.new", &["x"]),
+            PlannedChange::new(Change::AddCheck {
+                table: name("dbo.t"),
+                name: generated.clone(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "a > 0".into(),
+                },
+            }),
+        ];
+        let occupants = [
+            held(
+                &format!("dbo.{}", default_constraint_name(&name("dbo.old"), "x")),
+                "default constraint",
+                Some("dbo.old"),
+                Some("x"),
+            ),
+            held("dbo.new", "default constraint", Some("dbo.z"), Some("y")),
+            held(
+                &format!("dbo.{generated}"),
+                "sql scalar function",
+                None,
+                None,
+            ),
+            held("dbo.g", "sql scalar function", None, None),
+        ];
+        let precedence = [
+            (drop_table("dbo.u").change, f.change.clone()),
+            (f.change.clone(), g.change.clone()),
+        ];
+        let facts = NameFacts::new(&occupants, &[]);
+        assert_eq!(Search::new(&changes, &precedence, &facts).modules, [1, 2]);
+        let mut cs = ChangeSet { changes };
+        order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &precedence).unwrap();
+        let at = |c: &Change| cs.changes.iter().position(|p| p.change == *c).unwrap();
+        let renamed = cs
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::RenameTable { .. }))
+            .unwrap();
+        assert!(
+            renamed < at(&f.change) && at(&f.change) < at(&g.change),
+            "{:?}",
+            cs.changes
+        );
     }
 
     /// A drop on a renamed table names the table as it is called where the
