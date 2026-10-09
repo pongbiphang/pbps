@@ -3832,10 +3832,14 @@ the parse (#1706). So the read is of what another role could change, not of
 the checks there now. A role acts as another when it can `SET ROLE` to it
 or inherits its privileges; a membership granted with neither lets it do
 nothing as that role (#1706). A role is another when it can act neither as
-the current role nor as a superuser. Before storing anything the probe reads
-every domain, composite, range or multirange type whose owner such a role
-can act as, every schema where such a role holds `CREATE` through any role
-it can act as, the database itself when such a role can create a schema
+the current role nor as a superuser. It reaches every role along
+memberships granted with `SET`, `INHERIT` or `ADMIN`, since with `ADMIN` it
+can grant that role with `SET` to a role of its own before the store
+(#1706). That walk is wider than any one role can use, which only leaves
+the probe unrun more often. Before
+storing anything the probe reads every domain, composite, range or
+multirange type whose owner such a role reaches, every schema where such a
+role holds `CREATE` through any role it reaches, the database itself when such a role can create a schema
 in it, and every domain whose CHECK calls a function or operator such a
 role owns. Predefined roles act only through their members, so
 `public`, owned by `pg_database_owner`, counts only when the database's
@@ -3867,6 +3871,8 @@ Pinned on 16 and 18 by the CLI's
   or `INHERIT` (#1706);
 - `CREATE` on the database alone leaves the pair unasked with the database
   named (#1706);
+- `ADMIN` on the deploying role, without `SET` or `INHERIT`, leaves the pair
+  unasked with the deployer's own types named (#1706);
 - without it, and beside a domain the deployer owns that calls only
   built-ins, the pair is asked and refused as the parent's;
 - a default the engine refuses is told as `SQLSTATE 22P02`, without the

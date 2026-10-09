@@ -2721,8 +2721,13 @@ async fn enabled_ddl_event_triggers(conn: &mut Conn) -> Result<Vec<String>, DbEr
 /// (#1706). A role acts as another when it can `SET ROLE` to it or inherits
 /// its privileges; a membership granted with neither lets it do nothing as
 /// that role. A role "other" is one that can act neither as this role nor
-/// as a superuser, and a type or schema counts when such a role can act as
-/// its owner or holds `CREATE` through any role it can act as. Predefined
+/// as a superuser. It reaches every role along memberships granted with
+/// `SET`, `INHERIT` or `ADMIN`: with `ADMIN` it can grant that role, with
+/// `SET`, to a role of its own before the store. That walks more than any one
+/// role can use, which only leaves the probe unrun more often, and it walks
+/// `pg_auth_members` once rather than asking `pg_has_role` of every pair,
+/// which took seconds over a few hundred roles. A type or schema counts when
+/// such a role reaches its owner or holds `CREATE` through a role it reaches. Predefined
 /// roles act only through their members, so `pg_database_owner` counts only
 /// when the database's owner is another role. A function a trusted one calls
 /// by name inside its body is not recorded in the catalog and is not seen;
@@ -2730,7 +2735,7 @@ async fn enabled_ddl_event_triggers(conn: &mut Conn) -> Result<Vec<String>, DbEr
 async fn code_other_roles_can_change(conn: &mut Conn) -> Result<Vec<String>, DbError> {
     let rows = conn
         .query(
-            "WITH me AS (
+            "WITH RECURSIVE me AS (
                  SELECT r.oid FROM pg_catalog.pg_roles r
                   WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER),
              others AS (
@@ -2744,16 +2749,25 @@ async fn code_other_roles_can_change(conn: &mut Conn) -> Result<Vec<String>, DbE
                          WHERE su.rolsuper
                            AND pg_catalog.pg_has_role(r.oid, su.oid, 'SET'))),
              reach AS (
-                 SELECT g.oid FROM pg_catalog.pg_roles g
-                  WHERE EXISTS (SELECT FROM others o
-                                 WHERE pg_catalog.pg_has_role(o.oid, g.oid, 'SET')
-                                    OR pg_catalog.pg_has_role(o.oid, g.oid, 'USAGE')))
+                 SELECT oid FROM others
+                 UNION
+                 SELECT m.roleid FROM pg_catalog.pg_auth_members m
+                   JOIN reach r ON r.oid OPERATOR(pg_catalog.=) m.member
+                  WHERE m.set_option OR m.inherit_option OR m.admin_option),
+             owners AS (
+                 SELECT oid FROM reach
+                 UNION
+                 SELECT 'pg_database_owner'::pg_catalog.regrole::pg_catalog.oid
+                  WHERE EXISTS (
+                      SELECT FROM pg_catalog.pg_database db
+                       WHERE db.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
+                         AND db.datdba OPERATOR(pg_catalog.=) ANY (SELECT oid FROM reach)))
              SELECT pg_catalog.format('type `%I.%I`', n.nspname, t.typname) AS name
                FROM pg_catalog.pg_type t
                JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.typnamespace
               WHERE t.typtype OPERATOR(pg_catalog.=) ANY ('{d,c,r,m}'::pg_catalog.\"char\"[])
                 AND NOT pg_catalog.pg_is_other_temp_schema(n.oid)
-                AND (t.typowner OPERATOR(pg_catalog.=) ANY (SELECT oid FROM reach)
+                AND (t.typowner OPERATOR(pg_catalog.=) ANY (SELECT oid FROM owners)
                      OR EXISTS (
                          SELECT FROM pg_catalog.pg_constraint c
                            JOIN pg_catalog.pg_depend d
@@ -2772,7 +2786,7 @@ async fn code_other_roles_can_change(conn: &mut Conn) -> Result<Vec<String>, DbE
                                     ELSE o.oprcode::pg_catalog.oid END
                           WHERE c.contypid OPERATOR(pg_catalog.=) t.oid
                             AND c.contype OPERATOR(pg_catalog.=) 'c'
-                            AND p.proowner OPERATOR(pg_catalog.=) ANY (SELECT oid FROM reach)))
+                            AND p.proowner OPERATOR(pg_catalog.=) ANY (SELECT oid FROM owners)))
              UNION
              SELECT pg_catalog.format('schema `%I`', n.nspname)
                FROM pg_catalog.pg_namespace n

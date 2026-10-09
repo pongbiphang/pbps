@@ -20220,11 +20220,32 @@ fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
 
         // Negative: without them, and beside a domain the deployer owns that
         // calls only built-ins, the pair is asked and refused as the parent's.
+        // A role holding ADMIN on the deploying role, though it can act as
+        // neither, can grant it with SET to a role of its own before the store,
+        // which could then change the deployer's own types (#1706).
         on_server(
             &conn,
             "DO $$ BEGIN EXECUTE pg_catalog.format( \
                  'REVOKE CREATE ON DATABASE %I FROM pbps_1663_low', \
-                 pg_catalog.current_database()); END $$; \
+                 pg_catalog.current_database()); \
+             EXECUTE pg_catalog.format( \
+                 'GRANT %I TO pbps_1663_low WITH ADMIN TRUE', CURRENT_USER); END $$",
+        );
+        declare("(4)");
+        let plan = d.dir.join("admin.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        let err = stderr(&o);
+        assert!(
+            err.contains("a role other than this one or a superuser can change ")
+                && err.contains("type `app.ev`"),
+            "{version}: {}{err}",
+            stdout(&o)
+        );
+
+        on_server(
+            &conn,
+            "DO $$ BEGIN EXECUTE pg_catalog.format( \
+                 'REVOKE %I FROM pbps_1663_low', CURRENT_USER); END $$; \
              CREATE DOMAIN public.pbps_1663_ok AS integer CHECK (VALUE > 0)",
         );
         declare("(1)");
