@@ -927,3 +927,57 @@ recovery; no throwaway production PR is needed. See
 [GitHub's pull-request events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request),
 [rerun identity](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs),
 and [required check troubleshooting](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks).
+
+
+<a id="dec-1473-1"></a>
+
+**DEC-1473.1. Audit parent association over the fixed closeout window for every
+observed PR identity, regardless of age.** DEC-1458.1 selects newly created PRs
+for its history check. An older PR can acquire the parent base and lose it again
+before the final read, leaving the same base, head and state at both endpoints.
+Neither creation time nor snapshot equality proves that it was never dependent.
+An update timestamp is not an association log, and unrelated metadata activity
+is not evidence of dependency.
+
+Use the union of identities from the initial and final complete `state=all`
+scans and the explicitly recorded dependents. For each identity, retain readable,
+complete base/state history with a known anchor and all transitions through its
+post-delete read. Reconstruct association during the fixed window from before
+the first enumeration through confirmed deletion. A base-change event's previous
+and current ref both matter: moving away from the parent proves prior
+association even when the final base is already `master`. Include events at
+either timestamp boundary. When timestamp precision cannot order relevant
+events relative to deletion, retain the ambiguity and stop cleanup. Do not
+exclude a PR merely because its snapshots or `updated_at` match.
+
+The audit is bounded by this identity set, fixed window and finite paginated
+history reads, not a new background monitor or an executable cleanup service.
+History may be limited to a trustworthy anchor before the window and all later
+transitions through the final read; absent, hidden, truncated or inconsistent
+evidence cannot establish an empty association history. Reconcile replayed
+base/state with the observed endpoints. A disappeared identity, changed recorded
+head, unavailable content or incomplete page stops cleanup under the existing
+checks. No wait or repeated snapshot can substitute for missing history.
+
+A newly established parent dependent fails closeout even if it is now closed or
+already retargeted. Retain its observed state/base/head/diff without inventing
+an earlier head or expected patch, then inspect commit provenance and apply
+the existing recovery and verification rules. An unchanged intentionally closed
+older PR remains exempt only with complete evidence that it was closed before
+the window and acquired no new parent association or reopen in it. Unrelated
+activity with a proven absence of parent association requires no recovery.
+This extends association detection; independent closure provenance remains the
+separate #1475 contract. Preserve actual merge, recorded-ID reads, exact-owned-
+head atomic missing-ref restoration, refusal to overwrite a recreated foreign
+ref, expected surviving content and associated current-head review/CI gates.
+
+Read-only retained #1226 history supplies real closure, reopen and
+`BaseRefChangedEvent` evidence naming both
+`fix/issue-1130-ignored-test-ownership` and `master`, with complete pagination.
+It demonstrates the available history fields, not an observed older-PR race.
+Offline controls must separately qualify old PRs acquiring and losing parent
+association, acquiring then closing, equal endpoint snapshots, unchanged older
+intentional closure, unrelated activity, changed head or missing content,
+incomplete/missing history and boundary ambiguity. Removing only this
+association-history rule must restore the missed-dependency result. These are
+policy qualifications; they do not claim an automated enforcement mechanism.
