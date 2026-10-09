@@ -315,11 +315,13 @@ record](../DECISIONS.md), which says how to add an entry here.
     tree minutes earlier, so a red one is a flake until the failing job says
     otherwise.
 
-    **A stacked pull request needs a verified base change after its upstream
-    merge.** A PR still based on a merged feature branch does not enter the
-    `master` queue. DEC-1228.1 replaces the assumption that deleting that branch
-    reliably retargets every dependent: the primary agent explicitly changes
-    and verifies dependent bases before deleting the merged remote head, then
+    **An open stacked pull request needs a verified base change after its
+    upstream merge.** First apply DEC-1475.1's closure disposition; the following
+    retargeting and queue checks concern open dependents after that disposition.
+    A PR still based on a merged feature branch does not enter the `master`
+    queue. DEC-1228.1 replaces the assumption that deleting that branch reliably
+    retargets every dependent: the primary agent explicitly changes and verifies
+    open dependent bases before deleting the merged remote head, then
     verifies them again, including DEC-1458.1's operation-window/all-state check
     for newly discovered dependents. Deletion remains a separate step after the
     merge
@@ -761,6 +763,11 @@ change. The dependent head remained `ed622e0bd1bd6a88b7278333c0ce24050fc85fd2`.
 Reopening started [another CI run](https://github.com/pongbiphang/pbps/actions/runs/36359397387)
 after [the qualified run](https://github.com/pongbiphang/pbps/actions/runs/36356526170).
 These events do not establish a cause or equate every deletion mechanism.
+
+At every dependent read, first apply DEC-1475.1's closure disposition before
+retargeting or requiring OPEN state. The retarget/OPEN checks below concern
+open dependents after that disposition; preserve qualifying closed dependents
+and still complete their final provenance/content audit.
 
 The primary agent first verifies the parent actually merged and begins
 DEC-1458.1's window before enumeration, then reads every page of open PRs based
