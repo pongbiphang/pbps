@@ -2831,8 +2831,16 @@ pub async fn account_for_module_dependents(
             .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     // On the final order: every pass above may move what an expression
     // names, or the expression (#1576).
+    // Which name each unnamed key's index takes depends on what holds its
+    // candidates now (#1645).
+    let holders =
+        pbps_pg::catalog::key_name_holders(conn, &crate::dependents::key_name_prefixes(changes))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("module_dependents (PostgreSQL): reading what holds key names: {e}")
+            })?;
     let mut later = Vec::new();
-    for name in crate::dependents::names_a_later_relation(changes, dialect) {
+    for name in crate::dependents::names_a_later_relation(changes, dialect, Some(&holders)) {
         if !resolves_now(conn, &name).await? {
             later.push(name);
         }

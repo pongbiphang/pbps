@@ -6008,31 +6008,40 @@ pub fn cmd_bootstrap(
     // expression naming, in a literal, a relation created only after it is
     // refused with the two-plan remedy, before any script or DDL, rather
     // than rolled back by the engine. A qualified name is refused offline.
-    // An unqualified one may be found ahead on its path, and an unnamed
-    // key's generated index name may be held now (#1619), which only the
-    // target can say: asked of it with `--db`, before any script is written,
-    // and refused without one. One refusal names them all.
-    let later = if dialect.name() == "postgres" {
-        crate::dependents::names_a_later_relation(&cs, dialect.as_ref())
-    } else {
-        Vec::new()
-    };
-    let (unqualified, mut refused): (Vec<_>, Vec<_>) =
-        later.into_iter().partition(|n| !n.searched.is_empty());
-    match target {
-        Some(target) if !unqualified.is_empty() => {
-            db::runtime()?.block_on(async {
-                let mut conn = db::connect(target).await?;
-                for name in unqualified {
-                    if !crate::engine::resolves_now(&mut conn, &name).await? {
-                        refused.push(name);
+    // An unqualified one may be found ahead on its path, and which name an
+    // unnamed key's index takes depends on what holds its candidates now
+    // (#1619, #1645), which only the target can say: asked of it with
+    // `--db`, before any script is written, and refused without one. One
+    // refusal names them all.
+    let mut refused = Vec::new();
+    if dialect.name() == "postgres" {
+        let offline = crate::dependents::names_a_later_relation(&cs, dialect.as_ref(), None);
+        let prefixes = crate::dependents::key_name_prefixes(&cs);
+        match target {
+            Some(target)
+                if !prefixes.is_empty() || offline.iter().any(|n| !n.searched.is_empty()) =>
+            {
+                db::runtime()?.block_on(async {
+                    let mut conn = db::connect(target).await?;
+                    let holders = pbps_pg::catalog::key_name_holders(&mut conn, &prefixes)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("reading what holds key names: {e}"))?;
+                    for name in crate::dependents::names_a_later_relation(
+                        &cs,
+                        dialect.as_ref(),
+                        Some(&holders),
+                    ) {
+                        if name.searched.is_empty()
+                            || !crate::engine::resolves_now(&mut conn, &name).await?
+                        {
+                            refused.push(name);
+                        }
                     }
-                }
-                Ok::<_, anyhow::Error>(())
-            })?;
+                    Ok::<_, anyhow::Error>(())
+                })?;
+            }
+            Some(_) | None => refused = offline,
         }
-        Some(_) => {}
-        None => refused.extend(unqualified),
     }
     crate::dependents::later_relation_refusal(&refused)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;

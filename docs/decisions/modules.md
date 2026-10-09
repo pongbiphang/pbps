@@ -1812,3 +1812,65 @@ Pinned by `an_expression_naming_a_relation_the_plan_creates_later_is_refused`,
 (`crates/pbps-cli/tests/flow_pg.rs`), and the live
 `a_relation_lookup_finds_every_kind_by_its_exact_name`
 (`crates/pbps-pg/tests/live.rs`).
+
+*Amended by [DEC-1645.1](#dec-1645-1): a connected plan tells the name an
+unnamed key's index arrives under from what holds its candidates on the
+target and what the plan frees and adds before the key, instead of asking
+the target whether the generated name is held now.*
+
+<a id="dec-1645-1"></a>
+
+**DEC-1645.1. A connected PostgreSQL plan tells the name an unnamed primary
+key's index takes by walking the plan from what holds its candidates on the
+target now (#1645).** DEC-1576.1 read that index as arriving under
+`<table>_pkey` and asked the target whether a relation of the schema held
+that name now. Three plans it approved failed their apply:
+- a second key cutting to the first's name, whose index the engine creates
+  under `_pkey1`, named by a default of the second table;
+- a key whose name a relation the plan drops before it holds now: the target
+  answered for the relation, the drop freed the name, and the key took it;
+- an unnamed key replaced, with a default set between the drop and the add
+  naming the index: the old index answered, and was gone by then.
+
+What the engine does, measured on 16 and 18 (`ChooseRelationName`):
+- It tries `<table>_pkey`, then `_pkey1`, `_pkey2`…, cutting the table's
+  part to fit 63 bytes each time: 58 bytes for `_pkey`, 57 for `_pkey1` to
+  `_pkey9`, 56 for `_pkey10` on.
+- It takes the first name that no relation of the schema holds, of any
+  kind, a composite type's included, and that no constraint of the schema
+  is named, a check or a unique constraint on another table included. An
+  enum, a domain, and a constraint of that name in another schema hold
+  nothing. `ALTER TABLE … ADD PRIMARY KEY` chooses the same way.
+- It chooses when the statement runs: a holder dropped earlier in the same
+  transaction frees the name.
+
+So a connected plan reads the target's holders of every name each unnamed
+key may try, relations and constraints, in the planning transaction, and
+walks the plan to each key. A holder an earlier change frees no longer
+counts: the relation or constraint dropped, its table dropped or moved to
+another schema, the key it belongs to replaced, or a view dropped. An
+earlier arrival does count, as do a constraint added earlier and an earlier
+key's index. The key takes the first candidate left free, and that name is
+its arrival like any declared one, so the target is no longer asked about
+it.
+
+A holder the walk cannot tell is freed is kept, an index going with a
+dropped column, for one. The key is then read as numbered where the engine
+may not number it. That can miss a reference, the failed apply DEC-1576.1
+accepts; reading it freed could refuse a valid plan. Offline, as in a
+bootstrap without a target, the index still arrives under `<table>_pkey`
+and DEC-1576.1's rule stands: the target would be asked, and with none the
+literal is refused. A bootstrap with a target reads the holders as a plan
+does.
+
+Asking the target about each numbered name, as DEC-1576.1 asked about the
+first, was the alternative. It cannot see what the plan frees or adds
+before the key, the cause of all three failures.
+
+Pinned by `a_key_takes_the_first_candidate_free_when_it_is_created` and
+`key_name_prefixes_cover_every_candidate`
+(`crates/pbps-cli/src/dependents.rs`),
+`a_numbered_key_name_cuts_the_table_again_to_fit` (`crates/pbps-pg/src/lib.rs`),
+and the live
+`a_key_named_by_what_holds_its_candidates_when_it_is_created_is_refused`
+(`crates/pbps-cli/tests/flow_pg.rs`).

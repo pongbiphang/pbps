@@ -18578,6 +18578,130 @@ fn a_default_naming_an_unnamed_keys_index_is_refused_unless_the_name_is_held() {
     );
 }
 
+/// #1645: a connected plan reads what holds an unnamed key's candidate names
+/// now, and walks the plan to the key, so the key's index arrives under the
+/// name the engine will choose. Each case below was approved before and
+/// failed its apply; each is refused, writing no artifact. With `--staged`
+/// it is refused the same way, ahead of that mode's own refusal of a plan of
+/// more than one change, which the last case is not:
+/// - a second key cutting to the first's name, whose index is `_pkey1`;
+/// - a key whose name an index the plan drops first holds now;
+/// - an unnamed key replaced, with a default set between its drop and its
+///   add naming its index;
+/// - a key numbered past a check constraint's name in its schema.
+#[test]
+#[ignore = "needs a live PostgreSQL; see scripts/live-tests-pg.sh"]
+fn a_key_named_by_what_holds_its_candidates_when_it_is_created_is_refused() {
+    let names = |what: &str| format!("('app.{what}'::regclass)::text");
+    let new_table = |table: &str, default: &str| {
+        format!(
+            "table: app.{table}\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+             label: {{type: text, default: \"{default}\"}}\nprimary_key: [id]\n"
+        )
+    };
+    let t = |label: &str, key: &str, rest: &str| {
+        format!(
+            "table: app.t\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+             k: {{type: integer, nullable: false}}\n  label: {label}\n\
+             primary_key: {key}\n{rest}"
+        )
+    };
+    let kept = "indexes:\n  n_pkey: {columns: [k]}\nchecks:\n  q_pkey: k > 0\n";
+    let numbered = format!("{}_pkey1", "s".repeat(57));
+    let long = |last: char| format!("{}{last}", "s".repeat(61));
+    let cases = [
+        // Two tables cutting to one name: the second key's index is `_pkey1`.
+        (
+            "two_keys",
+            vec![
+                (long('a'), new_table(&long('a'), "''")),
+                (long('b'), new_table(&long('b'), &names(&numbered))),
+            ],
+            numbered.clone(),
+        ),
+        // `app.t`'s index `n_pkey` dropped first frees the name for
+        // `app.n`'s key.
+        (
+            "freed_holder",
+            vec![
+                (
+                    "t".to_owned(),
+                    t("{type: text}", "[id]", "checks:\n  q_pkey: k > 0\n"),
+                ),
+                ("n".to_owned(), new_table("n", &names("n_pkey"))),
+            ],
+            "n_pkey".to_owned(),
+        ),
+        // `app.t`'s key replaced, and a default naming its index set
+        // between its drop and its add.
+        (
+            "replaced_key",
+            vec![(
+                "t".to_owned(),
+                t(
+                    &format!("{{type: text, default: \"{}\"}}", names("t_pkey")),
+                    "[id, k]",
+                    kept,
+                ),
+            )],
+            "t_pkey".to_owned(),
+        ),
+        // The check `q_pkey` on `app.t` numbers `app.q`'s key.
+        (
+            "constraint_holder",
+            vec![("q".to_owned(), new_table("q", &names("q_pkey1")))],
+            "q_pkey1".to_owned(),
+        ),
+    ];
+    for (case, files, named) in cases {
+        let slug = format!("key_holders_{case}");
+        let own = OwnDatabase::new(&server(), &slug);
+        let connection = own.connection();
+        let d = bootstrapped_demo(connection, &slug, &t("{type: text}", "[id]", kept));
+        for (table, body) in &files {
+            std::fs::write(d.dir.join(format!("schema/app.{table}.yml")), body).unwrap();
+        }
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        for staged in [false, true] {
+            let artifact = d.dir.join("refused-plan.json");
+            let mut args = vec![
+                "plan",
+                "--db",
+                connection,
+                "--out",
+                artifact.to_str().unwrap(),
+            ];
+            if staged {
+                args.push("--staged");
+            }
+            let out = d.run(&args);
+            assert_ne!(code(&out), 0, "{case}, staged {staged}: {}", stdout(&out));
+            let why = stderr(&out);
+            assert!(why.contains(&format!("names app.{named}")), "{case}: {why}");
+            assert!(
+                !artifact.exists(),
+                "{case}: a refused plan writes no artifact"
+            );
+        }
+        if case == "constraint_holder" {
+            // Negative: without the default the plan applies, and the key
+            // is numbered where the engine puts it.
+            std::fs::write(d.dir.join("schema/app.q.yml"), new_table("q", "''")).unwrap();
+            let plan = connected_artifact(&d, connection, false);
+            succeeds(approved_apply(&d, connection, &plan, &[]));
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM pg_index WHERE indisprimary \
+                     AND indexrelid = 'app.q_pkey1'::regclass"
+                ),
+                1
+            );
+        }
+    }
+}
+
 /// #1593: `regclass` input cuts a name part to 63 bytes, silently, so a
 /// default naming 64 `a`s names the 63-`a` index the plan creates later. The
 /// connected plan is refused, writing no artifact, though the two spellings

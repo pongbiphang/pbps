@@ -1399,6 +1399,20 @@ pub fn implicit_primary_key_name(table: &str) -> String {
     generated_name(table, None, "pkey")
 }
 
+/// The name the engine tries for `table`'s unnamed primary key's index once
+/// `n` earlier candidates are held: `n == 0` is [`implicit_primary_key_name`],
+/// then `<table>_pkey1`, `<table>_pkey2`…, the table's part cut again to fit
+/// each (`ChooseRelationName`). Measured on 16 and 18 (#1645): twelve 61-byte
+/// tables keep 58 bytes for `_pkey`, 57 for `_pkey1` to `_pkey9`, and 56 for
+/// `_pkey10` and `_pkey11`.
+pub fn implicit_primary_key_fallback(table: &str, n: u32) -> String {
+    if n == 0 {
+        implicit_primary_key_name(table)
+    } else {
+        generated_name(table, None, &format!("pkey{n}"))
+    }
+}
+
 /// The name the engine generates for an implicit relation: `makeObjectName`
 /// in PostgreSQL's `src/backend/commands/indexcmds.c`, ported and measured on
 /// 18.6 (#465, DEC-465.1).
@@ -1958,6 +1972,26 @@ mod tests {
             refused.iter().any(|m| m.contains("`system_time`")),
             "{refused:?}"
         );
+    }
+
+    /// #1645: the numbered names the engine tries for an unnamed key's index,
+    /// as measured on 16 and 18 with twelve 61-byte tables.
+    #[test]
+    fn a_numbered_key_name_cuts_the_table_again_to_fit() {
+        use super::implicit_primary_key_fallback;
+        let table = format!("{}a", "a".repeat(60));
+        let names: Vec<String> = (0..12)
+            .map(|n| implicit_primary_key_fallback(&table, n))
+            .collect();
+        assert_eq!(names[0], format!("{}_pkey", "a".repeat(58)));
+        assert_eq!(names[1], format!("{}_pkey1", "a".repeat(57)));
+        assert_eq!(names[9], format!("{}_pkey9", "a".repeat(57)));
+        assert_eq!(names[10], format!("{}_pkey10", "a".repeat(56)));
+        assert_eq!(names[11], format!("{}_pkey11", "a".repeat(56)));
+        assert!(names.iter().all(|n| n.len() == 63), "{names:?}");
+        // Negative: a short table is not cut.
+        assert_eq!(implicit_primary_key_fallback("k", 1), "k_pkey1");
+        assert_eq!(implicit_primary_key_fallback("k", 0), "k_pkey");
     }
 
     /// #465: the generated names are the engine's own, measured on 18.6 —
