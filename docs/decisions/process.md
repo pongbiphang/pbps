@@ -997,7 +997,13 @@ regardless of age; the closure disposition must also be independent of age.
 First establish parent association with the bounded complete history audit.
 Proven unrelated closure or reopen/close activity needs no recovery, including
 an older PR with equal final snapshots. Missing association history remains
-unknown, not unrelated. For an actual dependent, preserve its closed state and
+unknown, not unrelated. Every dependent read in the ordered procedure applies
+this disposition before retargeting, requiring OPEN state or classifying closure
+as failure, including a closure between successful verification and deletion.
+Before a deletion request exists, use the completed read as a provisional
+closure cutoff and retain its evidence; verify again against the actual request
+and through the final read. Provisional preservation never skips the final
+operation-window audit. For an actual dependent, preserve its closed state and
 base without reopening or retargeting only when all of the following hold:
 
 - Complete readable closure, reopen and base-ref history, with a trustworthy
@@ -1018,12 +1024,16 @@ base without reopening or retargeting only when all of the following hold:
 This exception preserves an independent deliberate closure; it does not exempt
 an open dependent, deletion-caused closure, changed head/content, later reopen
 or renewed association. Those cases require fresh current state/base/head and
-expected surviving patch checks. Reopen only when evidence establishes closure
-caused by this owned deletion, then explicitly retarget and verify the open PR.
-For an independent closure that no longer qualifies, or an unknown closure
-cause, stop cleanup and PR recovery mutations: retain the observations and
-obtain missing evidence or the collaborator's direction before changing their closed
-PR. Restoring the exact owned parent ref under an atomic missing-ref lease may
+expected surviving patch checks. Autonomous reopening requires evidence that
+this owned deletion caused closure. Explicit collaborator direction is a
+separate authorization to reopen the identified PR within that instruction;
+direction for another PR or action is insufficient. Then explicitly retarget
+and verify the open PR. For an independent closure that no longer qualifies,
+or an unknown closure cause, stop cleanup and PR recovery mutations: retain the
+observations and obtain missing evidence or scoped collaborator direction.
+Authorization to reopen does not resolve missing or ambiguous cleanup evidence
+or waive owned-ref protection, state/base/head/content checks, or existing
+current-head review and associated CI gates. Restoring the exact owned parent ref under an atomic missing-ref lease may
 preserve recoverability; it does not itself authorize reopening. Never overwrite
 a changed or foreign ref. No repeated polling substitutes for missing evidence.
 
@@ -1049,4 +1059,11 @@ history, unrelated closures and timestamp ambiguity. The unrelated older
 reopen/close case must stay clear even with equal endpoint snapshots. Removing
 only the exemption must restore false recovery of intentional-closure controls;
 weakening unknown-history refusal must expose unsafe acceptance. These qualify
-the written policy, not a shipped automated enforcement mechanism.
+the written policy, not a shipped automated enforcement mechanism. Exercise
+them through the ordered retarget/verify/recheck/final-audit steps as well as
+the final predicate. Cover deliberate closure before retargeting, during
+verification and after successful verification, plus scoped reopening direction,
+no direction and direction for another PR/action. Removing the early disposition
+must restore false failure; removing only the authorization alternative must
+restore false refusal. Keep changed-content, unknown-evidence and timestamp
+boundary controls so neither alternative weakens the other checks.

@@ -2330,7 +2330,13 @@ Three traps sat inside the fix, and each of them is a measurement:
   closure/reopen/base history, deliberate-close evidence and unchanged closed
   state/base/head/content. Actor, timestamp or current closed state alone cannot
   prove intent. Unknown cause or ambiguous ordering stops cleanup and PR recovery
-  mutations; only proven deletion damage authorizes reopening. Later reopen,
+  mutations. Autonomous reopening requires proven deletion damage; explicit
+  collaborator direction may instead authorize the identified PR/action without
+  waiving remaining evidence, ownership, content or review/CI gates. Apply this
+  disposition before every early OPEN check, retargeting or closure-failure
+  branch, not just the final audit: otherwise a deliberate closure between
+  successful verification and deletion is refused before its exemption is read.
+  Pre-request preservation remains provisional until that final audit. Later reopen,
   changed content or renewed association needs fresh dependent checks, while
   proven unrelated reopen/close activity needs no recovery.
 

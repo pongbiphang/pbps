@@ -182,10 +182,18 @@ checksum-pinned, and state lives in the database itself.
   bases, heads and closure times of already closed parent dependents, then
   enumerate all open PRs based on its head branch, completing pagination.
   Record each dependent's head and expected
-  remaining diff after the parent's merged changes. While the parent branch
-  still exists, explicitly change each dependent's base to the merged parent's
-  base. Verify every dependent is OPEN, has that base and its unchanged recorded
-  head, and shows the expected remaining diff. Re-enumerate immediately before
+  remaining diff after the parent's merged changes. At every dependent read,
+  before retargeting or requiring OPEN state, apply DEC-1475.1's same closure
+  disposition. A qualifying closed dependent is preserved, not retargeted or
+  rejected for being closed; an open dependent must pass the checks below.
+  Before a deletion request exists, use the completed read as the provisional
+  closure cutoff and retain its evidence; recheck against the actual request
+  and through the final read before allowing local cleanup. Unknown evidence
+  stops the operation. While the parent branch still exists, explicitly change
+  each open dependent's base to the merged parent's base. Verify it is OPEN, has
+  that base and its unchanged recorded head, and shows the expected remaining
+  diff. If it closes during these steps, apply the same disposition before
+  declaring failure or making another PR mutation. Re-enumerate immediately before
   deletion; any new dependent must pass the same checks. An unreadable or
   incomplete result is not an empty dependent set; retain the parent branch
   when any verification fails. A successfully verified empty set needs no base
@@ -222,11 +230,14 @@ checksum-pinned, and state lives in the database itself.
   applies to PRs closed before the window. Failed, incomplete or ambiguous
   reads stop local cleanup. Recover only the exact owned parent ref; an atomic
   missing-ref lease must prevent overwriting a changed or foreign ref, then
-  reopen only a dependent proven closed by this deletion, then explicitly
-  retarget and verify affected open dependents before retrying. Unknown closure
-  cause or ambiguous ordering stops cleanup and PR recovery mutations; obtain
-  missing evidence or the collaborator's direction instead of assuming consent
-  to reopen. A later reopen, changed head/content or renewed parent association
+  autonomously reopen only a dependent proven closed by this deletion. Explicit
+  collaborator direction may instead authorize reopening the identified PR
+  within that instruction; direction for another PR/action is not permission.
+  Then explicitly retarget and verify affected open dependents before retrying.
+  Unknown closure cause or ambiguous ordering alone authorizes no PR mutation.
+  Obtain missing evidence or scoped collaborator direction; authorization to
+  reopen does not waive unresolved cleanup evidence, owned-ref protection or
+  state/base/head/content and review/CI checks. A later reopen, changed head/content or renewed parent association
   invalidates the closure exemption and requires fresh state/base/head/expected
   patch checks (DEC-1475.1).
   A confirmed empty set must pass both scans. Do not rely on automatic
