@@ -343,14 +343,32 @@ pub async fn marked(
         .collect()
 }
 
-/// Where the scratch session is, from what it saw. The scratch session must
-/// see its own mark: a cluster that does not show it cannot show the
-/// target's either, and its absence would then read as "another cluster".
+/// Where the scratch session is, from its cluster's identity and what it
+/// saw.
+///
+/// Two sessions reporting one [`cluster_identity`] are on one cluster or a
+/// physical copy of it, whatever their marks show. A session on a standby
+/// sees nothing of the primary's sessions, and one behind a balancing name
+/// may sit on another member, so an unseen mark alone would read as
+/// "another cluster" (#1685). A copy carries its primary's database OIDs,
+/// so the same OID there is the same database.
+///
+/// Otherwise the marks decide. The scratch session must see its own mark:
+/// a cluster that does not show it cannot show the target's either, and its
+/// absence would then read as "another cluster".
 pub fn placement(
     target: (&str, SessionMark),
     scratch: (&str, SessionMark),
     seen: &[(String, i64)],
+    same_identity: bool,
 ) -> Result<Placement, &'static str> {
+    if same_identity {
+        return Ok(if scratch.1.database == target.1.database {
+            Placement::Target
+        } else {
+            Placement::SameCluster
+        });
+    }
     let sees = |(token, mark): (&str, SessionMark)| {
         seen.iter()
             .any(|(found, pid)| found == token && *pid == mark.pid)
@@ -533,6 +551,22 @@ pub fn changed_defaults(
                 .map(|(database, entry)| format!("{entry} set {}", scope(database))),
         )
         .collect()
+}
+
+/// The cluster's `system_identifier`, which initdb chooses. A physical
+/// standby must share its primary's to replicate from it, and a cluster
+/// rebuilt by dump and restore gets a new one, so it names the database
+/// cluster a connection reached, not the address that reached it (#1685).
+/// A plain login may read it: `pg_control_system()` is granted to `PUBLIC`
+/// by default (measured on 16 and 18).
+pub async fn cluster_identity(conn: &mut impl QueryConnection) -> Result<String, DbError> {
+    let rows = conn
+        .query(
+            "SELECT system_identifier::text AS identity \
+               FROM pg_catalog.pg_control_system()",
+        )
+        .await?;
+    text(&one(rows, "the cluster's system identifier")?, "identity")
 }
 
 /// The session's login.
@@ -940,11 +974,11 @@ mod tests {
         let target = ("aa", mark(10, 5));
         let seen = vec![("aa".to_owned(), 10), ("bb".to_owned(), 20)];
         assert_eq!(
-            placement(target, ("bb", mark(20, 7)), &seen),
+            placement(target, ("bb", mark(20, 7)), &seen, false),
             Ok(Placement::SameCluster)
         );
         assert_eq!(
-            placement(target, ("bb", mark(20, 5)), &seen),
+            placement(target, ("bb", mark(20, 5)), &seen, false),
             Ok(Placement::Target)
         );
     }
@@ -955,18 +989,47 @@ mod tests {
         let scratch = ("bb", mark(20, 5));
         // Same database OID on two clusters is ordinary: the OID says nothing.
         assert_eq!(
-            placement(target, scratch, &[("bb".to_owned(), 20)]),
+            placement(target, scratch, &[("bb".to_owned(), 20)], false),
             Ok(Placement::SeparateCluster)
         );
         // Negative: nothing seen is unreadable, never "another cluster".
-        assert!(placement(target, scratch, &[]).is_err());
+        assert!(placement(target, scratch, &[], false).is_err());
         // Negative: the target's token on another backend is not its session.
         assert_eq!(
             placement(
                 target,
                 scratch,
-                &[("bb".to_owned(), 20), ("aa".to_owned(), 11)]
+                &[("bb".to_owned(), 20), ("aa".to_owned(), 11)],
+                false
             ),
+            Ok(Placement::SeparateCluster)
+        );
+    }
+
+    #[test]
+    fn one_cluster_identity_is_one_cluster_whatever_the_marks_show() {
+        // A target session on a standby, or behind a balancing name on
+        // another member, leaves no mark the scratch session can see (#1685).
+        let target = ("aa", mark(10, 5));
+        let unseen = [("bb".to_owned(), 20)];
+        assert_eq!(
+            placement(target, ("bb", mark(20, 7)), &unseen, true),
+            Ok(Placement::SameCluster)
+        );
+        // A copy keeps its primary's database OIDs: the same OID is the
+        // target's own database.
+        assert_eq!(
+            placement(target, ("bb", mark(20, 5)), &unseen, true),
+            Ok(Placement::Target)
+        );
+        // Not even its own mark is needed once the identities agree.
+        assert_eq!(
+            placement(target, ("bb", mark(20, 7)), &[], true),
+            Ok(Placement::SameCluster)
+        );
+        // Negative: different identities leave the marks to decide.
+        assert_eq!(
+            placement(target, ("bb", mark(20, 5)), &unseen, false),
             Ok(Placement::SeparateCluster)
         );
     }

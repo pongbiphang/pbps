@@ -173,10 +173,27 @@ async fn produce(
     inputs: &Inputs,
     key: &ProjectKey,
 ) -> Result<ResolvedPlan, ProduceError> {
+    // As the planning read records it: the identity of the cluster the
+    // target string reached.
+    let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
+    let identity = pbps_pg::resolver::vouched::cluster_identity(&mut planning)
+        .await
+        .unwrap();
+    produce_planned_on(scratch, target, &identity, inputs, key).await
+}
+
+async fn produce_planned_on(
+    scratch: &str,
+    target: &str,
+    planned_identity: &str,
+    inputs: &Inputs,
+    key: &ProjectKey,
+) -> Result<ResolvedPlan, ProduceError> {
     super::produce(
         Driver::Postgres,
         scratch,
         target,
+        planned_identity,
         &inputs.binding(),
         inputs.base(),
         inputs.desired(),
@@ -323,6 +340,80 @@ async fn vouched_refuses_the_target_as_scratch() {
             "{server}: {reason}"
         );
         assert_eq!(before, after, "{server}: nothing was created");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_target_connection_on_another_cluster_than_the_plan_was_read_from() {
+    // A target name that reaches two clusters, through DNS or a balancing
+    // proxy: the planning read reached the one the superuser scratch sits
+    // on, and the resolver's own connection the other. The marks then read
+    // "another cluster", and the scratch would provision roles and a
+    // database on the cluster the plan was read from (#1685).
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = target.target().await;
+    let mut planned = Conn::connect(Driver::Postgres, &scratch.server)
+        .await
+        .unwrap();
+    let planned = pbps_pg::resolver::vouched::cluster_identity(&mut planned)
+        .await
+        .unwrap();
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let before = scratch.inventory().await;
+    let reason = vouched_refusal(
+        produce_planned_on(
+            &scratch.server,
+            &target.on(&target_db),
+            &planned,
+            &inputs,
+            &key,
+        )
+        .await,
+    );
+    let after = scratch.inventory().await;
+    target.drop().await;
+    assert!(reason.contains("another database cluster"), "{reason}");
+    assert_eq!(before, after, "nothing was created on the scratch server");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_scratch_that_may_not_read_its_cluster_identity() {
+    // Without the identity a scratch on the target's cluster could pass as
+    // another one, so the run refuses instead of falling back to the marks,
+    // and names the grant (#1685). A function's privileges belong to each
+    // database: this revokes in the scratch database alone.
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        fixture
+            .run(
+                &scratch_db,
+                &["REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC"],
+            )
+            .await;
+        let inputs = Inputs::overload();
+        let key = ProjectKey::new(true);
+        let reason = vouched_refusal(
+            produce(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+            )
+            .await,
+        );
+        let left = fixture.foreign_objects(&scratch_db).await;
+        fixture.drop().await;
+        assert!(
+            reason.contains("GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system()"),
+            "{server}: {reason}"
+        );
+        assert_eq!(left.1, 0, "{server}: nothing was written: {left:?}");
     }
 }
 

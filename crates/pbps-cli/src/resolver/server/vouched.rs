@@ -42,6 +42,7 @@ pub async fn produce(
     driver: Driver,
     scratch: &str,
     target_connection: &str,
+    planned_identity: &str,
     binding: &BindingRequest<'_>,
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
@@ -78,9 +79,10 @@ pub async fn produce(
         .await
         .map_err(|error| vouched(format!("the scratch session's role: {error}")))?;
     let tokens = Tokens::generate();
-    let (placement, account, backend) = separation(&mut target, &mut admin, &tokens)
-        .await
-        .map_err(ProduceError::Run)?;
+    let (placement, account, backend) =
+        separation(&mut target, &mut admin, &tokens, planned_identity)
+            .await
+            .map_err(ProduceError::Run)?;
     let provisioning = match placement {
         Placement::Target => {
             return Err(vouched(
@@ -158,6 +160,7 @@ async fn separation(
     target: &mut Conn,
     scratch: &mut Conn,
     tokens: &Tokens,
+    planned_identity: &str,
 ) -> Result<(Placement, sql::Account, sql::Backend), Error> {
     let failed = |error: pbps_db::DbError| Error::Read(format!("the session marks: {error}"));
     // Both sessions hold a transaction across the whole check. A
@@ -175,7 +178,20 @@ async fn separation(
         account.target_login =
             sql::session_login(target).await? == sql::session_login(scratch).await?;
         let backend = sql::backend(scratch).await?;
-        Ok::<_, pbps_db::DbError>((target_mark, scratch_mark, seen, account, backend))
+        // Last, because a refused read aborts its transaction; it is told
+        // apart below so the remedy can name the grant.
+        let identities = (
+            sql::cluster_identity(target).await,
+            sql::cluster_identity(scratch).await,
+        );
+        Ok::<_, pbps_db::DbError>((
+            target_mark,
+            scratch_mark,
+            seen,
+            account,
+            backend,
+            identities,
+        ))
     }
     .await;
     // Nothing was written in either transaction; rolling back only ends it.
@@ -183,16 +199,50 @@ async fn separation(
         target.execute("ROLLBACK").await,
         scratch.execute("ROLLBACK").await,
     );
-    let (target_mark, scratch_mark, seen, account, backend) = observed.map_err(failed)?;
+    let (target_mark, scratch_mark, seen, account, backend, identities) =
+        observed.map_err(failed)?;
     ended.0.map_err(failed)?;
     ended.1.map_err(failed)?;
+    let target_identity = identity(identities.0, "target")?;
+    let scratch_identity = identity(identities.1, "scratch")?;
+    // A name can reach more than one cluster: DNS round-robin, a balancing
+    // proxy, a reader endpoint. The plan was computed against the cluster
+    // the planning read reached; a check made on another would vouch for
+    // the wrong one (#1685).
+    if target_identity != planned_identity {
+        return Err(Error::Vouched(format!(
+            "the target connection reached another database cluster (system identifier \
+             {target_identity}) than the one the plan was read from ({planned_identity}); \
+             a target name that reaches more than one cluster, through DNS or a balancing \
+             proxy, cannot be resolved, so connect to one cluster"
+        )));
+    }
     let placement = sql::placement(
         (&tokens.target, target_mark),
         (&tokens.scratch, scratch_mark),
         &seen,
+        scratch_identity == target_identity,
     )
     .map_err(|reason| Error::Vouched(reason.into()))?;
     Ok((placement, account, backend))
+}
+
+/// A cluster identity, or the refusal that names why it could not be read.
+/// Without it a scratch on the target's cluster could pass as another one,
+/// so an unreadable identity refuses rather than falls back to the marks.
+fn identity(read: Result<String, pbps_db::DbError>, side: &str) -> Result<String, Error> {
+    match read {
+        Ok(identity) => Ok(identity),
+        Err(error) if error.server_error_code().as_deref() == Some("42501") => {
+            Err(Error::Vouched(format!(
+                "the {side} session may not read its cluster's identity ({error}); grant it \
+                 with GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO the {side} login"
+            )))
+        }
+        Err(error) => Err(Error::Read(format!(
+            "the {side} cluster's identity: {error}"
+        ))),
+    }
 }
 
 /// Refuses unless `conn`'s current transaction runs on the backend the run

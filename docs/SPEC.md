@@ -1417,6 +1417,12 @@ entry implemented by #1672, Docker by #1674).**
     and what the scratch account may do (#1667, DEC-1672.1).
     - **Scratch is never the target.** The engines decide this, not the two
       connection strings, which can spell one server two ways.
+      - The cluster's `system_identifier` decides first (DEC-1685.1). The
+        planning read records the target's. The resolver's own target
+        connection must report the same one, because one name can reach
+        several clusters. A scratch reporting it is on the target's cluster,
+        a standby included. An unreadable identifier refuses, naming the
+        `pg_control_system()` grant.
       - Each session marks itself with a run-generated `application_name`.
       - A target mark that the scratch session finds in `pg_stat_activity`
         is a backend of the scratch's own cluster. Both sessions hold a

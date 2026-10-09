@@ -115,6 +115,58 @@ pub struct Request<'a> {
     pub base: pbps_diff::Side<'a>,
     pub desired: pbps_diff::Side<'a>,
     pub hints: &'a pbps_model::Hints,
+    /// The `system_identifier` of the cluster the planning read reached, for
+    /// a PostgreSQL target. The resolver's own target connection must reach
+    /// the same one: a target name can reach several (#1685). Like `base`,
+    /// only a producer reads it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub target_identity: Option<&'a str>,
+}
+
+/// The `system_identifier` of the cluster `conn` reached, for a PostgreSQL
+/// target: the planning read's, which the resolver's own target connection
+/// must match, since a target name can reach several clusters (#1685).
+/// Only PostgreSQL is resolved, and resolution refuses the other engines by
+/// name, so they record none. Only a supplied server is bound by it: the
+/// Docker profile does not read it, and must not demand the grant (#1718
+/// review).
+pub async fn planning_identity(
+    conn: &mut pbps_db::Conn,
+    selection: &ResolverSelection,
+) -> Result<Option<String>, Refused> {
+    let binds = matches!(
+        selection.profile,
+        pbps_config::resolver::ResolverProfile::Server { .. }
+    );
+    if !binds || conn.driver() != pbps_db::Driver::Postgres {
+        return Ok(None);
+    }
+    pbps_pg::resolver::vouched::cluster_identity(conn)
+        .await
+        .map(Some)
+        .map_err(identity_unread)
+}
+
+/// A refused read of the cluster's identity is the deployment role's to
+/// fix, and names the grant; any other failure is unanswerable.
+fn identity_unread(error: pbps_db::DbError) -> Refused {
+    if error.server_error_code().as_deref() == Some("42501") {
+        return Refused::Finding(
+            crate::output::Finding::error(
+                "resolver.identity",
+                format!(
+                    "the resolver binds its answer to the target's database cluster, and the \
+                     deployment role may not read the cluster's identity ({error})"
+                ),
+            )
+            .remedy(
+                "GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO <the deployment role>",
+            ),
+        );
+    }
+    Refused::Unanswerable(anyhow::anyhow!(
+        "the target cluster's identity could not be read: {error}"
+    ))
 }
 
 fn unresolved(request: &Request<'_>, why: impl std::fmt::Display) -> Refused {
@@ -209,10 +261,16 @@ mod producer {
             &request.selection.profile
         {
             let scratch = scratch_connection(request, url_env)?;
+            let Some(identity) = request.target_identity else {
+                return Err(Refused::Unanswerable(anyhow::anyhow!(
+                    "the planning read recorded no cluster identity for the resolver to bind"
+                )));
+            };
             return pbps_cli::resolver::server::vouched::produce(
                 driver,
                 &scratch,
                 request.target.connection(),
+                identity,
                 &binding,
                 request.base,
                 request.desired,
@@ -343,6 +401,100 @@ mod producer {
 mod tests {
     use super::*;
     use pbps_model::{Column, Hints, IdsFile, Module, ModuleKind, Schema, Table};
+
+    /// #1718 review: only a supplied server is bound by the planning
+    /// identity, so a Docker profile plans for a role refused
+    /// `pg_control_system()`, while a server profile refuses it and names the
+    /// grant. Function privileges belong to each database: the revoke stays in
+    /// the fixture's own.
+    #[test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    fn only_a_supplied_server_demands_the_cluster_identity_grant() {
+        use pbps_config::resolver::{ResolverProfile, SelectionSource, SelectionStatus};
+        let selection = |profile| ResolverSelection {
+            name: "r".into(),
+            source: SelectionSource::Cli,
+            profile,
+            status: SelectionStatus::NotAcquired,
+        };
+        let docker = selection(ResolverProfile::Docker {
+            image: "postgres:18".into(),
+            pull: Default::default(),
+        });
+        let server = selection(ResolverProfile::Server {
+            url_env: "PBPS_UNUSED".into(),
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        rt.block_on(async {
+            let database = crate::test_pg::TestDb::create("identity").await;
+            let mut conn = database.connect().await;
+            let role = format!("pbps_bin_identity_{}", std::process::id());
+            conn.execute(&format!(
+                "DROP ROLE IF EXISTS {role};
+                 CREATE ROLE {role} NOLOGIN;
+                 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC;"
+            ))
+            .await
+            .expect("the fixture");
+            let granted = planning_identity(&mut conn, &server).await;
+            conn.execute(&format!("SET ROLE {role}"))
+                .await
+                .expect("set role");
+            let unbound = planning_identity(&mut conn, &docker).await;
+            let refused = planning_identity(&mut conn, &server).await;
+            conn.execute("RESET ROLE").await.expect("reset role");
+            drop(conn);
+            database.drop().await;
+            crate::test_pg::shared()
+                .await
+                .execute(&format!("DROP ROLE {role}"))
+                .await
+                .expect("drop role");
+            assert!(
+                matches!(granted, Ok(Some(ref identity)) if !identity.is_empty()),
+                "a superuser reads it"
+            );
+            assert!(matches!(unbound, Ok(None)), "Docker reads no identity");
+            match refused {
+                Err(Refused::Finding(finding)) => assert_eq!(finding.id, "resolver.identity"),
+                Err(Refused::Unanswerable(error)) => panic!("answered, not: {error}"),
+                Ok(identity) => panic!("a refused role read {identity:?}"),
+            }
+        });
+    }
+
+    /// #1685: a role refused `pg_control_system()` is told the grant, as an
+    /// answered finding; any other failure to read the identity is
+    /// unanswerable, never a finding that blames the grant.
+    #[test]
+    fn an_unreadable_cluster_identity_names_the_grant_only_when_it_was_refused() {
+        let denied = pbps_db::DbError::Driver {
+            message: "permission denied for function pg_control_system".into(),
+            code: Some("42501".into()),
+        };
+        match identity_unread(denied) {
+            Refused::Finding(finding) => {
+                assert_eq!(finding.id, "resolver.identity");
+                assert!(
+                    finding
+                        .remedy
+                        .as_deref()
+                        .is_some_and(|remedy| remedy.contains("pg_control_system()")),
+                    "{finding:?}"
+                );
+            }
+            Refused::Unanswerable(error) => panic!("a refused read is answered: {error}"),
+        }
+        // Negative: a lost connection is not a missing grant.
+        let lost = pbps_db::DbError::Driver {
+            message: "connection reset".into(),
+            code: Some("08006".into()),
+        };
+        assert!(matches!(identity_unread(lost), Refused::Unanswerable(_)));
+    }
 
     /// #1575: a catalog read that failed part-way through the binding is
     /// `unanswerable`, exit 1; the binding's own verdict stays

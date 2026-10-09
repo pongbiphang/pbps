@@ -605,7 +605,8 @@
         "engine::tests::a_failed_cost_query_is_unavailable_not_a_static_guess",
         "engine::tests::a_module_handed_to_the_postgres_rename_impact_is_refused_not_empty",
         "engine::tests::the_postgres_arms_answer_engine_only_questions_by_name",
-        "engine::tests::the_role_questions_refuse_on_postgres_rather_than_answer_none"
+        "engine::tests::the_role_questions_refuse_on_postgres_rather_than_answer_none",
+        "resolution::tests::only_a_supplied_server_demands_the_cluster_identity_grant"
       ]
     },
     {
@@ -2142,6 +2143,8 @@
         "resolver::server::vouched::live_tests::vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_grants_elsewhere",
         "resolver::server::vouched::live_tests::vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_memberships_it_granted",
         "resolver::server::vouched::live_tests::vouched_refuses_a_scratch_that_is_not_empty",
+        "resolver::server::vouched::live_tests::vouched_refuses_a_scratch_that_may_not_read_its_cluster_identity",
+        "resolver::server::vouched::live_tests::vouched_refuses_a_target_connection_on_another_cluster_than_the_plan_was_read_from",
         "resolver::server::vouched::live_tests::vouched_refuses_the_target_as_scratch",
         "resolver::server::vouched::live_tests::vouched_runs_in_a_precreated_database_with_a_confined_account"
       ]

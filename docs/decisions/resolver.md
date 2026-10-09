@@ -1724,6 +1724,8 @@ by the engines, and the scratch account decides the layout.** Implemented by
 #1672 on the maintainer's decision on #1667.
 
 **The target is told from scratch by the engines, not by the strings.**
+*Amended by [DEC-1685.1](#dec-1685-1): the cluster identity decides first, and
+the target connection must reach the cluster the plan was read from.*
 - Two connection strings can spell one server two ways (`localhost` and an
   address, a DNS alias, a pooler), so comparing host, port and database
   answers the wrong question.
@@ -1961,3 +1963,73 @@ by the engines, and the scratch account decides the layout.** Implemented by
 
 Recorded in SPEC §9.3.2 and ADR-0016's amendment. Pinned by the `vouched_`
 live tests in `resolver::server::vouched`.
+
+<a id="dec-1685-1"></a>
+
+**DEC-1685.1. The resolver binds the target by its cluster identity, read at
+planning; a scratch connection's session pinning is operator-vouched.**
+Decided by the maintainer on #1685.
+
+**The problem.** A connection string names an address, not a server. One
+name can reach more than one cluster: through DNS round-robin, a balancing
+proxy, or a cloud reader endpoint. DEC 229 already refuses a string that
+names several hosts, but not a single name in front of several clusters.
+- The resolver opened a target connection of its own for the separation
+  check. That connection could reach another cluster than the planning
+  read, and the marks would then read "another cluster".
+- A superuser scratch on the cluster the plan was read from would then
+  provision roles and a database there (#1678 review; reproduced live: with
+  the check removed, the run answers).
+
+**The rule.**
+- **The planning read records the target's `system_identifier`** when a
+  supplied server is selected; the Docker profile does not read it and so
+  does not demand its grant (#1718 review). It comes from
+  `pg_control_system()`, which a plain login may execute by default
+  (measured on 16 and 18). initdb chooses the identifier, so it names the
+  cluster a connection reached, not the address that reached it.
+- **The resolver's target connection must report the same identifier**, or
+  the run refuses before any scratch write, naming both identifiers.
+- **A scratch reporting the target's identifier is on the target's cluster**,
+  whatever the marks show. A physical standby must share its primary's
+  identifier to replicate, and keeps the primary's database OIDs. So a
+  scratch on the primary with the target connection on a standby, which no
+  mark crosses, is the same cluster, or the target itself when the database
+  OID matches. Otherwise the marks decide as before.
+- **An unreadable identifier refuses, naming the grant**: `GRANT EXECUTE ON
+  FUNCTION pg_catalog.pg_control_system() TO` the role that was refused.
+  Falling back to the marks would reopen the case above.
+
+**Why not the alternatives.**
+- **Keeping the planning connection open for the resolver** binds one `plan`,
+  but apply (#616) is another run. The identity has to be recorded anyway.
+- **Declaring the target's identifier in `pbps.yml`** repeats what the
+  connection string already says: which database to manage. What it would
+  add is protection against a wrongly set address, a different problem.
+- **Comparing resolved addresses** cannot see behind a proxy.
+
+**What changes the identifier.**
+- A failover keeps it: a streaming standby must share it.
+- A dump and restore, a logical-replication move or a blue-green switch
+  makes a new cluster, so a plan in flight is refused and planning again is
+  the remedy.
+- #1516's recheck and #616's apply compare against the same identifier.
+
+**The scratch side is operator-vouched.** Transaction pooling on the scratch
+connection could still move a write between the backend checkpoints:
+- at the checks;
+- before compiling;
+- in the cleanup's own transaction.
+
+A per-transaction binding was rejected. The residual risk is writes landing
+on another backend behind the same operator-supplied scratch connection,
+never on the target, which the identity check guards. Like the scratch's
+other channels (SPEC §9.3.2), a session-pinned scratch connection, direct or
+session-pooled, is part of what the operator vouches for. The checkpoints
+stay and still refuse a move they see.
+
+Pinned by:
+- `vouched_refuses_a_target_connection_on_another_cluster_than_the_plan_was_read_from`;
+- `vouched_refuses_a_scratch_that_may_not_read_its_cluster_identity`;
+- `one_cluster_identity_is_one_cluster_whatever_the_marks_show`;
+- `an_unreadable_cluster_identity_names_the_grant_only_when_it_was_refused`.
