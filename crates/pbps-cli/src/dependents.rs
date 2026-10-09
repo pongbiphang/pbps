@@ -2082,7 +2082,8 @@ fn key_candidate(table: &str, n: u32) -> Option<String> {
 
 /// The `(schema, prefix)` every name [`key_candidate`] may try for each of
 /// the plan's unnamed keys starts with, which a connected plan reads the
-/// target's [`KeyNameHolder`]s by. Empty when the plan sets no unnamed key.
+/// target's [`KeyNameHolder`]s by, in the key's schema and in each schema the
+/// plan moves a table into it from. Empty when the plan sets no unnamed key.
 pub(crate) fn key_name_prefixes(cs: &ChangeSet) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for p in &cs.changes {
@@ -2104,9 +2105,23 @@ pub(crate) fn key_name_prefixes(cs: &ChangeSet) -> Vec<(String, String)> {
             while !first.is_char_boundary(shared) {
                 shared -= 1;
             }
-            let prefix = (table.schema.clone(), first[..shared].to_owned());
-            if !out.contains(&prefix) {
-                out.push(prefix);
+            // The key's schema, and each one a table moves into it from,
+            // which brings the names it holds there along.
+            let from = cs.changes.iter().filter_map(|p| {
+                if let Change::RenameTable { from, to, .. } = &p.change
+                    && to.schema == table.schema
+                    && from.schema != to.schema
+                {
+                    Some(from.schema.clone())
+                } else {
+                    None
+                }
+            });
+            for schema in std::iter::once(table.schema.clone()).chain(from) {
+                let prefix = (schema, first[..shared].to_owned());
+                if !out.contains(&prefix) {
+                    out.push(prefix);
+                }
             }
         }
     }
@@ -2167,14 +2182,32 @@ fn key_arrivals(
                 .map(move |c| (j, c))
         })
         .collect();
+    // A table moved to another schema takes its indexes and constraints
+    // along under their names, so each holder it owns also arrives there
+    // with the move (#1729 review).
+    let mut placed: Vec<(Option<usize>, KeyNameHolder)> =
+        holders.iter().map(|h| (None, h.clone())).collect();
+    for (j, p) in cs.changes.iter().enumerate() {
+        let Change::RenameTable { from, to, .. } = &p.change else {
+            continue;
+        };
+        if from.schema == to.schema {
+            continue;
+        }
+        for h in holders.iter().filter(|h| h.owner.as_ref() == Some(from)) {
+            let mut moved = h.clone();
+            moved.name.schema.clone_from(&to.schema);
+            placed.push((Some(j), moved));
+        }
+    }
     for (at, table) in keys {
         let held = |r: &TableName, out: &[Arrival]| {
             named.iter().any(|(_, n)| n == r)
                 || out.iter().any(|(_, o)| o == r)
                 || constraints.iter().any(|(j, c)| *j < at.0 && c == r)
-                || holders
-                    .iter()
-                    .any(|h| h.name == *r && !freed_before(cs, h, at))
+                || placed.iter().any(|(arrives, h)| {
+                    arrives.is_none_or(|j| j < at.0) && h.name == *r && !freed_before(cs, h, at)
+                })
         };
         let mut n = 0u32;
         while let Some(name) = key_candidate(&table.name, n) {
@@ -2193,9 +2226,10 @@ fn key_arrivals(
 /// relation or constraint holding it, or the table it belongs to, or moves
 /// that table to another schema, which takes its indexes and constraints
 /// along. Changes on a table the plan renames carry its new name, and the
-/// holder its name now, so each is read back to the catalog's name (as
-/// `deploy::refuse_uninventoried_occupants` does). Anything else, a dropped
-/// column's indexes among them, is kept (see [`key_arrivals`]).
+/// holder's owner its name now, so each is read back to the catalog's name
+/// (as `deploy::refuse_uninventoried_occupants` does); a drop is not, as it
+/// names the table it drops. Anything else, a dropped column's indexes among
+/// them, is kept (see [`key_arrivals`]).
 #[allow(clippy::wildcard_enum_match_arm)]
 fn freed_before(cs: &ChangeSet, holder: &KeyNameHolder, at: (usize, Step)) -> bool {
     let now = |t: &TableName| -> TableName {
@@ -2213,17 +2247,23 @@ fn freed_before(cs: &ChangeSet, holder: &KeyNameHolder, at: (usize, Step)) -> bo
         // replaced in one change frees its index's name for the new one.
         (j, AT_CREATE) < at
             && match &p.change {
-                Change::DropTable { name, .. } => {
-                    let name = now(name);
-                    holder.name == name || owned_by(&name)
-                }
+                // A dropped table goes by the name it has when it is
+                // dropped, never one a later rename gives another table.
+                Change::DropTable { name, .. } => holder.name == *name || owned_by(name),
+                // The move frees the names in the schema it leaves; in the
+                // one it enters, it brings them ([`key_arrivals`]).
                 Change::RenameTable { from, to, .. } => {
-                    holder.name == *from || (from.schema != to.schema && owned_by(from))
+                    holder.name == *from
+                        || (from.schema != to.schema
+                            && owned_by(from)
+                            && holder.name.schema == from.schema)
                 }
-                Change::DropIndex { table, name } | Change::DropUnique { table, name } => {
-                    holder.name == TableName::new(now(table).schema, name.clone())
-                }
-                Change::DropCheck { table, name } | Change::DropForeignKey { table, name } => {
+                // By the table and the name, so an index a rename carried to
+                // another schema is freed there too.
+                Change::DropIndex { table, name }
+                | Change::DropUnique { table, name }
+                | Change::DropCheck { table, name }
+                | Change::DropForeignKey { table, name } => {
                     owned_by(&now(table)) && holder.name.name == *name
                 }
                 Change::SetPrimaryKey {
@@ -6549,6 +6589,108 @@ mod tests {
             None,
         );
         assert_eq!(later[0].searched, ["app"], "{later:?}");
+    }
+
+    /// #1729 review: a rename moves a table and what it owns. A table dropped
+    /// under a name another table is then renamed to frees only its own
+    /// names; one moved into the key's schema brings its index there, which
+    /// numbers the key past it. A default naming either index binds the one
+    /// that is there, and is not refused.
+    #[test]
+    fn a_rename_moves_the_names_a_table_holds() {
+        let names = |what: &str| format!("('app.{what}'::regclass)::text");
+        let unnamed = || pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+        };
+        let keyed_as = |table: &str, default: &str| {
+            let mut t = new_table(Some(default), None, &[]);
+            t.primary_key = Some(unnamed());
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, &format!("app.{table}"), 0),
+                name: TableName::new("app", table),
+                table: Box::new(t),
+            }
+        };
+        let rename = |from: TableName, to: TableName| Change::RenameTable {
+            uid: Uid::derived(UidKind::Table, &from.to_string(), 0),
+            from,
+            to,
+            defaults: Vec::new(),
+        };
+        let refused = |changes: Vec<Change>, holders: &[KeyNameHolder]| -> Vec<String> {
+            names_a_later_relation(&plan(changes), &*pg(), Some(holders))
+                .into_iter()
+                .map(|n| n.what)
+                .collect()
+        };
+        // `app.target` dropped, `app.old` renamed to it, and `app.old`
+        // created again: `old_pkey` stays with the renamed table.
+        let drop_target = Change::DropTable {
+            uid: Uid::derived(UidKind::Table, "app.target", 0),
+            name: TableName::new("app", "target"),
+            detach_from: None,
+        };
+        let swapped = |default: &str| {
+            vec![
+                drop_target.clone(),
+                rename(
+                    TableName::new("app", "old"),
+                    TableName::new("app", "target"),
+                ),
+                keyed_as("old", &names(default)),
+            ]
+        };
+        let old_key = [KeyNameHolder {
+            name: TableName::new("app", "old_pkey"),
+            owner: Some(TableName::new("app", "old")),
+            primary_key: true,
+        }];
+        assert_eq!(refused(swapped("old_pkey"), &old_key), Vec::<String>::new());
+        assert_eq!(refused(swapped("old_pkey1"), &old_key).len(), 1);
+        // `archive.t` moved into `app` with its index `n_pkey1`, while
+        // `app.n_pkey` is held: the key's index is `n_pkey2`.
+        let moved = |default: &str| {
+            vec![
+                rename(TableName::new("archive", "t"), TableName::new("app", "t")),
+                keyed_as("n", &names(default)),
+            ]
+        };
+        let held = [
+            KeyNameHolder {
+                name: TableName::new("app", "n_pkey"),
+                owner: None,
+                primary_key: false,
+            },
+            KeyNameHolder {
+                name: TableName::new("archive", "n_pkey1"),
+                owner: Some(TableName::new("archive", "t")),
+                primary_key: false,
+            },
+        ];
+        assert_eq!(refused(moved("n_pkey1"), &held), Vec::<String>::new());
+        assert_eq!(refused(moved("n_pkey2"), &held).len(), 1);
+        assert!(
+            key_name_prefixes(&plan(moved("n_pkey1")))
+                .contains(&("archive".to_owned(), "n_pkey".to_owned()))
+        );
+        // Moved in and then dropped, the index frees its name there.
+        let dropped = vec![
+            rename(TableName::new("archive", "t"), TableName::new("app", "t")),
+            Change::DropIndex {
+                table: TableName::new("app", "t"),
+                name: "n_pkey1".into(),
+            },
+            keyed_as("n", &names("n_pkey1")),
+        ];
+        assert_eq!(refused(dropped, &held).len(), 1);
+        // Negative: moved after the key, the index is not there yet.
+        let late = vec![
+            keyed_as("n", &names("n_pkey1")),
+            rename(TableName::new("archive", "t"), TableName::new("app", "t")),
+        ];
+        assert_eq!(refused(late, &held).len(), 1);
     }
 
     /// #1645: the target is read for every name a key may try: the part all

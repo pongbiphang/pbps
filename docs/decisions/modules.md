@@ -1850,7 +1850,11 @@ walks the plan to each key. A holder an earlier change frees no longer
 counts: the relation or constraint dropped, its table dropped or moved to
 another schema, the key it belongs to replaced, or a view dropped. An
 earlier arrival does count, as do a constraint added earlier and an earlier
-key's index. The key takes the first candidate left free, and that name is
+key's index. A table moved into the key's schema earlier brings its indexes
+and constraints along under their names (measured on 16 and 18), so the
+holders of the schema it leaves are read too, and count from the move on. A
+dropped table goes by the name it has when it is dropped, never by one a
+later rename gives another table (#1729 review). The key takes the first candidate left free, and that name is
 its arrival like any declared one, so the target is no longer asked about
 it.
 
@@ -1867,7 +1871,8 @@ Asking the target about each numbered name, as DEC-1576.1 asked about the
 first, was the alternative. It cannot see what the plan frees or adds
 before the key, the cause of all three failures.
 
-Pinned by `a_key_takes_the_first_candidate_free_when_it_is_created` and
+Pinned by `a_key_takes_the_first_candidate_free_when_it_is_created`,
+`a_rename_moves_the_names_a_table_holds` and
 `key_name_prefixes_cover_every_candidate`
 (`crates/pbps-cli/src/dependents.rs`),
 `a_numbered_key_name_cuts_the_table_again_to_fit` (`crates/pbps-pg/src/lib.rs`),
