@@ -155,6 +155,39 @@ impl Conn {
     /// same reason [`tcp_user_timeout_disposition`] takes it as a
     /// parameter rather than being `#[cfg]`-gated itself.
     async fn connect_as(connection_string: &str, is_linux: bool) -> Result<Self, DbError> {
+        let (config, defaulted) = Self::parse(connection_string)?;
+        // Whether to explain a TLS failure is decided where the failure still
+        // says what it was, inside `connect_config` (#829).
+        Self::connect_config(config, is_linux, defaulted).await
+    }
+
+    /// [`connect`] to `database` on the same server, as `login` when given:
+    /// the string supplies the endpoint and the TLS it asked for, the caller
+    /// the database and credentials it created, and a new login none of the
+    /// string's startup `options`. The operator-vouched
+    /// resolver reaches its run-owned scratch database this way, so a
+    /// scratch server behind TLS stays behind it (#1672).
+    pub(crate) async fn connect_with(
+        connection_string: &str,
+        database: &str,
+        login: Option<(&str, &str)>,
+    ) -> Result<Self, DbError> {
+        let (mut config, defaulted) = Self::parse(connection_string)?;
+        config.dbname(database);
+        if let Some((user, password)) = login {
+            // The string's startup `options` are the operator's session
+            // settings for its own login (`-c role=...`, a path, a timeout).
+            // Carried over, they would refuse or reshape a login the caller
+            // created, which gets the settings the caller gives it instead
+            // (#1678 review). An empty value sends no setting.
+            config.user(user).password(password).options("");
+        }
+        Self::connect_config(config, cfg!(target_os = "linux"), defaulted).await
+    }
+
+    /// The parsed string, and whether it named no `sslmode` — the TLS then
+    /// required is pbps's choice, and a failure of it is explained (#829).
+    fn parse(connection_string: &str) -> Result<(Config, bool), DbError> {
         let mut config: Config = connection_string
             .parse()
             .map_err(|e: tokio_postgres::Error| DbError::BadConnectionString(e.to_string()))?;
@@ -170,9 +203,7 @@ impl Conn {
         if defaulted {
             config.ssl_mode(tokio_postgres::config::SslMode::Require);
         }
-        // Whether to explain a TLS failure is decided where the failure still
-        // says what it was, inside `connect_config` (#829).
-        Self::connect_config(config, is_linux, defaulted).await
+        Ok((config, defaulted))
     }
 
     pub(crate) async fn connect_verified(connection_string: &str) -> Result<Self, DbError> {

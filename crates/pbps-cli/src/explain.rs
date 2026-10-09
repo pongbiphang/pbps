@@ -595,6 +595,18 @@ fn findings(plan: &SavedPlan, e: &Explanation) -> Vec<output::Finding> {
     out
 }
 
+/// What produced a resolved plan's evidence, so a reviewer can tell an answer
+/// the operator vouched for from a measured one (DEC-1528.1).
+fn resolver_runtime(runtime: &pbps_model::resolver::ResolverRuntime) -> String {
+    use pbps_model::resolver::ResolverRuntime;
+    match runtime {
+        ResolverRuntime::Vouched => "operator-vouched scratch (not measured)".into(),
+        ResolverRuntime::Container { profile, .. } | ResolverRuntime::Supplied { profile, .. } => {
+            format!("measured profile {profile}")
+        }
+    }
+}
+
 fn render(plan: &SavedPlan, e: &Explanation) -> String {
     let mut out = String::from("Plan\n");
     out.push_str(&format!(
@@ -606,6 +618,12 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
             PlanOrigin::Preview => "computed offline — a preview; `apply` will refuse it",
         }
     ));
+    if let pbps_model::resolver::PlanAnalysis::Resolved(evidence) = &plan.analysis {
+        out.push_str(&format!(
+            "  resolver    {}\n",
+            resolver_runtime(&evidence.qualification().runtime)
+        ));
+    }
     out.push_str(&format!("  dialect     {}\n", e.dialect));
     out.push_str(&format!("  created     {}\n", e.created_at));
     if let Some(sha) = &e.git_sha {

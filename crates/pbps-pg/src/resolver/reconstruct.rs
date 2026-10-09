@@ -473,7 +473,7 @@ impl Reconstruction {
     pub async fn compile(
         &mut self,
         dialect: &crate::Postgres,
-        conn: &mut pbps_db::transport::StreamConn,
+        conn: &mut impl pbps_db::transport::ExecuteConnection,
     ) -> Result<(), ReconstructError> {
         let framing = dialect.transaction_framing();
         conn.execute(framing.begin)
@@ -491,7 +491,7 @@ impl Reconstruction {
 
     async fn compile_steps(
         &mut self,
-        conn: &mut pbps_db::transport::StreamConn,
+        conn: &mut impl pbps_db::transport::ExecuteConnection,
     ) -> Result<(), ReconstructError> {
         for step in &mut self.steps {
             let failed = |reason: String| ReconstructError::Compile {
@@ -627,7 +627,7 @@ pub fn dropped_signature(
 /// Every routine of one schema-qualified name, named as the capture names
 /// them: schema and name, then each argument type by schema and name.
 async fn routines(
-    conn: &mut pbps_db::transport::StreamConn,
+    conn: &mut impl pbps_db::transport::ExecuteConnection,
     schema: &str,
     name: &str,
 ) -> Result<Vec<ObjectIdentity>, String> {
@@ -792,7 +792,7 @@ fn relation(schema: &str, name: &str) -> Vec<(Nameable, String, String)> {
 /// name it chose: `_name` usually, but clipped to the identifier limit, or
 /// another spelling when that one was taken. `None` when it made none.
 async fn array_type(
-    conn: &mut pbps_db::transport::StreamConn,
+    conn: &mut impl pbps_db::transport::QueryConnection,
     schema: &str,
     name: &str,
 ) -> Result<Option<(String, String)>, String> {

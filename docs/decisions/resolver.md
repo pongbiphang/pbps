@@ -1586,6 +1586,11 @@ isolation, the confidentiality of what it compiles, and its channels. Both
 connections use whatever TLS the operator configured. The evidence names the
 profile, so a reviewer can always tell a vouched answer from a measured one.
 
+*Amended by [DEC-1672.1](#dec-1672-1): the target is told from scratch by the
+engines rather than the strings, a scratch on the target's cluster needs a
+confined account, and the account decides the layout. The cluster
+identifier read below needs no privilege after all.*
+
 **It keeps exactly two separation checks.** The first runs before the
 run-owned database is created; the second reads that database once it is
 created, before any other DDL.
@@ -1711,3 +1716,248 @@ their full definitions sends routine source no reviewer approved.
 Recorded in SPEC §9.3.2 and ADR-0016's amendment. The design and the
 maintainer's decisions are on #1528. Pinned by the acceptance tests ADR-0016's
 amendment lists, which land with the producer.
+
+<a id="dec-1672-1"></a>
+
+**DEC-1672.1. The operator-vouched resolver tells its scratch from the target
+by the engines, and the scratch account decides the layout.** Implemented by
+#1672 on the maintainer's decision on #1667.
+
+**The target is told from scratch by the engines, not by the strings.**
+- Two connection strings can spell one server two ways (`localhost` and an
+  address, a DNS alias, a pooler), so comparing host, port and database
+  answers the wrong question.
+- **Each session marks itself.** Each sets `application_name` to a
+  run-generated token, and the scratch session reads `pg_stat_activity` for
+  both tokens. Any role sees another session's `pid` and `application_name`
+  there; only its query and timings are hidden (measured on 16 and 18).
+  - A target mark the scratch session sees, on the target's backend, is the
+    same cluster. On the target's own database as well, it is the target, and
+    the run refuses.
+  - The scratch session must see its own mark. Otherwise the view shows
+    nothing on that cluster, and "not seen" would read as "another cluster".
+  - **Both sessions hold a transaction across the check**, and the marks are
+    transaction-local. A transaction-pooling proxy releases a backend
+    between transactions, so without one the scratch session could be handed
+    the target's backend, overwrite its mark and read "another cluster"
+    (#1678 review).
+  - **The run keeps the scratch backend it checked.** The same transaction
+    records that backend: its process ID, its start time and its
+    postmaster's start time, which a session reads about itself. A
+    connection keeps its socket, not its backend, so the supplied layout
+    rechecks it in the transaction that holds its checks, and again before
+    compiling. It refuses if the backend moved, and asks for a direct or
+    session-pooled connection. The cleanup's `DROP OWNED` runs in one
+    transaction with that check, so it is never sent to another backend
+    (#1678 review).
+  - The identity's times are compared as epochs. Their text follows
+    `TimeZone` and `DateStyle`, which the compile pins, so text would make
+    one backend read as two.
+- **Rejected: a `pg_database` row with the target database's name and
+  OID.** Two clusters started from one image with one `POSTGRES_DB` hold
+  identical rows, which is an ordinary CI layout. That check would call them
+  one cluster and refuse a valid setup.
+- **Rejected: `system_identifier`.** A cluster restored from a physical
+  backup, or an image with its data directory baked in, shares it.
+  - DEC-1528.1 dropped this check because it needs a privileged read. That
+    premise was wrong: `pg_control_system()` is executable by `PUBLIC` on 16
+    and 18. It is still not the separation check, for the reason above.
+
+**On the target's cluster, the scratch account must be confined** (#1667).
+- Confined means nothing the account can do reaches outside its
+  database. A compiled definition runs before the plan is approved, so
+  whatever the account can do, a declaration can make it do (#1678
+  security review).
+  - **What it can use.** The privileges of every role it can `SET ROLE`
+    to, itself included, of every role one of those inherits from, and of
+    PUBLIC. `SET` chains start at the session user, so a role reached by
+    `SET` and then inherited counts though neither `USAGE` nor `SET` from
+    the login reaches it (measured on 16 and 18; #1678 review).
+  - **Attributes.** Neither the account nor any role it can `SET ROLE` to
+    has `SUPERUSER`, `CREATEROLE`, `CREATEDB` or `REPLICATION`. A
+    replication slot holds WAL for the whole cluster (measured on 16 and 18
+    for a non-superuser after `SET ROLE`). A role it can become is as good
+    as holding the attribute. The attributes are never inherited, so a
+    membership granted `SET FALSE` does not count: the login can neither
+    become that role nor use its attribute (#1678 review).
+  - **Predefined roles.** It can use no predefined role outside a short
+    list whose privileges stay in the database or only read statistics and
+    settings: `pg_database_owner`, `pg_read_all_data`,
+    `pg_write_all_data`, `pg_maintain`, `pg_monitor`,
+    `pg_read_all_settings`, `pg_read_all_stats`, `pg_stat_scan_tables` and
+    `pg_use_reserved_connections`. Every other one is refused, a role a
+    later version adds included, until it is known. A predefined role's
+    privileges are inherited, so inheriting one counts: measured on 16 and
+    18, an `INHERIT TRUE, SET FALSE` membership of
+    `pg_execute_server_program` runs `COPY ... TO PROGRAM`.
+  - **Shared objects.** No role it can use, nor PUBLIC, holds authority
+    over a shared object other than the database it is in:
+    - ownership of another database or a tablespace;
+    - `ADMIN OPTION` on a role;
+    - a grant option on a database or tablespace;
+    - `ALTER SYSTEM`, or a grant option, on a parameter.
+
+    Each lets a compiled definition write outside the database:
+    `ALTER DATABASE` through an inherited membership of its owner, `GRANT`
+    of the role, `GRANT` on the database (measured on 16 and 18; #1678
+    review). A subscription is the exception: only a session in its own
+    database can alter or drop it (measured), and one in this database is
+    the emptiness check's. On another cluster none of these is the
+    target's, so they are not checked there.
+  - **Other sessions.** It can use no login role but its own, and it is
+    not the target session's login. A backend may be cancelled or
+    terminated by any role with its login role's privileges, from any
+    database (measured on 16 and 18 through an `INHERIT TRUE, SET FALSE`
+    membership; #1678 review). The scratch login's own sessions elsewhere
+    are the operator's to keep apart: it is the scratch database's login.
+- Reproducing the deployer's authorization creates roles server-wide, some
+  possibly `SUPERUSER`. On a shared cluster that is a write to the target's
+  cluster, and only an account that cannot make it is safe there.
+- An unconfined account on the target's cluster refuses before any write,
+  naming the attributes and memberships to remove.
+
+**The account decides the layout.**
+- **Run-owned.** A login that is itself a superuser, on another cluster,
+  gets the measured run's
+  layout: a run-owned login and a database from `template0` with the target's
+  recipe, the deployer's authorization reproduced, and a compile as the
+  reproduced deployer. All of it is dropped afterwards.
+  - Only a superuser. A `CREATEROLE` login is granted `ADMIN` on the roles it
+    creates but not `SET` (the default `createrole_self_grant`). So it can
+    neither hand them the database nor replay grants as them, and it cannot
+    reproduce a superuser deployer at all (#1678 review). It takes the
+    supplied layout instead.
+  - Nor a member of a superuser role. `SUPERUSER` is not inherited and the
+    run never `SET ROLE`s, so it runs without it. Membership still makes the
+    account unconfined on the target's cluster.
+- **Supplied.** Any other account compiles as itself in the database its
+  connection names.
+  - "As itself" is enforced: the first statement on every connection the
+    run opens as the scratch login is `SET ROLE NONE`, the run-owned
+    layout's provisioning connection included. Every step that switches role
+    and back returns with `SET ROLE NONE` too, never `RESET ROLE`, which
+    returns to the role the login's defaults name.
+  - A connection the run opens as a login it created carries none of the
+    operator string's startup `options`. Those are the operator's session
+    settings for its own login: a `-c role=` there would be refused for
+    the new login, and the new login gets the settings the run gives it
+    (#1678 review). A role set by the login's defaults or its
+    connection options would own what the run creates, out of reach of
+    `DROP OWNED BY SESSION_USER`. It would also hide the session's own
+    backend timings (#1678 review).
+  - It must own that database.
+  - The database must hold nothing initdb did not create: no object at or
+    above `FirstNormalObjectId`, a subscription created in it included,
+    and no large object at all. A large object's OID is its creator's to
+    choose, so no cutoff applies, and initdb makes none (#1678 review).
+  - **Every write goes through the connection the checks were made on**,
+    the cleanup included. A second connection from the same string need not
+    reach the same server: a name may resolve to several hosts, or to a
+    balancing proxy. `DROP OWNED` there would empty something unchecked
+    (#1678 review). The cleanup first ends a failed transaction and resets
+    the role.
+  - The deployer's role and database defaults become session settings. The
+    path, the preload lists and any setting the login may not set are left
+    for the comparison to report. So is a setting the session took from its
+    startup packet: the target's session, through the same driver, gets the
+    same override. The driver always sends `client_encoding=UTF8`, so a
+    stored `LATIN1` never takes effect on the target either (measured on 16
+    and 18; #1678 review).
+  - Each replayed value is an `E'…'` literal with its backslashes and
+    quotes doubled. The replay runs before any framing pins
+    `standard_conforming_strings`, and the login's own default may turn it
+    off. Under that, a plain literal's backslash escapes its closing quote,
+    and the rest of a stored value would run as SQL (#1678 review).
+  - No role is reproduced. A deployer that differs in schema visibility
+    refuses through the compatibility comparison.
+  - `DROP OWNED BY SESSION_USER` empties the database afterwards, whether
+    the run answered or refused.
+  - **Nothing outside the database is within the cleanup's reach.**
+    `DROP OWNED` acts on the shared dependencies recorded on the login, so
+    the run reads those (`pg_shdepend`) before any write and refuses,
+    naming them, while any remains other than the run's own. These count:
+    every entry in this database, and every shared entry other than
+    ownership. A privilege or membership is revoked; a database, tablespace
+    or subscription the login owns is not dropped. The login's own entry on
+    the database it compiles in is the run's own.
+    - Measured on 16 and 18, this one read covers each case review found
+      one at a time before it: a grant to the login on another database,
+      tablespace or parameter; a role membership the login granted, to
+      another role or to itself; an object it owns here, a large object
+      with a chosen low OID included (#1678 review).
+    - Left out, as measured: ownership of another database, which
+      `DROP OWNED` keeps, a grant the login made on another database's ACL,
+      and a membership granted to the login.
+- **The cleanup confirms the database is empty.** After `DROP OWNED`, the
+  emptiness inventory is read again, and anything left fails the run,
+  named, instead of returning a plan. A compiled definition may `SET ROLE`
+  to a role the login can become and create objects that role owns, which
+  `DROP OWNED BY SESSION_USER` does not reach. `pg_database_owner` is such
+  a role for every owner, and `DROP OWNED BY pg_database_owner` is refused
+  ("required by the database system"; measured on 16 and 18), so refusing
+  such roles up front cannot cover it (#1678 review).
+- **The cleanup also reads the login's own defaults.** A confined login
+  can still `ALTER ROLE CURRENT_USER [IN DATABASE ...] SET` its defaults,
+  and they outlive the database's contents; its connection limit,
+  validity and comment it cannot change (measured on 16 and 18). The run
+  reads them before its first write and again after `DROP OWNED`, and a
+  change fails the run, named (#1678 review). Its password is the one
+  self-change the login cannot read back: the next connection fails on it.
+- **The deployer's unusable schemas are given up.** The supplied login
+  owns every schema it compiles in, so it uses all of them. For each
+  in-scope schema the deployer cannot use once the plan's grants and
+  revokes have run, the login revokes its own `USAGE`. An owner may, and
+  the schema then leaves its effective path as it leaves the deployer's
+  (measured on 16 and 18). Otherwise the comparison sees a schema the
+  deployer will not, and a valid plan is refused (#1678 review).
+  - initdb's `public` is the one schema a supplied database holds that the
+    login does not own. The login reaches it through `PUBLIC`, its
+    membership of `pg_database_owner`, and any role whose privileges it
+    holds that the owner granted `USAGE`. It revokes all of those as
+    `pg_database_owner`, grants them back at cleanup, each with the grant
+    option it held, and fails the run, named, if the schema's ACL is not
+    then as it was. Measured on 16 and 18, the round trip restores the ACL
+    exactly.
+  - What no per-schema revoke reaches refuses the run, named, before
+    anything compiles: `pg_read_all_data` and `pg_write_all_data` grant
+    `USAGE` on every schema (measured on 16 and 18), and an entry another
+    grantor made is not the owner's to revoke. The schema would otherwise
+    stay on the login's path while it leaves the deployer's, and every
+    comparison would be a mismatch (#1678 review). What was given up is
+    still granted back.
+  - The path read that compares visibility runs before any framing pins
+    the string mode, so its literal is the setting-independent `E'…'`
+    form. A backslash in a schema name otherwise took the schema off the
+    path under the login's `standard_conforming_strings = off`.
+- **Why ownership is required.** `DROP OWNED` also revokes what was granted
+  to the login on the database, and only an owner keeps its rights through
+  that.
+- **`DROP OWNED` never runs as a superuser.** A superuser either provisions
+  (another cluster) or refuses (the target's), so it never reaches this
+  layout. Run as the bootstrap superuser, `DROP OWNED` would reach every
+  object initdb made.
+- **A run that dies part-way** leaves the supplied database non-empty. The
+  next run then refuses on emptiness instead of compiling over the
+  leftovers.
+
+**The comparison is rule `pg-reported-scope-v1`:** every catalog fact
+`pg-analysis-scope-v1` compares, and no executable.
+- Evidence naming the vouched runtime must name this rule, and measured
+  evidence the other. A rule that claims coverage the run did not have is
+  refused by the artifact reader.
+- **The build string, `server_version`, is recorded, not compared.** It
+  names the packaging as much as the build: a managed or distribution-packaged
+  target and a container scratch of one version report two strings
+  (`18.6 (Debian 18.6-1.pgdg13+2)` from the official image). That is the
+  common pairing, and refusing it would refuse most real setups. The version
+  number, extensions, collations and settings, which decide binding, are
+  compared. A packaging that patched name resolution apart within one
+  version is part of what the operator vouches for. A differing string is a
+  named limitation of the report and is in the build fingerprint; an
+  unreadable one is unknown (maintainer's decision on #1678).
+- The build fields carry keyed fingerprints of what each engine reports: its
+  version number and build string, and its installed extensions at their
+  versions.
+
+Recorded in SPEC §9.3.2 and ADR-0016's amendment. Pinned by the `vouched_`
+live tests in `resolver::server::vouched`.

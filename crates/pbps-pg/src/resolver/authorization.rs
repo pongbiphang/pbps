@@ -434,6 +434,17 @@ impl RoleMap {
         }
     }
 
+    /// The map of a run that reproduces no role: a supplied scratch database
+    /// whose login is confined to it compiles as that login, which stands
+    /// for the deployer and for nothing else (#1672). Any other role a
+    /// compiled object names is the scratch server's own.
+    pub fn supplied(context: &AuthorizationContext, login: &str) -> Self {
+        Self {
+            to_run_local: BTreeMap::from([(context.principal.effective.clone(), login.to_owned())]),
+            run_login: login.to_owned(),
+        }
+    }
+
     /// The run-local name for a logical role, or `PUBLIC` unchanged. `None`
     /// for a role the map does not cover — a grant to which would silently
     /// not be reproduced, so callers refuse rather than skip it.
@@ -471,6 +482,73 @@ impl RoleMap {
     pub fn deployer(&self, context: &AuthorizationContext) -> Option<String> {
         self.run_local(&context.principal.effective)
     }
+}
+
+/// Gives a supplied scratch session the deployer's role and database
+/// defaults as session settings, where the run-owned path stores them on its
+/// own login and database (`reconstruct`), which a confined login cannot.
+/// Precedence follows the engine's: a database default, then the login's,
+/// then the login's in that database.
+///
+/// Three kinds are left alone, and the comparison that follows reports any
+/// difference they leave as a mismatch rather than this hiding it. The path:
+/// every pbps session pins an empty one (DEC-1564.1), the target's too. The
+/// preload lists: a library loads only when a session starts, so a value set
+/// now would read as loaded when nothing was. And a setting the login may not
+/// set at all.
+pub async fn apply_session_settings(
+    conn: &mut impl QueryConnection,
+    context: &AuthorizationContext,
+) -> Result<(), DbError> {
+    const LOADED_AT_START: &[&str] = &[
+        "session_preload_libraries",
+        "shared_preload_libraries",
+        "local_preload_libraries",
+        "dynamic_library_path",
+    ];
+    for scope in ["database", "role", "database-role"] {
+        for (key, value) in &context.settings {
+            let Some(name) = key.strip_prefix(scope).and_then(|k| k.strip_prefix(':')) else {
+                continue;
+            };
+            if name == "search_path" || LOADED_AT_START.contains(&name) {
+                continue;
+            }
+            // A setting this session took from its startup packet overrides
+            // the stored default on the target's session as well, since both
+            // connect through the same driver: the driver always sends
+            // `client_encoding=UTF8`, so a stored `LATIN1` never takes
+            // effect there (measured on 16 and 18). Replaying the stored
+            // value would make scratch differ from the target (#1678
+            // review).
+            let source = conn
+                .query(&format!(
+                    "SELECT s.source FROM pg_catalog.pg_settings s \
+                      WHERE pg_catalog.lower(s.name) = pg_catalog.lower({})",
+                    literal(name)
+                ))
+                .await?;
+            if source
+                .first()
+                .and_then(|row| row.try_get::<&str>("source").ok().flatten())
+                == Some("client")
+            {
+                continue;
+            }
+            let statement = format!(
+                "SELECT pg_catalog.set_config({}, {}, false)",
+                literal(name),
+                literal(value)
+            );
+            match conn.query(&statement).await {
+                Ok(_) => {}
+                // Not settable by this login: left for the comparison.
+                Err(error) if error.server_error_code().as_deref() == Some("42501") => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A planned authorization change the plan performs before its DDL, applied
@@ -703,7 +781,10 @@ pub async fn reconstruct(
                         }
                     ))
                     .await;
-                admin.query("RESET ROLE").await?;
+                // `SET ROLE NONE`, not `RESET ROLE`: a reset returns to the
+                // role the login's defaults name, not to the login (#1678
+                // review).
+                admin.query("SET ROLE NONE").await?;
                 outcome?;
                 if grant.grantable && grantee != "PUBLIC" {
                     able.insert((grantee.clone(), grant.privilege.clone()));
@@ -788,7 +869,7 @@ pub async fn apply_planned(
         .query(&format!("SET ROLE {}", quote_ident(deployer)))
         .await?;
     let outcome = apply_planned_grants(admin, map, grants).await;
-    admin.query("RESET ROLE").await?;
+    admin.query("SET ROLE NONE").await?;
     outcome
 }
 
@@ -1099,12 +1180,23 @@ pub async fn verify(
     Ok(differences)
 }
 
-/// A SQL string literal with single quotes doubled: the schema, object and
-/// privilege names reach `has_*_privilege` as text arguments, and the scratch
-/// stream has no parameter binding, so quoting is what keeps a name from
-/// ending the literal.
+/// A SQL string literal no session setting can reinterpret: the schema,
+/// object and privilege names reach `has_*_privilege` as text arguments, and
+/// the scratch stream has no parameter binding, so quoting is what keeps a
+/// name from ending the literal. An `E'…'` with every backslash and quote
+/// doubled, as `emit::value_literal` renders a value: the supplied layout
+/// replays the deployer's stored settings before any framing pins
+/// `standard_conforming_strings`, and the login's own defaults may turn it
+/// off, under which a plain literal's backslash escapes the quote that was
+/// meant to close it (#1678 review).
 fn literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+/// [`literal`], for the other resolver modules that build statements
+/// before any framing pins the string mode.
+pub(crate) fn setting_literal(value: &str) -> String {
+    literal(value)
 }
 
 fn boolean(rows: &[Row], field: &str) -> Result<bool, DbError> {
@@ -1159,21 +1251,28 @@ mod tests {
         // and the literal-per-element form that stores the same text again.
         assert_eq!(
             setting_value("search_path", r#""$user", public, "odd name""#).unwrap(),
-            "'$user', 'public', 'odd name'"
+            "E'$user', E'public', E'odd name'"
         );
         assert_eq!(
             setting_value("session_preload_libraries", r#""foo,bar", auto_explain"#).unwrap(),
-            "'foo,bar', 'auto_explain'"
+            "E'foo,bar', E'auto_explain'"
         );
         // A scalar, and a list the engine does not quote, keep the whole
         // text as one literal; a quote in it cannot end the literal.
         assert_eq!(
             setting_value("DateStyle", "ISO, MDY").unwrap(),
-            "'ISO, MDY'"
+            "E'ISO, MDY'"
         );
         assert_eq!(
             setting_value("default_text_search_config", "it's").unwrap(),
-            "'it''s'"
+            "E'it''s'"
+        );
+        // Nor can a backslash, whatever `standard_conforming_strings` is
+        // (#1678 review); measured on 16 and 18, the E-form stores the same
+        // text.
+        assert_eq!(
+            setting_value("default_text_search_config", r"x\'y").unwrap(),
+            r"E'x\\''y'"
         );
         // A stored list the engine could not read is refused, not replayed.
         assert!(setting_value("search_path", r#""open"#).is_err());
@@ -1184,6 +1283,62 @@ mod tests {
             privilege: privilege.into(),
             grantable,
             grantor: grantor.into(),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn a_replayed_setting_is_one_literal_whatever_the_string_mode() {
+        // The supplied layout replays stored settings before any framing
+        // pins `standard_conforming_strings`, and the login's own default
+        // may turn it off. A configuration name with a backslash before a
+        // quote then ended a plain literal, and the rest ran as SQL (#1678
+        // review).
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &base)
+                .await
+                .unwrap();
+            let schema = format!(
+                "pbps_lit1678_{}",
+                crate::catalog::probe_token().replace('-', "_")
+            );
+            let value = format!(r#"{schema}."x\', false) FROM pbps_no_such_relation --""#);
+            conn.query(&format!("CREATE SCHEMA {schema}"))
+                .await
+                .unwrap();
+            conn.query(&format!(
+                "CREATE TEXT SEARCH CONFIGURATION {value} (COPY = pg_catalog.simple)"
+            ))
+            .await
+            .unwrap();
+            conn.query("SET standard_conforming_strings = off")
+                .await
+                .unwrap();
+            let mut replayed = context();
+            replayed.settings = [(
+                "database:default_text_search_config".to_owned(),
+                value.clone(),
+            )]
+            .into_iter()
+            .collect();
+            let result = apply_session_settings(&mut conn, &replayed).await;
+            let effective = conn
+                .query("SELECT pg_catalog.current_setting('default_text_search_config') AS v")
+                .await
+                .unwrap();
+            for reset in ["standard_conforming_strings", "default_text_search_config"] {
+                conn.query(&format!("RESET {reset}")).await.unwrap();
+            }
+            conn.query(&format!("DROP SCHEMA {schema} CASCADE"))
+                .await
+                .unwrap();
+            assert!(result.is_ok(), "{variable}: {result:?}");
+            assert_eq!(
+                effective[0].try_get::<&str>("v").unwrap(),
+                Some(value.as_str()),
+                "{variable}"
+            );
         }
     }
 

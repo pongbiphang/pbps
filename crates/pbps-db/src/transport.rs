@@ -24,6 +24,16 @@ pub trait QueryConnection: query_sealed::Sealed {
     ) -> impl std::future::Future<Output = Result<Vec<Row>, DbError>> + Send + 'a;
 }
 
+/// Engine-owned statements whose results are discarded, such as the DDL a
+/// resolver runs on its scratch database, over either an ordinary or a
+/// stream connection. Like [`QueryConnection`], it classifies no SQL.
+pub trait ExecuteConnection: QueryConnection {
+    fn execute<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl std::future::Future<Output = Result<(), DbError>> + Send + 'a;
+}
+
 /// Endpoints observed from the socket actually handed to the driver. These
 /// are connection facts, not peer authentication or runtime qualification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +147,12 @@ impl QueryConnection for PeerVerifiedConn {
 impl QueryConnection for Conn {
     async fn query<'a>(&'a mut self, sql: &'a str) -> Result<Vec<Row>, DbError> {
         Conn::query(self, sql).await
+    }
+}
+
+impl ExecuteConnection for Conn {
+    async fn execute<'a>(&'a mut self, sql: &'a str) -> Result<(), DbError> {
+        Conn::execute(self, sql).await
     }
 }
 
