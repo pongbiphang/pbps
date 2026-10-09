@@ -5759,12 +5759,22 @@ pub fn cmd_bootstrap(
     crate::dependents::later_relation_refusal(&refused)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
 
-    if let Some(path) = sql_out {
-        let script = crate::render_sql(&cs, dialect.as_ref(), "an empty database")?;
-        std::fs::write(path, script)
-            .with_context(|| format!("cannot write `{}`", path.display()))?;
-        println!("wrote {}", path.display());
-    }
+    // Rendered now, written only once nothing before the lock refuses: with
+    // a target, a script written first overwrote the file with one the same
+    // command then refused (#1684). The checks under the lock still follow
+    // it; they ask whether the target is empty, which the script, a preview
+    // of the build into an empty database, does not depend on.
+    let script = sql_out
+        .map(|_| crate::render_sql(&cs, dialect.as_ref(), "an empty database"))
+        .transpose()?;
+    let write_script = || -> anyhow::Result<()> {
+        if let (Some(path), Some(script)) = (sql_out, &script) {
+            std::fs::write(path, script)
+                .with_context(|| format!("cannot write `{}`", path.display()))?;
+            println!("wrote {}", path.display());
+        }
+        Ok(())
+    };
 
     let Some(target) = target else {
         if sql_out.is_none() {
@@ -5773,7 +5783,7 @@ pub fn cmd_bootstrap(
                 crate::report::placeholder("file")
             );
         }
-        return Ok(());
+        return write_script();
     };
 
     let statements = crate::statements(&cs, dialect.as_ref())?;
@@ -5791,6 +5801,7 @@ pub fn cmd_bootstrap(
         // A history retention or a cascading key the server lacks (#1502).
         crate::engine::refuse_unsupported_temporal(&mut conn, &cs).await?;
         crate::engine::permission_support(&mut conn, &cs).await?;
+        write_script()?;
         crate::engine::lock(&mut conn, &operator).await?;
         let mut transaction_attempted = false;
         let result = async {
