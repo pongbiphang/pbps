@@ -701,29 +701,39 @@ pub(crate) fn weave(
     // through the parent's change yet: it keys parts by the partition's own
     // name (#1692 review, #1699). A part on the partition's other columns is
     // woven as any table's.
+    // A default changed on the parent reaches only the partitions'
+    // defaults, which the engine overwrites; a nullability change reaches
+    // nothing a part reads, so neither counts for a check or an index
+    // (#1692 review).
     let mut parents_changing: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
+    let mut parents_defaulting: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
     for p in &cs.changes {
-        let names: Vec<&str> = if let Change::AddColumn { name, .. } = &p.change {
-            vec![name]
-        } else if let Change::RenameColumn { from, to, .. } = &p.change {
-            vec![from, to]
-        } else if let Change::DropColumn { column, .. }
-        | Change::AlterColumnType { column, .. }
-        | Change::AlterColumnNullability { column, .. }
-        | Change::AlterColumnDefault { column, .. } = &p.change
-        {
-            vec![&column.name]
-        } else {
-            Vec::new()
-        };
+        let (names, defaults): (Vec<&str>, Vec<&str>) =
+            if let Change::AddColumn { name, .. } = &p.change {
+                (vec![name], Vec::new())
+            } else if let Change::RenameColumn { from, to, .. } = &p.change {
+                (vec![from, to], Vec::new())
+            } else if let Change::DropColumn { column, .. }
+            | Change::AlterColumnType { column, .. } = &p.change
+            {
+                (vec![&column.name], Vec::new())
+            } else if let Change::AlterColumnDefault { column, .. } = &p.change {
+                (Vec::new(), vec![&column.name])
+            } else {
+                (Vec::new(), Vec::new())
+            };
         if let Some(t) = p.change.table()
-            && !names.is_empty()
             && declared
                 .tables
                 .get(t)
                 .is_some_and(|t| t.partition_by.is_some())
         {
-            parents_changing.entry(t).or_default().extend(names);
+            if !names.is_empty() {
+                parents_changing.entry(t).or_default().extend(names);
+            }
+            if !defaults.is_empty() {
+                parents_defaulting.entry(t).or_default().extend(defaults);
+            }
         }
     }
     // Whether a partition's part reads one of `names`: a default or a
@@ -774,10 +784,14 @@ pub(crate) fn weave(
                 Holds::TablePart { table, part } => {
                     let t = declared.tables.get(table)?;
                     let of = t.partition_of.as_ref()?;
-                    parents_changing
+                    let defaulted = matches!(part, Part::Default(column)
+                        if parents_defaulting
+                            .get(&of.parent)
+                            .is_some_and(|names| names.contains(column.as_str())));
+                    let changed = parents_changing
                         .get(&of.parent)
-                        .filter(|names| reads_changed(t, part, names))
-                        .map(|_| (table, &of.parent))
+                        .is_some_and(|names| reads_changed(t, part, names));
+                    (defaulted || changed).then_some((table, &of.parent))
                 }
                 Holds::Module(_) | Holds::Unrepresentable(_) => None,
             })
@@ -4850,6 +4864,19 @@ mod tests {
         if let Err(e) = weave(&mut other, &found, &s, &[&ids], pg().as_ref()) {
             assert!(!e.contains("#1699"), "{e}");
         }
+        // Negative: the parent's nullability change on `m` reaches nothing
+        // the partition's default reads (#1692 review).
+        let nullability = Change::AlterColumnNullability {
+            uid: "c_a7b8c9".parse().unwrap(),
+            column: pbps_model::ColumnRef::new(TableName::new("app", "ev"), "m"),
+            ty: "integer".parse().unwrap(),
+            to_nullable: false,
+            collation: None,
+        };
+        let mut tightened = plan(vec![nullability, alter(&s, "app.f(integer)")]);
+        if let Err(e) = weave(&mut tightened, &found, &s, &[&ids], pg().as_ref()) {
+            assert!(!e.contains("#1699"), "{e}");
+        }
         // A partition's own check whose text holds a Unicode-escaped
         // identifier may read the changed column: refused as one naming it.
         let mut escaped = s.clone();
@@ -4874,13 +4901,17 @@ mod tests {
                 },
             }],
         )]);
-        let other_column = Change::AlterColumnDefault {
+        let retype_k = Change::AlterColumnType {
             uid: "c_d4e5f6".parse().unwrap(),
             column: pbps_model::ColumnRef::new(TableName::new("app", "ev"), "k"),
-            from: None,
-            to: Some("0".into()),
+            from: "integer".parse().unwrap(),
+            to: "bigint".parse().unwrap(),
+            from_nullable: true,
+            to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         };
-        let mut cs = plan(vec![other_column, alter(&escaped, "app.f(integer)")]);
+        let mut cs = plan(vec![retype_k, alter(&escaped, "app.f(integer)")]);
         let e = weave(&mut cs, &checked, &escaped, &[&ids], pg().as_ref()).expect_err("refused");
         assert!(e.contains("#1699"), "{e}");
         // Negative: the rebuild alone is answered as before, not this way.

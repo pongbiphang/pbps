@@ -3944,7 +3944,10 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
   name, either of a rename's, found in the check's text or in the index's
   key columns or predicate, quoted or not, in any case. These are what the
   pre-flight probes; a plain index, filtered or not, and a unique one over
-  an expression are not probed, and are admitted. A text holding a Unicode-escaped identifier (`U&"\0076"`), which
+  an expression are not probed, and are admitted. Only a change that moves
+  what the probe reads counts: an addition, a drop, a rename or a retype. A
+  default or nullability change leaves the column and its values as they
+  are. A text holding a Unicode-escaped identifier (`U&"\0076"`), which
   spells a name without its letters, counts as reading every changed name.
   One that reads only the partition's other columns is admitted.
   Its pre-flight probe reads the stored rows
@@ -3960,10 +3963,11 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
   remedy is two plans, the name freed first;
 - in a connected plan, a function dropped or rebuilt that a part of one of
   the parent's partitions depends on, where the part is on a column the plan
-  changes. A default or generated column counts by its column; a check or
-  index the partition declares counts by a changed name, or a
-  Unicode-escaped identifier, found in its text; any other part, a clone of
-  the parent's, counts. The connected passes key
+  changes. A default counts by its column, under any change but a
+  nullability one, since the engine overwrites the partition's default with
+  the parent's. A check or index the partition declares counts by a name an
+  addition, drop, rename or retype changes, or a Unicode-escaped identifier,
+  found in its text. Any other part, a clone of the parent's, counts. The connected passes key
   parts by the partition's name and cannot follow the parent's column change
   into it. The remedy is two plans.
 

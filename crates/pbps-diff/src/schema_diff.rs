@@ -3250,11 +3250,18 @@ fn refuse_partition_changes(
             moving.entry(parent.clone()).or_default().push(name.clone());
         }
     }
-    // Each parent's column names this plan changes, a rename's both names.
+    // Each parent's column names this plan changes in what a probe reads,
+    // a rename's both names. A default or nullability change leaves the
+    // column and its stored values as they are (#1692 review).
     let mut parents_changing_columns: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
     for c in changes {
         if let (Some(name), Some(table)) = (parent_column(c), c.table())
-            && !matches!(c, Change::SetColumnDeprecated { .. })
+            && !matches!(
+                c,
+                Change::SetColumnDeprecated { .. }
+                    | Change::AlterColumnDefault { .. }
+                    | Change::AlterColumnNullability { .. }
+            )
         {
             let names = parents_changing_columns.entry(table).or_default();
             names.insert(name);
@@ -7236,6 +7243,28 @@ mod tests {
         own_unique(&mut filtered, false);
         index_of(&mut filtered, &a).filter = Some("n > 0".into());
         planned(&filtered, &[]);
+        // Negative: a default or nullability change of the parent's column
+        // leaves the column and its values as the probe reads them (#1692
+        // review).
+        let mut loosened = with(
+            &|p| p.columns.get_mut("n").unwrap().nullable = true,
+            &keep_a,
+            &keep_b,
+        );
+        own_check(&mut loosened);
+        assert!(
+            planned(&loosened, &[])
+                .iter()
+                .any(|c| matches!(c, Change::AlterColumnNullability { .. })),
+            "the parent's nullability changes"
+        );
+        let mut defaulted = with(
+            &|p| p.columns.get_mut("n").unwrap().default = Some("5".into()),
+            &keep_a,
+            &keep_b,
+        );
+        own_unique(&mut defaulted, true);
+        planned(&defaulted, &[]);
         let mut expression = with(&retype_n, &keep_a, &keep_b);
         own_unique(&mut expression, true);
         index_of(&mut expression, &a).columns[0].key =
