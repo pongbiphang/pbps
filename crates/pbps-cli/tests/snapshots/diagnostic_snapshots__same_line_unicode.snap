@@ -1,0 +1,19 @@
+---
+source: crates/pbps-cli/tests/diagnostic_snapshots.rs
+expression: human.snapshot()
+---
+exit: 2
+--- stdout ---
+No identity file yet at `./schema.ids.json`; run `pbps plan` to create it.
+--- stderr ---
+pbps::load::semantic
+
+  × invalid type: unclosed parenthesis in type `decimal(18, 2`
+   ╭─[./schema/dbo.café.yml:2:25]
+ 1 │ table: dbo.t
+ 2 │ columns: {café: {type: "decimal(18, 2"}}
+   ·                        ───────┬───────
+   ·                               ╰── unclosed parenthesis in type `decimal(18, 2`
+   ╰────
+
+--- end ---

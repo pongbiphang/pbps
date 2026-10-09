@@ -1,0 +1,23 @@
+---
+source: crates/pbps-cli/tests/diagnostic_snapshots.rs
+expression: human.snapshot()
+---
+exit: 2
+--- stdout ---
+No identity file yet at `./schema.ids.json`; run `pbps plan` to create it.
+--- stderr ---
+pbps::load::yaml
+
+  × there is a problem with the YAML in `./schema/dbo.t.yml`
+  │ 
+  │ error: line 4 column 11: unclosed bracket '['
+  │  --> <input>:4:11
+  │   |
+  │ 2 | columns:
+  │ 3 |   id:
+  │ 4 |     type: [
+  │   |           ^ unclosed bracket '['
+  │ 5 |       int
+  │   |
+
+--- end ---

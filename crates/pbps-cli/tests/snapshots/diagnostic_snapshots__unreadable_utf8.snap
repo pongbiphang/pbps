@@ -1,0 +1,14 @@
+---
+source: crates/pbps-cli/tests/diagnostic_snapshots.rs
+expression: human.snapshot()
+---
+exit: 2
+--- stdout ---
+No identity file yet at `./schema.ids.json`; run `pbps plan` to create it.
+--- stderr ---
+pbps::load::io
+
+  × cannot read `./schema/dbo.t.yml`
+  ╰─▶ stream did not contain valid UTF-8
+
+--- end ---

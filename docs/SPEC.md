@@ -2497,7 +2497,27 @@ four invariants must be machine-verified:
 3. **Migration convergence**: a database in state A -> apply `plan(A→B)` ->
    `introspect` -> equals state B. **The most important one**, run against a real
    SQL Server in Docker.
-4. **Diagnostic snapshots**: every error message pinned with `insta`.
+4. **Diagnostic snapshots**: the ordinary CLI integration target
+   `diagnostic_snapshots` pins complete stdout, stderr and exit status with
+   `insta`. Its initial corpus covers semantic type errors with Unicode before
+   the label (including on the same line), malformed foreign-key help, multiline
+   YAML syntax, duplicate and unknown fields, unreadable UTF-8 declarations,
+   copyable formatting remedies, and multiple ordered diagnostics. JSON field
+   and exit-code assertions remain independent of the human snapshots. New
+   diagnostic families and rendering regressions extend this corpus with a
+   failing fixture and a repaired or valid control; this finite corpus does not
+   claim snapshots for every database, policy or saved-plan failure.
+
+   The tests execute the shipped CLI with piped output and null stdin, giving
+   miette its 80-column non-terminal fallback, Unicode drawing, no colour and
+   no hyperlinks. Only transport CRLF and exact fixture path separators are
+   normalized; carets, whitespace, remedies and repeated excerpts are retained.
+   Linux and Windows ordinary CI run with `INSTA_UPDATE=no` and
+   `INSTA_FORCE_PASS=0`: changed or missing references fail. To propose an
+   intentional change, run `INSTA_UPDATE=new cargo test -p pbps-cli --test
+   diagnostic_snapshots`, inspect each `.snap.new` diff individually against
+   the source fixture and semantic assertions, and replace only reviewed
+   references. Never accept an entire snapshot directory without inspection.
 
 Phase 3 adds four more that only a live engine can settle, since each is a
 promise about the engine's behaviour rather than about the tool's own logic:

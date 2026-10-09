@@ -1,0 +1,9 @@
+---
+source: crates/pbps-cli/tests/diagnostic_snapshots.rs
+expression: human.snapshot()
+---
+exit: 1
+--- stdout ---
+--- stderr ---
+error: cannot read `./schema/dbo.t.yml`: stream did not contain valid UTF-8
+--- end ---

@@ -149,6 +149,9 @@ jobs:
           script --version
           timeout --version
       - run: cargo test --workspace --all-targets
+        env:
+          INSTA_UPDATE: "no"
+          INSTA_FORCE_PASS: "0"
       - run: python3 scripts/ignored_test_inventory_test.py
       - run: python3 scripts/ignored_test_inventory.py
       # An owned Linux kernel measurement also needs an execution owner.
@@ -177,6 +180,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets
+        env:
+          INSTA_UPDATE: "no"
+          INSTA_FORCE_PASS: "0"
       - run: python3 scripts/ignored_test_inventory_test.py
       - run: python3 scripts/ignored_test_inventory.py
 

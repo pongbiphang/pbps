@@ -1,0 +1,11 @@
+---
+source: crates/pbps-cli/tests/diagnostic_snapshots.rs
+expression: human.snapshot()
+---
+exit: 2
+--- stdout ---
+--- stderr ---
+  ./schema/dbo.t.yml: error: not in canonical form
+    pbps fmt
+1 file(s) are not in canonical form; run `pbps fmt`
+--- end ---

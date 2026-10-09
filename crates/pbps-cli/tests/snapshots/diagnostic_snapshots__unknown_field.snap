@@ -1,0 +1,25 @@
+---
+source: crates/pbps-cli/tests/diagnostic_snapshots.rs
+expression: human.snapshot()
+---
+exit: 2
+--- stdout ---
+No identity file yet at `./schema.ids.json`; run `pbps plan` to create it.
+--- stderr ---
+pbps::load::yaml
+
+  × there is a problem with the YAML in `./schema/dbo.t.yml`
+  │ 
+  │ error: line 5 column 5: unknown field `nulable`, expected one of type,
+  │ nullable, default, identity, generated, collation, description,
+  │ deprecated, renamed_from
+  │  --> <input>:5:5
+  │   |
+  │ 3 |   id:
+  │ 4 |     type: int
+  │ 5 |     nulable: false
+  │   |     ^ unknown field `nulable`, expected one of type, nullable,
+  │ default, identity, generated, collation, description, deprecated,
+  │ renamed_from
+
+--- end ---
