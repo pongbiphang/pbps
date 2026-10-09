@@ -2821,7 +2821,8 @@ pub async fn account_for_module_dependents(
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     let split = crate::dependents::split_new_tables(changes, ids, dialect)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
-    let released = crate::dependents::released(changes, &found);
+    let partitions = crate::dependents::standing_partitions(declared, changes);
+    let released = crate::dependents::released(changes, &found, &partitions);
     let moved = crate::dependents::after_the_rebuilds(changes, &released, deps, declared)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     // Last of the reorderings: a partition's own default after its parent's,
@@ -2840,7 +2841,7 @@ pub async fn account_for_module_dependents(
     crate::dependents::later_relation_refusal(&later)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     crate::dependents::settle_public_execution(changes, decisions);
-    let left = crate::dependents::unaccounted(changes, &found);
+    let left = crate::dependents::unaccounted(changes, &found, &partitions);
     if !left.is_empty() {
         anyhow::bail!(
             "module_dependents (PostgreSQL): the plan still drops a module before what depends \
@@ -2882,9 +2883,17 @@ pub(crate) async fn resolves_now(
 /// module's drop, everything that depends on that module now. A dependent
 /// created after planning is one the approver never saw; the plan is refused
 /// rather than extended, and planning again shows it.
-pub async fn check_module_dependents(conn: &mut Conn, changes: &ChangeSet) -> anyhow::Result<()> {
+///
+/// `stored` is the database as the plan's baseline found it, which says
+/// which table is whose partition (DEC-1699.1).
+pub async fn check_module_dependents(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    stored: &pbps_model::Schema,
+) -> anyhow::Result<()> {
     let found = module_dependents(conn, changes).await?;
-    let left = crate::dependents::unaccounted(changes, &found);
+    let partitions = crate::dependents::standing_partitions(stored, changes);
+    let left = crate::dependents::unaccounted(changes, &found, &partitions);
     if !left.is_empty() {
         anyhow::bail!(
             "module_dependents (PostgreSQL): the database now holds dependents this plan does not \

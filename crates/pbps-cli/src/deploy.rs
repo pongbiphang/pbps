@@ -3726,11 +3726,19 @@ fn refuse_unplanned_movement(
         if changing_hands.contains_key(table) {
             continue;
         }
-        if holds_column(before, table, from, to) || holds_column(after, table, from, to) {
-            continue;
+        // Each read is undone only where it holds the rename's result alone.
+        // One that holds both names has not run the rename — or holds a
+        // dropped column under the name the rename takes — and undoing it
+        // would move that column's constraints onto the renamed one. Both
+        // reads were left alone when either held both, so a column renamed
+        // into a dropped column's name kept its index under two spellings,
+        // and a valid plan was refused at apply (#1699).
+        let column = pbps_model::ColumnRef::new((*table).clone(), *to);
+        if !holds_column(before, table, from, to) {
+            undo_before.rename_column(column.clone(), *from);
         }
-        for undo in [&mut undo_before, &mut undo_after] {
-            undo.rename_column(pbps_model::ColumnRef::new((*table).clone(), *to), *from);
+        if !holds_column(after, table, from, to) {
+            undo_after.rename_column(column, *from);
         }
     }
     // The earlier read has run nothing, so only the later one is undone.
@@ -7750,13 +7758,13 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     )
     .await?;
 
-    preflight(conn, dialect, plan, rename_targets).await?;
+    preflight(conn, dialect, plan, rename_targets, &scoped.schema).await?;
 
     println!("Applying {} statement(s)...", statements.len());
     let result = async {
         conn.begin(dialect.transaction_framing()).await?;
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
-        crate::engine::check_module_dependents(conn, &plan.changes).await?;
+        crate::engine::check_module_dependents(conn, &plan.changes, &scoped.schema).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, false).await?;
         crate::engine::check_drop_blockers(conn, &plan.changes).await?;
         let data_guard =
@@ -8185,7 +8193,7 @@ async fn apply_staged_under_lock(
         // them before the first statement, and after a partial run some of
         // those names have already moved — a probe answered about the wrong
         // object is worse than one that was not asked.
-        preflight(conn, dialect, plan, rename_targets).await?;
+        preflight(conn, dialect, plan, rename_targets, &scoped.schema).await?;
         (0, watching)
     };
 
@@ -8875,6 +8883,7 @@ async fn preflight(
     dialect: &dyn pbps_dialect::Dialect,
     plan: &pbps_model::SavedPlan,
     rename_targets: &[pbps_db::impact::RenameTarget],
+    stored: &pbps_model::Schema,
 ) -> anyhow::Result<()> {
     // **The pins before the questions.** Every read below — the edition, the
     // role checks, the rename impact scans and the probes — used to run under
@@ -8962,7 +8971,13 @@ async fn preflight(
         );
     }
 
-    run_probes(conn, dialect, &plan.changes).await
+    run_probes(
+        conn,
+        dialect,
+        &plan.changes,
+        &pbps_model::Partitions::of(stored),
+    )
+    .await
 }
 
 /// The body of one rename's impact report: what breaks, what blocks, and what
@@ -9011,16 +9026,19 @@ fn impact_lines(report: &pbps_db::impact::ImpactReport, notes: &[String]) -> Vec
 /// — which used to be established only *after* this ran (DECISIONS 415). A
 /// second `SET` batch costs nothing; a probe answered under the wrong settings
 /// refuses a plan this engine takes.
+/// `partitions` is the relation as the database stands before the plan: the
+/// read whose checksum matched the plan's baseline (DEC-1699.1).
 async fn run_probes(
     conn: &mut Conn,
     dialect: &dyn pbps_dialect::Dialect,
     changes: &pbps_model::ChangeSet,
+    partitions: &pbps_model::Partitions,
 ) -> anyhow::Result<()> {
     pin_session(conn, dialect).await?;
     let mut failures = Vec::new();
     let mut passed = 0usize;
     let mut unchecked = 0usize;
-    let report = dialect.preflight(changes);
+    let report = dialect.preflight_with(changes, partitions);
     for skipped in &report.unchecked {
         unchecked += 1;
         eprintln!(
@@ -11509,7 +11527,13 @@ mod tests {
             let before = read(conn.query(&sequence).await.expect("the sequence"));
 
             let changes = check_on(&schema, &format!("nextval('{schema}.s') > 0"));
-            let probed = run_probes(&mut conn, &pbps_pg::Postgres::new(), &changes).await;
+            let probed = run_probes(
+                &mut conn,
+                &pbps_pg::Postgres::new(),
+                &changes,
+                &pbps_model::Partitions::default(),
+            )
+            .await;
             let after = read(conn.query(&sequence).await.expect("the sequence"));
             // Outside any transaction, and not a read-only one: the apply's
             // own `BEGIN` must open a real transaction after this.
@@ -11561,7 +11585,13 @@ mod tests {
             .expect("the fixture");
 
             let changes = check_on(&schema, "v > 1");
-            let probed = run_probes(&mut conn, &pbps_pg::Postgres::new(), &changes).await;
+            let probed = run_probes(
+                &mut conn,
+                &pbps_pg::Postgres::new(),
+                &changes,
+                &pbps_model::Partitions::default(),
+            )
+            .await;
 
             let cleanup = conn
                 .execute(&format!("DROP SCHEMA {schema} CASCADE;"))
@@ -11635,7 +11665,13 @@ mod tests {
         };
 
         let dialect = pbps_pg::Postgres::new();
-        let probed = run_probes(&mut conn, &dialect, &changes).await;
+        let probed = run_probes(
+            &mut conn,
+            &dialect,
+            &changes,
+            &pbps_model::Partitions::default(),
+        )
+        .await;
 
         // And what the engine does with the statement the probe just judged,
         // under the pins, which is where it will run. Established here rather
@@ -13148,6 +13184,62 @@ mod tests {
             Settled::Whole,
         )
         .expect("the dropped occupant and the renamed survivor are two columns");
+
+        // An index on the renamed column, which the engine carries to the
+        // name it takes: the later read is undone where it holds the rename
+        // alone, though the earlier one holds both names (#1699). It was
+        // compared under two spellings, and the plan refused at apply.
+        let indexed = |s: Schema, column: &str| {
+            let mut s = s;
+            s.tables.get_mut(&named).unwrap().indexes.insert(
+                "s_ix".to_owned(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn::column(column)],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: pbps_model::IndexMethod::default(),
+                    storage_parameters: BTreeMap::new(),
+                },
+            );
+            s
+        };
+        let baseline = || {
+            indexed(
+                table(&[
+                    ("code", "varchar(20)"),
+                    ("label", "nvarchar(50)"),
+                    ("note", "int"),
+                ]),
+                "label",
+            )
+        };
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &changes,
+            &baseline(),
+            &indexed(
+                table(&[("code", "varchar(20)"), ("note", "nvarchar(50)")]),
+                "note",
+            ),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the index went with the renamed column");
+        // Negative: the index moved to another column is still movement.
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &changes,
+            &baseline(),
+            &indexed(
+                table(&[("code", "varchar(20)"), ("note", "nvarchar(50)")]),
+                "code",
+            ),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("an index another session moved");
+        assert!(format!("{e:#}").contains("s_ix"), "{e:#}");
 
         // And the negative case: a column nothing in the plan touches, whose
         // type moved under it, is still movement.

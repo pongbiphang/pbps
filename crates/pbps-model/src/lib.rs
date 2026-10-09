@@ -32,6 +32,7 @@ pub mod ids;
 pub mod intent;
 pub mod module;
 pub mod name;
+pub mod partitions;
 pub mod plan;
 pub mod rename;
 pub mod resolver;
@@ -62,6 +63,7 @@ pub use module::{
     RoutineArg, RoutineArgError, RoutineId,
 };
 pub use name::{ColumnRef, NameError, TableName, check_segment};
+pub use partitions::Partitions;
 pub use plan::{
     PlanBaseline, PlanMode, PlanOrigin, RoutinePins, SavedPlan, SchemaPin, plan_checksum,
     state_checksum,
