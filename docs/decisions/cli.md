@@ -681,6 +681,10 @@ Two checks hold the part a reviewer cannot see.
 the same binary as the CLI they read (ADR-0015 decision 6), and each addition
 updates them in the same change.
 
+*Amended by [DEC-1734.1](#dec-1734-1): until the first tagged release the
+wire version stays 1, and a change this rule would count as moving it is
+recorded by the schema-set version and DEC-1038.1's archives instead.*
+
 <a id="dec-1038-1"></a>
 
 **DEC-1038.1. DEC-997.1's wire-version rule is checked by validating the
@@ -753,3 +757,42 @@ one `plan.failed` and one `plan.partition-default-unasked` in the JSON
 envelope with no `warning:` on stderr, and the warning line beside the
 refusal in human output. The carrier's text and its empty case are pinned by
 `output`'s unit tests.
+
+<a id="dec-1734-1"></a>
+
+**DEC-1734.1. Until the first tagged release, the envelope's wire version
+stays 1; DEC-997.1's rule applies from that release on (#1734).** DEC-997.1
+moves `output::SCHEMA_VERSION` whenever an emitted envelope could fail the
+envelope schema published before it, and it has no pre-release clause. Its
+practice already departs from it: DECISIONS 435's `denied` variant moved
+nothing, which DEC-997.1 records, and #1725 adds `standard:` to the closed
+`ResolverProfile` server variant under version 1. With no clause to cite,
+each addition to a closed envelope object is flagged again in review, and
+the answer has nothing to point to.
+
+Before the first release, a move buys nothing and costs something:
+- No consumer reads wire version 1 yet. The tool has no release tag, and
+  the workspace is `0.0.0`.
+- A move now would be undone at the first release, which starts the
+  published numbering at 1. DECISIONS 145 does the same for the artifact
+  format versions, for the same reason: a pre-release bump records a history
+  nobody has.
+- A move touches `pbps-ui`'s contract and its `app.js`,
+  `scripts/findings-to-github.py`, and the snapshots.
+- DEC-1038.1 validates the emitted envelopes only against the archived
+  schema sets that share the current wire version. Right after a move, there
+  are none, so the check holds nothing until new sets are archived.
+
+So until the first tagged release:
+- The wire version stays 1.
+- A change that DEC-997.1 would count as moving it is recorded instead by
+  the schema-set version, which moves for every content change
+  (DECISIONS 465), and by the archived sets DEC-1038.1 validates against.
+- From the first tagged release on, DEC-997.1 applies as written. It moves
+  the version exactly when an envelope the new build emits could fail the
+  envelope schema published before it. The compatibility and upgrade
+  contract that release publishes is #1159's to define.
+
+Moving the version now, as DEC-997.1 reads, was the alternative. It pays
+every cost above for a consumer that does not exist, and the release then
+resets it anyway.
