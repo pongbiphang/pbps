@@ -192,7 +192,13 @@ fn normalize_identity(
         .iter()
         .map(|id| normalize_identity(id, roles))
         .collect::<Result<_, _>>()?;
+    // The explicit slot for every role, which a database-wide setting holds
+    // (`setrole = 0`, see `logical::related`), names no role to map. Kept as
+    // it is: refusing it refused every scratch database with a setting of
+    // its own, which a declared scratch standard is (#1708).
+    let every_role = object.name.is_empty() && object.signature.is_empty();
     if object.class == "pg_authid"
+        && !every_role
         && let Some(roles) = roles
     {
         let [name] = object.name.as_slice() else {

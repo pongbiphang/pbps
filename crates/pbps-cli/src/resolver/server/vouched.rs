@@ -30,6 +30,7 @@ use pbps_db::resolver::environment::{CatalogFacts, Verdict};
 use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::ResolverRuntime;
+use pbps_pg::resolver::standard::{self, Standard};
 use pbps_pg::resolver::vouched::{self as sql, Placement};
 use std::collections::BTreeSet;
 
@@ -50,6 +51,7 @@ pub async fn produce(
     write_path_extras: &[String],
     project: &pbps_config::Project,
     environment: Option<&str>,
+    standard: &Standard,
 ) -> Result<ResolvedPlan, ProduceError> {
     if driver != Driver::Postgres {
         return Err(ProduceError::Run(Error::Binding(
@@ -109,6 +111,7 @@ pub async fn produce(
         request: &request,
         tokens: &tokens,
         backend: &backend,
+        standard,
         created: Created::Nothing,
     };
     let result = run
@@ -277,13 +280,13 @@ enum Created {
         names: ScratchNames,
         roles: Vec<String>,
     },
-    /// Objects the scratch account owns in the supplied database, and its
-    /// own stored defaults as they were before the run's first write.
+    /// Objects the scratch account owns in the supplied database, its own
+    /// stored defaults, and the database's ACL as they were once the
+    /// database was put into its standard state.
     Supplied {
         database: String,
         defaults: std::collections::BTreeSet<(String, String)>,
-        /// The usage of `public` the run took, to grant back.
-        given_up: Vec<sql::GivenUp>,
+        acl: BTreeSet<standard::Entry>,
     },
 }
 
@@ -295,6 +298,8 @@ struct Run<'a> {
     tokens: &'a Tokens,
     /// The scratch backend the separation was read on.
     backend: &'a sql::Backend,
+    /// The state the scratch database is put into (#1708).
+    standard: &'a Standard,
     created: Created,
 }
 
@@ -554,6 +559,21 @@ impl Run<'_> {
             .await
             .map_err(db("the run-owned scratch session's role"))?;
         refuse_foreign_objects(&mut owner).await?;
+        // The run-owned database compiles under the same declared state as a
+        // supplied one: settings, comments, limit and grants (#1708). The
+        // limit waits for the run login's session: this superuser session
+        // counts toward a database's limit though it is not held to it, so a
+        // declared limit of 1 would refuse that session (measured on 16 and
+        // 18). It then goes on alone, since the reproduction builds on this
+        // state in between.
+        put_into_standard(
+            &mut owner,
+            &Standard {
+                connection_limit: -1,
+                ..self.standard.clone()
+            },
+        )
+        .await?;
         scope::prepare(
             &mut owner,
             &map,
@@ -574,6 +594,9 @@ impl Run<'_> {
         )
         .await
         .map_err(db("the run login's scratch session"))?;
+        standard::put_connection_limit(&mut owner, names.database(), self.standard)
+            .await
+            .map_err(db("the scratch database's connection limit"))?;
         let deployer = map
             .deployer(authorization)
             .map_err(|reason| Error::Scope(reason.into()))?;
@@ -628,8 +651,27 @@ impl Run<'_> {
             .map_err(db("the scratch checks"))?;
         let checked = self.supplied_checks(admin).await;
         let ended = admin.execute("ROLLBACK").await;
-        let (principal, database, defaults) = checked?;
+        let (principal, database) = checked?;
         ended.map_err(db("the scratch checks"))?;
+        // Repairs what an interrupted run left, or refuses naming it, before
+        // anything is compiled; the snapshots below are then of the
+        // standard database (#1708).
+        put_into_standard(admin, self.standard).await?;
+        admin
+            .execute("BEGIN")
+            .await
+            .map_err(db("the scratch checks"))?;
+        let reached = self.reach_checks(admin, &principal.login).await;
+        let ended = admin.execute("ROLLBACK").await;
+        reached?;
+        ended.map_err(db("the scratch checks"))?;
+        let defaults = sql::login_defaults(admin)
+            .await
+            .map_err(db("the scratch account's own defaults"))?;
+        let acl = standard::read_state(admin)
+            .await
+            .map_err(db("the scratch database's privileges"))?
+            .acl;
         let scope::Authorization::Postgres(context) = authorization else {
             return Err(Error::Scope(
                 "the operator-vouched resolver is implemented for PostgreSQL only".into(),
@@ -645,7 +687,7 @@ impl Run<'_> {
         self.created = Created::Supplied {
             database,
             defaults,
-            given_up: Vec::new(),
+            acl,
         };
         sql::create_schemas(admin, scope_schemas)
             .await
@@ -655,16 +697,13 @@ impl Run<'_> {
             .into_iter()
             .filter(|schema| scope_schemas.contains(schema))
             .collect::<Vec<_>>();
-        let (given_up, usable) = sql::revoke_usage(admin, &unusable)
+        let usable = sql::revoke_usage(admin, &unusable)
             .await
             .map_err(db("the schemas the deployer cannot use"))?;
-        if let Created::Supplied { given_up: kept, .. } = &mut self.created {
-            *kept = given_up;
-        }
         // Kept on the login's path while it leaves the deployer's, such a
         // schema would make every comparison a mismatch; name what keeps it
         // instead (#1678 review). What was given up is granted back at
-        // cleanup all the same.
+        // release, which puts public back into its standard state.
         if !usable.is_empty() {
             return Err(Error::Vouched(format!(
                 "the scratch account keeps USAGE on what the plan takes from the deployer ({}); \
@@ -696,14 +735,7 @@ impl Run<'_> {
     async fn supplied_checks(
         &self,
         admin: &mut Conn,
-    ) -> Result<
-        (
-            pbps_db::resolver::environment::DeploymentPrincipal,
-            String,
-            std::collections::BTreeSet<(String, String)>,
-        ),
-        Error,
-    > {
+    ) -> Result<(pbps_db::resolver::environment::DeploymentPrincipal, String), Error> {
         let db = |what: &'static str| {
             move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
         };
@@ -722,23 +754,30 @@ impl Run<'_> {
             )));
         }
         refuse_foreign_objects(admin).await?;
-        let reach = sql::cleanup_reach(admin)
-            .await
-            .map_err(db("what the scratch account's cleanup would reach"))?;
-        if !reach.is_empty() {
-            return Err(Error::Vouched(format!(
-                "the scratch account {} has objects or privileges that emptying its database \
-                 with DROP OWNED would also drop or revoke ({}); use an account with none \
-                 outside that database",
-                principal.login,
-                reach.join(", ")
-            )));
-        }
         let database = current_database(admin).await?;
-        let defaults = sql::login_defaults(admin)
-            .await
-            .map_err(db("the scratch account's own defaults"))?;
-        Ok((principal, database, defaults))
+        Ok((principal, database))
+    }
+
+    /// What `DROP OWNED` would reach beyond the run's own objects, read once
+    /// the database is standard: before, a `public` an interrupted run left
+    /// owned by the login would be counted, which the standard hands back
+    /// to `pg_database_owner` (#1708).
+    async fn reach_checks(&self, admin: &mut Conn, login: &str) -> Result<(), Error> {
+        pinned(admin, self.backend).await?;
+        let reach = sql::cleanup_reach(admin).await.map_err(|error| {
+            Error::Read(format!(
+                "what the scratch account's cleanup would reach: {error}"
+            ))
+        })?;
+        if reach.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Vouched(format!(
+            "the scratch account {login} has objects or privileges that emptying its database \
+             with DROP OWNED would also drop or revoke ({}); use an account with none outside \
+             that database",
+            reach.join(", ")
+        )))
     }
 
     /// Drops what the run created. `Err` names exactly what may remain.
@@ -769,62 +808,184 @@ impl Run<'_> {
             Created::Supplied {
                 database,
                 defaults,
-                given_up,
+                acl,
             } => {
-                // The checked connection, never a new one, and only on the
-                // checked backend: see `supplied`.
-                let mut remaining = match sql::drop_owned(admin, self.backend).await {
-                    Ok((_, 0)) => Ok(()),
-                    // Owned by another role a definition switched to, which
-                    // `DROP OWNED BY SESSION_USER` does not reach; never an
-                    // empty database (see `sql::drop_owned`).
-                    Ok((named, total)) => Err(vec![format!(
-                        "{total} object(s) in database {database} owned by a role other than \
-                         the scratch account ({})",
-                        named.join(", ")
-                    )]),
-                    Err(error) => Err(vec![format!(
-                        "every object the scratch account owns in database {database} ({error})"
-                    )]),
-                }
-                .err()
-                .unwrap_or_default();
-                match sql::restore_usage(admin, &given_up).await {
-                    Ok(differing) => remaining.extend(differing),
-                    Err(error) => remaining.extend(given_up.iter().map(|given| {
-                        format!(
-                            "usage of schema {} by {}, not granted back ({error})",
-                            given.schema,
-                            given
-                                .grantees
-                                .iter()
-                                .map(|(name, _)| name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    })),
-                }
-                // A definition may have changed the login's own defaults,
-                // which outlive the database's contents (see
-                // `sql::login_defaults`). Named, never left unread.
-                match sql::login_defaults(admin).await {
-                    Ok(after) => remaining.extend(
-                        sql::changed_defaults(&defaults, &after)
-                            .into_iter()
-                            .map(|change| format!("the scratch account's own default {change}")),
-                    ),
-                    Err(error) => remaining.push(format!(
-                        "the scratch account's own defaults, unreadable after the run ({error})"
-                    )),
-                }
-                if remaining.is_empty() {
-                    Ok(())
-                } else {
-                    Err(remaining)
-                }
+                release_supplied(
+                    admin,
+                    self.backend,
+                    self.standard,
+                    &database,
+                    &defaults,
+                    &acl,
+                )
+                .await
             }
         }
     }
+}
+
+/// Empties the supplied database and puts it back into its standard state,
+/// on the checked connection, never a new one, and only on the checked
+/// backend: see `Run::supplied`. `Err` names exactly what may remain.
+async fn release_supplied(
+    admin: &mut Conn,
+    backend: &sql::Backend,
+    declared: &Standard,
+    database: &str,
+    defaults: &BTreeSet<(String, String)>,
+    acl: &BTreeSet<standard::Entry>,
+) -> Result<(), Vec<String>> {
+    let mut remaining = match sql::drop_owned(admin, backend).await {
+        Ok((_, 0)) => Ok(()),
+        // Owned by another role a definition switched to, which
+        // `DROP OWNED BY SESSION_USER` does not reach; never an
+        // empty database (see `sql::drop_owned`).
+        Ok((named, total)) => Err(vec![format!(
+            "{total} object(s) in database {database} owned by a role other than \
+             the scratch account ({})",
+            named.join(", ")
+        )]),
+        Err(error) => Err(vec![format!(
+            "every object the scratch account owns in database {database} ({error})"
+        )]),
+    }
+    .err()
+    .unwrap_or_default();
+    // Back into the standard state, and the ACL back to what the run
+    // found, then read again whole: what differs is named, never reported
+    // as a clean release (#1708).
+    let put_back = standard::enforce(admin, declared, Some(acl)).await;
+    match standard::verify(admin, declared, Some(acl)).await {
+        Ok(left) if left.is_empty() => {}
+        Ok(left) => {
+            remaining.extend(left.into_iter().map(|difference| {
+                format!("database {database} not back in its standard state: {difference}")
+            }));
+            match put_back {
+                Ok(failed) => {
+                    remaining.extend(failed.into_iter().map(|why| format!("refused: {why}")));
+                }
+                Err(error) => remaining.push(format!("refused: {error}")),
+            }
+        }
+        Err(error) => remaining.push(format!(
+            "database {database}'s standard state, unreadable after the run ({error})"
+        )),
+    }
+    // A definition may have changed the login's own defaults, which outlive
+    // the database's contents (see `sql::login_defaults`). Named, never left
+    // unread.
+    match sql::login_defaults(admin).await {
+        Ok(after) => remaining.extend(
+            sql::changed_defaults(defaults, &after)
+                .into_iter()
+                .map(|change| format!("the scratch account's own default {change}")),
+        ),
+        Err(error) => remaining.push(format!(
+            "the scratch account's own defaults, unreadable after the run ({error})"
+        )),
+    }
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(remaining)
+    }
+}
+
+/// Puts the scratch database into `standard`, or refuses naming what the
+/// scratch account cannot apply or cannot put back, before anything is
+/// compiled. Whatever would stop it refuses before the first write: the
+/// whole declared state is first tried in a transaction that is rolled
+/// back, so the engine, not a model of it, judges each declared value.
+async fn put_into_standard(conn: &mut Conn, declared: &Standard) -> Result<(), Error> {
+    let db =
+        |what: &'static str| move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"));
+    let unappliable = standard::unappliable(conn, declared)
+        .await
+        .map_err(db("the scratch database's declared standard"))?;
+    if !unappliable.is_empty() {
+        return Err(Error::Vouched(format!(
+            "the scratch account cannot apply the resolver's declared standard: {}",
+            unappliable.join("; ")
+        )));
+    }
+    // Already standard, as a release leaves it: no statement, no trial.
+    if standard::verify(conn, declared, None)
+        .await
+        .map_err(db("the scratch database's standard state"))?
+        .is_empty()
+    {
+        return Ok(());
+    }
+    let refused = standard::trial(conn, declared)
+        .await
+        .map_err(db("the scratch database's standard state"))?;
+    if !refused.is_empty() {
+        return Err(Error::Vouched(format!(
+            "the scratch database cannot be put into its declared standard state, so nothing \
+             was written ({}); its operator must repair the database or the declaration",
+            refused.join("; ")
+        )));
+    }
+    let failed = standard::enforce(conn, declared, None)
+        .await
+        .map_err(db("the scratch database's standard state"))?;
+    let left = standard::verify(conn, declared, None)
+        .await
+        .map_err(db("the scratch database's standard state"))?;
+    if left.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Vouched(format!(
+        "the scratch database is not in its standard state and the scratch account cannot \
+         put it there ({}){}; its operator must repair it",
+        left.join("; "),
+        if failed.is_empty() {
+            String::new()
+        } else {
+            format!(", because {}", failed.join("; "))
+        }
+    )))
+}
+
+/// The resolver entry's declared standard over the built-in one: what
+/// `CREATE DATABASE ... TEMPLATE template0` makes (#1708).
+pub fn declared_standard(declared: Option<&pbps_config::resolver::ScratchStandard>) -> Standard {
+    let mut standard = Standard::default();
+    let Some(declared) = declared else {
+        return standard;
+    };
+    standard.settings = declared
+        .settings
+        .iter()
+        .map(|(name, value)| (name.to_lowercase(), value.0.clone()))
+        .collect();
+    // The engine removes a comment given as the empty string, so a declared
+    // `""` is read back as no comment and declares exactly that (measured on
+    // 16 and 18, for the database and for `public`).
+    let comment = |comment: &String| Some(comment.clone()).filter(|c| !c.is_empty());
+    if let Some(declared) = &declared.comment {
+        standard.comment = comment(declared);
+    }
+    if let Some(limit) = declared.connection_limit {
+        standard.connection_limit = limit;
+    }
+    if let Some(public) = &declared.public {
+        if let Some(declared) = &public.comment {
+            standard.public_comment = comment(declared);
+        }
+        standard.public_grants = public
+            .grants
+            .iter()
+            .flat_map(|grant| {
+                grant
+                    .privileges
+                    .iter()
+                    .map(|privilege| (grant.to.clone(), privilege.as_str().to_owned()))
+            })
+            .collect();
+    }
+    standard
 }
 
 /// Refuses a scratch database holding anything initdb did not create: a
@@ -889,3 +1050,70 @@ fn reported_build(
 
 #[cfg(test)]
 mod live_tests;
+
+#[cfg(test)]
+mod declared_standard_tests {
+    use super::declared_standard;
+
+    /// The engine stores `TimeZone` under its own spelling whatever the
+    /// declaration wrote, and the scratch's state is read keyed by
+    /// lowercase name: a declared name is keyed the same way, or a declared
+    /// `TimeZone` never reads back as declared.
+    #[test]
+    fn a_declared_setting_name_is_keyed_as_the_scratch_state_is_read() {
+        let config = pbps_config::Config::parse(
+            "dialect: postgres\nresolvers:\n  s:\n    kind: server\n    url_env: S\n    \
+             standard: {settings: {TimeZone: UTC, work_mem: 64}}\n",
+            std::path::Path::new("pbps.yml"),
+        )
+        .unwrap();
+        let pbps_config::resolver::ResolverProfile::Server {
+            standard: Some(declared),
+            ..
+        } = &config.resolvers["s"]
+        else {
+            panic!("a server profile with a standard");
+        };
+        let standard = declared_standard(Some(declared));
+        assert_eq!(
+            standard.settings.keys().collect::<Vec<_>>(),
+            ["timezone", "work_mem"]
+        );
+        // Negative: nothing declared is the built-in standard, with no
+        // settings of its own.
+        assert!(declared_standard(None).settings.is_empty());
+    }
+
+    fn declared(standard: &str) -> pbps_pg::resolver::standard::Standard {
+        let config = pbps_config::Config::parse(
+            &format!(
+                "dialect: postgres\nresolvers:\n  s:\n    kind: server\n    url_env: S\n    \
+                 standard: {standard}\n"
+            ),
+            std::path::Path::new("pbps.yml"),
+        )
+        .unwrap();
+        let pbps_config::resolver::ResolverProfile::Server {
+            standard: Some(declared),
+            ..
+        } = &config.resolvers["s"]
+        else {
+            panic!("a server profile with a standard");
+        };
+        declared_standard(Some(declared))
+    }
+
+    /// `COMMENT ... IS ''` removes the comment, so the state read back has
+    /// none: a declared empty comment is declared as none, or every run is
+    /// refused for a comment the engine will never store (#1708 review).
+    #[test]
+    fn a_declared_empty_comment_is_declared_as_none() {
+        let standard = declared(r#"{comment: "", public: {comment: ""}}"#);
+        assert_eq!(standard.comment, None);
+        assert_eq!(standard.public_comment, None);
+        // Negative: a comment with text is kept as written.
+        let standard = declared("{comment: ours, public: {comment: theirs}}");
+        assert_eq!(standard.comment.as_deref(), Some("ours"));
+        assert_eq!(standard.public_comment.as_deref(), Some("theirs"));
+    }
+}

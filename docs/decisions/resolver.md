@@ -1833,7 +1833,9 @@ the target connection must reach the cluster the plan was read from.*
     run never `SET ROLE`s, so it runs without it. Membership still makes the
     account unconfined on the target's cluster.
 - **Supplied.** Any other account compiles as itself in the database its
-  connection names.
+  connection names. *Amended by [DEC-1708.1](#dec-1708-1): the database is
+  put into a declared standard state at the start of each run and back into
+  it at release.*
   - "As itself" is enforced: the first statement on every connection the
     run opens as the scratch login is `SET ROLE NONE`, the run-owned
     layout's provisioning connection included. Every step that switches role
@@ -1876,7 +1878,8 @@ the target connection must reach the cluster the plan was read from.*
     the run answered or refused.
   - **Nothing outside the database is within the cleanup's reach.**
     `DROP OWNED` acts on the shared dependencies recorded on the login, so
-    the run reads those (`pg_shdepend`) before any write and refuses,
+    the run reads those (`pg_shdepend`) before compiling, once the database
+    is in its standard state (DEC-1708.1), and refuses,
     naming them, while any remains other than the run's own. These count:
     every entry in this database, and every shared entry other than
     ownership. A privilege or membership is revoked; a database, tablespace
@@ -1916,10 +1919,9 @@ the target connection must reach the cluster the plan was read from.*
     login does not own. The login reaches it through `PUBLIC`, its
     membership of `pg_database_owner`, and any role whose privileges it
     holds that the owner granted `USAGE`. It revokes all of those as
-    `pg_database_owner`, grants them back at cleanup, each with the grant
-    option it held, and fails the run, named, if the schema's ACL is not
-    then as it was. Measured on 16 and 18, the round trip restores the ACL
-    exactly.
+    `pg_database_owner`. Release grants them back by putting `public` into
+    its standard state, and fails the run, named, if it is not then
+    standard (DEC-1708.1).
   - What no per-schema revoke reaches refuses the run, named, before
     anything compiles: `pg_read_all_data` and `pg_write_all_data` grant
     `USAGE` on every schema (measured on 16 and 18), and an entry another
@@ -1940,7 +1942,8 @@ the target connection must reach the cluster the plan was read from.*
   object initdb made.
 - **A run that dies part-way** leaves the supplied database non-empty. The
   next run then refuses on emptiness instead of compiling over the
-  leftovers.
+  leftovers. What it changed of `public` and the database's own properties
+  the next run puts back into the standard state (DEC-1708.1).
 
 **The comparison is rule `pg-reported-scope-v1`:** every catalog fact
 `pg-analysis-scope-v1` compares, and no executable.
@@ -2034,3 +2037,115 @@ Pinned by:
 - `vouched_refuses_a_scratch_that_may_not_read_its_cluster_identity`;
 - `one_cluster_identity_is_one_cluster_whatever_the_marks_show`;
 - `an_unreadable_cluster_identity_names_the_grant_only_when_it_was_refused`.
+
+<a id="dec-1708-1"></a>
+
+**DEC-1708.1. A supplied scratch database is put into a declared standard
+state at the start of each run and back into it at release; its own ACL is
+kept as the run found it.** Decided with the maintainer on #1708.
+
+**The problem.** A supplied scratch database is reused from one run to the
+next. Its cleanup was defined by its mechanism: `DROP OWNED`, plus one check
+for each change review found it missed. Review on #1678 kept finding one
+more change that survived it:
+- `public` renamed, re-owned, commented or granted;
+- the database's connection limit, template flag, comment or settings;
+- the login's own settings in the database.
+
+Each time the cleanup reported success while the next run started from a
+changed database, and a run that died before cleanup left the same changes,
+which the next run could not tell from the operator's setup.
+
+**The rule.** The scratch database has a standard state: what `CREATE
+DATABASE ... TEMPLATE template0` makes, unless the resolver entry declares
+otherwise under `standard:`.
+- **At the start of a run**, after the separation, confinement, ownership
+  and emptiness checks, the run puts the database into it, re-reads it, and
+  refuses naming each difference it could not put back. A declared value
+  the account cannot apply refuses before the first write: a grant to a
+  role that does not exist, or a setting it may not store on its database.
+- **At release**, after `DROP OWNED` and the leftover inventory, it puts the
+  database back and re-reads it whole. A difference fails the run, named,
+  never reported as a clean release.
+- **The database's ACL is the exception.** Operators harden it, for example
+  `REVOKE CONNECT ... FROM PUBLIC`, and an ACL is awkward to declare. The
+  run reads it once the database is standard, and release puts it back to
+  that.
+- **The run-owned layout** applies the same declared state to the database
+  it creates, so both layouts compile under one state. Its connection limit
+  goes on last and alone, once the run login's session is open: the
+  superuser's own session counts toward the limit though it is not held to
+  it, and the reproduction has by then rebuilt what it scopes on that state.
+
+**Why the state is finite.** A persistent change needs ownership of the
+changed object or a grant option on it. The database owner acts as owner of
+exactly four things in its database:
+- **What it creates**, which `DROP OWNED` removes and the emptiness
+  inventory proves gone.
+- **initdb's objects owned by `pg_database_owner`.** In a database from
+  `template0`, the only low-OID object of any owner-bearing catalog not
+  owned by the bootstrap superuser is `public` (measured on 16 and 18, and
+  pinned by a live test that finds the catalogs by their owner column, so
+  a release that adds one fails the test). The standard covers its name,
+  keyed by OID 2200, its owner, ACL and comment.
+- **The database itself:** its connection limit, template flag, comment
+  and settings, for every role and for the login. `ALLOW_CONNECTIONS
+  false` on the current database is refused by the engine, and renaming
+  needs `CREATEDB`, which confinement refuses.
+- **The login's own role.** Its defaults are compared, as before
+  (DEC-1672.1); its password stays the documented limit.
+
+**How it is put back,** measured on 16 and 18:
+- Every statement runs as the login, never under `SET ROLE`. The owner acts
+  for `pg_database_owner`, and renaming a schema also needs `CREATE` on
+  the database, which `pg_database_owner` lacks.
+- An owner change rewrites the old owner's ACL entries as the new owner's,
+  and a superuser's grant on an owned schema is recorded as the owner's, so
+  the login can revoke both. An entry another role granted, with a grant
+  option, is that role's to revoke, and may carry grants that depend on it:
+  the ACL is then left as it is and each such entry is named, for the
+  operator to remove.
+- Settings are put back one at a time. `ALTER DATABASE ... RESET ALL`
+  silently keeps a setting the session may not remove, so only the
+  re-read is the verdict.
+- A database already standard costs no statement.
+- At the start of a run, a database that is not standard is first put
+  into its declared state inside a transaction that is rolled back, each
+  statement under a savepoint, and read back there. Anything the engine
+  refuses, or reads back otherwise than declared, refuses the run before
+  its first write. The engine judges each declared value, so a value it
+  cannot parse, or one this code spells or reads back wrongly, is named
+  before any write instead of after a partial one. A release does not try
+  first: its repair is wanted even in part.
+
+**Not covered: a connection limit of 0.** It locks the login out, so a run
+that died after setting it cannot connect again, and only a superuser can
+lift it. A run that finishes puts it back through the connection it still
+holds. The declared limit is `-1` or at least 1.
+
+**Declared settings are operational**, such as timeouts. The settings that
+decide the resolver's answer come from the target: the deployer's role and
+database defaults are replayed as session settings, which override the
+database's.
+
+**A database-wide setting is an explicit every-role slot in the capture.**
+Its `pg_db_role_setting` row has `setrole = 0`, which the capture records as
+a `pg_authid` identity with no name. Normalizing the compiled side's roles
+refused that identity, which refused every scratch database with a setting
+of its own, as a declared standard makes it. It is kept as the slot it is.
+
+**Why not the alternatives.**
+- **A photograph of each scratch, stored in git.** It is environment
+  specific: CI's scratch, each developer's and staging's differ. It would
+  have to be retaken on every legitimate change, and the first photograph
+  of a scratch an interrupted run had already changed would bless the
+  change.
+- **More checks on `DROP OWNED`.** That is the mechanism-defined cleanup
+  this replaces: each review found the next piece.
+
+**What it replaces.** The give-up's restore of `public`'s grants and the
+release-side comparison of its ACL: putting `public` back into the standard
+grants back what the give-up took.
+
+Recorded in SPEC §9.3.2. Pinned by the `vouched_` live tests in
+`resolver::server::vouched` and the live tests in `resolver::standard`.

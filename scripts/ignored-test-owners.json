@@ -1776,6 +1776,12 @@
         "resolver::capture::tests::retained_roots_are_read_even_when_nothing_reaches_them",
         "resolver::capture::tests::coherent_inputs_pin_properties_membership_and_actual_bindings",
         "resolver::vouched::tests::the_cleanup_names_what_another_role_owns_and_what_changed_on_the_login",
+        "resolver::standard::tests::a_declared_standard_in_the_engines_own_spelling_reads_back_as_declared",
+        "resolver::standard::tests::a_fresh_database_is_the_built_in_standard_and_public_is_its_only_owned_initdb_object",
+        "resolver::standard::tests::a_public_entry_another_role_granted_is_named_and_the_acl_is_left_alone",
+        "resolver::standard::tests::a_trial_names_what_the_engine_refuses_and_writes_nothing",
+        "resolver::standard::tests::enforce_issues_no_statement_on_a_standard_database",
+        "resolver::standard::tests::enforce_puts_back_every_covered_change_and_the_kept_database_acl",
         "resolver::environment::tests::a_schema_with_a_backslash_is_on_the_path_whatever_the_string_mode"
       ]
     },
@@ -2154,6 +2160,14 @@
         "resolver::server::vouched::live_tests::vouched_refuses_a_scratch_that_is_not_empty",
         "resolver::server::vouched::live_tests::vouched_refuses_a_scratch_that_may_not_read_its_cluster_identity",
         "resolver::server::vouched::live_tests::vouched_refuses_a_target_connection_on_another_cluster_than_the_plan_was_read_from",
+        "resolver::server::vouched::live_tests::vouched_applies_a_declared_standard_and_keeps_a_hardened_database_acl",
+        "resolver::server::vouched::live_tests::vouched_refuses_a_declared_setting_the_scratch_account_may_not_set_before_writing",
+        "resolver::server::vouched::live_tests::vouched_refuses_a_declared_value_the_engine_rejects_before_writing",
+        "resolver::server::vouched::live_tests::vouched_refuses_a_public_grant_chain_it_cannot_revoke_and_leaves_the_acl",
+        "resolver::server::vouched::live_tests::vouched_release_puts_a_supplied_scratch_back_and_names_what_it_cannot",
+        "resolver::server::vouched::live_tests::vouched_repairs_a_supplied_scratch_an_interrupted_run_left_changed",
+        "resolver::server::vouched::live_tests::vouched_run_owned_compiles_under_the_declared_standard",
+        "resolver::server::vouched::live_tests::vouched_run_owned_keeps_what_the_reproduction_put_on_its_database",
         "resolver::server::vouched::live_tests::vouched_refuses_the_target_as_scratch",
         "resolver::server::vouched::live_tests::vouched_runs_in_a_precreated_database_with_a_confined_account"
       ]

@@ -304,7 +304,7 @@ impl ScratchEndpoint {
     /// this; only a run that actually needs a resolver reads the value, and a
     /// failure never echoes it.
     pub fn from_profile(profile: &pbps_config::resolver::ResolverProfile) -> Result<Self, Error> {
-        let pbps_config::resolver::ResolverProfile::Server { url_env } = profile else {
+        let pbps_config::resolver::ResolverProfile::Server { url_env, .. } = profile else {
             return Err(Error::Endpoint);
         };
         Self::parse(&std::env::var(url_env).map_err(|_| Error::Endpoint)?)

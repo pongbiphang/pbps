@@ -1477,9 +1477,20 @@ entry implemented by #1672, Docker by #1674).**
         again and fails, naming what remains; so does a change to the
         login's own defaults. A schema the deployer cannot use after the
         plan's grants is one the login gives up its usage of; for initdb's
-        `public` that usage is granted back at cleanup. A usage it cannot
+        `public` that usage is granted back at release. A usage it cannot
         give up, such as one `pg_read_all_data` grants, refuses the run,
         named.
+      - **The scratch database has a standard state** (DEC-1708.1): what
+        `CREATE DATABASE ... TEMPLATE template0` makes, unless the resolver
+        entry declares otherwise under `standard:` (below). It covers
+        initdb's `public`, keyed by its OID (name, owner, ACL, comment), and
+        the database's connection limit, template flag, comment and
+        settings, for every role and for the login. The run puts the
+        database into it at the start, which repairs what an interrupted
+        run left, and back into it at release, re-reading it both times; a
+        difference it cannot put back refuses the run, or fails the
+        release, named. The database's own ACL is kept as the run found it
+        instead. The run-owned database gets the same declared state.
     - **Scratch is empty.** The database the run compiles in holds nothing
       initdb did not create: no object at or above `FirstNormalObjectId`,
       subscriptions included, and no large object, whose OID may be
@@ -1591,6 +1602,15 @@ resolvers:
   scratch:
     kind: server
     url_env: PBPS_SCRATCH_DB
+    standard:                       # optional; omitted = template0's state
+      settings:                     # ALTER DATABASE <scratch> SET ...
+        statement_timeout: 5min
+      comment: pbps scratch, do not use
+      connection_limit: 10          # -1 (no limit) or at least 1
+      public:
+        comment: scratch public schema
+        grants:                     # granted by public's owner
+          - { to: ci_reader, privileges: [USAGE] }
 environments:
   prod:
     url_env: PROD_DB
@@ -1607,7 +1627,18 @@ instance separation, transport and containment. A server entry names a
 separate credential variable, never an inline connection string, and there
 is no fallback to target credentials. The variable holds an ordinary
 connection string, in either form the target's takes and with the TLS it
-asks for. The account it names decides the layout (above).
+asks for. The account it names decides the layout (above). Its optional
+`standard:` declares the scratch database's standard state (above): only
+the database's settings, comment and connection limit, and `public`'s
+comment and grants, each an override of what `template0` makes. An unknown
+key is refused. A declared setting is operational, such as a timeout: the
+settings that decide the answer are the target deployer's, replayed as
+session settings, which override the database's. A grant to a role that
+does not exist, or a setting the scratch account may not store on its
+database, refuses the run before its first write. So does anything else the
+engine refuses or stores otherwise than declared, such as a value it cannot
+parse: the run tries the whole declared state in a transaction it rolls back
+before writing any of it.
 
 A missing selected profile is a named finding (exit 2) before target access or
 output writes. An unused profile/default is not resolved by offline commands,

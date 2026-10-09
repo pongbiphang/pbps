@@ -5,6 +5,7 @@ pub mod capture;
 pub mod compatibility;
 pub mod environment;
 pub mod reconstruct;
+pub mod standard;
 pub mod vouched;
 
 // Live, and in the library target on purpose: a capture refuses any

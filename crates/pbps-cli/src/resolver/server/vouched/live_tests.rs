@@ -11,6 +11,7 @@ use super::super::qualified_evidence_tests::{ENVIRONMENT, Inputs, ProjectKey, vi
 use super::super::{Error, ProduceError, ResolvedPlan};
 use pbps_db::{Conn, Driver};
 use pbps_model::Change;
+use pbps_pg::resolver::standard::Standard;
 
 /// The two pinned servers of `scripts/live-tests-pg.sh`, 18 and 16.
 const SERVERS: &[&str] = &["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"];
@@ -83,6 +84,18 @@ impl Fixture {
         (name, password)
     }
 
+    /// A role that cannot log in, for a grantee.
+    async fn role(&mut self, purpose: &str) -> String {
+        let name = format!("pbps_v1708_{purpose}_{}", self.token);
+        self.admin()
+            .await
+            .execute(&format!("CREATE ROLE {name} NOLOGIN"))
+            .await
+            .unwrap();
+        self.roles.insert(0, name.clone());
+        name
+    }
+
     async fn run(&self, database: &str, statements: &[&str]) {
         let mut conn = Conn::connect(Driver::Postgres, &self.on(database))
             .await
@@ -153,6 +166,11 @@ impl Fixture {
     async fn drop(self) {
         let mut admin = self.admin().await;
         for database in &self.databases {
+            // A test that fails may leave a template, which cannot be
+            // dropped as one.
+            let _ = admin
+                .execute(&format!("ALTER DATABASE {database} IS_TEMPLATE false"))
+                .await;
             admin
                 .execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
                 .await
@@ -173,13 +191,23 @@ async fn produce(
     inputs: &Inputs,
     key: &ProjectKey,
 ) -> Result<ResolvedPlan, ProduceError> {
+    produce_with(scratch, target, inputs, key, &Standard::default()).await
+}
+
+async fn produce_with(
+    scratch: &str,
+    target: &str,
+    inputs: &Inputs,
+    key: &ProjectKey,
+    standard: &Standard,
+) -> Result<ResolvedPlan, ProduceError> {
     // As the planning read records it: the identity of the cluster the
     // target string reached.
     let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
     let identity = pbps_pg::resolver::vouched::cluster_identity(&mut planning)
         .await
         .unwrap();
-    produce_planned_on(scratch, target, &identity, inputs, key).await
+    produce_planned_on(scratch, target, &identity, inputs, key, standard).await
 }
 
 async fn produce_planned_on(
@@ -188,6 +216,7 @@ async fn produce_planned_on(
     planned_identity: &str,
     inputs: &Inputs,
     key: &ProjectKey,
+    standard: &Standard,
 ) -> Result<ResolvedPlan, ProduceError> {
     super::produce(
         Driver::Postgres,
@@ -201,6 +230,7 @@ async fn produce_planned_on(
         &[],
         &key.project,
         Some(ENVIRONMENT),
+        standard,
     )
     .await
 }
@@ -370,6 +400,7 @@ async fn vouched_refuses_a_target_connection_on_another_cluster_than_the_plan_wa
             &planned,
             &inputs,
             &key,
+            &Standard::default(),
         )
         .await,
     );
@@ -1037,4 +1068,460 @@ async fn vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_memberships
         "{server}: both memberships are kept"
     );
     assert_eq!(left.1, 0, "{server}: nothing was written: {left:?}");
+}
+
+/// What differs from `standard` in a supplied scratch database, read as its
+/// login after the run has let go of its one connection.
+async fn not_standard(
+    fixture: &Fixture,
+    database: &str,
+    login: &(String, String),
+    standard: &Standard,
+    acl: Option<&std::collections::BTreeSet<pbps_pg::resolver::standard::Entry>>,
+) -> Vec<String> {
+    let mut conn = Conn::connect(Driver::Postgres, &fixture.as_login(database, login))
+        .await
+        .unwrap();
+    pbps_pg::resolver::standard::verify(&mut conn, standard, acl)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_repairs_a_supplied_scratch_an_interrupted_run_left_changed() {
+    // What a run that died before its release can leave, changed by the
+    // login itself: the next run puts it back into its standard state
+    // first, and answers (#1708).
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        let other = fixture.role("o").await;
+        {
+            let mut conn = Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
+                .await
+                .unwrap();
+            for statement in [
+                "ALTER SCHEMA public RENAME TO elsewhere".to_owned(),
+                format!("ALTER SCHEMA elsewhere OWNER TO {}", login.0),
+                "COMMENT ON SCHEMA elsewhere IS 'changed'".to_owned(),
+                format!("GRANT USAGE ON SCHEMA elsewhere TO {other} WITH GRANT OPTION"),
+                format!("GRANT CREATE ON SCHEMA elsewhere TO {other}"),
+                format!("ALTER DATABASE {scratch_db} CONNECTION LIMIT 5"),
+                format!("ALTER DATABASE {scratch_db} IS_TEMPLATE true"),
+                format!("ALTER DATABASE {scratch_db} SET statement_timeout = '7s'"),
+                format!("ALTER ROLE CURRENT_USER IN DATABASE {scratch_db} SET work_mem = '8MB'"),
+                format!("COMMENT ON DATABASE {scratch_db} IS 'changed'"),
+            ] {
+                conn.execute(&statement).await.unwrap();
+            }
+        }
+        let inputs = Inputs::overload();
+        let key = ProjectKey::new(true);
+        let result = produce(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+        )
+        .await;
+        let left = not_standard(&fixture, &scratch_db, &login, &Standard::default(), None).await;
+        fixture.drop().await;
+        assert_answers_the_overload(&result.unwrap());
+        assert!(left.is_empty(), "{server}: {left:#?}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_applies_a_declared_standard_and_keeps_a_hardened_database_acl() {
+    // The declared settings, comments, limit and grant are applied over a
+    // scratch configured otherwise, and kept through the release; the
+    // database's own hardened ACL is the operator's and stays (#1708).
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        let reader = fixture.role("r").await;
+        fixture
+            .admin()
+            .await
+            .execute(&format!(
+                "REVOKE CONNECT, TEMPORARY ON DATABASE {scratch_db} FROM PUBLIC; \
+                 COMMENT ON DATABASE {scratch_db} IS 'configured otherwise'"
+            ))
+            .await
+            .unwrap();
+        let hardened = {
+            let mut conn = Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
+                .await
+                .unwrap();
+            pbps_pg::resolver::standard::read_state(&mut conn)
+                .await
+                .unwrap()
+                .acl
+        };
+        let declared = Standard {
+            settings: [("statement_timeout".to_owned(), "5min".to_owned())].into(),
+            comment: Some("pbps scratch".into()),
+            connection_limit: 10,
+            public_comment: Some("ours".into()),
+            public_grants: [(reader.clone(), "USAGE".to_owned())].into(),
+        };
+        let inputs = Inputs::overload();
+        let key = ProjectKey::new(true);
+        let result = produce_with(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+            &declared,
+        )
+        .await;
+        let left = not_standard(&fixture, &scratch_db, &login, &declared, Some(&hardened)).await;
+        // Negative: the built-in standard would see each declared item.
+        let builtin = not_standard(&fixture, &scratch_db, &login, &Standard::default(), None).await;
+        fixture.drop().await;
+        assert_answers_the_overload(&result.unwrap());
+        assert!(left.is_empty(), "{server}: {left:#?}");
+        assert_eq!(builtin.len(), 5, "{server}: {builtin:#?}");
+        assert!(
+            !hardened.iter().any(|entry| entry.grantee == "PUBLIC"),
+            "{server}: the fixture hardened the ACL: {hardened:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_declared_setting_the_scratch_account_may_not_set_before_writing() {
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        // Not standard, so a write would show: the run must refuse first.
+        fixture
+            .admin()
+            .await
+            .execute(&format!("COMMENT ON DATABASE {scratch_db} IS 'untouched'"))
+            .await
+            .unwrap();
+        let declared = Standard {
+            settings: [("log_min_duration_statement".to_owned(), "5".to_owned())].into(),
+            ..Standard::default()
+        };
+        let inputs = Inputs::overload();
+        let key = ProjectKey::new(true);
+        let reason = vouched_refusal(
+            produce_with(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+                &declared,
+            )
+            .await,
+        );
+        let left = not_standard(&fixture, &scratch_db, &login, &Standard::default(), None).await;
+        fixture.drop().await;
+        assert!(
+            reason.contains("log_min_duration_statement")
+                && reason.contains("may not set on its database"),
+            "{server}: {reason}"
+        );
+        assert_eq!(
+            left,
+            ["the database's comment is \"untouched\""],
+            "{server}: nothing was written"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_declared_value_the_engine_rejects_before_writing() {
+    // A permitted setting with a value the engine cannot parse: the
+    // declared state is tried and rolled back first, so the run refuses
+    // naming it, and the comment that would have been written first stays
+    // as it was (#1708 review).
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        let declared = Standard {
+            settings: [("statement_timeout".to_owned(), "nonsense".to_owned())].into(),
+            comment: Some("ours".into()),
+            ..Standard::default()
+        };
+        let inputs = Inputs::overload();
+        let key = ProjectKey::new(true);
+        let reason = vouched_refusal(
+            produce_with(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+                &declared,
+            )
+            .await,
+        );
+        let left = not_standard(&fixture, &scratch_db, &login, &Standard::default(), None).await;
+        fixture.drop().await;
+        assert!(
+            reason.contains("statement_timeout") && reason.contains("nothing was written"),
+            "{server}: {reason}"
+        );
+        assert!(left.is_empty(), "{server}: nothing was written: {left:#?}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_public_grant_chain_it_cannot_revoke_and_leaves_the_acl() {
+    // A role granted USAGE on public with its grant option passed it on:
+    // the onward entry is that role's to revoke, not the login's. The run
+    // refuses naming it, and the ACL stays as it was (#1708, #1678 review).
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        let other = fixture.role("o").await;
+        let onward = fixture.role("w").await;
+        fixture
+            .run(
+                &scratch_db,
+                &[
+                    &format!("GRANT USAGE ON SCHEMA public TO {other} WITH GRANT OPTION"),
+                    &format!("SET ROLE {other}"),
+                    &format!("GRANT USAGE ON SCHEMA public TO {onward}"),
+                    "RESET ROLE",
+                ],
+            )
+            .await;
+        let acl = || async {
+            let mut conn = Conn::connect(Driver::Postgres, &fixture.on(&scratch_db))
+                .await
+                .unwrap();
+            pbps_pg::resolver::standard::read_state(&mut conn)
+                .await
+                .unwrap()
+                .public
+        };
+        let before = acl().await;
+        let inputs = Inputs::overload();
+        let key = ProjectKey::new(true);
+        let reason = vouched_refusal(
+            produce(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+            )
+            .await,
+        );
+        let after = acl().await;
+        fixture.drop().await;
+        assert!(
+            reason.contains(&format!("which only {other} can revoke")) && reason.contains(&onward),
+            "{server}: {reason}"
+        );
+        assert_eq!(before, after, "{server}: the ACL was left alone");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_release_puts_a_supplied_scratch_back_and_names_what_it_cannot() {
+    // What a compiled definition may change during the run, put back by
+    // the release on the run's own connection; and a setting the login may
+    // not remove, named rather than reported as a clean release (#1708).
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let (login, scratch_db) = fixture.confined().await;
+        let other = fixture.role("o").await;
+        let standard = Standard::default();
+        let mut conn = Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
+            .await
+            .unwrap();
+        let backend = pbps_pg::resolver::vouched::backend(&mut conn)
+            .await
+            .unwrap();
+        let defaults = pbps_pg::resolver::vouched::login_defaults(&mut conn)
+            .await
+            .unwrap();
+        let acl = pbps_pg::resolver::standard::read_state(&mut conn)
+            .await
+            .unwrap()
+            .acl;
+        for statement in [
+            "SET ROLE pg_database_owner".to_owned(),
+            "COMMENT ON SCHEMA public IS 'changed'".to_owned(),
+            format!("GRANT CREATE ON SCHEMA public TO {other}"),
+            "SET ROLE NONE".to_owned(),
+            "ALTER SCHEMA public RENAME TO elsewhere".to_owned(),
+            // The run's own connection stays open: 0 locks out only the
+            // next one, which the release must prevent.
+            format!("ALTER DATABASE {scratch_db} CONNECTION LIMIT 0"),
+            format!("ALTER DATABASE {scratch_db} IS_TEMPLATE true"),
+            format!("ALTER DATABASE {scratch_db} SET statement_timeout = '7s'"),
+            format!("COMMENT ON DATABASE {scratch_db} IS 'changed'"),
+            format!("REVOKE CONNECT ON DATABASE {scratch_db} FROM PUBLIC"),
+        ] {
+            conn.execute(&statement).await.unwrap();
+        }
+        let released =
+            super::release_supplied(&mut conn, &backend, &standard, &scratch_db, &defaults, &acl)
+                .await;
+        // Negative: one the login may not remove is named.
+        fixture
+            .admin()
+            .await
+            .execute(&format!(
+                "ALTER DATABASE {scratch_db} SET log_min_duration_statement = 5"
+            ))
+            .await
+            .unwrap();
+        let unremovable =
+            super::release_supplied(&mut conn, &backend, &standard, &scratch_db, &defaults, &acl)
+                .await;
+        drop(conn);
+        let left = not_standard(&fixture, &scratch_db, &login, &standard, Some(&acl)).await;
+        fixture.drop().await;
+        assert_eq!(released, Ok(()), "{server}");
+        let named = unremovable.expect_err("a setting the login may not remove");
+        assert!(
+            named.iter().any(|item| item.contains(
+                "not back in its standard state: the database sets log_min_duration_statement=5"
+            )) && named.iter().any(|item| item.starts_with("refused: ")),
+            "{server}: {named:#?}"
+        );
+        assert_eq!(
+            left,
+            ["the database sets log_min_duration_statement=5"],
+            "{server}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_run_owned_keeps_what_the_reproduction_put_on_its_database() {
+    // The declared limit goes on after the run login's session opens, and
+    // only the limit: the reproduction has by then rebuilt an in-scope
+    // `public` and stored the target's database defaults, which a second
+    // full standardization would refuse and reset (#1708 review).
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = target.target().await;
+    target
+        .run(
+            &target_db,
+            &[&format!(
+                r#"ALTER DATABASE "{target_db}" SET work_mem = '8MB'"#
+            )],
+        )
+        .await;
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let before = scratch.inventory().await;
+    let target_url = target.on(&target_db);
+    let mut planning = Conn::connect(Driver::Postgres, &target_url).await.unwrap();
+    let identity = pbps_pg::resolver::vouched::cluster_identity(&mut planning)
+        .await
+        .unwrap();
+    // `public` on the write path puts it in the reproduction's scope.
+    let extras = ["public".to_owned()];
+    let mut answers = Vec::new();
+    for standard in [
+        Standard {
+            connection_limit: 1,
+            ..Standard::default()
+        },
+        Standard::default(),
+    ] {
+        answers.push(
+            super::produce(
+                Driver::Postgres,
+                &scratch.server,
+                &target_url,
+                &identity,
+                &inputs.binding(),
+                inputs.base(),
+                inputs.desired(),
+                &inputs.hints,
+                &extras,
+                &key.project,
+                Some(ENVIRONMENT),
+                &standard,
+            )
+            .await,
+        );
+    }
+    let unlimited = answers.pop().unwrap();
+    let limited = answers.pop().unwrap();
+    let after = scratch.inventory().await;
+    target.drop().await;
+    assert_answers_the_overload(&limited.unwrap());
+    // Negative: without a declared limit nothing is put on after the
+    // reproduction either.
+    assert_answers_the_overload(&unlimited.unwrap());
+    assert_eq!(
+        before, after,
+        "the run-owned database and roles are dropped"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_run_owned_compiles_under_the_declared_standard() {
+    // The database a superuser scratch creates gets the same declared state
+    // as a supplied one (#1708): a declared grant to a role the scratch
+    // server lacks refuses before anything is compiled, and a declared
+    // setting, comment and limit are applied and answered under. A limit of
+    // 1 still admits the run's own two sessions (#1708 review).
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = target.target().await;
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let missing = format!("pbps_v1708_absent_{}", scratch.token);
+    let before = scratch.inventory().await;
+    let refused = vouched_refusal(
+        produce_with(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &Standard {
+                public_grants: [(missing.clone(), "USAGE".to_owned())].into(),
+                ..Standard::default()
+            },
+        )
+        .await,
+    );
+    let answered = produce_with(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &Standard {
+            settings: [("statement_timeout".to_owned(), "5min".to_owned())].into(),
+            comment: Some("pbps scratch".into()),
+            connection_limit: 1,
+            ..Standard::default()
+        },
+    )
+    .await;
+    let after = scratch.inventory().await;
+    target.drop().await;
+    assert!(
+        refused.contains(&format!("to {missing}, a role that does not exist")),
+        "{refused}"
+    );
+    assert_answers_the_overload(&answered.unwrap());
+    assert_eq!(
+        before, after,
+        "the run-owned database and roles are dropped"
+    );
 }
