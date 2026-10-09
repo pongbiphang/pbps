@@ -3731,7 +3731,11 @@ table drops ruled out that order, and the plan was refused at `plan --db`.
   after every module drop in any order, so no other place can differ.
   A module drop a pair ties to a movable one, directly or through other
   module drops, moves too. A function the movable one is bound to drops after
-  it, and held fixed it would pin the movable one in front of it. Made
+  it, and held fixed it would pin the movable one in front of it.
+  A module drop ahead of the renames and drops (class 0) joins them by the
+  same rule when a pair names it. One that must only precede a table it is
+  bound to is not moved by DEC-1431.1's pass, yet a rename can need to run
+  before it. Every other change ahead of them still runs first. Made
   movable without this, a table's drop releasing a dozen functions
   multiplied the orders past the search's bound. That happened with names
   nothing held, and again with names only added checks claimed. A claim the
@@ -3764,6 +3768,10 @@ Pinned by:
 - `a_module_drop_tied_to_a_movable_one_moves_with_it`: the example's function
   is bound to another dropped function, which moves with it to after the
   rename.
+- `a_leading_module_drop_a_pair_names_moves_too`: a class-0 function that
+  must only precede the table it is bound to moves after the rename, while a
+  class-0 drop no pair names stays first. Without the pair the plan is
+  refused.
 - `what_a_released_function_is_bound_to_follows_it`
   (`crates/pbps-cli/src/computed_order.rs`), on the pairs themselves.
 - `a_computed_drop_follows_the_module_bound_to_it_and_its_inputs_follow_it`

@@ -17,11 +17,11 @@
 //! - the drops keep their own order, which already puts a foreign key's drop
 //!   before the key or the table it references (DEC-536.1). A drop claims no
 //!   name, so no order a rename needs is one the drops have to give up;
-//! - a module drop the computed edges placed among them (DEC-1431.1) moves
-//!   like a rename, but only between what the edges say it waits for (the
-//!   drop that releases it) and what waits for it (a table it is
-//!   schema-bound to, #1461). Its name is one a rename can need: dropped
-//!   early it frees a name a default then takes (#1680);
+//! - a module drop the computed edges ordered (DEC-1431.1), among the drops
+//!   or ahead of them, moves like a rename where a rename can claim its
+//!   name, but only between what the edges say it waits for (the drop that
+//!   releases it) and what waits for it (a table it is schema-bound to,
+//!   #1461): dropped early it frees a name a default then takes (#1680);
 //! - every other change keeps its place, after the renames and drops. A name
 //!   one of them frees is refused with that change named (DEC-1366.2).
 //!
@@ -275,6 +275,9 @@ type Seen = BTreeSet<(
 
 struct Search<'c> {
     changes: &'c [PlannedChange],
+    /// The position of the first rename or drop: the changes before it run
+    /// first, but a module drop the search moves.
+    start: usize,
     /// The positions of the renames and drops, in the plan's order.
     region: Vec<usize>,
     drops: Vec<usize>,
@@ -315,7 +318,11 @@ impl<'c> Search<'c> {
         // movable one moves too, through every such pair: a function bound to
         // the movable one drops after it, and one that must follow it cannot
         // be held in front of where it has to go. A module drop the edges
-        // left alone runs in class 0, before the first of them.
+        // left alone runs in class 0, before the first of them, and stays
+        // there unless a pair names it and it is movable by the same rule:
+        // one that must only precede a table it is bound to is not moved by
+        // `release`, yet a rename can need to run before it (#1680 review).
+        // The changes before the first rename or drop keep running first.
         let first = (0..changes.len()).find(|&i| part(&changes[i].change).is_some());
         let at = |c: &Change| (0..changes.len()).find(|&i| changes[i].change == *c);
         let pairs: Vec<(usize, usize)> = precedence
@@ -325,10 +332,19 @@ impl<'c> Search<'c> {
         let late_module = |i: usize| {
             first.is_some_and(|f| i > f) && matches!(changes[i].change, Change::DropModule { .. })
         };
+        let named = |i: usize| pairs.iter().any(|&(a, b)| a == i || b == i);
+        // A module drop the search may move: one among the drops, or one
+        // before them that a pair names.
+        let edge_module = |i: usize| {
+            late_module(i)
+                || (first.is_some_and(|f| i < f)
+                    && named(i)
+                    && matches!(changes[i].change, Change::DropModule { .. }))
+        };
         let mut movable: BTreeSet<usize> = (0..changes.len())
             .filter(|&i| {
-                late_module(i)
-                    && pairs.iter().any(|&(a, b)| a == i || b == i)
+                edge_module(i)
+                    && named(i)
                     && matches!(&changes[i].change,
                         Change::DropModule { id, .. } if facts.module_drop_matters(changes, id))
             })
@@ -336,8 +352,8 @@ impl<'c> Search<'c> {
         loop {
             let before = movable.len();
             for &(a, b) in &pairs {
-                if late_module(a)
-                    && late_module(b)
+                if edge_module(a)
+                    && edge_module(b)
                     && (movable.contains(&a) || movable.contains(&b))
                 {
                     movable.insert(a);
@@ -350,13 +366,11 @@ impl<'c> Search<'c> {
         }
         let part_at = |i: usize| -> Option<Part> {
             part(&changes[i].change).or_else(|| {
-                late_module(i).then(|| {
-                    if movable.contains(&i) {
-                        Part::Module
-                    } else {
-                        Part::Drop
-                    }
-                })
+                if movable.contains(&i) {
+                    Some(Part::Module)
+                } else {
+                    late_module(i).then_some(Part::Drop)
+                }
             })
         };
         let region: Vec<usize> = (0..changes.len())
@@ -404,6 +418,7 @@ impl<'c> Search<'c> {
         }
         Search {
             changes,
+            start: first.unwrap_or(changes.len()),
             region,
             drops,
             renames,
@@ -432,10 +447,10 @@ impl<'c> Search<'c> {
     /// The first order of the renames and drops the walk clears, with the
     /// rest of the plan after it, by position.
     fn run(&mut self, facts: &NameFacts) -> Option<Vec<usize>> {
-        let first = *self.region.first()?;
+        self.region.first()?;
         let mut walk = Walk::new(facts);
-        for (i, p) in self.changes[..first].iter().enumerate() {
-            walk.step(i, &p.change);
+        for i in self.before() {
+            walk.step(i, &self.changes[i].change);
         }
         if !walk.is_clear() {
             return None;
@@ -463,8 +478,7 @@ impl<'c> Search<'c> {
             .collect();
         if drop == self.drops.len() && left.is_empty() {
             let mut rest = walk.clone();
-            let first = self.region[0];
-            for i in (first..self.changes.len()).filter(|i| !self.region.contains(i)) {
+            for i in self.after() {
                 rest.step(i, &self.changes[i].change);
             }
             return rest.is_clear().then(|| order.clone());
@@ -502,12 +516,22 @@ impl<'c> Search<'c> {
         None
     }
 
+    /// The positions that run before the region: every change ahead of the
+    /// first rename or drop, but a module drop the search moves.
+    fn before(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.start).filter(|i| !self.region.contains(i))
+    }
+
+    /// The positions that run after it, in the plan's order.
+    fn after(&self) -> impl Iterator<Item = usize> + '_ {
+        (self.start..self.changes.len()).filter(|i| !self.region.contains(i))
+    }
+
     /// The plan with its renames and drops in `order`, each drop addressed
     /// for where it now runs: everything before the first of them, then
     /// them, then the rest in the plan's order.
     fn reordered(&self, order: &[usize]) -> Vec<PlannedChange> {
-        let first = self.region[0];
-        let mut out: Vec<PlannedChange> = self.changes[..first].to_vec();
+        let mut out: Vec<PlannedChange> = self.before().map(|i| self.changes[i].clone()).collect();
         let mut done = BTreeSet::new();
         for &i in order {
             let mut p = self.changes[i].clone();
@@ -517,11 +541,7 @@ impl<'c> Search<'c> {
             }
             out.push(p);
         }
-        out.extend(
-            (first..self.changes.len())
-                .filter(|i| !self.region.contains(i))
-                .map(|i| self.changes[i].clone()),
-        );
+        out.extend(self.after().map(|i| self.changes[i].clone()));
         out
     }
 }
@@ -1449,6 +1469,84 @@ mod tests {
             "{:?}",
             cs.changes
         );
+    }
+
+    /// #1680 review: a module drop ahead of the renames and drops that a pair
+    /// names moves too. `F` must only drop before `dbo.lookup`, which it is
+    /// bound to, so `release` leaves it in class 0. Run there, it frees its
+    /// name for the rename's default, and the check claiming that name
+    /// collides; `rename → F → lookup` clears the plan. A class-0 change no
+    /// pair names still runs first.
+    #[test]
+    fn a_leading_module_drop_a_pair_names_moves_too() {
+        let new = name("dbo.new");
+        let generated = default_constraint_name(&new, "x");
+        let drop_function = |n: &str| {
+            PlannedChange::new(Change::DropModule {
+                id: pbps_model::ModuleId::Named(name(n)),
+                kind: pbps_model::ModuleKind::Function,
+            })
+        };
+        let f = drop_function(&format!("dbo.{generated}"));
+        let view = drop_function("dbo.v");
+        let lookup = PlannedChange::new(Change::DropTable {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.lookup", 0),
+            name: name("dbo.lookup"),
+            detach_from: None,
+        });
+        let plan = || {
+            vec![
+                f.clone(),
+                view.clone(),
+                lookup.clone(),
+                rename("dbo.old", "dbo.new", &["x"]),
+                PlannedChange::new(Change::AddCheck {
+                    table: name("dbo.t"),
+                    name: generated.clone(),
+                    constraint: pbps_model::CheckConstraint {
+                        expression: "a > 0".into(),
+                    },
+                }),
+            ]
+        };
+        let occupants = [
+            held(
+                &format!("dbo.{}", default_constraint_name(&name("dbo.old"), "x")),
+                "default constraint",
+                Some("dbo.old"),
+                Some("x"),
+            ),
+            held(
+                &format!("dbo.{generated}"),
+                "sql scalar function",
+                None,
+                None,
+            ),
+        ];
+        let precedence = [(f.change.clone(), lookup.change.clone())];
+        let facts = NameFacts::new(&occupants, &[]);
+        let changes = plan();
+        let search = Search::new(&changes, &precedence, &facts);
+        assert_eq!(search.modules, [0]);
+        assert_eq!(search.region, [0, 2, 3]);
+        let mut cs = ChangeSet { changes: plan() };
+        order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &precedence).unwrap();
+        assert_eq!(cs.changes[0].change, view.change, "{:?}", cs.changes);
+        let at = |c: &Change| cs.changes.iter().position(|p| p.change == *c).unwrap();
+        let renamed = cs
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::RenameTable { .. }))
+            .unwrap();
+        assert!(
+            renamed < at(&f.change) && at(&f.change) < at(&lookup.change),
+            "{:?}",
+            cs.changes
+        );
+        // Negative: without the pair it stays in class 0, and no order
+        // clears the plan.
+        let mut cs = ChangeSet { changes: plan() };
+        order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &[]).unwrap_err();
     }
 
     /// A drop on a renamed table names the table as it is called where the
