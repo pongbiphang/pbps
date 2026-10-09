@@ -317,10 +317,10 @@ indexes:
   engine recursing each into every partition, whose own defaults and NOT
   NULLs follow (DEC-1687.1). A key column is never dropped or retyped, and the
   columns do not change in a plan that attaches, detaches or drops under the
-  parent, nor beside a partition's own new check or unique or filtered
-  index. Every other change stays refused by name: the parent's indexes,
-  keys, checks and foreign keys, and its rename, until #1688–#1690, and
-  attaching as the DEFAULT partition until #1639.
+  parent, nor beside a partition's own new check or unique index that
+  reads a changed column. Every other change stays refused by name: the
+  parent's indexes, keys, checks and foreign keys, and its rename, until
+  #1688–#1690, and attaching as the DEFAULT partition until #1639.
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

@@ -3939,10 +3939,12 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
   holds them as declared at the other end of the plan, so each column change
   would need its own place against each transition. The remedy is two plans,
   the columns first or the partitions first;
-- a partition's own check, or unique or filtered index, added while the plan
+- a partition's own check, or unique index on columns, added while the plan
   changes a column of its parent that the check or index reads: a changed
-  name, either of a rename's, found anywhere in its text, quoted or not, in
-  any case. A text holding a Unicode-escaped identifier (`U&"\0076"`), which
+  name, either of a rename's, found in the check's text or in the index's
+  key columns or predicate, quoted or not, in any case. These are what the
+  pre-flight probes; a plain index, filtered or not, and a unique one over
+  an expression are not probed, and are admitted. A text holding a Unicode-escaped identifier (`U&"\0076"`), which
   spells a name without its letters, counts as reading every changed name.
   One that reads only the partition's other columns is admitted.
   Its pre-flight probe reads the stored rows

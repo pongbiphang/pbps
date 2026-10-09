@@ -3311,7 +3311,7 @@ fn refuse_partition_changes(
                 (standing(base.schema, t) || attaching.contains(t)) && standing(declared.schema, t)
             })
         {
-            // Its own check, or a unique or filtered index, is probed over
+            // Its own check, or a unique index on columns, is probed over
             // its stored rows before the plan runs, and its parent's column
             // change reaches those rows first: a retype converts them, a
             // rename moves a name to another column. The probe knows the
@@ -3319,22 +3319,21 @@ fn refuse_partition_changes(
             // partition, so it would test values or columns the engine never
             // checks, and refuse a valid plan (DECISIONS 410, #1692 review,
             // until #1699). Two plans keep each probe over the rows it judges.
-            // What the probe reads: an index's or a check's whole text. A
+            // A plain index constrains nothing and a unique one over an
+            // expression is left unchecked, so neither is probed (#1692
+            // review). What the probe reads: a check's text, or the index's
+            // key columns and predicate. A
             // changed name found anywhere in it counts, quoted or not, so an
             // index or check on the partition's other columns alone stays
             // admitted (#1692 review). A Unicode-escaped identifier
             // (`U&"\0076"`) can spell any name without its letters, so a
             // text holding one counts as reading every changed name.
             let probed: Option<Vec<&str>> = if let Change::AddIndex { index, .. } = change {
-                (index.unique || index.filter.is_some()).then(|| {
+                (index.unique && index.column_keys().is_some()).then(|| {
                     index
                         .columns
                         .iter()
-                        .map(|c| match &c.key {
-                            pbps_model::IndexKey::Column(name)
-                            | pbps_model::IndexKey::Expression(name) => name.as_str(),
-                        })
-                        .chain(index.include.iter().map(String::as_str))
+                        .filter_map(|c| c.key.column())
                         .chain(index.filter.as_deref())
                         .collect()
                 })
@@ -7227,6 +7226,21 @@ mod tests {
             .unwrap();
         ix.columns[0].key = pbps_model::IndexKey::Column("id".into());
         planned(&unique_other, &[]);
+        // Negative: an index the pre-flight does not probe, a plain filtered
+        // one or a unique one over an expression, on the retyped column
+        // (#1692 review).
+        fn index_of<'s>(s: &'s mut Schema, a: &TableName) -> &'s mut pbps_model::Index {
+            s.tables.get_mut(a).unwrap().indexes.get_mut("a_m").unwrap()
+        }
+        let mut filtered = with(&retype_n, &keep_a, &keep_b);
+        own_unique(&mut filtered, false);
+        index_of(&mut filtered, &a).filter = Some("n > 0".into());
+        planned(&filtered, &[]);
+        let mut expression = with(&retype_n, &keep_a, &keep_b);
+        own_unique(&mut expression, true);
+        index_of(&mut expression, &a).columns[0].key =
+            pbps_model::IndexKey::Expression("(n + 1)".into());
+        planned(&expression, &[]);
         // A partition dropped while its parent's column tightens: the
         // pre-flight would count the doomed partition's rows (round 7).
         let mut dropped_b = with(
