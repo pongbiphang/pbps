@@ -4960,6 +4960,37 @@ fn refuse_unplanned_movement(
         }
     }
 
+    // A table a change works on but neither creates, drops, renames,
+    // attaches nor detaches stays, at every read: the shape comparison
+    // passes over every table a change names, so without this a table whose
+    // index the plan drops, gone with all its rows by a DDL trigger, was
+    // recorded as success. At every read and not only the closing one,
+    // since a staged run compares each read with the checkpoint before it,
+    // and a table gone at one checkpoint would be gone from the next one's
+    // `before` (DEC-1687.2).
+    let presence_planned: BTreeSet<&TableName> = changes
+        .changes
+        .iter()
+        .flat_map(|p| p.change.tables_after())
+        .map(|(t, _)| t)
+        .collect();
+    let mut stays: BTreeSet<&TableName> = BTreeSet::new();
+    for p in &changes.changes {
+        if let Some(t) = p.change.table()
+            && before.tables.contains_key(t)
+            && !presence_planned.contains(t)
+        {
+            stays.insert(t);
+        }
+    }
+    for name in stays {
+        if !after.tables.contains_key(name) {
+            moved.push(format!(
+                "{name} is gone, and no change of this plan drops it"
+            ));
+        }
+    }
+
     // And the names the plan leaves standing or empty. Existence, for the
     // tables and roles themselves: a table's shape is answered for above,
     // entry by entry, and below for the entries this plan writes. A role
@@ -4972,26 +5003,6 @@ fn refuse_unplanned_movement(
         for p in &changes.changes {
             expected_tables.extend(p.change.tables_after());
             expected_roles.extend(p.change.roles_after());
-        }
-        // A table a change works on but neither drops nor renames stays: the
-        // shape comparison passes over every table a change names, so
-        // without this a table whose index the plan drops, gone with all its
-        // rows by a DDL trigger, was recorded as success (DEC-1687.2).
-        let mut stays: BTreeSet<&TableName> = BTreeSet::new();
-        for p in &changes.changes {
-            if let Some(t) = p.change.table()
-                && before.tables.contains_key(t)
-                && !expected_tables.contains_key(t)
-            {
-                stays.insert(t);
-            }
-        }
-        for name in stays {
-            if !after.tables.contains_key(name) {
-                moved.push(format!(
-                    "{name} is gone, and no change of this plan drops it"
-                ));
-            }
         }
         for (name, expected) in expected_tables {
             match (expected, after.tables.contains_key(name)) {
@@ -14338,8 +14349,17 @@ mod tests {
             format!("{e:#}").contains("app.t is gone, and no change of this plan drops it"),
             "{e:#}"
         );
-        // Negative: the table is there without the index.
+        // At a staged checkpoint too: the next read's `before` is this one,
+        // which would no longer hold the table (#1692 review).
+        let e = check(&drop_index, &Schema::default(), Settled::SoFar)
+            .expect_err("gone at a checkpoint");
+        assert!(
+            format!("{e:#}").contains("app.t is gone, and no change of this plan drops it"),
+            "{e:#}"
+        );
+        // Negative: the table is there without the index, at either read.
         check(&drop_index, &with_table(false), Settled::Whole).expect("as planned");
+        check(&drop_index, &with_table(false), Settled::SoFar).expect("as planned so far");
         // Negative: a plan that drops the table answers for it as before.
         let drop_table = plan(vec![
             Change::DropIndex {
@@ -14353,6 +14373,7 @@ mod tests {
             },
         ]);
         check(&drop_table, &Schema::default(), Settled::Whole).expect("dropped as planned");
+        check(&drop_table, &Schema::default(), Settled::SoFar).expect("dropped so far");
     }
 
     #[test]
