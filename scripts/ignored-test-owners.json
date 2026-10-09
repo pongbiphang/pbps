@@ -1325,6 +1325,7 @@
         "omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload",
         "pbps_sql_calls_no_operator_a_schema_user_could_add",
         "permission_versions_are_checked_before_planning_bootstrap_apply_and_resume",
+        "a_restrict_foreign_key_round_trips_and_its_actions_change_on_both_servers",
         "postgres_rename_impact_reaches_the_cli_as_advisory_and_requires_explicit_approval",
         "pull_adopts_a_cluster_role_only_once_this_database_grants_it_something",
         "pull_data_on_a_table_validate_refuses_leaves_it_out_and_reads_the_rest",

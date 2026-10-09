@@ -113,6 +113,10 @@ says how to add an entry here.
     at all. The key is therefore absent from the pull and present in the
     warnings, which is the shape every other unexpressible fact takes here.
 
+    *Amended by [DEC-1633.1](#dec-1633-1): `ReferentialAction` now has
+    `Restrict`, so a `RESTRICT` key is pulled as itself. The rule stands for an
+    action character the pull does not know.*
+
 <a id="decision-249"></a>
 
 249. **A foreign key's referenced columns are read out of
@@ -155,6 +159,9 @@ says how to add an entry here.
     other kind: the constraint itself is exactly what the model says, and what
     recreating it changes is which rows get checked. Carried and named, that is
     a plan that may fail on apply rather than one that lies.
+
+    *Amended by [DEC-1633.1](#dec-1633-1): `RESTRICT` is no longer such a
+    property. The model holds it, so its key is carried.*
 
 <a id="decision-252"></a>
 
@@ -616,3 +623,60 @@ again. `set_config('jit', 'off', true)` sits beside DECISIONS 254's settings:
 local to the transaction or savepoint DECISIONS 250 and 418 already unwind,
 so the statements an apply runs after a read are under the session's own
 `jit`.
+
+<a id="dec-1633-1"></a>
+
+**DEC-1633.1. A foreign key's `RESTRICT` is held as its own action,
+`restrict`, never mapped to `NO ACTION`, and SQL Server refuses it (#1633).**
+DECISIONS 248 left a `RESTRICT` key out of the pull because the model had no
+word for it. The measured surveys for #1616 found it common (pagila 12 keys,
+GitLab 19), and every such key was a table pbps could not fully adopt.
+
+The two actions differ in when the check runs. Measured on 16 and 18:
+- One statement that moves a referenced value away while another row takes
+  it over passes under `NO ACTION` and fails under `RESTRICT`.
+- With the key `DEFERRABLE INITIALLY DEFERRED`, deleting a referenced row and
+  inserting it again before `COMMIT` passes under `NO ACTION`, and `RESTRICT`
+  refuses the delete at once.
+- One statement deleting a parent row and the child row that references it
+  passes under both, so the difference is not "RESTRICT refuses more deletes".
+
+So the model gains `Restrict`, spelled `restrict` in a declaration:
+- PostgreSQL pulls `confdeltype` / `confupdtype` `r` as it, writes it back,
+  and emits `ON DELETE RESTRICT` / `ON UPDATE RESTRICT`.
+- Keys compare whole, so a change between `restrict` and `no_action` is the
+  drop and add any changed key is, through the same ordering and risk
+  classes as `cascade`.
+- An action character the pull does not know still leaves the key out and
+  names it (DECISIONS 248).
+- SQL Server has no `RESTRICT`. Its validation refuses `restrict` on delete
+  and on update, each by name, with `no_action` as the remedy, and its
+  emitter refuses one that reaches it anyway. Mapping it to `NO ACTION` would
+  apply a key that checks later than declared, which DECISIONS 248 exists to
+  prevent.
+- An older build cannot read the new word. The plan format moves to 33, the
+  state format to 22 (versions 6 to 21 stay readable), and the schema set to
+  35.
+
+pbps's own declared-data writes are unaffected. Each row write changes one
+row in a statement of its own, so no statement moves a referenced value away
+while another row takes it over. The two actions then decide each write
+alike, and pbps declares no deferred key.
+
+A project whose database has such a key, and which declared it as
+`no_action` to get past the old omission, now gets a plan that drops and adds
+the key with the action the database has. That is intended: the old
+declaration was the action the key did not have.
+
+Pinned by `a_restrict_foreign_key_is_held_and_an_unknown_action_is_left_out_and_named`
+and `a_referential_action_is_spelled_only_when_it_is_not_the_default`
+(`crates/pbps-pg/src/`), `a_restrict_action_is_not_equated_with_no_action`
+(`crates/pbps-diff/src/schema_diff.rs`),
+`a_restrict_foreign_key_action_round_trips` (`crates/pbps-load/src/fmt.rs`),
+`a_restrict_foreign_key_action_is_refused_on_sql_server` and
+`a_restrict_foreign_key_action_is_refused_not_rendered_as_no_action`
+(`crates/pbps-mssql/src/`), the live
+`what_the_model_cannot_hold_is_named_and_never_silently_dropped`
+(`crates/pbps-pg/tests/live.rs`), and the live
+`a_restrict_foreign_key_round_trips_and_its_actions_change_on_both_servers`
+(`crates/pbps-cli/tests/flow_pg.rs`), on 16 and 18.

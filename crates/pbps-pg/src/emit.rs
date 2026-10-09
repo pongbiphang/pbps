@@ -807,6 +807,7 @@ fn key_index_parameters(parameters: &BTreeMap<String, String>) -> Result<String,
 const fn referential_action(a: ReferentialAction) -> &'static str {
     match a {
         ReferentialAction::NoAction => "NO ACTION",
+        ReferentialAction::Restrict => "RESTRICT",
         ReferentialAction::Cascade => "CASCADE",
         ReferentialAction::SetNull => "SET NULL",
         ReferentialAction::SetDefault => "SET DEFAULT",
@@ -6726,6 +6727,11 @@ mod tests {
         ));
         assert!(loud.contains("ON DELETE SET DEFAULT"), "{loud}");
         assert!(loud.contains("ON UPDATE CASCADE"), "{loud}");
+        // #1633: `RESTRICT` is spelled, on either side, never left to read
+        // as the `NO ACTION` default.
+        let held = emit(fk(ReferentialAction::Restrict, ReferentialAction::Restrict));
+        assert!(held.contains("ON DELETE RESTRICT"), "{held}");
+        assert!(held.contains("ON UPDATE RESTRICT"), "{held}");
     }
 
     /// A name is quoted wherever it goes, including inside the `DO` block that

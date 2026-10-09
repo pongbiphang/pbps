@@ -1026,6 +1026,11 @@ pub struct ForeignKey {
 pub enum ReferentialAction {
     #[default]
     NoAction,
+    // PostgreSQL's: checked as each row is changed, never at the end of the
+    // statement nor deferred, so it is not `NoAction` (DEC-1633.1). SQL
+    // Server has none, and its validation refuses it. A plain comment, so
+    // the published schema keeps one flat enum of words.
+    Restrict,
     Cascade,
     SetNull,
     SetDefault,

@@ -1657,13 +1657,22 @@ fn unique_clause(
     ))
 }
 
-fn referential_action(a: ReferentialAction) -> &'static str {
-    match a {
+/// `RESTRICT` is PostgreSQL's: SQL Server has no such action, and `validate`
+/// refuses it before a plan exists. One that arrives here anyway is refused
+/// rather than spelled as `NO ACTION`, which checks later (DEC-1633.1).
+fn referential_action(a: ReferentialAction) -> Result<&'static str, DialectError> {
+    Ok(match a {
         ReferentialAction::NoAction => "NO ACTION",
         ReferentialAction::Cascade => "CASCADE",
         ReferentialAction::SetNull => "SET NULL",
         ReferentialAction::SetDefault => "SET DEFAULT",
-    }
+        ReferentialAction::Restrict => {
+            return Err(DialectError::Unsupported {
+                dialect: DIALECT,
+                feature: "a `restrict` foreign-key action, which is PostgreSQL's".into(),
+            });
+        }
+    })
 }
 
 fn foreign_key_clause(name: &str, fk: &ForeignKey) -> Result<String, DialectError> {
@@ -1677,10 +1686,10 @@ fn foreign_key_clause(name: &str, fk: &ForeignKey) -> Result<String, DialectErro
     // NO ACTION is the default, and spelling out a default adds noise to a plan
     // a human has to read at a deployment gate.
     if fk.on_delete != ReferentialAction::NoAction {
-        s.push_str(&format!(" ON DELETE {}", referential_action(fk.on_delete)));
+        s.push_str(&format!(" ON DELETE {}", referential_action(fk.on_delete)?));
     }
     if fk.on_update != ReferentialAction::NoAction {
-        s.push_str(&format!(" ON UPDATE {}", referential_action(fk.on_update)));
+        s.push_str(&format!(" ON UPDATE {}", referential_action(fk.on_update)?));
     }
     Ok(s)
 }
@@ -4552,6 +4561,35 @@ mod tests {
             assert!(feature.contains("dbo.charge(int)"), "{feature}");
             assert!(feature.contains("ordinary database role"), "{feature}");
         }
+    }
+
+    /// #1633: `RESTRICT` is PostgreSQL's. A key carrying it that reaches this
+    /// emitter past `validate` is refused, on either side, never spelled as
+    /// `NO ACTION`, which checks later; `no_action` still renders.
+    #[test]
+    fn a_restrict_foreign_key_action_is_refused_not_rendered_as_no_action() {
+        use pbps_model::ReferentialAction::{NoAction, Restrict};
+        let add = |on_delete, on_update| Change::AddForeignKey {
+            table: tname("dbo.t"),
+            name: "fk_t".into(),
+            constraint: Box::new(pbps_model::ForeignKey {
+                columns: vec!["a".into()],
+                references_table: tname("dbo.p"),
+                references_columns: vec!["id".into()],
+                on_delete,
+                on_update,
+            }),
+        };
+        for change in [add(Restrict, NoAction), add(NoAction, Restrict)] {
+            let e = emit(&change, Strategy::default()).unwrap_err();
+            let DialectError::Unsupported { feature, .. } = &e else {
+                panic!("not unsupported: {e:?}");
+            };
+            assert!(feature.contains("restrict"), "{feature}");
+        }
+        let plain = sql_of(&add(NoAction, NoAction)).join("\n");
+        assert!(plain.contains("FOREIGN KEY"), "{plain}");
+        assert!(!plain.contains("RESTRICT"), "{plain}");
     }
 
     /// A word the model holds for PostgreSQL (ADR-0010 §6) is never rendered

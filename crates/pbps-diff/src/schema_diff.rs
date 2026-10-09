@@ -14290,6 +14290,40 @@ mod tests {
         );
     }
 
+    /// #1633: `RESTRICT` is not `NO ACTION`, so a key changed from one to the
+    /// other, on delete or on update, is dropped and added again, as any
+    /// changed key is. An identical `RESTRICT` key is no change.
+    #[test]
+    fn a_restrict_action_is_not_equated_with_no_action() {
+        use pbps_model::ReferentialAction::{NoAction, Restrict};
+        let keyed = |on_delete, on_update| {
+            let mut product = sku_table();
+            product
+                .unique
+                .insert("uq_product_sku".into(), unique(&["sku"]));
+            let mut order_line = sku_table();
+            let mut key = fk(&["sku"], "dbo.product", &["sku"]);
+            key.on_delete = on_delete;
+            key.on_update = on_update;
+            order_line.foreign_keys.insert("fk_ol_product".into(), key);
+            two_tables(("dbo.product", product), ("dbo.order_line", order_line))
+        };
+        let plain = keyed(NoAction, NoAction);
+        for changed in [keyed(Restrict, NoAction), keyed(NoAction, Restrict)] {
+            assert_eq!(
+                kinds(&run(&plain, &changed, &[])),
+                ["DropForeignKey", "AddForeignKey"]
+            );
+            assert_eq!(
+                kinds(&run(&changed, &plain, &[])),
+                ["DropForeignKey", "AddForeignKey"]
+            );
+        }
+        // Negative: the same `RESTRICT` key on both sides.
+        let held = keyed(Restrict, Restrict);
+        assert!(run(&held, &keyed(Restrict, Restrict), &[]).is_empty());
+    }
+
     /// A unique **index** is a supplier too. Measured: SQL Server accepts a
     /// foreign key referencing a plain `CREATE UNIQUE INDEX`, with no `UNIQUE`
     /// constraint anywhere — so ranking only the constraint pair would leave
