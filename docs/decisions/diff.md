@@ -4233,3 +4233,54 @@ partition's index is attached by hand, which is not one statement.
 Pinned by `a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken`
 and by the CLI's `a_partitioned_parents_indexes_change_through_the_cli`, on 18
 and on 16.
+
+<a id="dec-1689-1"></a>
+
+**DEC-1689.1. A standing range-partitioned parent's primary key, unique
+constraints, checks and foreign keys are added and dropped as a table's are,
+the engine recursing each into every partition, and two combinations are
+refused by name (#1689).**
+
+The third of #1546's four slices (leon, 2026-10-08). Measured on 16.15 and
+18.6, on a populated tree:
+- **Keys.** A primary key or unique constraint added to the parent recurses,
+  each partition getting the engine's clone. One without every
+  partition-key column is refused: "unique constraint on partitioned table
+  must include all partitioning columns". A drop takes the clones with it.
+- **Checks.** A check recurses as a clone. A partition's own check under
+  the same name and expression is absorbed into it: it becomes inherited,
+  and the parent's later drop removes it. With another expression, the
+  engine refuses the add.
+- **Foreign keys.** A foreign key from the parent recurses. A foreign key
+  referencing the parent works. `NOT VALID` on one from the parent is
+  refused on 16 and accepted on 18. The PostgreSQL emitter never writes
+  `NOT VALID`, so the issue's refusal on 16 has nothing to refuse.
+- **A partition's own key.** A parent key adopts a partition's own key, and
+  a parent's unique index adopts the index behind one. Neither case is
+  reachable: a partition entry declares no key of its own (the loader
+  rejects one), and the reader refuses a tree whose partition holds one
+  (#1170). So DEC-1688.1's guard needs nothing more.
+
+**What is planned.** On a parent standing before and after the plan:
+`SetPrimaryKey`, `AddUnique`, `DropUnique`, `AddCheck`, `DropCheck`,
+`AddForeignKey` and `DropForeignKey`, with no new kind of change. A foreign
+key from another table referencing the parent was never refused, since its
+change is the other table's. The pre-flight probes a new key or check over
+the parent, which reads every partition's rows. `strategy: online` asks
+nothing of these, as on any table: only an index honours it (`emit.rs`).
+
+**Refused by name, before any DDL:**
+- **a primary key or unique constraint without every partition-key
+  column**, naming the missing column;
+- **a new check under a name a declared partition holds as its own** (leon,
+  2026-10-08, on #1546). The remedy is to drop or rename the partition's own
+  check in an earlier plan. Only the name is asked, since the engine merges
+  or refuses on the name alone;
+- **any of these in a plan that attaches, detaches or drops a partition
+  under the parent**, the two plans DEC-1687.1 and DEC-1688.1 already
+  require.
+
+Pinned by `a_partitioned_parents_keys_checks_and_foreign_keys_change`, and by
+the CLI's
+`a_partitioned_parents_keys_checks_and_foreign_keys_change_through_the_cli`,
+on 18 and on 16.

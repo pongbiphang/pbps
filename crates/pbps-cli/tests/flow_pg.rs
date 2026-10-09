@@ -19513,6 +19513,187 @@ fn partition_inheritance_flow(server: &str, slug: &str) {
     );
 }
 
+/// A standing range-partitioned parent's keys, checks and foreign keys
+/// change through the CLI (#1689), on a tree holding rows: a primary key, a
+/// unique constraint, a check and a foreign key added together, each
+/// reaching every partition as the engine's clone; a foreign key from
+/// another table referencing the parent; then the parent's own dropped. Each
+/// verifies and replans empty. A check the rows of one partition violate is
+/// refused by the pre-flight before any DDL, and at plan time, by name: a
+/// key without the partition key column, and a check under a name a
+/// partition holds as its own.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_partitioned_parents_keys_checks_and_foreign_keys_change_through_the_cli() {
+    parent_keys_flow(&server(), "parent-keys-1689");
+}
+
+/// [`a_partitioned_parents_keys_checks_and_foreign_keys_change_through_the_cli`]
+/// on a pre-17 server.
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn a_partitioned_parents_keys_checks_and_foreign_keys_change_through_the_cli_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    parent_keys_flow(&server, "parent-keys-1689-old");
+}
+
+fn parent_keys_flow(server: &str, slug: &str) {
+    let db = OwnDatabase::new(server, slug);
+    let conn = db.connection().to_owned();
+    on_server(
+        &conn,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ref (id integer PRIMARY KEY); \
+         INSERT INTO app.ref VALUES (1), (2), (500); \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, r integer) \
+             PARTITION BY RANGE (ts); \
+         CREATE TABLE app.ev_2024 PARTITION OF app.ev \
+             FOR VALUES FROM ('2024-01-01') TO ('2025-01-01'); \
+         CREATE TABLE app.ev_2025 PARTITION OF app.ev \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
+         ALTER TABLE app.ev_2025 ADD CONSTRAINT ev_2025_ck CHECK (r > 0); \
+         INSERT INTO app.ev VALUES (1, '2024-06-01', 1), (2, '2025-06-01', 2); \
+         CREATE TABLE app.child (id integer NOT NULL, ts date NOT NULL); \
+         INSERT INTO app.child VALUES (1, '2024-06-01')",
+    );
+    let d = Demo::new(slug);
+    succeeds(d.run(&["pull", "--db", &conn]));
+    let path = d.dir.join("schema/app.ev.yml");
+    let child = d.dir.join("schema/app.child.yml");
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+    let edit = |file: &std::path::Path, from: &str, to: &str| {
+        let text = std::fs::read_to_string(file).unwrap();
+        assert!(text.contains(from), "{from:?} in {text}");
+        std::fs::write(file, text.replacen(from, to, 1)).unwrap();
+    };
+    let applied = |name: &str| {
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join(name);
+        let o = succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+        let planned = stdout(&o);
+        succeeds(approved_apply(
+            &d,
+            &conn,
+            &plan,
+            &["--allow", "destructive,constraint"],
+        ));
+        succeeds(d.run(&["verify", "--db", &conn]));
+        let next = succeeds(d.run(&["plan", "--db", &conn]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        planned
+    };
+    let refused = |what: &str| {
+        let o = d.run(&["plan"]);
+        assert_ne!(code(&o), 0, "{}", stdout(&o));
+        assert!(stderr(&o).contains(what), "{}", stderr(&o));
+    };
+    let holds = |sql: &str| scalar(&conn, &format!("SELECT ({sql})::int::int8"));
+    // The partitions' constraints of a kind that are the parent's clones.
+    let clones = |kind: &str| {
+        holds(&format!(
+            "SELECT count(*) FROM pg_constraint WHERE contype = '{kind}' \
+             AND conrelid IN ('app.ev_2024'::regclass, 'app.ev_2025'::regclass) \
+             AND (conparentid <> 0 OR NOT conislocal)"
+        ))
+    };
+
+    // Added together: each reaches both partitions.
+    edit(
+        &path,
+        "\npartition_by:",
+        "\nprimary_key: [id, ts]\nunique:\n  ev_u: [id, r, ts]\nchecks:\n  ev_r_ck: r > 0\n\
+         foreign_keys:\n  ev_r_fk:\n    columns: [r]\n    references: app.ref(id)\n\npartition_by:",
+    );
+    let planned = applied("add.json");
+    assert!(
+        planned.contains("recurses into its 2 partition(s)"),
+        "{planned}"
+    );
+    for kind in ["p", "u", "c", "f"] {
+        assert_eq!(clones(kind), 2, "{kind}");
+    }
+    // A foreign key from another table referencing the parent.
+    edit(
+        &child,
+        "\n",
+        "\nforeign_keys:\n  child_ev_fk:\n    columns: [id, ts]\n    references: app.ev(id, ts)\n",
+    );
+    applied("referenced.json");
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_constraint WHERE conname = 'child_ev_fk'"),
+        1
+    );
+
+    // A check one partition's rows violate: refused by the pre-flight, nothing
+    // changed.
+    on_server(&conn, "INSERT INTO app.ev VALUES (3, '2025-07-01', 500)");
+    edit(
+        &path,
+        "  ev_r_ck: r > 0\n",
+        "  ev_r_ck: r > 0\n  ev_r_max: r < 100\n",
+    );
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let violates = d.dir.join("violates.json");
+    succeeds(d.run(&["plan", "--db", &conn, "--out", violates.to_str().unwrap()]));
+    let o = approved_apply(&d, &conn, &violates, &["--allow", "destructive,constraint"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("violate the new check ev_r_max"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_constraint WHERE conname = 'ev_r_max'"),
+        0
+    );
+    on_server(&conn, "DELETE FROM app.ev WHERE id = 3");
+    applied("checked.json");
+    assert_eq!(clones("c"), 4);
+
+    // Dropped: the parent's unique, checks and foreign key, with their clones.
+    edit(
+        &path,
+        "unique:\n  ev_u: [id, r, ts]\nchecks:\n  ev_r_ck: r > 0\n  ev_r_max: r < 100\n\
+         foreign_keys:\n  ev_r_fk:\n    columns: [r]\n    references: app.ref(id)\n",
+        "",
+    );
+    applied("drop.json");
+    for kind in ["u", "c", "f"] {
+        assert_eq!(clones(kind), 0, "{kind}");
+    }
+    assert_eq!(clones("p"), 2, "the key the child references stays");
+    // The partition's own check is still its own.
+    assert_eq!(
+        holds(
+            "SELECT count(*) FROM pg_constraint WHERE conname = 'ev_2025_ck' AND conislocal \
+             AND coninhcount = 0"
+        ),
+        1
+    );
+
+    // Refused by name, before any DDL: a key without the partition key
+    // column, and a check under the name of a partition's own.
+    edit(
+        &path,
+        "\npartition_by:",
+        "\nunique:\n  ev_id: [id]\n\npartition_by:",
+    );
+    refused("without the partition key column `ts`");
+    edit(
+        &path,
+        "\nunique:\n  ev_id: [id]\n",
+        "\nchecks:\n  ev_2025_ck: r > 0\n",
+    );
+    refused("a name app.ev_2025 holds as its own check");
+}
+
 /// A standing range-partitioned parent's indexes change through the CLI
 /// (#1688), on a tree holding rows: an index added, renamed (a drop and an
 /// add) and dropped, and a unique one over the key column, each reaching

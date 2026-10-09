@@ -85,9 +85,9 @@ refused from the catalog (#1595, DEC-1595.1). An ordinary table declared
 in its parent's `partitions:` with its parent's columns is attached with its
 rows, after a pre-flight count of the rows its range does not take (#1545,
 DEC-1545.1). A standing parent's columns change, recursed into every partition
-(#1687, DEC-1687.1), and its indexes are added and dropped (#1688,
-DEC-1688.1). Its keys, checks, foreign keys and rename stay refused by name
-(#1689–#1690), as do moving DEFAULT-partition rows (#1547) and attaching as the
+(#1687, DEC-1687.1), and its indexes (#1688, DEC-1688.1), keys, checks and
+foreign keys (#1689, DEC-1689.1) are added and dropped. Its rename stays refused
+by name (#1690), as do moving DEFAULT-partition rows (#1547) and attaching as the
 DEFAULT partition (#1639).
 
 A SQL Server column may name its collation (`collation:`); `pull` declares one
