@@ -86,7 +86,7 @@ pub struct ScratchStandard {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "connection_limit"
     )]
-    #[schemars(range(min = -1))]
+    #[schemars(schema_with = "connection_limit_schema")]
     pub connection_limit: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public: Option<PublicStandard>,
@@ -113,6 +113,7 @@ pub struct PublicGrant {
     #[serde(deserialize_with = "role_name")]
     #[schemars(length(min = 1))]
     pub to: String,
+    #[serde(deserialize_with = "privileges")]
     #[schemars(length(min = 1))]
     pub privileges: Vec<SchemaPrivilege>,
 }
@@ -193,6 +194,29 @@ fn connection_limit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i32
         Err(serde::de::Error::custom(
             "a scratch connection_limit is -1 or at least 1; 0 would lock the scratch account out",
         ))
+    }
+}
+
+/// The domain [`connection_limit`] admits, so an editor refuses what the
+/// loader refuses: `0`, below `-1`, and `null`.
+fn connection_limit_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "integer",
+        "format": "int32",
+        "anyOf": [{ "const": -1 }, { "minimum": 1, "maximum": i32::MAX }]
+    })
+}
+
+/// A grant of nothing is no grant; the schema says `minItems: 1`, and the
+/// loader agrees, so an echoed profile never fails its own schema.
+fn privileges<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<SchemaPrivilege>, D::Error> {
+    let value = Vec::<SchemaPrivilege>::deserialize(d)?;
+    if value.is_empty() {
+        Err(serde::de::Error::custom(
+            "a grant names at least one privilege",
+        ))
+    } else {
+        Ok(value)
     }
 }
 
@@ -477,6 +501,8 @@ mod tests {
             "{connection_limit: -2}",
             "{public: {grants: [{to: '', privileges: [USAGE]}]}}",
             "{public: {grants: [{to: r, privileges: [SELECT]}]}}",
+            "{public: {grants: [{to: r, privileges: []}]}}",
+            "{connection_limit: null}",
             "{settings: {work_mem: [1, 2]}}",
             // One setting in two spellings: the engine reads them as one.
             "{settings: {TimeZone: UTC, timezone: GMT}}",

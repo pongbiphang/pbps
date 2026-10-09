@@ -398,6 +398,31 @@ mod tests {
                 serde_json::json!({"kind": "docker", "image": "pg:18", "verified": true}),
                 false,
             ),
+            // A scratch standard's domain, in both (#1708 review).
+            (
+                serde_json::json!({"kind": "server", "url_env": "S", "standard": {"connection_limit": -1, "public": {"grants": [{"to": "r", "privileges": ["USAGE"]}]}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "server", "url_env": "S", "standard": {"connection_limit": 1}}),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "server", "url_env": "S", "standard": {"connection_limit": 0}}),
+                false,
+            ),
+            (
+                serde_json::json!({"kind": "server", "url_env": "S", "standard": {"connection_limit": -2}}),
+                false,
+            ),
+            (
+                serde_json::json!({"kind": "server", "url_env": "S", "standard": {"connection_limit": null}}),
+                false,
+            ),
+            (
+                serde_json::json!({"kind": "server", "url_env": "S", "standard": {"public": {"grants": [{"to": "r", "privileges": []}]}}}),
+                false,
+            ),
         ] {
             let config =
                 serde_json::json!({"dialect": "postgres", "resolvers": {"scratch": profile}});

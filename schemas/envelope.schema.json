@@ -611,12 +611,17 @@
         },
         "connection_limit": {
           "description": "`-1` for no limit. Never `0`, which would lock the scratch account out\nof its own database.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
           "format": "int32",
-          "minimum": -1
+          "anyOf": [
+            {
+              "const": -1
+            },
+            {
+              "minimum": 1,
+              "maximum": 2147483647
+            }
+          ]
         },
         "public": {
           "anyOf": [
