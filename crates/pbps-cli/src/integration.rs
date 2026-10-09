@@ -41,7 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 35;
+pub const SCHEMA_VERSION: u32 = 36;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
@@ -49,6 +49,7 @@ pub const SCHEMA_VERSION: u32 = 35;
 // 32: a partition's own `checks:` and `indexes:` under `partitions:` (issue #1577).
 // 33: a partition's own `columns:` defaults and NOT NULLs under `partitions:` (issue #1578).
 // 35: a foreign key's `restrict` action (issue #1633).
+// 36: a server resolver's scratch `standard:` (issue #1708).
 // 26: index, key and unique-constraint `storage_parameters` (issue #1442).
 // 25: a table's `storage_parameters:` (issue #1441).
 // 24: a table's `replica_identity:` (issue #1444).
@@ -542,7 +543,8 @@ mod tests {
     ///
     /// `ResolverProfile` is the configuration's own type, echoed by a connected
     /// plan's resolver selection, and stays closed so `pbps.yml` refuses a
-    /// misspelt key. `Discovery`'s two maps accept new keys whose values are
+    /// misspelt key; so do the server entry's `standard:` types within it
+    /// (#1708). `Discovery`'s two maps accept new keys whose values are
     /// `Observation`s, and nothing else.
     #[test]
     fn only_the_named_envelope_objects_constrain_unnamed_properties() {
@@ -553,8 +555,11 @@ mod tests {
             [
                 "Discovery/properties/observations",
                 "Discovery/properties/qualification",
+                "PublicGrant",
+                "PublicStandard",
                 "ResolverProfile/oneOf/0",
                 "ResolverProfile/oneOf/1",
+                "ScratchStandard",
             ]
         );
     }

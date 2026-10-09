@@ -257,7 +257,7 @@ mod producer {
         // A supplied server is the operator-vouched resolver (DEC-1528.1);
         // Docker stays the measured profile until #1674 gives it a vouched
         // runtime.
-        if let pbps_config::resolver::ResolverProfile::Server { url_env } =
+        if let pbps_config::resolver::ResolverProfile::Server { url_env, standard } =
             &request.selection.profile
         {
             let scratch = scratch_connection(request, url_env)?;
@@ -278,6 +278,7 @@ mod producer {
                 &[],
                 request.project,
                 request.target.environment(),
+                &pbps_cli::resolver::server::vouched::declared_standard(standard.as_ref()),
             )
             .await
             .map(|resolved| resolved.changes)
@@ -423,6 +424,7 @@ mod tests {
         });
         let server = selection(ResolverProfile::Server {
             url_env: "PBPS_UNUSED".into(),
+            standard: None,
         });
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -521,6 +523,7 @@ mod tests {
             source: pbps_config::resolver::SelectionSource::Cli,
             profile: pbps_config::resolver::ResolverProfile::Server {
                 url_env: "PBPS_RESOLVER_UNSET_1515".into(),
+                standard: None,
             },
             status: pbps_config::resolver::SelectionStatus::NotAcquired,
         }

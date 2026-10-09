@@ -256,6 +256,17 @@
               "type": "string",
               "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
             },
+            "standard": {
+              "description": "The state the scratch database is put into at the start of each\nrun and back into at release, where it differs from what\n`CREATE DATABASE ... TEMPLATE template0` makes (#1708). Omitted, a\nrun uses that.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ScratchStandard"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "kind": {
               "type": "string",
               "const": "server"
@@ -281,6 +292,100 @@
           "type": "string",
           "const": "if_missing"
         }
+      ]
+    },
+    "ScratchStandard": {
+      "description": "A scratch database's declared standard state. Only what the scratch\naccount can change and `DROP OWNED` does not undo is declarable: the\ndatabase's settings, comment and connection limit, and `public`'s\ncomment and grants. The database's own ACL is not: the run keeps it as\nit found it (DEC-1708.1).",
+      "type": "object",
+      "properties": {
+        "settings": {
+          "description": "`ALTER DATABASE <scratch> SET`: operational settings such as\ntimeouts. The settings that decide the resolver's answer come from the\ntarget, as the deployer's session settings, and override these.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SettingValue"
+          }
+        },
+        "comment": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "connection_limit": {
+          "description": "`-1` for no limit. Never `0`, which would lock the scratch account out\nof its own database.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32",
+          "minimum": -1
+        },
+        "public": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicStandard"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "SettingValue": {
+      "type": [
+        "string",
+        "number",
+        "boolean"
+      ]
+    },
+    "PublicStandard": {
+      "description": "initdb's `public` schema in the scratch database.",
+      "type": "object",
+      "properties": {
+        "comment": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "grants": {
+          "description": "Granted by `public`'s owner, beyond initdb's `USAGE` to `PUBLIC`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PublicGrant"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "PublicGrant": {
+      "type": "object",
+      "properties": {
+        "to": {
+          "type": "string",
+          "minLength": 1
+        },
+        "privileges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SchemaPrivilege"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "to",
+        "privileges"
+      ]
+    },
+    "SchemaPrivilege": {
+      "type": "string",
+      "enum": [
+        "USAGE",
+        "CREATE"
       ]
     },
     "Policies": {

@@ -49,7 +49,156 @@ pub enum ResolverProfile {
         #[serde(deserialize_with = "variable_name")]
         #[schemars(regex(pattern = "^[A-Za-z_][A-Za-z0-9_]*$"))]
         url_env: String,
+        /// The state the scratch database is put into at the start of each
+        /// run and back into at release, where it differs from what
+        /// `CREATE DATABASE ... TEMPLATE template0` makes (#1708). Omitted, a
+        /// run uses that.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        standard: Option<ScratchStandard>,
     },
+}
+
+/// A scratch database's declared standard state. Only what the scratch
+/// account can change and `DROP OWNED` does not undo is declarable: the
+/// database's settings, comment and connection limit, and `public`'s
+/// comment and grants. The database's own ACL is not: the run keeps it as
+/// it found it (DEC-1708.1).
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ScratchStandard {
+    /// `ALTER DATABASE <scratch> SET`: operational settings such as
+    /// timeouts. The settings that decide the resolver's answer come from the
+    /// target, as the deployer's session settings, and override these.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub settings: std::collections::BTreeMap<String, SettingValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// `-1` for no limit. Never `0`, which would lock the scratch account out
+    /// of its own database.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "connection_limit"
+    )]
+    #[schemars(range(min = -1))]
+    pub connection_limit: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public: Option<PublicStandard>,
+}
+
+/// initdb's `public` schema in the scratch database.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct PublicStandard {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Granted by `public`'s owner, beyond initdb's `USAGE` to `PUBLIC`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<PublicGrant>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct PublicGrant {
+    #[serde(deserialize_with = "role_name")]
+    #[schemars(length(min = 1))]
+    pub to: String,
+    #[schemars(length(min = 1))]
+    pub privileges: Vec<SchemaPrivilege>,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SchemaPrivilege {
+    Usage,
+    Create,
+}
+
+impl SchemaPrivilege {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Usage => "USAGE",
+            Self::Create => "CREATE",
+        }
+    }
+}
+
+/// A setting's value, written as YAML writes it: a string, a number or a
+/// boolean, kept as the text the engine is given.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct SettingValue(pub String);
+
+impl<'de> serde::Deserialize<'de> for SettingValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Scalar {
+            Bool(bool),
+            Int(i64),
+            Real(f64),
+            Text(String),
+        }
+        Ok(Self(
+            match Scalar::deserialize(d).map_err(|_| {
+                serde::de::Error::custom(
+                    "a setting's value must be a string, a number or a boolean",
+                )
+            })? {
+                Scalar::Bool(value) => value.to_string(),
+                Scalar::Int(value) => value.to_string(),
+                Scalar::Real(value) => value.to_string(),
+                Scalar::Text(value) => value,
+            },
+        ))
+    }
+}
+
+impl schemars::JsonSchema for SettingValue {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SettingValue".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": ["string", "number", "boolean"] })
+    }
+}
+
+fn connection_limit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error> {
+    let value = i32::deserialize(d)?;
+    if value == -1 || value >= 1 {
+        Ok(Some(value))
+    } else {
+        Err(serde::de::Error::custom(
+            "a scratch connection_limit is -1 or at least 1; 0 would lock the scratch account out",
+        ))
+    }
+}
+
+fn role_name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let value = String::deserialize(d)?;
+    if value.is_empty() {
+        Err(serde::de::Error::custom("a grant names a role"))
+    } else {
+        Ok(value)
+    }
 }
 
 fn image_reference<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -241,6 +390,7 @@ mod tests {
             "{kind: docker, image: ''}",
             "{kind: docker, image: 'postgres:18 --privileged'}",
             "{kind: unknown}",
+            "{kind: docker, image: postgres:18, standard: {comment: c}}",
         ] {
             assert!(
                 Config::parse(
@@ -249,6 +399,87 @@ mod tests {
                 )
                 .is_err(),
                 "{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_entry_declares_its_scratch_standard_with_scalar_settings() {
+        let parsed = Config::parse(
+            "dialect: postgres\nresolvers:\n  scratch:\n    kind: server\n    url_env: S\n    standard:\n      settings:\n        statement_timeout: 5min\n        work_mem: 64\n        jit: false\n        random_page_cost: 1.5\n      comment: pbps scratch\n      connection_limit: 10\n      public:\n        comment: ours\n        grants:\n          - {to: ci_reader, privileges: [USAGE, CREATE]}\n",
+            Path::new("pbps.yml"),
+        )
+        .unwrap();
+        let ResolverProfile::Server {
+            standard: Some(standard),
+            ..
+        } = &parsed.resolvers["scratch"]
+        else {
+            panic!("a server entry with a standard");
+        };
+        let settings: Vec<(&str, &str)> = standard
+            .settings
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.0.as_str()))
+            .collect();
+        assert_eq!(
+            settings,
+            [
+                ("jit", "false"),
+                ("random_page_cost", "1.5"),
+                ("statement_timeout", "5min"),
+                ("work_mem", "64"),
+            ]
+        );
+        assert_eq!(standard.connection_limit, Some(10));
+        let public = standard.public.as_ref().unwrap();
+        assert_eq!(
+            public.grants[0].privileges,
+            [SchemaPrivilege::Usage, SchemaPrivilege::Create]
+        );
+        // Omitted: no standard of its own, so the built-in one.
+        assert!(matches!(
+            config("").resolvers["scratch"],
+            ResolverProfile::Server { standard: None, .. }
+        ));
+    }
+
+    #[test]
+    fn a_scratch_standard_refuses_what_it_cannot_mean() {
+        for standard in [
+            // An unknown key is refused, never ignored (SPEC 4.3).
+            "{acl: []}",
+            "{public: {owner: me}}",
+            "{public: {grants: [{to: r, privileges: [USAGE], option: true}]}}",
+            // 0 locks the scratch account out of its own database.
+            "{connection_limit: 0}",
+            "{connection_limit: -2}",
+            "{public: {grants: [{to: '', privileges: [USAGE]}]}}",
+            "{public: {grants: [{to: r, privileges: [SELECT]}]}}",
+            "{settings: {work_mem: [1, 2]}}",
+        ] {
+            assert!(
+                Config::parse(
+                    &format!(
+                        "dialect: postgres\nresolvers:\n  s:\n    kind: server\n    url_env: S\n    standard: {standard}\n"
+                    ),
+                    Path::new("pbps.yml")
+                )
+                .is_err(),
+                "{standard}"
+            );
+        }
+        // Negative: the limits a standard may hold.
+        for limit in ["-1", "1"] {
+            assert!(
+                Config::parse(
+                    &format!(
+                        "dialect: postgres\nresolvers:\n  s:\n    kind: server\n    url_env: S\n    standard: {{connection_limit: {limit}}}\n"
+                    ),
+                    Path::new("pbps.yml")
+                )
+                .is_ok(),
+                "{limit}"
             );
         }
     }
