@@ -217,16 +217,28 @@ The primary agent owns this ordered closeout (DEC-1228.1):
    metadata activity alone is not failed closeout. A missing anchor, hidden or
    incomplete history, inconsistent state or ambiguous timestamp ordering stops
    cleanup; do not substitute a delay or unbounded polling (DEC-1473.1).
-   A newly discovered parent-dependent PR fails closeout even
+   For a proven parent association, first apply DEC-1475.1: preserve a deliberate
+   independent closure strictly before the deletion request, regardless of age.
+   Retain complete closure/reopen/base history, available actors/times, linked
+   deliberate-close evidence and the closure head/content baseline. Actor or
+   timestamp alone is insufficient. Require unchanged closed state/base/head/
+   content through the final read and no later reopen or renewed association.
+   Proven unrelated reopen/close activity needs no recovery. Outside that
+   exemption, a newly discovered parent-dependent PR fails closeout even
    if it is now closed or already has the intended base. Retain its observed
    state/base/head/diff; do not invent an earlier head or expected patch.
    Inspect commit provenance and expected remaining work before recovery.
-   An unchanged older PR demonstrably closed before the window is not a
-   closeout failure. Failed, incomplete or ambiguous evidence stops local
+   The same independent-closure exemption applies to PRs closed before the
+   window. Failed, incomplete or ambiguous evidence stops local
    cleanup. To restore a deleted parent, use an atomic missing-ref lease for
    the exact recorded owned head; a recreated changed or foreign ref must
-   never be overwritten. Reopen, explicitly retarget and verify affected
-   dependents, then repeat the checks before retrying deletion (DEC-1458.1).
+   never be overwritten. Reopen only a PR proven closed by this deletion;
+   explicitly retarget and verify affected open dependents before retrying.
+   Unknown cause or ambiguous ordering stops cleanup and PR recovery mutations;
+   obtain missing evidence or the collaborator's direction before reopening.
+   A later reopen, changed head/content or renewed parent association invalidates
+   the exemption and requires fresh state/base/head/expected patch checks
+   (DEC-1458.1, DEC-1475.1).
    A successfully verified empty set needs no retargeting, but both the
    pre-delete enumeration and this all-state check must succeed.
 5. Refresh each dependent's existing review and current-head CI evidence after
