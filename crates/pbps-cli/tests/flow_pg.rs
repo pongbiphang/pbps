@@ -17146,13 +17146,26 @@ fn a_staged_or_bootstrapped_definer_routine_without_a_pinned_path_is_refused_bef
     .unwrap();
     succeeds(b.run(&["plan"]));
     b.commit();
-    let refused = b.run(&["bootstrap", "--db", fresh.connection()]);
+    // Refused after the build ran, so after every check before it: a script
+    // the command was asked for keeps what it held (#1684).
+    let sql = b.dir.join("bootstrap.sql");
+    let before = "-- the script from an earlier run\n";
+    std::fs::write(&sql, before).unwrap();
+    let refused = b.run(&[
+        "bootstrap",
+        "--sql",
+        sql.to_str().unwrap(),
+        "--db",
+        fresh.connection(),
+    ]);
     assert_ne!(code(&refused), 0, "{}", stdout(&refused));
     assert!(
         stderr(&refused).contains("sets no search_path"),
         "{}",
         stderr(&refused)
     );
+    assert!(!stdout(&refused).contains("wrote"), "{}", stdout(&refused));
+    assert_eq!(std::fs::read_to_string(&sql).unwrap(), before);
     assert!(!routine_exists(fresh.connection(), "app.boot()"));
     assert_eq!(
         scalar(

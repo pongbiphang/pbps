@@ -5816,12 +5816,24 @@ pub fn cmd_bootstrap(
     crate::dependents::later_relation_refusal(&refused)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
 
-    if let Some(path) = sql_out {
-        let script = crate::render_sql(&cs, dialect.as_ref(), "an empty database")?;
-        std::fs::write(path, script)
-            .with_context(|| format!("cannot write `{}`", path.display()))?;
-        println!("wrote {}", path.display());
-    }
+    // Rendered now; with a target, written as the build's last step inside
+    // its transaction, after the ledger row: a script written first
+    // overwrote the file with one the same command then refused (#1684).
+    // Refusals come before the lock, under it (two roles the collation reads
+    // as one name, DECISIONS 123) and after the build (a definer routine
+    // without a pinned path, #322), so only the end of the build is past all
+    // of them. A write that fails there rolls the build back with it.
+    let script = sql_out
+        .map(|_| crate::render_sql(&cs, dialect.as_ref(), "an empty database"))
+        .transpose()?;
+    let write_script = || -> anyhow::Result<()> {
+        if let (Some(path), Some(script)) = (sql_out, &script) {
+            std::fs::write(path, script)
+                .with_context(|| format!("cannot write `{}`", path.display()))?;
+            println!("wrote {}", path.display());
+        }
+        Ok(())
+    };
 
     let Some(target) = target else {
         if sql_out.is_none() {
@@ -5830,7 +5842,7 @@ pub fn cmd_bootstrap(
                 crate::report::placeholder("file")
             );
         }
-        return Ok(());
+        return write_script();
     };
 
     let statements = crate::statements(&cs, dialect.as_ref())?;
@@ -6029,6 +6041,7 @@ pub fn cmd_bootstrap(
             // declared is exactly what bootstrap holds (ADR-0009 §2.2).
             snapshot.declared = pbps_model::Declared::from_schema(&loaded.schema);
             let id = crate::engine::record(&mut conn, &snapshot).await?;
+            write_script()?;
             Ok::<_, anyhow::Error>((id, snapshot))
         }
         .await;

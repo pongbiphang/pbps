@@ -3301,6 +3301,104 @@ fn a_key_to_a_case_variant_of_a_history_is_refused_under_the_collation() {
     assert!(!stderr(&o).contains("13565"), "{}", stderr(&o));
 }
 
+/// #1684: `bootstrap --sql --db` writes its script only as the build's last
+/// step, once every refusal has passed (one after the build is pinned in
+/// `flow_pg`'s definer test). Written first, it replaced the file with a script the same
+/// command then refused. #1625's refusal before the lock, and two roles the
+/// collation reads as one name under it (DECISIONS 123), each stop the
+/// command, and an existing file keeps what it held; the same command over a
+/// valid declaration writes it.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_refused_bootstrap_leaves_its_sql_file_as_it_was() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::collated(&server, "bootstrap1684_ci", "Latin1_General_100_CI_AS");
+    let d = Demo::new("bootstrap1684");
+    std::fs::write(
+        d.dir.join("schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         vf: {type: datetime2(7), nullable: false}\n  \
+         vt: {type: datetime2(7), nullable: false}\n\nprimary_key: [id]\n\n\
+         system_time:\n  period: [vf, vt]\n  versioning:\n    history: dbo.T_History\n",
+    )
+    .unwrap();
+    let child = d.dir.join("schema/dbo.child.yml");
+    std::fs::write(
+        &child,
+        "table: dbo.child\ncolumns:\n  id: {type: int, nullable: false}\n  t_id: {type: int}\n\
+         primary_key: [id]\nforeign_keys:\n  fk_child_history:\n    columns: [t_id]\n    \
+         references: dbo.t_history(id)\n",
+    )
+    .unwrap();
+    // Two roles the collation reads as one name, refused under the lock, after
+    // the key's refusal before it.
+    let roles = d.dir.join("schema").join("roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    // Distinct filenames keep both on a case-insensitive filesystem.
+    let pair = [("first.yml", "Reader"), ("second.yml", "reader")];
+    for (file, role) in pair {
+        std::fs::write(
+            roles.join(file),
+            format!("role: {role}\ngrants:\n  dbo.t: [select]\n"),
+        )
+        .unwrap();
+    }
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "offline: {}{}", stdout(&o), stderr(&o));
+    d.commit();
+
+    let sql = d.dir.join("bootstrap.sql");
+    let before = "-- the script from an earlier run\n";
+    std::fs::write(&sql, before).unwrap();
+    let bootstrap = || {
+        d.run(&[
+            "bootstrap",
+            "--sql",
+            sql.to_str().unwrap(),
+            "--db",
+            own.connection(),
+        ])
+    };
+    let o = bootstrap();
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("foreign key the engine refuses (13565)"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!stdout(&o).contains("wrote"), "{}", stdout(&o));
+    assert_eq!(std::fs::read_to_string(&sql).unwrap(), before);
+
+    // Without the key, the roles' refusal under the lock: one name to this
+    // database.
+    std::fs::remove_file(&child).unwrap();
+    d.commit();
+    let o = bootstrap();
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o)
+            .contains("two declared roles are one name to this database: `Reader` and `reader`"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!stdout(&o).contains("wrote"), "{}", stdout(&o));
+    assert_eq!(std::fs::read_to_string(&sql).unwrap(), before);
+
+    // Negative: without either, nothing refuses, and the script is written;
+    // the database was left empty by the refused runs.
+    // Bootstrap reads the declarations as they stand, so neither the key's
+    // table nor the roles need a recorded drop.
+    for (file, _) in pair {
+        std::fs::remove_file(roles.join(file)).unwrap();
+    }
+    d.commit();
+    let o = bootstrap();
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    assert!(script.contains("CREATE TABLE"), "{script}");
+    assert!(!script.contains("dbo.child"), "{script}");
+}
+
 /// A connected plan orders a SQL Server computed column's function drops by
 /// the catalog's own edges (#1431, DEC-1431.1). A dropped table's computed
 /// columns call the schema-bound `dbo.g` over `dbo.lookup`, and `x.f`; a
