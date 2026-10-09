@@ -560,8 +560,19 @@ impl Run<'_> {
             .map_err(db("the run-owned scratch session's role"))?;
         refuse_foreign_objects(&mut owner).await?;
         // The run-owned database compiles under the same declared state as a
-        // supplied one: settings, comments, limit and grants (#1708).
-        put_into_standard(&mut owner, self.standard).await?;
+        // supplied one: settings, comments, limit and grants (#1708). The
+        // limit waits for the run login's session: this superuser session
+        // counts toward a database's limit though it is not held to it, so a
+        // declared limit of 1 would refuse that session (measured on 16 and
+        // 18).
+        put_into_standard(
+            &mut owner,
+            &Standard {
+                connection_limit: -1,
+                ..self.standard.clone()
+            },
+        )
+        .await?;
         scope::prepare(
             &mut owner,
             &map,
@@ -582,6 +593,7 @@ impl Run<'_> {
         )
         .await
         .map_err(db("the run login's scratch session"))?;
+        put_into_standard(&mut owner, self.standard).await?;
         let deployer = map
             .deployer(authorization)
             .map_err(|reason| Error::Scope(reason.into()))?;

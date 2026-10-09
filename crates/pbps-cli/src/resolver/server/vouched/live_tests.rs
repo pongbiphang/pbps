@@ -1372,7 +1372,8 @@ async fn vouched_run_owned_compiles_under_the_declared_standard() {
     // The database a superuser scratch creates gets the same declared state
     // as a supplied one (#1708): a declared grant to a role the scratch
     // server lacks refuses before anything is compiled, and a declared
-    // setting and comment are applied and answered under.
+    // setting, comment and limit are applied and answered under. A limit of
+    // 1 still admits the run's own two sessions (#1708 review).
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let scratch = Fixture::new(SCRATCH_SERVER);
     let target_db = target.target().await;
@@ -1401,6 +1402,7 @@ async fn vouched_run_owned_compiles_under_the_declared_standard() {
         &Standard {
             settings: [("statement_timeout".to_owned(), "5min".to_owned())].into(),
             comment: Some("pbps scratch".into()),
+            connection_limit: 1,
             ..Standard::default()
         },
     )
