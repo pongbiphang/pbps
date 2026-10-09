@@ -3940,7 +3940,10 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
   would need its own place against each transition. The remedy is two plans,
   the columns first or the partitions first;
 - a partition's own check, or unique or filtered index, added while the plan
-  changes a column of its parent. Its pre-flight probe reads the stored rows
+  changes a column of its parent that the check or index reads: a changed
+  name, either of a rename's, found anywhere in its text, quoted or not, in
+  any case. One that reads only the partition's other columns is admitted.
+  Its pre-flight probe reads the stored rows
   before the parent's change reaches them: a retype converts them and a rename
   moves a name to another column. The probe knows the plan's column changes
   by table, not which table is whose partition, so it would test values or
@@ -3952,12 +3955,14 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
   the partition's own name, so they would read the column the name left. The
   remedy is two plans, the name freed first;
 - in a connected plan, a function dropped or rebuilt that a part of one of
-  the parent's partitions depends on. The connected passes key parts by the
-  partition's name and cannot follow the parent's column change into it. The
-  remedy is two plans.
+  the parent's partitions depends on, where the part is on a column the plan
+  changes. A default or generated column counts by its column; a check or
+  index the partition declares counts by a changed name found in its text;
+  any other part, a clone of the parent's, counts. The connected passes key
+  parts by the partition's name and cannot follow the parent's column change
+  into it. The remedy is two plans.
 
-The last three, the partition drop among the transitions, and the
-conservative same-name rule in `after_their_functions` below, stand until
+The last three and the partition drop among the transitions stand until
 #1699. That issue gives every
 consumer the partition-to-parent relation, so that a partition's column is
 looked up as its parent's (leon, 2026-10-09).
@@ -3990,10 +3995,9 @@ may only now add or retype. The connected pass that holds an added column
 behind the function its default calls (`after_their_functions`, DEC-1364.1)
 holds such a partition behind the column too, and one whose own index or
 check names the column. So it does a standing partition's own default, NOT
-NULL, index or check on the column. Only the default's change names its
-parent, and the rule for the others matches the column's name alone, so any
-table's NOT NULL, index or check naming a column of that name waits as well.
-That holds it longer, short of a cycle, which is refused with its two-plan
+NULL, index or check on the column. A default's change names its parent; a
+NOT NULL, index or check waits only when the declared schema shows its table
+is one of the parent's partitions. A cycle is refused with its two-plan
 remedy.
 
 The pass reads the declared partitions for what reads the column through a

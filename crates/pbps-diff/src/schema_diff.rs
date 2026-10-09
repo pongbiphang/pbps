@@ -3250,11 +3250,19 @@ fn refuse_partition_changes(
             moving.entry(parent.clone()).or_default().push(name.clone());
         }
     }
-    let parents_changing_columns: BTreeSet<&TableName> = changes
-        .iter()
-        .filter(|c| parent_column(c).is_some() && !matches!(c, Change::SetColumnDeprecated { .. }))
-        .filter_map(Change::table)
-        .collect();
+    // Each parent's column names this plan changes, a rename's both names.
+    let mut parents_changing_columns: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
+    for c in changes {
+        if let (Some(name), Some(table)) = (parent_column(c), c.table())
+            && !matches!(c, Change::SetColumnDeprecated { .. })
+        {
+            let names = parents_changing_columns.entry(table).or_default();
+            names.insert(name);
+            if let Change::RenameColumn { to, .. } = c {
+                names.insert(to);
+            }
+        }
+    }
     for change in changes {
         // A partition is created with its parent, or under a parent that
         // already stands (#1171); either way it is a creation, and whether
@@ -3311,19 +3319,46 @@ fn refuse_partition_changes(
             // partition, so it would test values or columns the engine never
             // checks, and refuse a valid plan (DECISIONS 410, #1692 review,
             // until #1699). Two plans keep each probe over the rows it judges.
-            let probed = if let Change::AddIndex { index, .. } = change {
-                index.unique || index.filter.is_some()
+            // What the probe reads: an index's or a check's whole text. A
+            // changed name found anywhere in it counts, quoted or not, so an
+            // index or check on the partition's other columns alone stays
+            // admitted (#1692 review).
+            let probed: Option<Vec<&str>> = if let Change::AddIndex { index, .. } = change {
+                (index.unique || index.filter.is_some()).then(|| {
+                    index
+                        .columns
+                        .iter()
+                        .map(|c| match &c.key {
+                            pbps_model::IndexKey::Column(name)
+                            | pbps_model::IndexKey::Expression(name) => name.as_str(),
+                        })
+                        .chain(index.include.iter().map(String::as_str))
+                        .chain(index.filter.as_deref())
+                        .collect()
+                })
+            } else if let Change::AddCheck { constraint, .. } = change {
+                Some(vec![constraint.expression.as_str()])
             } else {
-                matches!(change, Change::AddCheck { .. })
+                None
             };
-            if probed
+            let reads = |texts: &[&str], name: &str| {
+                let name = name.to_lowercase();
+                let quoted = name.replace('"', "\"\"");
+                texts.iter().any(|text| {
+                    let text = text.to_lowercase();
+                    text.contains(&name) || text.contains(&quoted)
+                })
+            };
+            if let Some(texts) = probed
                 && let Some(t) = change.table()
                 && let Some(of) = declared
                     .schema
                     .tables
                     .get(t)
                     .and_then(|t| t.partition_of.as_ref())
-                && parents_changing_columns.contains(&of.parent)
+                && parents_changing_columns
+                    .get(&of.parent)
+                    .is_some_and(|names| names.iter().any(|name| reads(&texts, name)))
             {
                 refuse(
                     t,
@@ -7146,7 +7181,15 @@ mod tests {
             &[("m2", own_default("7"))],
             &[("m2", own_not_null.clone())],
         );
-        own_check(&mut renamed_checked);
+        let reads = |s: &mut Schema, expression: &str| {
+            s.tables.get_mut(&a).unwrap().checks.insert(
+                "a_n".into(),
+                pbps_model::CheckConstraint {
+                    expression: expression.into(),
+                },
+            );
+        };
+        reads(&mut renamed_checked, "\"M2\" > 0");
         let rename_m = [renaming("m", "m2")];
         for (declared, intents) in [
             (&checked, &[][..]),
@@ -7162,6 +7205,22 @@ mod tests {
                 "{errors:?}"
             );
         }
+        // Negative: a check or unique index that reads none of the changed
+        // columns is probed over the rows it judges (#1692 review).
+        let mut renamed_other = renamed_checked.clone();
+        reads(&mut renamed_other, "n > 0");
+        planned(&renamed_other, &rename_m);
+        let mut unique_other = with(&retype_n, &keep_a, &keep_b);
+        own_unique(&mut unique_other, true);
+        let ix = unique_other
+            .tables
+            .get_mut(&a)
+            .unwrap()
+            .indexes
+            .get_mut("a_m")
+            .unwrap();
+        ix.columns[0].key = pbps_model::IndexKey::Column("id".into());
+        planned(&unique_other, &[]);
         // A partition dropped while its parent's column tightens: the
         // pre-flight would count the doomed partition's rows (round 7).
         let mut dropped_b = with(
