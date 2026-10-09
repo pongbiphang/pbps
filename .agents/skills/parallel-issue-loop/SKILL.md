@@ -105,27 +105,15 @@ and merge order.
   agent; workers must not invent a temporary integration branch or copy
   unreviewed changes between worktrees.
 - Merge in topological order. The merge queue builds a merely behind branch
-  against current `master` when it is enqueued. A PR stacked on an upstream
-  branch must instead have its base explicitly changed to the merged upstream
-  PR's base by the primary agent, while the upstream branch still exists.
-  Follow the closeout verification in the review reference: enumerate all
-  dependents, record their heads and expected remaining diffs, verify OPEN/base/
-  unchanged head/diff before deletion, then reverify after deletion. Record the
-  operation window and complete the repository-wide `state=all` post-delete
-  scan and the bounded base/state history audit for every identity in the
-  initial/final scans and recorded dependents, regardless of PR age. Equal
-  snapshots and creation/update times do not exclude an intervening parent
-  association; incomplete or ambiguous history stops cleanup (DEC-1473.1).
-  At every dependent read, apply DEC-1475.1's closure disposition in the review
-  reference before retargeting, requiring OPEN state or classifying failure.
-  Preserve a qualifying deliberate independent closure; pre-request observations
-  remain provisional until the final audit. Autonomous reopening requires proven
-  deletion damage; explicit collaborator direction may instead authorize the
-  identified PR/action. Unknown cause alone permits no mutation, and reopening
-  authorization waives no cleanup evidence, ownership, content or review/CI gate.
-  Proven unrelated reopen/close activity needs no
-  recovery. An open-only scan cannot authorize local cleanup (DEC-1458.1).
-  Never rely on automatic retargeting (DEC-1228.1). Refresh each dependent's
+  against current `master` when it is enqueued. For a PR stacked on a merged
+  upstream branch, first follow §7 of the review reference, including its
+  closure disposition, before retargeting or requiring OPEN state. Only open
+  dependents after that disposition are explicitly retargeted to the merged
+  parent's base and checked for OPEN/base/unchanged head/expected remaining diff.
+  Preserve qualifying closed dependents without retargeting; their final
+  provenance and content audit remains required. The same ordered procedure
+  governs pre-delete rechecks, post-delete history verification and recovery.
+  Never rely on automatic retargeting (DEC-1228.1). Refresh each open dependent's
   existing review
   and current-head CI gates before enqueueing. When fresh retargeted CI is
   required, add `ci-retest` to the owned PR; if already present, remove only
@@ -178,19 +166,16 @@ adds the PR to the queue rather than merging it; wait for the queued merge to
 land before treating the PR as merged (DECISIONS 502).
 
 After an actual merge, verify the intended issue closed and capture the merge
-commit. The primary agent must complete §7 of the review reference before
-cleaning the remote head, local branch and worktree: explicitly retarget and
-verify dependents first, including a successfully enumerated empty set, then
-verify them again after deletion, completing the operation-window/all-state
-check for newly discovered dependents. DEC-1475.1 preserves proven deliberate
-independent pre-request closures regardless of age, with unchanged closed
-state/base/head/content and complete history. Incomplete or ambiguous evidence
-stops cleanup; unknown closure cause alone never authorizes reopening. Explicit
-collaborator direction is scoped to the identified PR/action and does not waive
-the remaining closeout or current-head review/CI gates.
-Retain the parent branch before deletion if any check fails; after deletion,
-stop local cleanup and follow the exact-owned-ref recovery without overwriting
-a changed or foreign ref. Update dependent agents, and report
+commit. Before any dependent retargeting or OPEN requirement, enter §7 of the
+review reference and apply its closure disposition. Only open dependents after
+that disposition are retargeted and checked; qualifying closed dependents are
+preserved with their final provenance/content audit. Delete the owned remote
+head only when that procedure's pre-delete checks permit it; remove the local
+branch and worktree only after its post-delete audit passes, including the
+all-state/history audit for an empty dependent set.
+An incomplete or failed closeout retains the branch before deletion and stops
+local cleanup afterwards; follow §7's recovery and authorization rules without
+overwriting a changed or foreign ref. Update dependent agents, and report
 the review count and any explicitly deferred findings. If the merge touched
 `Cargo.toml`, `Cargo.lock`, `deny.toml`, or the dependency-audit workflow, wait
 for the dependency audit; a failure becomes the next task before any free slot
