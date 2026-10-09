@@ -4280,6 +4280,20 @@ nothing of these, as on any table: only an index honours it (`emit.rs`).
   under the parent**, the two plans DEC-1687.1 and DEC-1688.1 already
   require.
 
+**A clone is its parent's to a module rebuild.** When a function is rebuilt,
+its dependents are read from `pg_depend`. A parent's check or index that
+calls the function is found there on every partition too, as clones no
+declaration names: a partition's inherited check, and the index attached to
+the parent's. Each was refused as unmanaged. The parent's own index, of
+relkind `I`, was refused as "a relation of a kind this reader does not
+know". The dependents query now reports a partition's clone as the parent's
+object: its table, its name and its description. So the parent's drop and
+add around the rebuild, or its removal in the same plan, account for every
+clone, in planning and in the saved-plan check alike, and the plan never
+needs to name the clones (#1745 review). This was not new with this slice:
+a parent created with a check or index calling a function met it on that
+function's first rebuild.
+
 Pinned by `a_partitioned_parents_keys_checks_and_foreign_keys_change`, and by
 the CLI's
 `a_partitioned_parents_keys_checks_and_foreign_keys_change_through_the_cli`,

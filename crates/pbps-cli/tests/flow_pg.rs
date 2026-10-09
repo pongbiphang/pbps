@@ -19547,6 +19547,8 @@ fn parent_keys_flow(server: &str, slug: &str) {
     on_server(
         &conn,
         "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE \
+             AS $$ SELECT x $$; \
          CREATE TABLE app.ref (id integer PRIMARY KEY); \
          INSERT INTO app.ref VALUES (1), (2), (500); \
          CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, r integer) \
@@ -19655,6 +19657,52 @@ fn parent_keys_flow(server: &str, slug: &str) {
     );
     on_server(&conn, "DELETE FROM app.ev WHERE id = 3");
     applied("checked.json");
+    assert_eq!(clones("c"), 4);
+
+    // A function the parent's check and index call, rebuilt: each is taken
+    // down and put back around it on the parent, which takes its clones on
+    // every partition with it (#1745 review).
+    edit(
+        &path,
+        "\npartition_by:",
+        "\nindexes:\n  ev_f:\n    keys:\n      - expression: app.f(r)\n\npartition_by:",
+    );
+    edit(
+        &path,
+        "  ev_r_max: r < 100\n",
+        "  ev_r_max: r < 100\n  ev_f_ck: app.f(r) > 0\n",
+    );
+    applied("function-backed.json");
+    assert_eq!(clones("c"), 6);
+    std::fs::write(
+        d.dir.join("schema/app.f%28integer%29.function.yml"),
+        "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x + 0 $$\n",
+    )
+    .unwrap();
+    applied("rebuilt.json");
+    assert_eq!(
+        holds(
+            "SELECT prosrc LIKE '%x + 0%' FROM pg_proc WHERE oid = 'app.f(integer)'::regprocedure"
+        ),
+        1
+    );
+    assert_eq!(clones("c"), 6);
+    edit(
+        &path,
+        "\nindexes:\n  ev_f:\n    keys:\n      - expression: app.f(r)\n",
+        "\n",
+    );
+    edit(&path, "  ev_f_ck: app.f(r) > 0\n", "");
+    // Removed in the plan that rebuilds the function again: the parent's
+    // drops release the clones too.
+    std::fs::write(
+        d.dir.join("schema/app.f%28integer%29.function.yml"),
+        "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x + 1 $$\n",
+    )
+    .unwrap();
+    applied("unbacked.json");
     assert_eq!(clones("c"), 4);
 
     // Dropped: the parent's unique, checks and foreign key, with their clones.

@@ -1994,7 +1994,11 @@ fn dependents_query(refclass: &str) -> String {
            JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
           WHERE {edge} AND d.classid = 'pg_catalog.pg_trigger'::regclass
           UNION ALL
-         SELECT 'check', {described}, n2.nspname, c2.relname, con.conname, 0::int8,
+         SELECT 'check',
+                COALESCE(pg_catalog.pg_describe_object('pg_catalog.pg_constraint'::regclass, pcon.oid, 0),
+                         pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid)),
+                COALESCE(pn.nspname, n2.nspname), COALESCE(pt.relname, c2.relname), con.conname,
+                0::int8,
                 CASE WHEN con.conrelid = 0
                      THEN 'a constraint on a domain rather than on a table, which this model does not hold'
                      WHEN con.contype <> 'c'
@@ -2004,6 +2008,14 @@ fn dependents_query(refclass: &str) -> String {
            JOIN pg_catalog.pg_constraint con ON con.oid = d.objid
            LEFT JOIN pg_catalog.pg_class c2 ON c2.oid = con.conrelid
            LEFT JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
+           -- A partition's clone of its parent's check is the parent's: the
+           -- parent's drop takes it, and its add puts it back (#1745 review).
+           LEFT JOIN pg_catalog.pg_inherits hc
+             ON hc.inhrelid = con.conrelid AND c2.relispartition AND NOT con.conislocal
+           LEFT JOIN pg_catalog.pg_constraint pcon
+             ON pcon.conrelid = hc.inhparent AND pcon.conname = con.conname
+           LEFT JOIN pg_catalog.pg_class pt ON pt.oid = pcon.conrelid
+           LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pt.relnamespace
           WHERE {edge} AND d.classid = 'pg_catalog.pg_constraint'::regclass
           UNION ALL
          SELECT CASE WHEN a.attgenerated <> '' THEN 'generated' ELSE 'default' END,
@@ -2016,8 +2028,14 @@ fn dependents_query(refclass: &str) -> String {
            JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
           WHERE {edge} AND d.classid = 'pg_catalog.pg_attrdef'::regclass
           UNION ALL
-         SELECT 'index', {described}, n2.nspname, c2.relname, ic.relname, 0::int8,
-                CASE WHEN ic.relkind <> 'i'
+         SELECT 'index',
+                COALESCE(pg_catalog.pg_describe_object('pg_catalog.pg_class'::regclass, pic.oid, 0),
+                         pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid)),
+                COALESCE(pn.nspname, n2.nspname), COALESCE(pc.relname, c2.relname),
+                COALESCE(pic.relname, ic.relname), 0::int8,
+                -- `I` is a partitioned table's index, which its partitions
+                -- hold as clones (#1745 review).
+                CASE WHEN ic.relkind NOT IN ('i', 'I')
                      THEN 'a relation of a kind this reader does not know'
                      ELSE '' END
            FROM pg_catalog.pg_depend d
@@ -2025,6 +2043,13 @@ fn dependents_query(refclass: &str) -> String {
            LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = ic.oid
            LEFT JOIN pg_catalog.pg_class c2 ON c2.oid = i.indrelid
            LEFT JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
+           -- A partition's clone of its parent's index is the parent's, as
+           -- its check is.
+           LEFT JOIN pg_catalog.pg_inherits hi ON hi.inhrelid = ic.oid AND ic.relispartition
+           LEFT JOIN pg_catalog.pg_class pic ON pic.oid = hi.inhparent
+           LEFT JOIN pg_catalog.pg_index pi ON pi.indexrelid = pic.oid
+           LEFT JOIN pg_catalog.pg_class pc ON pc.oid = pi.indrelid
+           LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace
           WHERE {edge} AND d.classid = 'pg_catalog.pg_class'::regclass
           UNION ALL
          SELECT 'other', {described}, '', '', '', 0::int8,
