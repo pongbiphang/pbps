@@ -19500,7 +19500,7 @@ fn parent_indexes_flow(server: &str, slug: &str) {
     // which stands now, as its clone. Refused, then planned with the own
     // one dropped in the same plan, which runs before the add.
     edit("  ev_m:\n", "  ev_m2:\n");
-    refused("which would take app.ev_2024's `ev_2024_m`");
+    refused("which can take app.ev_2024's `ev_2024_m`");
     edit("    indexes:\n      ev_2024_m:\n        columns: [m]\n", "");
     applied("rename.json");
     assert_eq!(
@@ -19555,7 +19555,7 @@ fn parent_indexes_flow(server: &str, slug: &str) {
         "  ev_m:\n    columns: [m]\n",
         "  ev_n:\n    columns: [\"n\"]\n",
     );
-    refused("which would take app.ev_2025's `ev_2025_n`");
+    refused("which can take app.ev_2025's `ev_2025_n`");
     assert_eq!(clones_on("n"), 0);
     assert_eq!(
         holds("SELECT count(*) FROM pg_inherits WHERE inhrelid = 'app.ev_2025_n'::regclass"),

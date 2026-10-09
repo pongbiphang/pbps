@@ -321,7 +321,7 @@ indexes:
   plan that attaches, detaches or drops under the parent. Its indexes are
   added and dropped, a new name being a drop and an add, each recursing as
   the partitions' clones; `strategy: online`, a unique index without a key
-  column, and a new index that would take a partition's own as its clone are
+  column, and a new index that can take a partition's own as its clone are
   refused by name (DEC-1688.1). Every other change stays refused by name: the
   parent's keys, checks and foreign keys, and its rename, until #1689–#1690,
   and attaching as the DEFAULT partition until #1639.

@@ -4195,8 +4195,10 @@ for a column change (DEC-1687.1).
   it again beside the clone. The remedy is to drop or rename the partition's
   own index in an earlier plan, or in the same plan, whose drop runs first.
   Only an own index standing when the parent's is built is asked: one a
-  partition held before the plan and keeps, and every one of a partition the
-  plan creates, which is created with them. One the plan adds to a standing
+  partition held before the plan and the plan does not drop, and every one of
+  a partition the plan creates, which is created with them. Held, not equal:
+  an own index kept across its parent's column rename is compared as renamed
+  and never dropped, so it stands (#1737 review). One the plan adds to a standing
   partition is its own, because a partitioned parent's `AddIndex` sorts first
   in class 13, at (13, 0), before any partition's own (#1737 review). The
   parent's goes first, not the partition's last: last would put an own index
@@ -4213,10 +4215,14 @@ then read as absent: its own changes went unplanned, and its own index read
 as one the plan creates (#1737 review). The git baseline now loads them as
 the declarations do.
 
-A predicate or key expression is compared as declared text. Under a
-partition in another schema, the same text may bind to another function, so
-the comparison can refuse an index the engine would not adopt. That class of
-ambiguous adoption is #1671's, the resolver's to rehearse.
+A predicate or an expression key is a possible match whatever its text, as
+on the attach path (DEC-1545.1). The engine compares what each parses and
+binds to: measured on 16 and 18, `WHERE n > 0` adopted an own `WHERE n>0`,
+and `(n + 1)` adopted an own `(n+1)` (#1737 review). The refusal therefore
+says the index "can take" the partition's own. It also refuses some indexes
+the engine would not adopt, such as different predicates, or the same text
+binding to another function under a partition in another schema. That class
+of ambiguous adoption is #1671's, the resolver's to rehearse.
 
 `ONLY` is not used. It leaves the parent's index invalid until every
 partition's index is attached by hand, which is not one statement.

@@ -3338,7 +3338,9 @@ fn refuse_partition_changes(
                         tables.join(", ")
                     ),
                 );
-            } else if let Some(why) = refuse_parent_index(table, change, base, declared, hints) {
+            } else if let Some(why) =
+                refuse_parent_index(table, change, base, declared, hints, changes)
+            {
                 refuse(table, why);
             }
             continue;
@@ -3458,6 +3460,7 @@ fn refuse_parent_index(
     base: Side<'_>,
     declared: Side<'_>,
     hints: &Hints,
+    changes: &[Change],
 ) -> Option<String> {
     if hints.strategies.get(table).is_some_and(|s| s.online) {
         return Some(format!(
@@ -3485,10 +3488,11 @@ fn refuse_parent_index(
         ));
     }
     // Only an own index standing when the parent's is built: one the
-    // partition held before the plan and keeps, or every one of a partition
-    // the plan creates, which is created with them. One the plan adds to a
-    // standing partition is built after its parent's, and is its own (#1737
-    // review).
+    // partition held before the plan and the plan does not drop, or every
+    // one of a partition the plan creates, which is created with them. One
+    // the plan adds to a standing partition is built after its parent's, and
+    // is its own. Held, not equal: across a column rename the index is
+    // compared as renamed and kept, not dropped (#1737 review).
     let adopted: Vec<String> = declared
         .schema
         .tables
@@ -3508,8 +3512,14 @@ fn refuse_parent_index(
                 .and_then(|name| base.schema.tables.get(name));
             t.indexes
                 .iter()
-                .filter(move |(own, ix)| {
-                    before.is_none_or(|b| b.indexes.get(own.as_str()) == Some(ix))
+                .filter(move |(own, _)| {
+                    before.is_none_or(|b| {
+                        b.indexes.contains_key(own.as_str())
+                            && !changes.iter().any(|c| {
+                                matches!(c, Change::DropIndex { table, name }
+                                    if table == partition && name == *own)
+                            })
+                    })
                 })
                 .filter(|(_, own)| adopts(index, own))
                 .map(move |(own, _)| format!("{partition}'s `{own}`"))
@@ -3517,7 +3527,7 @@ fn refuse_parent_index(
         .collect();
     (!adopted.is_empty()).then(|| {
         format!(
-            "add index `{name}`, which would take {} as the partition's copy of it and leave the \
+            "add index `{name}`, which can take {} as the partition's copy of it and leave the \
              partition without its own; drop or rename the partition's own index in an earlier \
              plan",
             adopted.join(", ")
@@ -3525,21 +3535,26 @@ fn refuse_parent_index(
     })
 }
 
-/// Whether a new parent index takes a partition's own index as its clone.
-/// Measured on 16.15 and 18.6: the method, the keys in order with their
-/// classes, uniqueness, the predicate and the `INCLUDE` columns must match;
-/// a key's direction and the storage parameters need not (#1688).
+/// Whether a new parent index can take a partition's own index as its
+/// clone. Measured on 16.15 and 18.6: the method, the keys in order with
+/// their classes, uniqueness, the predicate and the `INCLUDE` columns must
+/// match; a key's direction and the storage parameters need not (#1688).
+///
+/// An expression key or a predicate is a match whatever its text, as the
+/// attach path takes it (DEC-1545.1): the engine compares what each parses
+/// and binds to, so `n+1` and `n + 1` are one index to it (#1737 review).
 fn adopts(parent: &pbps_model::Index, own: &pbps_model::Index) -> bool {
     parent.method == own.method
         && parent.unique == own.unique
-        && parent.filter == own.filter
+        && parent.filter.is_some() == own.filter.is_some()
         && parent.include == own.include
         && parent.columns.len() == own.columns.len()
-        && parent
-            .columns
-            .iter()
-            .zip(&own.columns)
-            .all(|(p, o)| p.key == o.key && p.opclass == o.opclass)
+        && parent.columns.iter().zip(&own.columns).all(|(p, o)| {
+            match (p.key.column(), o.key.column()) {
+                (Some(p_column), Some(o_column)) => p_column == o_column && p.opclass == o.opclass,
+                _ => true,
+            }
+        })
 }
 
 /// The column a parent's column change names, for the kinds the engine
@@ -6695,7 +6710,7 @@ mod tests {
                 &tree(&[("ev_n", index(&["n"], false, None))], &own, false),
                 false,
             ),
-            "which would take app.ev_1's `ev_1_n`",
+            "which can take app.ev_1's `ev_1_n`",
         );
         let mut descending = index(&["n"], false, None);
         descending.columns[0].descending = true;
@@ -6709,7 +6724,7 @@ mod tests {
                 ),
                 false,
             ),
-            "which would take app.ev_new's `own`",
+            "which can take app.ev_new's `own`",
         );
         // An own index this plan adds to a standing partition is built after
         // its parent's, whatever the names, and stays its own (#1737 review).
@@ -6770,6 +6785,106 @@ mod tests {
         );
         // Negative: the partition dropped alone is planned.
         assert!(outcome(&indexed, &without_partition, false).is_ok());
+        // A predicate or an expression key is a match whatever its text: the
+        // engine compares what it parses (#1737 review).
+        let mut spaced = index(&["n"], false, None);
+        spaced.columns[0].key = pbps_model::IndexKey::Expression("n + 1".into());
+        let mut packed = spaced.clone();
+        packed.columns[0].key = pbps_model::IndexKey::Expression("n+1".into());
+        for (own_index, parent_index) in [
+            (
+                index(&["n"], false, Some("n>0")),
+                index(&["n"], false, Some("n > 0")),
+            ),
+            (packed, spaced),
+        ] {
+            let own = [("ev_1_x", own_index)];
+            refused(
+                outcome(
+                    &tree(&[], &own, false),
+                    &tree(&[("ev_x", parent_index)], &own, false),
+                    false,
+                ),
+                "which can take app.ev_1's `ev_1_x`",
+            );
+        }
+        // Negative: an own index the plan redefines is dropped before the
+        // parent's is built and added after it, so it is its own.
+        let redefined = planned(
+            &tree(
+                &[],
+                &[("ev_1_x", index(&["n"], false, Some("n > 0")))],
+                false,
+            ),
+            &tree(
+                &[("ev_n", index(&["n"], false, None))],
+                &[("ev_1_x", index(&["n"], false, None))],
+                false,
+            ),
+            false,
+        )
+        .expect("planned");
+        let order: Vec<String> = redefined
+            .changes
+            .iter()
+            .map(|p| {
+                format!(
+                    "{} {}",
+                    change_in_words(&p.change),
+                    p.change.table().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "drop index app.ev_1",
+                "add index app.ev",
+                "add index app.ev_1"
+            ],
+            "{order:?}"
+        );
+        // An own index kept across its parent's column rename stands when
+        // the parent's is built: compared as renamed, it is not dropped
+        // (#1737 review).
+        {
+            let own = |column: &str| [("ev_1_n", index(&[column], false, None))];
+            let base = tree(&[], &own("n"), false);
+            let mut declared = tree(&[("ev_n2", index(&["n2"], false, None))], &own("n2"), false);
+            let parent = declared.tables.get_mut(&ev).unwrap();
+            let n = parent.columns.shift_remove("n").unwrap();
+            parent.columns.insert("n2".into(), n);
+            let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let rename = [Intent::RenameColumn {
+                table: ev.clone(),
+                from: "n".into(),
+                to: "n2".into(),
+            }];
+            let declared_ids = crate::resolve(&declared, &base_ids, &rename, &ctx())
+                .unwrap()
+                .ids;
+            let errors = diff(
+                Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: &declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .expect_err("refused");
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.to_string().contains("which can take app.ev_1's `ev_1_n`")),
+                "{errors:?}"
+            );
+        }
         // Negative: an own index the engine does not adopt, by uniqueness or
         // by predicate, leaves the parent's planned.
         for other in [
@@ -9381,7 +9496,7 @@ mod tests {
         assert!(
             errors.iter().any(
                 |e| e.starts_with("app.ev is a partitioned table or a partition")
-                    && e.contains(&format!("which would take {p}'s `p_ts`"))
+                    && e.contains(&format!("which can take {p}'s `p_ts`"))
             ),
             "{errors:?}"
         );
