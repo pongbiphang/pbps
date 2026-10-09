@@ -3186,8 +3186,9 @@ pub async fn relation_name_occupants(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyNameHolder {
     pub name: TableName,
-    /// The table an index or a constraint belongs to; `None` for a relation
-    /// that is not an index, a table among them.
+    /// The table an index or a constraint belongs to, or whose column owns a
+    /// sequence, which moves and goes with it (measured on 16 and 18, #1729
+    /// review); `None` for any other relation, a table among them.
     pub owner: Option<TableName>,
     /// Whether it is a primary key's index or constraint.
     pub primary_key: bool,
@@ -3225,7 +3226,13 @@ pub async fn key_name_holders(
            FROM pg_catalog.pg_class c\n  \
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n  \
            LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid\n  \
-           LEFT JOIN pg_catalog.pg_class own ON own.oid = i.indrelid\n  \
+           LEFT JOIN pg_catalog.pg_depend d\n    \
+             ON c.relkind = 'S'\n   \
+            AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass\n   \
+            AND d.objid = c.oid\n   \
+            AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass\n   \
+            AND d.deptype IN ('a', 'i')\n  \
+           LEFT JOIN pg_catalog.pg_class own ON own.oid = COALESCE(i.indrelid, d.refobjid)\n  \
            LEFT JOIN pg_catalog.pg_namespace ownns ON ownns.oid = own.relnamespace\n \
           WHERE EXISTS (SELECT 1 FROM wanted w\n                  \
                          WHERE w.schema_name = n.nspname\n                    \

@@ -2072,6 +2072,7 @@
         "range_partitions_are_added_and_dropped_on_populated_trees",
         "referenced_key_guards_use_actual_bindings_and_prior_removals",
         "relation_name_occupants_name_each_kind_and_its_owner",
+        "key_name_holders_name_each_holder_its_owner_and_its_kind",
         "rename_order_tests::rename_dependencies_execute_with_their_statement_time_names",
         "resolver_tests::auth610::an_in_scope_schema_the_deployer_cannot_see_refuses_rather_than_reading_empty",
         "resolver_tests::auth610::the_deployers_authorization_is_the_engines_own_answers_not_the_admins",

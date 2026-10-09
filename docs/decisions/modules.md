@@ -1847,8 +1847,9 @@ What the engine does, measured on 16 and 18 (`ChooseRelationName`):
 So a connected plan reads the target's holders of every name each unnamed
 key may try, relations and constraints, in the planning transaction. It
 reads them in the key's schema and in every schema the plan moves a table
-into it from: a table moved to another schema takes its indexes and
-constraints along under their names (measured on 16 and 18).
+into it from: a table moved to another schema takes its indexes, its
+constraints and the sequences its columns own along under their names
+(measured on 16 and 18; a sequence no column owns stays, #1729 review).
 
 The plan is then replayed from those holders, change by change. Each holder
 is followed by its name and its owner's name as they are at that point, so a
@@ -1894,4 +1895,6 @@ Pinned by `a_key_takes_the_first_candidate_free_when_it_is_created`,
 `a_numbered_key_name_cuts_the_table_again_to_fit` (`crates/pbps-pg/src/lib.rs`),
 and the live
 `a_key_named_by_what_holds_its_candidates_when_it_is_created_is_refused`
-(`crates/pbps-cli/tests/flow_pg.rs`).
+(`crates/pbps-cli/tests/flow_pg.rs`) and
+`key_name_holders_name_each_holder_its_owner_and_its_kind`
+(`crates/pbps-pg/tests/live.rs`).
