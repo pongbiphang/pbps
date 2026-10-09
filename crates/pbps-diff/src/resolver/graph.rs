@@ -272,6 +272,29 @@ pub(super) fn constraints(
         }
     }
 
+    // A partitioned parent's new index before each partition's own: built
+    // after one of its shape, it would take it as its clone (DEC-1688.1). The
+    // ordinary plan's (13, 0) rank is no edge, and an index the parent waits
+    // for a column to build could otherwise follow the partition's (#1737
+    // review).
+    for (i, change) in steps.iter().enumerate() {
+        let Change::AddIndex { table: parent, .. } = change else {
+            continue;
+        };
+        for (j, other) in steps.iter().enumerate() {
+            if let Change::AddIndex { table, .. } = other
+                && desired
+                    .schema
+                    .tables
+                    .get(table)
+                    .and_then(|t| t.partition_of.as_ref())
+                    .is_some_and(|of| of.parent == *parent)
+            {
+                edge(i, j, OrderReason::Structural);
+            }
+        }
+    }
+
     // A default change spelled by its own column's final name: where the
     // plan renames that column, by its UID, into the name the change uses.
     let own_rename: Vec<Option<usize>> = steps

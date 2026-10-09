@@ -4202,7 +4202,10 @@ for a column change (DEC-1687.1).
   partition is its own, because a partitioned parent's `AddIndex` sorts first
   in class 13, at (13, 0), before any partition's own (#1737 review). The
   parent's goes first, not the partition's last: last would put an own index
-  after a replica identity naming it.
+  after a replica identity naming it. A rank is no edge, and the resolver
+  keeps only edges, so its graph carries a structural one from a parent's
+  `AddIndex` to each `AddIndex` on its partitions (#1737 review). The
+  dependents' weave keeps the plan's order among what it moves.
 - **an index change in a plan that attaches, detaches or drops a partition
   under the parent**, the same two plans a column change takes (DEC-1687.1).
   A detach checks its shape against the parent's indexes as they stood, and
