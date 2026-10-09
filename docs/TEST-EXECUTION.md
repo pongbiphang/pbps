@@ -172,3 +172,67 @@ portable successful mutation control. Run the integrated suite on actual
 The ordinary quick job explicitly runs the owned Linux rename-churn measurement.
 It previously had only a manual-run note. Its assertions remain unchanged; the
 checker also rejects removal of that scheduling command.
+
+
+## Shipped viewer browser acceptance
+
+`tests/ui-browser` is a separate, locked Playwright/Chromium suite, not an
+ignored Rust target. Its single CI owner is `live-pg/flow-rest`, after that
+variant's existing serial database work. Node setup, the actual CLI build,
+browser installation and execution are all conditional on that variant.
+`ci-gate` already waits for the whole `live-pg` matrix. The ordinary Node DOM
+and CLI HTTP tests remain in the workspace suite.
+
+On Linux with Node 24, npm, Git, the Rust toolchain and a disposable PostgreSQL
+server whose test account may create databases:
+
+```bash
+export CARGO_TARGET_DIR=/tmp/pbps-build
+cargo build --locked -p pbps-cli --bin pbps
+export PBPS_TEST_UI_BIN="$CARGO_TARGET_DIR/debug/pbps"
+export PBPS_TEST_UI_PG_URL='postgresql://TEST_USER:TEST_PASSWORD@127.0.0.1:54320/pbps_test?sslmode=disable'
+python3 scripts/ui-browser.py
+```
+
+Replace the fixture credentials, and use only a server intended for tests.
+The runner requires both variables, installs the lockfile in an external
+unique temporary directory and downloads the matching Chromium revision to
+an external cache. `PLAYWRIGHT_BROWSERS_PATH` can select another external
+cache. `--install-deps` also installs Chromium OS dependencies and may require
+sudo; CI uses it on its disposable runner. No package installation, build,
+report, browser profile or cache belongs in the repository. The installed
+product does not use Node or Playwright. This command is an additional required
+local check for browser changes; the existing full PostgreSQL and SQL Server
+scripts are still required and are not replaced by it.
+
+The fixture creates a random, owned database without deleting a pre-existing
+name, commits ordinary declarations/identities, generates a real preview plan,
+and bootstraps a ledger through the actual CLI. The viewer is the explicitly
+selected binary and uses its printed loopback/token URL. Tests assert known
+fixture facts as well as real report values: authentication and its negative
+cases, preview limitations and checksum, bootstrap history and controlled
+managed drift, late success/error delivery across navigation, typed and
+transport error recovery, effective docs CSS and empty iframe sandbox,
+escaped hostile text, keyboard focus/labels and narrow controls. Delivery
+gates hold completed real replies so the synchronous server can answer the
+next read. Browser acceptance sends no compose/deployment write request.
+
+All application-context traffic must use the exact viewer origin; unexpected
+network attempts, WebSockets, dialogs, page errors and ordinary CSP violations
+fail. This observes application traffic, not unrelated browser/OS background
+traffic. Viewer/CLI process groups, browser contexts and the owned database
+are closed on success and failure. Setup/teardown errors and zero/skipped
+execution cannot qualify the suite. Retries are disabled.
+
+Only bounded, redacted text diagnostics are emitted; trace/HAR/video and
+screenshots are disabled because they can capture token URLs or credentials.
+The runner reports Node, actual Chromium and PostgreSQL versions and named
+case results. `--grep` is for focused causal controls, not the normal CI gate.
+`PBPS_BROWSER_CSP_CONTROL=remove-docs-style` is a runner-only negative control:
+it removes only the documentation style hash from the fetched shell CSP while
+keeping genuine document content. The same computed-style assertion must
+then fail. Source counterfactuals require rebuilding the selected binary after
+each change: remove each generation guard independently, break a used DOM
+selector, remove the sandbox or token header, or substitute unsafe insertion.
+Restore the source, rebuild and pass the same selected case before accepting
+the evidence. A build/setup failure is not a causal browser failure.

@@ -516,6 +516,20 @@ jobs:
         env:
           PBPS_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
           PBPS_TEST_PG_OLD_CONTAINER: ${{ job.services.postgres-old.id }}
+      - uses: actions/setup-node@v7
+        if: matrix.suite == 'flow-rest'
+        with:
+          node-version: 24
+      - name: Build the actual viewer executable
+        if: matrix.suite == 'flow-rest'
+        run: cargo build --locked -p pbps-cli --bin pbps --target-dir "$RUNNER_TEMP/pbps-ui-build"
+      - name: Shipped viewer in Chromium
+        if: matrix.suite == 'flow-rest'
+        env:
+          PBPS_TEST_UI_PG_URL: "postgresql://postgres:Pbps!Ci12345@127.0.0.1:54320/pbps_test?sslmode=disable"
+        run: |
+          PBPS_TEST_UI_BIN="$RUNNER_TEMP/pbps-ui-build/debug/pbps" \
+            python3 scripts/ui-browser.py --install-deps
 
   # `plan --dev docker://<image>` starts a throwaway container of its own, and
   # nothing else reaches that code: every other `--dev` test passes a connection

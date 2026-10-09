@@ -1,0 +1,9 @@
+{
+  "name": "pbps-ui-browser-acceptance",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@playwright/test": "1.64.0",
+    "pg": "8.23.1"
+  }
+}
