@@ -7140,11 +7140,14 @@ async fn a_reference_into_another_database_is_not_a_local_edge() {
     far.drop().await;
 }
 
-/// #1704: a `DENY SELECT` in `master` on a dependency function is a readiness
-/// gap named at that function (DEC-1704.1). `public` holds the grant there, so
-/// the schema-scoped login is ready until the deny; with it, the pull fails
-/// rather than reading a schema, and `doctor` names the function. With the
-/// deny removed the login is ready again.
+/// #1704: a `DENY SELECT` in `master` on the referenced-entities function is
+/// a readiness gap named at that function (DEC-1704.1). `public` holds the
+/// grant there, so the schema-scoped login is ready until the deny; with it,
+/// the pull fails rather than reading a schema, and `doctor` names the
+/// function. #1717: the same deny on the referencing-entities function, read
+/// only by an apply that renames, is advice, and that rename's impact read
+/// refuses by name, saying where the deny lives (DEC-1717.1). With the denies
+/// removed the login is ready again.
 #[tokio::test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 async fn a_denied_dependency_function_is_a_readiness_gap() {
@@ -7200,30 +7203,85 @@ async fn a_denied_dependency_function_is_a_readiness_gap() {
         db.name
     );
     let mut lp = connect_live(&as_login).await.expect("connect as the login");
-    assert_eq!(schema_scoped_gaps(&mut lp).await, Vec::<String>::new());
+    assert_eq!(schema_scoped_report(&mut lp).await.0, Vec::<String>::new());
     pbps_mssql::catalog::introspect(&mut lp)
         .await
         .expect("the pull reads as the login");
 
-    for function in pbps_mssql::doctor::DEPENDENCY_FUNCTIONS {
-        db.conn
-            .execute(&format!(
-                "USE master; DENY SELECT ON sys.{function} TO [{login}];"
-            ))
-            .await
-            .expect("deny");
-        let mut lp = connect_live(&as_login).await.expect("reconnect");
-        assert_eq!(
-            schema_scoped_gaps(&mut lp).await,
-            [format!("SELECT on OBJECT::[sys].[{function}]")]
-        );
-        db.conn
-            .execute(&format!(
-                "USE master; REVOKE SELECT ON sys.{function} FROM [{login}];"
-            ))
-            .await
-            .expect("revoke the deny");
+    use pbps_mssql::impact::{RenameTarget, rename_impact};
+    let rename = RenameTarget::Table("dbo.t".parse().unwrap());
+    let referencing = "SELECT on OBJECT::[sys].[dm_sql_referencing_entities]";
+
+    // The referenced-entities function: a gap, named at it.
+    db.conn
+        .execute(&format!(
+            "USE master; DENY SELECT ON sys.dm_sql_referenced_entities TO [{login}];"
+        ))
+        .await
+        .expect("deny");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    let (gaps, _) = schema_scoped_report(&mut lp).await;
+    assert_eq!(
+        gaps,
+        ["SELECT on OBJECT::[sys].[dm_sql_referenced_entities]"]
+    );
+    // A table's impact read asks only the referencing function, so it reads;
+    // a column's asks this one too, and refuses naming it (#1717 review).
+    rename_impact(&mut lp, &rename)
+        .await
+        .expect("a table's impact read does not ask the denied function");
+    let refused = rename_impact(&mut lp, &RenameTarget::Column("dbo.t.a".parse().unwrap()))
+        .await
+        .expect_err("a column's impact read asks it")
+        .to_string();
+    assert!(
+        refused.contains("sys.dm_sql_referenced_entities"),
+        "{refused}"
+    );
+    assert!(
+        !refused.contains("sys.dm_sql_referencing_entities"),
+        "{refused}"
+    );
+    db.conn
+        .execute(&format!(
+            "USE master; REVOKE SELECT ON sys.dm_sql_referenced_entities FROM [{login}];"
+        ))
+        .await
+        .expect("revoke the deny");
+
+    // The referencing-entities function, read only by an apply that renames:
+    // advice, and that rename's impact read refuses by name (#1717).
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    let (_, advice) = schema_scoped_report(&mut lp).await;
+    assert!(!advice.iter().any(|a| a == referencing), "{advice:?}");
+    rename_impact(&mut lp, &rename)
+        .await
+        .expect("the rename's impact reads as the login");
+    db.conn
+        .execute(&format!(
+            "USE master; DENY SELECT ON sys.dm_sql_referencing_entities TO [{login}];"
+        ))
+        .await
+        .expect("deny");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    let (gaps, advice) = schema_scoped_report(&mut lp).await;
+    assert_eq!(gaps, Vec::<String>::new());
+    assert!(advice.iter().any(|a| a == referencing), "{advice:?}");
+    let refused = rename_impact(&mut lp, &rename)
+        .await
+        .expect_err("the rename's impact read refuses under the deny")
+        .to_string();
+    for said in ["sys.dm_sql_referencing_entities", "a DENY there", "master"] {
+        assert!(refused.contains(said), "{said}: {refused}");
     }
+    assert!(!refused.contains("229"), "{refused}");
+    db.conn
+        .execute(&format!(
+            "USE master; REVOKE SELECT ON sys.dm_sql_referencing_entities FROM [{login}];"
+        ))
+        .await
+        .expect("revoke the deny");
+
     // The pull asks the referenced-entities function, and fails under its
     // deny rather than reading a schema without the edges.
     db.conn
@@ -7249,7 +7307,7 @@ async fn a_denied_dependency_function_is_a_readiness_gap() {
 
     // Negative: with the denies gone, ready again.
     let mut lp = connect_live(&as_login).await.expect("reconnect");
-    assert_eq!(schema_scoped_gaps(&mut lp).await, Vec::<String>::new());
+    assert_eq!(schema_scoped_report(&mut lp).await.0, Vec::<String>::new());
     drop(lp);
     db.drop().await;
     let mut admin = connect_live(&conn_str()).await.expect("connect");
@@ -7261,8 +7319,9 @@ async fn a_denied_dependency_function_is_a_readiness_gap() {
         .await;
 }
 
-/// `doctor`'s gaps for a login managing `dbo` only, as `permission on securable`.
-async fn schema_scoped_gaps(lp: &mut pbps_db::Conn) -> Vec<String> {
+/// `doctor`'s gaps and advice for a login managing `dbo` only, each as
+/// `permission on securable`.
+async fn schema_scoped_report(lp: &mut pbps_db::Conn) -> (Vec<String>, Vec<String>) {
     let held = pbps_mssql::doctor::permissions(
         lp,
         &[],
@@ -7275,10 +7334,15 @@ async fn schema_scoped_gaps(lp: &mut pbps_db::Conn) -> Vec<String> {
     )
     .await
     .expect("read permissions");
-    pbps_mssql::doctor::missing(&held)
-        .iter()
-        .map(|g| format!("{} on {}", g.permission, g.securable()))
-        .collect()
+    let render = |gaps: Vec<pbps_mssql::doctor::Gap>| {
+        gaps.iter()
+            .map(|g| format!("{} on {}", g.permission, g.securable()))
+            .collect()
+    };
+    (
+        render(pbps_mssql::doctor::missing(&held)),
+        render(pbps_mssql::doctor::advised(&held)),
+    )
 }
 
 /// The permission check against a real least-privilege login.

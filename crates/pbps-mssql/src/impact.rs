@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 
-use pbps_db::Conn;
+use pbps_db::{Conn, DbError};
 use pbps_dialect::DialectError;
 use pbps_model::{Change, TableName};
 
@@ -724,6 +724,52 @@ pub async fn rename_impact(
     rename_impact_reading(conn, target, read).await
 }
 
+/// Refuses by name a login that may not `SELECT` from a dependency function
+/// the functions' read asks (#1717, DEC-1717.1). `public` holds both in
+/// `master`, so this is a `DENY` there, which `doctor` reports as advice for
+/// the referencing one: only an apply that renames reads it. Without this the
+/// read failed with the engine's Msg 229, which says what was denied and not
+/// why pbps asked or where the `DENY` lives. Asked of each function from this
+/// database, which sees a `DENY` in `master` to this login's user or to
+/// `public` (measured on 17.0, DEC-1704.1).
+async fn require_dependency_functions(conn: &mut Conn, functions: &[&str]) -> Result<(), DbError> {
+    let mut denied = Vec::new();
+    for function in functions {
+        let held = conn
+            .query(&format!(
+                "SELECT HAS_PERMS_BY_NAME(N'sys.{function}', N'OBJECT', N'SELECT') AS held;"
+            ))
+            .await?;
+        if held
+            .first()
+            .and_then(|row| row.try_get::<i32>("held").ok().flatten())
+            != Some(1)
+        {
+            denied.push(format!("sys.{function}"));
+        }
+    }
+    if denied.is_empty() {
+        return Ok(());
+    }
+    Err(DbError::Refused(format!(
+        "this login may not SELECT from {}, which pbps reads to find what a rename affects. \
+         `public` holds that permission in master, so a DENY there has taken it away; remove \
+         the DENY in master, or run the rename as a login it does not cover",
+        denied.join(" or ")
+    )))
+}
+
+/// The dependency functions the functions' read asks for this target:
+/// [`DEPENDENCIES_TABLE`] asks only who refers to the object, and
+/// [`DEPENDENCIES_COLUMN`] also what each referrer reads. Checking both for a
+/// table refused a rename whose read never asks the denied one (#1717 review).
+fn functions_read_for(target: &RenameTarget) -> &'static [&'static str] {
+    match target {
+        RenameTarget::Table(_) | RenameTarget::Module(_) => &["dm_sql_referencing_entities"],
+        RenameTarget::Column(_) => &crate::doctor::DEPENDENCY_FUNCTIONS,
+    }
+}
+
 /// [`rename_impact`] with the read given rather than chosen, so the view's read
 /// can be exercised on a server that would not choose it.
 pub async fn rename_impact_reading(
@@ -758,7 +804,10 @@ pub async fn rename_impact_reading(
     };
 
     let (by_table, by_column) = match read {
-        DependencyRead::Functions => (DEPENDENCIES_TABLE, DEPENDENCIES_COLUMN),
+        DependencyRead::Functions => {
+            require_dependency_functions(conn, functions_read_for(target)).await?;
+            (DEPENDENCIES_TABLE, DEPENDENCIES_COLUMN)
+        }
         DependencyRead::Catalog => {
             crate::catalog::require_dependency_catalog(conn).await?;
             (CATALOG_DEPENDENCIES_TABLE, CATALOG_DEPENDENCIES_COLUMN)
