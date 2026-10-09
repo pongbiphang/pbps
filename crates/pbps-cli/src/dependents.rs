@@ -271,6 +271,31 @@ fn removes_with_its_owner(change: &Change, holds: &Holds, partitions: &Partition
     }
 }
 
+/// The partitions of `schema` that stand through the whole plan: every one
+/// but those it attaches, detaches or drops. The declarations at plan time
+/// and the baseline read at apply then give the same relation, and a
+/// parent's change is taken to reach only a partition it reaches wherever it
+/// runs (DEC-1699.1).
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn standing_partitions(schema: &Schema, cs: &ChangeSet) -> Partitions {
+    let moving: Vec<&TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::AttachPartition { table, .. } | Change::DetachPartition { table, .. } => {
+                Some(table)
+            }
+            Change::DropTable {
+                name,
+                detach_from: Some(_),
+                ..
+            } => Some(name),
+            _ => None,
+        })
+        .collect();
+    Partitions::of(schema).without(moving)
+}
+
 /// Whether a change to a column of `changed` reaches a part of `table`: the
 /// table itself, or the parent of a partition, whose column changes the
 /// engine recurses into every partition. A partition's part names the
@@ -742,7 +767,7 @@ pub(crate) fn weave(
 ) -> Result<usize, String> {
     let roots = dropped_modules(cs);
     let mut refused: Vec<String> = Vec::new();
-    let partitions = Partitions::of(declared);
+    let partitions = standing_partitions(declared, cs);
     for (root, _) in &roots {
         let Some(deps) = found.get(root) else {
             continue;
@@ -4933,6 +4958,98 @@ mod tests {
                 rendered(&cs)
             );
         }
+    }
+
+    /// A table this plan attaches is a partition on one side of the plan
+    /// only, so a parent's `DROP DEFAULT` is not taken to release its
+    /// default: the table's own removal is planned, and the apply, which
+    /// reads the relation off the baseline where the table is not a partition
+    /// yet, accounts for it the same way (#1728 review).
+    #[test]
+    fn a_table_this_plan_attaches_keeps_its_own_removal_around_a_rebuild() {
+        let (mut s, mut ids) = declared();
+        let ev = TableName::new("app", "ev");
+        let p_1 = TableName::new("app", "p_1");
+        let mut parent = Table::default();
+        let mut n = Column::new("integer".parse().unwrap());
+        n.default = Some("app.f(1)".into());
+        parent.columns.insert("n".into(), n);
+        parent.partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["n".into()],
+        });
+        s.tables.insert(ev.clone(), parent.clone());
+        // The baseline: `p_1` an ordinary table with the same default.
+        let mut base = s.clone();
+        let mut plain = parent.clone();
+        plain.partition_by = None;
+        base.tables.insert(p_1.clone(), plain.clone());
+        let bound = pbps_model::PartitionBound::Default;
+        s.tables.insert(
+            p_1.clone(),
+            Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: ev.clone(),
+                    bound: bound.clone(),
+                    columns: Default::default(),
+                }),
+                ..Table::default()
+            },
+        );
+        ids.tables
+            .insert(Uid::derived(UidKind::Table, "app.p_1", 0), p_1.clone());
+        ids.columns.insert(
+            Uid::derived(UidKind::Column, "app.ev.n", 0),
+            ColumnRef::new(ev.clone(), "n"),
+        );
+        let default_on = |table: &TableName| Dependent {
+            described: format!("default value for column n of table {table}"),
+            holds: Holds::TablePart {
+                table: table.clone(),
+                part: Part::Default("n".into()),
+            },
+        };
+        // The parent's first, so its `DROP DEFAULT` is in the plan when
+        // `p_1`'s is woven.
+        let found = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![default_on(&ev), default_on(&p_1)],
+        )]);
+        let attach = Change::AttachPartition {
+            uid: Uid::derived(UidKind::Table, "app.p_1", 0),
+            table: p_1.clone(),
+            parent: ev.clone(),
+            bound,
+            shape: Box::new(plain),
+        };
+        let mut cs = plan(vec![attach, alter(&s, "app.f(integer)")]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect("woven");
+        let names = rendered(&cs);
+        let at = |name: &str| {
+            names
+                .iter()
+                .position(|n| n.starts_with(name))
+                .unwrap_or_else(|| panic!("{name} in {names:?}"))
+        };
+        assert!(
+            at("default p_1.n -> None") < at("alter app.f(integer)"),
+            "{names:?}"
+        );
+        assert!(
+            unaccounted(&cs, &found, &standing_partitions(&base, &cs)).is_empty(),
+            "{names:?}"
+        );
+        // Negative: a partition standing through the plan is released by the
+        // parent's `DROP DEFAULT`, and adds nothing of its own.
+        assert_eq!(
+            standing_partitions(&s, &cs).parent(&p_1),
+            None,
+            "the attached table is not standing"
+        );
+        assert_eq!(
+            Partitions::of(&s).parent(&p_1),
+            Some(&ev),
+            "the declarations alone call it a partition"
+        );
     }
 
     #[test]

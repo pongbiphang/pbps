@@ -4061,6 +4061,17 @@ what it already has:
 A tree is one level deep, since a partitioned partition is not held
 (DEC-1170.1), so a partition's column has exactly one parent's column.
 
+The connected passes and `check_module_dependents` read only the partitions
+that stand through the plan: every one but those it attaches, detaches or
+drops (`standing_partitions`). Such a table is a partition on one side of
+the plan only, so the declarations and the baseline read disagree about it.
+A parent's change reaches it only on one side of its own transition. Read off
+the declarations, a parent's `DROP DEFAULT` was taken to release the default
+of a table the plan attaches, and its own removal was left out. The apply,
+reading the baseline where the table is not a partition yet, then refused the
+valid plan (#1728 review). Its own removal is planned instead, as any
+table's.
+
 **The pre-flight** gives each partition its parent's renames, retypes, added
 columns and recomputed generated columns as its own (`reach_partitions`).
 A partition's own check is then skipped over a parent's retype, as a plain
@@ -4134,6 +4145,7 @@ Pinned by:
 - `a_partitions_probe_takes_its_parents_column_changes_as_its_own`;
 - `a_probe_never_reads_a_name_this_plan_gives_another_column`;
 - `a_rebuild_under_a_partition_follows_its_parents_column_changes`;
+- `a_table_this_plan_attaches_keeps_its_own_removal_around_a_rebuild`;
 - `a_column_renamed_into_a_dropped_columns_name_is_not_movement`;
 - `a_partitioned_parents_columns_change_and_its_partitions_keep_their_own`;
 - the CLI's

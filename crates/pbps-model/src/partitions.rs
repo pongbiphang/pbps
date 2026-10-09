@@ -70,6 +70,23 @@ impl Partitions {
         }
     }
 
+    /// The relation without `tables` as partitions: the ones a plan
+    /// attaches, detaches or drops, which are a partition on one side of it
+    /// and not the other. A parent's change reaches such a table only on one
+    /// side of its own transition, so a consumer that reads the relation off
+    /// one schema at plan time and another at apply would disagree about it
+    /// (#1728 review).
+    pub fn without<'a>(mut self, tables: impl IntoIterator<Item = &'a TableName>) -> Self {
+        for table in tables {
+            if let Some(parent) = self.parents.remove(table)
+                && let Some(held) = self.held.get_mut(&parent)
+            {
+                held.retain(|p| p != table);
+            }
+        }
+        self
+    }
+
     /// Whether this schema has no partition at all.
     pub fn is_empty(&self) -> bool {
         self.parents.is_empty()

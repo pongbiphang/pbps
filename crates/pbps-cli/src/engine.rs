@@ -2821,7 +2821,7 @@ pub async fn account_for_module_dependents(
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     let split = crate::dependents::split_new_tables(changes, ids, dialect)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
-    let partitions = pbps_model::Partitions::of(declared);
+    let partitions = crate::dependents::standing_partitions(declared, changes);
     let released = crate::dependents::released(changes, &found, &partitions);
     let moved = crate::dependents::after_the_rebuilds(changes, &released, deps, declared)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
@@ -2892,7 +2892,8 @@ pub async fn check_module_dependents(
     stored: &pbps_model::Schema,
 ) -> anyhow::Result<()> {
     let found = module_dependents(conn, changes).await?;
-    let left = crate::dependents::unaccounted(changes, &found, &pbps_model::Partitions::of(stored));
+    let partitions = crate::dependents::standing_partitions(stored, changes);
+    let left = crate::dependents::unaccounted(changes, &found, &partitions);
     if !left.is_empty() {
         anyhow::bail!(
             "module_dependents (PostgreSQL): the database now holds dependents this plan does not \
