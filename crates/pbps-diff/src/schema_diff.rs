@@ -1563,6 +1563,20 @@ fn diff_partial_rebuilding(
             }
             return (order_key(c), 2);
         }
+        // A partitioned parent's index first in its class, before any
+        // partition's own: built after one, it would take it as its clone
+        // (#1737 review, DEC-1688.1). First rather than the partition's own
+        // last, which would put it after a replica identity naming it. A
+        // parent's index reads only its columns, all of earlier classes.
+        if let Change::AddIndex { table, .. } = c
+            && declared
+                .schema
+                .tables
+                .get(table)
+                .is_some_and(|t| t.partition_by.is_some())
+        {
+            return (order_key(c), 0);
+        }
         if let Change::RenameColumn { table, from, .. } = c {
             let depth = chain_depth
                 .get(&(table.clone(), from.clone()))
@@ -3134,7 +3148,7 @@ fn refuse_partition_changes(
     let mut refused: BTreeMap<TableName, Vec<String>> = BTreeMap::new();
     // The tables this plan attaches under each parent or detaches from it.
     let mut moving: BTreeMap<TableName, Vec<TableName>> = BTreeMap::new();
-    let mut columns_meet_moves: BTreeSet<TableName> = BTreeSet::new();
+    let mut changes_meet_moves: BTreeSet<TableName> = BTreeSet::new();
     let mut refuse = |table: &TableName, what: String| {
         let list = refused.entry(table.clone()).or_default();
         if !list.contains(&what) {
@@ -3309,7 +3323,22 @@ fn refuse_partition_changes(
             && parent_standing(base.schema, table)
             && parent_standing(declared.schema, table)
         {
-            if let Some(why) = refuse_parent_index(table, change, declared.schema, hints) {
+            if let Some(tables) = moving.get(table) {
+                // The same two plans as a column change (DEC-1687.1): a
+                // detach's shape and a unique index's probe each read the
+                // tree on one side of the other (#1737 review).
+                let tables: Vec<String> = tables.iter().map(ToString::to_string).collect();
+                changes_meet_moves.insert(table.clone());
+                refuse(
+                    table,
+                    format!(
+                        "{} while this plan attaches, detaches or drops {}; change the indexes and \
+                         the partitions in separate plans",
+                        change_in_words(change),
+                        tables.join(", ")
+                    ),
+                );
+            } else if let Some(why) = refuse_parent_index(table, change, base, declared, hints) {
                 refuse(table, why);
             }
             continue;
@@ -3356,7 +3385,7 @@ fn refuse_partition_changes(
                 // column change would need its own place against each
                 // transition (#1692 review). Two plans keep each simple.
                 let tables: Vec<String> = tables.iter().map(ToString::to_string).collect();
-                columns_meet_moves.insert(table.clone());
+                changes_meet_moves.insert(table.clone());
                 refuse(
                     table,
                     format!(
@@ -3402,7 +3431,7 @@ fn refuse_partition_changes(
     // shape the detach cannot take: its declaration holds the columns as the
     // refused changes leave them.
     errs.retain(|e| {
-        !matches!(e, DiffError::DetachedShape { parent, .. } if columns_meet_moves.contains(parent))
+        !matches!(e, DiffError::DetachedShape { parent, .. } if changes_meet_moves.contains(parent))
     });
     errs.extend(
         refused
@@ -3426,7 +3455,8 @@ fn refuse_partition_changes(
 fn refuse_parent_index(
     table: &TableName,
     change: &Change,
-    declared: &Schema,
+    base: Side<'_>,
+    declared: Side<'_>,
     hints: &Hints,
 ) -> Option<String> {
     if hints.strategies.get(table).is_some_and(|s| s.online) {
@@ -3439,7 +3469,7 @@ fn refuse_parent_index(
     let Change::AddIndex { name, index, .. } = change else {
         return None;
     };
-    let parent = declared.tables.get(table)?;
+    let parent = declared.schema.tables.get(table)?;
     if index.unique
         && let Some(by) = &parent.partition_by
         && let Some(missing) = by.columns.iter().find(|key| {
@@ -3454,7 +3484,13 @@ fn refuse_parent_index(
              PostgreSQL refuses on a partitioned table; add `{missing}` to its columns"
         ));
     }
+    // Only an own index standing when the parent's is built: one the
+    // partition held before the plan and keeps, or every one of a partition
+    // the plan creates, which is created with them. One the plan adds to a
+    // standing partition is built after its parent's, and is its own (#1737
+    // review).
     let adopted: Vec<String> = declared
+        .schema
         .tables
         .iter()
         .filter(|(_, t)| {
@@ -3463,8 +3499,18 @@ fn refuse_parent_index(
                 .is_some_and(|of| of.parent == *table)
         })
         .flat_map(|(partition, t)| {
+            let before = declared
+                .ids
+                .tables
+                .iter()
+                .find(|(_, name)| *name == partition)
+                .and_then(|(uid, _)| base.ids.tables.get(uid))
+                .and_then(|name| base.schema.tables.get(name));
             t.indexes
                 .iter()
+                .filter(move |(own, ix)| {
+                    before.is_none_or(|b| b.indexes.get(own.as_str()) == Some(ix))
+                })
                 .filter(|(_, own)| adopts(index, own))
                 .map(move |(own, _)| format!("{partition}'s `{own}`"))
         })
@@ -6561,11 +6607,21 @@ mod tests {
             }
             s
         };
-        let outcome = |base: &Schema, declared: &Schema, online: bool| {
+        let planned = |base: &Schema, declared: &Schema, online: bool| {
             let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
                 .unwrap()
                 .ids;
-            let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+            // A partition left out is dropped, which takes a reason.
+            let dropped: Vec<Intent> = base
+                .tables
+                .keys()
+                .filter(|t| !declared.tables.contains_key(*t))
+                .map(|t| Intent::DropTable {
+                    table: t.clone(),
+                    reason: "gone".into(),
+                })
+                .collect();
+            let declared_ids = crate::resolve(declared, &base_ids, &dropped, &ctx())
                 .unwrap()
                 .ids;
             let mut hints = Hints::default();
@@ -6586,8 +6642,10 @@ mod tests {
                 &MinimalDialect,
                 &hints,
             )
-            .map(|cs| kinds(&cs))
             .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let outcome = |base: &Schema, declared: &Schema, online: bool| {
+            planned(base, declared, online).map(|cs| kinds(&cs))
         };
         let plain = tree(&[], &[], false);
         let indexed = tree(&[("ev_n", index(&["n"], false, None))], &[], false);
@@ -6653,6 +6711,65 @@ mod tests {
             ),
             "which would take app.ev_new's `own`",
         );
+        // An own index this plan adds to a standing partition is built after
+        // its parent's, whatever the names, and stays its own (#1737 review).
+        // A partition whose name sorts before its parent's takes the rule,
+        // not the tie-break, to come second.
+        let renamed = |mut s: Schema, to: &str| {
+            let t = s
+                .tables
+                .remove(&"app.ev_1".parse::<TableName>().unwrap())
+                .unwrap();
+            s.tables.insert(to.parse().unwrap(), t);
+            s
+        };
+        for (partition, partition_index, parent_index) in
+            [("app.ev_1", "ev_1_n", "ev_n"), ("app.aa", "a", "z")]
+        {
+            let both = tree(
+                &[(parent_index, index(&["n"], false, None))],
+                &[(partition_index, index(&["n"], false, None))],
+                false,
+            );
+            let cs = planned(
+                &renamed(plain.clone(), partition),
+                &renamed(both, partition),
+                false,
+            )
+            .expect("planned");
+            let tables: Vec<String> = cs
+                .changes
+                .iter()
+                .map(|p| p.change.table().unwrap().to_string())
+                .collect();
+            assert_eq!(tables, ["app.ev", partition], "{:?}", cs.changes);
+        }
+        // Refused by name: an index change in a plan that drops a partition
+        // under the parent, whose rows the unique probe would still read and
+        // whose shape a detach would check against the parent's indexes as
+        // they stood (#1737 review).
+        let mut without_partition = indexed.clone();
+        without_partition
+            .tables
+            .remove(&"app.ev_1".parse::<TableName>().unwrap());
+        let mut unique_without = tree(&[("ev_u", index(&["id", "ts"], true, None))], &[], false);
+        unique_without
+            .tables
+            .remove(&"app.ev_1".parse::<TableName>().unwrap());
+        let mut plain_without = plain.clone();
+        plain_without
+            .tables
+            .remove(&"app.ev_1".parse::<TableName>().unwrap());
+        refused(
+            outcome(&plain, &unique_without, false),
+            "change the indexes and the partitions in separate plans",
+        );
+        refused(
+            outcome(&indexed, &plain_without, false),
+            "change the indexes and the partitions in separate plans",
+        );
+        // Negative: the partition dropped alone is planned.
+        assert!(outcome(&indexed, &without_partition, false).is_ok());
         // Negative: an own index the engine does not adopt, by uniqueness or
         // by predicate, leaves the parent's planned.
         for other in [

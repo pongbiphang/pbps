@@ -334,7 +334,14 @@ fn load_from_git(
         let text = git(root, &["show", &format!("{rev}:{path}")])?;
         match pbps_load::load_file_str(Path::new(path), &text) {
             Ok(pbps_load::LoadedFile::Table(t)) => {
+                let t = *t;
                 schema.tables.insert(t.name, t.table);
+                // Each a table of its own, as the declarations load them
+                // (#1170): left out, every standing partition read as absent
+                // and its own changes went unplanned (#1737 review).
+                for (child, table) in t.partitions {
+                    schema.tables.insert(child, table);
+                }
                 count += 1;
             }
             // A module has no identity to reconstruct, so the baseline needs

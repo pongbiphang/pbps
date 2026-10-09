@@ -6989,9 +6989,9 @@ fn a_partition_is_detached_and_kept_through_the_cli() {
         format!("table: app.ev_2025\n{columns}primary_key: [id, ts]\n"),
     )
     .unwrap();
-    succeeds(d.run(&["plan"]));
-    d.commit();
-    let o = d.run(&["plan", "--db", &connection]);
+    // Refused offline, where the git baseline holds the standing partition
+    // (#1737 review), before an identity file is written for the shape.
+    let o = d.run(&["plan"]);
     assert_ne!(code(&o), 0, "{}", stdout(&o));
     let said = format!("{}{}", stdout(&o), stderr(&o));
     assert!(
@@ -19473,19 +19473,35 @@ fn parent_indexes_flow(server: &str, slug: &str) {
         ))
     };
 
-    // Added: a clone on every partition.
+    // Added: a clone on every partition. With it, `ev_2024` gains its own
+    // index of the same shape, built after the parent's and so its own
+    // (#1737 review).
     edit(
         "\npartition_by:",
         "\nindexes:\n  ev_m:\n    columns: [m]\n\npartition_by:",
     );
+    edit(
+        "  ev_2024: {from: [\"2024-01-01\"], to: [\"2025-01-01\"]}\n",
+        "  ev_2024:\n    from: [\"2024-01-01\"]\n    to: [\"2025-01-01\"]\n    \
+         indexes:\n      ev_2024_m:\n        columns: [m]\n",
+    );
     let planned = applied("add.json");
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_inherits WHERE inhrelid = 'app.ev_2024_m'::regclass"),
+        0,
+        "the partition's own index is its own"
+    );
     assert!(
         planned.contains("recurses into its 2 partition(s)"),
         "{planned}"
     );
     assert_eq!(clones_on("m"), 2);
-    // Renamed: a drop and an add.
+    // Renamed: a drop and an add, and the add would take `ev_2024`'s own,
+    // which stands now, as its clone. Refused, then planned with the own
+    // one dropped in the same plan, which runs before the add.
     edit("  ev_m:\n", "  ev_m2:\n");
+    refused("which would take app.ev_2024's `ev_2024_m`");
+    edit("    indexes:\n      ev_2024_m:\n        columns: [m]\n", "");
     applied("rename.json");
     assert_eq!(
         holds("SELECT count(*) FROM pg_class WHERE relname = 'ev_m2'"),

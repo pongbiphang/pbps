@@ -4193,10 +4193,30 @@ for a column change (DEC-1687.1).
   into** (leon, 2026-10-08, on #1546). The adoption leaves the partition
   without its own index on every later read, and the next plan would create
   it again beside the clone. The remedy is to drop or rename the partition's
-  own index in an earlier plan. The declarations decide which partitions are
-  asked, so a partition the plan creates or attaches with a matching own
-  index is refused too: the create and the attach run before the index is
-  added.
+  own index in an earlier plan, or in the same plan, whose drop runs first.
+  Only an own index standing when the parent's is built is asked: one a
+  partition held before the plan and keeps, and every one of a partition the
+  plan creates, which is created with them. One the plan adds to a standing
+  partition is its own, because a partitioned parent's `AddIndex` sorts first
+  in class 13, at (13, 0), before any partition's own (#1737 review). The
+  parent's goes first, not the partition's last: last would put an own index
+  after a replica identity naming it.
+- **an index change in a plan that attaches, detaches or drops a partition
+  under the parent**, the same two plans a column change takes (DEC-1687.1).
+  A detach checks its shape against the parent's indexes as they stood, and
+  a unique index's probe reads the rows of a partition the plan removes
+  before the index is built (#1737 review).
+
+An offline `plan` reads its baseline from git. Until this PR, that baseline
+left out the partitions a parent's file declares. Every standing partition
+then read as absent: its own changes went unplanned, and its own index read
+as one the plan creates (#1737 review). The git baseline now loads them as
+the declarations do.
+
+A predicate or key expression is compared as declared text. Under a
+partition in another schema, the same text may bind to another function, so
+the comparison can refuse an index the engine would not adopt. That class of
+ambiguous adoption is #1671's, the resolver's to rehearse.
 
 `ONLY` is not used. It leaves the parent's index invalid until every
 partition's index is attached by hand, which is not one statement.
