@@ -19672,26 +19672,26 @@ fn parent_keys_flow(server: &str, slug: &str) {
         "  ev_r_max: r < 100\n",
         "  ev_r_max: r < 100\n  ev_f_ck: app.f(r) > 0\n",
     );
-    // With `ev_2024`'s own index of the same shape, built after the
-    // parent's and named to sort after it: dropped around the rebuild, it
-    // must come back after the parent's, or the parent's takes it.
-    edit(
-        &path,
-        "  ev_2024: {from: [\"2024-01-01\"], to: [\"2025-01-01\"]}\n",
-        "  ev_2024:\n    from: [\"2024-01-01\"]\n    to: [\"2025-01-01\"]\n    indexes:\n      \
-         zz_own:\n        keys:\n          - expression: app.f(r)\n",
-    );
     applied("function-backed.json");
     assert_eq!(clones("c"), 6);
-    let own_is_own =
-        || holds("SELECT count(*) FROM pg_inherits WHERE inhrelid = 'app.zz_own'::regclass");
-    assert_eq!(own_is_own(), 0);
+    // Rebuilt, in the plan that gives `ev_2024` its own index of the
+    // parent's shape, named to sort after it: the parent's is taken down and
+    // put back around the rebuild, and the own index must be built after it,
+    // or the parent's takes it (#1745 review).
     std::fs::write(
         d.dir.join("schema/app.f%28integer%29.function.yml"),
         "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
          (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x + 0 $$\n",
     )
     .unwrap();
+    edit(
+        &path,
+        "  ev_2024: {from: [\"2024-01-01\"], to: [\"2025-01-01\"]}\n",
+        "  ev_2024:\n    from: [\"2024-01-01\"]\n    to: [\"2025-01-01\"]\n    indexes:\n      \
+         zz_own:\n        keys:\n          - expression: app.f(r)\n",
+    );
+    let own_is_own =
+        || holds("SELECT count(*) FROM pg_inherits WHERE inhrelid = 'app.zz_own'::regclass");
     applied("rebuilt.json");
     assert_eq!(
         holds(

@@ -4297,6 +4297,20 @@ needs to name the clones (#1745 review). This was not new with this slice:
 a parent created with a check or index calling a function met it on that
 function's first rebuild.
 
+Two consequences, both from the #1745 review:
+- **A rebuild alongside a detach under the parent is refused by name.**
+  The parent's drop, placed before the function's, takes every copy while
+  the partitions are attached, and its add after the function's create puts
+  them back. A detach runs between the two, finds no copy to give its
+  declared name, and would leave the detached table without it. The remedy
+  is the two plans DEC-1687.1 already asks for. An attach needs nothing: the
+  table's check is its own until the attach and the parent's after
+  (DEC-1545.1, #1642 review). A partition dropped goes with its copy.
+- **A partition's new index goes after its parent's.** It is the last
+  reordering of `plan --db`: a partition's new own index that calls the
+  rebuilt function moves after the rebuild, but ahead of the parent's
+  restoration, and the parent's would take it.
+
 Pinned by `a_partitioned_parents_keys_checks_and_foreign_keys_change`, and by
 the CLI's
 `a_partitioned_parents_keys_checks_and_foreign_keys_change_through_the_cli`,
