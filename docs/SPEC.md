@@ -2341,6 +2341,10 @@ could fail validation against the envelope schema published before it
   `additionalProperties`, `unevaluatedProperties` or `propertyNames`, or set
   `patternProperties` or `maxProperties`.
 
+Until the first tagged release, none of these moves it either. The wire
+version stays 1. The schema-set version records the change, and the change
+raises the archive check's floor to its own set (DEC-1734.1).
+
 A consumer that parses `data` strictly accepts that it must update with the
 tool.
 
