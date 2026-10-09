@@ -2560,7 +2560,7 @@ struct OwnDefault<'a> {
 /// creates nothing. What cannot be asked — no `TEMP` privilege, an enabled
 /// DDL event trigger (one fires on the `CREATE`, measured, so none is run
 /// under one; #1669), a text that names an object the plan has yet to
-/// create — is listed in
+/// create, one that may name a temporary schema (#1706) — is listed in
 /// `defaults_unasked`, never read as an answer.
 async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mut Spellings) {
     let mut asked: Vec<OwnDefault<'_>> = Vec::new();
@@ -2581,6 +2581,22 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
             };
             // The same text is validation's to refuse (DEC-1578.1).
             if own == parents {
+                continue;
+            }
+            // Another session's temporary schema is open to any role with
+            // `TEMP`, which `PUBLIC` holds by default, so what is in it can
+            // change after the read below. Only a superuser reaches one,
+            // and only by naming it: a non-superuser is refused `USAGE`
+            // and no path searches one, measured on 16 and 18 (#1706).
+            let declared_ty = theirs.ty.to_string();
+            if [own, parents, declared_ty.as_str()]
+                .into_iter()
+                .any(may_name_a_temporary_schema)
+            {
+                out.defaults_unasked.push(format!(
+                    "partition {partition} column `{column}`: its declared text may name a \
+                     temporary schema, whose objects another session can change"
+                ));
                 continue;
             }
             match crate::types::normalize(&theirs.ty) {
@@ -2608,28 +2624,53 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
     // they take, a message they send stays. A connected plan is read-only
     // (SPEC §9.8), so with one enabled nothing is stored and each pair stays
     // to the apply's closing check (#1669). A failed read is no answer either.
-    match enabled_ddl_event_triggers(conn).await {
-        Ok(names) if names.is_empty() => {}
-        found => {
-            let why = match found {
-                Ok(names) => format!(
-                    "the target has the enabled DDL event trigger(s) {}, which this check's \
-                     temporary table would fire",
-                    names
-                        .iter()
-                        .map(|n| format!("`{n}`"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                Err(e) => format!("cannot read the target's event triggers: {e}"),
-            };
-            out.defaults_unasked.extend(
-                asked
-                    .iter()
-                    .map(|d| format!("partition {} column `{}`: {why}", d.partition, d.column)),
-            );
-            return;
-        }
+    let listed = |names: Vec<String>| {
+        names
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut refused = match enabled_ddl_event_triggers(conn).await {
+        Ok(names) if names.is_empty() => None,
+        Ok(names) => Some(format!(
+            "the target has the enabled DDL event trigger(s) {}, which this check's \
+             temporary table would fire",
+            listed(names)
+        )),
+        Err(e) => Some(format!("cannot read the target's event triggers: {e}")),
+    };
+    // A domain's CHECK runs when the parse reads a literal as a composite,
+    // array or range over that domain, and it runs as this role: storing
+    // `'(5)'::app.c` runs it, measured on 16 and 18. A check another role
+    // can rewrite would run that role's code with the deployer's privileges
+    // during a plan that is read-only, and an error it raises can carry what
+    // it read (#1663). Which domains a declared text reaches is the parse's
+    // to find, and nothing holds the catalog still between a read and the
+    // store, so any role but a trusted one that can change it at all leaves
+    // every pair unasked (#1707).
+    if refused.is_none() {
+        refused = match untrusted_catalog_writers(conn).await {
+            Ok(names) if names.is_empty() => None,
+            Ok(names) => Some(format!(
+                "the role(s) {}, neither a superuser nor able to become this one, can \
+                 change this database's catalog, and storing a default can run a check \
+                 written there as this role",
+                names.join(", ")
+            )),
+            Err(e) => Some(format!(
+                "cannot read who can change the target's catalog: {}",
+                redacted(e)
+            )),
+        };
+    }
+    if let Some(why) = refused {
+        out.defaults_unasked.extend(
+            asked
+                .iter()
+                .map(|d| format!("partition {} column `{}`: {why}", d.partition, d.column)),
+        );
+        return;
     }
     let result = store_and_read(conn, &asked).await;
     // Rolled back whatever happened: nothing this asks may outlive it.
@@ -2663,6 +2704,18 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
     }
 }
 
+/// Whether a declared text could name a temporary schema (`pg_temp_N`,
+/// `pg_toast_temp_N` or the `pg_temp` alias). Read on the text, not the
+/// parse, since the parse is what runs the check. An identifier cannot be
+/// split by a comment or quoting, and folding case covers both spellings; a
+/// `U&` escape can spell the name without its letters, so any is counted.
+/// A text that only mentions one in a literal is left unasked too: that
+/// costs a warning, never a wrong answer.
+fn may_name_a_temporary_schema(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("pg_temp") || text.contains("pg_toast_temp") || text.contains("u&")
+}
+
 /// Every event trigger that DDL could fire: any not disabled, since one
 /// enabled for replicas only still fires under a session that runs as one.
 async fn enabled_ddl_event_triggers(conn: &mut Conn) -> Result<Vec<String>, DbError> {
@@ -2686,6 +2739,101 @@ async fn enabled_ddl_event_triggers(conn: &mut Conn) -> Result<Vec<String>, DbEr
         .collect()
 }
 
+/// The roles other than this one or a superuser that can change this
+/// database's catalog, and so what a default's parse reaches, between the
+/// probe's read and its store (#1707). Listing the dangerous kinds of object
+/// failed five ways in review: a check added `NOT VALID` to a domain, a
+/// column of a new domain added to a composite or table, a type created in
+/// a schema or a new schema, a membership granted without `SET`, and one
+/// granted with `ADMIN` alone (#1706). Catalog lookups see DDL other sessions
+/// commit mid-transaction, so the only state that holds until the store is
+/// one no such role can change at all.
+///
+/// A role is trusted when it is a superuser or can `SET ROLE` to this role
+/// or to a superuser. Inheriting this role's privileges is not enough: the
+/// check would run with `current_user` this role, which a row security
+/// policy tells apart from a member that only inherits. From each other
+/// role the read walks `pg_auth_members` along memberships granted with
+/// `SET`, `INHERIT` or `ADMIN` (with `ADMIN` it can grant the role with `SET`
+/// to one of its own), once rather than asking `pg_has_role` of every pair,
+/// which took seconds over a few hundred roles. The catalog is open to it
+/// when anything it reaches is this role or a superuser, owns any object in
+/// this database (whatever its kind: a `pg_shdepend` owner row), or holds
+/// `CREATE` on the database or a schema. Predefined roles act only through
+/// their members, so `pg_database_owner` counts only under another owner.
+async fn untrusted_catalog_writers(conn: &mut Conn) -> Result<Vec<String>, DbError> {
+    let rows = conn
+        .query(
+            "WITH RECURSIVE me AS (
+                 SELECT r.oid FROM pg_catalog.pg_roles r
+                  WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER),
+             here AS (
+                 SELECT db.oid, db.datdba FROM pg_catalog.pg_database db
+                  WHERE db.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()),
+             others AS (
+                 SELECT r.oid, r.rolname FROM pg_catalog.pg_roles r
+                  WHERE r.oid OPERATOR(pg_catalog.>=) 16384::pg_catalog.oid
+                    AND NOT r.rolsuper
+                    AND NOT pg_catalog.pg_has_role(r.oid, (SELECT oid FROM me), 'SET')
+                    AND NOT EXISTS (
+                        SELECT FROM pg_catalog.pg_roles su
+                         WHERE su.rolsuper
+                           AND pg_catalog.pg_has_role(r.oid, su.oid, 'SET'))),
+             walk AS (
+                 SELECT o.oid AS origin, o.oid FROM others o
+                 UNION
+                 SELECT w.origin, m.roleid FROM pg_catalog.pg_auth_members m
+                   JOIN walk w ON w.oid OPERATOR(pg_catalog.=) m.member
+                  WHERE m.set_option OR m.inherit_option OR m.admin_option),
+             reach AS (
+                 SELECT origin, oid FROM walk
+                 UNION
+                 SELECT w.origin, 'pg_database_owner'::pg_catalog.regrole::pg_catalog.oid
+                   FROM walk w JOIN here ON here.datdba OPERATOR(pg_catalog.=) w.oid)
+             SELECT DISTINCT pg_catalog.format('`%I`', o.rolname) AS name
+               FROM others o
+               JOIN reach r ON r.origin OPERATOR(pg_catalog.=) o.oid
+              WHERE r.oid OPERATOR(pg_catalog.=) (SELECT oid FROM me)
+                 OR EXISTS (SELECT FROM pg_catalog.pg_roles su
+                             WHERE su.oid OPERATOR(pg_catalog.=) r.oid AND su.rolsuper)
+                 OR EXISTS (
+                        SELECT FROM pg_catalog.pg_shdepend d
+                         WHERE d.refclassid OPERATOR(pg_catalog.=)
+                                   'pg_catalog.pg_authid'::pg_catalog.regclass
+                           AND d.refobjid OPERATOR(pg_catalog.=) r.oid
+                           AND d.dbid OPERATOR(pg_catalog.=) (SELECT oid FROM here)
+                           AND d.deptype OPERATOR(pg_catalog.=) 'o')
+                 OR pg_catalog.has_database_privilege(r.oid, (SELECT oid FROM here), 'CREATE')
+                 OR EXISTS (
+                        SELECT FROM pg_catalog.pg_namespace n
+                         WHERE NOT pg_catalog.pg_is_other_temp_schema(n.oid)
+                           AND pg_catalog.has_schema_privilege(r.oid, n.oid, 'CREATE'))
+              ORDER BY 1",
+        )
+        .await?;
+    // `typname` is NOT NULL; a NULL read still counts as a domain, never as
+    // none.
+    rows.iter()
+        .map(|row| {
+            Ok(row
+                .try_get::<&str>("name")?
+                .unwrap_or("<unnamed>")
+                .to_owned())
+        })
+        .collect()
+}
+
+/// What a failure inside the probe tells the user: the engine's SQLSTATE,
+/// never its text. The text is whatever the code the parse reached chose to
+/// raise, and that code ran with this role's privileges (#1663). A failure
+/// with no server code is the driver's own and is told as it is.
+fn redacted(e: DbError) -> String {
+    match e.server_error_code() {
+        Some(code) => format!("the engine refused it (SQLSTATE {code})"),
+        None => e.to_string(),
+    }
+}
+
 /// Stores one declared text as `column`'s default, under `under`'s path, in a
 /// savepoint of its own.
 ///
@@ -2696,7 +2844,7 @@ async fn enabled_ddl_event_triggers(conn: &mut Conn) -> Result<Vec<String>, DbEr
 async fn store_one(conn: &mut Conn, column: &str, under: &str, text: &str) -> Result<(), String> {
     let path =
         crate::emit::write_path(&crate::Postgres::new(), under).map_err(|e| e.to_string())?;
-    let fail = |e: DbError| e.to_string();
+    let fail = redacted;
     conn.execute("SAVEPOINT pbps_1609").await.map_err(fail)?;
     let result = async {
         conn.query(&format!(
@@ -2726,7 +2874,7 @@ async fn store_one(conn: &mut Conn, column: &str, under: &str, text: &str) -> Re
             conn.execute("ROLLBACK TO SAVEPOINT pbps_1609")
                 .await
                 .map_err(fail)?;
-            Err(e.to_string())
+            Err(redacted(e))
         }
     }
 }
@@ -2738,7 +2886,7 @@ async fn store_and_read(
     conn: &mut Conn,
     asked: &[OwnDefault<'_>],
 ) -> Result<Vec<Result<(String, String), String>>, String> {
-    let fail = |e: DbError| e.to_string();
+    let fail = redacted;
     conn.execute("BEGIN").await.map_err(fail)?;
     // Every parser setting the apply pins, not only the deparse's: a role's
     // `transform_null_equals = on` would store `FALSE = NULL` as `FALSE IS
@@ -3271,6 +3419,35 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_text_that_could_name_a_temporary_schema_is_told_by_any_spelling() {
+        for text in [
+            "('(1)')::pg_temp_3.c",
+            "('(1)')::PG_TEMP_3.c",
+            "('(1)')::\"pg_temp_3\".c",
+            "('(1)')::pg_temp.c",
+            "('(1)')::pg_toast_temp_3.c",
+            "('(1)')::U&\"\\0070g_temp_3\".c",
+            "('(1)')::u&\"pg\\005ftemp_3\".c",
+        ] {
+            assert!(may_name_a_temporary_schema(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_text_naming_no_temporary_schema_is_still_asked() {
+        for text in [
+            "(1)",
+            "'other'::text",
+            "('(1)')::app.c",
+            "app.temperature()",
+            "('(1)')::pg_catalog.int4",
+            "pg_catalog.now()",
+        ] {
+            assert!(!may_name_a_temporary_schema(text), "{text}");
+        }
+    }
 
     #[test]
     fn catalog_guidance_preserves_a_separate_source_only_for_recognized_codes() {

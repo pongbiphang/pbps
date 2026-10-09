@@ -20096,3 +20096,252 @@ fn an_unlogged_partition_under_an_undeclared_permanent_key_is_refused() {
     assert_eq!(absent(), 0);
     succeeds(d.run(&["verify", "--db", &conn]));
 }
+
+/// A role other than the deployer or a superuser that can change the
+/// database's catalog leaves every partition default pair unasked, naming the
+/// role: storing a literal of a composite over its domain runs the domain's
+/// check as the deployer, and its function could read and raise what only
+/// the deployer can (#1663). Its function never runs, and nothing it would
+/// have read reaches the output. So does each way it could change the
+/// catalog before the store: types it owns with no check yet, `CREATE` on the
+/// database, `ADMIN` on the deploying role, or inheriting it without `SET`
+/// (#1707). A text naming another session's temporary schema is left unasked
+/// whoever holds it, its check unrun (#1706). Negatives: without it, the pair
+/// is asked and refused as the
+/// parent's, a domain the deployer owns calling only built-ins does not stop
+/// it, and a text the engine refuses is told by its SQLSTATE alone. On 18
+/// and 16.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
+    const LOW: &str = "partition app.ev_a column `v`: the role(s) `pbps_1663_low`, neither \
+                       a superuser nor able to become this one, can change this database's \
+                       catalog";
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (version, server) in [("18", server()), ("16", old)] {
+        let db = OwnDatabase::new(&server, &format!("parts-1663-{version}"));
+        let conn = db.connection().to_owned();
+        on_server(
+            &conn,
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.ev (k integer NOT NULL, v integer DEFAULT 1) \
+                 PARTITION BY RANGE (k); \
+             CREATE TABLE app.ev_a PARTITION OF app.ev FOR VALUES FROM (0) TO (10); \
+             ALTER TABLE app.ev_a ALTER COLUMN v SET DEFAULT 7",
+        );
+        let d = Demo::new(&format!("parts-1663-{version}"));
+        succeeds(d.run(&["pull", "--db", &conn]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+        // A role with CREATE in a schema of its own writes a check that
+        // counts its runs and raises what only the deployer can read.
+        on_server(
+            &conn,
+            "DO $$ BEGIN CREATE ROLE pbps_1663_low; \
+                 EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
+             CREATE TABLE public.pbps_1663_secret (s text); \
+             INSERT INTO public.pbps_1663_secret VALUES ('pbps-1663-secret'); \
+             CREATE SCHEMA evil; CREATE SEQUENCE evil.ran; \
+             GRANT CREATE, USAGE ON SCHEMA evil TO pbps_1663_low; \
+             SET ROLE pbps_1663_low; \
+             CREATE FUNCTION evil.peek(integer) RETURNS boolean LANGUAGE plpgsql AS \
+                 $$ BEGIN PERFORM pg_catalog.nextval('evil.ran'); \
+                    RAISE EXCEPTION 'leaked %', \
+                        (SELECT pg_catalog.string_agg(s, ',') FROM public.pbps_1663_secret); \
+                 END $$; \
+             CREATE DOMAIN evil.d AS integer CHECK (evil.peek(VALUE)); \
+             CREATE TYPE evil.c AS (v evil.d); \
+             RESET ROLE",
+        );
+        let path = d.dir.join("schema/app.ev.yml");
+        let pulled = std::fs::read_to_string(&path).unwrap();
+        let own = "      v: {default: \"7\"}\n";
+        assert!(pulled.contains(own), "{pulled}");
+        let declare = |text: &str| {
+            std::fs::write(
+                &path,
+                pulled.replace(own, &format!("      v: {{default: {text:?}}}\n")),
+            )
+            .unwrap();
+            d.commit();
+        };
+        declare("pg_catalog.length((('(5)')::evil.c)::text)");
+
+        let ran = "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM evil.ran";
+        let plan = d.dir.join("unasked.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        assert_eq!(scalar(&conn, ran), 0, "{version}: the plan ran the check");
+        let (out, err) = (stdout(&o), stderr(&o));
+        assert!(
+            !out.contains("pbps-1663-secret") && !err.contains("pbps-1663-secret"),
+            "{version}: {out}{err}"
+        );
+        assert!(
+            err.contains(
+                "warning: not checked before the plan whether the engine stores it as the \
+                 parent's default: partition app.ev_a column `v`: the role(s) \
+                 `pbps_1663_low`, neither a superuser nor able to become this one, can \
+                 change this database's catalog, and storing a default can run a check \
+                 written there as this role"
+            ),
+            "{version}: {out}{err}"
+        );
+
+        // A type another role owns holds no check yet, and no schema lets it
+        // create one: it can still add a `NOT VALID` CHECK to its domain, or a
+        // column of a new domain to its composite or table, between the read
+        // and the store, so the pair stays unasked all the same (#1706). A
+        // membership in the deploying role granted without SET or INHERIT
+        // does not make it the deployer.
+        on_server(
+            &conn,
+            "DROP SCHEMA evil CASCADE; CREATE SCHEMA held; \
+             DO $$ BEGIN EXECUTE pg_catalog.format( \
+                 'GRANT %I TO pbps_1663_low WITH INHERIT FALSE, SET FALSE', \
+                 CURRENT_USER); END $$; \
+             GRANT CREATE, USAGE ON SCHEMA held TO pbps_1663_low; \
+             SET ROLE pbps_1663_low; \
+             CREATE DOMAIN held.nc AS integer; \
+             CREATE TYPE held.c AS (v integer); \
+             CREATE TABLE held.t (a integer); \
+             RESET ROLE; \
+             REVOKE CREATE ON SCHEMA held FROM pbps_1663_low",
+        );
+        declare("(2)");
+        let plan = d.dir.join("held.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        let err = stderr(&o);
+        assert!(err.contains(LOW), "{version}: {}{err}", stdout(&o));
+
+        // A role that can create a schema in the database can create the type
+        // a declared text names, in a schema no read could have seen (#1706).
+        on_server(
+            &conn,
+            "DROP SCHEMA held CASCADE; \
+             DO $$ BEGIN EXECUTE pg_catalog.format( \
+                 'GRANT CREATE ON DATABASE %I TO pbps_1663_low', \
+                 pg_catalog.current_database()); END $$",
+        );
+        declare("(3)");
+        let plan = d.dir.join("creator.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        let err = stderr(&o);
+        assert!(err.contains(LOW), "{version}: {}{err}", stdout(&o));
+
+        // Negative: without them, and beside a domain the deployer owns that
+        // calls only built-ins, the pair is asked and refused as the parent's.
+        // A role holding ADMIN on the deploying role, though it can act as
+        // neither, can grant it with SET to a role of its own before the store,
+        // which could then change the deployer's own types (#1706).
+        on_server(
+            &conn,
+            "DO $$ BEGIN EXECUTE pg_catalog.format( \
+                 'REVOKE CREATE ON DATABASE %I FROM pbps_1663_low', \
+                 pg_catalog.current_database()); \
+             EXECUTE pg_catalog.format( \
+                 'GRANT %I TO pbps_1663_low WITH ADMIN TRUE', CURRENT_USER); END $$",
+        );
+        declare("(4)");
+        let plan = d.dir.join("admin.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        let err = stderr(&o);
+        assert!(err.contains(LOW), "{version}: {}{err}", stdout(&o));
+
+        // A member that inherits the deploying role's privileges but cannot
+        // SET to it is not the deployer: `current_user` tells them apart, so
+        // a check it writes would see what a row policy hides from it (#1706).
+        on_server(
+            &conn,
+            "DO $$ BEGIN EXECUTE pg_catalog.format( \
+                 'GRANT %I TO pbps_1663_low WITH ADMIN FALSE, INHERIT TRUE', \
+                 CURRENT_USER); END $$",
+        );
+        declare("(5)");
+        let plan = d.dir.join("inherit.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        let err = stderr(&o);
+        assert!(err.contains(LOW), "{version}: {}{err}", stdout(&o));
+
+        on_server(
+            &conn,
+            "DO $$ BEGIN EXECUTE pg_catalog.format( \
+                 'REVOKE %I FROM pbps_1663_low', CURRENT_USER); END $$; \
+             CREATE DOMAIN public.pbps_1663_ok AS integer CHECK (VALUE > 0)",
+        );
+        declare("(1)");
+        let plan = d.dir.join("asked.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 1, "{version}: {}{}", stdout(&o), stderr(&o));
+        assert!(
+            stderr(&o).contains(
+                "partition app.ev_a column `v`: its own default \"(1)\" is stored as \"1\""
+            ),
+            "{version}: {}",
+            stderr(&o)
+        );
+
+        // Another session's temporary schema is open to any role with TEMP,
+        // PUBLIC's by default, so a check there can appear after the read;
+        // a superuser reaches it by naming it. Held here by the deployer, so
+        // only the text leaves the pair unasked, and the check never runs
+        // (#1706).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut held = rt
+            .block_on(pbps_db::Conn::connect(pbps_db::Driver::Postgres, &conn))
+            .unwrap();
+        on_server(&conn, "CREATE SEQUENCE public.pbps_1663_temp_ran");
+        rt.block_on(held.execute(
+            "CREATE FUNCTION pg_temp.bump(integer) RETURNS boolean LANGUAGE sql AS \
+                 $$ SELECT pg_catalog.nextval('public.pbps_1663_temp_ran') > 0 $$; \
+             CREATE DOMAIN pg_temp.d AS integer CHECK (pg_temp.bump(VALUE)); \
+             CREATE TYPE pg_temp.c AS (v pg_temp.d)",
+        ))
+        .unwrap();
+        let temp = text_of(
+            &conn,
+            "SELECT n.nspname::text FROM pg_catalog.pg_type t \
+               JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+              WHERE t.typname = 'c' AND n.nspname LIKE 'pg\\_temp\\_%'",
+        );
+        declare(&format!("pg_catalog.length((('(6)')::{temp}.c)::text)"));
+        let plan = d.dir.join("temporary.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        let temp_ran = "SELECT CASE WHEN is_called THEN last_value ELSE 0 END \
+                        FROM public.pbps_1663_temp_ran";
+        assert_eq!(
+            scalar(&conn, temp_ran),
+            0,
+            "{version}: the plan ran the check"
+        );
+        assert!(
+            stderr(&o).contains(
+                "partition app.ev_a column `v`: its declared text may name a temporary \
+                 schema, whose objects another session can change"
+            ),
+            "{version}: {}{}",
+            stdout(&o),
+            stderr(&o)
+        );
+        drop(held);
+        drop(rt);
+
+        // A text the engine refuses is told by its SQLSTATE, not its words.
+        declare("('pbps-1663-text')::integer");
+        let plan = d.dir.join("refused.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        let err = stderr(&o);
+        assert!(
+            err.contains("partition app.ev_a column `v`: the engine refused it (SQLSTATE 22P02)")
+                && !err.contains("invalid input syntax"),
+            "{version}: {}{err}",
+            stdout(&o)
+        );
+        on_server(
+            &conn,
+            "DROP OWNED BY pbps_1663_low; DROP ROLE pbps_1663_low",
+        );
+    }
+}

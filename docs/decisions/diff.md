@@ -3797,3 +3797,100 @@ Pinned by:
   computed column reads, and checks their pairs. Its negative: unbound, both
   drops keep their place. The search test above also refuses to move the
   function past a computed drop bound to it.
+
+<a id="dec-1663-1"></a>
+
+**DEC-1663.1. The partition-default probe runs only on a catalog no
+untrusted role can change, and tells a failure by its SQLSTATE, never the
+engine's words (#1663, #1707; amends DEC-1609.1).** Storing a declared
+default parses it as the deployer. Measured on 16 and 18, the parse runs
+neither a domain's CHECK for a literal of the domain itself nor a user
+cast's function. It does run a domain's CHECK when it reads a literal as a
+composite, array or range over that domain: `record_in` and `array_in` call
+the element's input function, which for a domain is `domain_in`. A role
+with `CREATE` in any schema can own such a domain, and a check that calls
+its PL/pgSQL function ran with the deployer's privileges and raised a table
+only the deployer could read. The rollback took back no read, and the error
+text carried it to the output.
+
+The issue offered two fixes: run the probes as a role with no data access,
+or refuse types whose functions an untrusted role owns. The first needs a
+role pbps would provision in every target, with `USAGE` on whatever schemas
+the declared texts name. The second, as written, reads the wrong functions.
+Measured, a non-superuser cannot create a base type or a shell type, so
+neither a range's `canonical` nor a type modifier function. Every input
+function the parse reaches is a superuser's; what another role can write is
+a domain's CHECK.
+
+A check present when the probe looks is not the only one it can meet.
+Reading the dangerous kinds of object failed five ways in review (#1706):
+between the read and the store, measured on 16 and 18, the owner of a
+domain with no check can add a `NOT VALID` one; the owner of a composite or
+a table can give it a column of a new domain; a role that can create in a
+schema, or create a schema in the database, can create the type a declared
+text names; a role holding `ADMIN` on another can grant it with `SET` to
+one of its own; and a member that only inherits the deployer was taken for
+it, though `current_user` tells them apart under a row security policy.
+Catalog lookups see what other sessions commit mid-transaction, and nothing
+locks a type against `CREATE` or `ALTER`, so no read of the present state
+holds until the store. The rule is instead that the catalog is closed
+(#1707): a role is trusted when it is a superuser or can `SET ROLE` to the
+current role or to a superuser, and from every other role the probe walks
+`pg_auth_members` along memberships granted with `SET`, `INHERIT` or
+`ADMIN`. When anything a walk reaches is the current role or a superuser,
+owns any object in this database (a `pg_shdepend` owner row, whatever the
+object's kind), or holds `CREATE` on the database or on a schema, nothing is
+stored and each pair stays unasked with a warning naming the untrusted
+roles, as under an event trigger (#1669); the apply's closing check still
+refuses a wrong recording. Predefined roles act only through their members,
+so `pg_database_owner` counts only under another database owner. The walk
+is wider than any one role can use, and it counts a concurrent session's
+temporary objects; both only leave the probe unrun more often, never run it
+where it should not. Under the single-deployer assumption (SPEC §7.6), a
+database pbps manages alone keeps the probe. A function a trusted one calls
+by name inside its body is not seen; that body is its trusted owner's to
+write, and the apply would run it all the same.
+
+Another session's temporary schema is outside that rule: any role with
+`TEMP` on the database, `PUBLIC`'s by default, creates objects there, and
+the role can empty it before the read and fill it after. Counting `TEMP`
+would leave the probe unrun in nearly every database with a second role.
+Measured on 16 and 18 instead, those schemas belong to the bootstrap
+superuser with no grant, so a non-superuser is refused `USAGE` on one, and
+no `search_path` searches another session's. Only a superuser reaches one,
+and only by naming it. So a pair whose declared texts or column type
+contain `pg_temp`, `pg_toast_temp` or a `U&` escape, in any case, stays
+unasked with a warning (#1706). The text is read, not the parse, since the
+parse is what runs the check. An identifier cannot be split by a comment or
+quoting, and `U&` can spell one without its letters. A literal that only
+mentions the name costs a warning, never a wrong answer.
+
+A failure inside the probe is reported as "the engine refused it (SQLSTATE
+22P02)", never the server's text. That text is whatever the code the parse
+reached chose to raise, with what it read. The row and bound spelling reads
+(DECISIONS 101, 106; DEC-1170.1) cast only to the types pbps spells, under
+an empty `search_path`. They run built-in input functions only and keep
+their text.
+
+Pinned on 16 and 18 by the CLI's
+`an_untrusted_domain_check_leaves_the_partition_default_probe_unrun`:
+
+- a role's domain whose check counts its runs and raises a deployer-only
+  table, reached through a composite literal in a declared default, leaves
+  the pair unasked with the role named; the check never runs and the
+  table's contents appear nowhere in the output;
+- each alone leaves the pair unasked with the role named (#1707): a domain
+  with no check, a composite and a table it owns in a schema it can no
+  longer create in; `CREATE` on the database; `ADMIN` on the deploying role
+  without `SET` or `INHERIT`; `INHERIT` on it without `SET`;
+- without it, and beside a domain the deployer owns that calls only
+  built-ins, the pair is asked and refused as the parent's;
+- a default naming a composite over a domain in another session's
+  temporary schema, held by the deployer so the catalog is closed, leaves
+  the pair unasked, and that check never runs (#1706);
+- a default the engine refuses is told as `SQLSTATE 22P02`, without the
+  server's words.
+
+The text check's spellings are pinned by
+`a_text_that_could_name_a_temporary_schema_is_told_by_any_spelling` and
+`a_text_naming_no_temporary_schema_is_still_asked`.
