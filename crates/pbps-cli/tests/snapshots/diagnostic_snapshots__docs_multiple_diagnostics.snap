@@ -1,0 +1,32 @@
+---
+source: crates/pbps-cli/tests/diagnostic_snapshots.rs
+expression: human.snapshot()
+---
+exit: 1
+--- stdout ---
+--- stderr ---
+pbps::load::semantic
+
+  × invalid type: unclosed parenthesis in type `decimal(18, 2`
+   ╭─[./schema/a.yml:7:11]
+ 6 │   solde:
+ 7 │     type: "decimal(18, 2"
+   ·           ───────┬───────
+   ·                  ╰── unclosed parenthesis in type `decimal(18, 2`
+ 8 │     nullable: false
+   ╰────
+
+pbps::load::semantic
+
+  × invalid foreign key target: missing `(`
+   ╭─[./schema/z.yml:8:17]
+ 7 │     columns: [id]
+ 8 │     references: dbo.region
+   ·                 ─────┬────
+   ·                      ╰── missing `(`
+   ╰────
+  help: the format is `schema.table(column)`; separate multiple columns with
+        commas
+
+error: the declarations have 2 problem(s)
+--- end ---

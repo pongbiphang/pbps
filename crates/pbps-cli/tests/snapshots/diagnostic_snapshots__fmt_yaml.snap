@@ -1,0 +1,20 @@
+---
+source: crates/pbps-cli/tests/diagnostic_snapshots.rs
+expression: human.snapshot()
+---
+exit: 1
+--- stdout ---
+--- stderr ---
+pbps::load::yaml
+
+  × there is a problem with the YAML in `./schema/dbo.t.yml`
+  │ 
+  │ error: line 2 column 10: unclosed bracket '['
+  │  --> <input>:2:10
+  │   |
+  │ 1 | table: dbo.t
+  │ 2 | columns: [
+  │   |          ^ unclosed bracket '['
+
+error: `./schema/dbo.t.yml` does not parse
+--- end ---

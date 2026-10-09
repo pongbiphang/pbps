@@ -1,0 +1,21 @@
+---
+source: crates/pbps-cli/tests/diagnostic_snapshots.rs
+expression: human.snapshot()
+---
+exit: 1
+--- stdout ---
+--- stderr ---
+pbps::load::semantic
+
+  × invalid foreign key target: missing `(`
+   ╭─[./schema/dbo.t.yml:8:17]
+ 7 │     columns: [id]
+ 8 │     references: dbo.region
+   ·                 ─────┬────
+   ·                      ╰── missing `(`
+   ╰────
+  help: the format is `schema.table(column)`; separate multiple columns with
+        commas
+
+error: the declarations have 1 problem(s)
+--- end ---

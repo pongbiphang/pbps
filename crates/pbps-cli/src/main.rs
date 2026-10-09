@@ -1593,10 +1593,11 @@ pub(crate) fn routine_ids_as_the_dialect_spells_them(
 /// is keyed by routine identity, runs it (#566).
 fn load(project: &Project, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::Loaded> {
     let mut loaded = load_quiet(project).map_err(|errs| {
-        for e in &errs {
+        let count = errs.len();
+        for e in errs {
             print_load_error(e);
         }
-        anyhow::anyhow!("the declarations have {} problem(s)", errs.len())
+        anyhow::anyhow!("the declarations have {count} problem(s)")
     })?;
     let collisions =
         routine_ids_as_the_dialect_spells_them(&mut loaded.schema, &mut loaded.hints, dialect);
@@ -1737,8 +1738,8 @@ pub(crate) fn declaration_problems(
 /// so they are rendered rather than reduced to their message — the JSON view
 /// takes the reduced form instead, because a caret is not something a consumer
 /// can act on.
-fn print_load_error(e: &pbps_load::LoadError) {
-    eprintln!("{:?}", miette::Report::msg(format!("{e}")));
+fn print_load_error(e: pbps_load::LoadError) {
+    eprintln!("{:?}", miette::Report::new(e));
 }
 
 /// One load error as a typed finding.
@@ -1989,7 +1990,7 @@ fn cmd_validate(
         // checks; the alternative is `validate_findings` returning the raw
         // errors as well and every other caller ignoring them.
         if let Err(errs) = load_quiet(project) {
-            for e in &errs {
+            for e in errs {
                 print_load_error(e);
             }
         }
@@ -2139,7 +2140,7 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
             // understand. This is a tool failure rather than a finding: `fmt`
             // did not get to answer its own question.
             if format == OutputFormat::Human {
-                for e in &errs {
+                for e in errs {
                     print_load_error(e);
                 }
             } else {
@@ -2494,6 +2495,7 @@ fn cmd_plan(
     let mut loaded = match load_quiet(project) {
         Ok(l) => l,
         Err(errs) => {
+            let count = errs.len();
             // Unanswerable rather than a finding: `plan`'s question is "what
             // changes", and with declarations it cannot read it did not answer
             // that. The parse errors are still the findings — the user needs
@@ -2503,11 +2505,11 @@ fn cmd_plan(
             if json {
                 output::unanswerable("plan", errs.iter().map(load_finding).collect());
             } else {
-                for e in &errs {
+                for e in errs {
                     print_load_error(e);
                 }
             }
-            bail!("the declarations have {} problem(s)", errs.len());
+            bail!("the declarations have {count} problem(s)");
         }
     };
     // The identity file is read here for the same reason the declarations were

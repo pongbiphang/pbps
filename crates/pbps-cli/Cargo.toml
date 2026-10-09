@@ -48,6 +48,7 @@ rustix = { workspace = true, features = ["mount", "process", "system", "thread"]
 workspace = true
 
 [dev-dependencies]
+insta = { version = "1.49.0", default-features = false }
 rustls.workspace = true
 serde_json.workspace = true
 # The schema's permission pattern is asserted by running it, not by reading it:
