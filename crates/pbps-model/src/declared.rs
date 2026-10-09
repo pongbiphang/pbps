@@ -283,6 +283,30 @@ impl Declared {
     /// A binding is the dialect's to record at creation, so here it only
     /// follows drops and renames.
     pub fn advance(&mut self, changes: &ChangeSet) {
+        self.advance_over(changes, None);
+    }
+
+    /// [`Self::advance`], and a parent's column rename or drop carried into
+    /// the records of its partitions, which the engine renames or drops with
+    /// it (#1687). The plan names only the parent, so the partitions are read
+    /// from `state`, the state the plan leaves (#1692 review).
+    pub fn advance_with_partitions(&mut self, changes: &ChangeSet, state: &Schema) {
+        self.advance_over(changes, Some(state));
+    }
+
+    fn advance_over(&mut self, changes: &ChangeSet, state: Option<&Schema>) {
+        let partitions = |parent: &TableName| -> Vec<TableName> {
+            state
+                .into_iter()
+                .flat_map(|s| &s.tables)
+                .filter(|(_, t)| {
+                    t.partition_of
+                        .as_ref()
+                        .is_some_and(|of| &of.parent == parent)
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
         for planned in &changes.changes {
             match &planned.change {
                 Change::CreateTable { name, table, .. } => {
@@ -418,6 +442,10 @@ impl Declared {
                     remove_nested(&mut self.expressions.defaults, &column.table, &column.name);
                     remove_nested(&mut self.expressions.generated, &column.table, &column.name);
                     remove_nested(&mut self.bindings.defaults, &column.table, &column.name);
+                    for partition in partitions(&column.table) {
+                        remove_nested(&mut self.expressions.defaults, &partition, &column.name);
+                        remove_nested(&mut self.bindings.defaults, &partition, &column.name);
+                    }
                 }
                 Change::RenameColumn {
                     table, from, to, ..
@@ -425,6 +453,10 @@ impl Declared {
                     rekey_nested(&mut self.expressions.defaults, table, from, to);
                     rekey_nested(&mut self.expressions.generated, table, from, to);
                     rekey_nested(&mut self.bindings.defaults, table, from, to);
+                    for partition in partitions(table) {
+                        rekey_nested(&mut self.expressions.defaults, &partition, from, to);
+                        rekey_nested(&mut self.bindings.defaults, &partition, from, to);
+                    }
                 }
                 Change::AlterColumnDefault { column, to, .. } => {
                     remove_nested(&mut self.expressions.defaults, &column.table, &column.name);
@@ -959,6 +991,75 @@ mod tests {
         // Negative: the adopted index's filter and its binding are gone.
         assert!(d.expressions.filters.get(&t()).is_none_or(|m| m.is_empty()));
         assert!(!d.bindings.filters.contains_key(&t()));
+    }
+
+    /// A parent's column rename or drop reaches its partitions' records of
+    /// their own defaults and bindings, which the engine renames or drops
+    /// with it (#1692 review); the partitions are read from the state the
+    /// plan leaves, since the plan names only the parent.
+    #[test]
+    fn a_parents_column_rename_and_drop_carry_its_partitions_records() {
+        let parent: TableName = "app.ev".parse().unwrap();
+        let partition: TableName = "app.ev_1".parse().unwrap();
+        let other: TableName = "app.other".parse().unwrap();
+        let mut state = Schema::default();
+        state.tables.insert(
+            partition.clone(),
+            Table {
+                partition_of: Some(crate::PartitionOf {
+                    parent: parent.clone(),
+                    bound: crate::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Table::default()
+            },
+        );
+        state.tables.insert(other.clone(), Table::default());
+        let recorded = || {
+            let mut d = Declared::default();
+            for t in [&partition, &other] {
+                d.expressions.defaults.insert(
+                    t.clone(),
+                    [
+                        ("m".to_owned(), "1+2".to_owned()),
+                        ("n".to_owned(), "3".to_owned()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+                d.bindings.defaults.insert(
+                    t.clone(),
+                    [("m".to_owned(), Binding::default())].into_iter().collect(),
+                );
+            }
+            d
+        };
+        let plan = changes(vec![
+            Change::RenameColumn {
+                uid: "c_a1b2c3".parse().unwrap(),
+                table: parent.clone(),
+                from: "m".into(),
+                to: "m2".into(),
+                table_was: None,
+            },
+            Change::DropColumn {
+                uid: "c_d4e5f6".parse().unwrap(),
+                column: crate::ColumnRef::new(parent.clone(), "n"),
+            },
+        ]);
+        let mut d = recorded();
+        d.advance_with_partitions(&plan, &state);
+        let defaults = &d.expressions.defaults[&partition];
+        assert_eq!(defaults.get("m2").map(String::as_str), Some("1+2"));
+        assert!(!defaults.contains_key("m") && !defaults.contains_key("n"));
+        assert!(d.bindings.defaults[&partition].contains_key("m2"));
+        // Negative: a table that is no partition of the parent keeps its own.
+        assert_eq!(d.expressions.defaults[&other].len(), 2);
+        assert!(d.bindings.defaults[&other].contains_key("m"));
+        // Negative: from the plan alone, the partitions' records stay.
+        let mut alone = recorded();
+        alone.advance(&plan);
+        assert!(alone.expressions.defaults[&partition].contains_key("m"));
     }
 
     /// A generation expression is recorded as declared, overlaid on the

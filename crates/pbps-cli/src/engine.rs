@@ -2822,7 +2822,7 @@ pub async fn account_for_module_dependents(
     let split = crate::dependents::split_new_tables(changes, ids, dialect)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     let released = crate::dependents::released(changes, &found);
-    let moved = crate::dependents::after_the_rebuilds(changes, &released, deps)
+    let moved = crate::dependents::after_the_rebuilds(changes, &released, deps, declared)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     // Last of the reorderings: a partition's own default after its parent's,
     // wherever the passes above left that (#1588).

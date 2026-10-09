@@ -19152,6 +19152,236 @@ fn a_table_bootstrap_did_not_build_is_created_by_the_next_plan() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+/// A standing range-partitioned parent's columns change through the CLI
+/// (#1687), on a tree holding rows: a range partition with its own default,
+/// one with its own NOT NULL, and a table attached with a NOT NULL of its
+/// own. A column is added, retyped, renamed with the key column, its default
+/// changed and its NOT NULL dropped and set, then dropped; each saved plan
+/// applies, verifies and replans empty, the engine recursing each into every
+/// partition, and the partitions keep their own. The cost estimate names the
+/// recursion. A key column's retype and drop are refused by name, and
+/// nothing changes.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_partitioned_parents_columns_change_through_the_cli() {
+    parent_columns_flow(&server(), "parent-columns-1687");
+}
+
+/// [`a_partitioned_parents_columns_change_through_the_cli`] on a pre-17
+/// server, where a parent's NOT NULL drop takes a partition's own with it.
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn a_partitioned_parents_columns_change_through_the_cli_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    parent_columns_flow(&server, "parent-columns-1687-old");
+}
+
+fn parent_columns_flow(server: &str, slug: &str) {
+    let db = OwnDatabase::new(server, slug);
+    let conn = db.connection().to_owned();
+    on_server(
+        &conn,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, n integer NOT NULL, \
+             m integer, note text DEFAULT 'p') PARTITION BY RANGE (ts); \
+         CREATE TABLE app.ev_2024 PARTITION OF app.ev \
+             FOR VALUES FROM ('2024-01-01') TO ('2025-01-01'); \
+         ALTER TABLE app.ev_2024 ALTER COLUMN note SET DEFAULT 'own'; \
+         CREATE TABLE app.ev_2025 PARTITION OF app.ev \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
+         ALTER TABLE app.ev_2025 ALTER COLUMN m SET NOT NULL; \
+         CREATE TABLE app.att (id integer NOT NULL, ts date NOT NULL, n integer NOT NULL, \
+             m integer, note text DEFAULT 'p'); \
+         ALTER TABLE app.ev ATTACH PARTITION app.att \
+             FOR VALUES FROM ('2026-01-01') TO ('2027-01-01'); \
+         INSERT INTO app.ev VALUES (1, '2024-06-01', 1, 1, 'a'), (2, '2025-06-01', 2, 2, 'b'), \
+             (3, '2026-06-01', 3, 3, 'c')",
+    );
+    let d = Demo::new(slug);
+    succeeds(d.run(&["pull", "--db", &conn]));
+    let path = d.dir.join("schema/app.ev.yml");
+    let text = std::cell::RefCell::new(std::fs::read_to_string(&path).unwrap());
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+    let edit = |from: &str, to: &str| {
+        let mut text = text.borrow_mut();
+        assert!(text.contains(from), "{from:?} in {text}");
+        *text = text.replacen(from, to, 1);
+        std::fs::write(&path, &*text).unwrap();
+    };
+    let applied = |name: &str| {
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join(name);
+        let o = succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+        let planned = stdout(&o);
+        succeeds(approved_apply(
+            &d,
+            &conn,
+            &plan,
+            &["--allow", "rename,not-null,destructive,constraint"],
+        ));
+        succeeds(d.run(&["verify", "--db", &conn]));
+        let next = succeeds(d.run(&["plan", "--db", &conn]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        planned
+    };
+    let holds = |sql: &str| scalar(&conn, &format!("SELECT ({sql})::int::int8"));
+    let each = |sql: &str| {
+        ["app.ev_2024", "app.ev_2025", "app.att"]
+            .iter()
+            .map(|t| holds(&sql.replace("{t}", t)))
+            .collect::<Vec<_>>()
+    };
+    let not_null = |column: &str| {
+        each(&format!(
+            "SELECT attnotnull FROM pg_attribute WHERE attrelid = '{{t}}'::regclass \
+             AND attname = '{column}'"
+        ))
+    };
+    let default_is = |column: &str, value: &str| {
+        each(&format!(
+            "SELECT pg_get_expr(adbin, adrelid) IS NOT DISTINCT FROM {value} FROM pg_attribute a \
+             LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+             WHERE a.attrelid = '{{t}}'::regclass AND a.attname = '{column}'"
+        ))
+    };
+
+    // Added, with a default every row takes.
+    edit(
+        "    default: \"'p'::text\"\n",
+        "    default: \"'p'::text\"\n  extra:\n    type: integer\n    default: \"3\"\n",
+    );
+    let planned = applied("add.json");
+    assert!(
+        planned.contains("recurses into its 3 partition(s) and takes AccessExclusiveLock on each"),
+        "{planned}"
+    );
+    assert_eq!(holds("SELECT count(*) FROM app.ev WHERE extra = 3"), 3);
+    // Retyped.
+    edit("  m:\n    type: integer\n", "  m:\n    type: bigint\n");
+    applied("retype.json");
+    assert_eq!(
+        each(
+            "SELECT format_type(atttypid, atttypmod) = 'bigint' FROM pg_attribute \
+             WHERE attrelid = '{t}'::regclass AND attname = 'm'"
+        ),
+        [1, 1, 1]
+    );
+    // Renamed, the key column with it; the partitions' own follow.
+    edit("  m:\n", "  m2:\n");
+    edit("      m: {nullable: false}", "      m2: {nullable: false}");
+    succeeds(d.run(&["rename", "app.ev.m", "m2"]));
+    edit("  ts:\n", "  at:\n");
+    edit("partition_by: [ts]", "partition_by: [at]");
+    succeeds(d.run(&["rename", "app.ev.ts", "at"]));
+    applied("rename.json");
+    assert_eq!(
+        holds("SELECT pg_get_partkeydef('app.ev'::regclass) = 'RANGE (at)'"),
+        1
+    );
+    assert_eq!(not_null("m2"), [0, 1, 0]);
+    // A default changed on the parent: `ev_2024` keeps its own.
+    edit(
+        "    default: \"'p'::text\"\n",
+        "    default: \"'q'::text\"\n",
+    );
+    applied("default.json");
+    assert_eq!(default_is("note", "'''q''::text'"), [0, 1, 1]);
+    assert_eq!(default_is("note", "'''own''::text'"), [1, 0, 0]);
+    // The parent's default dropped, which the engine takes off every
+    // partition too: `ev_2024`'s own is set again after it.
+    edit("    default: \"'q'::text\"\n", "");
+    applied("undefault.json");
+    assert_eq!(default_is("note", "NULL"), [0, 1, 1]);
+    assert_eq!(default_is("note", "'''own''::text'"), [1, 0, 0]);
+    // NOT NULL dropped on the parent: `ev_2024` declares its own, and the
+    // attached table's own, which 18 would keep, goes.
+    edit(
+        "  \"n\":\n    type: integer\n    nullable: false\n",
+        "  \"n\":\n    type: integer\n",
+    );
+    edit(
+        "      note: {default: \"'own'::text\"}",
+        "      \"n\": {nullable: false}\n      note: {default: \"'own'::text\"}",
+    );
+    applied("loosen.json");
+    assert_eq!(not_null("n"), [1, 0, 0]);
+    // NOT NULL set on the parent: `ev_2025`'s own is left to it.
+    edit(
+        "  m2:\n    type: bigint\n",
+        "  m2:\n    type: bigint\n    nullable: false\n",
+    );
+    edit("    columns:\n      m2: {nullable: false}\n", "");
+    applied("tighten.json");
+    assert_eq!(not_null("m2"), [1, 1, 1]);
+    // And dropped again: `ev_2025`'s own NOT NULL, from before the parent's,
+    // is one 18 keeps through the parent's drop, and the plan takes it off.
+    edit(
+        "  m2:\n    type: bigint\n    nullable: false\n",
+        "  m2:\n    type: bigint\n",
+    );
+    applied("loosen-again.json");
+    assert_eq!(not_null("m2"), [0, 0, 0]);
+    // A partition's own default in a spelling the engine rewrites, then its
+    // column renamed on the parent: the recorded spelling follows the rename
+    // into the partition, so the next plan has nothing to do (#1692 review).
+    edit(
+        "      note: {default: \"'own'::text\"}",
+        "      note: {default: \"'own2'\"}",
+    );
+    applied("own-spelling.json");
+    edit("  note:\n", "  label:\n");
+    edit(
+        "      note: {default: \"'own2'\"}",
+        "      label: {default: \"'own2'\"}",
+    );
+    succeeds(d.run(&["rename", "app.ev.note", "label"]));
+    applied("rename-own.json");
+    assert_eq!(default_is("label", "'''own2''::text'"), [1, 0, 0]);
+    // Dropped.
+    edit("  extra:\n    type: integer\n    default: \"3\"\n", "");
+    succeeds(d.run(&["drop", "app.ev.extra", "--reason", "gone"]));
+    applied("drop.json");
+    assert_eq!(
+        holds(
+            "SELECT count(*) FROM pg_attribute WHERE attname = 'extra' AND NOT attisdropped \
+             AND attrelid IN ('app.ev'::regclass, 'app.ev_2024'::regclass, \
+             'app.ev_2025'::regclass, 'app.att'::regclass)"
+        ),
+        0
+    );
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM app.ev"), 3);
+
+    // Refused by name: a key column retyped, then dropped.
+    edit("  at:\n    type: date\n", "  at:\n    type: timestamp\n");
+    let o = d.run(&["plan"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("which is in its partition key"),
+        "{}",
+        stderr(&o)
+    );
+    edit("  at:\n    type: timestamp\n", "  at:\n    type: date\n");
+    edit("  at:\n    type: date\n    nullable: false\n", "");
+    succeeds(d.run(&["drop", "app.ev.at", "--reason", "gone"]));
+    let o = d.run(&["plan"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("which is in its partition key"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        holds("SELECT pg_get_partkeydef('app.ev'::regclass) = 'RANGE (at)'"),
+        1
+    );
+}
+
 /// A standing partition's own properties change through the CLI, each on a
 /// partition holding rows (#1581): its own index and CHECK added and
 /// dropped, its own default changed and then dropped back to its parent's,
@@ -19159,7 +19389,7 @@ fn a_table_bootstrap_did_not_build_is_created_by_the_next_plan() {
 /// parameters switched. Each saved plan applies, verifies and replans empty.
 /// A NOT NULL over a NULL the partition holds is refused before the apply's
 /// first statement, and an index added to the parent stays refused by name
-/// (#1546).
+/// (#1688).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_standing_partitions_own_properties_change_through_the_cli() {
@@ -19326,7 +19556,7 @@ fn a_standing_partitions_own_properties_change_through_the_cli() {
     assert_eq!(not_null("app.ev_rest", "k"), 0, "nothing ran");
 
     // Negative: an index added to the parent is the parent's change, refused
-    // by name until #1546.
+    // by name until #1688.
     std::fs::write(
         &path,
         text.replace(

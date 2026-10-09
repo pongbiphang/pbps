@@ -158,14 +158,14 @@ requirement is common to all of them, so it is listed once,
 | `DropColumn` | 5 | Its indexes, constraints, inbound foreign keys and modules gone. P: generated columns reading it gone | Removes the column, frees its name |
 | `DropTable` | 6 | Inbound foreign keys and dependent modules gone | Removes the table, frees its name |
 | `DetachPartition` | 6 | P: no row referencing the partition through a foreign key to its parent (pre-flight) | The partition leaves its parent with its rows, as an ordinary table under the declared names; frees its range (DEC-1544.1) |
-| `CreateTable` | 7 | The name free, its types. Functions its defaults, checks and generated columns call: *content* | The table, columns, key, uniques, checks, indexes |
+| `CreateTable` | 7; a partition (7, 2), or (9, 5) under a parent whose columns the plan changes | The name free, its types. Functions its defaults, checks and generated columns call: *content* | The table, columns, key, uniques, checks, indexes |
 | `AttachPartition` | 7; (11, 1) when its parent's foreign key references a table the plan writes rows into or attaches a table to | The parent standing; the table already its parent's columns, order and parent's checks (refused otherwise). P: no row of the table outside its range, no trigger or column grant on it, none in the parent's DEFAULT partition inside it (pre-flight) | The table becomes a partition with its rows; its columns become its parent's, its matching keys and indexes clones, and the rest its own; takes its range (DEC-1545.1) |
 | `AddColumn` | 8 | The table, the name free. A generated column's inputs; functions its default or expression calls: *content* | The column, backfilled |
 | `AlterColumnType` | 9 | What blocks a retype gone. S: keys, indexes, checks, foreign keys. P: views and rules (`weave`), generated readers (refused). An old default dropped first | Converted values |
 | `AlterColumnNullability` | 9 | Tightening: the values non-null | Accepts or refuses NULL |
 | `AlterColumnDefault` | 9 | Functions the default calls: *content* | The default |
-| `SetPartitionDefault` | 9 | Functions the default calls: *content*. P: after its parent's default set by the plan (`after_their_parents_defaults`) | One partition's default: its own, or its parent's again (DEC-1581.1) |
-| `SetPartitionNotNull` | 9 | Tightening: the partition's values non-null | One partition's column accepts or refuses NULL (DEC-1581.1) |
+| `SetPartitionDefault` | 9; (9, 4) after its parent's default or NOT NULL change on the column | Functions the default calls: *content*. P: after its parent's default set by the plan (`after_their_parents_defaults`) | One partition's default: its own, or its parent's again (DEC-1581.1) |
+| `SetPartitionNotNull` | 9; (9, 4) after its parent's default or NOT NULL change on the column | Tightening: the partition's values non-null | One partition's column accepts or refuses NULL (DEC-1581.1) |
 | `AlterColumnExpression` | 9 | P: its inputs, a relaxation of its own column. Functions it calls: *content* | Recomputed stored values |
 | `AddComputedColumn` | 9 (9, 3) | S: the columns it reads, in their final type. Functions it calls exist (one this plan creates is refused by name) | A computed column at the end of its table (DEC-1174.1) |
 | `SetColumnDeprecated` | 10 | Nothing | Metadata only |
@@ -266,6 +266,8 @@ and the expression-bearing changes that need a function.
 |---|---|---|---|
 | `CreateTable` → rows, keys, foreign keys, modules and grants on it | fixed | class 7 before 11, 13, 14, 16 | ✓ |
 | `CreateTable` of a partitioned parent → `CreateTable` of its partition | fixed | (7, 2) after the rest of class 7 | ✓ DEC-1170.1 |
+| `AlterColumnDefault`, `AlterColumnNullability`, or an `AlterColumnType` changing nullability, of a parent → its partitions' `SetPartitionDefault` and `SetPartitionNotNull` on that column | fixed | (9, 4) after the parent's class 9; the parent's change recurses over the partition's own (DEC-1687.1) | ✓ DEC-1687.1 |
+| A parent's column change (`AddColumn`, `DropColumn`, `RenameColumn`, `AlterColumn*`) → `CreateTable` of a partition under it | fixed | (9, 5) after them: the partition is created with its own entries on the parent's columns as they end (DEC-1687.1) | ✓ DEC-1687.1 |
 | `AttachPartition` → the partition's own `SetPartitionDefault`, `SetPartitionNotNull`, `SetTablePersistence`, `SetStorageParameters`, `AddIndex` and `AddCheck` | fixed | class 7 before 9, 10 and 13; each acts on the partition alone once attached. After an attach at (11, 1), its own alterations of classes 9 and 10 move to (11, 2) | ✓ DEC-1545.1 |
 | `AddColumn` → rows, constraints, modules naming it | fixed | class 8 before 11, 13, 14 | ✓ |
 | `AddColumn` (input) → generated `AddColumn` reading it | fixed | (9, 2) after class 8 | ✓ DEC-1168.1 |
@@ -287,7 +289,7 @@ and the expression-bearing changes that need a function.
 | Module → module that names it | content, over-approximated | `creation_order_with`, lexed names (DECISIONS 315) | ✓ |
 | Function created or rebuilt → check, filtered index or set default calling it | content, over-approximated | `after_the_rebuilds`: after the last function create, when its text names the function | ✓ DEC-942.1, DEC-1364.1 |
 | Function created or rebuilt → `AlterColumnExpression` calling it | content, over-approximated | `after_the_rebuilds`, when its text names the function | ✓ DEC-1168.1, DEC-1364.1 |
-| Function created or rebuilt → `AddColumn` whose default or generation expression calls it | content, over-approximated | `after_their_functions`: after the create its text names, and what may read the column after it; a cycle is refused by name | ✓ DEC-1364.1 |
+| Function created or rebuilt → `AddColumn` whose default or generation expression calls it | content, over-approximated | `after_their_functions`: after the create its text names, and what may read the column, or a partition holding it, after it; a cycle is refused by name | ✓ DEC-1364.1 |
 | `AddColumn` → a module created that reads it | content, over-approximated | class 8 before 14; reordered after a column that moves, when it names the column or its table | ✓ DEC-1364.1 |
 | Function rebuilt → default a row of the plan takes | content | stays ahead of the rows | ⧗ #1030 |
 | Function created → a new table's expression-bearing parts | content, over-approximated | `split_new_tables`, then `after_the_rebuilds`, when their text names the function | ✓ #1027, DEC-1364.1 |

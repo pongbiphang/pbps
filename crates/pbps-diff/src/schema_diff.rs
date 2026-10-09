@@ -701,7 +701,8 @@ fn diff_partial_rebuilding(
                         declared_name,
                         &table,
                         declared_table,
-                        declared.schema,
+                        base,
+                        declared,
                         &mut changes,
                     );
                     // A column without a default where its parent's has one:
@@ -768,7 +769,8 @@ fn diff_partial_rebuilding(
             declared_name,
             base_table,
             declared_table,
-            declared.schema,
+            base,
+            declared,
             &mut changes,
         );
         // Rows are compared by column *name* on each side, and a rename in
@@ -1390,6 +1392,58 @@ fn diff_partial_rebuilding(
         depths
     };
     let deepest = depth_of.values().copied().max().unwrap_or(0);
+    // A parent's column default or NULL-ness this plan changes, which the
+    // engine recurses into every partition: a partition's own on that
+    // column is set after it, or the parent's would overwrite it (#1687).
+    let parent_moved: BTreeSet<(TableName, String)> = planned
+        .iter()
+        .filter_map(|p| {
+            // A retype carries its NOT NULL change with it (#1692 review).
+            if let Change::AlterColumnDefault { column, .. }
+            | Change::AlterColumnNullability { column, .. } = &p.change
+            {
+                Some((column.table.clone(), column.name.clone()))
+            } else if let Change::AlterColumnType {
+                column,
+                from_nullable,
+                to_nullable,
+                ..
+            } = &p.change
+                && from_nullable != to_nullable
+            {
+                Some((column.table.clone(), column.name.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // The parents whose columns this plan changes (#1687).
+    let parent_columns_change: BTreeSet<TableName> = planned
+        .iter()
+        .filter(|p| parent_column(&p.change).is_some())
+        .filter_map(|p| p.change.table())
+        .filter(|t| {
+            declared
+                .schema
+                .tables
+                .get(*t)
+                .is_some_and(|t| t.partition_by.is_some())
+        })
+        .cloned()
+        .collect();
+    let follows_its_parent = |c: &Change| -> bool {
+        let (Change::SetPartitionDefault { table, column, .. }
+        | Change::SetPartitionNotNull { table, column, .. }) = c
+        else {
+            return false;
+        };
+        declared
+            .schema
+            .tables
+            .get(table)
+            .and_then(|t| t.partition_of.as_ref())
+            .is_some_and(|of| parent_moved.contains(&(of.parent.clone(), column.clone())))
+    };
     let sort_class = |c: &Change| -> (u8, usize) {
         if let Change::AttachPartition { table, .. } = c
             && late_attach.contains_key(table)
@@ -1398,6 +1452,9 @@ fn diff_partial_rebuilding(
         }
         if follows_late_attach(c) {
             return (ROW_DELETIONS - 1, 2);
+        }
+        if follows_its_parent(c) {
+            return (COLUMN_ALTERATIONS, 4);
         }
         if let Change::SetTablePersistence {
             table, unlogged, ..
@@ -1494,10 +1551,16 @@ fn diff_partial_rebuilding(
             return (order_key(c), 2);
         }
         // A partition is created after every parent, whose columns, keys and
-        // indexes the engine gives it as it is made (#1170).
+        // indexes the engine gives it as it is made (#1170). Under a parent
+        // whose columns this plan changes, after those changes too: its own
+        // default may name a column the parent adds, and a parent's default
+        // set or dropped afterwards would overwrite its own (#1692 review).
         if let Change::CreateTable { table, .. } = c
-            && table.partition_of.is_some()
+            && let Some(of) = &table.partition_of
         {
+            if parent_columns_change.contains(&of.parent) {
+                return (COLUMN_ALTERATIONS, 5);
+            }
             return (order_key(c), 2);
         }
         if let Change::RenameColumn { table, from, .. } = c {
@@ -3068,6 +3131,9 @@ fn refuse_partition_changes(
             .is_some_and(|t| t.partition_by.is_some() || t.partition_of.is_some())
     };
     let mut refused: BTreeMap<TableName, Vec<String>> = BTreeMap::new();
+    // The tables this plan attaches under each parent or detaches from it.
+    let mut moving: BTreeMap<TableName, Vec<TableName>> = BTreeMap::new();
+    let mut columns_meet_moves: BTreeSet<TableName> = BTreeSet::new();
     let mut refuse = |table: &TableName, what: String| {
         let list = refused.entry(table.clone()).or_default();
         if !list.contains(&what) {
@@ -3089,10 +3155,35 @@ fn refuse_partition_changes(
             let detached =
                 b.partition_of.is_some() && d.partition_of.is_none() && d.partition_by.is_none();
             let attached = b.partition_of.is_none() && d.partition_of.is_some();
+            let parent = if detached {
+                b.partition_of.as_ref()
+            } else if attached {
+                d.partition_of.as_ref()
+            } else {
+                None
+            };
+            if let Some(of) = parent {
+                moving
+                    .entry(of.parent.clone())
+                    .or_default()
+                    .push(declared_name.clone());
+            }
             fn where_(t: &Table) -> Option<(&TableName, &pbps_model::PartitionBound)> {
                 t.partition_of.as_ref().map(|of| (&of.parent, &of.bound))
             }
-            if (b.partition_by != d.partition_by || where_(b) != where_(d))
+            // A key column renamed is the same key: the engine renames it in
+            // the key as it does in the table (measured on 16 and 18, #1687).
+            let renamed = |by: &pbps_model::PartitionBy| {
+                let names = renamed_columns(base.ids, base_name, declared.ids, declared_name);
+                pbps_model::PartitionBy {
+                    columns: by
+                        .columns
+                        .iter()
+                        .map(|c| names.get(c).cloned().unwrap_or_else(|| c.clone()))
+                        .collect(),
+                }
+            };
+            if (b.partition_by.as_ref().map(renamed) != d.partition_by || where_(b) != where_(d))
                 && !detached
                 && !attached
             {
@@ -3123,6 +3214,62 @@ fn refuse_partition_changes(
             }
         })
         .collect();
+    // The names the plan takes from a column, by a drop or a rename away,
+    // and the name a change gives a column, by an addition or a rename into.
+    let vacated: BTreeSet<(&TableName, &String)> = changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::DropColumn { column, .. } = c {
+                Some((&column.table, &column.name))
+            } else if let Change::RenameColumn { table, from, .. } = c {
+                Some((table, from))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let takes_name = |c: &'_ Change| -> Option<String> {
+        if let Change::RenameColumn { to, .. } = c {
+            Some(to.clone())
+        } else if let Change::AddColumn { name, .. } = c {
+            Some(name.clone())
+        } else {
+            None
+        }
+    };
+    // A partition dropped under its parent is a transition too: its rows
+    // still stand when the pre-flight probes the parent's column (#1692
+    // review).
+    for change in changes {
+        if let Change::DropTable {
+            name,
+            detach_from: Some(parent),
+            ..
+        } = change
+        {
+            moving.entry(parent.clone()).or_default().push(name.clone());
+        }
+    }
+    // Each parent's column names this plan changes in what a probe reads,
+    // a rename's both names. A default or nullability change leaves the
+    // column and its stored values as they are (#1692 review).
+    let mut parents_changing_columns: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
+    for c in changes {
+        if let (Some(name), Some(table)) = (parent_column(c), c.table())
+            && !matches!(
+                c,
+                Change::SetColumnDeprecated { .. }
+                    | Change::AlterColumnDefault { .. }
+                    | Change::AlterColumnNullability { .. }
+            )
+        {
+            let names = parents_changing_columns.entry(table).or_default();
+            names.insert(name);
+            if let Change::RenameColumn { to, .. } = c {
+                names.insert(to);
+            }
+        }
+    }
     for change in changes {
         // A partition is created with its parent, or under a parent that
         // already stands (#1171); either way it is a creation, and whether
@@ -3171,6 +3318,66 @@ fn refuse_partition_changes(
                 (standing(base.schema, t) || attaching.contains(t)) && standing(declared.schema, t)
             })
         {
+            // Its own check, or a unique index on columns, is probed over
+            // its stored rows before the plan runs, and its parent's column
+            // change reaches those rows first: a retype converts them, a
+            // rename moves a name to another column. The probe knows the
+            // plan's column changes by table and not which table is whose
+            // partition, so it would test values or columns the engine never
+            // checks, and refuse a valid plan (DECISIONS 410, #1692 review,
+            // until #1699). Two plans keep each probe over the rows it judges.
+            // A plain index constrains nothing and a unique one over an
+            // expression is left unchecked, so neither is probed (#1692
+            // review). What the probe reads: a check's text, or the index's
+            // key columns and predicate. A
+            // changed name found anywhere in it counts, quoted or not, so an
+            // index or check on the partition's other columns alone stays
+            // admitted (#1692 review). A Unicode-escaped identifier
+            // (`U&"\0076"`) can spell any name without its letters, so a
+            // text holding one counts as reading every changed name.
+            let probed: Option<Vec<&str>> = if let Change::AddIndex { index, .. } = change {
+                (index.unique && index.column_keys().is_some()).then(|| {
+                    index
+                        .columns
+                        .iter()
+                        .filter_map(|c| c.key.column())
+                        .chain(index.filter.as_deref())
+                        .collect()
+                })
+            } else if let Change::AddCheck { constraint, .. } = change {
+                Some(vec![constraint.expression.as_str()])
+            } else {
+                None
+            };
+            let reads = |texts: &[&str], name: &str| {
+                let name = name.to_lowercase();
+                let quoted = name.replace('"', "\"\"");
+                texts.iter().any(|text| {
+                    let text = text.to_lowercase();
+                    text.contains(&name) || text.contains(&quoted) || text.contains("u&")
+                })
+            };
+            if let Some(texts) = probed
+                && let Some(t) = change.table()
+                && let Some(of) = declared
+                    .schema
+                    .tables
+                    .get(t)
+                    .and_then(|t| t.partition_of.as_ref())
+                && parents_changing_columns
+                    .get(&of.parent)
+                    .is_some_and(|names| names.iter().any(|name| reads(&texts, name)))
+            {
+                refuse(
+                    t,
+                    format!(
+                        "{} while this plan changes a column of its parent {}; change the \
+                         parent's columns and add the partition's own in separate plans",
+                        change_in_words(change),
+                        of.parent
+                    ),
+                );
+            }
             continue;
         }
         // Before the attach, still the ordinary table's: a key or unique
@@ -3181,6 +3388,93 @@ fn refuse_partition_changes(
             Change::DropUnique { .. } | Change::SetPrimaryKey { to: None, .. }
         ) && change.table().is_some_and(|t| attaching.contains(t))
         {
+            continue;
+        }
+        // A standing parent's column (#1687): the engine recurses each of
+        // these into every partition, and the partitions' own defaults and
+        // NOT NULLs follow in `diff_partition_columns`. A key column is never
+        // dropped or retyped (measured on 16 and 18), and an identity column
+        // on a partitioned table is not read back yet (#1681).
+        let parent_standing = |schema: &Schema, name: &TableName| {
+            schema
+                .tables
+                .get(name)
+                .is_some_and(|t| t.partition_by.is_some() && t.partition_of.is_none())
+        };
+        if let Some(column) = parent_column(change)
+            && let Some(table) = change.table()
+            && parent_standing(base.schema, table)
+            && parent_standing(declared.schema, table)
+        {
+            let key = |schema: &Schema| {
+                schema
+                    .tables
+                    .get(table)
+                    .and_then(|t| t.partition_by.as_ref())
+                    .is_some_and(|by| by.columns.iter().any(|c| c == column))
+            };
+            // A drop names the base column and a retype the declared one, so
+            // each is asked of its own side's key: across one plan a name
+            // can leave the key's column for another (#1692 review).
+            if (matches!(change, Change::DropColumn { .. }) && key(base.schema))
+                || (matches!(change, Change::AlterColumnType { .. }) && key(declared.schema))
+            {
+                refuse(
+                    table,
+                    format!("{}, which is in its partition key", change_in_words(change)),
+                );
+            } else if let Change::AddColumn { column: c, .. } = change
+                && c.identity.is_some()
+            {
+                refuse(
+                    table,
+                    format!(
+                        "{}, an identity column, which a partitioned table's partitions are not \
+                         read back with yet (#1681)",
+                        change_in_words(change)
+                    ),
+                );
+            } else if let Some(name) = takes_name(change)
+                && vacated.contains(&(table, &name))
+            {
+                // A name passing from one column to another in one plan: the
+                // apply guard builds no undo for a dropped name taken again
+                // (DEC-541.1), and the pre-flight and the guard key the
+                // partitions' probes and carried indexes by the partition's
+                // name, so they would read the column the name left (#1692
+                // review, until #1699).
+                let what = if matches!(change, Change::RenameColumn { .. }) {
+                    format!("rename column `{column}` into `{name}`")
+                } else {
+                    format!("add column `{name}`")
+                };
+                refuse(
+                    table,
+                    format!(
+                        "{what}, a name this plan takes from another column; free the name and \
+                         give it to the other column in separate plans"
+                    ),
+                );
+            } else if let Some(tables) = moving.get(table)
+                && !matches!(change, Change::SetColumnDeprecated { .. })
+            {
+                // An attach or a detach meets the parent's columns as they
+                // stand at that statement, and the table on its other side
+                // holds them as declared at the other end of the plan: each
+                // column change would need its own place against each
+                // transition (#1692 review). Two plans keep each simple.
+                let tables: Vec<String> = tables.iter().map(ToString::to_string).collect();
+                columns_meet_moves.insert(table.clone());
+                refuse(
+                    table,
+                    format!(
+                        "{} while this plan attaches, detaches or drops {}; change the columns and the \
+                         partitions in separate plans",
+                        change_in_words(change),
+                        tables.join(", ")
+                    ),
+                );
+            }
             continue;
         }
         let ends_a_table = matches!(
@@ -3212,6 +3506,12 @@ fn refuse_partition_changes(
             refuse(table, change_in_words(change));
         }
     }
+    // A detach refused above for its parent's column changes is not also a
+    // shape the detach cannot take: its declaration holds the columns as the
+    // refused changes leave them.
+    errs.retain(|e| {
+        !matches!(e, DiffError::DetachedShape { parent, .. } if columns_meet_moves.contains(parent))
+    });
     errs.extend(
         refused
             .into_iter()
@@ -3219,28 +3519,125 @@ fn refuse_partition_changes(
     );
 }
 
+/// The column a parent's column change names, for the kinds the engine
+/// recurses into every partition (#1687): its name before a rename, as the
+/// partition key holds it.
+// The complement is every change that names no column of a table.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn parent_column(change: &Change) -> Option<&String> {
+    match change {
+        Change::AddColumn { name, .. } => Some(name),
+        Change::RenameColumn { from, .. } => Some(from),
+        Change::DropColumn { column, .. }
+        | Change::AlterColumnType { column, .. }
+        | Change::AlterColumnNullability { column, .. }
+        | Change::AlterColumnDefault { column, .. }
+        | Change::SetColumnDeprecated { column, .. } => Some(&column.name),
+        _ => None,
+    }
+}
+
+/// A table's columns this plan renames, base name to declared name, by uid.
+fn renamed_columns(
+    base: &IdsFile,
+    base_name: &TableName,
+    declared: &IdsFile,
+    declared_name: &TableName,
+) -> BTreeMap<String, String> {
+    let now = columns_of(declared, declared_name);
+    columns_of(base, base_name)
+        .into_iter()
+        .filter_map(|(uid, was)| {
+            now.get(&uid)
+                .filter(|c| c.name != was.name)
+                .map(|c| (was.name, c.name.clone()))
+        })
+        .collect()
+}
+
 /// A standing partition's own defaults and NOT NULLs (#1581, DEC-1581.1),
 /// one change per column and kind. Its partitioning, when changed, is refused
 /// by `refuse_partition_changes`; these are compared only where both sides
 /// are a partition.
+///
+/// The parent's own column changes in the same plan are followed (#1687),
+/// each recursed by the engine into every partition, measured on 16 and 18:
+/// - a rename carries a partition's own default and NOT NULL with it;
+/// - a drop takes them, and nothing is left to change;
+/// - a default set or dropped on the parent overwrites the partition's own,
+///   which is set again after it;
+/// - a NOT NULL dropped on the parent leaves one of the partition's own on 18
+///   and not on 16, so every partition is brought to its declaration after
+///   it;
+/// - a NOT NULL set on the parent holds every partition, so the partition's
+///   own, which the declarations then leave out, is left to it.
 fn diff_partition_columns(
     uid: &Uid,
     name: &TableName,
-    base: &Table,
-    declared: &Table,
-    declared_schema: &Schema,
+    base_table: &Table,
+    declared_table: &Table,
+    base: Side<'_>,
+    declared: Side<'_>,
     changes: &mut Vec<Change>,
 ) {
-    let (Some(was), Some(now)) = (&base.partition_of, &declared.partition_of) else {
+    let (Some(was), Some(now)) = (&base_table.partition_of, &declared_table.partition_of) else {
         return;
     };
-    let parent = declared_schema.tables.get(&now.parent);
+    let parent = declared.schema.tables.get(&now.parent);
+    let base_parent = base.schema.tables.get(&was.parent);
+    // What became of each of the parent's base columns, by uid: its declared
+    // name, or `None` where the plan drops it. By uid and not by name, since
+    // one plan can drop a column and rename another into its name (#1692
+    // review). A column no identity names is taken as it stands.
+    let now_by_uid = columns_of(declared.ids, &now.parent);
+    let fate: BTreeMap<String, Option<String>> = columns_of(base.ids, &was.parent)
+        .into_iter()
+        .map(|(uid, c)| (c.name, now_by_uid.get(&uid).map(|d| d.name.clone())))
+        .collect();
+    let is_now = |c: &String| -> Option<String> {
+        match fate.get(c) {
+            Some(now) => now.clone(),
+            None => Some(c.clone()),
+        }
+    };
+    let was_columns: BTreeMap<String, &pbps_model::PartitionColumn> = was
+        .columns
+        .iter()
+        .filter_map(|(c, own)| Some((is_now(c)?, own)))
+        .collect();
+    let base_of: BTreeMap<String, &pbps_model::Column> = base_parent
+        .map(|p| {
+            p.columns
+                .iter()
+                .filter_map(|(c, column)| Some((is_now(c)?, column)))
+                .collect()
+        })
+        .unwrap_or_default();
     let none = pbps_model::PartitionColumn::default();
-    let columns: BTreeSet<&String> = was.columns.keys().chain(now.columns.keys()).collect();
+    let loosened: BTreeSet<String> = parent
+        .map(|p| {
+            p.columns
+                .iter()
+                .filter(|(c, column)| {
+                    column.nullable && base_of.get(*c).is_some_and(|b| !b.nullable)
+                })
+                .map(|(c, _)| c.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let columns: BTreeSet<&String> = was_columns
+        .keys()
+        .chain(now.columns.keys())
+        .chain(&loosened)
+        .collect();
     for column in columns {
-        let from = was.columns.get(column).unwrap_or(&none);
+        let from = was_columns.get(column).copied().unwrap_or(&none);
         let to = now.columns.get(column).unwrap_or(&none);
-        if from.default != to.default {
+        let theirs = parent.and_then(|p| p.columns.get(column));
+        let theirs_was = base_of.get(column);
+        let default_moved =
+            theirs_was.is_some_and(|b| Some(&b.default) != theirs.map(|c| &c.default));
+        if from.default != to.default || (default_moved && to.default.is_some()) {
             changes.push(Change::SetPartitionDefault {
                 uid: uid.clone(),
                 table: name.clone(),
@@ -3255,7 +3652,9 @@ fn diff_partition_columns(
                     .and_then(|c| c.default.clone()),
             });
         }
-        if from.not_null != to.not_null {
+        let tightened =
+            theirs.is_some_and(|c| !c.nullable) && theirs_was.is_some_and(|b| b.nullable);
+        if !tightened && (from.not_null != to.not_null || loosened.contains(column)) {
             changes.push(Change::SetPartitionNotNull {
                 uid: uid.clone(),
                 table: name.clone(),
@@ -6102,6 +6501,808 @@ mod tests {
     /// refused by name: its bound, a parent's column, a rename, the parent's
     /// drop. A change to another table, even one referencing the parent, is
     /// not refused.
+    /// A standing range-partitioned parent's columns change (#1687): an
+    /// addition, a drop, a retype, a rename (a key column's too, which the
+    /// key follows), a default and NOT NULL each one change to the parent,
+    /// which the engine recurses into every partition. A partition's own
+    /// default and NOT NULL follow the parent's change on their column:
+    /// - carried through a rename;
+    /// - taken with a drop;
+    /// - set again after a default change and after a NOT NULL drop, every
+    ///   partition brought to its declaration;
+    /// - left to the parent's tightening.
+    ///
+    /// A key column's drop or retype, and an identity column added, are
+    /// refused by name.
+    #[test]
+    fn a_partitioned_parents_columns_change_and_its_partitions_keep_their_own() {
+        use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+        let parent = || {
+            let mut t = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("ts", Column::new(ty("date")).not_null()),
+                ("n", Column::new(ty("int")).not_null()),
+                ("m", Column::new(ty("int"))),
+            ]);
+            t.partition_by = Some(PartitionBy {
+                columns: vec!["ts".into()],
+            });
+            t
+        };
+        let partition = |from: &str, to: &str, own: &[(&str, PartitionColumn)]| Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: PartitionBound::Range {
+                    from: vec![BoundDatum::Value(from.into())],
+                    to: vec![BoundDatum::Value(to.into())],
+                },
+                columns: own
+                    .iter()
+                    .map(|(c, o)| ((*c).to_owned(), o.clone()))
+                    .collect(),
+            }),
+            ..Default::default()
+        };
+        let own_default = |d: &str| PartitionColumn {
+            default: Some(d.into()),
+            not_null: false,
+        };
+        let own_not_null = PartitionColumn {
+            default: None,
+            not_null: true,
+        };
+        let tree = |parent: Table, a: &[(&str, PartitionColumn)], b: &[(&str, PartitionColumn)]| {
+            let mut s = schema_of("app.ev", parent);
+            s.tables.insert(
+                "app.a".parse().unwrap(),
+                partition("2024-01-01", "2025-01-01", a),
+            );
+            s.tables.insert(
+                "app.b".parse().unwrap(),
+                partition("2025-01-01", "2026-01-01", b),
+            );
+            s
+        };
+        let base = tree(
+            parent(),
+            &[("m", own_default("7"))],
+            &[("m", own_not_null.clone())],
+        );
+        let outcome = |declared: &Schema, intents: &[Intent]| {
+            let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+        };
+        let planned = |declared: &Schema, intents: &[Intent]| -> Vec<Change> {
+            outcome(declared, intents)
+                .unwrap_or_else(|e| panic!("refused: {e:?}"))
+                .changes
+                .into_iter()
+                .map(|p| p.change)
+                .collect()
+        };
+        let refused = |declared: &Schema, intents: &[Intent]| -> Vec<String> {
+            match outcome(declared, intents) {
+                Ok(cs) => panic!("planned {:?}", kinds(&cs)),
+                Err(e) => e.iter().map(ToString::to_string).collect(),
+            }
+        };
+        let ev: TableName = "app.ev".parse().unwrap();
+        let with = |edit: &dyn Fn(&mut Table),
+                    a: &[(&str, PartitionColumn)],
+                    b: &[(&str, PartitionColumn)]| {
+            let mut p = parent();
+            edit(&mut p);
+            tree(p, a, b)
+        };
+        let keep_a = [("m", own_default("7"))];
+        let keep_b = [("m", own_not_null.clone())];
+
+        // Added: the parent's change alone.
+        let added = planned(
+            &with(
+                &|p| {
+                    p.columns.insert("note".into(), Column::new(ty("text")));
+                },
+                &keep_a,
+                &keep_b,
+            ),
+            &[],
+        );
+        assert!(
+            matches!(added.as_slice(), [Change::AddColumn { name, .. }] if name == "note"),
+            "{added:?}"
+        );
+        // Retyped: the parent's change alone.
+        let retyped = planned(
+            &with(
+                &|p| {
+                    p.columns.get_mut("n").unwrap().ty = ty("bigint");
+                },
+                &keep_a,
+                &keep_b,
+            ),
+            &[],
+        );
+        assert!(
+            matches!(retyped.as_slice(), [Change::AlterColumnType { .. }]),
+            "{retyped:?}"
+        );
+        // Dropped with intent: the partitions' own on it go with it.
+        let drop_m = [Intent::DropColumn {
+            column: ColumnRef {
+                table: ev.clone(),
+                name: "m".into(),
+            },
+            reason: "gone".into(),
+        }];
+        let dropped = planned(
+            &with(
+                &|p| {
+                    p.columns.shift_remove("m");
+                },
+                &[],
+                &[],
+            ),
+            &drop_m,
+        );
+        assert!(
+            matches!(dropped.as_slice(), [Change::DropColumn { .. }]),
+            "{dropped:?}"
+        );
+        // Renamed, the key column too: the key and the partitions' own follow.
+        let renames = [
+            Intent::RenameColumn {
+                table: ev.clone(),
+                from: "m".into(),
+                to: "m2".into(),
+            },
+            Intent::RenameColumn {
+                table: ev.clone(),
+                from: "ts".into(),
+                to: "at".into(),
+            },
+        ];
+        let renamed = planned(
+            &with(
+                &|p| {
+                    // In place: a rename keeps the column's position.
+                    p.columns = std::mem::take(&mut p.columns)
+                        .into_iter()
+                        .map(|(c, column)| match c.as_str() {
+                            "m" => ("m2".to_owned(), column),
+                            "ts" => ("at".to_owned(), column),
+                            _ => (c, column),
+                        })
+                        .collect();
+                    p.partition_by = Some(PartitionBy {
+                        columns: vec!["at".into()],
+                    });
+                },
+                &[("m2", own_default("7"))],
+                &[("m2", own_not_null.clone())],
+            ),
+            &renames,
+        );
+        assert!(
+            renamed.len() == 2
+                && renamed
+                    .iter()
+                    .all(|c| matches!(c, Change::RenameColumn { .. })),
+            "{renamed:?}"
+        );
+        // A default set on the parent: its own default set again after it on
+        // `a`; `b` has none, and takes the parent's.
+        let defaulted = planned(
+            &with(
+                &|p| {
+                    p.columns.get_mut("m").unwrap().default = Some("1".into());
+                },
+                &keep_a,
+                &keep_b,
+            ),
+            &[],
+        );
+        assert!(
+            matches!(
+                defaulted.as_slice(),
+                [
+                    Change::AlterColumnDefault { .. },
+                    Change::SetPartitionDefault { table, to: Some(own), fallback: Some(f), .. },
+                ] if table.to_string() == "app.a" && own == "7" && f == "1"
+            ),
+            "{defaulted:?}"
+        );
+        // NOT NULL dropped on the parent: every partition brought to its
+        // declaration after it, `a` without one and `b` with its own.
+        let loosened = planned(
+            &with(
+                &|p| {
+                    p.columns.get_mut("n").unwrap().nullable = true;
+                },
+                &keep_a,
+                &[("m", own_not_null.clone()), ("n", own_not_null.clone())],
+            ),
+            &[],
+        );
+        assert!(
+            matches!(
+                loosened.first(),
+                Some(Change::AlterColumnNullability {
+                    to_nullable: true,
+                    ..
+                })
+            ),
+            "{loosened:?}"
+        );
+        let set: Vec<(String, bool)> = loosened[1..]
+            .iter()
+            .filter_map(|c| match c {
+                Change::SetPartitionNotNull {
+                    table,
+                    column,
+                    not_null,
+                    ..
+                } if column == "n" => Some((table.to_string(), *not_null)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            set,
+            [("app.a".to_owned(), false), ("app.b".to_owned(), true)],
+            "{loosened:?}"
+        );
+        assert_eq!(loosened.len(), 3, "{loosened:?}");
+        // NOT NULL set on the parent: `b`'s own, which the declaration then
+        // leaves out, is left to it.
+        let tightened = planned(
+            &with(
+                &|p| {
+                    p.columns.get_mut("m").unwrap().nullable = false;
+                },
+                &keep_a,
+                &[],
+            ),
+            &[],
+        );
+        assert!(
+            matches!(
+                tightened.as_slice(),
+                [Change::AlterColumnNullability {
+                    to_nullable: false,
+                    ..
+                }]
+            ),
+            "{tightened:?}"
+        );
+
+        // Negative: a key column dropped or retyped, and an identity column
+        // added, are refused by name.
+        let drop_ts = [Intent::DropColumn {
+            column: ColumnRef {
+                table: ev.clone(),
+                name: "ts".into(),
+            },
+            reason: "gone".into(),
+        }];
+        let mut no_key = with(
+            &|p| {
+                p.columns.shift_remove("ts");
+            },
+            &keep_a,
+            &keep_b,
+        );
+        no_key.tables.get_mut(&ev).unwrap().partition_by = Some(PartitionBy {
+            columns: vec!["ts".into()],
+        });
+        let e = refused(&no_key, &drop_ts);
+        assert!(
+            e.iter()
+                .any(|m| m.contains("which is in its partition key")),
+            "{e:?}"
+        );
+        let e = refused(
+            &with(
+                &|p| {
+                    p.columns.get_mut("ts").unwrap().ty = ty("timestamp");
+                },
+                &keep_a,
+                &keep_b,
+            ),
+            &[],
+        );
+        assert!(
+            e.iter()
+                .any(|m| m.contains("which is in its partition key")),
+            "{e:?}"
+        );
+        let e = refused(
+            &with(
+                &|p| {
+                    let mut c = Column::new(ty("int")).not_null();
+                    c.identity = Some(pbps_model::Identity {
+                        seed: 1,
+                        increment: 1,
+                    });
+                    p.columns.insert("seq".into(), c);
+                },
+                &keep_a,
+                &keep_b,
+            ),
+            &[],
+        );
+        assert!(
+            e.iter()
+                .any(|m| m.contains("an identity column") && m.contains("#1681")),
+            "{e:?}"
+        );
+
+        // From another base, through revisions: one revision cannot rename
+        // into a name it also drops, so a swap takes two.
+        let from_outcome = |base: &Schema, revisions: &[(&Schema, &[Intent])]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let mut declared_ids = base_ids.clone();
+            for (schema, intents) in revisions {
+                declared_ids = crate::resolve(schema, &declared_ids, intents, &ctx())
+                    .unwrap()
+                    .ids;
+            }
+            let declared = revisions.last().unwrap().0;
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .map(|cs| cs.changes.into_iter().map(|p| p.change).collect::<Vec<_>>())
+            .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let from = |base: &Schema, revisions: &[(&Schema, &[Intent])]| {
+            from_outcome(base, revisions).unwrap_or_else(|e| panic!("refused: {e:?}"))
+        };
+        let reuse_refused = |errors: Vec<String>, from: &str, to: &str| {
+            assert!(
+                errors.iter().any(|e| e.contains(&format!(
+                    "rename column `{from}` into `{to}`, a name this plan takes from another \
+                     column; free the name and give it to the other column in separate plans"
+                ))),
+                "{errors:?}"
+            );
+        };
+        // `n` dropped and `m` renamed into its name: refused by name, since
+        // the apply guard, the pre-flight and the connected passes cannot
+        // follow a dropped name taken again into the partitions yet (#1692
+        // review, #1699).
+        let handoff_base = tree(
+            parent(),
+            &[("m", own_default("7")), ("n", own_default("8"))],
+            &[],
+        );
+        let handoff = with(
+            &|p| {
+                p.columns.shift_remove("n");
+                p.columns = std::mem::take(&mut p.columns)
+                    .into_iter()
+                    .map(|(c, col)| (if c == "m" { "n".to_owned() } else { c }, col))
+                    .collect();
+            },
+            &[("n", own_default("8"))],
+            &[],
+        );
+        let without_n = with(
+            &|p| {
+                p.columns.shift_remove("n");
+            },
+            &[("m", own_default("7"))],
+            &[],
+        );
+        let refused_handoff = from_outcome(
+            &handoff_base,
+            &[
+                (
+                    &without_n,
+                    &[Intent::DropColumn {
+                        column: ColumnRef {
+                            table: ev.clone(),
+                            name: "n".into(),
+                        },
+                        reason: "gone".into(),
+                    }],
+                ),
+                (
+                    &handoff,
+                    &[Intent::RenameColumn {
+                        table: ev.clone(),
+                        from: "m".into(),
+                        to: "n".into(),
+                    }],
+                ),
+            ],
+        );
+        reuse_refused(
+            refused_handoff.expect_err("a dropped name reused"),
+            "m",
+            "n",
+        );
+        // A retype that drops NOT NULL with it: the partitions' NOT NULLs
+        // follow the retype, which carries the parent's change (#1692
+        // review).
+        let retype_loosened = planned(
+            &with(
+                &|p| {
+                    let n = p.columns.get_mut("n").unwrap();
+                    n.ty = ty("bigint");
+                    n.nullable = true;
+                },
+                &keep_a,
+                &[("m", own_not_null.clone()), ("n", own_not_null.clone())],
+            ),
+            &[],
+        );
+        let retype_at = retype_loosened
+            .iter()
+            .position(|c| matches!(c, Change::AlterColumnType { .. }))
+            .expect("the retype");
+        assert!(
+            retype_loosened
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| matches!(c, Change::SetPartitionNotNull { .. }))
+                .all(|(i, _)| i > retype_at)
+                && retype_loosened
+                    .iter()
+                    .filter(|c| matches!(c, Change::SetPartitionNotNull { .. }))
+                    .count()
+                    == 2,
+            "{retype_loosened:?}"
+        );
+        // A partition created with its own default on a column its parent
+        // adds in the same plan comes after the addition (#1692 review).
+        let mut grown = with(
+            &|p| {
+                p.columns.insert("extra".into(), Column::new(ty("int")));
+            },
+            &keep_a,
+            &keep_b,
+        );
+        grown.tables.insert(
+            "app.c".parse().unwrap(),
+            partition("2026-01-01", "2027-01-01", &[("extra", own_default("5"))]),
+        );
+        let grew = planned(&grown, &[]);
+        let at = |kind: &dyn Fn(&Change) -> bool| grew.iter().position(kind).unwrap();
+        assert!(
+            at(&|c| matches!(c, Change::AddColumn { .. }))
+                < at(&|c| matches!(c, Change::CreateTable { .. })),
+            "{grew:?}"
+        );
+        // A non-key column dropped and the key column renamed into its name:
+        // the same refusal, which the key's own checks never reach.
+        let spare_base = with(
+            &|p| {
+                p.columns.insert("spare".into(), Column::new(ty("int")));
+            },
+            &keep_a,
+            &keep_b,
+        );
+        let spare = with(
+            &|p| {
+                p.columns = std::mem::take(&mut p.columns)
+                    .into_iter()
+                    .map(|(c, col)| (if c == "ts" { "spare".to_owned() } else { c }, col))
+                    .collect();
+                p.partition_by = Some(PartitionBy {
+                    columns: vec!["spare".into()],
+                });
+            },
+            &keep_a,
+            &keep_b,
+        );
+        let without_spare = with(&|_| {}, &keep_a, &keep_b);
+        let swapped = from_outcome(
+            &spare_base,
+            &[
+                (
+                    &without_spare,
+                    &[Intent::DropColumn {
+                        column: ColumnRef {
+                            table: ev.clone(),
+                            name: "spare".into(),
+                        },
+                        reason: "gone".into(),
+                    }],
+                ),
+                (
+                    &spare,
+                    &[Intent::RenameColumn {
+                        table: ev.clone(),
+                        from: "ts".into(),
+                        to: "spare".into(),
+                    }],
+                ),
+            ],
+        );
+        reuse_refused(
+            swapped.expect_err("the key renamed into a dropped name"),
+            "ts",
+            "spare",
+        );
+        // The key column moved out of `ts` and a non-key column into it,
+        // then retyped: the retype is the non-key column's (#1692 review).
+        let rename = |p: &mut Table, from: &str, to: &str| {
+            p.columns = std::mem::take(&mut p.columns)
+                .into_iter()
+                .map(|(c, col)| (if c == from { to.to_owned() } else { c }, col))
+                .collect();
+        };
+        let moved_key = with(
+            &|p| {
+                p.columns.insert("spare".into(), Column::new(ty("int")));
+                rename(p, "ts", "k");
+                p.partition_by = Some(PartitionBy {
+                    columns: vec!["k".into()],
+                });
+            },
+            &keep_a,
+            &keep_b,
+        );
+        let moved_in = with(
+            &|p| {
+                p.columns.insert("spare".into(), Column::new(ty("int")));
+                rename(p, "ts", "k");
+                rename(p, "spare", "ts");
+                p.columns.get_mut("ts").unwrap().ty = ty("bigint");
+                p.partition_by = Some(PartitionBy {
+                    columns: vec!["k".into()],
+                });
+            },
+            &keep_a,
+            &keep_b,
+        );
+        let renaming = |from: &str, to: &str| Intent::RenameColumn {
+            table: ev.clone(),
+            from: from.into(),
+            to: to.into(),
+        };
+        // The key's old name passes to another column: refused like every
+        // name passing hands under a partitioned parent (until #1699).
+        let retyped = from_outcome(
+            &spare_base,
+            &[
+                (&moved_key, &[renaming("ts", "k")]),
+                (&moved_in, &[renaming("spare", "ts")]),
+            ],
+        );
+        reuse_refused(retyped.expect_err("a name passing hands"), "spare", "ts");
+        // A name renamed away and given to a new column (round 8): a
+        // partition's own NOT NULL probe would read the old column.
+        let renamed_away = with(&|p| rename(p, "n", "n_old"), &keep_a, &keep_b);
+        let readded = with(
+            &|p| {
+                rename(p, "n", "n_old");
+                p.columns.insert("n".into(), Column::new(ty("int")));
+            },
+            &keep_a,
+            &keep_b,
+        );
+        let errors = from_outcome(
+            &with(&|_| {}, &keep_a, &keep_b),
+            &[(&renamed_away, &[renaming("n", "n_old")]), (&readded, &[])],
+        )
+        .expect_err("a renamed-away name added again");
+        assert!(
+            errors.iter().any(|e| e.contains(
+                "add column `n`, a name this plan takes from another column; free the name and \
+                 give it to the other column in separate plans"
+            )),
+            "{errors:?}"
+        );
+        // A partition's own index on the renamed column is carried by the
+        // engine's rename, and not dropped and added again (#1692 review).
+        let own_index = |s: &mut Schema, column: &str| {
+            s.tables
+                .get_mut(&"app.a".parse::<TableName>().unwrap())
+                .unwrap()
+                .indexes
+                .insert(
+                    "a_m".into(),
+                    Index {
+                        columns: vec![pbps_model::IndexColumn {
+                            key: pbps_model::IndexKey::Column(column.into()),
+                            descending: false,
+                            opclass: None,
+                        }],
+                        include: Vec::new(),
+                        unique: false,
+                        filter: None,
+                        method: Default::default(),
+                        storage_parameters: Default::default(),
+                    },
+                );
+        };
+        let mut indexed_base = with(&|_| {}, &keep_a, &keep_b);
+        own_index(&mut indexed_base, "m");
+        let mut indexed_renamed = with(
+            &|p| rename(p, "m", "m2"),
+            &[("m2", own_default("7"))],
+            &[("m2", own_not_null.clone())],
+        );
+        own_index(&mut indexed_renamed, "m2");
+        let carried = from(&indexed_base, &[(&indexed_renamed, &[renaming("m", "m2")])]);
+        assert!(
+            matches!(carried.as_slice(), [Change::RenameColumn { .. }]),
+            "{carried:?}"
+        );
+        // A partition's own check or unique index, probed over its stored
+        // rows, beside a retype of its parent's column that converts them
+        // first: refused by name (DECISIONS 410, #1692 review).
+        let retype_n = |p: &mut Table| p.columns.get_mut("n").unwrap().ty = ty("bigint");
+        let a: TableName = "app.a".parse().unwrap();
+        let own_check = |s: &mut Schema| {
+            s.tables.get_mut(&a).unwrap().checks.insert(
+                "a_n".into(),
+                pbps_model::CheckConstraint {
+                    expression: "n > 0".into(),
+                },
+            );
+        };
+        let own_unique = |s: &mut Schema, unique: bool| {
+            own_index(s, "n");
+            s.tables
+                .get_mut(&a)
+                .unwrap()
+                .indexes
+                .get_mut("a_m")
+                .unwrap()
+                .unique = unique;
+        };
+        let mut checked = with(&retype_n, &keep_a, &keep_b);
+        own_check(&mut checked);
+        let mut unique = with(&retype_n, &keep_a, &keep_b);
+        own_unique(&mut unique, true);
+        // A rename moves a name the probe reads to another column (round 7).
+        let mut renamed_checked = with(
+            &|p| rename(p, "m", "m2"),
+            &[("m2", own_default("7"))],
+            &[("m2", own_not_null.clone())],
+        );
+        let reads = |s: &mut Schema, expression: &str| {
+            s.tables.get_mut(&a).unwrap().checks.insert(
+                "a_n".into(),
+                pbps_model::CheckConstraint {
+                    expression: expression.into(),
+                },
+            );
+        };
+        reads(&mut renamed_checked, "\"M2\" > 0");
+        // A Unicode-escaped identifier spells `n` without its letter.
+        let mut escaped = with(&retype_n, &keep_a, &keep_b);
+        reads(&mut escaped, r#"U&"\006E" > 0"#);
+        let rename_m = [renaming("m", "m2")];
+        for (declared, intents) in [
+            (&checked, &[][..]),
+            (&escaped, &[][..]),
+            (&unique, &[][..]),
+            (&renamed_checked, &rename_m[..]),
+        ] {
+            let errors = refused(declared, intents);
+            assert!(
+                errors.iter().any(|e| e.contains(
+                    "while this plan changes a column of its parent app.ev; change the parent's \
+                     columns and add the partition's own in separate plans"
+                )),
+                "{errors:?}"
+            );
+        }
+        // Negative: a check or unique index that reads none of the changed
+        // columns is probed over the rows it judges (#1692 review).
+        let mut renamed_other = renamed_checked.clone();
+        reads(&mut renamed_other, "n > 0");
+        planned(&renamed_other, &rename_m);
+        let mut unique_other = with(&retype_n, &keep_a, &keep_b);
+        own_unique(&mut unique_other, true);
+        let ix = unique_other
+            .tables
+            .get_mut(&a)
+            .unwrap()
+            .indexes
+            .get_mut("a_m")
+            .unwrap();
+        ix.columns[0].key = pbps_model::IndexKey::Column("id".into());
+        planned(&unique_other, &[]);
+        // Negative: an index the pre-flight does not probe, a plain filtered
+        // one or a unique one over an expression, on the retyped column
+        // (#1692 review).
+        fn index_of<'s>(s: &'s mut Schema, a: &TableName) -> &'s mut pbps_model::Index {
+            s.tables.get_mut(a).unwrap().indexes.get_mut("a_m").unwrap()
+        }
+        let mut filtered = with(&retype_n, &keep_a, &keep_b);
+        own_unique(&mut filtered, false);
+        index_of(&mut filtered, &a).filter = Some("n > 0".into());
+        planned(&filtered, &[]);
+        // Negative: a default or nullability change of the parent's column
+        // leaves the column and its values as the probe reads them (#1692
+        // review).
+        let mut loosened = with(
+            &|p| p.columns.get_mut("n").unwrap().nullable = true,
+            &keep_a,
+            &keep_b,
+        );
+        own_check(&mut loosened);
+        assert!(
+            planned(&loosened, &[])
+                .iter()
+                .any(|c| matches!(c, Change::AlterColumnNullability { .. })),
+            "the parent's nullability changes"
+        );
+        let mut defaulted = with(
+            &|p| p.columns.get_mut("n").unwrap().default = Some("5".into()),
+            &keep_a,
+            &keep_b,
+        );
+        own_unique(&mut defaulted, true);
+        planned(&defaulted, &[]);
+        let mut expression = with(&retype_n, &keep_a, &keep_b);
+        own_unique(&mut expression, true);
+        index_of(&mut expression, &a).columns[0].key =
+            pbps_model::IndexKey::Expression("(n + 1)".into());
+        planned(&expression, &[]);
+        // A partition dropped while its parent's column tightens: the
+        // pre-flight would count the doomed partition's rows (round 7).
+        let mut dropped_b = with(
+            &|p| p.columns.get_mut("m").unwrap().nullable = false,
+            &[("m", own_default("7"))],
+            &[],
+        );
+        dropped_b
+            .tables
+            .remove(&"app.b".parse::<TableName>().unwrap());
+        let errors = refused(
+            &dropped_b,
+            &[Intent::DropTable {
+                table: "app.b".parse().unwrap(),
+                reason: "gone".into(),
+            }],
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("while this plan attaches, detaches or drops app.b")),
+            "{errors:?}"
+        );
+        // Negative: a plain index is not probed, and a check without the
+        // retype is probed over the rows it judges.
+        let mut plain = with(&retype_n, &keep_a, &keep_b);
+        own_unique(&mut plain, false);
+        planned(&plain, &[]);
+        let mut unretyped = with(&|_| {}, &keep_a, &keep_b);
+        own_check(&mut unretyped);
+        planned(&unretyped, &[]);
+    }
+
     #[test]
     fn a_partition_tree_is_created_then_gains_and_loses_partitions_only() {
         use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionOf};
@@ -6255,8 +7456,13 @@ mod tests {
                 reason: "gone".into(),
             },
         ];
+        // A parent's column is the parent's change, which the engine
+        // recurses (#1687).
+        assert_eq!(
+            kinds(&outcome(&tree, &column, &[]).expect("a parent's column")),
+            ["AddColumn"]
+        );
         for (declared, intents, expected) in [
-            (&column, &[][..], "app.ev is a partitioned table"),
             (&bound, &[][..], "change its partitioning"),
             (&renamed, &rename[..], "rename table"),
             (&no_parent, &drop_all[..], "app.ev is a partitioned table"),
@@ -7690,21 +8896,22 @@ mod tests {
             ),
             "{kinds:?}"
         );
-        // Negative: the parent's own default is the parent's change, still
-        // refused by name (#1546).
+        // The parent's own default is the parent's change, which the engine
+        // recurses into every partition over the partition's own default:
+        // that is set again after it (#1687).
         let mut parent_default = tree.clone();
         parents(&mut parent_default);
-        let errors: Vec<String> = outcome(&tree, &parent_default)
-            .expect_err("a partitioned parent's default")
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        let planned = outcome(&tree, &parent_default).expect("a partitioned parent's default");
+        let kinds: Vec<&Change> = planned.changes.iter().map(|c| &c.change).collect();
         assert!(
-            errors.iter().any(
-                |e| e.starts_with("app.ev is a partitioned table or a partition")
-                    && e.contains("alter column default")
+            matches!(
+                kinds.as_slice(),
+                [
+                    Change::AlterColumnDefault { to: Some(d), .. },
+                    Change::SetPartitionDefault { from: Some(a), to: Some(b), fallback: Some(f), .. },
+                ] if d == "1" && a == "7" && b == "7" && f == "1"
             ),
-            "{errors:?}"
+            "{kinds:?}"
         );
 
         // Detached: its columns are the parent's with its own default and
@@ -7742,6 +8949,54 @@ mod tests {
                 .any(|e| e.contains("its columns are not its parent's")),
             "{errors:?}"
         );
+        // The parent's columns changed while a partition is detached or
+        // attached in the same plan: refused by name, with the two-plan
+        // remedy, and not also as a detached shape (#1692 review).
+        let mut kept = Column::new(ty("int")).not_null();
+        kept.default = Some("7".into());
+        let grown = |s: &mut Schema| {
+            for t in s.tables.values_mut() {
+                if t.partition_of.is_none() {
+                    t.columns.insert("x".into(), Column::new(ty("int")));
+                }
+            }
+        };
+        let mut detached_grown = detached(kept.clone());
+        grown(&mut detached_grown);
+        // Attached as a range: the DEFAULT partition is not attached here.
+        let mut ranged = tree.clone();
+        if let Some(of) = ranged
+            .tables
+            .get_mut(&p)
+            .and_then(|t| t.partition_of.as_mut())
+        {
+            of.bound = PartitionBound::Range {
+                from: vec![pbps_model::BoundDatum::Value("2024-01-01".into())],
+                to: vec![pbps_model::BoundDatum::Value("2025-01-01".into())],
+            };
+        }
+        let mut grown_tree = ranged.clone();
+        grown(&mut grown_tree);
+        for (base, declared) in [
+            (&tree, &detached_grown),
+            (&detached(kept.clone()), &grown_tree),
+        ] {
+            let errors: Vec<String> = outcome(base, declared)
+                .expect_err("columns changed across an attach or a detach")
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            assert!(
+                errors.iter().any(|e| e.contains(
+                    "while this plan attaches, detaches or drops app.p; change the columns and the \
+                     partitions in separate plans"
+                )) && !errors.iter().any(|e| e.contains("not its parent's")),
+                "{errors:?}"
+            );
+        }
+        // Negative: each half alone is planned.
+        outcome(&ranged, &grown_tree).expect("the parent's column alone");
+        outcome(&detached(kept.clone()), &ranged).expect("the attach alone");
     }
 
     /// A partition's own checks and indexes (#1577) are created with it, are
@@ -7869,7 +9124,7 @@ mod tests {
             assert_eq!(kinds, expected, "{:?}", planned.changes);
         }
         // Negative: one added to the parent is the parent's change, refused
-        // by name until #1546.
+        // by name until #1688.
         let mut declared = tree.clone();
         declared
             .tables

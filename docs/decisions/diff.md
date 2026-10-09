@@ -3894,3 +3894,165 @@ Pinned on 16 and 18 by the CLI's
 The text check's spellings are pinned by
 `a_text_that_could_name_a_temporary_schema_is_told_by_any_spelling` and
 `a_text_naming_no_temporary_schema_is_still_asked`.
+
+<a id="dec-1687-1"></a>
+
+**DEC-1687.1. A standing range-partitioned parent's columns change as a
+table's do, the engine recursing each change into every partition, and each
+partition's own default and NOT NULL follow the parent's change on their
+column (#1687).**
+
+The first of #1546's four slices (leon, 2026-10-08): columns here, then
+indexes (#1688), keys, checks and foreign keys (#1689), and renaming the parent
+(#1690). Until DEC-1170.1 every change to a partitioned parent was refused.
+
+Measured on 16.15 and 18.6, on a populated tree:
+
+- `ADD COLUMN` (with a default, NOT NULL, or generated), `DROP COLUMN`,
+  `ALTER COLUMN … TYPE` and `RENAME COLUMN` on the parent recurse into every
+  partition, under `AccessExclusiveLock` on each. No partition can add, drop,
+  retype or rename an inherited column alone.
+- A partition-key column cannot be dropped or retyped. It can be renamed, and
+  the key follows it (`RANGE (ts)` becomes `RANGE (at)`).
+- `SET DEFAULT` and `DROP DEFAULT` on the parent recurse and **overwrite a
+  partition's own default** (DEC-1578.1). `ONLY` leaves the partitions alone,
+  but then the partitions created earlier lack the parent's default, which the
+  reader's tree purity refuses.
+- `SET NOT NULL` recurses. `DROP NOT NULL` recurses too, and a partition's own
+  NOT NULL that predates the parent's **survives on 18 but not on 16**. A NOT
+  NULL a table brought to its attach does not survive it on either version.
+- A partition's own default follows a column rename.
+
+**What is planned.** On a parent that stands before and after the plan, the
+following are admitted with no new change kind: `AddColumn`, `DropColumn`,
+`RenameColumn`, `AlterColumnType`, `AlterColumnNullability`,
+`AlterColumnDefault` and `SetColumnDeprecated`. These stay refused by name:
+- a key column's drop or retype, a drop asked of the base key and a retype of
+  the declared one, since one plan can move a name off the key's column and
+  another column into it;
+- an identity column added, whose partitions cannot be read back yet (#1681);
+- a generation expression changed in place;
+- any of these but a deprecation while the same plan attaches a table under
+  the parent, or detaches or drops one of its partitions. A dropped
+  partition's rows still stand when the pre-flight probes the parent's column. The transition meets the parent's
+  columns as they stand at its statement, and the table on its other side
+  holds them as declared at the other end of the plan, so each column change
+  would need its own place against each transition. The remedy is two plans,
+  the columns first or the partitions first;
+- a partition's own check, or unique index on columns, added while the plan
+  changes a column of its parent that the check or index reads: a changed
+  name, either of a rename's, found in the check's text or in the index's
+  key columns or predicate, quoted or not, in any case. These are what the
+  pre-flight probes; a plain index, filtered or not, and a unique one over
+  an expression are not probed, and are admitted. Only a change that moves
+  what the probe reads counts: an addition, a drop, a rename or a retype. A
+  default or nullability change leaves the column and its values as they
+  are. A text holding a Unicode-escaped identifier (`U&"\0076"`), which
+  spells a name without its letters, counts as reading every changed name.
+  One that reads only the partition's other columns is admitted.
+  Its pre-flight probe reads the stored rows
+  before the parent's change reaches them: a retype converts them and a rename
+  moves a name to another column. The probe knows the plan's column changes
+  by table, not which table is whose partition, so it would test values or
+  columns the engine never checks (DECISIONS 410). The remedy is two plans;
+- a name passing from one column to another in the same plan: a column
+  added, or renamed, into a name the plan drops or renames away. The apply
+  guard builds no undo for a dropped name taken again (DEC-541.1), and the
+  pre-flight and the guard key a partition's probes and carried indexes by
+  the partition's own name, so they would read the column the name left. The
+  remedy is two plans, the name freed first;
+- in a connected plan, a function dropped or rebuilt that a part of one of
+  the parent's partitions depends on, where the part is on a column the plan
+  changes. A default counts by its column, under any change but a
+  nullability one, since the engine overwrites the partition's default with
+  the parent's. A check or index the partition declares counts by a name an
+  addition, drop, rename or retype changes, or a Unicode-escaped identifier,
+  found in its text. Any other part, a clone of the parent's, counts. The connected passes key
+  parts by the partition's name and cannot follow the parent's column change
+  into it. The remedy is two plans.
+
+The last three and the partition drop among the transitions stand until
+#1699. That issue gives every
+consumer the partition-to-parent relation, so that a partition's column is
+looked up as its parent's (leon, 2026-10-09).
+
+A key column renamed is not a change of the partitioning.
+
+**The partitions' own** (`diff_partition_columns`), compared through the
+parent's renames and drops in the same plan, matched by the column's identity
+rather than its name, since one plan can drop a column and rename another into
+its name:
+- **A rename** carries a partition's own entry with it, and plans nothing.
+- **A drop** takes the partition's own entries on that column, and plans
+  nothing.
+- **A default the parent sets or drops** is followed by each declared own
+  default on that column, set again. The connected pass
+  `after_their_parents_defaults` (#1588) already did this for a `SET`, and
+  `DROP DEFAULT` is the case it does not cover.
+- **A NOT NULL the parent drops** is followed by every partition brought to
+  its declaration: its own NOT NULL set, or dropped where 18 would keep one
+  from before.
+- **A NOT NULL the parent sets** holds every partition, so a partition's own,
+  which validation then forbids the declaration to keep, is left to it rather
+  than dropped after.
+
+These partition changes sort at (9, 4), after their parent's change of class 9,
+which includes a retype that changes the column's nullability with it. A
+partition the same plan creates under a parent whose columns change sorts at
+(9, 5): it is created with its own default or NOT NULL on a column the parent
+may only now add or retype. The connected pass that holds an added column
+behind the function its default calls (`after_their_functions`, DEC-1364.1)
+holds such a partition behind the column too, and one whose own index or
+check names the column. So it does a standing partition's own default, NOT
+NULL, index or check on the column. A default's change names its parent; a
+NOT NULL, index or check waits only when the declared schema shows its table
+is one of the parent's partitions. A cycle is refused with its two-plan
+remedy.
+
+The pass reads the declared partitions for what reads the column through a
+partition. A view or routine that names a partition, and a row written into
+one, waits behind the parent's added column as one naming the parent does.
+Otherwise a view's `*` over the partition would be bound before the column is
+added, and would never gain it (measured on 18).
+
+**Why not drop the partition's own NOT NULL before the parent's tightening.**
+It would leave no local NOT NULL behind on 18, but it orders a partition
+change before its parent's in a class that otherwise follows the parent. And
+the leftover is harmless until the parent drops its NOT NULL again, which the
+rule above already handles.
+
+**The apply guard.** The undo of a plan's column renames (`Renames::apply`)
+renames a parent's key and a partition's own column entries too, and a
+partition's own index columns, all looked up under its parent's name, so both
+reads compare under one set of names. The differ brings the base forward
+through the same function, so a partition's own index the engine's rename
+carries is not dropped and added again. A partition of a parent whose column the
+plan drops, renames or makes NOT NULL is held field by field, to what the
+parent's change leaves it. Otherwise it would be compared whole and called
+moved. Where the parent's column names change hands in the plan (DEC-541.1), or a
+dropped column's name is taken by a rename or a new column, undoing would put
+two columns' own entries under one name or cannot be built, so a partition's
+own entries, and the parent's key, are compared under the names the plan
+leaves instead, as the parent's columns are. A partition held field by field for its parent's change
+alone is still held to being there: one dropped or created by another session
+is movement, as the whole-table comparison would have called it.
+
+**The recorded spellings.** A partition's own default is recorded in its
+declared spelling under the partition (DEC-1581.1), and the plan names only
+the parent's rename or drop. So the apply carries the parent's column rename
+or drop into its partitions' records, reading the partitions from the state it
+records. Otherwise the next plan overlays nothing on the engine's respelling,
+and plans the default again.
+
+**The cost estimate** names the recursion. On a partitioned table it says the
+statement recurses into its partitions, how many, and the lock it takes on
+each. Rows and rewrite stay unknown, since ADR-0012 did not measure
+partitioned tables.
+
+Pinned by:
+- `a_partitioned_parents_columns_change_and_its_partitions_keep_their_own`;
+- `a_partitions_own_column_overrides_are_its_own_through_a_detach`;
+- `a_partition_key_and_a_partitions_own_columns_follow_the_parents_renames`;
+- `a_partitions_own_columns_set_by_someone_else_are_movement`;
+- the CLI's `a_partitioned_parents_columns_change_through_the_cli`, on 18 and
+  on 16.
