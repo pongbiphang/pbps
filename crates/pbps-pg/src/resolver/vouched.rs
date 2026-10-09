@@ -486,6 +486,55 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
     })
 }
 
+/// The scratch login's own stored defaults, in every database: each
+/// `(database, name=value)`, the database empty for one that applies in
+/// all. A confined login can still `ALTER ROLE CURRENT_USER [IN DATABASE
+/// ...] SET` them (measured on 16 and 18; its connection limit, validity
+/// and comment it cannot change), so a compiled definition could leave
+/// them changed for every later session of the login. The run compares
+/// them before and after (#1678 review). A changed password is the one
+/// self-change the login cannot read back; the next connection fails on it.
+pub async fn login_defaults(
+    conn: &mut impl QueryConnection,
+) -> Result<std::collections::BTreeSet<(String, String)>, DbError> {
+    let rows = conn
+        .query(
+            "SELECT coalesce(d.datname::text, '') AS database, e.entry AS entry \
+               FROM pg_catalog.pg_db_role_setting s \
+               LEFT JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase \
+               CROSS JOIN LATERAL pg_catalog.unnest(s.setconfig) AS e(entry) \
+              WHERE s.setrole = (SELECT r.oid FROM pg_catalog.pg_roles r \
+                                  WHERE r.rolname = session_user)",
+        )
+        .await?;
+    rows.iter()
+        .map(|row| Ok((text(row, "database")?, text(row, "entry")?)))
+        .collect()
+}
+
+/// What differs between two [`login_defaults`] reads, named.
+pub fn changed_defaults(
+    before: &std::collections::BTreeSet<(String, String)>,
+    after: &std::collections::BTreeSet<(String, String)>,
+) -> Vec<String> {
+    let scope = |database: &str| {
+        if database.is_empty() {
+            "in every database".to_owned()
+        } else {
+            format!("in database {database}")
+        }
+    };
+    before
+        .difference(after)
+        .map(|(database, entry)| format!("{entry} removed {}", scope(database)))
+        .chain(
+            after
+                .difference(before)
+                .map(|(database, entry)| format!("{entry} set {}", scope(database))),
+        )
+        .collect()
+}
+
 /// The session's login.
 pub async fn session_login(conn: &mut impl QueryConnection) -> Result<String, DbError> {
     let rows = conn.query("SELECT session_user::text AS login").await?;
@@ -626,6 +675,28 @@ pub async fn create_schemas(
         }
         conn.execute(&format!(
             "CREATE SCHEMA IF NOT EXISTS \"{}\"",
+            schema.replace('"', "\"\"")
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+/// Gives up the scratch login's `USAGE` on each schema the target's
+/// deployer will not be able to use. An owner may revoke its own
+/// privileges, and the schema then leaves its effective search path, as it
+/// leaves the deployer's (measured on 16 and 18); `DROP OWNED` still drops
+/// it.
+pub async fn revoke_usage(
+    conn: &mut impl ExecuteConnection,
+    schemas: &[String],
+) -> Result<(), DbError> {
+    for schema in schemas {
+        if super::authorization::is_system_schema(schema) {
+            continue;
+        }
+        conn.execute(&format!(
+            "REVOKE USAGE ON SCHEMA \"{}\" FROM SESSION_USER",
             schema.replace('"', "\"\"")
         ))
         .await?;
@@ -798,11 +869,12 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
-    async fn the_cleanup_names_what_another_role_still_owns() {
+    async fn the_cleanup_names_what_another_role_owns_and_what_changed_on_the_login() {
         // A definition may `SET ROLE` to a role the login can become, every
         // database owner's `pg_database_owner` among them, and create there
-        // an object `DROP OWNED BY SESSION_USER` does not reach. The cleanup
-        // reports it rather than an empty database (#1678 review).
+        // an object `DROP OWNED BY SESSION_USER` does not reach; and it may
+        // change the login's own defaults. The cleanup reports both rather
+        // than an untouched account (#1678 review).
         use pbps_db::{Conn, Driver};
         for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
             let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
@@ -830,14 +902,26 @@ mod tests {
                 .await?;
                 // Read before any role switch, as the run reads it.
                 let checked = backend(&mut login).await?;
+                let before = login_defaults(&mut login).await?;
+                // A schema the deployer will not be able to use leaves the
+                // login's usage too, and still goes with the cleanup.
+                login.execute("CREATE SCHEMA given_up").await?;
+                revoke_usage(&mut login, &["given_up".to_owned()]).await?;
+                let usable = login
+                    .query("SELECT pg_catalog.has_schema_privilege('given_up', 'USAGE')::text AS u")
+                    .await?;
+                assert_eq!(usable[0].try_get::<&str>("u")?, Some("false"));
                 for statement in [
+                    "ALTER ROLE CURRENT_USER SET work_mem = '1MB'",
                     "CREATE TABLE public.mine (i integer)",
                     "SET ROLE pg_database_owner",
                     "CREATE TABLE public.escaped (i integer)",
                 ] {
                     login.execute(statement).await?;
                 }
-                drop_owned(&mut login, &checked).await
+                let left = drop_owned(&mut login, &checked).await?;
+                let after = login_defaults(&mut login).await?;
+                Ok::<_, DbError>((left, changed_defaults(&before, &after)))
             }
             .await;
             admin
@@ -845,15 +929,53 @@ mod tests {
                 .await
                 .unwrap();
             admin.execute(&format!("DROP ROLE {name}")).await.unwrap();
-            let (named, total) = result.unwrap();
+            let ((named, total), changed) = result.unwrap();
+            assert_eq!(
+                changed,
+                ["work_mem=1MB set in every database"],
+                "{variable}"
+            );
             // The table, with its row type and that type's array.
             assert!(total > 0, "{variable}: {named:?}");
             assert!(
                 named.iter().any(|object| object == "table public.escaped")
-                    && !named.iter().any(|object| object.contains("mine")),
+                    && !named
+                        .iter()
+                        .any(|object| object.contains("mine") || object.contains("given_up")),
                 "{variable}: {named:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_changed_login_default_is_named_whichever_way_it_changed() {
+        let entry = |database: &str, entry: &str| (database.to_owned(), entry.to_owned());
+        let before = [entry("", "work_mem=4MB"), entry("s", "TimeZone=UTC")]
+            .into_iter()
+            .collect();
+        assert!(changed_defaults(&before, &before).is_empty());
+        let after = [entry("", "work_mem=1MB"), entry("s", "TimeZone=UTC")]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            changed_defaults(&before, &after),
+            [
+                "work_mem=4MB removed in every database",
+                "work_mem=1MB set in every database"
+            ]
+        );
+        // Negative: one added in another database is a change too.
+        let added = [
+            entry("", "work_mem=4MB"),
+            entry("s", "TimeZone=UTC"),
+            entry("other", "search_path=evil"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            changed_defaults(&before, &added),
+            ["search_path=evil set in database other"]
+        );
     }
 
     #[test]

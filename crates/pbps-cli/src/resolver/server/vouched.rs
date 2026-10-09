@@ -227,9 +227,11 @@ enum Created {
         names: ScratchNames,
         roles: Vec<String>,
     },
-    /// Objects the scratch account owns in the supplied database.
+    /// Objects the scratch account owns in the supplied database, and its
+    /// own stored defaults as they were before the run's first write.
     Supplied {
         database: String,
+        defaults: std::collections::BTreeSet<(String, String)>,
     },
 }
 
@@ -574,7 +576,7 @@ impl Run<'_> {
             .map_err(db("the scratch checks"))?;
         let checked = self.supplied_checks(admin).await;
         let ended = admin.execute("ROLLBACK").await;
-        let (principal, database) = checked?;
+        let (principal, database, defaults) = checked?;
         ended.map_err(db("the scratch checks"))?;
         let scope::Authorization::Postgres(context) = authorization else {
             return Err(Error::Scope(
@@ -588,10 +590,18 @@ impl Run<'_> {
         // not reach the same server: a name may resolve to several hosts or a
         // balancing proxy, and `DROP OWNED` there would empty something else
         // (#1678 review).
-        self.created = Created::Supplied { database };
+        self.created = Created::Supplied { database, defaults };
         sql::create_schemas(admin, scope_schemas)
             .await
             .map_err(db("the in-scope schemas"))?;
+        let unusable = authorization
+            .unusable_schemas(&request.planned)
+            .into_iter()
+            .filter(|schema| scope_schemas.contains(schema))
+            .collect::<Vec<_>>();
+        sql::revoke_usage(admin, &unusable)
+            .await
+            .map_err(db("the schemas the deployer cannot use"))?;
         pbps_pg::resolver::authorization::apply_session_settings(admin, context)
             .await
             .map_err(db("the deployer's settings"))?;
@@ -616,7 +626,14 @@ impl Run<'_> {
     async fn supplied_checks(
         &self,
         admin: &mut Conn,
-    ) -> Result<(pbps_db::resolver::environment::DeploymentPrincipal, String), Error> {
+    ) -> Result<
+        (
+            pbps_db::resolver::environment::DeploymentPrincipal,
+            String,
+            std::collections::BTreeSet<(String, String)>,
+        ),
+        Error,
+    > {
         let db = |what: &'static str| {
             move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
         };
@@ -648,7 +665,10 @@ impl Run<'_> {
             )));
         }
         let database = current_database(admin).await?;
-        Ok((principal, database))
+        let defaults = sql::login_defaults(admin)
+            .await
+            .map_err(db("the scratch account's own defaults"))?;
+        Ok((principal, database, defaults))
     }
 
     /// Drops what the run created. `Err` names exactly what may remain.
@@ -676,10 +696,10 @@ impl Run<'_> {
                     Err(remaining)
                 }
             }
-            Created::Supplied { database } => {
+            Created::Supplied { database, defaults } => {
                 // The checked connection, never a new one, and only on the
                 // checked backend: see `supplied`.
-                match sql::drop_owned(admin, self.backend).await {
+                let mut remaining = match sql::drop_owned(admin, self.backend).await {
                     Ok((_, 0)) => Ok(()),
                     // Owned by another role a definition switched to, which
                     // `DROP OWNED BY SESSION_USER` does not reach; never an
@@ -692,6 +712,26 @@ impl Run<'_> {
                     Err(error) => Err(vec![format!(
                         "every object the scratch account owns in database {database} ({error})"
                     )]),
+                }
+                .err()
+                .unwrap_or_default();
+                // A definition may have changed the login's own defaults,
+                // which outlive the database's contents (see
+                // `sql::login_defaults`). Named, never left unread.
+                match sql::login_defaults(admin).await {
+                    Ok(after) => remaining.extend(
+                        sql::changed_defaults(&defaults, &after)
+                            .into_iter()
+                            .map(|change| format!("the scratch account's own default {change}")),
+                    ),
+                    Err(error) => remaining.push(format!(
+                        "the scratch account's own defaults, unreadable after the run ({error})"
+                    )),
+                }
+                if remaining.is_empty() {
+                    Ok(())
+                } else {
+                    Err(remaining)
                 }
             }
         }

@@ -1896,6 +1896,20 @@ by the engines, and the scratch account decides the layout.** Implemented by
   a role for every owner, and `DROP OWNED BY pg_database_owner` is refused
   ("required by the database system"; measured on 16 and 18), so refusing
   such roles up front cannot cover it (#1678 review).
+- **The cleanup also reads the login's own defaults.** A confined login
+  can still `ALTER ROLE CURRENT_USER [IN DATABASE ...] SET` its defaults,
+  and they outlive the database's contents; its connection limit,
+  validity and comment it cannot change (measured on 16 and 18). The run
+  reads them before its first write and again after `DROP OWNED`, and a
+  change fails the run, named (#1678 review). Its password is the one
+  self-change the login cannot read back: the next connection fails on it.
+- **The deployer's unusable schemas are given up.** The supplied login
+  owns every schema it compiles in, so it uses all of them. For each
+  in-scope schema the deployer cannot use once the plan's grants and
+  revokes have run, the login revokes its own `USAGE`. An owner may, and
+  the schema then leaves its effective path as it leaves the deployer's
+  (measured on 16 and 18). Otherwise the comparison sees a schema the
+  deployer will not, and a valid plan is refused (#1678 review).
 - **Why ownership is required.** `DROP OWNED` also revokes what was granted
   to the login on the database, and only an owner keeps its rights through
   that.

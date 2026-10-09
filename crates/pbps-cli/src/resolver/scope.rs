@@ -473,6 +473,23 @@ impl Authorization {
         }
     }
 
+    /// The in-scope schemas the deployer cannot use once the plan's grants
+    /// and revokes have run. A supplied scratch login owns every schema it
+    /// compiles in and so uses all of them; these it must give up, or the
+    /// comparison sees a schema the target's deployer will not, and a valid
+    /// plan is refused (#1678 review). SQL Server has no supplied layout.
+    pub(crate) fn unusable_schemas(&self, planned: &[PlannedGrant]) -> Vec<String> {
+        match self {
+            Self::Postgres(context) => pg_auth::with_planned(context.clone(), &pg_planned(planned))
+                .schemas
+                .into_iter()
+                .filter(|(_, schema)| schema.privileges.get("USAGE") != Some(&true))
+                .map(|(name, _)| name)
+                .collect(),
+            Self::Mssql(_) => Vec::new(),
+        }
+    }
+
     /// Rewrites the target's visibility facts to what the deployer is meant
     /// to see once the plan's grants have run. On PostgreSQL a planned USAGE
     /// grant changes the effective search order, so it is derived from the
@@ -785,6 +802,40 @@ mod tests {
         // The engine's code beside shared objects is the engine's to name.
         assert!(engine_packages(Driver::Postgres).is_empty());
         assert_eq!(engine_packages(Driver::Mssql), [".sfp"]);
+    }
+
+    #[test]
+    fn a_planned_revoke_makes_the_schema_one_the_supplied_login_gives_up() {
+        let context = Authorization::Postgres(pg_auth::AuthorizationContext {
+            principal: pbps_db::resolver::environment::DeploymentPrincipal {
+                login: "d".into(),
+                effective: "d".into(),
+                superuser: false,
+            },
+            schemas: [(
+                "app".to_owned(),
+                // The deployer owns it, so its revoke from itself is one it
+                // has the authority to make.
+                pg_auth::SchemaAuthorization {
+                    owner: "d".into(),
+                    privileges: BTreeMap::from([("USAGE".into(), true), ("CREATE".into(), true)]),
+                    acl: BTreeMap::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            roles: BTreeMap::new(),
+            settings: BTreeMap::new(),
+        });
+        // Negative: with nothing planned the deployer keeps its usage.
+        assert!(context.unusable_schemas(&[]).is_empty());
+        let revoke = [PlannedGrant {
+            principal: "d".into(),
+            schema: "app".into(),
+            privilege: "USAGE".into(),
+            revoke: true,
+        }];
+        assert_eq!(context.unusable_schemas(&revoke), ["app"]);
     }
 
     /// The sealed digest moves with a planned grant on either engine, and

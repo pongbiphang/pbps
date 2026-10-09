@@ -1450,7 +1450,9 @@ entry implemented by #1672, Docker by #1674).**
         database defaults become session settings, and `DROP OWNED` empties
         the database afterwards, whether the run answered or refused. What
         another role owns survives it, so the run then reads the database
-        again and fails, naming what remains.
+        again and fails, naming what remains; so does a change to the
+        login's own defaults. A schema the deployer cannot use after the
+        plan's grants is one the login gives up its usage of.
     - **Scratch is empty.** The database the run compiles in holds nothing
       initdb did not create: no object at or above `FirstNormalObjectId`,
       subscriptions included, and no large object, whose OID may be
