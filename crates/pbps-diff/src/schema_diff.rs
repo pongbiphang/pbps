@@ -822,7 +822,7 @@ fn diff_partial_rebuilding(
         &mut errs,
     );
     refuse_temporal_changes(base, declared, &changes, &mut errs);
-    refuse_partition_changes(base, declared, &changes, &mut errs);
+    refuse_partition_changes(base, declared, hints, &changes, &mut errs);
     // A module declaration can stay byte-for-byte identical while a new
     // overload or shadow changes what it should bind to. Ask the dialect
     // before sorting, rather than appending unreviewed SQL at apply time.
@@ -3121,6 +3121,7 @@ fn attached(
 fn refuse_partition_changes(
     base: Side<'_>,
     declared: Side<'_>,
+    hints: &Hints,
     changes: &[Change],
     errs: &mut Vec<DiffError>,
 ) {
@@ -3300,6 +3301,19 @@ fn refuse_partition_changes(
                 .get(name)
                 .is_some_and(|t| t.partition_by.is_some() && t.partition_of.is_none())
         };
+        // A standing parent's index (#1688): the engine recurses `CREATE
+        // INDEX` and `DROP INDEX` into every partition, under SHARE on each,
+        // a clone on each partition that the reader leaves to the parent
+        // (DEC-1577.1). A new name is a drop and an add, as on any table.
+        if let Change::AddIndex { table, .. } | Change::DropIndex { table, .. } = change
+            && parent_standing(base.schema, table)
+            && parent_standing(declared.schema, table)
+        {
+            if let Some(why) = refuse_parent_index(table, change, declared.schema, hints) {
+                refuse(table, why);
+            }
+            continue;
+        }
         if let Some(column) = parent_column(change)
             && let Some(table) = change.table()
             && parent_standing(base.schema, table)
@@ -3395,6 +3409,91 @@ fn refuse_partition_changes(
             .into_iter()
             .map(|(table, what)| DiffError::PartitionedTableChange { table, what }),
     );
+}
+
+/// Why a standing parent's index change cannot be planned, if it cannot
+/// (#1688). Each is measured on 16.15 and 18.6:
+/// - `CONCURRENTLY` is refused on a partitioned table, building or dropping,
+///   so `strategy: online` cannot be honoured, and leaving it off would lock
+///   every partition the operator asked to keep writable;
+/// - a unique index lacking a partition-key column is refused by the engine,
+///   "unique constraint on partitioned table must include all partitioning
+///   columns";
+/// - a new index adopts a partition's own index that matches it (DEC-1577.1),
+///   which then becomes the parent's clone, and the partition's own is gone
+///   from every later read. Refused by name (leon, 2026-10-08), the remedy
+///   being to drop or rename the partition's own first.
+fn refuse_parent_index(
+    table: &TableName,
+    change: &Change,
+    declared: &Schema,
+    hints: &Hints,
+) -> Option<String> {
+    if hints.strategies.get(table).is_some_and(|s| s.online) {
+        return Some(format!(
+            "{} with `strategy: online`, which PostgreSQL cannot build or drop concurrently on a \
+             partitioned table; remove the table's `strategy: online` for this plan",
+            change_in_words(change)
+        ));
+    }
+    let Change::AddIndex { name, index, .. } = change else {
+        return None;
+    };
+    let parent = declared.tables.get(table)?;
+    if index.unique
+        && let Some(by) = &parent.partition_by
+        && let Some(missing) = by.columns.iter().find(|key| {
+            !index
+                .columns
+                .iter()
+                .any(|c| c.key.column() == Some(key.as_str()))
+        })
+    {
+        return Some(format!(
+            "add unique index `{name}` without the partition key column `{missing}`, which \
+             PostgreSQL refuses on a partitioned table; add `{missing}` to its columns"
+        ));
+    }
+    let adopted: Vec<String> = declared
+        .tables
+        .iter()
+        .filter(|(_, t)| {
+            t.partition_of
+                .as_ref()
+                .is_some_and(|of| of.parent == *table)
+        })
+        .flat_map(|(partition, t)| {
+            t.indexes
+                .iter()
+                .filter(|(_, own)| adopts(index, own))
+                .map(move |(own, _)| format!("{partition}'s `{own}`"))
+        })
+        .collect();
+    (!adopted.is_empty()).then(|| {
+        format!(
+            "add index `{name}`, which would take {} as the partition's copy of it and leave the \
+             partition without its own; drop or rename the partition's own index in an earlier \
+             plan",
+            adopted.join(", ")
+        )
+    })
+}
+
+/// Whether a new parent index takes a partition's own index as its clone.
+/// Measured on 16.15 and 18.6: the method, the keys in order with their
+/// classes, uniqueness, the predicate and the `INCLUDE` columns must match;
+/// a key's direction and the storage parameters need not (#1688).
+fn adopts(parent: &pbps_model::Index, own: &pbps_model::Index) -> bool {
+    parent.method == own.method
+        && parent.unique == own.unique
+        && parent.filter == own.filter
+        && parent.include == own.include
+        && parent.columns.len() == own.columns.len()
+        && parent
+            .columns
+            .iter()
+            .zip(&own.columns)
+            .all(|(p, o)| p.key == o.key && p.opclass == o.opclass)
 }
 
 /// The column a parent's column change names, for the kinds the engine
@@ -6392,6 +6491,186 @@ mod tests {
     ///
     /// A key column's drop or retype, and an identity column added, are
     /// refused by name.
+    /// A standing parent's indexes change as a table's do (#1688): added,
+    /// dropped, and a new name as a drop and an add, the engine recursing
+    /// each into every partition. Refused by name: `strategy: online`, a
+    /// unique index without a partition-key column, and a new index that
+    /// would take a partition's own as its clone (measured on 16 and 18).
+    #[test]
+    fn a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken() {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+        let ev: TableName = "app.ev".parse().unwrap();
+        let index = |columns: &[&str], unique: bool, filter: Option<&str>| Index {
+            columns: columns
+                .iter()
+                .map(|c| pbps_model::IndexColumn::column(*c))
+                .collect(),
+            include: Vec::new(),
+            unique,
+            filter: filter.map(Into::into),
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
+        let tree = |parent_indexes: &[(&str, Index)], own: &[(&str, Index)], created: bool| {
+            let mut parent = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("ts", Column::new(ty("date")).not_null()),
+                ("n", Column::new(ty("int"))),
+            ]);
+            parent.partition_by = Some(PartitionBy {
+                columns: vec!["ts".into()],
+            });
+            for (name, ix) in parent_indexes {
+                parent.indexes.insert((*name).into(), ix.clone());
+            }
+            let mut s = schema_of("app.ev", parent);
+            let partition = |bound: PartitionBound, own: &[(&str, Index)]| {
+                let mut t = Table {
+                    partition_of: Some(PartitionOf {
+                        parent: ev.clone(),
+                        bound,
+                        columns: Default::default(),
+                    }),
+                    ..Default::default()
+                };
+                for (name, ix) in own {
+                    t.indexes.insert((*name).into(), ix.clone());
+                }
+                t
+            };
+            let (standing, new) = if created {
+                (&[][..], own)
+            } else {
+                (own, &[][..])
+            };
+            s.tables.insert(
+                "app.ev_1".parse().unwrap(),
+                partition(PartitionBound::Default, standing),
+            );
+            if created {
+                s.tables.insert(
+                    "app.ev_new".parse().unwrap(),
+                    partition(
+                        PartitionBound::Range {
+                            from: vec![pbps_model::BoundDatum::Value("2030-01-01".into())],
+                            to: vec![pbps_model::BoundDatum::Value("2031-01-01".into())],
+                        },
+                        new,
+                    ),
+                );
+            }
+            s
+        };
+        let outcome = |base: &Schema, declared: &Schema, online: bool| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+                .unwrap()
+                .ids;
+            let mut hints = Hints::default();
+            if online {
+                hints
+                    .strategies
+                    .insert(ev.clone(), pbps_model::Strategy { online: true });
+            }
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &hints,
+            )
+            .map(|cs| kinds(&cs))
+            .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let plain = tree(&[], &[], false);
+        let indexed = tree(&[("ev_n", index(&["n"], false, None))], &[], false);
+        let renamed = tree(&[("ev_n2", index(&["n"], false, None))], &[], false);
+        assert_eq!(
+            outcome(&plain, &indexed, false),
+            Ok(vec!["AddIndex".to_owned()])
+        );
+        assert_eq!(
+            outcome(&indexed, &plain, false),
+            Ok(vec!["DropIndex".to_owned()])
+        );
+        assert_eq!(
+            outcome(&indexed, &renamed, false),
+            Ok(vec!["DropIndex".to_owned(), "AddIndex".to_owned()])
+        );
+        let refused = |result: Result<Vec<String>, Vec<String>>, what: &str| {
+            let errors = result.expect_err(what);
+            assert!(errors.iter().any(|e| e.contains(what)), "{errors:?}");
+        };
+        // Online, either way.
+        refused(outcome(&plain, &indexed, true), "with `strategy: online`");
+        refused(outcome(&indexed, &plain, true), "with `strategy: online`");
+        // Unique without the key column; with it, planned.
+        refused(
+            outcome(
+                &plain,
+                &tree(&[("ev_u", index(&["id"], true, None))], &[], false),
+                false,
+            ),
+            "without the partition key column `ts`",
+        );
+        assert!(
+            outcome(
+                &plain,
+                &tree(&[("ev_u", index(&["id", "ts"], true, None))], &[], false),
+                false
+            )
+            .is_ok()
+        );
+        // Adoption: a standing partition's own index, and one created by the
+        // same plan, a key's direction notwithstanding.
+        let own = [("ev_1_n", index(&["n"], false, None))];
+        refused(
+            outcome(
+                &tree(&[], &own, false),
+                &tree(&[("ev_n", index(&["n"], false, None))], &own, false),
+                false,
+            ),
+            "which would take app.ev_1's `ev_1_n`",
+        );
+        let mut descending = index(&["n"], false, None);
+        descending.columns[0].descending = true;
+        refused(
+            outcome(
+                &plain,
+                &tree(
+                    &[("ev_n", index(&["n"], false, None))],
+                    &[("own", descending)],
+                    true,
+                ),
+                false,
+            ),
+            "which would take app.ev_new's `own`",
+        );
+        // Negative: an own index the engine does not adopt, by uniqueness or
+        // by predicate, leaves the parent's planned.
+        for other in [
+            index(&["n", "ts"], true, None),
+            index(&["n"], false, Some("n > 0")),
+        ] {
+            let own = [("ev_1_x", other)];
+            assert_eq!(
+                outcome(
+                    &tree(&[], &own, false),
+                    &tree(&[("ev_n", index(&["n"], false, None))], &own, false),
+                    false,
+                ),
+                Ok(vec!["AddIndex".to_owned()])
+            );
+        }
+    }
+
     #[test]
     fn a_partitioned_parents_columns_change_and_its_partitions_keep_their_own() {
         use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
@@ -8971,8 +9250,9 @@ mod tests {
                 .collect();
             assert_eq!(kinds, expected, "{:?}", planned.changes);
         }
-        // Negative: one added to the parent is the parent's change, refused
-        // by name until #1688.
+        // Negative: one added to the parent is the parent's change, and one
+        // the partition's own `p_ts` would be adopted into as its clone is
+        // refused by name (#1688, DEC-1688.1).
         let mut declared = tree.clone();
         declared
             .tables
@@ -8984,7 +9264,7 @@ mod tests {
         assert!(
             errors.iter().any(
                 |e| e.starts_with("app.ev is a partitioned table or a partition")
-                    && e.contains("add index")
+                    && e.contains(&format!("which would take {p}'s `p_ts`"))
             ),
             "{errors:?}"
         );

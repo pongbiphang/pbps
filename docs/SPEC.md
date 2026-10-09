@@ -318,10 +318,13 @@ indexes:
   NULLs follow (DEC-1687.1). A partition's column is its parent's in the
   pre-flight, the apply guard and the connected passes alike (DEC-1699.1). A
   key column is never dropped or retyped, and the columns do not change in a
-  plan that attaches, detaches or drops under the parent. Every other change
-  stays refused by name: the
-  parent's indexes, keys, checks and foreign keys, and its rename, until
-  #1688–#1690, and attaching as the DEFAULT partition until #1639.
+  plan that attaches, detaches or drops under the parent. Its indexes are
+  added and dropped, a new name being a drop and an add, each recursing as
+  the partitions' clones; `strategy: online`, a unique index without a key
+  column, and a new index that would take a partition's own as its clone are
+  refused by name (DEC-1688.1). Every other change stays refused by name: the
+  parent's keys, checks and foreign keys, and its rename, until #1689–#1690,
+  and attaching as the DEFAULT partition until #1639.
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

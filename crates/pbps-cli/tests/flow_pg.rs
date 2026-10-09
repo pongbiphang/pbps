@@ -19389,6 +19389,165 @@ fn partition_inheritance_flow(server: &str, slug: &str) {
     );
 }
 
+/// A standing range-partitioned parent's indexes change through the CLI
+/// (#1688), on a tree holding rows: an index added, renamed (a drop and an
+/// add) and dropped, and a unique one over the key column, each reaching
+/// every partition as the engine's clone, verifying and replanning empty, the
+/// cost estimate naming the recursion. Refused at plan time by name, nothing
+/// changed: `strategy: online`, and a new index that would take a
+/// partition's own as its clone.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_partitioned_parents_indexes_change_through_the_cli() {
+    parent_indexes_flow(&server(), "parent-indexes-1688");
+}
+
+/// [`a_partitioned_parents_indexes_change_through_the_cli`] on a pre-17
+/// server.
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn a_partitioned_parents_indexes_change_through_the_cli_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    parent_indexes_flow(&server, "parent-indexes-1688-old");
+}
+
+fn parent_indexes_flow(server: &str, slug: &str) {
+    let db = OwnDatabase::new(server, slug);
+    let conn = db.connection().to_owned();
+    on_server(
+        &conn,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, n integer, m integer) \
+             PARTITION BY RANGE (ts); \
+         CREATE TABLE app.ev_2024 PARTITION OF app.ev \
+             FOR VALUES FROM ('2024-01-01') TO ('2025-01-01'); \
+         CREATE TABLE app.ev_2025 PARTITION OF app.ev \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
+         CREATE INDEX ev_2025_n ON app.ev_2025 (n); \
+         INSERT INTO app.ev VALUES (1, '2024-06-01', 1, 1), (2, '2025-06-01', 2, 2)",
+    );
+    let d = Demo::new(slug);
+    succeeds(d.run(&["pull", "--db", &conn]));
+    let path = d.dir.join("schema/app.ev.yml");
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+    let edit = |from: &str, to: &str| {
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(from), "{from:?} in {text}");
+        std::fs::write(&path, text.replacen(from, to, 1)).unwrap();
+    };
+    let applied = |name: &str| {
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join(name);
+        let o = succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+        let planned = stdout(&o);
+        succeeds(approved_apply(
+            &d,
+            &conn,
+            &plan,
+            &["--allow", "destructive,constraint"],
+        ));
+        succeeds(d.run(&["verify", "--db", &conn]));
+        let next = succeeds(d.run(&["plan", "--db", &conn]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        planned
+    };
+    let refused = |what: &str| {
+        let o = d.run(&["plan"]);
+        assert_ne!(code(&o), 0, "{}", stdout(&o));
+        assert!(stderr(&o).contains(what), "{}", stderr(&o));
+    };
+    let holds = |sql: &str| scalar(&conn, &format!("SELECT ({sql})::int::int8"));
+    // The partitions' indexes on `column`, the engine's clones among them.
+    let clones_on = |column: &str| {
+        holds(&format!(
+            "SELECT count(*) FROM pg_index i JOIN pg_inherits h ON h.inhrelid = i.indexrelid \
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] \
+             WHERE i.indrelid IN ('app.ev_2024'::regclass, 'app.ev_2025'::regclass) \
+             AND a.attname = '{column}'"
+        ))
+    };
+
+    // Added: a clone on every partition.
+    edit(
+        "\npartition_by:",
+        "\nindexes:\n  ev_m:\n    columns: [m]\n\npartition_by:",
+    );
+    let planned = applied("add.json");
+    assert!(
+        planned.contains("recurses into its 2 partition(s)"),
+        "{planned}"
+    );
+    assert_eq!(clones_on("m"), 2);
+    // Renamed: a drop and an add.
+    edit("  ev_m:\n", "  ev_m2:\n");
+    applied("rename.json");
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_class WHERE relname = 'ev_m2'"),
+        1
+    );
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_class WHERE relname = 'ev_m'"),
+        0
+    );
+    assert_eq!(clones_on("m"), 2);
+    // A unique one over the key column, probed over every partition's rows.
+    edit(
+        "  ev_m2:\n    columns: [m]\n",
+        "  ev_m2:\n    columns: [m]\n  ev_id:\n    columns: [id, ts]\n    unique: true\n",
+    );
+    // A duplicate in one partition refuses the apply before any DDL.
+    on_server(&conn, "INSERT INTO app.ev VALUES (2, '2025-06-01', 3, 3)");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let collides = d.dir.join("collides.json");
+    succeeds(d.run(&["plan", "--db", &conn, "--out", collides.to_str().unwrap()]));
+    let o = approved_apply(&d, &conn, &collides, &["--allow", "destructive,constraint"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("would collide under the new unique index ev_id"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_class WHERE relname = 'ev_id'"),
+        0
+    );
+    on_server(&conn, "DELETE FROM app.ev WHERE n = 3");
+    applied("unique.json");
+    assert_eq!(clones_on("id"), 2);
+    // Dropped: the clones with it.
+    edit("  ev_m2:\n    columns: [m]\n", "");
+    applied("drop.json");
+    assert_eq!(clones_on("m"), 0);
+
+    // Refused by name, nothing changed: `strategy: online`.
+    edit(
+        "\npartition_by:",
+        "\nstrategy: {online: true}\n\npartition_by:",
+    );
+    edit("  ev_id:\n", "  ev_m:\n    columns: [m]\n  ev_id:\n");
+    refused("with `strategy: online`");
+    edit("\nstrategy: {online: true}\n", "\n");
+    // And a new index the partition `ev_2025`'s own would be taken into.
+    edit(
+        "  ev_m:\n    columns: [m]\n",
+        "  ev_n:\n    columns: [\"n\"]\n",
+    );
+    refused("which would take app.ev_2025's `ev_2025_n`");
+    assert_eq!(clones_on("n"), 0);
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_inherits WHERE inhrelid = 'app.ev_2025_n'::regclass"),
+        0,
+        "the partition's own index is still its own"
+    );
+}
+
 const SETUP_1699: &str = "CREATE SCHEMA app; \
      CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
      CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, k integer, n integer, \
@@ -19777,8 +19936,9 @@ fn a_standing_partitions_own_properties_change_through_the_cli() {
     );
     assert_eq!(not_null("app.ev_rest", "k"), 0, "nothing ran");
 
-    // Negative: an index added to the parent is the parent's change, refused
-    // by name until #1688.
+    // An index added to the parent is the parent's change, planned since
+    // #1688: the partition's own index on `k` is gone by now, so none is
+    // adopted.
     std::fs::write(
         &path,
         text.replace(
@@ -19788,14 +19948,8 @@ fn a_standing_partitions_own_properties_change_through_the_cli() {
     )
     .unwrap();
     d.commit();
-    let o = d.run(&["plan", "--db", &conn]);
-    assert_ne!(code(&o), 0, "{}", stdout(&o));
-    assert!(
-        stderr(&o).contains("app.ev is a partitioned table or a partition")
-            && stderr(&o).contains("add index"),
-        "{}",
-        stderr(&o)
-    );
+    let o = succeeds(d.run(&["plan", "--db", &conn]));
+    assert!(stdout(&o).contains("+ index ev_k"), "{}", stdout(&o));
 }
 
 /// A function rebuilt under a partition tree's defaults (#1588). The
