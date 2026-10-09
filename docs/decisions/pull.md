@@ -664,9 +664,10 @@ while another row takes it over. The two actions then decide each write
 alike, and pbps declares no deferred key.
 
 A project whose database has such a key, and which declared it as
-`no_action` to get past the old omission, now gets a plan that drops and adds
-the key with the action the database has. That is intended: the old
-declaration was the action the key did not have.
+`no_action` to get past the old omission, now gets a plan that drops the key
+and adds it back as declared. Applying it turns the database's `RESTRICT`
+into `NO ACTION`, as the live test measures. The plan shows that change before
+it is approved; declaring `restrict` instead keeps the key as it is.
 
 Pinned by `a_restrict_foreign_key_is_held_and_an_unknown_action_is_left_out_and_named`
 and `a_referential_action_is_spelled_only_when_it_is_not_the_default`
