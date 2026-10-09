@@ -1029,6 +1029,7 @@
         "a_hidden_table_is_not_recorded_as_missing",
         "a_call_on_a_column_without_methods_is_a_call_to_the_function",
         "a_key_to_a_case_variant_of_a_history_is_refused_under_the_collation",
+        "a_rename_under_a_denied_referrer_function_is_refused_by_name",
         "a_refused_bootstrap_leaves_its_sql_file_as_it_was",
         "computed_function_drops_keep_their_place_when_the_renames_are_searched",
         "a_readded_computed_columns_calls_are_compared_under_the_collation",

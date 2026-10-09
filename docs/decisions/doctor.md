@@ -1108,9 +1108,55 @@ login `doctor` called ready then fails those reads with Msg 229.
 plan, which is refused by name without it. These decide every pull, plan and
 verify, which fail without them.
 
+*Amended by [DEC-1717.1](#dec-1717-1): only the referenced-entities function
+decides those; the referencing one is read only by an apply that renames, and
+is advice.*
+
 Pinned by:
 - `a_denied_dependency_function_is_a_readiness_gap`
   (`crates/pbps-mssql/tests/live.rs`);
-- `a_denied_dependency_function_is_a_gap_named_at_that_function` and
+- `a_denied_dependency_function_is_named_at_that_function` and
+  `only_the_functions_a_servers_reads_ask_are_required`
+  (`crates/pbps-mssql/src/doctor.rs`).
+
+<a id="dec-1717-1"></a>
+
+**DEC-1717.1. `SELECT` on `sys.dm_sql_referencing_entities` is advice in
+`doctor`, and an apply that renames refuses by name, before its first
+statement, a login denied it (#1717; amends DEC-1704.1).** Only the rename
+impact report reads that function, and only `apply`'s pre-flight runs the
+report; `pull`, `plan --db` and `verify` read the referenced-entities
+function alone. Required, it called an account not ready for every project,
+including one that never renames.
+
+**Measured** on 17.0: under a `DENY SELECT` on the function in `master`, the
+report's read fails inside its `TRY`, and the `CATCH` re-raises it with
+`RAISERROR`, so the error arrives as code 50000 with Msg 229's text. Nothing
+in it says why pbps asked or where the `DENY` lives, and its code does not say
+it was a permission.
+
+**Decision.**
+- `ADVISED` holds the referencing function's `SELECT`, with its reason: an
+  apply that renames is refused without it. The referenced function stays in
+  `REQUIRED`.
+- Before the functions' read, `impact::rename_impact_reading` asks
+  `HAS_PERMS_BY_NAME` of both functions, which sees a `DENY` in `master` to
+  the login's user or to `public` (DEC-1704.1), and refuses with
+  `DbError::Refused` naming each one denied, the `DENY` in `master` and the
+  remedy. It runs in the pre-flight before the first statement, as the report
+  itself does.
+- On SQL Server 2008 to 2012 the report reads the view (DEC-1644.1), so
+  neither the check nor the advice asks the referencing function there.
+
+**Why not match the engine's error.** Its code is the re-raise's 50000, not
+229, and matching the text would read a server-supplied sentence. Asking
+first answers the question directly.
+
+Pinned by:
+- `a_denied_dependency_function_is_a_readiness_gap`
+  (`crates/pbps-mssql/tests/live.rs`);
+- `a_rename_under_a_denied_referrer_function_is_refused_by_name`
+  (`crates/pbps-cli/tests/flow.rs`);
+- `a_denied_dependency_function_is_named_at_that_function` and
   `only_the_functions_a_servers_reads_ask_are_required`
   (`crates/pbps-mssql/src/doctor.rs`).

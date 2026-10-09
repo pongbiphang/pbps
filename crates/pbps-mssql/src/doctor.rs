@@ -353,7 +353,7 @@ const fn req(name: &'static str, why: &'static str, needed: Needed) -> Requireme
 /// `verify` ask `sys.dm_sql_referenc*_entities`, which answer under the
 /// managed-schema grant. So `doctor` names them as advice, never as a gap:
 /// database-wide `VIEW DEFINITION` is the broad ask this list avoids.
-pub const ADVISED: [Requirement; 2] = [
+pub const ADVISED: [Requirement; 3] = [
     req(
         "VIEW DEFINITION",
         "proving no hidden computed column or module refers to a function a connected plan \
@@ -365,6 +365,15 @@ pub const ADVISED: [Requirement; 2] = [
         "SELECT",
         "the same reads, which ask this view",
         Needed::CatalogView,
+    ),
+    // Advice, not a gap (#1717, DEC-1717.1): only an apply that renames reads
+    // it, and that apply refuses by name without it, before any statement.
+    req(
+        "SELECT",
+        "reading what a rename affects, on SQL Server 2014 and later; without it, an apply \
+         that renames is refused. `public` holds it in master, so it is missing only where a \
+         DENY in master takes it away, and only there can it be changed",
+        Needed::DependencyFunction("dm_sql_referencing_entities"),
     ),
 ];
 
@@ -394,7 +403,7 @@ pub use crate::state::LEDGER_SCHEMA;
 /// absence still requires the create-time permission.
 pub const LEDGER_TABLES: [&str; 2] = [crate::state::STATE_TABLE, crate::state::LOCK_TABLE];
 
-pub const REQUIRED: [Requirement; 27] = [
+pub const REQUIRED: [Requirement; 26] = [
     req(
         "ALTER",
         "adding the timeline columns to an existing pre-migration state ledger",
@@ -405,21 +414,14 @@ pub const REQUIRED: [Requirement; 27] = [
         "reading the catalog: pull, plan --db, verify",
         Needed::Managed,
     ),
-    // Each function its own entry, because they are read for different
-    // commands, and the reason has to say which.
+    // The other dependency function is in `ADVISED`: only an apply that
+    // renames reads it (DEC-1717.1).
     req(
         "SELECT",
         "reading what depends on what: pull, plan --db, verify. `public` holds it in master, \
          so it is missing only where a DENY in master takes it away, and only there can it be \
          changed",
         Needed::DependencyFunction("dm_sql_referenced_entities"),
-    ),
-    req(
-        "SELECT",
-        "reading what a rename affects, on SQL Server 2014 and later: plan --db. `public` \
-         holds it in master, so it is missing only where a DENY in master takes it away, and \
-         only there can it be changed",
-        Needed::DependencyFunction("dm_sql_referencing_entities"),
     ),
     // `SELECT` twice, because it is needed in two places for two reasons and a
     // single entry made the wrong demand in both directions. The probes count
@@ -4133,34 +4135,49 @@ mod tests {
         assert!(advised(&held).is_empty());
     }
 
-    /// #1704: `SELECT` on each dependency function is a gap of its own,
-    /// named at that function, because the reads of `pull`, `plan --db` and
-    /// `verify` fail without it (DEC-1704.1).
+    /// #1704: `SELECT` on the referenced-entities function is a gap named at
+    /// that function, because the reads of `pull`, `plan --db` and `verify`
+    /// fail without it (DEC-1704.1). The referencing-entities function is
+    /// read only by an apply that renames, which refuses by name without it,
+    /// so it is advice (#1717, DEC-1717.1).
     #[test]
-    fn a_denied_dependency_function_is_a_gap_named_at_that_function() {
-        for denied in DEPENDENCY_FUNCTIONS {
-            let mut held = everything(&["dbo"]);
-            held.dependency_functions.insert(denied, false);
-            let gaps = missing(&held);
-            assert_eq!(gaps.len(), 1, "{gaps:?}");
-            assert_eq!(gaps[0].permission, "SELECT");
-            assert_eq!(
-                gaps[0].securable,
-                Securable::Object(ObjectName::new("sys", denied))
-            );
-            assert_eq!(gaps[0].securable(), format!("OBJECT::[sys].[{denied}]"));
-            // Each says what it is read for.
-            let read_for = if denied == "dm_sql_referenced_entities" {
-                "pull, plan --db, verify"
-            } else {
-                "what a rename affects"
-            };
-            assert!(gaps[0].why.contains(read_for), "{}", gaps[0].why);
-            // Not advice: the account is not ready.
-            assert!(advised(&held).is_empty(), "{:?}", advised(&held));
-        }
-        // Negative: holding both, nothing is missing.
+    fn a_denied_dependency_function_is_named_at_that_function() {
+        let mut held = everything(&["dbo"]);
+        held.dependency_functions
+            .insert("dm_sql_referenced_entities", false);
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "SELECT");
+        assert_eq!(
+            gaps[0].securable(),
+            "OBJECT::[sys].[dm_sql_referenced_entities]"
+        );
+        assert!(
+            gaps[0].why.contains("pull, plan --db, verify"),
+            "{}",
+            gaps[0].why
+        );
+        assert!(advised(&held).is_empty(), "{:?}", advised(&held));
+
+        let mut held = everything(&["dbo"]);
+        held.dependency_functions
+            .insert("dm_sql_referencing_entities", false);
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
+        let advice = advised(&held);
+        assert_eq!(advice.len(), 1, "{advice:?}");
+        assert_eq!(
+            advice[0].securable(),
+            "OBJECT::[sys].[dm_sql_referencing_entities]"
+        );
+        assert!(
+            advice[0].why.contains("an apply that renames is refused"),
+            "{}",
+            advice[0].why
+        );
+
+        // Negative: holding both, nothing is missing or advised.
         assert!(missing(&everything(&["dbo"])).is_empty());
+        assert!(advised(&everything(&["dbo"])).is_empty());
     }
 
     /// A function this server's reads do not ask is no gap, denied or not:
@@ -4187,10 +4204,11 @@ mod tests {
         held.dependency_functions
             .remove("dm_sql_referencing_entities");
         assert!(missing(&held).is_empty(), "{:?}", missing(&held));
-        // Negative: asked and denied is.
+        assert!(advised(&held).is_empty(), "{:?}", advised(&held));
+        // Negative: asked and denied is advice.
         held.dependency_functions
             .insert("dm_sql_referencing_entities", false);
-        assert_eq!(missing(&held).len(), 1);
+        assert_eq!(advised(&held).len(), 1);
     }
 
     #[test]

@@ -3599,6 +3599,108 @@ fn computed_function_drops_keep_their_place_when_the_renames_are_searched() {
     ok(&d.run(&["verify", "--db", own.connection()]));
 }
 
+/// #1717: `SELECT` on `sys.dm_sql_referencing_entities` is advice in
+/// `doctor`, because only an apply that renames reads it. Under a `DENY` on it
+/// in `master`, that apply refuses before its first statement, naming the
+/// function and where the deny lives, instead of the engine's re-raised
+/// Msg 229 (DEC-1717.1). The connected plan reads only the other function, so
+/// it plans; with the deny revoked, the same plan applies.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_rename_under_a_denied_referrer_function_is_refused_by_name() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "referrers1717");
+    let login = format!("pbps_flow_referrers_{}", std::process::id());
+    // Not a secret: this login exists for one test inside a throwaway container.
+    let password = "pbpsLeastPrivilege!1";
+    on_server(
+        &server,
+        &format!(
+            "USE master; \
+             IF USER_ID('{login}') IS NOT NULL DROP USER [{login}]; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF; \
+             CREATE USER [{login}] FOR LOGIN [{login}];"
+        ),
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("referrers1717");
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  a: {type: int}\n\
+         primary_key: [id]\n",
+    );
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["bootstrap", "--db", own.connection()]));
+    on_server(
+        own.connection(),
+        &format!(
+            "CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, UPDATE, DELETE, ALTER, REFERENCES \
+                 ON SCHEMA::dbo TO [{login}];"
+        ),
+    );
+    on_server(
+        &server,
+        &format!("USE master; DENY SELECT ON sys.dm_sql_referencing_entities TO [{login}];"),
+    );
+    let as_login = with_key(
+        &with_key(own.connection(), "User Id", &login),
+        "Password",
+        password,
+    );
+
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  b: {type: int}\n\
+         primary_key: [id]\n",
+    );
+    ok(&d.run(&["rename", "dbo.t.a", "b"]));
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    ok(&d.run(&["plan", "--db", &as_login, "--out", plan.to_str().unwrap()]));
+    let checksum = plan_checksum(&plan);
+    let apply = || {
+        d.run(&[
+            "apply",
+            "--db",
+            &as_login,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--allow",
+            "rename",
+        ])
+    };
+    let o = apply();
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    for said in ["sys.dm_sql_referencing_entities", "a DENY there", "master"] {
+        assert!(stderr(&o).contains(said), "{said}: {}", stderr(&o));
+    }
+    assert_eq!(
+        text_on_server(own.connection(), "SELECT COL_NAME(OBJECT_ID('dbo.t'), 2);"),
+        "a",
+        "nothing ran"
+    );
+
+    // Negative: without the deny the same plan applies.
+    on_server(
+        &server,
+        &format!("USE master; REVOKE SELECT ON sys.dm_sql_referencing_entities FROM [{login}];"),
+    );
+    ok(&apply());
+    on_server(
+        &server,
+        &format!("USE master; IF USER_ID('{login}') IS NOT NULL DROP USER [{login}];"),
+    );
+    drop(own);
+    on_server(
+        &server,
+        &format!("IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"),
+    );
+}
+
 /// The connected pass reads "no edge" as none only where no referrer can be
 /// hidden (#1462). A login denied `VIEW DEFINITION` on schema `hidden` does
 /// not see `hidden.t`, whose computed column calls `dbo.f`, so its plan to
