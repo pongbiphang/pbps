@@ -6735,6 +6735,15 @@ pub fn cmd_plan_db(
                 selection,
                 assessment,
             } => {
+                // The cluster this plan was read from: the resolver checks its
+                // own target connection against it (#1685).
+                let identity = match crate::resolution::planning_identity(&mut conn).await {
+                    Ok(identity) => identity,
+                    Err(crate::resolution::Refused::Finding(finding)) => {
+                        return Ok(Connected::Refused { finding, findings });
+                    }
+                    Err(crate::resolution::Refused::Unanswerable(error)) => return Err(error),
+                };
                 let request = crate::resolution::Request {
                     selection,
                     assessment: &assessment,
@@ -6743,6 +6752,7 @@ pub fn cmd_plan_db(
                     base: base_side,
                     desired: desired_side,
                     hints: &hints,
+                    target_identity: identity.as_deref(),
                 };
                 let asked = crate::resolution::named(&assessment);
                 return match crate::resolution::resolve(&request).await {
