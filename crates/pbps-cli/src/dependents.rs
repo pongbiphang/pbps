@@ -1295,72 +1295,101 @@ pub(crate) fn split_new_tables(
 /// change is the parent's to spell (#1546). A parent's own default change is
 /// planned on the parent, and its partitions' own defaults set again after it
 /// by the differ, `DROP DEFAULT` included (DEC-1687.1).
-/// A partition's new index after every one of its parent's, wherever the
-/// passes before left them (DEC-1688.1, #1745 review). A parent's index built
-/// after a partition's own of its shape takes it as its clone. The differ
-/// ranks the parent's first, and the weave restores the parent's first, but
-/// a partition's own index that calls a rebuilt function moves after the
-/// rebuild ahead of the parent's restoration. Moving an index later is
-/// always safe, since nothing in a plan depends on one.
-pub(crate) fn after_their_parents_indexes(cs: &mut ChangeSet, declared: &Schema) {
-    let parent_of = |c: &Change| {
-        let Change::AddIndex { table, index, .. } = c else {
-            return None;
+/// A parent's new index ahead of every partition index it could take as its
+/// clone, wherever the passes before left them (DEC-1688.1, #1745 review).
+/// The differ ranks the parent's first and the weave restores it first, but
+/// a partition's own index that calls a rebuilt function can still come
+/// ahead of the parent's restoration.
+///
+/// The parent's moves, not the partition's: what rests on a partition's
+/// index (a foreign key on a unique one, another index naming it in a
+/// literal) stays where the passes put it, after it, and what rests on the
+/// parent's stays after the parent's too. The parent's index needs only its
+/// table, its columns and the modules its text calls, which the partition's
+/// index of its shape needs as well, so it crosses only changes that create
+/// none of those; anything else between them is refused by name rather
+/// than reordered.
+pub(crate) fn before_its_partitions_indexes(
+    cs: &mut ChangeSet,
+    declared: &Schema,
+) -> Result<(), String> {
+    let adoptable_by = |parent: &TableName, index: &pbps_model::Index, c: &Change| {
+        let Change::AddIndex {
+            table, index: own, ..
+        } = c
+        else {
+            return false;
         };
         declared
             .tables
             .get(table)
             .and_then(|t| t.partition_of.as_ref())
-            .map(|of| (of.parent.clone(), (**index).clone()))
+            .is_some_and(|of| of.parent == *parent)
+            && pbps_diff::schema_diff::adopts(index, own)
     };
-    // Each parent's last index, and the partitions' indexes ahead of it that
-    // a later index of the parent's could take, in the order the passes left
-    // them: moved together, so one that names another in its text still
-    // follows it. Only those: another, a unique one a foreign key later in
-    // the plan rests on, stays ahead of what needs it (#1745 review).
-    let last: BTreeMap<TableName, usize> = cs
-        .changes
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| {
-            let Change::AddIndex { table, .. } = &p.change else {
-                return None;
+    // Changes a parent's index may cross: none creates a table, a column or
+    // a module it could need, and none frees a relation name on the parent,
+    // which may be the one it takes.
+    let crossable = |parent: &TableName, c: &Change| {
+        if let Change::DropIndex { table, .. }
+        | Change::DropUnique { table, .. }
+        | Change::SetPrimaryKey { table, .. } = c
+        {
+            return table != parent;
+        }
+        matches!(
+            c,
+            Change::AddIndex { .. }
+                | Change::SetIndexStorageParameters { .. }
+                | Change::AddUnique { .. }
+                | Change::AddCheck { .. }
+                | Change::DropCheck { .. }
+                | Change::AddForeignKey { .. }
+                | Change::DropForeignKey { .. }
+                | Change::SetReplicaIdentity { .. }
+                | Change::Grant { .. }
+                | Change::Revoke { .. }
+                | Change::PublicExecution { .. }
+        )
+    };
+    // Each move takes a parent's index earlier, and only ahead of a
+    // partition index after it: the passes end.
+    loop {
+        let mut moved = false;
+        for k in 0..cs.changes.len() {
+            let Change::AddIndex {
+                table: parent,
+                index,
+                name,
+                ..
+            } = &cs.changes[k].change
+            else {
+                continue;
             };
-            Some((table.clone(), i))
-        })
-        .collect();
-    let mut held: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (i, p) in cs.changes.iter().enumerate() {
-        let Some((parent, own)) = parent_of(&p.change) else {
-            continue;
-        };
-        let adopted_later = cs.changes[i + 1..].iter().any(|later| {
-            matches!(&later.change, Change::AddIndex { table, index, .. }
-                if *table == parent && pbps_diff::schema_diff::adopts(index, &own))
-        });
-        if adopted_later && let Some(&k) = last.get(&parent) {
-            held.entry(k).or_default().push(i);
-        }
-    }
-    if held.is_empty() {
-        return;
-    }
-    let moving: BTreeSet<usize> = held.values().flatten().copied().collect();
-    let mut taken: Vec<Option<PlannedChange>> = std::mem::take(&mut cs.changes)
-        .into_iter()
-        .map(Some)
-        .collect();
-    for k in 0..taken.len() {
-        if moving.contains(&k) {
-            continue;
-        }
-        if let Some(p) = taken[k].take() {
-            cs.changes.push(p);
-        }
-        for &i in held.get(&k).map_or(&[][..], Vec::as_slice) {
-            if let Some(p) = taken[i].take() {
-                cs.changes.push(p);
+            let Some(first) = cs.changes[..k]
+                .iter()
+                .position(|p| adoptable_by(parent, index, &p.change))
+            else {
+                continue;
+            };
+            if let Some(blocking) = cs.changes[first..k]
+                .iter()
+                .find(|p| !crossable(parent, &p.change))
+            {
+                return Err(format!(
+                    "the index `{name}` on {parent} is built after a partition's own index it \
+                     could take as its clone, and cannot be moved ahead of it past a change to \
+                     {}; make the partition's index and this change in separate plans",
+                    blocking.change.subject()
+                ));
             }
+            let parents = cs.changes.remove(k);
+            cs.changes.insert(first, parents);
+            moved = true;
+            break;
+        }
+        if !moved {
+            return Ok(());
         }
     }
 }
@@ -5194,11 +5223,13 @@ mod tests {
         }
     }
 
-    /// A partition's new index goes after every one of its parent's, wherever
-    /// the passes before left it, partitions' indexes in the order they had
-    /// (#1745 review); one under an unrelated table stays where it is.
+    /// A parent's new index goes ahead of every partition index it could take
+    /// as its clone, wherever the passes before left them (#1745 review).
+    /// The partitions' indexes and what rests on them keep their order: an
+    /// index naming another, a foreign key on a unique one. A change that
+    /// could create what the parent's needs is not crossed: refused by name.
     #[test]
-    fn a_partitions_new_index_follows_its_parents() {
+    fn a_parents_new_index_goes_ahead_of_the_partition_indexes_it_could_take() {
         let (mut s, _) = declared();
         let ev = TableName::new("app", "ev");
         let ev_1 = TableName::new("app", "ev_1");
@@ -5224,59 +5255,88 @@ mod tests {
             },
         );
         s.tables.insert(other.clone(), Table::default());
-        let add = |table: &TableName, name: &str| Change::AddIndex {
+        let add = |table: &TableName, name: &str, column: &str, unique: bool| Change::AddIndex {
             table: table.clone(),
             name: name.into(),
             index: Box::new(pbps_model::Index {
-                columns: vec![pbps_model::IndexColumn::column("k")],
+                columns: vec![pbps_model::IndexColumn::column(column)],
                 include: Vec::new(),
-                unique: false,
+                unique,
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
             }),
             clustered: false,
         };
-        // Two, the second possibly naming the first: their order is kept
-        // (#1745 review).
+        let names = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .map(|p| {
+                    if let Change::AddIndex { name, .. } = &p.change {
+                        name.clone()
+                    } else {
+                        p.change.subject()
+                    }
+                })
+                .collect()
+        };
+        // The adoptable one, a sibling naming it, an unrelated table's: the
+        // parent's goes ahead of the first, the rest keep their order.
         let mut cs = plan(vec![
-            add(&ev_1, "own_a"),
-            add(&ev_1, "own_b"),
-            add(&other, "z"),
-            add(&ev, "ev_k"),
+            add(&ev_1, "own_k", "k", false),
+            add(&ev_1, "own_sibling", "m", false),
+            add(&other, "z", "k", false),
+            add(&ev, "ev_k", "k", false),
         ]);
-        after_their_parents_indexes(&mut cs, &s);
-        let order: Vec<String> = cs
-            .changes
-            .iter()
-            .map(|p| {
-                let Change::AddIndex { name, .. } = &p.change else {
-                    panic!("{:?}", p.change)
-                };
-                name.clone()
-            })
-            .collect();
-        assert_eq!(order, ["z", "ev_k", "own_a", "own_b"]);
-        // Negative: one the parent's could not take, a unique index of
-        // another shape a foreign key may rest on, stays ahead (#1745
-        // review).
-        let mut unique = add(&ev_1, "own_u");
-        if let Change::AddIndex { index, .. } = &mut unique {
-            index.unique = true;
-        }
-        let mut cs = plan(vec![unique, add(&ev, "ev_k")]);
-        let before = cs.clone();
-        after_their_parents_indexes(&mut cs, &s);
-        assert_eq!(cs, before);
-        // Negative: already after it, nothing moves.
+        before_its_partitions_indexes(&mut cs, &s).unwrap();
+        assert_eq!(names(&cs), ["ev_k", "own_k", "own_sibling", "z"]);
+        // Negative: a unique one the parent's could not take, and the foreign
+        // key on it, stay as they are.
+        let fk = Change::AddForeignKey {
+            table: other.clone(),
+            name: "zz_fk".into(),
+            constraint: Box::new(pbps_model::ForeignKey {
+                columns: vec!["k".into()],
+                references_table: ev_1.clone(),
+                references_columns: vec!["k".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            }),
+        };
         let mut cs = plan(vec![
-            add(&ev, "ev_k"),
-            add(&ev_1, "own_b"),
-            add(&ev_1, "own_a"),
+            add(&ev_1, "own_u", "k", true),
+            fk,
+            add(&ev, "ev_k", "k", false),
         ]);
         let before = cs.clone();
-        after_their_parents_indexes(&mut cs, &s);
+        before_its_partitions_indexes(&mut cs, &s).unwrap();
         assert_eq!(cs, before);
+        // Negative: already ahead, nothing moves.
+        let mut cs = plan(vec![
+            add(&ev, "ev_k", "k", false),
+            add(&ev_1, "own_k", "k", false),
+        ]);
+        let before = cs.clone();
+        before_its_partitions_indexes(&mut cs, &s).unwrap();
+        assert_eq!(cs, before);
+        // A module between them is not crossed.
+        let mut cs = plan(vec![
+            add(&ev_1, "own_k", "k", false),
+            alter(&s, "app.f(integer)"),
+            add(&ev, "ev_k", "k", false),
+        ]);
+        let why = before_its_partitions_indexes(&mut cs, &s).expect_err("refused");
+        assert!(why.contains("index `ev_k` on app.ev"), "{why}");
+        // Nor a drop that frees a name on the parent, the one it takes.
+        let mut cs = plan(vec![
+            add(&ev_1, "own_k", "k", false),
+            Change::DropIndex {
+                table: ev.clone(),
+                name: "ev_k".into(),
+            },
+            add(&ev, "ev_k", "k", false),
+        ]);
+        before_its_partitions_indexes(&mut cs, &s).expect_err("refused");
     }
 
     #[test]

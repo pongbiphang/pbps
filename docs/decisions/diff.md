@@ -4306,10 +4306,17 @@ Two consequences, both from the #1745 review:
   is the two plans DEC-1687.1 already asks for. An attach needs nothing: the
   table's check is its own until the attach and the parent's after
   (DEC-1545.1, #1642 review). A partition dropped goes with its copy.
-- **A partition's new index goes after its parent's.** It is the last
-  reordering of `plan --db`: a partition's new own index that calls the
-  rebuilt function moves after the rebuild, but ahead of the parent's
-  restoration, and the parent's would take it.
+- **A parent's new index goes ahead of the partition indexes it could
+  take.** A partition's new own index that calls the rebuilt function moves
+  after the rebuild, but ahead of the parent's restoration, which would then
+  take it as its clone. The last reordering of `plan --db` moves the
+  parent's index, not the partition's: what rests on a partition's index
+  (a foreign key on a unique one, a sibling naming it in a literal) keeps
+  its place after it, and the parent's index needs nothing the partition's
+  index of its shape does not. It crosses only changes that create no
+  table, column or module and free no relation name on the parent; anything else between
+  them is refused by name. Moving the partition's index instead was tried
+  first, and each fix of what rested on it found another dependent.
 
 Pinned by `a_partitioned_parents_keys_checks_and_foreign_keys_change`, and by
 the CLI's
