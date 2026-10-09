@@ -4312,11 +4312,15 @@ Two consequences, both from the #1745 review:
   take it as its clone. The last reordering of `plan --db` moves the
   parent's index, not the partition's: what rests on a partition's index
   (a foreign key on a unique one, a sibling naming it in a literal) keeps
-  its place after it, and the parent's index needs nothing the partition's
-  index of its shape does not. It crosses only changes that create no
-  table, column or module and free no relation name on the parent; anything else between
-  them is refused by name. Moving the partition's index instead was tried
-  first, and each fix of what rested on it found another dependent.
+  its place after it. The parent's index takes with it what it rests on
+  between them, closed over what those rest on: a relation a literal in its
+  text may name, the key a foreign key references, a drop that may free its
+  name. Read wide, a dependency imagined only moves a change that could
+  have stayed. Moving the partition's index instead was tried first, and
+  each fix of what rested on it found another dependent; the closure is the
+  general form of both directions. Refused by name: a closure that holds a
+  partition index the parent's could take (no order satisfies it), and a
+  change between them that could create a table, a column or a module.
 
 Pinned by `a_partitioned_parents_keys_checks_and_foreign_keys_change`, and by
 the CLI's
