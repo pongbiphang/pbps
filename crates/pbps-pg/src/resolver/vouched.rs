@@ -683,12 +683,12 @@ pub async fn create_schemas(
 }
 
 /// `USAGE` on a schema the run took from roles other than the login, to be
-/// granted back by [`restore_usage`]: the schema, the grantees, and its ACL
-/// as it was.
+/// granted back by [`restore_usage`]: the schema, each grantee with whether
+/// it held the grant option, and its ACL as it was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GivenUp {
     pub schema: String,
-    pub grantees: Vec<String>,
+    pub grantees: Vec<(String, bool)>,
     pub acl: String,
 }
 
@@ -719,7 +719,8 @@ pub async fn revoke_usage(
                         COALESCE(n.nspacl, \
                             pg_catalog.acldefault('n', n.nspowner))::text AS acl, \
                         (SELECT pg_catalog.string_agg(CASE WHEN x.grantee = 0 THEN 'PUBLIC' \
-                                     ELSE pg_catalog.pg_get_userbyid(x.grantee)::text END, \
+                                     ELSE pg_catalog.pg_get_userbyid(x.grantee)::text END \
+                                  || CASE WHEN x.is_grantable THEN '*' ELSE '' END, \
                                   ',' ORDER BY x.grantee) \
                            FROM pg_catalog.aclexplode(COALESCE(n.nspacl, \
                                     pg_catalog.acldefault('n', n.nspowner))) x \
@@ -745,9 +746,19 @@ pub async fn revoke_usage(
                 "schema {schema} is owned by {owner}, whose grants the scratch login cannot give up"
             )));
         }
+        // Only PUBLIC and pg_database_owner, whose names hold no `*`: a
+        // trailing one marks the grant option, which a revoke of USAGE
+        // takes too and the restore must grant back (#1678 review).
         let grantees = row
             .try_get::<&str>("grantees")?
-            .map(|list| list.split(',').map(str::to_owned).collect::<Vec<_>>())
+            .map(|list| {
+                list.split(',')
+                    .map(|entry| match entry.strip_suffix('*') {
+                        Some(name) => (name.to_owned(), true),
+                        None => (entry.to_owned(), false),
+                    })
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         if grantees.is_empty() {
             continue;
@@ -757,7 +768,11 @@ pub async fn revoke_usage(
         let revoked = conn
             .execute(&format!(
                 "REVOKE USAGE ON SCHEMA {quoted} FROM {}",
-                grantees.join(", ")
+                grantees
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ))
             .await;
         conn.execute("SET ROLE NONE").await?;
@@ -781,12 +796,17 @@ pub async fn restore_usage(
     for given in given_up {
         let quoted = format!("\"{}\"", given.schema.replace('"', "\"\""));
         conn.execute("SET ROLE pg_database_owner").await?;
-        let granted = conn
-            .execute(&format!(
-                "GRANT USAGE ON SCHEMA {quoted} TO {}",
-                given.grantees.join(", ")
-            ))
-            .await;
+        let mut granted = Ok(());
+        for (name, option) in &given.grantees {
+            if granted.is_ok() {
+                granted = conn
+                    .execute(&format!(
+                        "GRANT USAGE ON SCHEMA {quoted} TO {name}{}",
+                        if *option { " WITH GRANT OPTION" } else { "" }
+                    ))
+                    .await;
+            }
+        }
         conn.execute("SET ROLE NONE").await?;
         granted?;
         let rows = conn
@@ -1014,6 +1034,13 @@ mod tests {
                 // So does initdb's public, reached through PUBLIC and
                 // pg_database_owner, and it is granted back as it was.
                 login.execute("CREATE SCHEMA given_up").await?;
+                // With its grant option made explicit, which a revoke of
+                // USAGE takes too.
+                login.execute("SET ROLE pg_database_owner").await?;
+                login
+                    .execute("GRANT USAGE ON SCHEMA public TO pg_database_owner WITH GRANT OPTION")
+                    .await?;
+                login.execute("SET ROLE NONE").await?;
                 let given = revoke_usage(
                     &mut login,
                     &[

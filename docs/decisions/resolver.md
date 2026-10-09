@@ -1913,9 +1913,10 @@ by the engines, and the scratch account decides the layout.** Implemented by
   - initdb's `public` is the one schema a supplied database holds that the
     login does not own. The login reaches it through `PUBLIC` and its
     membership of `pg_database_owner`. It revokes those as
-    `pg_database_owner`, grants them back at cleanup, and fails the run,
-    named, if the schema's ACL is not then as it was. Measured on 16 and
-    18, the round trip restores the ACL exactly.
+    `pg_database_owner`, grants them back at cleanup, each with the grant
+    option it held, and fails the run, named, if the schema's ACL is not
+    then as it was. Measured on 16 and 18, the round trip restores the ACL
+    exactly.
   - The path read that compares visibility runs before any framing pins
     the string mode, so its literal is the setting-independent `E'…'`
     form. A backslash in a schema name otherwise took the schema off the

@@ -734,7 +734,12 @@ impl Run<'_> {
                         format!(
                             "usage of schema {} by {}, not granted back ({error})",
                             given.schema,
-                            given.grantees.join(", ")
+                            given
+                                .grantees
+                                .iter()
+                                .map(|(name, _)| name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         )
                     })),
                 }
