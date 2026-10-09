@@ -1304,28 +1304,63 @@ pub(crate) fn split_new_tables(
 /// always safe, since nothing in a plan depends on one.
 pub(crate) fn after_their_parents_indexes(cs: &mut ChangeSet, declared: &Schema) {
     let parent_of = |c: &Change| {
-        let Change::AddIndex { table, .. } = c else {
+        let Change::AddIndex { table, index, .. } = c else {
             return None;
         };
         declared
             .tables
             .get(table)
             .and_then(|t| t.partition_of.as_ref())
-            .map(|of| of.parent.clone())
+            .map(|of| (of.parent.clone(), (**index).clone()))
     };
-    let mut i = 0;
-    while i < cs.changes.len() {
-        let last_parents = parent_of(&cs.changes[i].change).and_then(|parent| {
-            cs.changes.iter().rposition(
-                |p| matches!(&p.change, Change::AddIndex { table, .. } if *table == parent),
-            )
+    // Each parent's last index, and the partitions' indexes ahead of it that
+    // a later index of the parent's could take, in the order the passes left
+    // them: moved together, so one that names another in its text still
+    // follows it. Only those: another, a unique one a foreign key later in
+    // the plan rests on, stays ahead of what needs it (#1745 review).
+    let last: BTreeMap<TableName, usize> = cs
+        .changes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let Change::AddIndex { table, .. } = &p.change else {
+                return None;
+            };
+            Some((table.clone(), i))
+        })
+        .collect();
+    let mut held: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, p) in cs.changes.iter().enumerate() {
+        let Some((parent, own)) = parent_of(&p.change) else {
+            continue;
+        };
+        let adopted_later = cs.changes[i + 1..].iter().any(|later| {
+            matches!(&later.change, Change::AddIndex { table, index, .. }
+                if *table == parent && pbps_diff::schema_diff::adopts(index, &own))
         });
-        match last_parents {
-            Some(k) if k > i => {
-                let moved = cs.changes.remove(i);
-                cs.changes.insert(k, moved);
+        if adopted_later && let Some(&k) = last.get(&parent) {
+            held.entry(k).or_default().push(i);
+        }
+    }
+    if held.is_empty() {
+        return;
+    }
+    let moving: BTreeSet<usize> = held.values().flatten().copied().collect();
+    let mut taken: Vec<Option<PlannedChange>> = std::mem::take(&mut cs.changes)
+        .into_iter()
+        .map(Some)
+        .collect();
+    for k in 0..taken.len() {
+        if moving.contains(&k) {
+            continue;
+        }
+        if let Some(p) = taken[k].take() {
+            cs.changes.push(p);
+        }
+        for &i in held.get(&k).map_or(&[][..], Vec::as_slice) {
+            if let Some(p) = taken[i].take() {
+                cs.changes.push(p);
             }
-            _ => i += 1,
         }
     }
 }
@@ -5160,8 +5195,8 @@ mod tests {
     }
 
     /// A partition's new index goes after every one of its parent's, wherever
-    /// the passes before left it (#1745 review); one under an unrelated table
-    /// stays where it is.
+    /// the passes before left it, partitions' indexes in the order they had
+    /// (#1745 review); one under an unrelated table stays where it is.
     #[test]
     fn a_partitions_new_index_follows_its_parents() {
         let (mut s, _) = declared();
@@ -5202,7 +5237,14 @@ mod tests {
             }),
             clustered: false,
         };
-        let mut cs = plan(vec![add(&ev_1, "own"), add(&other, "z"), add(&ev, "ev_k")]);
+        // Two, the second possibly naming the first: their order is kept
+        // (#1745 review).
+        let mut cs = plan(vec![
+            add(&ev_1, "own_a"),
+            add(&ev_1, "own_b"),
+            add(&other, "z"),
+            add(&ev, "ev_k"),
+        ]);
         after_their_parents_indexes(&mut cs, &s);
         let order: Vec<String> = cs
             .changes
@@ -5214,7 +5256,27 @@ mod tests {
                 name.clone()
             })
             .collect();
-        assert_eq!(order, ["z", "ev_k", "own"]);
+        assert_eq!(order, ["z", "ev_k", "own_a", "own_b"]);
+        // Negative: one the parent's could not take, a unique index of
+        // another shape a foreign key may rest on, stays ahead (#1745
+        // review).
+        let mut unique = add(&ev_1, "own_u");
+        if let Change::AddIndex { index, .. } = &mut unique {
+            index.unique = true;
+        }
+        let mut cs = plan(vec![unique, add(&ev, "ev_k")]);
+        let before = cs.clone();
+        after_their_parents_indexes(&mut cs, &s);
+        assert_eq!(cs, before);
+        // Negative: already after it, nothing moves.
+        let mut cs = plan(vec![
+            add(&ev, "ev_k"),
+            add(&ev_1, "own_b"),
+            add(&ev_1, "own_a"),
+        ]);
+        let before = cs.clone();
+        after_their_parents_indexes(&mut cs, &s);
+        assert_eq!(cs, before);
     }
 
     #[test]

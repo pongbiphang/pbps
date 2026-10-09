@@ -3599,7 +3599,7 @@ fn refuse_parent_index(
 /// An expression key or a predicate is a match whatever its text, as the
 /// attach path takes it (DEC-1545.1): the engine compares what each parses
 /// and binds to, so `n+1` and `n + 1` are one index to it (#1737 review).
-fn adopts(parent: &pbps_model::Index, own: &pbps_model::Index) -> bool {
+pub fn adopts(parent: &pbps_model::Index, own: &pbps_model::Index) -> bool {
     parent.method == own.method
         && parent.unique == own.unique
         && parent.filter.is_some() == own.filter.is_some()
