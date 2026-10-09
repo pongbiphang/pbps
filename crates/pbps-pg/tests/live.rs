@@ -2187,6 +2187,16 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             Postgres::new().normalize_type(&ty(spelling)).unwrap()
         );
     }
+    // `RESTRICT` is held since DEC-1633.1: the key is pulled as its own
+    // action, not named as a limitation.
+    let restricted = &pulled.schema.tables[&pbps_model::TableName::new(&s, "restricted")];
+    let held = restricted
+        .foreign_keys
+        .values()
+        .find(|fk| fk.columns == ["oid_"])
+        .expect("the RESTRICT key is pulled");
+    assert_eq!(held.on_delete, pbps_model::ReferentialAction::Restrict);
+    assert_eq!(held.on_update, pbps_model::ReferentialAction::NoAction);
     // This suite's own schema only. `warnings` covers the whole database, so
     // joining all of them lets another session's table — or this suite's own
     // leftovers from a run that crashed before its `DROP SCHEMA` — satisfy an
@@ -2216,8 +2226,6 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "NULLS LAST",
         // A check that has never been checked.
         "NOT VALID",
-        // An action the model has no word for.
-        "RESTRICT",
         // A table of a kind the model does not hold at all — one whose
         // `relkind` says so, and one whose does not.
         "partitioned table",
@@ -2444,12 +2452,8 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "the identity's own sequence, not the one merely owned by the column"
     );
 
-    let restricted = &pulled.schema.tables[&pbps_model::TableName::new(&s, "restricted")];
-    assert!(
-        restricted.foreign_keys.is_empty(),
-        "{:?}",
-        restricted.foreign_keys
-    );
+    // The RESTRICT key is held (checked above); the deferred unique
+    // constraint beside it still is not.
     assert!(
         restricted.unique.is_empty(),
         "a deferrable key is a property of the object, so the object is left out: {:?}",

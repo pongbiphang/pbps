@@ -829,6 +829,17 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                 "foreign key `{n}` names no columns on the referenced table"
             )));
         }
+        // PostgreSQL's action: SQL Server has no `RESTRICT`, and `no_action`
+        // checks later, so it is refused rather than mapped (DEC-1633.1).
+        for (side, action) in [("on_delete", fk.on_delete), ("on_update", fk.on_update)] {
+            if action == pbps_model::ReferentialAction::Restrict {
+                errs.push(invalid(format!(
+                    "foreign key `{n}` is `{side}: restrict`, a PostgreSQL action; SQL Server \
+                     has no RESTRICT, so declare `no_action`, which it checks at the end of the \
+                     statement instead"
+                )));
+            }
+        }
     }
 
     for (n, c) in &table.checks {
@@ -1273,6 +1284,42 @@ mod tests {
             refused.iter().any(|m| m.contains("`replica_identity`")),
             "{refused:?}"
         );
+    }
+
+    /// #1633: `restrict` is PostgreSQL's, and refused on SQL Server on delete
+    /// and on update, each by name, rather than read as `no_action`.
+    #[test]
+    fn a_restrict_foreign_key_action_is_refused_on_sql_server() {
+        use pbps_model::ReferentialAction::{NoAction, Restrict};
+        let keyed = |on_delete, on_update| {
+            let mut table = Table::default();
+            table
+                .columns
+                .insert("a".into(), Column::new("int".parse().unwrap()).not_null());
+            table.foreign_keys.insert(
+                "fk_t".into(),
+                pbps_model::ForeignKey {
+                    columns: vec!["a".into()],
+                    references_table: "dbo.p".parse().unwrap(),
+                    references_columns: vec!["id".into()],
+                    on_delete,
+                    on_update,
+                },
+            );
+            super::table(&"dbo.t".parse().unwrap(), &table)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        let refused = keyed(Restrict, NoAction);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("`on_delete: restrict`"), "{refused:?}");
+        let refused = keyed(NoAction, Restrict);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("`on_update: restrict`"), "{refused:?}");
+        assert_eq!(keyed(Restrict, Restrict).len(), 2);
+        // Negative: `no_action` passes.
+        assert!(keyed(NoAction, NoAction).is_empty());
     }
 
     /// Range partitioning is PostgreSQL's in this model, and refused on SQL

@@ -468,10 +468,12 @@ cannot spell, a virtual generated column (a stored one is held, DEC-1168.1),
 than `btree` and `gin`, a GIN index off `jsonb` or under a class other than
 `jsonb_ops` and `jsonb_path_ops` (GIN over `jsonb` itself is held, DEC-1169.1),
 a GIN index over an expression or an expression key under a non-default class
-or collation (a B-tree expression index is held, DEC-1169.2), a null ordering that is not its direction's default, a `NOT VALID`
-check, and a foreign key whose action is `RESTRICT` — a word `ReferentialAction`
-does not have, and one that is not `NO ACTION` however close it looks
-(DECISIONS 248). A constraint of a kind this reader has never seen is reported
+or collation (a B-tree expression index is held, DEC-1169.2), a null ordering that is not its direction's default, and a `NOT VALID`
+check. A foreign key whose action is `RESTRICT` is held as `restrict`, never as
+`NO ACTION` (DEC-1633.1). Such a key used to be left out of the pull and named.
+A project that declared it as `no_action` now gets a plan that drops the key and
+adds it back as declared, so applying it turns the database's `RESTRICT` into `NO
+ACTION`. To keep `RESTRICT`, declare `restrict` before applying. A constraint of a kind this reader has never seen is reported
 with its own definition rather than folded into the nearest kind it knows; the
 `NOT NULL` rows PostgreSQL 18 added to `pg_constraint` are what that rule is
 for (DECISIONS 247).

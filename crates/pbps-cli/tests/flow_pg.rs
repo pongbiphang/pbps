@@ -9579,6 +9579,82 @@ fn omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload() {
     assert_omitted_modules(&after_role_drop, false);
 }
 
+/// #1633: a foreign key's `RESTRICT` is pulled as `restrict` on delete and
+/// on update, bootstrapped into an empty database, and pulled back the same,
+/// with nothing left to plan. Changing an action between `restrict` and
+/// `no_action` plans, applies, and leaves nothing to plan, and the catalog
+/// then holds the action declared. On 16 and 18 (DEC-1633.1).
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_restrict_foreign_key_round_trips_and_its_actions_change_on_both_servers() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        let source = OwnDatabase::new(server, "restrict_source");
+        on_server(
+            source.connection(),
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.p (id integer PRIMARY KEY); \
+             CREATE TABLE app.c (id integer PRIMARY KEY, p integer CONSTRAINT c_p_fk \
+                 REFERENCES app.p ON DELETE RESTRICT ON UPDATE RESTRICT)",
+        );
+        let d = Demo::new(&format!("restrict-{k}"));
+        let pulled = succeeds(d.run(&["pull", "--db", source.connection()]));
+        assert!(!stderr(&pulled).contains("RESTRICT"), "{}", stderr(&pulled));
+        let file = d.dir.join("schema/app.c.yml");
+        let declared = std::fs::read_to_string(&file).unwrap();
+        assert!(declared.contains("on_delete: restrict"), "{declared}");
+        assert!(declared.contains("on_update: restrict"), "{declared}");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+
+        let target = OwnDatabase::new(server, "restrict_target");
+        let connection = target.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        // Tens for delete, units for update: 1 where the action is `r`,
+        // RESTRICT, and 2 where it is `a`, NO ACTION.
+        let actions = || {
+            scalar(
+                connection,
+                "SELECT ((CASE confdeltype WHEN 'r' THEN 10 WHEN 'a' THEN 20 END) \
+                      + (CASE confupdtype WHEN 'r' THEN 1 WHEN 'a' THEN 2 END))::bigint \
+                 FROM pg_constraint WHERE conname = 'c_p_fk'",
+            )
+        };
+        assert_eq!(actions(), 11);
+        let again = Demo::new(&format!("restrict-again-{k}"));
+        succeeds(again.run(&["pull", "--db", connection]));
+        assert_eq!(
+            std::fs::read_to_string(again.dir.join("schema/app.c.yml")).unwrap(),
+            declared
+        );
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+        // Each side changed in turn, then back.
+        for (on_delete, on_update, wanted) in [
+            ("no_action", "restrict", 21),
+            ("restrict", "no_action", 12),
+            ("restrict", "restrict", 11),
+        ] {
+            let text = declared
+                .replace("on_delete: restrict", &format!("on_delete: {on_delete}"))
+                .replace("on_update: restrict", &format!("on_update: {on_update}"));
+            std::fs::write(&file, text).unwrap();
+            let plan = connected_artifact(&d, connection, false);
+            succeeds(approved_apply(
+                &d,
+                connection,
+                &plan,
+                &["--allow", "constraint"],
+            ));
+            assert_eq!(actions(), wanted, "{on_delete} {on_update}");
+            let next = succeeds(d.run(&["plan", "--db", connection]));
+            assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
 fn permission_versions_are_checked_before_planning_bootstrap_apply_and_resume() {

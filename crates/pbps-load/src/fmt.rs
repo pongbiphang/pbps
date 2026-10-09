@@ -483,6 +483,7 @@ fn action(a: pbps_model::ReferentialAction) -> &'static str {
     use pbps_model::ReferentialAction as R;
     match a {
         R::NoAction => "no_action",
+        R::Restrict => "restrict",
         R::Cascade => "cascade",
         R::SetNull => "set_null",
         R::SetDefault => "set_default",
@@ -908,6 +909,14 @@ indexes:
     unique: true
     where: legacy IS NULL
 "#,
+        );
+    }
+
+    /// #1633: `restrict` is written back as itself on either side.
+    #[test]
+    fn a_restrict_foreign_key_action_round_trips() {
+        round_trip(
+            "table: dbo.t\ncolumns:\n  a: {type: int}\nforeign_keys:\n  fk_p:\n    columns: [a]\n    references: dbo.p(id)\n    on_delete: restrict\n    on_update: restrict\n",
         );
     }
 

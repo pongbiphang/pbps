@@ -22,8 +22,8 @@
 //! object it belongs to is carried anyway, and the line is what the difference
 //! is *about*:
 //!
-//! - **A property of the object itself** — `RESTRICT`, `DEFERRABLE`, a `gin`
-//!   index, an expression index — means the object is **left out**. Carried, it
+//! - **A property of the object itself** — `DEFERRABLE`, a `gin` index, an
+//!   expression index — means the object is **left out**. Carried, it
 //!   would compare equal to one that behaves differently, and a plan would
 //!   report no change while the behaviour stayed wrong. Left out, the plan is
 //!   wrong in the direction that fails loudly on apply, and the warning says
@@ -579,13 +579,15 @@ pub struct RawDefaultAcl {
 
 /// The engine's referential action characters.
 ///
-/// `RESTRICT` has no [`ReferentialAction`] to map onto, and the difference is
-/// not cosmetic: `NO ACTION` is deferrable and checked at the end of the
-/// statement, `RESTRICT` is not. Folding one into the other would let a plan
-/// silently replace a foreign key's behaviour, so it is refused and reported.
+/// `RESTRICT` is held as its own action, never folded into `NO ACTION`: the
+/// difference is not cosmetic. `NO ACTION` is checked at the end of the
+/// statement, or deferred, and `RESTRICT` as each row changes (measured on 16
+/// and 18, DEC-1633.1). A character this function does not know is `None`, and
+/// the key is left out and named rather than read as another action.
 fn referential_action(c: char) -> Option<ReferentialAction> {
     match c {
         'a' => Some(ReferentialAction::NoAction),
+        'r' => Some(ReferentialAction::Restrict),
         'c' => Some(ReferentialAction::Cascade),
         'n' => Some(ReferentialAction::SetNull),
         'd' => Some(ReferentialAction::SetDefault),
@@ -2938,10 +2940,9 @@ fn add_foreign_key(
             pulled,
             &parts.name,
             format!(
-                "foreign key `{}` on `{}` is `ON DELETE {}` `ON UPDATE {}`, and this model holds \
-                 no `RESTRICT`. The difference is not cosmetic -- `NO ACTION` is checked at the \
-                 end of the statement and can be deferred, `RESTRICT` cannot -- so the key is \
-                 left out rather than read back as the action it is not.",
+                "foreign key `{}` on `{}` is `ON DELETE {}` `ON UPDATE {}`, an action this \
+                 model does not know, so the key is left out rather than read back as an action \
+                 it is not.",
                 raw.name,
                 parts.name,
                 action_name(raw.on_delete),
@@ -4903,32 +4904,63 @@ mod tests {
         assert_eq!(only(&pulled).indexes.keys().collect::<Vec<_>>(), ["t_a_ix"]);
     }
 
-    /// `RESTRICT` is not `NO ACTION`: one is checked at the end of the
-    /// statement and can be deferred, the other cannot. The model holds only
-    /// the first, so the key is reported rather than read back as the wrong
-    /// one.
+    /// #1633: `RESTRICT` is held as its own action on delete and on update,
+    /// never read back as `NO ACTION`, which checks later (DEC-1633.1). An
+    /// action character this pull does not know still leaves the key out, and
+    /// names it, rather than reading it as another action.
     #[test]
-    fn a_foreign_key_the_model_cannot_spell_the_action_of_is_left_out_and_named() {
-        let mut fk = constraint(1, "t_fk", 'f');
-        fk.columns = vec![1];
-        fk.ref_columns = vec![1];
-        fk.ref_table = Some(2);
-        fk.on_delete = 'r';
-        fk.definition = "FOREIGN KEY (a) REFERENCES app.other(x) ON DELETE RESTRICT".to_owned();
-        let raw = RawCatalog {
-            tables: vec![table(1, "t"), table(2, "other")],
-            columns: vec![col(1, 1, "a", "integer"), col(2, 1, "x", "integer")],
-            constraints: vec![fk],
-            indexes: Vec::new(),
-            ..RawCatalog::default()
+    fn a_restrict_foreign_key_is_held_and_an_unknown_action_is_left_out_and_named() {
+        let raw = |on_delete: char, on_update: char| {
+            let mut fk = constraint(1, "t_fk", 'f');
+            fk.columns = vec![1];
+            fk.ref_columns = vec![1];
+            fk.ref_table = Some(2);
+            fk.on_delete = on_delete;
+            fk.on_update = on_update;
+            fk.definition = "FOREIGN KEY (a) REFERENCES app.other(x)".to_owned();
+            RawCatalog {
+                tables: vec![table(1, "t"), table(2, "other")],
+                columns: vec![col(1, 1, "a", "integer"), col(2, 1, "x", "integer")],
+                constraints: vec![fk],
+                indexes: Vec::new(),
+                ..RawCatalog::default()
+            }
         };
-        let pulled = assemble(&raw);
+        for (on_delete, on_update, wanted) in [
+            (
+                'r',
+                'a',
+                (ReferentialAction::Restrict, ReferentialAction::NoAction),
+            ),
+            (
+                'a',
+                'r',
+                (ReferentialAction::NoAction, ReferentialAction::Restrict),
+            ),
+            (
+                'r',
+                'r',
+                (ReferentialAction::Restrict, ReferentialAction::Restrict),
+            ),
+        ] {
+            let pulled = assemble(&raw(on_delete, on_update));
+            let fk = &pulled.schema.tables[&TableName::new("app", "t")].foreign_keys["t_fk"];
+            assert_eq!((fk.on_delete, fk.on_update), wanted);
+            assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+        }
+        // Negative: an action character this pull does not know.
+        let pulled = assemble(&raw('z', 'a'));
         assert!(
             pulled.schema.tables[&TableName::new("app", "t")]
                 .foreign_keys
                 .is_empty()
         );
-        assert!(pulled.warnings[0].contains("RESTRICT"));
+        assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
+        assert!(
+            pulled.warnings[0].contains("an action this model does not know"),
+            "{:?}",
+            pulled.warnings
+        );
     }
 
     /// `confkey` names attnums on the **referenced** table, so they are

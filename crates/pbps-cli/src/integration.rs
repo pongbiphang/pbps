@@ -41,13 +41,14 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 34;
+pub const SCHEMA_VERSION: u32 = 35;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
 // 31: a connected plan's `resolver_assessment` (issue #1515).
 // 32: a partition's own `checks:` and `indexes:` under `partitions:` (issue #1577).
 // 33: a partition's own `columns:` defaults and NOT NULLs under `partitions:` (issue #1578).
+// 35: a foreign key's `restrict` action (issue #1633).
 // 26: index, key and unique-constraint `storage_parameters` (issue #1442).
 // 25: a table's `storage_parameters:` (issue #1441).
 // 24: a table's `replica_identity:` (issue #1444).
@@ -879,7 +880,13 @@ mod tests {
     fn the_schema_lists_the_words_the_loader_accepts() {
         let v = schema(SchemaKind::Declaration);
         let actions = serde_json::to_string(&v["$defs"]["ReferentialAction"]).unwrap();
-        for word in ["no_action", "cascade", "set_null", "set_default"] {
+        for word in [
+            "no_action",
+            "restrict",
+            "cascade",
+            "set_null",
+            "set_default",
+        ] {
             assert!(actions.contains(word), "{actions}");
         }
     }
