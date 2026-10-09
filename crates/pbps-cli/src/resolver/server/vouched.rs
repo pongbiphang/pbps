@@ -941,15 +941,19 @@ pub fn declared_standard(declared: Option<&pbps_config::resolver::ScratchStandar
         .iter()
         .map(|(name, value)| (name.to_lowercase(), value.0.clone()))
         .collect();
-    if let Some(comment) = &declared.comment {
-        standard.comment = Some(comment.clone());
+    // The engine removes a comment given as the empty string, so a declared
+    // `""` is read back as no comment and declares exactly that (measured on
+    // 16 and 18, for the database and for `public`).
+    let comment = |comment: &String| Some(comment.clone()).filter(|c| !c.is_empty());
+    if let Some(declared) = &declared.comment {
+        standard.comment = comment(declared);
     }
     if let Some(limit) = declared.connection_limit {
         standard.connection_limit = limit;
     }
     if let Some(public) = &declared.public {
-        if let Some(comment) = &public.comment {
-            standard.public_comment = Some(comment.clone());
+        if let Some(declared) = &public.comment {
+            standard.public_comment = comment(declared);
         }
         standard.public_grants = public
             .grants
@@ -1059,5 +1063,38 @@ mod declared_standard_tests {
         // Negative: nothing declared is the built-in standard, with no
         // settings of its own.
         assert!(declared_standard(None).settings.is_empty());
+    }
+
+    fn declared(standard: &str) -> pbps_pg::resolver::standard::Standard {
+        let config = pbps_config::Config::parse(
+            &format!(
+                "dialect: postgres\nresolvers:\n  s:\n    kind: server\n    url_env: S\n    \
+                 standard: {standard}\n"
+            ),
+            std::path::Path::new("pbps.yml"),
+        )
+        .unwrap();
+        let pbps_config::resolver::ResolverProfile::Server {
+            standard: Some(declared),
+            ..
+        } = &config.resolvers["s"]
+        else {
+            panic!("a server profile with a standard");
+        };
+        declared_standard(Some(declared))
+    }
+
+    /// `COMMENT ... IS ''` removes the comment, so the state read back has
+    /// none: a declared empty comment is declared as none, or every run is
+    /// refused for a comment the engine will never store (#1708 review).
+    #[test]
+    fn a_declared_empty_comment_is_declared_as_none() {
+        let standard = declared(r#"{comment: "", public: {comment: ""}}"#);
+        assert_eq!(standard.comment, None);
+        assert_eq!(standard.public_comment, None);
+        // Negative: a comment with text is kept as written.
+        let standard = declared("{comment: ours, public: {comment: theirs}}");
+        assert_eq!(standard.comment.as_deref(), Some("ours"));
+        assert_eq!(standard.public_comment.as_deref(), Some("theirs"));
     }
 }
