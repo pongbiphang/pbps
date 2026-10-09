@@ -1067,9 +1067,9 @@ Pinned by:
 
 <a id="dec-1704-1"></a>
 
-**DEC-1704.1. `doctor` requires `SELECT` on each per-object dependency function,
-asked of that function from the managed database, and names the gap at the
-function (#1704; amends DEC-1644.1).** DEC-1644.1 moved the reads of `pull`,
+**DEC-1704.1. `doctor` requires `SELECT` on each per-object dependency function
+the server's reads ask, asked of that function from the managed database, and
+names the gap at the function (#1704; amends DEC-1644.1).** DEC-1644.1 moved the reads of `pull`,
 `plan --db` and `verify` onto `sys.dm_sql_referenced_entities` and
 `sys.dm_sql_referencing_entities`, and asked nothing of them because `public`
 holds `SELECT` on both in `master`. A `DENY` there takes it away, and the
@@ -1086,13 +1086,23 @@ login `doctor` called ready then fails those reads with Msg 229.
 
 `GRANT` or `DENY` on either function in any database but `master` is Msg 4629.
 
-**Decision.** Both functions are in `REQUIRED` as `SELECT`
-(`Needed::DependencyFunction`), each asked by `HAS_PERMS_BY_NAME` from the
-managed database and reported at `OBJECT::[sys].[<function>]`. The probe sees
-the `DENY` whichever principal carries it, so no failure-time diagnosis is
-needed. The reason names `master`, the only place the grant can change, and
-says it is missing only where a `DENY` there takes it away: the remedy is to
-remove that `DENY`, not to grant in the managed database.
+**Decision.**
+- Each function is its own entry in `REQUIRED`, `SELECT` with
+  `Needed::DependencyFunction`, asked by `HAS_PERMS_BY_NAME` from the managed
+  database and reported at `OBJECT::[sys].[<function>]`, each with the
+  commands that read it. The probe sees the `DENY` whichever principal carries
+  it, so no failure-time diagnosis is needed.
+- Only where the server's reads ask it (`doctor::dependency_functions_read`).
+  `dm_sql_referenced_entities` everywhere: the pull's module dependencies.
+  `dm_sql_referencing_entities` only where `impact::DependencyRead::for_server`
+  chooses the functions; on SQL Server 2008 to 2012 the rename impact report
+  reads the view (DEC-1644.1), so a `DENY` on it there stops nothing and is no
+  gap. `doctor` never sees a plan, so where the function is read it is asked
+  of every project: a rename is an ordinary change, and `public` holds the
+  grant until someone denies it.
+- The reason names `master`, the only place the grant can change, and says it
+  is missing only where a `DENY` there takes it away: the remedy is to remove
+  that `DENY`, not to grant in the managed database.
 
 **Why not advice, like the view.** The view's `SELECT` decides one kind of
 plan, which is refused by name without it. These decide every pull, plan and
@@ -1101,5 +1111,6 @@ verify, which fail without them.
 Pinned by:
 - `a_denied_dependency_function_is_a_readiness_gap`
   (`crates/pbps-mssql/tests/live.rs`);
-- `a_denied_dependency_function_is_a_gap_named_at_that_function`
+- `a_denied_dependency_function_is_a_gap_named_at_that_function` and
+  `only_the_functions_a_servers_reads_ask_are_required`
   (`crates/pbps-mssql/src/doctor.rs`).

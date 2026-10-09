@@ -2046,9 +2046,9 @@ report names that securable. The four `CREATE` permissions cannot be granted
 below the database, so they are asked for there; `ALTER` and `VIEW DEFINITION`
 are asked for on each **managed** schema. What depends on what is read through
 `sys.dm_sql_referencing_entities` and `sys.dm_sql_referenced_entities`, which
-answer under that schema grant; `SELECT` on each is asked of the function
-itself, held by `public` in `master` and missing only where a `DENY` there
-takes it away (DEC-1704.1). Only the proof that no hidden computed column
+answer under that schema grant; `SELECT` on each one the server's reads ask
+is asked of the function itself, held by `public` in `master` and missing only
+where a `DENY` there takes it away (DEC-1704.1). Only the proof that no hidden computed column
 or module refers to what a connected plan alters or drops reads
 `sys.sql_expression_dependencies`, which returns no row at all without
 database `VIEW DEFINITION`, and whose `SELECT` the engine gives only to
