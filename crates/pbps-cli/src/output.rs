@@ -312,6 +312,45 @@ pub fn or_unanswerable_at<T>(
 /// [`or_unanswerable_at`] replaced, four used `?` and would have done exactly
 /// that; two used `if let Ok`, one used `let _ = emit_json()`. Three spellings
 /// of one decision is how the decision gets made differently by accident.
+/// An error that ends a command after it had gathered warnings, carrying them
+/// to where the command's output is written (#1702).
+///
+/// A step that refuses after it learnt something it could not check printed
+/// that on stderr and then failed, so the JSON envelope written for the
+/// failure held the refusal alone. Carried here instead, the warnings land in
+/// the envelope in JSON mode ([`or_unanswerable`] takes them off the error)
+/// and on stderr before the error in human mode (`main` prints what is still
+/// on it). Its text is the wrapped error's, so the message and every caller
+/// that matches on it are unchanged.
+#[derive(Debug)]
+pub struct Warned {
+    pub warnings: Vec<Finding>,
+    pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for Warned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The top message alone: `{:#}` on the outer error walks `source`
+        // below, which is the wrapped error's own chain.
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for Warned {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+/// `error`, carrying `warnings` when there are any.
+pub fn warned(error: anyhow::Error, warnings: Vec<Finding>) -> anyhow::Error {
+    if warnings.is_empty() {
+        error
+    } else {
+        anyhow::Error::new(Warned { warnings, error })
+    }
+}
+
 pub fn unanswerable(command: &'static str, findings: Vec<Finding>) {
     let report = Report::plain(command, findings).unanswerable();
     if let Ok(text) = serde_json::to_string_pretty(&report) {
@@ -328,9 +367,18 @@ fn or_unanswerable_with<T>(
     match step {
         Ok(v) => Ok(v),
         Err(e) => {
-            if json {
-                unanswerable(command, findings(&e));
+            if !json {
+                return Err(e);
             }
+            // In the envelope, beside the failure; off the error, so `main`
+            // does not print them a second time on stderr (#1702).
+            let (warnings, e) = match e.downcast::<Warned>() {
+                Ok(w) => (w.warnings, w.error),
+                Err(e) => (Vec::new(), e),
+            };
+            let mut all = findings(&e);
+            all.extend(warnings);
+            unanswerable(command, all);
             Err(e)
         }
     }
@@ -368,6 +416,24 @@ pub fn human(findings: &[Finding]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_carrying_warnings_reads_as_the_error_it_wraps() {
+        let inner = anyhow::anyhow!("the cause").context("refused");
+        let plain = format!("{inner:#}");
+        let e = warned(inner, vec![Finding::warning("x.y", "not checked")]);
+        assert_eq!(format!("{e:#}"), plain);
+        assert_eq!(e.to_string(), "refused");
+        let w = e.downcast_ref::<Warned>().expect("carried");
+        assert_eq!(w.warnings.len(), 1);
+    }
+
+    #[test]
+    fn an_error_with_no_warnings_is_not_wrapped() {
+        let e = warned(anyhow::anyhow!("refused"), Vec::new());
+        assert!(e.downcast_ref::<Warned>().is_none());
+        assert_eq!(format!("{e:#}"), "refused");
+    }
 
     #[test]
     fn a_report_with_only_warnings_is_still_ok() {

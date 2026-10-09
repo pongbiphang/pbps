@@ -569,6 +569,13 @@ fn main() {
             }
             std::process::exit(EXIT_FINDING);
         }
+        // What a command learnt before it failed, which no envelope took
+        // (#1702).
+        if let Some(w) = e.downcast_ref::<output::Warned>() {
+            for f in &w.warnings {
+                eprintln!("warning: {}", f.message);
+            }
+        }
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }

@@ -724,3 +724,32 @@ named environment now carries its engine beside the resolution error, and a
 mismatch is reported as in 481, without connecting and with the environment
 replaced by the placeholder. An unknown environment, or no readable project,
 still knows no engine and keeps the file-only behavior.
+
+<a id="dec-1702-1"></a>
+
+**DEC-1702.1. Warnings gathered before a failure ride on its error to the
+envelope (#1702).** A step that learnt something it could not check, then
+refused for something else, printed the warning on stderr and failed, so the
+`--format json` envelope written for the failure held the refusal alone and
+lost the warning SPEC §9.8 keeps in the one report. The error now carries the
+warnings (`output::Warned`), with its text unchanged.
+`output::or_unanswerable` takes them off it into the same envelope in JSON
+mode, and in human mode `main` prints what is still on it as `warning:`
+lines before the error.
+
+- **Not a second return channel.** Returning warnings beside a `Result` would
+  ask every caller between the step and the envelope to thread them through.
+  An error that holds them reaches the envelope through every `?` on the way.
+- **Its text is the wrapped error's.** `Display` shows the wrapped error's top
+  message and `source` continues its chain. So `{:#}`, every message a test
+  matches, and every `downcast` to the wrapped type are as before.
+- **Where it applies.** The partition-default probe's unasked pairs beside a
+  spelling refusal (`refuse_misspelt`). A refusal with no warnings is the
+  plain error, so nothing else changes.
+
+Pinned on 16 and 18 by the CLI's
+`an_unasked_partition_default_stays_in_the_envelope_beside_a_spelling_refusal`:
+one `plan.failed` and one `plan.partition-default-unasked` in the JSON
+envelope with no `warning:` on stderr, and the warning line beside the
+refusal in human output. The carrier's text and its empty case are pinned by
+`output`'s unit tests.
