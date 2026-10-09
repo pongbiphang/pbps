@@ -1011,8 +1011,11 @@ the planning read is several transactions:
 - the declared-rows read;
 - the read-only name and permission checks.
 
-Apply and the ledger writes are further transactions. Each one assumes it
-reaches the cluster the others reached, and nothing in between re-checks.
+An apply spans several transactions too. Its checks under the lock run
+first. One transaction then runs the statements, the closing checks and the
+ledger row together, so that part is atomic; a staged apply instead records
+each statement as it completes. Each transaction assumes it reaches the
+cluster the others reached, and nothing in between re-checks.
 
 So a transaction-pooling proxy that hands one connection's successive
 transactions to different clusters is unsupported, even when the clusters

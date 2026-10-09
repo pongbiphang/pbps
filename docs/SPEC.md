@@ -1332,9 +1332,10 @@ full state.
 | `pbps status` | One screen across environments: last apply, git sha, drift state, last verified (see 9.4) |
 
 A target connection string names one endpoint (DECISIONS 229), and the
-connection must reach one database cluster for its whole life. pbps's own
-reads, checks and writes are separate transactions on it; a proxy that hands
-them to different clusters is unsupported, and ruling one out is the
+connection must reach one database cluster for its whole life. A command spans
+several transactions on it, an apply included, even though an apply's
+statements and its ledger row share one. A proxy that hands those
+transactions to different clusters is unsupported, and ruling one out is the
 operator's (DEC-1720.1).
 
 `pbps pull` is the key to the adoption threshold: every new user's first step is
