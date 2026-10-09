@@ -19672,8 +19672,20 @@ fn parent_keys_flow(server: &str, slug: &str) {
         "  ev_r_max: r < 100\n",
         "  ev_r_max: r < 100\n  ev_f_ck: app.f(r) > 0\n",
     );
+    // With `ev_2024`'s own index of the same shape, built after the
+    // parent's and named to sort after it: dropped around the rebuild, it
+    // must come back after the parent's, or the parent's takes it.
+    edit(
+        &path,
+        "  ev_2024: {from: [\"2024-01-01\"], to: [\"2025-01-01\"]}\n",
+        "  ev_2024:\n    from: [\"2024-01-01\"]\n    to: [\"2025-01-01\"]\n    indexes:\n      \
+         zz_own:\n        keys:\n          - expression: app.f(r)\n",
+    );
     applied("function-backed.json");
     assert_eq!(clones("c"), 6);
+    let own_is_own =
+        || holds("SELECT count(*) FROM pg_inherits WHERE inhrelid = 'app.zz_own'::regclass");
+    assert_eq!(own_is_own(), 0);
     std::fs::write(
         d.dir.join("schema/app.f%28integer%29.function.yml"),
         "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
@@ -19688,6 +19700,16 @@ fn parent_keys_flow(server: &str, slug: &str) {
         1
     );
     assert_eq!(clones("c"), 6);
+    assert_eq!(
+        own_is_own(),
+        0,
+        "the partition's own index is still its own"
+    );
+    edit(
+        &path,
+        "    indexes:\n      zz_own:\n        keys:\n          - expression: app.f(r)\n",
+        "",
+    );
     edit(
         &path,
         "\nindexes:\n  ev_f:\n    keys:\n      - expression: app.f(r)\n",

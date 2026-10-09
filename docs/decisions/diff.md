@@ -4205,7 +4205,10 @@ for a column change (DEC-1687.1).
   after a replica identity naming it. A rank is no edge, and the resolver
   keeps only edges, so its graph carries a structural one from a parent's
   `AddIndex` to each `AddIndex` on its partitions (#1737 review). The
-  dependents' weave keeps the plan's order among what it moves.
+  dependents' weave keeps the plan's order among what it moves. Around a
+  rebuilt function it restores the dependents it takes down itself, in the
+  reverse of the order it takes them, so it takes a parent's index after its
+  partitions' to restore it first (#1745 review).
 - **an index change in a plan that attaches, detaches or drops a partition
   under the parent**, the same two plans a column change takes (DEC-1687.1).
   A detach checks its shape against the parent's indexes as they stood, and

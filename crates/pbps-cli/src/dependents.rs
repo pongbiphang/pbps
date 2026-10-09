@@ -798,6 +798,20 @@ pub(crate) fn weave(
         let Some(deps) = found.get(root) else {
             continue;
         };
+        // A partitioned parent's index last, so that it is restored first:
+        // each restoration is placed right after the module's create, ahead
+        // of the ones placed before it. Built after a partition's own index
+        // of its shape, it would take that as its clone (DEC-1688.1, #1745
+        // review). Nothing depends on an index, so their drops may go in any
+        // order.
+        let parents_index = |d: &&Dependent| {
+            matches!(&d.holds, Holds::TablePart { table, part: Part::Index(_) }
+                if !partitions.of_parent(table).is_empty())
+        };
+        let deps = deps
+            .iter()
+            .filter(|d| !parents_index(d))
+            .chain(deps.iter().filter(parents_index));
         for d in deps {
             // Placed by the drop, after this loop: see `after_its_release`.
             if is_generated(&d.holds) {
