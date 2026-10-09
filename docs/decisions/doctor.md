@@ -1140,10 +1140,12 @@ it was a permission.
   apply that renames is refused without it. The referenced function stays in
   `REQUIRED`.
 - Before the functions' read, `impact::rename_impact_reading` asks
-  `HAS_PERMS_BY_NAME` of both functions, which sees a `DENY` in `master` to
-  the login's user or to `public` (DEC-1704.1), and refuses with
-  `DbError::Refused` naming each one denied, the `DENY` in `master` and the
-  remedy. It runs in the pre-flight before the first statement, as the report
+  `HAS_PERMS_BY_NAME` of the functions that target's read asks, which sees a
+  `DENY` in `master` to the login's user or to `public` (DEC-1704.1), and
+  refuses with `DbError::Refused` naming each one denied, the `DENY` in
+  `master` and the remedy. A table's or module's read asks only the
+  referencing function; a column's asks both. Checking both for every target
+  refused a table rename whose read never asks the denied one. It runs in the pre-flight before the first statement, as the report
   itself does.
 - On SQL Server 2008 to 2012 the report reads the view (DEC-1644.1), so
   neither the check nor the advice asks the referencing function there.

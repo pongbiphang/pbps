@@ -7225,6 +7225,23 @@ async fn a_denied_dependency_function_is_a_readiness_gap() {
         gaps,
         ["SELECT on OBJECT::[sys].[dm_sql_referenced_entities]"]
     );
+    // A table's impact read asks only the referencing function, so it reads;
+    // a column's asks this one too, and refuses naming it (#1717 review).
+    rename_impact(&mut lp, &rename)
+        .await
+        .expect("a table's impact read does not ask the denied function");
+    let refused = rename_impact(&mut lp, &RenameTarget::Column("dbo.t.a".parse().unwrap()))
+        .await
+        .expect_err("a column's impact read asks it")
+        .to_string();
+    assert!(
+        refused.contains("sys.dm_sql_referenced_entities"),
+        "{refused}"
+    );
+    assert!(
+        !refused.contains("sys.dm_sql_referencing_entities"),
+        "{refused}"
+    );
     db.conn
         .execute(&format!(
             "USE master; REVOKE SELECT ON sys.dm_sql_referenced_entities FROM [{login}];"

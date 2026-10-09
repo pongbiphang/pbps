@@ -732,9 +732,9 @@ pub async fn rename_impact(
 /// why pbps asked or where the `DENY` lives. Asked of each function from this
 /// database, which sees a `DENY` in `master` to this login's user or to
 /// `public` (measured on 17.0, DEC-1704.1).
-async fn require_dependency_functions(conn: &mut Conn) -> Result<(), DbError> {
+async fn require_dependency_functions(conn: &mut Conn, functions: &[&str]) -> Result<(), DbError> {
     let mut denied = Vec::new();
-    for function in crate::doctor::DEPENDENCY_FUNCTIONS {
+    for function in functions {
         let held = conn
             .query(&format!(
                 "SELECT HAS_PERMS_BY_NAME(N'sys.{function}', N'OBJECT', N'SELECT') AS held;"
@@ -757,6 +757,17 @@ async fn require_dependency_functions(conn: &mut Conn) -> Result<(), DbError> {
          the DENY in master, or run the rename as a login it does not cover",
         denied.join(" or ")
     )))
+}
+
+/// The dependency functions the functions' read asks for this target:
+/// [`DEPENDENCIES_TABLE`] asks only who refers to the object, and
+/// [`DEPENDENCIES_COLUMN`] also what each referrer reads. Checking both for a
+/// table refused a rename whose read never asks the denied one (#1717 review).
+fn functions_read_for(target: &RenameTarget) -> &'static [&'static str] {
+    match target {
+        RenameTarget::Table(_) | RenameTarget::Module(_) => &["dm_sql_referencing_entities"],
+        RenameTarget::Column(_) => &crate::doctor::DEPENDENCY_FUNCTIONS,
+    }
 }
 
 /// [`rename_impact`] with the read given rather than chosen, so the view's read
@@ -794,7 +805,7 @@ pub async fn rename_impact_reading(
 
     let (by_table, by_column) = match read {
         DependencyRead::Functions => {
-            require_dependency_functions(conn).await?;
+            require_dependency_functions(conn, functions_read_for(target)).await?;
             (DEPENDENCIES_TABLE, DEPENDENCIES_COLUMN)
         }
         DependencyRead::Catalog => {
