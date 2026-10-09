@@ -2711,20 +2711,22 @@ async fn enabled_ddl_event_triggers(conn: &mut Conn) -> Result<Vec<String>, DbEr
 }
 
 /// What a role other than this one or a superuser could make the parse run
-/// as this role: a domain, composite, range or multirange type it owns, or a
-/// schema it can create in, and a domain whose CHECK calls a function or
-/// operator it owns. Ownership is not enough to read alone: between this
+/// as this role: a domain, composite, range or multirange type it owns, a
+/// schema it can create in, this database when it can create a schema in
+/// it, and a domain whose CHECK calls a function or operator it owns. Ownership is not enough to read alone: between this
 /// read and the store, an owner can add a `NOT VALID` CHECK to a domain that
 /// has none, or give its composite or table a column of a new domain, and a
-/// role that can create in a schema can create the type a declared text
-/// names. Each ran the new check through the parse, measured on 16 and 18
-/// (#1706). A role "other" is one neither a superuser nor able to act as
-/// this role; a type or schema counts when such a role can act as its owner
-/// or holds `CREATE` through any role it can act as. Predefined roles act
-/// only through their members, so `pg_database_owner` counts only when the
-/// database's owner is another role. A function a trusted one calls by name
-/// inside its body is not recorded in the catalog and is not seen; that body
-/// is its trusted owner's to write.
+/// role that can create in a schema, or create a schema in this database,
+/// can create the type a declared text names. Each ran the new check through the parse, measured on 16 and 18
+/// (#1706). A role acts as another when it can `SET ROLE` to it or inherits
+/// its privileges; a membership granted with neither lets it do nothing as
+/// that role. A role "other" is one that can act neither as this role nor
+/// as a superuser, and a type or schema counts when such a role can act as
+/// its owner or holds `CREATE` through any role it can act as. Predefined
+/// roles act only through their members, so `pg_database_owner` counts only
+/// when the database's owner is another role. A function a trusted one calls
+/// by name inside its body is not recorded in the catalog and is not seen;
+/// that body is its trusted owner's to write.
 async fn code_other_roles_can_change(conn: &mut Conn) -> Result<Vec<String>, DbError> {
     let rows = conn
         .query(
@@ -2735,11 +2737,17 @@ async fn code_other_roles_can_change(conn: &mut Conn) -> Result<Vec<String>, DbE
                  SELECT r.oid FROM pg_catalog.pg_roles r
                   WHERE r.oid OPERATOR(pg_catalog.>=) 16384::pg_catalog.oid
                     AND NOT r.rolsuper
-                    AND NOT pg_catalog.pg_has_role(r.oid, (SELECT oid FROM me), 'MEMBER')),
+                    AND NOT pg_catalog.pg_has_role(r.oid, (SELECT oid FROM me), 'SET')
+                    AND NOT pg_catalog.pg_has_role(r.oid, (SELECT oid FROM me), 'USAGE')
+                    AND NOT EXISTS (
+                        SELECT FROM pg_catalog.pg_roles su
+                         WHERE su.rolsuper
+                           AND pg_catalog.pg_has_role(r.oid, su.oid, 'SET'))),
              reach AS (
                  SELECT g.oid FROM pg_catalog.pg_roles g
                   WHERE EXISTS (SELECT FROM others o
-                                 WHERE pg_catalog.pg_has_role(o.oid, g.oid, 'MEMBER')))
+                                 WHERE pg_catalog.pg_has_role(o.oid, g.oid, 'SET')
+                                    OR pg_catalog.pg_has_role(o.oid, g.oid, 'USAGE')))
              SELECT pg_catalog.format('type `%I.%I`', n.nspname, t.typname) AS name
                FROM pg_catalog.pg_type t
                JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.typnamespace
@@ -2771,6 +2779,11 @@ async fn code_other_roles_can_change(conn: &mut Conn) -> Result<Vec<String>, DbE
               WHERE NOT pg_catalog.pg_is_other_temp_schema(n.oid)
                 AND EXISTS (SELECT FROM reach g
                              WHERE pg_catalog.has_schema_privilege(g.oid, n.oid, 'CREATE'))
+             UNION
+             SELECT pg_catalog.format('database `%I`', pg_catalog.current_database())
+              WHERE EXISTS (SELECT FROM reach g
+                             WHERE pg_catalog.has_database_privilege(
+                                       g.oid, pg_catalog.current_database(), 'CREATE'))
               ORDER BY 1",
         )
         .await?;

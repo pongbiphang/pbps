@@ -3826,14 +3826,18 @@ read and the store are separate statements, and nothing locks a type
 against `ALTER`. Between them, measured on 16 and 18, the owner of a domain
 with no check can add a `NOT VALID` one, the owner of a composite or a table
 can give it a column of a new domain, and a role that can create in a schema
-can create the type a declared text names; each ran its new check through
+can create the type a declared text names, and a role that can create in
+the database can create that schema first; each ran its new check through
 the parse (#1706). So the read is of what another role could change, not of
-the checks there now. A role is another when it is neither a superuser nor
-able to act as the current role. Before storing anything the probe reads
+the checks there now. A role acts as another when it can `SET ROLE` to it
+or inherits its privileges; a membership granted with neither lets it do
+nothing as that role (#1706). A role is another when it can act neither as
+the current role nor as a superuser. Before storing anything the probe reads
 every domain, composite, range or multirange type whose owner such a role
 can act as, every schema where such a role holds `CREATE` through any role
-it can act as, and every domain whose CHECK calls a function or operator
-such a role owns. Predefined roles act only through their members, so
+it can act as, the database itself when such a role can create a schema
+in it, and every domain whose CHECK calls a function or operator such a
+role owns. Predefined roles act only through their members, so
 `public`, owned by `pg_database_owner`, counts only when the database's
 owner is another role. With any of them, nothing is stored and each pair
 stays unasked with a warning naming them, as under an event trigger
@@ -3859,6 +3863,9 @@ Pinned on 16 and 18 by the CLI's
   table's contents appear nowhere in the output;
 - a domain with no check, a composite and a table another role owns, in a
   schema it can no longer create in, leave the pair unasked with each type
+  named, though that role is a member of the deploying role without `SET`
+  or `INHERIT` (#1706);
+- `CREATE` on the database alone leaves the pair unasked with the database
   named (#1706);
 - without it, and beside a domain the deployer owns that calls only
   built-ins, the pair is asked and refused as the parent's;

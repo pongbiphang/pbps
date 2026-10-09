@@ -20168,10 +20168,15 @@ fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
         // A type another role owns holds no check yet, and no schema lets it
         // create one: it can still add a `NOT VALID` CHECK to its domain, or a
         // column of a new domain to its composite or table, between the read
-        // and the store, so the pair stays unasked all the same (#1706).
+        // and the store, so the pair stays unasked all the same (#1706). A
+        // membership in the deploying role granted without SET or INHERIT
+        // does not make it the deployer.
         on_server(
             &conn,
             "DROP SCHEMA evil CASCADE; CREATE SCHEMA held; \
+             DO $$ BEGIN EXECUTE pg_catalog.format( \
+                 'GRANT %I TO pbps_1663_low WITH INHERIT FALSE, SET FALSE', \
+                 CURRENT_USER); END $$; \
              GRANT CREATE, USAGE ON SCHEMA held TO pbps_1663_low; \
              SET ROLE pbps_1663_low; \
              CREATE DOMAIN held.nc AS integer; \
@@ -20180,7 +20185,7 @@ fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
              RESET ROLE; \
              REVOKE CREATE ON SCHEMA held FROM pbps_1663_low",
         );
-        declare("(1)");
+        declare("(2)");
         let plan = d.dir.join("held.json");
         let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
         let err = stderr(&o);
@@ -20193,11 +20198,33 @@ fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
             stdout(&o)
         );
 
+        // A role that can create a schema in the database can create the type
+        // a declared text names, in a schema no read could have seen (#1706).
+        on_server(
+            &conn,
+            "DROP SCHEMA held CASCADE; \
+             DO $$ BEGIN EXECUTE pg_catalog.format( \
+                 'GRANT CREATE ON DATABASE %I TO pbps_1663_low', \
+                 pg_catalog.current_database()); END $$",
+        );
+        declare("(3)");
+        let plan = d.dir.join("creator.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        let err = stderr(&o);
+        assert!(
+            err.contains("a role other than this one or a superuser can change database `")
+                && err.contains("`, and storing a default can run a check"),
+            "{version}: {}{err}",
+            stdout(&o)
+        );
+
         // Negative: without them, and beside a domain the deployer owns that
         // calls only built-ins, the pair is asked and refused as the parent's.
         on_server(
             &conn,
-            "DROP SCHEMA held CASCADE; \
+            "DO $$ BEGIN EXECUTE pg_catalog.format( \
+                 'REVOKE CREATE ON DATABASE %I FROM pbps_1663_low', \
+                 pg_catalog.current_database()); END $$; \
              CREATE DOMAIN public.pbps_1663_ok AS integer CHECK (VALUE > 0)",
         );
         declare("(1)");
