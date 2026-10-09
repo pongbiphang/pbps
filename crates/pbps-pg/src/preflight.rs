@@ -500,10 +500,15 @@ struct AsStored {
     /// for, so the parent's rows are its own and these tables' together
     /// (DEC-1545.1).
     attached: BTreeMap<TableName, Vec<TableName>>,
+    /// The names this plan takes off a column: the columns it drops, and the
+    /// old name of each it renames. A name among them that the plan gives a
+    /// column again is held by the catalog for another column, so a probe
+    /// spelling it reads the wrong one (DEC-1699.1).
+    vacated: BTreeSet<ColumnRef>,
 }
 
 /// A column this plan adds, as the pre-delete probe needs it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AddedColumn {
     default: Option<String>,
     /// The declared type, which a backfilled literal is compared through:
@@ -595,6 +600,7 @@ impl AsStored {
                     table, from, to, ..
                 } => {
                     this.columns.insert(table.column(to), from.clone());
+                    this.vacated.insert(table.column(from));
                 }
                 Change::CreateTable { name, table, .. } => {
                     this.created.insert(name.clone());
@@ -794,8 +800,10 @@ impl AsStored {
                 Change::AlterColumnExpression { column, .. } => {
                     this.recomputed.insert(column.clone());
                 }
-                Change::DropColumn { .. }
-                | Change::AlterColumnNullability { .. }
+                Change::DropColumn { column, .. } => {
+                    this.vacated.insert(column.clone());
+                }
+                Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
@@ -833,6 +841,72 @@ impl AsStored {
             }
         }
         this
+    }
+
+    /// Gives each partition its parent's column changes as its own.
+    ///
+    /// The engine recurses a parent's `RENAME COLUMN`, `ALTER COLUMN … TYPE`,
+    /// `ADD COLUMN` and `SET EXPRESSION` into every partition, so the rows a
+    /// probe over the partition counts hold the parent's new names, types and
+    /// values when the partition's own check or index is added. The plan
+    /// names those changes by the parent alone, and without this a probe over
+    /// the partition compared stored values the engine has converted, or
+    /// translated a name the parent had moved, and was quietly wrong where a
+    /// plain table's is skipped or translated (DECISIONS 410, DEC-1699.1).
+    fn reach_partitions(&mut self, partitions: &pbps_model::Partitions) {
+        fn reach<V: Clone>(map: &mut BTreeMap<ColumnRef, V>, partitions: &pbps_model::Partitions) {
+            let inherited: Vec<(ColumnRef, V)> = map
+                .iter()
+                .flat_map(|(column, value)| {
+                    partitions
+                        .of_parent(&column.table)
+                        .iter()
+                        .map(|p| (p.column(&column.name), value.clone()))
+                })
+                .collect();
+            for (column, value) in inherited {
+                map.entry(column).or_insert(value);
+            }
+        }
+        reach(&mut self.columns, partitions);
+        reach(&mut self.columns_added, partitions);
+        reach(&mut self.retyped, partitions);
+        reach(&mut self.retyped_from, partitions);
+        reach(&mut self.column_types, partitions);
+        let recomputed: Vec<ColumnRef> = self
+            .recomputed
+            .iter()
+            .flat_map(|c| {
+                partitions
+                    .of_parent(&c.table)
+                    .iter()
+                    .map(|p| p.column(&c.name))
+            })
+            .collect();
+        self.recomputed.extend(recomputed);
+        let vacated: Vec<ColumnRef> = self
+            .vacated
+            .iter()
+            .flat_map(|c| {
+                partitions
+                    .of_parent(&c.table)
+                    .iter()
+                    .map(|p| p.column(&c.name))
+            })
+            .collect();
+        self.vacated.extend(vacated);
+    }
+
+    /// Whether this plan gives one of `table`'s names to another column: a
+    /// rename into a name it drops or renames away, or a column added under
+    /// one. The catalog holds that name for the column leaving it, so a probe
+    /// whose text spells it runs and reads the wrong column, where a name
+    /// that is simply new makes the probe fail and report itself unchecked.
+    fn passes_a_name(&self, table: &TableName) -> bool {
+        self.vacated
+            .iter()
+            .filter(|c| c.table == *table)
+            .any(|c| self.columns.contains_key(c) || self.columns_added.contains_key(c))
     }
 
     /// Whether this plan retypes any column of a table.
@@ -3162,6 +3236,11 @@ fn build(
             ..
         } => {
             let column = table.column(column);
+            // A column the parent adds in this plan is not in the stored
+            // rows, or is there under its name as the column leaving it.
+            if names.columns_added.contains_key(&column) {
+                return Ok(skip(change, "the column is added by this plan", unchecked));
+            }
             match names.column(&column) {
                 Some(stored) => Ok(vec![null_probe(
                     &column,
@@ -3261,6 +3340,13 @@ fn build(
                 || names.retypes_in(table)
             {
                 return Ok(skip(change, "the check predicate cannot be evaluated over planned row writes or retyped columns", unchecked));
+            }
+            if names.passes_a_name(table) {
+                return Ok(skip(
+                    change,
+                    "the check predicate may spell a name this plan gives another column",
+                    unchecked,
+                ));
             }
             let mut sql = format!(
                 // A CHECK rejects a row only when its predicate is FALSE;
@@ -3632,8 +3718,9 @@ fn key_collation_probe(
 ///
 /// A probe that cannot be built is reported as unchecked, keeping it distinct
 /// from a change that needs no data question at all.
-pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
-    let names = AsStored::of(changes);
+pub(crate) fn probes(changes: &ChangeSet, partitions: &pbps_model::Partitions) -> Preflight {
+    let mut names = AsStored::of(changes);
+    names.reach_partitions(partitions);
     let mut out = Vec::new();
     let mut unchecked = Vec::new();
     for p in &changes.changes {
@@ -4147,7 +4234,11 @@ fn skip(change: &Change, reason: &str, unchecked: &mut Vec<Unchecked>) -> Vec<Pr
 mod tests {
     use super::*;
     fn probes(changes: &ChangeSet) -> Vec<Probe> {
-        super::probes(changes).probes
+        preflight(changes).probes
+    }
+    /// The pre-flight with no partitions, as `Dialect::preflight` asks it.
+    fn preflight(changes: &ChangeSet) -> Preflight {
+        super::probes(changes, &pbps_model::Partitions::default())
     }
     use pbps_model::{Change, PlannedChange};
 
@@ -4215,7 +4306,7 @@ mod tests {
             },
         ];
         for constraint in constraints {
-            let report = super::probes(&set(vec![retype.clone(), constraint]));
+            let report = preflight(&set(vec![retype.clone(), constraint]));
             assert!(report.unchecked.is_empty(), "{report:#?}");
             assert!(
                 report
@@ -4296,7 +4387,7 @@ mod tests {
                 expression: "g >= 0".into(),
             },
         };
-        let report = super::probes(&set(vec![
+        let report = preflight(&set(vec![
             recompute.clone(),
             tighten("g"),
             unique("g"),
@@ -4305,20 +4396,20 @@ mod tests {
         assert!(report.probes.is_empty(), "{report:#?}");
         assert_eq!(report.unchecked.len(), 3, "{report:#?}");
         // The same changes with no recomputation are probed as ever.
-        let report = super::probes(&set(vec![tighten("g"), unique("g"), check]));
+        let report = preflight(&set(vec![tighten("g"), unique("g"), check]));
         assert_eq!(report.probes.len(), 3, "{report:#?}");
         assert!(report.unchecked.is_empty(), "{report:#?}");
         // And a key or a tightening over another column of the table is too.
-        let report = super::probes(&set(vec![recompute.clone(), tighten("a"), unique("a")]));
+        let report = preflight(&set(vec![recompute.clone(), tighten("a"), unique("a")]));
         assert_eq!(report.probes.len(), 2, "{report:#?}");
         assert!(report.unchecked.is_empty(), "{report:#?}");
         // A reference row deleted in the same plan is counted against foreign
         // keys the catalog names at run time, which a recomputed column may
         // be part of: unchecked with a recomputation, probed without one.
-        let report = super::probes(&set(vec![recompute, deleting("app.p", "1")]));
+        let report = preflight(&set(vec![recompute, deleting("app.p", "1")]));
         assert!(report.probes.is_empty(), "{report:#?}");
         assert_eq!(report.unchecked.len(), 1, "{report:#?}");
-        let report = super::probes(&set(vec![deleting("app.p", "1")]));
+        let report = preflight(&set(vec![deleting("app.p", "1")]));
         assert!(!report.probes.is_empty(), "{report:#?}");
         assert!(report.unchecked.is_empty(), "{report:#?}");
     }
@@ -4586,7 +4677,7 @@ mod tests {
             ("pre-delete", deleting("app.parent", "old")),
         ];
         for (kind, change) in cases {
-            let report = super::probes(&set(vec![change]));
+            let report = preflight(&set(vec![change]));
             assert!(report.unchecked.is_empty(), "{kind}: {report:#?}");
             let counts: Vec<_> = report
                 .probes
@@ -4621,8 +4712,8 @@ mod tests {
             }
         }
         // Changes without a count question must not gain a synthetic probe.
-        assert!(super::probes(&set(vec![])).probes.is_empty());
-        let relaxed = super::probes(&set(vec![Change::AlterColumnNullability {
+        assert!(preflight(&set(vec![])).probes.is_empty());
+        let relaxed = preflight(&set(vec![Change::AlterColumnNullability {
             uid: "c_aaaaaa".parse().unwrap(),
             column: table.column("v"),
             ty: "integer".parse().unwrap(),
@@ -4707,6 +4798,219 @@ mod tests {
         );
     }
 
+    /// A partition's own check or unique index is probed over the
+    /// partition's stored rows, and its parent's retype or rename reaches
+    /// those rows first: the engine recurses both into every partition. The
+    /// plan names them by the parent alone, so the probe takes them from the
+    /// parent through the relation (DEC-1699.1).
+    #[test]
+    fn a_partitions_probe_takes_its_parents_column_changes_as_its_own() {
+        let parent: TableName = "app.p".parse().expect("a table name");
+        let partition: TableName = "app.p_1".parse().expect("a table name");
+        let mut stored = pbps_model::Schema::default();
+        stored
+            .tables
+            .insert(parent.clone(), pbps_model::Table::default());
+        stored.tables.insert(
+            partition.clone(),
+            pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: parent.clone(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: BTreeMap::new(),
+                }),
+                ..pbps_model::Table::default()
+            },
+        );
+        let partitions = pbps_model::Partitions::of(&stored);
+        let check = Change::AddCheck {
+            table: partition.clone(),
+            name: "p_1_rounded".to_owned(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "v = round(v)".to_owned(),
+            },
+        };
+        let retype = Change::AlterColumnType {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            column: parent.column("v"),
+            from: "numeric(10,2)".parse().expect("a type"),
+            to: "numeric(10,0)".parse().expect("a type"),
+            from_nullable: true,
+            to_nullable: true,
+            from_collation: None,
+            to_collation: None,
+        };
+        let plan = set(vec![retype.clone(), check.clone()]);
+        let told = super::probes(&plan, &partitions);
+        assert!(
+            told.probes.iter().all(|p| !p.sql.contains("v = round(v)")),
+            "the parent's conversion runs first: {told:#?}"
+        );
+        assert!(
+            told.unchecked
+                .iter()
+                .any(|u| format!("{u:?}").contains("retyped")),
+            "{told:#?}"
+        );
+        // Negative: without the relation the probe judges the stored values,
+        // which is what the relation is for; and a check on another table is
+        // still probed beside the parent's retype.
+        assert!(
+            probes(&plan).iter().any(|p| p.sql.contains("v = round(v)")),
+            "the unrelated reading"
+        );
+        let elsewhere = Change::AddCheck {
+            table: "app.t".parse().expect("a table name"),
+            name: "t_rounded".to_owned(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "v = round(v)".to_owned(),
+            },
+        };
+        assert!(
+            super::probes(&set(vec![retype, elsewhere]), &partitions)
+                .probes
+                .iter()
+                .any(|p| p.sql.contains("v = round(v)")),
+            "a plain table's check is still probed"
+        );
+
+        // A unique index on the partition reads its column under the name
+        // the catalog has before the parent's rename runs.
+        let rename = Change::RenameColumn {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            table: parent.clone(),
+            table_was: None,
+            from: "code".to_owned(),
+            to: "label".to_owned(),
+        };
+        let unique = Change::AddIndex {
+            table: partition.clone(),
+            name: "p_1_label".to_owned(),
+            index: Box::new(pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn::column("label")],
+                include: Vec::new(),
+                unique: true,
+                filter: None,
+                method: pbps_model::IndexMethod::default(),
+                storage_parameters: BTreeMap::new(),
+            }),
+            clustered: false,
+        };
+        let renamed = super::probes(&set(vec![rename, unique]), &partitions);
+        assert_eq!(renamed.probes.len(), 1, "{renamed:#?}");
+        let sql = &renamed.probes[0].sql;
+        assert!(sql.contains("\"code\""), "{sql}");
+        assert!(!sql.contains("\"label\""), "{sql}");
+    }
+
+    /// A name this plan takes off one column and gives another is held by
+    /// the catalog for the column leaving it, so a probe whose text spells
+    /// it would read that column: a check is then unchecked, and so is a
+    /// partition's own NOT NULL on a column its parent adds (DEC-1699.1). A
+    /// name that is only new makes the probe fail by itself, and a check that
+    /// reads the table without a name passing is still probed.
+    #[test]
+    fn a_probe_never_reads_a_name_this_plan_gives_another_column() {
+        let t: TableName = "app.t".parse().expect("a table name");
+        let check = Change::AddCheck {
+            table: t.clone(),
+            name: "t_n".to_owned(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "n > 0".to_owned(),
+            },
+        };
+        let drop = |c: &str| Change::DropColumn {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            column: t.column(c),
+        };
+        let rename = |table: &TableName, from: &str, to: &str| Change::RenameColumn {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            table: table.clone(),
+            table_was: None,
+            from: from.to_owned(),
+            to: to.to_owned(),
+        };
+        let add = |table: &TableName, c: &str| Change::AddColumn {
+            table: table.clone(),
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            name: c.to_owned(),
+            column: Box::new(pbps_model::Column::new("integer".parse().expect("a type"))),
+        };
+        let checked = |changes: Vec<Change>| {
+            preflight(&set(changes))
+                .probes
+                .iter()
+                .any(|p| p.sql.contains("n > 0"))
+        };
+        assert!(!checked(vec![
+            drop("n"),
+            rename(&t, "m", "n"),
+            check.clone()
+        ]));
+        assert!(!checked(vec![
+            rename(&t, "n", "n_old"),
+            add(&t, "n"),
+            check.clone()
+        ]));
+        // Negative: a rename into a new name, a drop alone, and the check
+        // alone are probed as before.
+        assert!(checked(vec![rename(&t, "m", "m2"), check.clone()]));
+        assert!(checked(vec![drop("x"), check.clone()]));
+        assert!(checked(vec![check]));
+
+        // A partition's own NOT NULL on the name its parent re-adds.
+        let parent: TableName = "app.p".parse().expect("a table name");
+        let partition: TableName = "app.p_1".parse().expect("a table name");
+        let mut stored = pbps_model::Schema::default();
+        stored
+            .tables
+            .insert(parent.clone(), pbps_model::Table::default());
+        stored.tables.insert(
+            partition.clone(),
+            pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: parent.clone(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: BTreeMap::new(),
+                }),
+                ..pbps_model::Table::default()
+            },
+        );
+        let partitions = pbps_model::Partitions::of(&stored);
+        let not_null = |c: &str| Change::SetPartitionNotNull {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+            table: partition.clone(),
+            column: c.to_owned(),
+            not_null: true,
+        };
+        let readded = super::probes(
+            &set(vec![
+                rename(&parent, "n", "n_old"),
+                add(&parent, "n"),
+                not_null("n"),
+            ]),
+            &partitions,
+        );
+        assert!(readded.probes.is_empty(), "{readded:#?}");
+        assert!(
+            readded
+                .unchecked
+                .iter()
+                .any(|u| format!("{u:?}").contains("added by this plan")),
+            "{readded:#?}"
+        );
+        // Negative: a NOT NULL on a column the parent keeps is probed.
+        let kept = super::probes(
+            &set(vec![
+                rename(&parent, "n", "n_old"),
+                add(&parent, "n"),
+                not_null("v"),
+            ]),
+            &partitions,
+        );
+        assert_eq!(kept.probes.len(), 1, "{kept:#?}");
+    }
+
     /// A key this plan adds is asked about from the plan alone — and the
     /// hidden-children refusal names the child outright (DECISIONS 336, 345).
     /// A foreign key into a table this plan **creates** with no rows: the
@@ -4753,7 +5057,7 @@ mod tests {
             ])
         };
 
-        let report = super::probes(&created("text"));
+        let report = preflight(&created("text"));
         assert!(report.unchecked.is_empty(), "{report:#?}");
         let orphan = report
             .probes
@@ -4784,7 +5088,7 @@ mod tests {
         // says so here, which is what keeps the comparison out of `text`. In
         // the dialect's normalized spelling, which is the one emitted SQL
         // carries.
-        let report = super::probes(&created("numeric(5,1)"));
+        let report = preflight(&created("numeric(5,1)"));
         let orphan = report
             .probes
             .iter()

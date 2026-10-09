@@ -3216,27 +3216,6 @@ fn refuse_partition_changes(
         .collect();
     // The names the plan takes from a column, by a drop or a rename away,
     // and the name a change gives a column, by an addition or a rename into.
-    let vacated: BTreeSet<(&TableName, &String)> = changes
-        .iter()
-        .filter_map(|c| {
-            if let Change::DropColumn { column, .. } = c {
-                Some((&column.table, &column.name))
-            } else if let Change::RenameColumn { table, from, .. } = c {
-                Some((table, from))
-            } else {
-                None
-            }
-        })
-        .collect();
-    let takes_name = |c: &'_ Change| -> Option<String> {
-        if let Change::RenameColumn { to, .. } = c {
-            Some(to.clone())
-        } else if let Change::AddColumn { name, .. } = c {
-            Some(name.clone())
-        } else {
-            None
-        }
-    };
     // A partition dropped under its parent is a transition too: its rows
     // still stand when the pre-flight probes the parent's column (#1692
     // review).
@@ -3248,26 +3227,6 @@ fn refuse_partition_changes(
         } = change
         {
             moving.entry(parent.clone()).or_default().push(name.clone());
-        }
-    }
-    // Each parent's column names this plan changes in what a probe reads,
-    // a rename's both names. A default or nullability change leaves the
-    // column and its stored values as they are (#1692 review).
-    let mut parents_changing_columns: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
-    for c in changes {
-        if let (Some(name), Some(table)) = (parent_column(c), c.table())
-            && !matches!(
-                c,
-                Change::SetColumnDeprecated { .. }
-                    | Change::AlterColumnDefault { .. }
-                    | Change::AlterColumnNullability { .. }
-            )
-        {
-            let names = parents_changing_columns.entry(table).or_default();
-            names.insert(name);
-            if let Change::RenameColumn { to, .. } = c {
-                names.insert(to);
-            }
         }
     }
     for change in changes {
@@ -3318,66 +3277,6 @@ fn refuse_partition_changes(
                 (standing(base.schema, t) || attaching.contains(t)) && standing(declared.schema, t)
             })
         {
-            // Its own check, or a unique index on columns, is probed over
-            // its stored rows before the plan runs, and its parent's column
-            // change reaches those rows first: a retype converts them, a
-            // rename moves a name to another column. The probe knows the
-            // plan's column changes by table and not which table is whose
-            // partition, so it would test values or columns the engine never
-            // checks, and refuse a valid plan (DECISIONS 410, #1692 review,
-            // until #1699). Two plans keep each probe over the rows it judges.
-            // A plain index constrains nothing and a unique one over an
-            // expression is left unchecked, so neither is probed (#1692
-            // review). What the probe reads: a check's text, or the index's
-            // key columns and predicate. A
-            // changed name found anywhere in it counts, quoted or not, so an
-            // index or check on the partition's other columns alone stays
-            // admitted (#1692 review). A Unicode-escaped identifier
-            // (`U&"\0076"`) can spell any name without its letters, so a
-            // text holding one counts as reading every changed name.
-            let probed: Option<Vec<&str>> = if let Change::AddIndex { index, .. } = change {
-                (index.unique && index.column_keys().is_some()).then(|| {
-                    index
-                        .columns
-                        .iter()
-                        .filter_map(|c| c.key.column())
-                        .chain(index.filter.as_deref())
-                        .collect()
-                })
-            } else if let Change::AddCheck { constraint, .. } = change {
-                Some(vec![constraint.expression.as_str()])
-            } else {
-                None
-            };
-            let reads = |texts: &[&str], name: &str| {
-                let name = name.to_lowercase();
-                let quoted = name.replace('"', "\"\"");
-                texts.iter().any(|text| {
-                    let text = text.to_lowercase();
-                    text.contains(&name) || text.contains(&quoted) || text.contains("u&")
-                })
-            };
-            if let Some(texts) = probed
-                && let Some(t) = change.table()
-                && let Some(of) = declared
-                    .schema
-                    .tables
-                    .get(t)
-                    .and_then(|t| t.partition_of.as_ref())
-                && parents_changing_columns
-                    .get(&of.parent)
-                    .is_some_and(|names| names.iter().any(|name| reads(&texts, name)))
-            {
-                refuse(
-                    t,
-                    format!(
-                        "{} while this plan changes a column of its parent {}; change the \
-                         parent's columns and add the partition's own in separate plans",
-                        change_in_words(change),
-                        of.parent
-                    ),
-                );
-            }
             continue;
         }
         // Before the attach, still the ordinary table's: a key or unique
@@ -3432,27 +3331,6 @@ fn refuse_partition_changes(
                         "{}, an identity column, which a partitioned table's partitions are not \
                          read back with yet (#1681)",
                         change_in_words(change)
-                    ),
-                );
-            } else if let Some(name) = takes_name(change)
-                && vacated.contains(&(table, &name))
-            {
-                // A name passing from one column to another in one plan: the
-                // apply guard builds no undo for a dropped name taken again
-                // (DEC-541.1), and the pre-flight and the guard key the
-                // partitions' probes and carried indexes by the partition's
-                // name, so they would read the column the name left (#1692
-                // review, until #1699).
-                let what = if matches!(change, Change::RenameColumn { .. }) {
-                    format!("rename column `{column}` into `{name}`")
-                } else {
-                    format!("add column `{name}`")
-                };
-                refuse(
-                    table,
-                    format!(
-                        "{what}, a name this plan takes from another column; free the name and \
-                         give it to the other column in separate plans"
                     ),
                 );
             } else if let Some(tables) = moving.get(table)
@@ -6883,19 +6761,19 @@ mod tests {
         let from = |base: &Schema, revisions: &[(&Schema, &[Intent])]| {
             from_outcome(base, revisions).unwrap_or_else(|e| panic!("refused: {e:?}"))
         };
-        let reuse_refused = |errors: Vec<String>, from: &str, to: &str| {
+        // A name passing from one column to another under a partitioned
+        // parent is planned as a plain table's: the pre-flight, the guard and
+        // the connected passes follow the parent's columns into the
+        // partitions (DEC-1699.1), where the interim plan refused it (#1692).
+        let reuse_planned = |outcome: Result<Vec<Change>, Vec<String>>, from: &str, to: &str| {
+            let changes = outcome.unwrap_or_else(|e| panic!("refused: {e:?}"));
             assert!(
-                errors.iter().any(|e| e.contains(&format!(
-                    "rename column `{from}` into `{to}`, a name this plan takes from another \
-                     column; free the name and give it to the other column in separate plans"
-                ))),
-                "{errors:?}"
+                changes.iter().any(|c| matches!(c,
+                    Change::RenameColumn { from: f, to: t, .. } if f == from && t == to)),
+                "{changes:?}"
             );
         };
-        // `n` dropped and `m` renamed into its name: refused by name, since
-        // the apply guard, the pre-flight and the connected passes cannot
-        // follow a dropped name taken again into the partitions yet (#1692
-        // review, #1699).
+        // `n` dropped and `m` renamed into its name.
         let handoff_base = tree(
             parent(),
             &[("m", own_default("7")), ("n", own_default("8"))],
@@ -6919,7 +6797,7 @@ mod tests {
             &[("m", own_default("7"))],
             &[],
         );
-        let refused_handoff = from_outcome(
+        let handed_off = from_outcome(
             &handoff_base,
             &[
                 (
@@ -6942,11 +6820,7 @@ mod tests {
                 ),
             ],
         );
-        reuse_refused(
-            refused_handoff.expect_err("a dropped name reused"),
-            "m",
-            "n",
-        );
+        reuse_planned(handed_off, "m", "n");
         // A retype that drops NOT NULL with it: the partitions' NOT NULLs
         // follow the retype, which carries the parent's change (#1692
         // review).
@@ -6999,8 +6873,7 @@ mod tests {
                 < at(&|c| matches!(c, Change::CreateTable { .. })),
             "{grew:?}"
         );
-        // A non-key column dropped and the key column renamed into its name:
-        // the same refusal, which the key's own checks never reach.
+        // A non-key column dropped and the key column renamed into its name.
         let spare_base = with(
             &|p| {
                 p.columns.insert("spare".into(), Column::new(ty("int")));
@@ -7045,11 +6918,7 @@ mod tests {
                 ),
             ],
         );
-        reuse_refused(
-            swapped.expect_err("the key renamed into a dropped name"),
-            "ts",
-            "spare",
-        );
+        reuse_planned(swapped, "ts", "spare");
         // The key column moved out of `ts` and a non-key column into it,
         // then retyped: the retype is the non-key column's (#1692 review).
         let rename = |p: &mut Table, from: &str, to: &str| {
@@ -7087,8 +6956,7 @@ mod tests {
             from: from.into(),
             to: to.into(),
         };
-        // The key's old name passes to another column: refused like every
-        // name passing hands under a partitioned parent (until #1699).
+        // The key's old name passes to another column.
         let retyped = from_outcome(
             &spare_base,
             &[
@@ -7096,9 +6964,9 @@ mod tests {
                 (&moved_in, &[renaming("spare", "ts")]),
             ],
         );
-        reuse_refused(retyped.expect_err("a name passing hands"), "spare", "ts");
-        // A name renamed away and given to a new column (round 8): a
-        // partition's own NOT NULL probe would read the old column.
+        reuse_planned(retyped, "spare", "ts");
+        // A name renamed away and given to a new column (round 8): the
+        // partition's own NOT NULL probe no longer reads the old column.
         let renamed_away = with(&|p| rename(p, "n", "n_old"), &keep_a, &keep_b);
         let readded = with(
             &|p| {
@@ -7108,17 +6976,13 @@ mod tests {
             &keep_a,
             &keep_b,
         );
-        let errors = from_outcome(
-            &with(&|_| {}, &keep_a, &keep_b),
-            &[(&renamed_away, &[renaming("n", "n_old")]), (&readded, &[])],
-        )
-        .expect_err("a renamed-away name added again");
-        assert!(
-            errors.iter().any(|e| e.contains(
-                "add column `n`, a name this plan takes from another column; free the name and \
-                 give it to the other column in separate plans"
-            )),
-            "{errors:?}"
+        reuse_planned(
+            from_outcome(
+                &with(&|_| {}, &keep_a, &keep_b),
+                &[(&renamed_away, &[renaming("n", "n_old")]), (&readded, &[])],
+            ),
+            "n",
+            "n_old",
         );
         // A partition's own index on the renamed column is carried by the
         // engine's rename, and not dropped and added again (#1692 review).
@@ -7156,16 +7020,17 @@ mod tests {
             matches!(carried.as_slice(), [Change::RenameColumn { .. }]),
             "{carried:?}"
         );
-        // A partition's own check or unique index, probed over its stored
-        // rows, beside a retype of its parent's column that converts them
-        // first: refused by name (DECISIONS 410, #1692 review).
+        // A partition's own check or index beside its parent's change to the
+        // column it reads: planned, the parent's change first. The pre-flight
+        // takes the parent's retype or rename as the partition's own
+        // (DEC-1699.1), where the interim plan refused it (#1692).
         let retype_n = |p: &mut Table| p.columns.get_mut("n").unwrap().ty = ty("bigint");
         let a: TableName = "app.a".parse().unwrap();
-        let own_check = |s: &mut Schema| {
+        let reads = |s: &mut Schema, expression: &str| {
             s.tables.get_mut(&a).unwrap().checks.insert(
                 "a_n".into(),
                 pbps_model::CheckConstraint {
-                    expression: "n > 0".into(),
+                    expression: expression.into(),
                 },
             );
         };
@@ -7179,97 +7044,78 @@ mod tests {
                 .unwrap()
                 .unique = unique;
         };
+        fn index_of<'s>(s: &'s mut Schema, a: &TableName) -> &'s mut pbps_model::Index {
+            s.tables.get_mut(a).unwrap().indexes.get_mut("a_m").unwrap()
+        }
         let mut checked = with(&retype_n, &keep_a, &keep_b);
-        own_check(&mut checked);
+        reads(&mut checked, "n > 0");
+        let mut escaped = with(&retype_n, &keep_a, &keep_b);
+        reads(&mut escaped, r#"U&"\006E" > 0"#);
         let mut unique = with(&retype_n, &keep_a, &keep_b);
         own_unique(&mut unique, true);
-        // A rename moves a name the probe reads to another column (round 7).
+        let mut filtered = with(&retype_n, &keep_a, &keep_b);
+        own_unique(&mut filtered, false);
+        index_of(&mut filtered, &a).filter = Some("n > 0".into());
+        let mut expression = with(&retype_n, &keep_a, &keep_b);
+        own_unique(&mut expression, true);
+        index_of(&mut expression, &a).columns[0].key =
+            pbps_model::IndexKey::Expression("(n + 1)".into());
         let mut renamed_checked = with(
             &|p| rename(p, "m", "m2"),
             &[("m2", own_default("7"))],
             &[("m2", own_not_null.clone())],
         );
-        let reads = |s: &mut Schema, expression: &str| {
-            s.tables.get_mut(&a).unwrap().checks.insert(
-                "a_n".into(),
-                pbps_model::CheckConstraint {
-                    expression: expression.into(),
-                },
-            );
-        };
         reads(&mut renamed_checked, "\"M2\" > 0");
-        // A Unicode-escaped identifier spells `n` without its letter.
-        let mut escaped = with(&retype_n, &keep_a, &keep_b);
-        reads(&mut escaped, r#"U&"\006E" > 0"#);
-        let rename_m = [renaming("m", "m2")];
-        for (declared, intents) in [
-            (&checked, &[][..]),
-            (&escaped, &[][..]),
-            (&unique, &[][..]),
-            (&renamed_checked, &rename_m[..]),
-        ] {
-            let errors = refused(declared, intents);
-            assert!(
-                errors.iter().any(|e| e.contains(
-                    "while this plan changes a column of its parent app.ev; change the parent's \
-                     columns and add the partition's own in separate plans"
-                )),
-                "{errors:?}"
-            );
-        }
-        // Negative: a check or unique index that reads none of the changed
-        // columns is probed over the rows it judges (#1692 review).
-        let mut renamed_other = renamed_checked.clone();
-        reads(&mut renamed_other, "n > 0");
-        planned(&renamed_other, &rename_m);
-        let mut unique_other = with(&retype_n, &keep_a, &keep_b);
-        own_unique(&mut unique_other, true);
-        let ix = unique_other
-            .tables
-            .get_mut(&a)
-            .unwrap()
-            .indexes
-            .get_mut("a_m")
-            .unwrap();
-        ix.columns[0].key = pbps_model::IndexKey::Column("id".into());
-        planned(&unique_other, &[]);
-        // Negative: an index the pre-flight does not probe, a plain filtered
-        // one or a unique one over an expression, on the retyped column
-        // (#1692 review).
-        fn index_of<'s>(s: &'s mut Schema, a: &TableName) -> &'s mut pbps_model::Index {
-            s.tables.get_mut(a).unwrap().indexes.get_mut("a_m").unwrap()
-        }
-        let mut filtered = with(&retype_n, &keep_a, &keep_b);
-        own_unique(&mut filtered, false);
-        index_of(&mut filtered, &a).filter = Some("n > 0".into());
-        planned(&filtered, &[]);
-        // Negative: a default or nullability change of the parent's column
-        // leaves the column and its values as the probe reads them (#1692
-        // review).
-        let mut loosened = with(
-            &|p| p.columns.get_mut("n").unwrap().nullable = true,
-            &keep_a,
-            &keep_b,
-        );
-        own_check(&mut loosened);
-        assert!(
-            planned(&loosened, &[])
-                .iter()
-                .any(|c| matches!(c, Change::AlterColumnNullability { .. })),
-            "the parent's nullability changes"
-        );
         let mut defaulted = with(
             &|p| p.columns.get_mut("n").unwrap().default = Some("5".into()),
             &keep_a,
             &keep_b,
         );
         own_unique(&mut defaulted, true);
-        planned(&defaulted, &[]);
-        let mut expression = with(&retype_n, &keep_a, &keep_b);
-        own_unique(&mut expression, true);
-        index_of(&mut expression, &a).columns[0].key =
-            pbps_model::IndexKey::Expression("(n + 1)".into());
-        planned(&expression, &[]);
+        let mut loosened = with(
+            &|p| p.columns.get_mut("n").unwrap().nullable = true,
+            &keep_a,
+            &keep_b,
+        );
+        reads(&mut loosened, "n > 0");
+        let rename_m = [renaming("m", "m2")];
+        let parents = |c: &Change| {
+            matches!(
+                c,
+                Change::AlterColumnType { .. }
+                    | Change::RenameColumn { .. }
+                    | Change::AlterColumnDefault { .. }
+                    | Change::AlterColumnNullability { .. }
+            )
+        };
+        for (what, declared, intents) in [
+            ("a check on the retyped column", &checked, &[][..]),
+            ("an escaped name", &escaped, &[][..]),
+            ("a unique index", &unique, &[][..]),
+            ("a filtered index", &filtered, &[][..]),
+            ("a unique index over an expression", &expression, &[][..]),
+            (
+                "a check on the renamed column",
+                &renamed_checked,
+                &rename_m[..],
+            ),
+            ("a unique index beside a default", &defaulted, &[][..]),
+            ("a check beside a nullability change", &loosened, &[][..]),
+        ] {
+            let changes = planned(declared, intents);
+            let own = changes
+                .iter()
+                .position(|c| {
+                    matches!(c, Change::AddCheck { table, .. } | Change::AddIndex { table, .. }
+                        if *table == a)
+                })
+                .unwrap_or_else(|| panic!("{what}: {changes:?}"));
+            let parent = changes
+                .iter()
+                .position(parents)
+                .unwrap_or_else(|| panic!("{what}: {changes:?}"));
+            assert!(parent < own, "{what}: {changes:?}");
+        }
         // A partition dropped while its parent's column tightens: the
         // pre-flight would count the doomed partition's rows (round 7).
         let mut dropped_b = with(
@@ -7293,14 +7139,16 @@ mod tests {
                 .any(|e| e.contains("while this plan attaches, detaches or drops app.b")),
             "{errors:?}"
         );
-        // Negative: a plain index is not probed, and a check without the
-        // retype is probed over the rows it judges.
-        let mut plain = with(&retype_n, &keep_a, &keep_b);
-        own_unique(&mut plain, false);
-        planned(&plain, &[]);
+        // Negative: the partition's own check alone is its change alone.
         let mut unretyped = with(&|_| {}, &keep_a, &keep_b);
-        own_check(&mut unretyped);
-        planned(&unretyped, &[]);
+        reads(&mut unretyped, "n > 0");
+        assert!(
+            matches!(
+                planned(&unretyped, &[]).as_slice(),
+                [Change::AddCheck { .. }]
+            ),
+            "the check alone"
+        );
     }
 
     #[test]

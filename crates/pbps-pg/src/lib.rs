@@ -1377,7 +1377,15 @@ impl Dialect for Postgres {
     /// caller reports how many could not be checked rather than counting them
     /// as passes.
     fn preflight(&self, changes: &ChangeSet) -> pbps_dialect::Preflight {
-        preflight::probes(changes)
+        preflight::probes(changes, &pbps_model::Partitions::default())
+    }
+
+    fn preflight_with(
+        &self,
+        changes: &ChangeSet,
+        partitions: &pbps_model::Partitions,
+    ) -> pbps_dialect::Preflight {
+        preflight::probes(changes, partitions)
     }
 
     /// Whether an omitted cell in the read-back *means* at-default for this

@@ -25,8 +25,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
 use pbps_model::{
-    Change, ChangeSet, ColumnRef, IdsFile, ModuleDeps, ModuleId, ModuleKind, PlannedChange, Schema,
-    TableName,
+    Change, ChangeSet, ColumnRef, IdsFile, ModuleDeps, ModuleId, ModuleKind, Partitions,
+    PlannedChange, Schema, TableName,
 };
 use pbps_pg::modules::{Dependent, Holds, Part};
 
@@ -173,18 +173,21 @@ fn span(changes: &[PlannedChange], root: &ModuleId) -> Option<Span> {
 
 /// Whether `change` removes exactly this dependent.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn removes(change: &Change, holds: &Holds) -> bool {
+fn removes(change: &Change, holds: &Holds, partitions: &Partitions) -> bool {
     match (holds, change) {
         (Holds::Module(x), Change::DropModule { id, .. }) => id == x,
         (Holds::TablePart { table, part }, change) => match (part, change) {
             (Part::Check(n), Change::DropCheck { table: t, name }) => t == table && name == n,
             (Part::Index(n), Change::DropIndex { table: t, name }) => t == table && name == n,
+            // On a partition, its parent's too: the engine recurses `DROP
+            // DEFAULT` into every partition, its own default included
+            // (measured on 16 and 18, #1699).
             (
                 Part::Default(c),
                 Change::AlterColumnDefault {
                     column, to: None, ..
                 },
-            ) => column.table == *table && column.name == *c,
+            ) => reaches(&column.table, table, partitions) && column.name == *c,
             // A partition's default goes only when the partition takes
             // neither its own nor its parent's (#1588).
             (
@@ -203,7 +206,7 @@ fn removes(change: &Change, holds: &Holds) -> bool {
             // inside the transaction: the loud outcome, where telling the two
             // apart would mean parsing the expression (DECISIONS 174).
             (Part::Generated(c), Change::AlterColumnExpression { column, .. }) => {
-                column.table == *table && column.name == *c
+                reaches(&column.table, table, partitions) && column.name == *c
             }
             _ => false,
         },
@@ -212,8 +215,12 @@ fn removes(change: &Change, holds: &Holds) -> bool {
 }
 
 /// Whether `change` creates exactly this dependent.
+///
+/// Exact, unlike [`removes`]: a parent's `SET DEFAULT` gives each partition
+/// the parent's default, and a partition's own comes back only through its
+/// own change, which has to be the one placed after the module (#1699).
 #[allow(clippy::wildcard_enum_match_arm)]
-fn restores(change: &Change, holds: &Holds) -> bool {
+fn restores(change: &Change, holds: &Holds, _: &Partitions) -> bool {
     match (holds, change) {
         (Holds::Module(x), Change::CreateModule { id, .. }) => id == x,
         (Holds::TablePart { table, part }, change) => match (part, change) {
@@ -250,7 +257,7 @@ fn restores(change: &Change, holds: &Holds) -> bool {
 /// removal before the module's drop, but a dependent it takes away this way
 /// is one the declarations let go of, not one they fail to hold.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn removes_with_its_owner(change: &Change, holds: &Holds) -> bool {
+fn removes_with_its_owner(change: &Change, holds: &Holds, partitions: &Partitions) -> bool {
     match (holds, change) {
         (Holds::TablePart { table, .. }, Change::DropTable { name, .. }) => name == table,
         (
@@ -259,16 +266,24 @@ fn removes_with_its_owner(change: &Change, holds: &Holds) -> bool {
                 part: Part::Default(c) | Part::Generated(c),
             },
             Change::DropColumn { column, .. },
-        ) => column.table == *table && column.name == *c,
+        ) => reaches(&column.table, table, partitions) && column.name == *c,
         _ => false,
     }
+}
+
+/// Whether a change to a column of `changed` reaches a part of `table`: the
+/// table itself, or the parent of a partition, whose column changes the
+/// engine recurses into every partition. A partition's part names the
+/// partition, and the parent's change names the parent alone (DEC-1699.1).
+fn reaches(changed: &TableName, table: &TableName, partitions: &Partitions) -> bool {
+    changed == table || partitions.parent(table) == Some(changed)
 }
 
 /// Whether `change` edits this dependent in one step that drops and creates
 /// it: a view's `AlterModule`, or a default changed from one expression to
 /// another.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn edits_in_place(change: &Change, holds: &Holds) -> bool {
+fn edits_in_place(change: &Change, holds: &Holds, _: &Partitions) -> bool {
     match (holds, change) {
         (Holds::Module(x), Change::AlterModule { id, .. }) => id == x,
         (
@@ -307,8 +322,13 @@ fn edits_in_place(change: &Change, holds: &Holds) -> bool {
 /// of the module: a view's `AlterModule` is one step that drops and creates,
 /// and a default changed from one expression to another is one statement.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn split_in_place_edit(changes: &mut Vec<PlannedChange>, holds: &Holds, dialect: &dyn Dialect) {
-    let Some(i) = find(changes, holds, edits_in_place) else {
+fn split_in_place_edit(
+    changes: &mut Vec<PlannedChange>,
+    holds: &Holds,
+    partitions: &Partitions,
+    dialect: &dyn Dialect,
+) {
+    let Some(i) = find(changes, holds, partitions, edits_in_place) else {
         return;
     };
     let (removal, restoration) = match changes[i].change.clone() {
@@ -388,7 +408,7 @@ fn planned(change: Change, dialect: &dyn Dialect) -> PlannedChange {
 /// has two names in one plan, and each change must be matched, and each
 /// synthesized one written, with the name that holds at its own position.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn named_at(changes: &[PlannedChange], i: usize, holds: &Holds) -> Holds {
+fn named_at(changes: &[PlannedChange], i: usize, holds: &Holds, partitions: &Partitions) -> Holds {
     let Holds::TablePart { table, part } = holds else {
         return holds.clone();
     };
@@ -396,9 +416,10 @@ fn named_at(changes: &[PlannedChange], i: usize, holds: &Holds) -> Holds {
     for p in &changes[..i] {
         match &p.change {
             Change::RenameTable { from, to, .. } if *from == table => table = to.clone(),
+            // A partition's column is renamed with its parent's (#1699).
             Change::RenameColumn {
                 table: t, from, to, ..
-            } if *t == table => {
+            } if reaches(t, &table, partitions) => {
                 if let Part::Default(c) | Part::Generated(c) = &mut part
                     && c == from
                 {
@@ -415,8 +436,13 @@ fn named_at(changes: &[PlannedChange], i: usize, holds: &Holds) -> Holds {
 /// does: the name that holds where the change is being moved to. A removal
 /// the differ put after a rename, moved before the module's drop, may land
 /// before that rename, where the table still has its old name.
+///
+/// A parent's change that reaches a partition's part keeps the parent's
+/// table: it is the parent's statement, which the engine recurses, and the
+/// partition's name in it would change the partition alone (#1699). Only its
+/// column follows the rename.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
+fn respell(p: &mut PlannedChange, holds: &Holds, partitions: &Partitions, dialect: &dyn Dialect) {
     let Holds::TablePart { table, part } = holds else {
         return;
     };
@@ -429,7 +455,21 @@ fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
             _,
         ) => *t = table.clone(),
         (Change::AlterColumnDefault { column, .. }, Part::Default(c)) => {
-            *column = ColumnRef::new(table.clone(), c.clone());
+            let owner = match partitions.parent(table) {
+                Some(parent) if *parent == column.table => parent.clone(),
+                _ => table.clone(),
+            };
+            *column = ColumnRef::new(owner, c.clone());
+        }
+        // A partition's, named by its parent's column as that holds there.
+        (
+            Change::SetPartitionDefault {
+                table: t, column, ..
+            },
+            Part::Default(c),
+        ) => {
+            *t = table.clone();
+            *column = c.clone();
         }
         _ => return,
     }
@@ -441,17 +481,24 @@ fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
 fn find(
     changes: &[PlannedChange],
     holds: &Holds,
-    test: fn(&Change, &Holds) -> bool,
+    partitions: &Partitions,
+    test: fn(&Change, &Holds, &Partitions) -> bool,
 ) -> Option<usize> {
-    (0..changes.len()).find(|&i| test(&changes[i].change, &named_at(changes, i, holds)))
+    (0..changes.len()).find(|&i| {
+        test(
+            &changes[i].change,
+            &named_at(changes, i, holds, partitions),
+            partitions,
+        )
+    })
 }
 
 /// The dependent under the name the declarations use: after every rename in
 /// the plan.
-fn as_declared(changes: &[PlannedChange], d: &Dependent) -> Dependent {
+fn as_declared(changes: &[PlannedChange], d: &Dependent, partitions: &Partitions) -> Dependent {
     Dependent {
         described: d.described.clone(),
-        holds: named_at(changes, changes.len(), &d.holds),
+        holds: named_at(changes, changes.len(), &d.holds, partitions),
     }
 }
 
@@ -695,123 +742,18 @@ pub(crate) fn weave(
 ) -> Result<usize, String> {
     let roots = dropped_modules(cs);
     let mut refused: Vec<String> = Vec::new();
-    // The column names this plan changes on each partitioned parent, a
-    // rename's both (#1687). A partition's copy of its parent's default, or
-    // its own part on one of them, is a dependent this pass cannot follow
-    // through the parent's change yet: it keys parts by the partition's own
-    // name (#1692 review, #1699). A part on the partition's other columns is
-    // woven as any table's.
-    // A default changed on the parent reaches only the partitions'
-    // defaults, which the engine overwrites; a nullability change reaches
-    // nothing a part reads, so neither counts for a check or an index
-    // (#1692 review).
-    let mut parents_changing: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
-    let mut parents_defaulting: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
-    for p in &cs.changes {
-        let (names, defaults): (Vec<&str>, Vec<&str>) =
-            if let Change::AddColumn { name, .. } = &p.change {
-                (vec![name], Vec::new())
-            } else if let Change::RenameColumn { from, to, .. } = &p.change {
-                (vec![from, to], Vec::new())
-            } else if let Change::DropColumn { column, .. }
-            | Change::AlterColumnType { column, .. } = &p.change
-            {
-                (vec![&column.name], Vec::new())
-            } else if let Change::AlterColumnDefault { column, .. } = &p.change {
-                (Vec::new(), vec![&column.name])
-            } else {
-                (Vec::new(), Vec::new())
-            };
-        if let Some(t) = p.change.table()
-            && declared
-                .tables
-                .get(t)
-                .is_some_and(|t| t.partition_by.is_some())
-        {
-            if !names.is_empty() {
-                parents_changing.entry(t).or_default().extend(names);
-            }
-            if !defaults.is_empty() {
-                parents_defaulting.entry(t).or_default().extend(defaults);
-            }
-        }
-    }
-    // Whether a partition's part reads one of `names`: a default or a
-    // generated column is its column's; a declared check or index is read
-    // whole, a name found anywhere in its text counting, and a
-    // Unicode-escaped identifier (`U&"\0076"`), which can spell any name
-    // without its letters, as every name. A part the partition does not
-    // declare, a clone of its parent's, is taken to.
-    let reads_changed = |table: &pbps_model::Table, part: &Part, names: &BTreeSet<&str>| {
-        let found = |texts: &[&str]| {
-            texts.iter().any(|text| {
-                let text = text.to_lowercase();
-                text.contains("u&")
-                    || names.iter().any(|name| {
-                        let name = name.to_lowercase();
-                        text.contains(&name) || text.contains(&name.replace('"', "\"\""))
-                    })
-            })
-        };
-        match part {
-            Part::Default(column) | Part::Generated(column) => names.contains(column.as_str()),
-            Part::Check(name) => table
-                .checks
-                .get(name)
-                .is_none_or(|check| found(&[check.expression.as_str()])),
-            Part::Index(name) => table.indexes.get(name).is_none_or(|index| {
-                let texts: Vec<&str> = index
-                    .columns
-                    .iter()
-                    .map(|c| match &c.key {
-                        pbps_model::IndexKey::Column(text)
-                        | pbps_model::IndexKey::Expression(text) => text.as_str(),
-                    })
-                    .chain(index.include.iter().map(String::as_str))
-                    .chain(index.filter.as_deref())
-                    .collect();
-                found(&texts)
-            }),
-        }
-    };
+    let partitions = Partitions::of(declared);
     for (root, _) in &roots {
         let Some(deps) = found.get(root) else {
             continue;
         };
-        let under_a_changing_parent: Vec<(&TableName, &TableName)> = deps
-            .iter()
-            .filter_map(|d| match &d.holds {
-                Holds::TablePart { table, part } => {
-                    let t = declared.tables.get(table)?;
-                    let of = t.partition_of.as_ref()?;
-                    let defaulted = matches!(part, Part::Default(column)
-                        if parents_defaulting
-                            .get(&of.parent)
-                            .is_some_and(|names| names.contains(column.as_str())));
-                    let changed = parents_changing
-                        .get(&of.parent)
-                        .is_some_and(|names| reads_changed(t, part, names));
-                    (defaulted || changed).then_some((table, &of.parent))
-                }
-                Holds::Module(_) | Holds::Unrepresentable(_) => None,
-            })
-            .collect();
-        if let Some((partition, parent)) = under_a_changing_parent.first() {
-            refused.push(format!(
-                "`{root}` is dropped or rebuilt, and a part of the partition {partition} depends \
-                 on it while this plan changes the columns of its parent {parent}, which this \
-                 plan cannot follow into the partition yet (#1699). Change {parent}'s columns \
-                 and `{root}` in separate plans"
-            ));
-            continue;
-        }
         let blocked: Vec<Dependent> = deps
             .iter()
             .filter(|d| {
-                let accounted = find(&cs.changes, &d.holds, removes).is_some()
-                    || find(&cs.changes, &d.holds, removes_with_its_owner).is_some();
+                let accounted = find(&cs.changes, &d.holds, &partitions, removes).is_some()
+                    || find(&cs.changes, &d.holds, &partitions, removes_with_its_owner).is_some();
                 matches!(d.holds, Holds::Unrepresentable(_))
-                    || (!as_declared(&cs.changes, d).managed(declared)
+                    || (!as_declared(&cs.changes, d, &partitions).managed(declared)
                         && !accounted
                         && !its_parents_once_attached(&cs.changes, &d.holds))
             })
@@ -835,7 +777,7 @@ pub(crate) fn weave(
             if is_generated(&d.holds) {
                 continue;
             }
-            split_in_place_edit(&mut cs.changes, &d.holds, dialect);
+            split_in_place_edit(&mut cs.changes, &d.holds, &partitions, dialect);
             let Some(at) = span(&cs.changes, root) else {
                 continue;
             };
@@ -848,17 +790,20 @@ pub(crate) fn weave(
             // already removed, and nothing to put back, since the
             // declarations no longer have its owner. A removal synthesized
             // here would name an object that is gone by then.
-            if find(&cs.changes, &d.holds, removes_with_its_owner).is_some_and(|i| i < at.drop_at) {
+            if find(&cs.changes, &d.holds, &partitions, removes_with_its_owner)
+                .is_some_and(|i| i < at.drop_at)
+            {
                 continue;
             }
-            let removal = find(&cs.changes, &d.holds, removes);
+            let removal = find(&cs.changes, &d.holds, &partitions, removes);
             let removed_at = match removal {
                 Some(i) if i < at.drop_at => i,
                 Some(i) => {
                     let mut moved = cs.changes.remove(i);
                     respell(
                         &mut moved,
-                        &named_at(&cs.changes, at.drop_at, &d.holds),
+                        &named_at(&cs.changes, at.drop_at, &d.holds, &partitions),
+                        &partitions,
                         dialect,
                     );
                     cs.changes.insert(at.drop_at, moved);
@@ -869,7 +814,7 @@ pub(crate) fn weave(
                     // after any rename the plan makes ahead of that.
                     let here = Dependent {
                         described: d.described.clone(),
-                        holds: named_at(&cs.changes, at.drop_at, &d.holds),
+                        holds: named_at(&cs.changes, at.drop_at, &d.holds, &partitions),
                     };
                     let change = removal_of(&here, declared, ids)?;
                     cs.changes.insert(at.drop_at, planned(change, dialect));
@@ -881,10 +826,10 @@ pub(crate) fn weave(
             // new table or column, created with it, and not this dependent
             // kept. The old one is removed before the drop above; the new one
             // is its own creation's business.
-            if find(&cs.changes, &d.holds, removes_with_its_owner).is_some() {
+            if find(&cs.changes, &d.holds, &partitions, removes_with_its_owner).is_some() {
                 continue;
             }
-            let kept = as_declared(&cs.changes, d);
+            let kept = as_declared(&cs.changes, d, &partitions);
             if !kept.managed(declared) {
                 continue;
             }
@@ -894,7 +839,7 @@ pub(crate) fn weave(
                 continue;
             };
             let after = at.create_at.unwrap_or(removed_at);
-            let restoration = find(&cs.changes, &d.holds, restores);
+            let restoration = find(&cs.changes, &d.holds, &partitions, restores);
             match restoration {
                 Some(j) if j > after => {}
                 Some(j) => {
@@ -903,7 +848,8 @@ pub(crate) fn weave(
                     let after = if j < after { after - 1 } else { after };
                     respell(
                         &mut moved,
-                        &named_at(&cs.changes, after + 1, &d.holds),
+                        &named_at(&cs.changes, after + 1, &d.holds, &partitions),
+                        &partitions,
                         dialect,
                     );
                     cs.changes.insert(after + 1, moved);
@@ -934,7 +880,12 @@ pub(crate) fn weave(
     for _ in 0..=roots.len() {
         let mut moved = false;
         for (root, _) in &roots {
-            moved |= after_its_release(cs, root, found.get(root).map_or(&[][..], Vec::as_slice));
+            moved |= after_its_release(
+                cs,
+                root,
+                found.get(root).map_or(&[][..], Vec::as_slice),
+                &partitions,
+            );
         }
         if !moved {
             break;
@@ -972,7 +923,12 @@ fn is_generated(holds: &Holds) -> bool {
 /// A module that depends on this one, dropped by the plan, counts as well:
 /// its own drop may have moved after its own releases, and this drop has to
 /// stay behind it. Returns whether the drop moved.
-fn after_its_release(cs: &mut ChangeSet, root: &ModuleId, deps: &[Dependent]) -> bool {
+fn after_its_release(
+    cs: &mut ChangeSet,
+    root: &ModuleId,
+    deps: &[Dependent],
+    partitions: &Partitions,
+) -> bool {
     let Some(at) = span(&cs.changes, root) else {
         return false;
     };
@@ -982,9 +938,9 @@ fn after_its_release(cs: &mut ChangeSet, root: &ModuleId, deps: &[Dependent]) ->
             Holds::TablePart {
                 part: Part::Generated(_),
                 ..
-            } => find(&cs.changes, &d.holds, removes)
-                .or_else(|| find(&cs.changes, &d.holds, removes_with_its_owner)),
-            Holds::Module(_) => find(&cs.changes, &d.holds, removes),
+            } => find(&cs.changes, &d.holds, partitions, removes)
+                .or_else(|| find(&cs.changes, &d.holds, partitions, removes_with_its_owner)),
+            Holds::Module(_) => find(&cs.changes, &d.holds, partitions, removes),
             Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
         })
         .filter(|i| *i > at.drop_at)
@@ -2373,28 +2329,6 @@ fn truncated(mut part: String) -> String {
     part
 }
 
-/// Each partitioned table's partitions, as declared: a column added to the
-/// parent is added to each of them, so what reads a partition reads the
-/// column (#1692 review).
-struct Partitions<'a>(BTreeMap<&'a TableName, Vec<&'a TableName>>);
-
-impl<'a> Partitions<'a> {
-    fn of(declared: &'a pbps_model::Schema) -> Self {
-        let mut map: BTreeMap<&TableName, Vec<&TableName>> = BTreeMap::new();
-        for (name, table) in &declared.tables {
-            if let Some(of) = &table.partition_of {
-                map.entry(&of.parent).or_default().push(name);
-            }
-        }
-        Self(map)
-    }
-
-    /// The table and the partitions it holds a column for.
-    fn holding(&self, table: &'a TableName) -> impl Iterator<Item = &'a TableName> + '_ {
-        std::iter::once(table).chain(self.0.get(table).into_iter().flatten().copied())
-    }
-}
-
 /// Places a column this plan adds whose default or generation expression
 /// names a function the plan creates or rebuilds after that function's
 /// create, and whatever may need the column after the column (DEC-1364.1).
@@ -2826,6 +2760,7 @@ fn touches(change: &Change, table: &TableName) -> bool {
 pub(crate) fn released(
     cs: &ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
+    partitions: &Partitions,
 ) -> BTreeSet<ColumnRef> {
     let mut out = BTreeSet::new();
     for (root, _) in dropped_modules(cs) {
@@ -2839,7 +2774,7 @@ pub(crate) fn released(
             ) {
                 continue;
             }
-            if let Some(i) = find(&cs.changes, &d.holds, removes)
+            if let Some(i) = find(&cs.changes, &d.holds, partitions, removes)
                 && let Change::AlterColumnExpression { column, .. } = &cs.changes[i].change
             {
                 out.insert(column.clone());
@@ -2849,9 +2784,13 @@ pub(crate) fn released(
     out
 }
 
+///
+/// `partitions` is the relation of the schema the plan was made over: a
+/// parent's column change releases its partitions' parts (DEC-1699.1).
 pub(crate) fn unaccounted(
     cs: &ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
+    partitions: &Partitions,
 ) -> Vec<String> {
     let mut out = Vec::new();
     for (root, _) in dropped_modules(cs) {
@@ -2859,8 +2798,8 @@ pub(crate) fn unaccounted(
             continue;
         };
         for d in deps {
-            let removed_first = find(&cs.changes, &d.holds, removes)
-                .or_else(|| find(&cs.changes, &d.holds, removes_with_its_owner))
+            let removed_first = find(&cs.changes, &d.holds, partitions, removes)
+                .or_else(|| find(&cs.changes, &d.holds, partitions, removes_with_its_owner))
                 .is_some_and(|i| i < at.drop_at)
                 || taken_by_its_parent(&cs.changes, &d.holds, at.drop_at);
             if !removed_first {
@@ -4773,7 +4712,7 @@ mod tests {
                 "add app.t own"
             ]
         );
-        assert!(unaccounted(&cs, &found).is_empty());
+        assert!(unaccounted(&cs, &found, &Partitions::default()).is_empty());
         let woven = cs.changes.len();
         weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect("woven again");
         assert_eq!(cs.changes.len(), woven, "a fixed point");
@@ -4789,7 +4728,7 @@ mod tests {
                 .clone(),
         ]);
         assert_eq!(
-            unaccounted(&late, &found),
+            unaccounted(&late, &found, &Partitions::default()),
             [
                 "constraint own on table app.t depends on `app.f(integer)`",
                 "constraint ck on table app.t depends on `app.f(integer)`",
@@ -4802,122 +4741,197 @@ mod tests {
     }
 
     /// A rebuilt function a partition's part depends on, while the plan
-    /// changes its parent's columns: refused by name with the two-plan
-    /// remedy, since this pass keys parts by the partition's own name and
-    /// cannot follow the parent's change into it (#1692 review, #1699). The
-    /// same rebuild without the parent's change, or beside a change of the
-    /// parent's other column, is not this refusal.
+    /// changes its parent's columns. The engine recurses the parent's change
+    /// into the partition, so the parent's `DROP DEFAULT` or drop of the
+    /// column releases the part, and its rename renames the column the part
+    /// is on; the weave takes each through the relation (DEC-1699.1), where
+    /// the interim plan refused them all (#1692).
     #[test]
-    fn a_rebuild_under_a_partition_whose_parent_changes_columns_is_refused_by_name() {
-        let (mut s, ids) = declared();
+    fn a_rebuild_under_a_partition_follows_its_parents_column_changes() {
+        let (mut s, mut ids) = declared();
+        let ev = TableName::new("app", "ev");
+        let ev_1 = TableName::new("app", "ev_1");
         let mut parent = Table::default();
-        parent
-            .columns
-            .insert("m".into(), Column::new("integer".parse().unwrap()));
+        for c in ["k", "m"] {
+            parent
+                .columns
+                .insert(c.into(), Column::new("integer".parse().unwrap()));
+        }
         parent.partition_by = Some(pbps_model::PartitionBy {
-            columns: vec!["m".into()],
+            columns: vec!["k".into()],
         });
-        s.tables.insert(TableName::new("app", "ev"), parent);
-        s.tables.insert(
-            TableName::new("app", "ev_1"),
-            Table {
-                partition_of: Some(pbps_model::PartitionOf {
-                    parent: TableName::new("app", "ev"),
-                    bound: pbps_model::PartitionBound::Default,
-                    columns: Default::default(),
-                }),
-                ..Table::default()
-            },
-        );
-        let found = BTreeMap::from([(
-            id("app.f(integer)"),
-            vec![Dependent {
-                described: "default value for column m of table app.ev_1".into(),
-                holds: Holds::TablePart {
-                    table: TableName::new("app", "ev_1"),
-                    part: Part::Default("m".into()),
-                },
-            }],
-        )]);
-        let default_change = Change::AlterColumnDefault {
+        s.tables.insert(ev.clone(), parent);
+        let partition = |own: &[(&str, &str)]| Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: ev.clone(),
+                bound: pbps_model::PartitionBound::Default,
+                columns: own
+                    .iter()
+                    .map(|(c, d)| {
+                        (
+                            (*c).to_owned(),
+                            pbps_model::PartitionColumn {
+                                default: Some((*d).to_owned()),
+                                not_null: false,
+                            },
+                        )
+                    })
+                    .collect(),
+            }),
+            ..Table::default()
+        };
+        s.tables.insert(ev_1.clone(), partition(&[]));
+        ids.tables
+            .insert(Uid::derived(UidKind::Table, "app.ev_1", 0), ev_1.clone());
+        let on_m = |column: &str| {
+            BTreeMap::from([(
+                id("app.f(integer)"),
+                vec![Dependent {
+                    described: format!("default value for column {column} of table app.ev_1"),
+                    holds: Holds::TablePart {
+                        table: ev_1.clone(),
+                        part: Part::Default(column.into()),
+                    },
+                }],
+            )])
+        };
+        let found = on_m("m");
+        let partitions = Partitions::of(&s);
+
+        // The parent's default released: its `DROP DEFAULT` takes the
+        // partition's copy, before the rebuild, and nothing comes back.
+        let released = Change::AlterColumnDefault {
             uid: "c_a1b2c3".parse().unwrap(),
-            column: pbps_model::ColumnRef::new(TableName::new("app", "ev"), "m"),
+            column: ColumnRef::new(ev.clone(), "m"),
             from: Some("app.f(1)".into()),
             to: None,
         };
-        let mut cs = plan(vec![default_change, alter(&s, "app.f(integer)")]);
-        let e = weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect_err("refused");
-        assert!(
-            e.contains("while this plan changes the columns of its parent app.ev")
-                && e.contains("Change app.ev's columns and `app.f(integer)` in separate plans"),
-            "{e}"
+        let mut cs = plan(vec![alter(&s, "app.f(integer)"), released.clone()]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect("woven");
+        assert_eq!(
+            rendered(&cs),
+            ["default m -> None", "alter app.f(integer)"],
+            "the parent's release, moved before the rebuild"
         );
-        // Negative: a change of the parent's other column leaves the
-        // partition's default on `m` to the weave (#1692 review).
-        let other_column = Change::AlterColumnDefault {
+        assert!(unaccounted(&cs, &found, &partitions).is_empty());
+        // Negative: without the relation the partition's copy is unaccounted
+        // for, which is what the interim refusal stood in for.
+        assert!(!unaccounted(&cs, &found, &Partitions::default()).is_empty());
+        // And the parent's statement stays the parent's: the partition's
+        // name in it would drop the partition's default alone.
+        assert!(
+            matches!(&cs.changes[0].change, Change::AlterColumnDefault { column, .. }
+                if column.table == ev),
+            "{:?}",
+            cs.changes[0].change
+        );
+
+        // The parent's column renamed: the partition's own default on it is
+        // taken off under the name that holds before the rename, and put back
+        // under the one after it.
+        let mut renamed = s.clone();
+        {
+            let p = renamed.tables.get_mut(&ev).unwrap();
+            let m = p.columns.shift_remove("m").unwrap();
+            p.columns.insert("m2".into(), m);
+        }
+        renamed
+            .tables
+            .insert(ev_1.clone(), partition(&[("m2", "app.f(2)")]));
+        let rename = Change::RenameColumn {
             uid: "c_d4e5f6".parse().unwrap(),
-            column: pbps_model::ColumnRef::new(TableName::new("app", "ev"), "k"),
+            table: ev.clone(),
+            table_was: None,
+            from: "m".into(),
+            to: "m2".into(),
+        };
+        for (order, expected) in [
+            (
+                vec![alter(&renamed, "app.f(integer)"), rename.clone()],
+                [
+                    "default ev_1.m -> None else None",
+                    "alter app.f(integer)",
+                    "default ev_1.m2 -> Some(\"app.f(2)\") else None",
+                ],
+            ),
+            (
+                vec![rename.clone(), alter(&renamed, "app.f(integer)")],
+                [
+                    "default ev_1.m2 -> None else None",
+                    "alter app.f(integer)",
+                    "default ev_1.m2 -> Some(\"app.f(2)\") else None",
+                ],
+            ),
+        ] {
+            let mut cs = plan(order);
+            weave(&mut cs, &found, &renamed, &[&ids], pg().as_ref()).expect("woven");
+            let woven: Vec<String> = rendered(&cs)
+                .into_iter()
+                .filter(|c| !c.starts_with("RenameColumn"))
+                .collect();
+            assert_eq!(woven, expected, "{:?}", rendered(&cs));
+            assert!(unaccounted(&cs, &found, &Partitions::of(&renamed)).is_empty());
+        }
+
+        // The parent's column dropped: the partition's part goes with it,
+        // and nothing is put back.
+        let mut dropped = s.clone();
+        dropped
+            .tables
+            .get_mut(&ev)
+            .unwrap()
+            .columns
+            .shift_remove("m");
+        let drop = Change::DropColumn {
+            uid: "c_a7b8c9".parse().unwrap(),
+            column: ColumnRef::new(ev.clone(), "m"),
+        };
+        let mut cs = plan(vec![drop.clone(), alter(&dropped, "app.f(integer)")]);
+        weave(&mut cs, &found, &dropped, &[&ids], pg().as_ref()).expect("woven");
+        assert_eq!(
+            rendered(&cs).len(),
+            2,
+            "the drop alone releases it: {:?}",
+            rendered(&cs)
+        );
+        assert!(unaccounted(&cs, &found, &Partitions::of(&dropped)).is_empty());
+
+        // Negative: the parent's change of another column, or of the same
+        // column's nullability, leaves the partition's default to the weave
+        // as any table's: off before the rebuild and back after it.
+        let mut kept = s.clone();
+        kept.tables
+            .insert(ev_1.clone(), partition(&[("m", "app.f(2)")]));
+        let other = Change::AlterColumnDefault {
+            uid: "c_b1c2d3".parse().unwrap(),
+            column: ColumnRef::new(ev.clone(), "k"),
             from: None,
             to: Some("0".into()),
         };
-        let mut other = plan(vec![other_column, alter(&s, "app.f(integer)")]);
-        if let Err(e) = weave(&mut other, &found, &s, &[&ids], pg().as_ref()) {
-            assert!(!e.contains("#1699"), "{e}");
-        }
-        // Negative: the parent's nullability change on `m` reaches nothing
-        // the partition's default reads (#1692 review).
         let nullability = Change::AlterColumnNullability {
-            uid: "c_a7b8c9".parse().unwrap(),
-            column: pbps_model::ColumnRef::new(TableName::new("app", "ev"), "m"),
+            uid: "c_e4f5a6".parse().unwrap(),
+            column: ColumnRef::new(ev.clone(), "m"),
             ty: "integer".parse().unwrap(),
             to_nullable: false,
             collation: None,
         };
-        let mut tightened = plan(vec![nullability, alter(&s, "app.f(integer)")]);
-        if let Err(e) = weave(&mut tightened, &found, &s, &[&ids], pg().as_ref()) {
-            assert!(!e.contains("#1699"), "{e}");
-        }
-        // A partition's own check whose text holds a Unicode-escaped
-        // identifier may read the changed column: refused as one naming it.
-        let mut escaped = s.clone();
-        escaped
-            .tables
-            .get_mut(&TableName::new("app", "ev_1"))
-            .unwrap()
-            .checks
-            .insert(
-                "ck".into(),
-                pbps_model::CheckConstraint {
-                    expression: r#"U&"\006B" > 0"#.into(),
-                },
+        for beside in [other, nullability] {
+            let mut cs = plan(vec![beside, alter(&kept, "app.f(integer)")]);
+            weave(&mut cs, &found, &kept, &[&ids], pg().as_ref()).expect("woven");
+            let woven: Vec<String> = rendered(&cs)
+                .into_iter()
+                .filter(|c| c.contains("ev_1") || c.starts_with("alter"))
+                .collect();
+            assert_eq!(
+                woven,
+                [
+                    "default ev_1.m -> None else None",
+                    "alter app.f(integer)",
+                    "default ev_1.m -> Some(\"app.f(2)\") else None",
+                ],
+                "{:?}",
+                rendered(&cs)
             );
-        let checked = BTreeMap::from([(
-            id("app.f(integer)"),
-            vec![Dependent {
-                described: "constraint ck on table app.ev_1".into(),
-                holds: Holds::TablePart {
-                    table: TableName::new("app", "ev_1"),
-                    part: Part::Check("ck".into()),
-                },
-            }],
-        )]);
-        let retype_k = Change::AlterColumnType {
-            uid: "c_d4e5f6".parse().unwrap(),
-            column: pbps_model::ColumnRef::new(TableName::new("app", "ev"), "k"),
-            from: "integer".parse().unwrap(),
-            to: "bigint".parse().unwrap(),
-            from_nullable: true,
-            to_nullable: true,
-            from_collation: None,
-            to_collation: None,
-        };
-        let mut cs = plan(vec![retype_k, alter(&escaped, "app.f(integer)")]);
-        let e = weave(&mut cs, &checked, &escaped, &[&ids], pg().as_ref()).expect_err("refused");
-        assert!(e.contains("#1699"), "{e}");
-        // Negative: the rebuild alone is answered as before, not this way.
-        let mut alone = plan(vec![alter(&s, "app.f(integer)")]);
-        if let Err(e) = weave(&mut alone, &found, &s, &[&ids], pg().as_ref()) {
-            assert!(!e.contains("#1699"), "{e}");
         }
     }
 
@@ -4947,7 +4961,7 @@ mod tests {
                 "add check ck",
             ]
         );
-        assert!(unaccounted(&cs, &found).is_empty());
+        assert!(unaccounted(&cs, &found, &Partitions::default()).is_empty());
         // Every change carries the dialect's own risks: saved-plan
         // verification recomputes them and would refuse any other answer.
         for p in &cs.changes {
@@ -5026,7 +5040,7 @@ mod tests {
             0
         );
         assert_eq!(rendered(&cs), once);
-        assert!(unaccounted(&cs, &found).is_empty());
+        assert!(unaccounted(&cs, &found, &Partitions::default()).is_empty());
     }
 
     /// The refusals, each with its name: an object this project does not
@@ -5182,13 +5196,16 @@ mod tests {
         };
         // One `ALTER` here, a drop and a create when emitted (ADR-0009 §3).
         let rebuilt = at("alter app.f(integer)");
-        for released in [
-            "default n -> None",
-            "default t_1.n -> None else None",
-            "default t_2.n -> None else None",
-        ] {
+        for released in ["default n -> None", "default t_2.n -> None else None"] {
             assert!(at(released) < rebuilt, "{names:?}");
         }
+        // The copy goes with the parent's `DROP DEFAULT`, which the engine
+        // recurses into `t_1`: nothing of `t_1`'s own is added for it
+        // (DEC-1699.1).
+        assert!(
+            !names.iter().any(|n| n == "default t_1.n -> None else None"),
+            "{names:?}"
+        );
         // The copy back as its parent's, which the parent's own sets too.
         assert!(
             at("default t_1.n -> None else Some(\"app.f(1)\")") > rebuilt,
@@ -5225,11 +5242,11 @@ mod tests {
         let (s, _) = declared();
         let cs = plan(vec![alter(&s, "app.v0")]);
         let found = BTreeMap::from([(id("app.v0"), vec![view("public.late")])]);
-        let left = unaccounted(&cs, &found);
+        let left = unaccounted(&cs, &found, &Partitions::default());
         assert_eq!(left, ["view public.late depends on `app.v0`"]);
         // And a module with no dependents needs nothing.
         let none = BTreeMap::from([(id("app.v0"), Vec::new())]);
-        assert!(unaccounted(&cs, &none).is_empty());
+        assert!(unaccounted(&cs, &none, &Partitions::default()).is_empty());
     }
 
     /// A plan that renames the table and the column while rebuilding the
@@ -5293,7 +5310,7 @@ mod tests {
             "{:?}",
             rendered(&cs)
         );
-        assert!(unaccounted(&cs, &found).is_empty());
+        assert!(unaccounted(&cs, &found, &Partitions::default()).is_empty());
         assert_eq!(
             weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap(),
             0
@@ -5328,7 +5345,7 @@ mod tests {
             0
         );
         assert_eq!(cs.changes.len(), 2, "{:?}", rendered(&cs));
-        assert!(unaccounted(&cs, &found).is_empty());
+        assert!(unaccounted(&cs, &found, &Partitions::default()).is_empty());
     }
 
     /// The declared views a rebuild meets and the plan does not touch are the
@@ -5457,7 +5474,7 @@ mod tests {
         assert_eq!(shape[0], "drop check ck", "{shape:?}");
         assert_eq!(shape[1], "drop app.f(integer)", "{shape:?}");
         assert!(!shape.iter().any(|c| c == "add check ck"), "{shape:?}");
-        assert!(unaccounted(&cs, &found).is_empty());
+        assert!(unaccounted(&cs, &found, &Partitions::default()).is_empty());
     }
 
     /// A plan that drops a function for good, renames the table, and edits
@@ -5516,7 +5533,7 @@ mod tests {
             }
             other => panic!("expected the moved removal first, got {other:?}"),
         }
-        assert!(unaccounted(&cs, &found).is_empty());
+        assert!(unaccounted(&cs, &found, &Partitions::default()).is_empty());
     }
 
     /// The check with nothing already on the target: every candidate stands.

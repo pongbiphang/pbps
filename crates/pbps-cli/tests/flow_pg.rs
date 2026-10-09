@@ -19180,6 +19180,228 @@ fn a_partitioned_parents_columns_change_through_the_cli_before_postgres_17() {
     parent_columns_flow(&server, "parent-columns-1687-old");
 }
 
+/// A partitioned parent's column changes meet its partitions' own entries
+/// through the CLI (#1699), on a tree holding rows. Each combination the
+/// interim plan refused by name (#1692) is planned, applies, verifies and
+/// replans empty: a partition's own check and unique index on a column the
+/// parent retypes; a name passing hands on the parent, a partition's own
+/// default and index on the column following it; a function rebuilt under a
+/// partition's own default while the parent renames its column; the parent's
+/// default released while the function its partitions' copies call is
+/// rebuilt; and a name renamed away and added again, with a partition's own
+/// NOT NULL on the new column.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_partitioned_parents_column_changes_reach_its_partitions_own_through_the_cli() {
+    partition_inheritance_flow(&server(), "partition-inheritance-1699");
+}
+
+/// [`a_partitioned_parents_column_changes_reach_its_partitions_own_through_the_cli`]
+/// on a pre-17 server.
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn a_partitioned_parents_column_changes_reach_its_partitions_own_through_the_cli_before_postgres_17()
+ {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    partition_inheritance_flow(&server, "partition-inheritance-1699-old");
+}
+
+fn partition_inheritance_flow(server: &str, slug: &str) {
+    let db = OwnDatabase::new(server, slug);
+    let conn = db.connection().to_owned();
+    on_server(&conn, SETUP_1699);
+    let d = Demo::new(slug);
+    succeeds(d.run(&["pull", "--db", &conn]));
+    let path = d.dir.join("schema/app.ev.yml");
+    let function = d.dir.join("schema/app.f%28integer%29.function.yml");
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+    let edit = |path: &std::path::Path, from: &str, to: &str| {
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains(from), "{from:?} in {text}");
+        std::fs::write(path, text.replacen(from, to, 1)).unwrap();
+    };
+    let applied = |name: &str| {
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join(name);
+        let o = succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+        let planned = stdout(&o);
+        succeeds(approved_apply(
+            &d,
+            &conn,
+            &plan,
+            &["--allow", "rename,not-null,destructive,constraint"],
+        ));
+        succeeds(d.run(&["verify", "--db", &conn]));
+        let next = succeeds(d.run(&["plan", "--db", &conn]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        planned
+    };
+    let holds = |sql: &str| scalar(&conn, &format!("SELECT ({sql})::int::int8"));
+    let default_of = |table: &str, column: &str| {
+        text_of(
+            &conn,
+            &format!(
+                "SELECT coalesce(pg_get_expr(d.adbin, d.adrelid), '-') FROM pg_attribute a \
+                 LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+                 WHERE a.attrelid = '{table}'::regclass AND a.attname = '{column}'"
+            ),
+        )
+    };
+    let rebuild_f = |body: &str| {
+        std::fs::write(
+            &function,
+            format!(
+                "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+                 (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ {body} $$\n"
+            ),
+        )
+        .unwrap();
+    };
+
+    // A partition's own check and unique index on the column its parent
+    // retypes: the parent's retype first, each probe over the converted rows.
+    edit(
+        &path,
+        "  k:\n    type: integer\n",
+        "  k:\n    type: bigint\n",
+    );
+    edit(
+        &path,
+        "    columns:\n      m: {default: app.f(7)}\n",
+        "    columns:\n      m: {default: app.f(7)}\n    checks:\n      ev_2024_k: k > 0\n    \
+         indexes:\n      ev_2024_k:\n        columns: [k]\n        unique: true\n",
+    );
+    applied("retype.json");
+    assert_eq!(
+        holds(
+            "SELECT format_type(atttypid, atttypmod) = 'bigint' FROM pg_attribute \
+             WHERE attrelid = 'app.ev_2024'::regclass AND attname = 'k'"
+        ),
+        1
+    );
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_constraint WHERE conname = 'ev_2024_k'"),
+        1
+    );
+    assert_eq!(
+        holds("SELECT indisunique::int FROM pg_index WHERE indexrelid = 'app.ev_2024_k'::regclass"),
+        1
+    );
+
+    // A name passing hands: `n` dropped and `m` renamed into it. The
+    // partitions' own default and index on `m` follow it to `n`.
+    edit(&path, "  \"n\":\n    type: integer\n", "");
+    succeeds(d.run(&["drop", "app.ev.n", "--reason", "gone"]));
+    edit(
+        &path,
+        "  m:\n    type: integer\n",
+        "  \"n\":\n    type: integer\n",
+    );
+    edit(
+        &path,
+        "      m: {default: app.f(7)}",
+        "      \"n\": {default: app.f(7)}",
+    );
+    edit(&path, "        columns: [m]", "        columns: [\"n\"]");
+    succeeds(d.run(&["rename", "app.ev.m", "n"]));
+    applied("hands.json");
+    assert_eq!(default_of("app.ev_2024", "n"), "app.f(7)");
+    assert_eq!(default_of("app.ev_2025", "n"), "-");
+    assert_eq!(
+        holds("SELECT pg_get_indexdef('app.ev_2025_m'::regclass) LIKE '%(n)'"),
+        1
+    );
+    assert_eq!(holds("SELECT sum(n) FROM app.ev"), 6, "the old `m` values");
+
+    // `f` rebuilt under `ev_2024`'s own default while the parent renames the
+    // column it is on: taken off under `n`, put back under `n2`.
+    rebuild_f("SELECT x + 0");
+    edit(
+        &path,
+        "  \"n\":\n    type: integer\n",
+        "  n2:\n    type: integer\n",
+    );
+    edit(
+        &path,
+        "      \"n\": {default: app.f(7)}",
+        "      n2: {default: app.f(7)}",
+    );
+    edit(&path, "        columns: [\"n\"]", "        columns: [n2]");
+    succeeds(d.run(&["rename", "app.ev.n", "n2"]));
+    applied("rebuild-rename.json");
+    assert_eq!(default_of("app.ev_2024", "n2"), "app.f(7)");
+    assert_eq!(
+        holds(
+            "SELECT prosrc LIKE '%x + 0%' FROM pg_proc WHERE oid = 'app.f(integer)'::regprocedure"
+        ),
+        1
+    );
+
+    // The parent's default on `g` released while `f`, which every
+    // partition's copy calls, is rebuilt: the parent's `DROP DEFAULT` takes
+    // the copies first.
+    rebuild_f("SELECT x + 1");
+    edit(
+        &path,
+        "  g:\n    type: integer\n    default: app.f(1)\n",
+        "  g:\n    type: integer\n",
+    );
+    applied("rebuild-release.json");
+    for t in ["app.ev", "app.ev_2024", "app.ev_2025"] {
+        assert_eq!(default_of(t, "g"), "-", "{t}");
+    }
+
+    // `z` renamed away and added again, `ev_2025` holding its own NOT NULL
+    // on the new one, which every row takes at its default. The old `z` is
+    // NULL in `ev_2025`'s row, so a probe reading it under the name it
+    // leaves refused the plan the engine takes.
+    edit(
+        &path,
+        "  z:\n    type: integer\n",
+        "  z_old:\n    type: integer\n",
+    );
+    succeeds(d.run(&["rename", "app.ev.z", "z_old"]));
+    edit(
+        &path,
+        "  z_old:\n    type: integer\n",
+        "  z_old:\n    type: integer\n  z:\n    type: integer\n    default: \"5\"\n",
+    );
+    edit(
+        &path,
+        "    indexes:\n      ev_2025_m:",
+        "    columns:\n      z: {nullable: false}\n    indexes:\n      ev_2025_m:",
+    );
+    applied("readd.json");
+    assert_eq!(holds("SELECT count(*) FROM app.ev WHERE z = 5"), 3);
+    assert_eq!(holds("SELECT count(*) FROM app.ev WHERE z_old IS NULL"), 1);
+    assert_eq!(
+        holds(
+            "SELECT attnotnull::int FROM pg_attribute WHERE attrelid = 'app.ev_2025'::regclass \
+             AND attname = 'z'"
+        ),
+        1
+    );
+}
+
+const SETUP_1699: &str = "CREATE SCHEMA app; \
+     CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+     CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, k integer, n integer, \
+         m integer, z integer, g integer DEFAULT app.f(1)) PARTITION BY RANGE (ts); \
+     CREATE TABLE app.ev_2024 PARTITION OF app.ev \
+         FOR VALUES FROM ('2024-01-01') TO ('2025-01-01'); \
+     CREATE TABLE app.ev_2025 PARTITION OF app.ev \
+         FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
+     ALTER TABLE app.ev_2024 ALTER COLUMN m SET DEFAULT app.f(7); \
+     CREATE INDEX ev_2025_m ON app.ev_2025 (m); \
+     INSERT INTO app.ev (id, ts, k, n, m, z) VALUES (1, '2024-06-01', 1, -1, 1, 1), \
+         (2, '2024-07-01', 2, -2, 2, 2), (3, '2025-06-01', 3, -3, 3, NULL)";
+
 fn parent_columns_flow(server: &str, slug: &str) {
     let db = OwnDatabase::new(server, slug);
     let conn = db.connection().to_owned();

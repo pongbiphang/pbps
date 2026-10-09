@@ -42,8 +42,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub mod estimate;
 
 use pbps_model::{
-    Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, ObjectName, RiskClass, Role,
-    RoutineArg, Schema, Strategy, Table, TableName,
+    Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, ObjectName, Partitions, RiskClass,
+    Role, RoutineArg, Schema, Strategy, Table, TableName,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -2562,6 +2562,18 @@ pub trait Dialect {
     /// in `probes`.
     fn preflight(&self, _changes: &ChangeSet) -> Preflight {
         Preflight::default()
+    }
+
+    /// [`Dialect::preflight`], told which table is whose partition.
+    ///
+    /// A change to a partitioned parent's column reaches every partition's
+    /// stored rows, while a partition's own check or index names the
+    /// partition, so a probe over the partition needs the parent's renames,
+    /// retypes and added columns as its own (DEC-1699.1). The relation is not
+    /// in the plan; the caller derives it from the database read the plan's
+    /// baseline was checked against. `preflight` is this with no partitions.
+    fn preflight_with(&self, changes: &ChangeSet, _partitions: &Partitions) -> Preflight {
+        self.preflight(changes)
     }
 
     /// The line that separates batches in a script for this dialect, if the

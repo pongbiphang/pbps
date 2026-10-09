@@ -3938,43 +3938,17 @@ following are admitted with no new change kind: `AddColumn`, `DropColumn`,
   columns as they stand at its statement, and the table on its other side
   holds them as declared at the other end of the plan, so each column change
   would need its own place against each transition. The remedy is two plans,
-  the columns first or the partitions first;
-- a partition's own check, or unique index on columns, added while the plan
-  changes a column of its parent that the check or index reads: a changed
-  name, either of a rename's, found in the check's text or in the index's
-  key columns or predicate, quoted or not, in any case. These are what the
-  pre-flight probes; a plain index, filtered or not, and a unique one over
-  an expression are not probed, and are admitted. Only a change that moves
-  what the probe reads counts: an addition, a drop, a rename or a retype. A
-  default or nullability change leaves the column and its values as they
-  are. A text holding a Unicode-escaped identifier (`U&"\0076"`), which
-  spells a name without its letters, counts as reading every changed name.
-  One that reads only the partition's other columns is admitted.
-  Its pre-flight probe reads the stored rows
-  before the parent's change reaches them: a retype converts them and a rename
-  moves a name to another column. The probe knows the plan's column changes
-  by table, not which table is whose partition, so it would test values or
-  columns the engine never checks (DECISIONS 410). The remedy is two plans;
-- a name passing from one column to another in the same plan: a column
-  added, or renamed, into a name the plan drops or renames away. The apply
-  guard builds no undo for a dropped name taken again (DEC-541.1), and the
-  pre-flight and the guard key a partition's probes and carried indexes by
-  the partition's own name, so they would read the column the name left. The
-  remedy is two plans, the name freed first;
-- in a connected plan, a function dropped or rebuilt that a part of one of
-  the parent's partitions depends on, where the part is on a column the plan
-  changes. A default counts by its column, under any change but a
-  nullability one, since the engine overwrites the partition's default with
-  the parent's. A check or index the partition declares counts by a name an
-  addition, drop, rename or retype changes, or a Unicode-escaped identifier,
-  found in its text. Any other part, a clone of the parent's, counts. The connected passes key
-  parts by the partition's name and cannot follow the parent's column change
-  into it. The remedy is two plans.
+  the columns first or the partitions first.
 
-The last three and the partition drop among the transitions stand until
-#1699. That issue gives every
-consumer the partition-to-parent relation, so that a partition's column is
-looked up as its parent's (leon, 2026-10-09).
+Three more combinations were refused here as well, because the pre-flight,
+the apply guard and the connected passes looked a partition's column up by
+the partition's own name: a partition's own check or unique index beside its
+parent's change to the column it reads, a name passing from one column to
+another, and a function rebuilt under a partition's part on a changed
+column. DEC-1699.1 gives each consumer the partition-to-parent relation and
+admits all three. The transitions above stay refused: they are a question of
+where each column change goes against each attach or detach, not of which
+table a column belongs to.
 
 A key column renamed is not a change of the partitioning.
 
@@ -4056,3 +4030,112 @@ Pinned by:
 - `a_partitions_own_columns_set_by_someone_else_are_movement`;
 - the CLI's `a_partitioned_parents_columns_change_through_the_cli`, on 18 and
   on 16.
+
+<a id="dec-1699-1"></a>
+
+**DEC-1699.1. A partition's column is its parent's in every consumer, which
+derives the partition-to-parent relation from the schema it already holds
+(#1699).**
+
+A partition's columns, types included, are its parent's, and the engine
+recurses every change to a parent's column into each partition. The plan
+names that change by the parent alone, and a partition's own default, NOT
+NULL, index or check by the partition. Every consumer that looked a column up
+by `(table, column)` asked the wrong key wherever the two met. The #1692
+review found nine instances of it, one subsystem at a time, and DEC-1687.1
+refused the combinations instead.
+
+**The relation is derived, not carried** (leon, 2026-10-09).
+`pbps_model::Partitions` maps each partition to its parent and each parent to
+its partitions, built from a schema with `Partitions::of`. The plan gains no
+field, so no plan format or checksum changes. Each consumer builds it from
+what it already has:
+- the connected passes in `dependents.rs`, from the declarations;
+- the pre-flight, through `Dialect::preflight_with`, from the read whose
+  checksum matched the plan's baseline. `Dialect::preflight` is the same with
+  no partitions. `explain` without a database lists the probes that way, and
+  the apply's own pre-flight is the one that runs;
+- `check_module_dependents` at apply, from the same read;
+- the apply guard, from its two reads, as `Renames::apply` already did.
+
+A tree is one level deep, since a partitioned partition is not held
+(DEC-1170.1), so a partition's column has exactly one parent's column.
+
+**The pre-flight** gives each partition its parent's renames, retypes, added
+columns and recomputed generated columns as its own (`reach_partitions`).
+A partition's own check is then skipped over a parent's retype, as a plain
+table's is (DECISIONS 410). A unique index reads the partition's stored rows
+under the names and types the engine leaves them with.
+
+Two probes assumed a name the plan moves makes the probe fail by itself, and
+a name passing from one column to another breaks that for plain tables too.
+The catalog still holds the name for the column leaving it, so the probe runs
+and reads the wrong column:
+- a check is unchecked where the plan renames a column of its table into a
+  name it drops or renames away, or adds a column under one;
+- a partition's own NOT NULL on a column its parent adds is unchecked. The
+  rows are not there to count, or the name is held by the column leaving it.
+
+A filtered index's predicate was already left unprobed beside any rename or
+added column of its table.
+
+**The connected passes.** `weave` and `unaccounted` take a parent's change as
+reaching a partition's part where the engine recurses it:
+- `DROP DEFAULT` releases the partition's default, its own included;
+- `DROP COLUMN` takes the partition's default and generated expression;
+- a new generation expression replaces the partition's;
+- `RENAME COLUMN` renames the column the part is on, so a removal or
+  restoration the weave synthesizes is spelled as the column is named at its
+  place.
+
+A removal and a restoration stay exact. A parent's `SET DEFAULT` gives each
+partition the parent's default, and a partition's own comes back only through
+its own `SetPartitionDefault`, which has to be the change placed after the
+module. Taking the parent's change as editing the partition's default would
+leave that `SetPartitionDefault` unsplit and ahead of the rebuilt function.
+When the weave moves a parent's change ahead of a module's drop, the change
+keeps the parent's table. With the partition's name it would change the
+partition alone. `after_their_parents_defaults` still puts each partition's
+own default after its parent's `SET DEFAULT`, which overwrites it (measured
+on 16 and 18).
+
+**The apply guard.** A rename's undo is built for each read that holds the
+rename's result alone. A read holding both names has not run the rename, or
+holds a dropped column under the name the rename takes. Before this, both
+reads were left alone when either held both names. So a column renamed into a
+dropped column's name kept its index under two spellings, and a valid plan
+was refused at apply. That held for plain tables too (measured on 18), and for
+a partition's index carried by its parent's rename. A partition's own
+entries were already compared under the names the plan leaves (DEC-1687.1).
+
+**What this admits.** The three combinations DEC-1687.1 refused, each planned
+like a plain table's, on a tree holding rows:
+- a partition's own check or unique index beside its parent's change to the
+  column it reads;
+- a name passing from one column to another on the parent, the partitions'
+  own entries on it following;
+- a function dropped or rebuilt under a partition's part on a column the
+  parent drops, renames or changes the default of.
+
+Still refused, by DEC-1687.1: a parent's column change beside an attach, a
+detach or a partition's drop under it.
+
+**Why not carry the relation in the plan.** Design A on #1699 would serialise
+it in the `ChangeSet`, so that the checksum pins it. Every consumer already
+holds a schema that states the relation: the declarations at plan time, and
+at apply the read whose checksum equals the plan's baseline, so the relation
+cannot differ from the one the plan was made over. The field would have cost
+a plan-format change and every `ChangeSet` literal, for nothing those
+consumers cannot already read.
+
+Pinned by:
+- `a_partitions_column_is_its_parents` and
+  `a_change_to_a_parents_column_reaches_each_of_its_partitions`;
+- `a_partitions_probe_takes_its_parents_column_changes_as_its_own`;
+- `a_probe_never_reads_a_name_this_plan_gives_another_column`;
+- `a_rebuild_under_a_partition_follows_its_parents_column_changes`;
+- `a_column_renamed_into_a_dropped_columns_name_is_not_movement`;
+- `a_partitioned_parents_columns_change_and_its_partitions_keep_their_own`;
+- the CLI's
+  `a_partitioned_parents_column_changes_reach_its_partitions_own_through_the_cli`,
+  on 18 and on 16.

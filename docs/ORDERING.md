@@ -86,7 +86,10 @@ Then, in this order:
   `crates/pbps-cli/src/engine.rs`):
   - `weave` puts each catalog dependent of a dropped or rebuilt module on the
     right side of the drop: removed before it, restored after its create
-    (DECISIONS 311, DEC-942.1). `after_its_release` then moves a function's
+    (DECISIONS 311, DEC-942.1). A partition's part is released by its
+    parent's drop of the column, `DROP DEFAULT` or new generation
+    expression, and named through its parent's column rename (DEC-1699.1).
+    `after_its_release` then moves a function's
     drop after what releases its generated columns (DEC-1168.1).
     `release_generated_inputs` then moves the retype or drop of a column a
     generated column reads after the expression change that stops reading it,
