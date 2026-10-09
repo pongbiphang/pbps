@@ -71,7 +71,11 @@ pub struct ScratchStandard {
     /// `ALTER DATABASE <scratch> SET`: operational settings such as
     /// timeouts. The settings that decide the resolver's answer come from the
     /// target, as the deployer's session settings, and override these.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty",
+        deserialize_with = "settings"
+    )]
     pub settings: std::collections::BTreeMap<String, SettingValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
@@ -190,6 +194,23 @@ fn connection_limit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i32
             "a scratch connection_limit is -1 or at least 1; 0 would lock the scratch account out",
         ))
     }
+}
+
+/// The engine matches setting names case-insensitively, so `TimeZone` and
+/// `timezone` are one setting: declared twice, one value would silently win.
+fn settings<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::BTreeMap<String, SettingValue>, D::Error> {
+    let settings = std::collections::BTreeMap::<String, SettingValue>::deserialize(d)?;
+    let mut seen = std::collections::BTreeSet::new();
+    for name in settings.keys() {
+        if !seen.insert(name.to_lowercase()) {
+            return Err(serde::de::Error::custom(format!(
+                "the setting {name} is declared twice, in two spellings of one name"
+            )));
+        }
+    }
+    Ok(settings)
 }
 
 fn role_name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -457,6 +478,8 @@ mod tests {
             "{public: {grants: [{to: '', privileges: [USAGE]}]}}",
             "{public: {grants: [{to: r, privileges: [SELECT]}]}}",
             "{settings: {work_mem: [1, 2]}}",
+            // One setting in two spellings: the engine reads them as one.
+            "{settings: {TimeZone: UTC, timezone: GMT}}",
         ] {
             assert!(
                 Config::parse(

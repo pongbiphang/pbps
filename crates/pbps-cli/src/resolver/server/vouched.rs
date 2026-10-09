@@ -924,7 +924,7 @@ pub fn declared_standard(declared: Option<&pbps_config::resolver::ScratchStandar
     standard.settings = declared
         .settings
         .iter()
-        .map(|(name, value)| (name.clone(), value.0.clone()))
+        .map(|(name, value)| (name.to_lowercase(), value.0.clone()))
         .collect();
     if let Some(comment) = &declared.comment {
         standard.comment = Some(comment.clone());
@@ -1012,3 +1012,37 @@ fn reported_build(
 
 #[cfg(test)]
 mod live_tests;
+
+#[cfg(test)]
+mod declared_standard_tests {
+    use super::declared_standard;
+
+    /// The engine stores `TimeZone` under its own spelling whatever the
+    /// declaration wrote, and the scratch's state is read keyed by
+    /// lowercase name: a declared name is keyed the same way, or a declared
+    /// `TimeZone` never reads back as declared.
+    #[test]
+    fn a_declared_setting_name_is_keyed_as_the_scratch_state_is_read() {
+        let config = pbps_config::Config::parse(
+            "dialect: postgres\nresolvers:\n  s:\n    kind: server\n    url_env: S\n    \
+             standard: {settings: {TimeZone: UTC, work_mem: 64}}\n",
+            std::path::Path::new("pbps.yml"),
+        )
+        .unwrap();
+        let pbps_config::resolver::ResolverProfile::Server {
+            standard: Some(declared),
+            ..
+        } = &config.resolvers["s"]
+        else {
+            panic!("a server profile with a standard");
+        };
+        let standard = declared_standard(Some(declared));
+        assert_eq!(
+            standard.settings.keys().collect::<Vec<_>>(),
+            ["timezone", "work_mem"]
+        );
+        // Negative: nothing declared is the built-in standard, with no
+        // settings of its own.
+        assert!(declared_standard(None).settings.is_empty());
+    }
+}

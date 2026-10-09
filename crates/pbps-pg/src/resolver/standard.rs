@@ -23,6 +23,7 @@ use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 
 use super::authorization::setting_literal as literal;
+use super::authorization::{LIST_QUOTE_SETTINGS, setting_value};
 
 /// initdb's `public` has this OID in every database it creates, which keys
 /// it through a rename.
@@ -72,7 +73,10 @@ impl std::fmt::Display for Entry {
 /// declared otherwise on its resolver entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Standard {
-    /// `ALTER DATABASE ... SET`, name to value as the engine stores it.
+    /// `ALTER DATABASE ... SET`, name to value as the engine stores it. The
+    /// name is lowercase: the engine stores a setting under its own spelling
+    /// (`TimeZone`) whatever the statement wrote, and matches names
+    /// case-insensitively.
     pub settings: BTreeMap<String, String>,
     pub comment: Option<String>,
     /// `-1` for no limit.
@@ -140,7 +144,8 @@ pub struct State {
     pub connection_limit: i32,
     pub template: bool,
     pub comment: Option<String>,
-    /// The database's own settings, for every role.
+    /// The database's own settings, for every role, keyed by lowercase name
+    /// as [`Standard::settings`] is.
     pub settings: BTreeMap<String, String>,
     /// The session login's settings in this database.
     pub login_settings: BTreeSet<String>,
@@ -245,7 +250,8 @@ pub async fn read_state(conn: &mut impl QueryConnection) -> Result<State, DbErro
     {
         let entry = text(&row, "entry")?;
         if text(&row, "everyone")? == "true" {
-            settings.insert(setting(&entry).0, setting(&entry).1);
+            let (name, value) = setting(&entry);
+            settings.insert(name.to_lowercase(), value);
         } else {
             login_settings.insert(entry);
         }
@@ -350,7 +356,7 @@ pub fn differences(
     }
     for (name, value) in &state.settings {
         match standard.settings.get(name) {
-            Some(expected) if expected == value => {}
+            Some(expected) if same_value(name, value, expected) => {}
             _ => found.push(format!("the database sets {name}={value}")),
         }
     }
@@ -398,6 +404,8 @@ pub async fn unappliable(
         .public_grants
         .iter()
         .map(|(role, _)| role)
+        // `PUBLIC` is the engine's pseudo-role, never a row of `pg_roles`.
+        .filter(|role| role.as_str() != PUBLIC_GRANTEE)
         .collect();
     for role in roles {
         let rows = conn
@@ -413,7 +421,17 @@ pub async fn unappliable(
         }
     }
     for (name, value) in &standard.settings {
-        if state.settings.get(name) == Some(value) {
+        if state
+            .settings
+            .get(name)
+            .is_some_and(|stored| same_value(name, stored, value))
+        {
+            continue;
+        }
+        if setting_value(name, value).is_err() {
+            found.push(format!(
+                "the declared setting {name}={value}, which is not a list the engine can read"
+            ));
             continue;
         }
         let rows = conn
@@ -425,7 +443,7 @@ pub async fn unappliable(
                          OR (s.context IN ('superuser', 'superuser-backend') \
                              AND pg_catalog.has_parameter_privilege(session_user, s.name, 'SET')) \
                         )::text AS may \
-                   FROM pg_catalog.pg_settings s WHERE s.name = pg_catalog.lower({})",
+                   FROM pg_catalog.pg_settings s WHERE pg_catalog.lower(s.name) = {}",
                 literal(name)
             ))
             .await?;
@@ -561,7 +579,7 @@ pub async fn enforce(
                 format!("ALTER DATABASE {database} RESET {}", ident(name)),
             )
             .await;
-        } else if standard.settings.get(name) != Some(value) {
+        } else if !same_value(name, value, &standard.settings[name]) {
             run(
                 conn,
                 &mut failed,
@@ -606,12 +624,29 @@ async fn run(conn: &mut impl ExecuteConnection, failed: &mut Vec<String>, sql: S
     }
 }
 
+/// A list setting such as `search_path` goes element by element: as one
+/// literal the engine stores a single quoted identifier, which never reads
+/// back as the declared list (measured on 16 and 18). [`unappliable`] has
+/// refused a declared list the engine cannot read before any write.
 fn set(database: &str, name: &str, value: &str) -> String {
     format!(
         "ALTER DATABASE {database} SET {} TO {}",
         ident(name),
-        literal(value)
+        setting_value(name, value).unwrap_or_else(|_| literal(value))
     )
+}
+
+/// Whether a stored setting is the declared one. A list setting is
+/// compared element by element, because the engine stores it in its own
+/// spelling (`"$user", public`), not as written.
+fn same_value(name: &str, stored: &str, declared: &str) -> bool {
+    if LIST_QUOTE_SETTINGS.contains(&name) {
+        let list = pbps_db::resolver::environment::guc_list;
+        if let (Some(stored), Some(declared)) = (list(stored), list(declared)) {
+            return stored == declared;
+        }
+    }
+    stored == declared
 }
 
 /// Makes the ACL of `object` equal `expected`: revokes each entry it should
@@ -1062,6 +1097,51 @@ mod tests {
                 )],
                 "{variable}"
             );
+        }
+    }
+
+    /// A declared standard the engine stores in its own spelling is still
+    /// the declared one: a setting the engine names in mixed case
+    /// (`TimeZone`), a list setting stored element by element, and a grant
+    /// to `PUBLIC`, which is no row of `pg_roles`. Applied once, it reads
+    /// back as declared, and the next run finds nothing to apply.
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn a_declared_standard_in_the_engines_own_spelling_reads_back_as_declared() {
+        for variable in SERVERS {
+            let fixture = Fixture::new(variable).await;
+            let mut standard = Standard::default();
+            for (name, value) in [
+                ("timezone", "UTC"),
+                ("datestyle", "ISO, MDY"),
+                // Written without the spaces the engine stores between elements.
+                ("search_path", "\"$user\",public,pg_catalog"),
+            ] {
+                standard.settings.insert(name.into(), value.into());
+            }
+            standard
+                .public_grants
+                .insert((PUBLIC_GRANTEE.into(), "CREATE".into()));
+            let mut login = fixture.connect(&fixture.name).await;
+            let refused = unappliable(&mut login, &standard).await.unwrap();
+            let failed = enforce(&mut login, &standard, None).await.unwrap();
+            let left = verify(&mut login, &standard, None).await.unwrap();
+            let again = unappliable(&mut login, &standard).await.unwrap();
+            // Negative: an unknown setting and a list the engine cannot read
+            // are still named before any write.
+            let mut wrong = standard.clone();
+            wrong.settings.insert("no_such_setting".into(), "1".into());
+            wrong
+                .settings
+                .insert("search_path".into(), "\"unterminated".into());
+            let named = unappliable(&mut login, &wrong).await.unwrap();
+            drop(login);
+            fixture.drop().await;
+            assert!(refused.is_empty(), "{variable}: {refused:#?}");
+            assert!(failed.is_empty(), "{variable}: {failed:#?}");
+            assert!(left.is_empty(), "{variable}: {left:#?}");
+            assert!(again.is_empty(), "{variable}: {again:#?}");
+            assert_eq!(named.len(), 2, "{variable}: {named:#?}");
         }
     }
 }

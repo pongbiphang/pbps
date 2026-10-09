@@ -47,7 +47,7 @@ fn is_context_setting(name: &str) -> bool {
 /// the commonest role default of all did not reproduce and every such
 /// deployer was refused (measured on 18; finding on #688). Each element goes
 /// back as its own literal, which the engine renders to the same text.
-const LIST_QUOTE_SETTINGS: &[&str] = &[
+pub(crate) const LIST_QUOTE_SETTINGS: &[&str] = &[
     "search_path",
     "session_preload_libraries",
     "shared_preload_libraries",
@@ -57,7 +57,7 @@ const LIST_QUOTE_SETTINGS: &[&str] = &[
 
 /// The right-hand side of `ALTER ROLE ... SET name = ...` that stores the
 /// target's text for `name` again.
-fn setting_value(name: &str, value: &str) -> Result<String, DbError> {
+pub(crate) fn setting_value(name: &str, value: &str) -> Result<String, DbError> {
     if !LIST_QUOTE_SETTINGS.contains(&name) {
         return Ok(literal(value));
     }

@@ -1776,6 +1776,7 @@
         "resolver::capture::tests::retained_roots_are_read_even_when_nothing_reaches_them",
         "resolver::capture::tests::coherent_inputs_pin_properties_membership_and_actual_bindings",
         "resolver::vouched::tests::the_cleanup_names_what_another_role_owns_and_what_changed_on_the_login",
+        "resolver::standard::tests::a_declared_standard_in_the_engines_own_spelling_reads_back_as_declared",
         "resolver::standard::tests::a_fresh_database_is_the_built_in_standard_and_public_is_its_only_owned_initdb_object",
         "resolver::standard::tests::a_public_entry_another_role_granted_is_named_and_the_acl_is_left_alone",
         "resolver::standard::tests::enforce_issues_no_statement_on_a_standard_database",
