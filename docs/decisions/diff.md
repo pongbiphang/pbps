@@ -3819,13 +3819,27 @@ the declared texts name. The second, as written, reads the wrong functions.
 Measured, a non-superuser cannot create a base type or a shell type, so
 neither a range's `canonical` nor a type modifier function. Every input
 function the parse reaches is a superuser's; what another role can write is
-a domain's CHECK. So before storing anything the probe reads every domain with a CHECK
-whose owner, or the owner of a function or operator its expression calls,
-is neither a superuser nor the current role. With one, nothing is stored and
-each pair stays unasked with a warning naming the domains, as under an event
-trigger (#1669); the apply's closing check still refuses a wrong recording.
-Which domains a declared text reaches is the parse's to find, so the read
-covers the database. A function a trusted one calls by name inside its body
+a domain's CHECK.
+
+A check present when the probe looks is not the only one it can meet. The
+read and the store are separate statements, and nothing locks a type
+against `ALTER`. Between them, measured on 16 and 18, the owner of a domain
+with no check can add a `NOT VALID` one, the owner of a composite or a table
+can give it a column of a new domain, and a role that can create in a schema
+can create the type a declared text names; each ran its new check through
+the parse (#1706). So the read is of what another role could change, not of
+the checks there now. A role is another when it is neither a superuser nor
+able to act as the current role. Before storing anything the probe reads
+every domain, composite, range or multirange type whose owner such a role
+can act as, every schema where such a role holds `CREATE` through any role
+it can act as, and every domain whose CHECK calls a function or operator
+such a role owns. Predefined roles act only through their members, so
+`public`, owned by `pg_database_owner`, counts only when the database's
+owner is another role. With any of them, nothing is stored and each pair
+stays unasked with a warning naming them, as under an event trigger
+(#1669); the apply's closing check still refuses a wrong recording. Which
+types a declared text reaches is the parse's to find, so the read covers
+the database. A function a trusted one calls by name inside its body
 is not in the catalog's dependencies and is not seen. That body is its
 trusted owner's to write, and the apply would run it all the same.
 
@@ -3843,6 +3857,9 @@ Pinned on 16 and 18 by the CLI's
   table, reached through a composite literal in a declared default, leaves
   the pair unasked with the domain named; the check never runs and the
   table's contents appear nowhere in the output;
+- a domain with no check, a composite and a table another role owns, in a
+  schema it can no longer create in, leave the pair unasked with each type
+  named (#1706);
 - without it, and beside a domain the deployer owns that calls only
   built-ins, the pair is asked and refused as the parent's;
 - a default the engine refuses is told as `SQLSTATE 22P02`, without the

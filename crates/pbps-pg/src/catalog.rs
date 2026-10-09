@@ -2630,17 +2630,21 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
     // can rewrite would run that role's code with the deployer's privileges
     // during a plan that is read-only, and an error it raises can carry what
     // it read (#1663). Which domains a declared text reaches is the parse's
-    // to find, so any such domain leaves every pair unasked.
+    // to find, and another role can wire a new check into a type it owns or
+    // create a type a declared text names between this read and the store
+    // (#1706), so any type or schema it can change leaves every pair unasked.
     if refused.is_none() {
-        refused = match untrusted_domain_checks(conn).await {
+        refused = match code_other_roles_can_change(conn).await {
             Ok(names) if names.is_empty() => None,
             Ok(names) => Some(format!(
-                "the target has the domain(s) {} whose CHECK runs code a role other than \
-                 this one or a superuser can change, and storing a default can run it as \
-                 this role",
-                listed(names)
+                "a role other than this one or a superuser can change {}, and storing a \
+                 default can run a check it writes there as this role",
+                names.join(", ")
             )),
-            Err(e) => Some(format!("cannot read the target's domains: {}", redacted(e))),
+            Err(e) => Some(format!(
+                "cannot read who can change the target's types: {}",
+                redacted(e)
+            )),
         };
     }
     if let Some(why) = refused {
@@ -2706,27 +2710,48 @@ async fn enabled_ddl_event_triggers(conn: &mut Conn) -> Result<Vec<String>, DbEr
         .collect()
 }
 
-/// Every domain with a CHECK that a role other than this one or a superuser
-/// can change: one it owns, or one whose check calls a function or operator
-/// it owns, which it can replace. A function a trusted one calls by name
+/// What a role other than this one or a superuser could make the parse run
+/// as this role: a domain, composite, range or multirange type it owns, or a
+/// schema it can create in, and a domain whose CHECK calls a function or
+/// operator it owns. Ownership is not enough to read alone: between this
+/// read and the store, an owner can add a `NOT VALID` CHECK to a domain that
+/// has none, or give its composite or table a column of a new domain, and a
+/// role that can create in a schema can create the type a declared text
+/// names. Each ran the new check through the parse, measured on 16 and 18
+/// (#1706). A role "other" is one neither a superuser nor able to act as
+/// this role; a type or schema counts when such a role can act as its owner
+/// or holds `CREATE` through any role it can act as. Predefined roles act
+/// only through their members, so `pg_database_owner` counts only when the
+/// database's owner is another role. A function a trusted one calls by name
 /// inside its body is not recorded in the catalog and is not seen; that body
 /// is its trusted owner's to write.
-async fn untrusted_domain_checks(conn: &mut Conn) -> Result<Vec<String>, DbError> {
+async fn code_other_roles_can_change(conn: &mut Conn) -> Result<Vec<String>, DbError> {
     let rows = conn
         .query(
-            "WITH trusted AS (
+            "WITH me AS (
                  SELECT r.oid FROM pg_catalog.pg_roles r
-                  WHERE r.rolsuper OR r.rolname OPERATOR(pg_catalog.=) CURRENT_USER)
-             SELECT DISTINCT pg_catalog.format('%I.%I', n.nspname, t.typname) AS name
+                  WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER),
+             others AS (
+                 SELECT r.oid FROM pg_catalog.pg_roles r
+                  WHERE r.oid OPERATOR(pg_catalog.>=) 16384::pg_catalog.oid
+                    AND NOT r.rolsuper
+                    AND NOT pg_catalog.pg_has_role(r.oid, (SELECT oid FROM me), 'MEMBER')),
+             reach AS (
+                 SELECT g.oid FROM pg_catalog.pg_roles g
+                  WHERE EXISTS (SELECT FROM others o
+                                 WHERE pg_catalog.pg_has_role(o.oid, g.oid, 'MEMBER')))
+             SELECT pg_catalog.format('type `%I.%I`', n.nspname, t.typname) AS name
                FROM pg_catalog.pg_type t
                JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.typnamespace
-               JOIN pg_catalog.pg_constraint c ON c.contypid OPERATOR(pg_catalog.=) t.oid
-              WHERE t.typtype OPERATOR(pg_catalog.=) 'd'
-                AND c.contype OPERATOR(pg_catalog.=) 'c'
-                AND (NOT EXISTS (SELECT FROM trusted
-                                  WHERE trusted.oid OPERATOR(pg_catalog.=) t.typowner)
+              WHERE t.typtype OPERATOR(pg_catalog.=) ANY ('{d,c,r,m}'::pg_catalog.\"char\"[])
+                AND NOT pg_catalog.pg_is_other_temp_schema(n.oid)
+                AND (t.typowner OPERATOR(pg_catalog.=) ANY (SELECT oid FROM reach)
                      OR EXISTS (
-                         SELECT FROM pg_catalog.pg_depend d
+                         SELECT FROM pg_catalog.pg_constraint c
+                           JOIN pg_catalog.pg_depend d
+                             ON d.classid OPERATOR(pg_catalog.=)
+                                    'pg_catalog.pg_constraint'::pg_catalog.regclass
+                            AND d.objid OPERATOR(pg_catalog.=) c.oid
                            LEFT JOIN pg_catalog.pg_operator o
                              ON d.refclassid OPERATOR(pg_catalog.=)
                                     'pg_catalog.pg_operator'::pg_catalog.regclass
@@ -2737,12 +2762,15 @@ async fn untrusted_domain_checks(conn: &mut Conn) -> Result<Vec<String>, DbError
                                          'pg_catalog.pg_proc'::pg_catalog.regclass
                                     THEN d.refobjid
                                     ELSE o.oprcode::pg_catalog.oid END
-                          WHERE d.classid OPERATOR(pg_catalog.=)
-                                    'pg_catalog.pg_constraint'::pg_catalog.regclass
-                            AND d.objid OPERATOR(pg_catalog.=) c.oid
-                            AND NOT EXISTS (SELECT FROM trusted
-                                             WHERE trusted.oid OPERATOR(pg_catalog.=)
-                                                   p.proowner)))
+                          WHERE c.contypid OPERATOR(pg_catalog.=) t.oid
+                            AND c.contype OPERATOR(pg_catalog.=) 'c'
+                            AND p.proowner OPERATOR(pg_catalog.=) ANY (SELECT oid FROM reach)))
+             UNION
+             SELECT pg_catalog.format('schema `%I`', n.nspname)
+               FROM pg_catalog.pg_namespace n
+              WHERE NOT pg_catalog.pg_is_other_temp_schema(n.oid)
+                AND EXISTS (SELECT FROM reach g
+                             WHERE pg_catalog.has_schema_privilege(g.oid, n.oid, 'CREATE'))
               ORDER BY 1",
         )
         .await?;

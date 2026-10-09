@@ -20088,10 +20088,11 @@ fn an_unlogged_partition_under_an_undeclared_permanent_key_is_refused() {
 /// default pair unasked: storing a literal of a composite over it runs the
 /// check as the deployer, and that role's function could read and raise what
 /// only the deployer can (#1663). Its function never runs, and nothing it
-/// would have read reaches the output. Negatives: without it, the pair is
-/// asked and refused as the parent's, a domain the deployer owns calling only
-/// built-ins does not stop it, and a text the engine refuses is told by its
-/// SQLSTATE alone. On 18 and 16.
+/// would have read reaches the output. A type that role owns with no check
+/// yet does the same: it could add one before the store (#1706). Negatives:
+/// without them, the pair is asked and refused as the parent's, a domain the
+/// deployer owns calling only built-ins does not stop it, and a text the
+/// engine refuses is told by its SQLSTATE alone. On 18 and 16.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
 fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
@@ -20157,17 +20158,46 @@ fn an_untrusted_domain_check_leaves_the_partition_default_probe_unrun() {
         assert!(
             err.contains(
                 "warning: not checked before the plan whether the engine stores it as the \
-                 parent's default: partition app.ev_a column `v`: the target has the \
-                 domain(s) `evil.d` whose CHECK runs code"
+                 parent's default: partition app.ev_a column `v`: a role other than this \
+                 one or a superuser can change schema `evil`, type `evil.c`, type `evil.d`, \
+                 and storing a default can run a check it writes there as this role"
             ),
             "{version}: {out}{err}"
         );
 
-        // Negative: without it, and beside a domain the deployer owns that
+        // A type another role owns holds no check yet, and no schema lets it
+        // create one: it can still add a `NOT VALID` CHECK to its domain, or a
+        // column of a new domain to its composite or table, between the read
+        // and the store, so the pair stays unasked all the same (#1706).
+        on_server(
+            &conn,
+            "DROP SCHEMA evil CASCADE; CREATE SCHEMA held; \
+             GRANT CREATE, USAGE ON SCHEMA held TO pbps_1663_low; \
+             SET ROLE pbps_1663_low; \
+             CREATE DOMAIN held.nc AS integer; \
+             CREATE TYPE held.c AS (v integer); \
+             CREATE TABLE held.t (a integer); \
+             RESET ROLE; \
+             REVOKE CREATE ON SCHEMA held FROM pbps_1663_low",
+        );
+        declare("(1)");
+        let plan = d.dir.join("held.json");
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        let err = stderr(&o);
+        assert!(
+            err.contains(
+                "partition app.ev_a column `v`: a role other than this one or a superuser \
+                 can change type `held.c`, type `held.nc`, type `held.t`, and storing"
+            ),
+            "{version}: {}{err}",
+            stdout(&o)
+        );
+
+        // Negative: without them, and beside a domain the deployer owns that
         // calls only built-ins, the pair is asked and refused as the parent's.
         on_server(
             &conn,
-            "DROP SCHEMA evil CASCADE; \
+            "DROP SCHEMA held CASCADE; \
              CREATE DOMAIN public.pbps_1663_ok AS integer CHECK (VALUE > 0)",
         );
         declare("(1)");
