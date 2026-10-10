@@ -235,6 +235,26 @@ pub async fn resolve(request: &Request<'_>) -> Result<pbps_model::ChangeSet, Ref
     producer::produce(request, driver, &bootstrap).await
 }
 
+/// A resolver's baseline file, read only from under the project root.
+///
+/// The baseline is reviewed history like the declarations (SPEC §9.3.2), so
+/// it is never a file elsewhere on the planning machine: an absolute path, a
+/// `..` or a symlink that leads outside the root is refused. Judged on the
+/// resolved path, not lexically, because a symlink inside the root can point
+/// anywhere. The file read is the one judged.
+fn read_baseline(root: &std::path::Path, path: &std::path::Path) -> Result<String, String> {
+    let unreadable = |error: std::io::Error| format!("could not be read: {error}");
+    let root = root.canonicalize().map_err(unreadable)?;
+    let file = root.join(path).canonicalize().map_err(unreadable)?;
+    if !file.starts_with(&root) {
+        return Err(format!(
+            "lies outside the project root {}; a baseline is a file in the project",
+            root.display()
+        ));
+    }
+    std::fs::read_to_string(&file).map_err(unreadable)
+}
+
 /// The producers of the profiles pbps implements. Today every one is a
 /// measured profile (RESOLVER-RUNTIME): its run binds the target by observing
 /// the engine service that holds the connection (DEC-1514.1). That premise
@@ -267,10 +287,9 @@ mod producer {
             let baseline = baseline
                 .as_ref()
                 .map(|path| {
-                    std::fs::read_to_string(request.project.root().join(path)).map_err(|error| {
+                    super::read_baseline(request.project.root(), path).map_err(|why| {
                         Refused::Unanswerable(anyhow::anyhow!(
-                            "the resolver `{}` names the baseline {}, which could not be read: \
-                             {error}",
+                            "the resolver `{}` names the baseline {}, which {why}",
                             request.selection.name,
                             path.display()
                         ))
@@ -421,6 +440,56 @@ mod producer {
 mod tests {
     use super::*;
     use pbps_model::{Column, Hints, IdsFile, Module, ModuleKind, Schema, Table};
+
+    #[test]
+    fn a_baseline_is_read_only_from_under_the_project_root() {
+        use std::path::{Path, PathBuf};
+        let dir = std::env::temp_dir().join(format!(
+            "pbps-baseline-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = dir.join("project");
+        std::fs::create_dir_all(root.join("db")).unwrap();
+        std::fs::write(root.join("db/baseline.sql"), "CREATE SCHEMA ext;").unwrap();
+        std::fs::write(dir.join("outside.sql"), "CREATE SCHEMA other;").unwrap();
+        std::os::unix::fs::symlink(dir.join("outside.sql"), root.join("db/link.sql")).unwrap();
+        std::os::unix::fs::symlink(root.join("db/baseline.sql"), root.join("inside.sql")).unwrap();
+
+        assert_eq!(
+            read_baseline(&root, Path::new("db/baseline.sql")).as_deref(),
+            Ok("CREATE SCHEMA ext;")
+        );
+        // A symlink that stays inside the project is the file it names.
+        assert_eq!(
+            read_baseline(&root, Path::new("inside.sql")).as_deref(),
+            Ok("CREATE SCHEMA ext;")
+        );
+        // Negative: a parent step, an absolute path and a symlink each lead
+        // outside the project root, to a file that exists.
+        for path in [
+            PathBuf::from("../outside.sql"),
+            dir.join("outside.sql"),
+            PathBuf::from("db/link.sql"),
+        ] {
+            let refused = read_baseline(&root, &path).unwrap_err();
+            assert!(
+                refused.starts_with("lies outside the project root"),
+                "{}: {refused}",
+                path.display()
+            );
+        }
+        // Negative: a missing file is unreadable, not empty.
+        assert!(
+            read_baseline(&root, Path::new("db/missing.sql"))
+                .unwrap_err()
+                .starts_with("could not be read")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// #1718 review: only a supplied server is bound by the planning
     /// identity, so a Docker profile plans for a role refused

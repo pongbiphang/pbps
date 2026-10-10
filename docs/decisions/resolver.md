@@ -2166,6 +2166,9 @@ the baseline's schemas instead would keep `public`'s template ACL against a
 target whose recreated `public` has none, the difference #688 removed.
 
 **The rule.**
+- **The file** lies under the project root. A path that resolves outside
+  it (absolute, through `..`, or through a symlink) is refused, so a plan
+  never runs SQL the project does not hold.
 - **Order.** The baseline runs after the reproduction (run-owned) or after
   the in-scope schemas are created (supplied), and before any managed
   object is staged. That is what #1664 protects: the baseline meets nothing
