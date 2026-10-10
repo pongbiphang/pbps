@@ -648,9 +648,9 @@ jobs:
     needs: [approve, lint]
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/release-build
     steps:
+      - name: Keep release build outputs outside the checkout
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/release-build" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.approve.outputs.checkout_sha }}
@@ -680,9 +680,11 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 60
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/release-build
       RUSTFLAGS: -D warnings -C target-feature=+crt-static
     steps:
+      - name: Keep release build outputs outside the checkout
+        shell: pwsh
+        run: '"CARGO_TARGET_DIR=$env:RUNNER_TEMP/release-build" >> $env:GITHUB_ENV'
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.approve.outputs.checkout_sha }}
