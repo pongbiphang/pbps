@@ -33093,3 +33093,118 @@ async fn a_relation_lookup_finds_every_kind_by_its_exact_name() {
         );
     }
 }
+
+/// #1756: the engine is asked whether a declared date/time literal reads the
+/// same under this tool's pinned settings and under contrasting ones, on 16
+/// and on 18. The issue's measured table, row by row: each literal that comes
+/// back two ways is listed with the pinned reading, and each that comes back
+/// one way is not. The same characters in a `text` column, a non-literal
+/// default and `pull`'s own spellings are never listed.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_date_or_time_literal_read_two_ways_is_found_on_both_versions() {
+    use pbps_db::catalog::LiteralAt;
+
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
+    let s = data_schema("ambiguous");
+    let mut table = Table::default();
+    for (name, t) in [
+        ("code", "text"),
+        ("d", "date"),
+        ("tz", "timestamp with time zone"),
+        ("ts", "timestamp without time zone"),
+        ("ttz", "time with time zone"),
+        ("span", "interval"),
+        ("ratio", "double precision"),
+        ("label", "text"),
+        ("tzs", "timestamp with time zone[]"),
+        ("spans", "interval[]"),
+    ] {
+        table.columns.insert(name.into(), Column::new(ty(t)));
+    }
+    table.columns.get_mut("d").unwrap().default = Some("'01/02/2026'::date".into());
+    table.columns.get_mut("ts").unwrap().default = Some("now()".into());
+    table.columns.get_mut("tz").unwrap().default =
+        Some("'2026-01-02 09:00:00+00'::timestamp with time zone".into());
+    table.columns.get_mut("label").unwrap().default = Some("'01/02/2026'::text".into());
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+        storage_parameters: Default::default(),
+    });
+    let text = |v: &str| Value::Text(v.into());
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[
+            ("d_slash", row(&[("d", text("01/02/2026"))])),
+            ("d_ymd", row(&[("d", text("01/01/02"))])),
+            ("d_iso", row(&[("d", text("2026-01-02"))])),
+            ("tz_bare", row(&[("tz", text("2026-01-02 09:00"))])),
+            ("tz_abbrev", row(&[("tz", text("2026-01-15 12:00 CST"))])),
+            ("tz_utc", row(&[("tz", text("2026-01-02 09:00:00+00"))])),
+            ("ts_iso", row(&[("ts", text("2026-01-02 09:00:00"))])),
+            ("ttz_bare", row(&[("ttz", text("12:00:00"))])),
+            ("span_mixed", row(&[("span", text("-1 2:03:04"))])),
+            ("span_day", row(&[("span", text("1 day"))])),
+            ("ratio", row(&[("ratio", text("0.1"))])),
+            ("now", row(&[("tz", text("now"))])),
+            // An array is read element by element, each as its type.
+            ("tzs_bare", row(&[("tzs", text("{\"2026-01-02 09:00\"}"))])),
+            (
+                "tzs_utc",
+                row(&[("tzs", text("{\"2026-01-02 09:00:00+00\"}"))]),
+            ),
+            ("spans_mixed", row(&[("spans", text("{\"-1 2:03:04\"}"))])),
+            ("label", row(&[("label", text("01/02/2026"))])),
+        ],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(TableName::new(&s, "ev"), table);
+
+    for connection in [conn_str(), old] {
+        let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+        let found = pbps_pg::catalog::misspelt(&mut conn, &declared, &Default::default())
+            .await
+            .expect("ask the engine");
+        let mut listed: Vec<(String, Option<String>)> = found
+            .ambiguous
+            .iter()
+            .map(|a| {
+                let at = match &a.at {
+                    LiteralAt::Cell { key, .. } => key.as_str().to_owned(),
+                    LiteralAt::Default { column, .. } => format!("default {column}"),
+                    LiteralAt::Bound { column, .. } => format!("bound {column}"),
+                };
+                (at, a.pinned.clone())
+            })
+            .collect();
+        listed.sort();
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            listed,
+            [
+                ("d_slash".to_owned(), some("2026-01-02")),
+                ("d_ymd".to_owned(), some("2002-01-01")),
+                ("default d".to_owned(), some("2026-01-02")),
+                ("now".to_owned(), None),
+                (
+                    "span_mixed".to_owned(),
+                    some("0 months -1 days 7384.000000 seconds")
+                ),
+                (
+                    "spans_mixed".to_owned(),
+                    some("{\"0 months -1 days 7384.000000 seconds\"}")
+                ),
+                ("ttz_bare".to_owned(), some("12:00:00+00")),
+                ("tz_abbrev".to_owned(), some("2026-01-15 18:00:00+00")),
+                ("tz_bare".to_owned(), some("2026-01-02 09:00:00+00")),
+                ("tzs_bare".to_owned(), some("{\"2026-01-02 09:00:00+00\"}")),
+            ],
+            "{connection}: {found:#?}"
+        );
+        // Each listed cell is reported as two readings and not also as a
+        // misspelling whose remedy is the pinned one; the rest are clean.
+        assert!(found.misspelt.is_empty(), "{connection}: {found:#?}");
+    }
+}

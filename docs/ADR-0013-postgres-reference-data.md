@@ -1584,10 +1584,12 @@ reader, emitter, probes and connected collision checks. Two delivery boundaries
 matter when reading the original proposal:
 
 - The setting-sensitive structural-default canonicalization described in the
-  table remains [#173](https://github.com/pongbiphang/pbps/issues/173); the
-  reference-data and framing fixtures do not establish that every typed
-  default is resolved into the saved plan. The bare-literal refusal and
-  supported emitted forms are recorded in DECISIONS 261.
+  table was not built as described: the framing (DECISIONS 267) already makes
+  the stored value the same everywhere, so resolving it into the saved plan
+  would only make the pinned reading permanent. A connected plan instead
+  refuses a date/time literal — a default, a row value or a bound — that the
+  engine reads two ways, naming both (#1756, DEC-1756.1). The offline
+  bare-literal refusal is DECISIONS 261.
 - The original three-exception write-setting proposal was superseded by the
   framing measurements recorded in DECISIONS 267. The Limits section
   names the temporal-expression fixture and what it actually measures.
@@ -1647,8 +1649,9 @@ The declared-state fields landed during model preparation (DECISIONS 207–209).
 Phase 5 step 7 (#82) built the PostgreSQL reference-data path, step 9 (#84)
 added preflight probes, and step 10 (#85) connected them to the CLI. The Limits
 section names the production fixtures; the historical sequence and session
-experiments above retain their original scope. Deferred structural-default
-work (#173) is not made complete by those fixtures.
+experiments above retain their original scope. The deferred structural-default
+work (#173) closed as DEC-1756.1's connected refusal rather than as a resolved
+value in the plan.
 
 SPEC §12 now points to this ADR for the PostgreSQL reference-data collision;
 the original claim that ADR-0004 already recorded it was corrected in the

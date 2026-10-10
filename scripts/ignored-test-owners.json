@@ -1398,7 +1398,8 @@
         "an_untrusted_domain_check_leaves_the_partition_default_probe_unrun",
         "an_unasked_partition_default_stays_in_the_envelope_beside_a_spelling_refusal",
         "an_unasked_partition_default_stays_in_the_envelope_when_a_later_step_fails",
-        "an_unlogged_partition_under_an_undeclared_permanent_key_is_refused"
+        "an_unlogged_partition_under_an_undeclared_permanent_key_is_refused",
+        "an_ambiguous_date_or_time_literal_is_refused_with_both_readings"
       ]
     },
     {
@@ -2148,7 +2149,8 @@
         "two_real_ledger_tables_still_pass_the_relkind_confirmation",
         "unlogged_tables_round_trip_and_switch_in_foreign_key_order",
         "views_with_nondefault_options_are_named_and_default_options_stay_plain",
-        "what_the_model_cannot_hold_is_named_and_never_silently_dropped"
+        "what_the_model_cannot_hold_is_named_and_never_silently_dropped",
+        "a_date_or_time_literal_read_two_ways_is_found_on_both_versions"
       ]
     },
     {

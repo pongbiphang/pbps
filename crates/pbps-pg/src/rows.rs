@@ -125,7 +125,7 @@ pub struct RowQuery {
 }
 
 /// The single primary-key column, or why there is none.
-fn key_column(name: &TableName, table: &Table) -> Result<String, RowsError> {
+pub(crate) fn key_column(name: &TableName, table: &Table) -> Result<String, RowsError> {
     match &table.primary_key {
         Some(pk) if pk.columns.len() == 1 => Ok(pk.columns[0].clone()),
         Some(pk) => Err(RowsError::Unreadable {
@@ -466,18 +466,56 @@ pub fn is_constant(default: &str) -> bool {
 /// stores. What follows the string may be words alone: `TEXT 'a' || 'b'` is
 /// an expression (DECISIONS 367).
 fn is_a_typed_literal(s: &str) -> bool {
+    let Some((tail, start)) = typed_literal_tail(s) else {
+        return false;
+    };
+    if crate::emit::is_a_bare_literal(tail) {
+        return true;
+    }
+    // The string, then an interval's field qualifier and nothing else: not
+    // any words — `BOOLEAN 'false' OR flip()` is an expression, and one a
+    // probe must not evaluate a second time (DECISIONS 368).
+    let Some(end) = string_end(tail, start) else {
+        return false;
+    };
+    crate::emit::is_a_bare_literal(&tail[..end]) && is_an_interval_qualifier(&tail[end..])
+}
+
+/// The one string literal a default is, as SQL text, with its grouping, its
+/// casts and a type name before it taken off: `'01/02/2026'` out of
+/// `('01/02/2026'::date)`, `CAST('01/02/2026' AS date)` or `DATE
+/// '01/02/2026'`, in whichever of its spellings it was written.
+///
+/// `None` for anything else, by the readers [`is_constant`] already trusts and
+/// with no parser of its own (DECISIONS 174, 279): a call, an operator, a
+/// sign, two strings, and an interval's field qualifier after the string,
+/// whose words change what the string means. What it answers `None` for is
+/// left to the framing's pinned settings, as everything was before #1756.
+pub(crate) fn the_string_of(default: &str) -> Option<&str> {
+    let s = unwrapped(default);
+    if crate::emit::is_a_bare_literal(s) {
+        return Some(s);
+    }
+    let (tail, _) = typed_literal_tail(s)?;
+    crate::emit::is_a_bare_literal(tail).then_some(tail)
+}
+
+/// A typed literal's type name checked and taken off: what follows it, and
+/// the offset in that of the quote that opens the string. `None` where what
+/// precedes the string is not a type name.
+fn typed_literal_tail(s: &str) -> Option<(&str, usize)> {
     let bytes = s.as_bytes();
     // The first quote that opens a string, read past any comment before it.
     let mut i = 0;
     let start = loop {
         if i >= bytes.len() {
-            return false;
+            return None;
         }
         match bytes[i] {
             b'\'' | b'$' => break i,
             b'-' | b'/' => match comment_end(s, i) {
                 Some(end) => i = end,
-                None if s[i..].starts_with("/*") => return false,
+                None if s[i..].starts_with("/*") => return None,
                 None => i += 1,
             },
             _ => i += 1,
@@ -503,23 +541,11 @@ fn is_a_typed_literal(s: &str) -> bool {
             head_end = start - 2;
         }
     }
-    let Some(ty) = type_text(&s[..head_end]) else {
-        return false;
-    };
+    let ty = type_text(&s[..head_end])?;
     if ty.is_empty() || ty.contains('[') || !looks_like_a_type(&ty) {
-        return false;
+        return None;
     }
-    let tail = &s[head_end..];
-    if crate::emit::is_a_bare_literal(tail) {
-        return true;
-    }
-    // The string, then an interval's field qualifier and nothing else: not
-    // any words — `BOOLEAN 'false' OR flip()` is an expression, and one a
-    // probe must not evaluate a second time (DECISIONS 368).
-    let Some(end) = string_end(tail, start - head_end) else {
-        return false;
-    };
-    crate::emit::is_a_bare_literal(&tail[..end]) && is_an_interval_qualifier(&tail[end..])
+    Some((&s[head_end..], start - head_end))
 }
 
 /// Whether `s` is one of the field qualifiers the grammar lets follow an
@@ -1643,6 +1669,47 @@ mod tests {
     use super::*;
     use pbps_model::{Column, ColumnType, DataMode, PrimaryKey, TableData};
     use std::str::FromStr;
+
+    /// Every spelling of a default that is one string, with or without a type
+    /// around it, gives that string up for the ambiguity check (#1756).
+    #[test]
+    fn the_one_string_of_a_default_is_found_through_casts_grouping_and_type_names() {
+        for (default, string) in [
+            ("'01/02/2026'", "'01/02/2026'"),
+            ("'01/02/2026'::date", "'01/02/2026'"),
+            ("('01/02/2026'::pg_catalog.date)", "'01/02/2026'"),
+            ("CAST('01/02/2026' AS date)", "'01/02/2026'"),
+            ("DATE '01/02/2026'", "'01/02/2026'"),
+            (
+                "timestamp with time zone '2026-01-02 09:00'",
+                "'2026-01-02 09:00'",
+            ),
+            ("E'01/02/2026'::date", "E'01/02/2026'"),
+            ("$$01/02/2026$$::date", "$$01/02/2026$$"),
+        ] {
+            assert_eq!(the_string_of(default), Some(string), "{default}");
+        }
+    }
+
+    /// Anything that is not one string is left alone: a call, an operator, a
+    /// sign, a number, NULL, and an interval's field words, which change what
+    /// the string means.
+    #[test]
+    fn a_default_that_is_not_one_string_gives_none() {
+        for default in [
+            "now()",
+            "CURRENT_DATE",
+            "'2026-01-02'::date + 1",
+            "'a' || 'b'",
+            "NULL",
+            "0",
+            "- '1 day'::interval",
+            "INTERVAL '1' DAY",
+            "nextval('s'::regclass)",
+        ] {
+            assert_eq!(the_string_of(default), None, "{default}");
+        }
+    }
 
     fn table(pk: Option<Vec<&str>>, columns: &[(&str, &str, Option<&str>)]) -> Table {
         let mut t = Table::default();

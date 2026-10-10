@@ -222,6 +222,10 @@ how to add an entry here.
     concatenation, a function call — stays outside on purpose (DECISIONS 174),
     covered by the settings the framing pins.
 
+    *Amended by [DEC-1756.1](#dec-1756-1): the typed-but-ambiguous residue is
+    closed at connected plan time by asking the engine, not by a resolver.
+    The offline rule above is unchanged.*
+
 <a id="decision-278"></a>
 
 278. **A comment is whitespace to the bare-literal guard, and the two comment
@@ -910,3 +914,75 @@ how to add an entry here.
      is right there — 475 measured that engine accepting Unicode White_Space as
      a separator — but it has the comment half of this bug, and that is issue
      #661 rather than scope here.
+
+<a id="dec-1756-1"></a>
+
+**DEC-1756.1. A connected plan refuses a date/time literal the engine reads
+two ways, measured under the pinned settings and two contrasting sets, and
+names both readings (#1756).** DECISIONS 261 left the typed spelling of an
+ambiguous literal to "a resolver at plan time" (#173), and PR #487 built one
+that baked the canonical value into the saved plan. By the time it could land
+the framing already did that job: every write path pins `DateStyle`,
+`TimeZone`, `IntervalStyle` and `timezone_abbreviations` (DECISIONS 267), so
+the stored value is the same everywhere. What was left is a *silent wrong
+reading*. `'01/02/2026'` is 2 January under the pins and 1 February to an
+author who wrote it under DMY; `'2026-01-02 09:00'` on a `timestamptz` is
+09:00 UTC to the pins and 09:00 local to an author in Taipei. Baking the pinned
+value into the plan would make that guess permanent, not visible.
+
+So `catalog::misspelt` asks the engine, for every literal on one of 261's
+types — a row's cell or key, a partition's range bound, and a default that is
+one string — to read it under the pinned values and under two contrasting
+sets, each in a rolled-back `READ ONLY` transaction with `set_config(…,
+is_local)`. A literal that comes back two ways is refused with the pinned
+reading, the others, and a spelling the engine reads one way and also gives
+back as written, so the remedy does not run into the spelling check's own
+(DECISIONS 101). Measured on 16 and 18:
+
+```text
+'01/02/2026'::date            2026-01-02 pinned   2026-02-01 under DMY
+'01/01/02'::date              2002-01-01 pinned   2001-01-02 under YMD (same under DMY)
+'2026-01-02 09:00'::timestamptz   09:00 UTC pinned   19:15 / 12:30 UTC elsewhere
+'2026-01-15 12:00 CST'::timestamptz  differs under the Australia dictionary
+'12:00 IST'::timetz           differs only under the India dictionary
+'-1 2:03:04'::interval        -1 day +02:03:04 pinned, -(1 day 02:03:04) under sql_standard
+'2026-01-02', '2026-01-02 09:00:00+00', '1 day', '0.1'::float8    one reading each
+```
+
+- **Measured, not enumerated.** No pattern says which spellings are
+  ambiguous. A rule about slashes or missing offsets would refuse
+  `Jan 2 2026` or pass `'01/01/02'`; the engine answers both correctly.
+- **Two contrasting sets, because one cannot differ in every direction.** YMD
+  is the only order that splits `'01/01/02'`, and `India` the only dictionary
+  that moves `IST`. The zones are odd offsets so that no zone-less time lands
+  on the pinned UTC reading by coincidence.
+- **A reading is compared as text no setting changes.** Dates and timestamps
+  print ISO under every `DateStyle` used; a `timestamptz` or `timetz` is
+  shifted to UTC first; an interval is taken apart into months, days and
+  seconds, which is exactly what it stores.
+- **An array is read element by element**, each as its type, in order: an
+  array prints its elements as the session prints the element type, so its
+  own text is no steadier than theirs. Without this, `EXTRACT` on an
+  `interval[]` is an error and the whole plan fails.
+- **The engine's own spellings read one way.** `pull` writes intervals as
+  `-1 days +02:03:04`, and measured, every field signed reads the same under
+  `sql_standard`; dates and timestamps it writes in ISO, a `timestamptz` with
+  `+00`.
+- **`now`, `today`, `tomorrow` and `yesterday` are refused too**, by word,
+  since a set of settings cannot show them: they read as the moment the
+  statement runs. A default spelled with one is frozen at the `CREATE`.
+- **Not a second misspelling.** A cell or bound listed here is dropped from
+  the spelling check's list, whose remedy, "write the engine's spelling",
+  would name the pinned reading as the meant one.
+- **Offline paths are unchanged.** `plan` without `--db` and `bootstrap
+  --sql` have nothing to ask; 261's bare-literal refusal and the framing
+  still hold there. A default that is not one string — a call, an operator,
+  an interval's field words — is left to the framing as before, by the same
+  readers `rows::is_constant` trusts (DECISIONS 174, 279).
+- **A project time zone is #1757.** Until then an offset-less `timestamptz`
+  is refused and the remedy is its UTC spelling.
+
+Pinned by `a_date_or_time_literal_read_two_ways_is_found_on_both_versions`
+(pbps-pg, on 16 and 18) and
+`an_ambiguous_date_or_time_literal_is_refused_with_both_readings` (CLI: a
+connected plan and bootstrap refuse; the one-reading spellings apply clean).
