@@ -4486,8 +4486,13 @@ on 16 and 18:
   insert into the plain table fires nothing to answer it.
 - A statement trigger or rule on the DEFAULT itself ran even when no row
   moved. The parent's own statement triggers did not run.
+- Measured on 18 with a subscriber, under a publication of the parent with
+  `publish_via_partition_root`: the delete reached the subscriber, and the
+  insert did not, into a table no publication held yet. Nor did the attach.
+  The subscriber lost the moved row while the publisher kept it (#1763
+  review).
 
-So the apply's pre-flight asks four counts, under the names the catalog
+So the apply's pre-flight asks five counts, under the names the catalog
 has before the plan runs:
 - **The rows referencing a moved row.** These are rows referencing the
   DEFAULT's rows in the range, counted as #1171 counts the rows referencing
@@ -4517,6 +4522,11 @@ has before the plan runs:
   rows in the range, when a row trigger on the DEFAULT fires on delete.
 - **Statement triggers and rules.** These are the DEFAULT's statement
   triggers and rules that fire on delete.
+- **Publications.** These are publications that publish deletes from the
+  DEFAULT, through itself or any table above it, counted when there are rows
+  to move. `pg_publication_tables` expands `FOR ALL TABLES`, a schema and a
+  partitioned table into what each one sends. pbps does not manage
+  publications (DEC-1444.1); it reads them so as not to break one silently.
 
 "Fires" is asked as `data_triggers` asks it:
 - `A` always fires; `O` fires outside, and `R` under,
@@ -4531,7 +4541,7 @@ the rows, or drop or disable the trigger, or move the rows, and plan again.
 **Asked again inside the statement** (#1763 review). A probe that cannot run
 is reported as unchecked and the apply goes on (SPEC 7.5): the engine
 enforces, inside the transaction, what the probe asked. Here the engine enforces nothing: a cascade
-is the engine doing what it was told. So the `DO` block asks the same four
+is the engine doing what it was told. So the `DO` block asks the same five
 questions before its delete, from the catalog as the plan leaves it at that
 point, and raises over any of them. An answer it cannot get, such as a
 referencing table it has no `SELECT` on, is an error too. Either way the

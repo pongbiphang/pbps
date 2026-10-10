@@ -3971,6 +3971,7 @@ fn partition_probes(
                 default_hidden_referencers_probe(name, &parent, &stored, names, from, to),
                 default_trigger_probe(name, &parent, &stored, &gone, from, to),
                 default_statement_probe(name, &stored, &gone),
+                default_publication_probe(name, &parent, &stored, from, to),
             ] {
                 match probe {
                     Ok(probe) => out.push(probe),
@@ -4251,6 +4252,58 @@ pub(crate) fn delete_reaches(default: &str) -> String {
          WHERE t.tgrelid = {default} AND (t.tgtype::int & 8) <> 0 AND {})",
         fires_here("t.tgenabled")
     )
+}
+
+/// The publications that publish a delete from `default`, a SQL expression
+/// of type `regclass`, as a `FROM ... WHERE` over `p` (#1763 review).
+/// `pg_publication_tables` expands `FOR ALL TABLES`, `FOR TABLES IN SCHEMA`
+/// and a partitioned table into what each publication sends, under the
+/// partition or under its root, so the DEFAULT and each of its ancestors are
+/// looked for there. Measured on 18 with a subscriber: under
+/// `publish_via_partition_root`, the move's delete reached the subscriber and
+/// its insert, into a table no publication held yet, did not, nor did the
+/// attach; the subscriber lost the moved row while the publisher kept it.
+/// pbps does not manage publications (DEC-1444.1); it reads them so as not to
+/// break one silently.
+pub(crate) fn publications_of(default: &str) -> String {
+    format!(
+        "FROM pg_catalog.pg_publication p \
+         JOIN pg_catalog.pg_publication_tables pt ON pt.pubname = p.pubname \
+         JOIN pg_catalog.pg_partition_ancestors({default}) AS a(relid) ON true \
+         JOIN pg_catalog.pg_class pc ON pc.oid = a.relid \
+         JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
+         WHERE p.pubdelete AND pt.schemaname = pn.nspname AND pt.tablename = pc.relname"
+    )
+}
+
+/// The publications that would send the move's delete and not its insert,
+/// when the DEFAULT has rows to move ([`publications_of`]).
+fn default_publication_probe(
+    partition: &TableName,
+    parent: &TableName,
+    default: &TableName,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+) -> Result<Probe, DialectError> {
+    Ok(Probe::new(
+        format!(
+            "publications that publish deletes from {default}: moving its rows inside the \
+             range of {partition} sends their delete to subscribers and not their insert, so a \
+             subscriber loses them; move the rows by hand, or take {default} out of the \
+             publication for the move, then plan again"
+        ),
+        format!(
+            "SELECT CASE WHEN {} > 0 THEN {} ELSE 0 END",
+            default_rows_in_range(parent, default, from, to)?,
+            saturated_count(&format!(
+                "(SELECT count(DISTINCT p.pubname) {})",
+                publications_of(&format!(
+                    "pg_catalog.to_regclass({})",
+                    value_literal(&qualified(default)?)
+                ))
+            ))
+        ),
+    ))
 }
 
 /// Whether a trigger or rule enabled as `column` holds fires in this
@@ -4966,7 +5019,20 @@ mod tests {
         for p in &asked {
             println!("-- {}\n{};", p.description, p.sql);
         }
-        assert_eq!(asked.len(), 4, "{asked:?}");
+        assert_eq!(asked.len(), 5, "{asked:?}");
+        // The publications that would send the move's delete and not its
+        // insert, asked only over rows to move (#1763 review).
+        assert!(
+            asked[4]
+                .description
+                .contains("publications that publish deletes from app.ev_rest")
+                && asked[4].sql.contains(
+                    "pg_partition_ancestors(pg_catalog.to_regclass(E'\"app\".\"ev_rest\"'))"
+                )
+                && asked[4].sql.contains("WHERE p.pubdelete")
+                && asked[4].sql.starts_with("SELECT CASE WHEN LEAST("),
+            "{asked:?}"
+        );
         // The rows referencing the moved ones, through a key to the parent or
         // to the DEFAULT; the parent under the name it has before the plan's
         // rename: under the new one the key is not found, and the count

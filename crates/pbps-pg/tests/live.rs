@@ -4242,7 +4242,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         );
         let over_step = plan(&added, &added_ids, &over, &mint_ids(&over, &added_ids, &[]));
         let probes = pg.preflight(&over_step).probes;
-        assert_eq!(probes.len(), 4, "{probes:#?}");
+        assert_eq!(probes.len(), 5, "{probes:#?}");
         // The moving statement, which asks the same questions again before
         // its delete (#1763 review).
         assert_eq!(over_step.changes.len(), 1, "{over_step:#?}");
@@ -4520,6 +4520,48 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         );
         rollback(&mut conn).await;
 
+        // A publication that publishes deletes from the DEFAULT, through its
+        // parent's root: the move's delete would reach a subscriber and its
+        // insert would not, so it is counted, and the moving statement stops
+        // over it. One that publishes no delete is not (#1763 review).
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!(
+            "CREATE PUBLICATION pbps_pub_1547 FOR TABLE {s}.ev \
+                 WITH (publish_via_partition_root = true); SAVEPOINT published"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[4].sql).await,
+            1,
+            "{}",
+            probes[4].description
+        );
+        let stopped = conn
+            .execute(&moving)
+            .await
+            .expect_err("the move stops over the publication");
+        assert!(
+            format!("{stopped:?}").contains("a publication publishes deletes from"),
+            "{stopped:?}"
+        );
+        conn.execute(
+            "ROLLBACK TO SAVEPOINT published; \
+             ALTER PUBLICATION pbps_pub_1547 SET (publish = 'insert, update')",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[4].sql).await,
+            0,
+            "{}",
+            probes[4].description
+        );
+        conn.execute(&moving)
+            .await
+            .expect("the move, with no delete published");
+        rollback(&mut conn).await;
+
         // Two key columns, with unbounded ends: the engine refuses
         // `PARTITION OF` over exactly the ranges holding rows, and the move
         // takes exactly the rows it would route into the range, NULL keys
@@ -4621,7 +4663,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         let checked_preflight = pg.preflight(&checked_step);
         assert_eq!(
             checked_preflight.probes.len(),
-            4,
+            5,
             "{:#?}",
             checked_preflight.probes
         );
@@ -4696,7 +4738,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &mint_ids(&collated_split, &collated_ids, &[]),
         );
         let collated_probes = pg.preflight(&collated_step).probes;
-        assert_eq!(collated_probes.len(), 4, "{collated_probes:#?}");
+        assert_eq!(collated_probes.len(), 5, "{collated_probes:#?}");
         in_a_transaction(&mut conn).await;
         apply(&mut conn, &pg, &collated_step).await;
         assert_eq!(
@@ -4909,7 +4951,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &mint_ids(&split, &added_ids, &archive),
         );
         let split_probes = pg.preflight(&split_step).probes;
-        assert_eq!(split_probes.len(), 9, "{split_probes:#?}");
+        assert_eq!(split_probes.len(), 11, "{split_probes:#?}");
         for probe in &split_probes {
             assert_eq!(
                 counted(&mut conn, &probe.sql).await,
