@@ -272,6 +272,22 @@ fn removes_with_its_owner(change: &Change, holds: &Holds, partitions: &Partition
     }
 }
 
+/// Each table the plan renames, from and to: what a read made before the plan
+/// is brought forward through to meet the plan's changes, which name a
+/// renamed table as declared ([`Partitions::renamed`], #1751 review).
+pub(crate) fn table_renames(cs: &ChangeSet) -> Vec<(&TableName, &TableName)> {
+    cs.changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::RenameTable { from, to, .. } = &p.change {
+                Some((from, to))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// The partitions of `schema` that stand through the whole plan: every one
 /// but those it attaches, detaches or drops. The declarations at plan time
 /// and the baseline read at apply then give the same relation, and a

@@ -21864,3 +21864,101 @@ fn abrupt_staged_apply_resumes_from_a_durable_checkpoint_before_the_next_step() 
         );
     }
 }
+
+/// #1751 review: a renamed parent's generated column calling a function,
+/// dropped with the function in the plan that renames the parent. The apply
+/// rechecks the function's dependents against the baseline's partitions,
+/// under the plan's names, so the partition's copy is taken by the parent's
+/// drop there as it was at planning; it used to read as left behind, and a
+/// plan `plan --db` had made was refused at apply.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_renamed_parents_generated_column_goes_with_its_function() {
+    renamed_parent_generated_flow(&server(), "renamed-generated-1751");
+}
+
+/// [`a_renamed_parents_generated_column_goes_with_its_function`] on a pre-17
+/// server.
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn a_renamed_parents_generated_column_goes_with_its_function_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE \
+         EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    renamed_parent_generated_flow(&server, "renamed-generated-1751-old");
+}
+
+fn renamed_parent_generated_flow(server: &str, slug: &str) {
+    let db = OwnDatabase::new(server, slug);
+    let conn = db.connection().to_owned();
+    on_server(
+        &conn,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE \
+             AS $$ SELECT x $$; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, \
+             g integer GENERATED ALWAYS AS (app.f(id)) STORED) PARTITION BY RANGE (ts); \
+         CREATE TABLE app.ev_2024 PARTITION OF app.ev \
+             FOR VALUES FROM ('2024-01-01') TO ('2025-01-01'); \
+         INSERT INTO app.ev (id, ts) VALUES (1, '2024-06-01')",
+    );
+    let d = Demo::new(slug);
+    succeeds(d.run(&["pull", "--db", &conn]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+    let from = d.dir.join("schema/app.ev.yml");
+    let text = std::fs::read_to_string(&from).unwrap();
+    let g = "  g:\n    type: integer\n    generated: {expression: app.f(id), stored: true}\n";
+    assert!(text.contains(g), "{text}");
+    std::fs::write(
+        d.dir.join("schema/app.events.yml"),
+        text.replacen(g, "", 1).replacen(
+            "table: app.ev\n",
+            "table: app.events\nrenamed_from: app.ev\n",
+            1,
+        ),
+    )
+    .unwrap();
+    std::fs::remove_file(&from).unwrap();
+    let mut functions = 0;
+    for entry in std::fs::read_dir(d.dir.join("schema")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.to_string_lossy().contains("app.f%28") {
+            std::fs::remove_file(path).unwrap();
+            functions += 1;
+        }
+    }
+    assert_eq!(functions, 1);
+    succeeds(d.run(&["drop", "app.events.g", "--reason", "unused"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("rename.json");
+    succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        &conn,
+        &plan,
+        &["--allow", "rename,destructive"],
+    ));
+    succeeds(d.run(&["verify", "--db", &conn]));
+    let next = succeeds(d.run(&["plan", "--db", &conn]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    let holds = |sql: &str| scalar(&conn, &format!("SELECT ({sql})::int::int8"));
+    assert_eq!(
+        holds(
+            "SELECT count(*) FROM pg_proc WHERE proname = 'f' AND pronamespace = 'app'::regnamespace"
+        ),
+        0
+    );
+    assert_eq!(
+        holds(
+            "SELECT count(*) FROM pg_attribute WHERE attname = 'g' AND NOT attisdropped \
+             AND attrelid IN ('app.events'::regclass, 'app.ev_2024'::regclass)"
+        ),
+        0
+    );
+    assert_eq!(holds("SELECT count(*) FROM app.events"), 1);
+}

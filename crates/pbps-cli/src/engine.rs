@@ -2917,7 +2917,11 @@ pub async fn check_module_dependents(
     stored: &pbps_model::Schema,
 ) -> anyhow::Result<()> {
     let found = module_dependents(conn, changes).await?;
-    let partitions = crate::dependents::standing_partitions(stored, changes);
+    // Under the plan's names, as the declarations the planner matched by are:
+    // a parent's column change names it as declared, and the baseline holds
+    // its partitions under its name before a rename (#1751 review).
+    let partitions = crate::dependents::standing_partitions(stored, changes)
+        .renamed(crate::dependents::table_renames(changes));
     let left = crate::dependents::unaccounted(changes, &found, &partitions);
     if !left.is_empty() {
         anyhow::bail!(

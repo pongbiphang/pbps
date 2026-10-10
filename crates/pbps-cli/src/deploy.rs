@@ -9001,18 +9001,12 @@ async fn preflight(
     // The probes take the plan's changes, which name a parent it renames by
     // its new name, so the stored relation is brought under those names
     // (#1751 review).
-    let renames = plan.changes.changes.iter().filter_map(|p| {
-        if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
-            Some((from, to))
-        } else {
-            None
-        }
-    });
     run_probes(
         conn,
         dialect,
         &plan.changes,
-        &pbps_model::Partitions::of(stored).renamed(renames),
+        &pbps_model::Partitions::of(stored)
+            .renamed(crate::dependents::table_renames(&plan.changes)),
     )
     .await
 }

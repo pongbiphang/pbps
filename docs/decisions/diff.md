@@ -4359,7 +4359,10 @@ What the rename touches beyond the parent's own statement:
   brought under the plan's names first (`Partitions::renamed`). Otherwise a
   retype on the renamed parent did not reach its partitions, and a
   partition's new check was probed against unconverted values (#1751
-  review).
+  review). The apply's recheck of a dropped function's dependents reads
+  the baseline's partitions the same way, or a renamed parent's dropped
+  generated column left its partition's copy unaccounted for, and a plan
+  `plan --db` had made was refused at apply (#1751 review).
 - **The parent's own changes in the same plan.** They name it as declared,
   so the standing-parent branches of `refuse_partition_changes` look the
   parent up on the base side under its base name. A rename with a new
