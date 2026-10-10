@@ -108,7 +108,7 @@ fn column_list(columns: &[String]) -> Result<String, DialectError> {
 /// abbreviation dictionary and `12:00:00+09:30` under another — and narrowing a
 /// recorded list because today's probe did not reach one of its rows is how the
 /// list stops being the rule it was derived from.
-const SETTING_SENSITIVE: &[&str] = &[
+pub(crate) const SETTING_SENSITIVE: &[&str] = &[
     "date",
     "time without time zone",
     "time with time zone",
@@ -661,8 +661,9 @@ fn is_one_dollar_quoted_literal(e: &str) -> bool {
 /// **The typed-but-ambiguous case is the residue, and it is deliberate.** The
 /// only offline rule that closes it refuses `'2026-01-02'::date` as well — a
 /// correct declaration, the one `pull` writes, with no remedy a message could
-/// name. ADR-0013 §3 closes it at plan time, connected, and that resolver
-/// arrives with the step that has a caller for it (issue #173).
+/// name. A connected plan closes it by asking the engine to read the literal
+/// under the pinned settings and under contrasting ones, and refusing one it
+/// reads two ways (DEC-1756.1, `crate::ambiguity`).
 ///
 /// None of this is about the plan converging. The state records what each
 /// object was declared as beside what it read back (DECISIONS 207–209), so a

@@ -36,6 +36,7 @@ use pbps_model::{
     Strategy, Table, TableName,
 };
 
+mod ambiguity;
 pub mod catalog;
 pub mod data_triggers;
 pub mod doctor;
