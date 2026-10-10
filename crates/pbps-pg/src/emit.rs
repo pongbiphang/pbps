@@ -3362,7 +3362,8 @@ fn beside_its_default(
          \x20       END IF;\n\
          \x20       FOR fk IN\n\
          \x20           SELECT con.conrelid, cl.relkind, ns.nspname, cl.relname,\n\
-         \x20                  {matched} AS matched\n\
+         \x20                  {matched} AS matched,\n\
+         \x20                  {moved_with_it} AS moved_with_it\n\
          \x20             FROM pg_catalog.pg_constraint con\n\
          \x20             JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid\n\
          \x20             JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace\n\
@@ -3374,7 +3375,8 @@ fn beside_its_default(
          \x20           EXECUTE 'SELECT EXISTS (SELECT 1 FROM '\n\
          \x20               || CASE WHEN fk.relkind = 'p' THEN '' ELSE 'ONLY ' END\n\
          \x20               || pg_catalog.quote_ident(fk.nspname) || '.' || pg_catalog.quote_ident(fk.relname)\n\
-         \x20               || {referencing} || fk.matched || ' AND ' || keep || '))' INTO hit;\n\
+         \x20               || {referencing} || fk.matched || ' AND ' || keep || ')'\n\
+         \x20               || fk.moved_with_it || ')' INTO hit;\n\
          \x20           IF hit THEN\n\
          \x20               {referenced}\n\
          \x20           END IF;\n\
@@ -3395,6 +3397,11 @@ fn beside_its_default(
         trigger_fires = fires("t.tgenabled"),
         rule_fires = fires("w.ev_enabled"),
         matched = crate::preflight::moved_row_match(),
+        moved_with_it = crate::preflight::moved_with_it(
+            default,
+            &format!("{}::pg_catalog.regclass", literal(&d)),
+            "keep",
+        )?,
         publications =
             crate::preflight::publications_of(&format!("{}::pg_catalog.regclass", literal(&d))),
         published = refuse(format!(

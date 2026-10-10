@@ -3963,14 +3963,15 @@ fn partition_probes(
                 continue;
             };
             let gone = dropped_triggers(changes, &stored, &parent);
-            // A generated column this plan recomputes may be a referencing
+            // A column this plan retypes or recomputes may be a referencing
             // column of a key the count finds in the catalog, and its new
             // values may be written before the move (a create at (9, 5)
-            // follows the expression change): the count is unchecked rather
-            // than taken over the old values, as a deleted row's is
-            // (DEC-1168.1). The moving statement asks the values it meets
-            // (#1763 review).
-            if names.recomputed.is_empty() {
+            // follows the alterations of class 9): the count is unchecked
+            // rather than taken over the old values, as a deleted row's is
+            // for a recomputation (DEC-1168.1). Which keys read the column is
+            // the catalog's to say when the move runs, and the moving
+            // statement asks the values it meets there (#1763 review).
+            if names.recomputed.is_empty() && names.retyped.is_empty() {
                 match default_reference_probe(
                     name,
                     &parent,
@@ -3988,7 +3989,7 @@ fn partition_probes(
             } else {
                 unchecked.push(Unchecked::for_change(
                     &p.change,
-                    "a generated column this plan recomputes may reference the moved rows, and \
+                    "a column this plan retypes or recomputes may reference the moved rows, and \
                      its new values cannot be evaluated before apply",
                 ));
             }
@@ -4223,8 +4224,16 @@ fn default_reference_probe(
     let text = format!(
         "'SELECT count(*) AS n FROM ' || CASE WHEN cl.relkind = 'p' THEN '' ELSE 'ONLY ' END \
          || pg_catalog.quote_ident(ns.nspname) || '.' || pg_catalog.quote_ident(cl.relname) \
-         || {child} || {matched} || ' AND ' || {} || ')' || {}",
+         || {child} || {matched} || ' AND ' || {} || ')' || {} || {}",
         range_predicate(from, to),
+        moved_with_it(
+            default,
+            &format!(
+                "pg_catalog.to_regclass({})",
+                value_literal(&qualified(default)?)
+            ),
+            &range_predicate(from, to),
+        )?,
         value_literal(&gone_rows)
     );
     Ok(Probe::new(
@@ -4277,6 +4286,36 @@ pub(crate) fn delete_reaches(default: &str) -> String {
          WHERE t.tgrelid = {default} AND (t.tgtype::int & 8) <> 0 AND {})",
         fires_here("t.tgenabled")
     )
+}
+
+/// A referencing row the move takes along, left out of the count of what
+/// references the moved rows, as SQL text to append to the count's `WHERE`
+/// after the match (#1763 review). It applies to a key whose referencing
+/// table is the DEFAULT or a table above it, a self-reference of the tree:
+/// a row of the DEFAULT inside the range, `keep` (a SQL text expression of
+/// the range over `r`), leaves in the same delete as the row it references.
+/// Measured on 16 and 18, with the referencing row moved too, the move kept
+/// the reference under every action; with one outside the range, `NO
+/// ACTION` and `RESTRICT` refused it and `CASCADE` and `SET NULL` rewrote
+/// it, so that one is still counted. `default` is the DEFAULT's name, and
+/// `default_expr` a SQL expression of type `regclass` for it, both for the
+/// query `con` is in scope of.
+pub(crate) fn moved_with_it(
+    default: &TableName,
+    default_expr: &str,
+    keep: &str,
+) -> Result<String, DialectError> {
+    let d = qualified(default)?;
+    Ok(format!(
+        "CASE WHEN con.conrelid IN (SELECT a.relid \
+         FROM pg_catalog.pg_partition_ancestors({default_expr}) AS a(relid)) \
+         THEN {} || {keep} || '))' ELSE '' END",
+        value_literal(&format!(
+            " AND NOT (ch.tableoid = {}::pg_catalog.regclass AND EXISTS (SELECT 1 FROM ONLY {d} \
+             AS r WHERE r.ctid OPERATOR(pg_catalog.=) ch.ctid AND ",
+            value_literal(&d)
+        ))
+    ))
 }
 
 /// The publications that publish a delete from `default`, a SQL expression
@@ -5210,7 +5249,23 @@ mod tests {
             ),
             "{refs}"
         );
-        assert!(!asked[0].sql.contains("ch.tableoid"), "{}", asked[0].sql);
+        assert!(
+            !asked[0].sql.contains("ch.tableoid IS DISTINCT FROM"),
+            "{}",
+            asked[0].sql
+        );
+        // A referencing row of the tree itself that leaves in the same move
+        // is not counted against it (#1763 review).
+        assert!(
+            asked[0].sql.contains(
+                "CASE WHEN con.conrelid IN (SELECT a.relid FROM \
+                 pg_catalog.pg_partition_ancestors(pg_catalog.to_regclass(E'\"app\".\"ev_rest\"'))"
+            ) && asked[0]
+                .sql
+                .contains("r.ctid OPERATOR(pg_catalog.=) ch.ctid"),
+            "{}",
+            asked[0].sql
+        );
         // A key compared as the engine compares it, under the referenced
         // column's collation and through the constraint's operator (#1763
         // review).
@@ -5233,12 +5288,12 @@ mod tests {
         );
     }
 
-    /// A generated column the plan recomputes may be a referencing column of
+    /// A column the plan recomputes or retypes may be a referencing column of
     /// a key into the moved rows, its new values written before the move:
     /// the count of what references them is unchecked rather than taken over
     /// the old values, and the rest is still asked (#1763 review).
     #[test]
-    fn a_move_beside_a_recomputation_leaves_its_reference_count_unchecked() {
+    fn a_move_beside_a_rewrite_leaves_its_reference_count_unchecked() {
         let create = Change::CreateTable {
             uid: "t_bbbbbb".parse().unwrap(),
             name: "app.ev_1".parse().unwrap(),
@@ -5277,12 +5332,42 @@ mod tests {
         );
         assert_eq!(asked.probes.len(), 4, "{:?}", asked.probes);
         assert!(
-            asked
-                .unchecked
-                .iter()
-                .any(|u| u.reason.contains("a generated column this plan recomputes")),
+            asked.unchecked.iter().any(|u| u
+                .reason
+                .contains("a column this plan retypes or recomputes")),
             "{:?}",
             asked.unchecked
+        );
+        // A retype rewrites the values too (#1763 review).
+        let retyped = preflight(&ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(Change::AlterColumnType {
+                    uid: "c_dddddd".parse().unwrap(),
+                    column: "ext.child.ev_id".parse().unwrap(),
+                    from: "numeric(10,2)".parse().unwrap(),
+                    to: "numeric(10,0)".parse().unwrap(),
+                    from_nullable: true,
+                    to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
+                }),
+                pbps_model::PlannedChange::new(create.clone()),
+            ],
+        });
+        assert!(
+            retyped
+                .probes
+                .iter()
+                .all(|p| !p.description.starts_with("rows that reference rows of")),
+            "{:?}",
+            retyped.probes
+        );
+        assert!(
+            retyped.unchecked.iter().any(|u| u
+                .reason
+                .contains("a column this plan retypes or recomputes")),
+            "{:?}",
+            retyped.unchecked
         );
         // Negative: with no recomputation, the count is asked.
         let plain = preflight(&ChangeSet {

@@ -4753,6 +4753,89 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         assert_eq!(alone_probes.len(), 1, "{alone_probes:#?}");
         assert_eq!(counted(&mut conn, &alone_probes[0].sql).await, 1);
 
+        // A self-referencing key of the tree, with the referencing row moved
+        // along with the one it references: one delete removes both sides,
+        // so the move keeps the reference and nothing is counted. One row
+        // outside the range referencing a moved one is counted, and the
+        // cascade that would delete it never runs (#1763 review).
+        conn.execute(&format!(
+            "CREATE TABLE {s}.sr (id integer NOT NULL, ts date NOT NULL, pid integer, pts date,
+                 PRIMARY KEY (id, ts),
+                 CONSTRAINT sr_self FOREIGN KEY (pid, pts) REFERENCES {s}.sr (id, ts)
+                     ON DELETE CASCADE)
+                 PARTITION BY RANGE (ts);
+             CREATE TABLE {s}.sr_rest PARTITION OF {s}.sr DEFAULT;
+             INSERT INTO {s}.sr VALUES (1, '2030-01-01', 1, '2030-01-01'),
+                 (2, '2030-02-01', 1, '2030-01-01');"
+        ))
+        .await
+        .expect("the self-referencing tree");
+        let sr_base = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
+        let sr_ids = mint_ids(&sr_base, &added_ids, &[]);
+        let mut sr_split = sr_base.clone();
+        sr_split.tables.insert(
+            t("sr_2030"),
+            partition(
+                "sr",
+                range(vec![value("2030-01-01")], vec![value("2031-01-01")]),
+            ),
+        );
+        let sr_step = plan(
+            &sr_base,
+            &sr_ids,
+            &sr_split,
+            &mint_ids(&sr_split, &sr_ids, &[]),
+        );
+        let sr_probes = pg.preflight(&sr_step).probes;
+        for probe in &sr_probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &sr_step).await;
+        assert_eq!(
+            counted(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM ONLY {s}.sr_2030 WHERE pid = 1")
+            )
+            .await,
+            2
+        );
+        rollback(&mut conn).await;
+        // Negative: a row outside the range referencing a moved one.
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!(
+            "INSERT INTO {s}.sr VALUES (3, '2040-01-01', 1, '2030-01-01'); SAVEPOINT outside"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &sr_probes[0].sql).await,
+            1,
+            "{}",
+            sr_probes[0].description
+        );
+        let sr_moving = &sr_step.changes[0];
+        let sr_moving = pg
+            .emit(&sr_moving.change, sr_moving.strategy)
+            .expect("emit")
+            .remove(0)
+            .sql;
+        let stopped = conn
+            .execute(&sr_moving)
+            .await
+            .expect_err("the move stops on the row outside the range");
+        assert!(
+            format!("{stopped:?}").contains("would fire the action of their foreign key"),
+            "{stopped:?}"
+        );
+        rollback(&mut conn).await;
+        conn.execute(&format!("DROP TABLE {s}.sr")).await.unwrap();
+
         // A DEFAULT's own NOT NULL, tightened in the plan that moves its only
         // NULL out, under a parent whose column default changes too, which
         // puts the create among the column alterations: the tightening

@@ -4563,15 +4563,20 @@ has before the plan runs:
   removes first is left out, and so are the rows of a referencing table's
   partitions the plan drops first, as for a detach. A key with nothing
   pointing at a moved row fires nothing, so it does not refuse the plan.
+  Nor does a row of the tree that the same delete moves, through a key of
+  the tree to itself. Measured on 16 and 18, with both sides moved, the move
+  kept the reference under every action. With a referencing row outside the
+  range, `NO ACTION` and `RESTRICT` refused the move, and `CASCADE` and
+  `SET NULL` rewrote that row, so it is still counted (#1763 review).
   Each column of the key is compared as the engine's referential check
   compares it, under the referenced column's collation and through the
   constraint's operator (DECISIONS 352). A bare `=` between columns
   collated differently fails to compare, and inside the moving statement
   that failure aborted a move the engine takes (#1763 review). With a
-  generated column recomputed in the same plan, the count is unchecked
-  rather than taken over the old values, as a deleted row's is
-  (DEC-1168.1). The new values may be written before the move, and the
-  moving statement asks the values it meets.
+  column retyped or a generated column recomputed in the same plan, the
+  count is unchecked rather than taken over the old values, as a deleted
+  row's is for a recomputation (DEC-1168.1). The new values may be written
+  before the move, and the moving statement asks the values it meets.
 - **The referencing tables the session cannot fully read.** These are
   tables with such a key on which row-level security is active, or that
   the session cannot read the key's columns of: `SELECT` on the table, or
