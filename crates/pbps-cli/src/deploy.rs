@@ -318,21 +318,38 @@ pub(crate) fn created_relation_names(cs: &pbps_model::ChangeSet) -> Vec<TableNam
         .collect();
     cs.changes
         .iter()
-        .filter_map(|p| match &p.change {
-            Change::CreateTable { name, .. } => Some(name.clone()),
-            Change::CreateModule {
-                id: id @ ModuleId::Named(name),
-                module,
-            } if module.kind == pbps_model::ModuleKind::View && !dropped.contains(id) => {
-                Some(name.clone())
-            }
-            _ => None,
-        })
-        .chain(created_index_names(cs))
+        .filter(|p| !matches!(&p.change, Change::CreateModule { id, .. } if dropped.contains(id)))
+        .flat_map(|p| relation_names_created(&p.change))
         .collect()
 }
 
-/// The index names this plan creates, each in its table's schema (#1355):
+/// The relation names one change creates: a table, a view, and the index
+/// names of [`index_names_created`].
+// The complement is every change that creates no relation.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn relation_names_created(change: &pbps_model::Change) -> Vec<TableName> {
+    use pbps_model::Change;
+    let mut out = match change {
+        Change::CreateTable { name, .. } => vec![name.clone()],
+        Change::CreateModule {
+            id: ModuleId::Named(name),
+            module,
+        } if module.kind == pbps_model::ModuleKind::View => vec![name.clone()],
+        _ => Vec::new(),
+    };
+    out.extend(index_names_created(change));
+    out
+}
+
+/// The index names this plan creates ([`index_names_created`]).
+fn created_index_names(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
+    cs.changes
+        .iter()
+        .flat_map(|p| index_names_created(&p.change))
+        .collect()
+}
+
+/// The index names a change creates, each in its table's schema (#1355):
 /// an added index, the index behind an added unique constraint or a named
 /// primary key, which PostgreSQL names after the constraint, and those a
 /// created table declares. An index shares the relation namespace with
@@ -342,37 +359,28 @@ pub(crate) fn created_relation_names(cs: &pbps_model::ChangeSet) -> Vec<TableNam
 /// its new name, which is the schema the index is created in.
 // The complement is every change that creates no index.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn created_index_names(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
+fn index_names_created(change: &pbps_model::Change) -> Vec<TableName> {
     use pbps_model::Change;
     let in_schema = |t: &TableName, name: &str| TableName::new(t.schema.clone(), name);
-    let mut out = Vec::new();
-    for p in &cs.changes {
-        match &p.change {
-            Change::AddIndex { table, name, .. } | Change::AddUnique { table, name, .. } => {
-                out.push(in_schema(table, name));
-            }
-            Change::SetPrimaryKey {
-                table,
-                to: Some(key),
-                ..
-            } => {
-                if let Some(name) = &key.name {
-                    out.push(in_schema(table, name));
-                }
-            }
-            Change::CreateTable { name, table, .. } => {
-                let named = table
-                    .primary_key
-                    .iter()
-                    .filter_map(|k| k.name.as_deref())
-                    .chain(table.unique.keys().map(String::as_str))
-                    .chain(table.indexes.keys().map(String::as_str));
-                out.extend(named.map(|n| in_schema(name, n)));
-            }
-            _ => {}
+    match change {
+        Change::AddIndex { table, name, .. } | Change::AddUnique { table, name, .. } => {
+            vec![in_schema(table, name)]
         }
+        Change::SetPrimaryKey {
+            table,
+            to: Some(key),
+            ..
+        } => key.name.iter().map(|name| in_schema(table, name)).collect(),
+        Change::CreateTable { name, table, .. } => table
+            .primary_key
+            .iter()
+            .filter_map(|k| k.name.as_deref())
+            .chain(table.unique.keys().map(String::as_str))
+            .chain(table.indexes.keys().map(String::as_str))
+            .map(|n| in_schema(name, n))
+            .collect(),
+        _ => Vec::new(),
     }
-    out
 }
 
 /// Refuses a name this plan creates that a sequence, an index or a composite
@@ -380,139 +388,46 @@ fn created_index_names(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
 /// inventory behind [`refuse_occupied_names`] does not report. One this plan
 /// frees first is not an occupant: an index it drops, and an index or owned
 /// sequence of a table it drops, which goes with its table.
-// The complement is every change that creates or frees no relation name.
-#[allow(clippy::wildcard_enum_match_arm)]
+///
+/// The occupants are replayed through the plan in its order ([`Occupant`]),
+/// and each name a change creates is compared with them as they are at that
+/// change, after its own drops (#1723). A rename moves what its table owns,
+/// and a cross-schema one carries it into the destination schema (#1084).
 pub(crate) fn refuse_uninventoried_occupants(
     cs: &pbps_model::ChangeSet,
     occupants: &[pbps_pg::catalog::NameOccupant],
     label: &str,
 ) -> anyhow::Result<()> {
-    use pbps_model::Change;
-    // The catalog read names every occupant and owner as the database does
-    // now, and the plan's changes on a table it also renames carry the new
-    // name (the differ sorts renames first). Each freeing change is read back
-    // to the catalog's name before it is compared, so a key dropped from a
-    // renamed table frees `<old>_pkey`, the name its index still has
-    // (#1082 review).
-    let renamed_from: BTreeMap<&TableName, &TableName> = cs
-        .changes
+    let mut present: Vec<Occupant<'_>> = occupants
         .iter()
-        .filter_map(|p| match &p.change {
-            Change::RenameTable { from, to, .. } => Some((to, from)),
-            _ => None,
+        .map(|found| Occupant {
+            found,
+            name: found.name.clone(),
+            owner: found.owner.clone(),
+            carried: None,
         })
         .collect();
-    let now = |t: &TableName| (*renamed_from.get(t).unwrap_or(&t)).clone();
-    // Names this plan frees before it creates anything: an index it drops,
-    // and the index behind a unique constraint or a primary key it drops,
-    // which PostgreSQL names after the constraint (an unnamed key's is
-    // `<table>_pkey`).
-    let freed: BTreeSet<TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::DropIndex { table, name } | Change::DropUnique { table, name, .. } => {
-                Some(TableName::new(now(table).schema, name.clone()))
-            }
-            Change::SetPrimaryKey {
-                table,
-                from: Some(key),
-                ..
-            } => {
-                let table = now(table);
-                let name = key
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| pbps_pg::implicit_primary_key_name(&table.name));
-                Some(TableName::new(table.schema, name))
-            }
-            _ => None,
-        })
-        .collect();
-    // Owners whose indexes and sequences leave the schema first: a table it
-    // drops, and one it moves to another schema, which `SET SCHEMA` takes
-    // them along with.
-    let released: BTreeSet<&TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::DropTable { name, .. } => Some(name),
-            Change::RenameTable { from, to, .. } if from.schema != to.schema => Some(from),
-            _ => None,
-        })
-        .collect();
-    // And a sequence whose owning column it drops, which goes with the column.
-    let dropped_columns: BTreeSet<(TableName, &str)> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::DropColumn { column, .. } => Some((now(&column.table), column.name.as_str())),
-            _ => None,
-        })
-        .collect();
-    let gone = |o: &pbps_pg::catalog::NameOccupant| {
-        freed.contains(&o.name)
-            || o.owner.as_ref().is_some_and(|t| released.contains(t))
-            || matches!((&o.owner, &o.owner_column), (Some(t), Some(c)) if dropped_columns.contains(&(t.clone(), c.as_str())))
-    };
-    let mut taken: Vec<String> = created_relation_names(cs)
-        .iter()
-        .flat_map(|name| {
-            occupants
-                .iter()
-                .filter(move |o| &o.name == name)
-                .filter(|o| !gone(o))
-                .map(move |o| match &o.owner {
-                    Some(owner) => format!(
-                        "`{name}`: the database already has {} `{name}` on `{owner}`",
-                        o.kind
-                    ),
-                    None => format!("`{name}`: the database already has {} `{name}`", o.kind),
-                })
-        })
-        .collect();
-    // And what a cross-schema rename carries into its destination (#1084):
-    // `SET SCHEMA` moves a table's indexes and owned sequences along under
-    // their own names, before any table or view is created. One the plan
-    // drops first stays behind, as above. A view the plan rebuilds counts
-    // here, unlike above: its drop runs before the rename, so a carried
-    // object takes the name its re-creation then needs.
-    let created: BTreeSet<TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::CreateTable { name, .. } => Some(name.clone()),
-            Change::CreateModule {
-                id: ModuleId::Named(name),
-                module,
-            } if module.kind == pbps_model::ModuleKind::View => Some(name.clone()),
-            _ => None,
-        })
-        .chain(created_index_names(cs))
-        .collect();
-    let still_owned = |o: &pbps_pg::catalog::NameOccupant| {
-        !freed.contains(&o.name)
-            && !matches!((&o.owner, &o.owner_column), (Some(t), Some(c)) if dropped_columns.contains(&(t.clone(), c.as_str())))
-    };
+    let mut created: BTreeSet<TableName> = BTreeSet::new();
+    let mut taken: Vec<String> = Vec::new();
     for p in &cs.changes {
-        let Change::RenameTable { from, to, .. } = &p.change else {
-            continue;
-        };
-        if from.schema == to.schema {
-            continue;
-        }
-        for o in occupants
-            .iter()
-            .filter(|o| o.owner.as_ref() == Some(from) && still_owned(o))
-        {
-            let carried = TableName::new(to.schema.clone(), o.name.name.clone());
-            if created.contains(&carried) {
-                taken.push(format!(
-                    "`{carried}`: this plan moves {} `{}` on `{from}` there first, with the \
-                     rename of `{from}` to `{to}`",
-                    o.kind, o.name
-                ));
+        present.retain(|o| !o.freed_by(&p.change));
+        if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
+            for o in &mut present {
+                // `SET SCHEMA` refuses to carry one onto a name the plan
+                // already created there.
+                if o.moved(from, to) && created.contains(&o.name) {
+                    taken.push(o.taken());
+                }
             }
+        }
+        for name in relation_names_created(&p.change) {
+            taken.extend(
+                present
+                    .iter()
+                    .filter(|o| o.name == name)
+                    .map(Occupant::taken),
+            );
+            created.insert(name);
         }
     }
     if taken.is_empty() {
@@ -525,6 +440,94 @@ pub(crate) fn refuse_uninventoried_occupants(
         taken.len(),
         taken.join("\n  ")
     );
+}
+
+/// A [`pbps_pg::catalog::NameOccupant`] as the plan has left it so far: its
+/// name and its owner's as they are at that point. A change matches it by
+/// the name the change carries, so one emitted before a rename names the
+/// table as it was, and one after it as it is (`rename_order` emits either,
+/// #1723).
+struct Occupant<'a> {
+    found: &'a pbps_pg::catalog::NameOccupant,
+    name: TableName,
+    owner: Option<TableName>,
+    /// The cross-schema rename that last carried it, by its two names.
+    carried: Option<(TableName, TableName)>,
+}
+
+impl Occupant<'_> {
+    /// Whether `change` takes it away: an index it drops, a unique
+    /// constraint's or a primary key's it drops, and what a table or a
+    /// column it drops owns. Anything else, a dropped column's indexes among
+    /// them, is kept, which can refuse a plan the engine would take and
+    /// never takes one it would refuse.
+    // The complement is every change that frees no occupant.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn freed_by(&self, change: &pbps_model::Change) -> bool {
+        use pbps_model::Change;
+        let owned_by = |t: &TableName| self.owner.as_ref() == Some(t);
+        let at = |t: &TableName, name: &str| self.name.schema == t.schema && self.name.name == name;
+        match change {
+            Change::DropIndex { table, name } | Change::DropUnique { table, name } => {
+                at(table, name)
+            }
+            // A connected plan reads each key with the name its index has,
+            // a numbered `<table>_pkey1` included (measured, #1723). An
+            // unnamed one's is named after its table as the catalog read it,
+            // which a rename does not change (#1082 review).
+            Change::SetPrimaryKey {
+                table,
+                from: Some(key),
+                ..
+            } => match &key.name {
+                Some(name) => at(table, name),
+                None => {
+                    owned_by(table)
+                        && self.found.owner.as_ref().is_some_and(|catalog| {
+                            self.found.name.name
+                                == pbps_pg::implicit_primary_key_name(&catalog.name)
+                        })
+                }
+            },
+            Change::DropTable { name, .. } => owned_by(name),
+            Change::DropColumn { column, .. } => {
+                owned_by(&column.table)
+                    && self.found.owner_column.as_deref() == Some(column.name.as_str())
+            }
+            _ => false,
+        }
+    }
+
+    /// Follows the rename of its owner: the owner takes the new name, and a
+    /// move to another schema takes it along under its own name. Whether
+    /// this rename carried it into another schema.
+    fn moved(&mut self, from: &TableName, to: &TableName) -> bool {
+        if self.owner.as_ref() != Some(from) {
+            return false;
+        }
+        self.owner = Some(to.clone());
+        if from.schema == to.schema {
+            return false;
+        }
+        self.name.schema.clone_from(&to.schema);
+        self.carried = Some((from.clone(), to.clone()));
+        true
+    }
+
+    /// The refusal for a name it holds.
+    fn taken(&self) -> String {
+        let (name, kind, found) = (&self.name, self.found.kind, &self.found.name);
+        match (&self.carried, &self.found.owner) {
+            (Some((from, to)), _) => format!(
+                "`{name}`: this plan moves {kind} `{found}` on `{from}` there first, with the \
+                 rename of `{from}` to `{to}`"
+            ),
+            (None, Some(owner)) => {
+                format!("`{name}`: the database already has {kind} `{name}` on `{owner}`")
+            }
+            (None, None) => format!("`{name}`: the database already has {kind} `{name}`"),
+        }
+    }
 }
 
 /// The partitions this plan creates `UNLOGGED`, each with its parent (#1595).
@@ -10890,6 +10893,89 @@ mod tests {
             owner_column: None,
         };
         refused(vec![set_key(None)], &pkey).unwrap();
+    }
+
+    /// #1723: a change names a table as it is at that point of the plan,
+    /// and `rename_order` puts a drop before a rename or after it, so each
+    /// occupant is followed through the renames in the plan's order. With
+    /// `s2.b -> s3.c` then `s1.a -> s2.b`, an index dropped from `s2.b`
+    /// before both is the original `s2.b`'s, which then never reaches `s3`,
+    /// while `s1.a`'s holds its name in `s1` until it moves to `s2`.
+    #[test]
+    fn an_occupant_is_matched_by_the_name_its_owner_has_at_each_change() {
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        use pbps_pg::catalog::NameOccupant;
+        let (a, b, c) = (
+            TableName::new("s1", "a"),
+            TableName::new("s2", "b"),
+            TableName::new("s3", "c"),
+        );
+        let index: Box<pbps_model::Index> =
+            Box::new(serde_json::from_str(r#"{"columns": [{"name": "n"}]}"#).unwrap());
+        let add_index = |table: &TableName| {
+            PlannedChange::new(Change::AddIndex {
+                table: table.clone(),
+                name: "n_pkey".into(),
+                index: index.clone(),
+                clustered: false,
+            })
+        };
+        let rename = |from: &TableName, to: &TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, &from.to_string(), 0),
+                from: from.clone(),
+                to: to.clone(),
+                defaults: Vec::new(),
+            })
+        };
+        let moves = || {
+            vec![
+                PlannedChange::new(Change::DropIndex {
+                    table: b.clone(),
+                    name: "n_pkey".into(),
+                }),
+                rename(&b, &c),
+                rename(&a, &b),
+            ]
+        };
+        let held = |owner: &TableName| NameOccupant {
+            name: TableName::new(owner.schema.clone(), "n_pkey"),
+            kind: "index",
+            owner: Some(owner.clone()),
+            owner_column: None,
+        };
+        let occupants = [held(&a), held(&b)];
+        let refused = |changes: Vec<PlannedChange>| {
+            refuse_uninventoried_occupants(&ChangeSet { changes }, &occupants, "prod")
+                .map_err(|e| e.to_string())
+        };
+
+        let mut in_s3 = moves();
+        in_s3.push(add_index(&c));
+        refused(in_s3).expect("the dropped index never reaches s3");
+        let x = TableName::new("s1", "x");
+        let mut before = vec![add_index(&x)];
+        before.extend(moves());
+        let e = refused(before).unwrap_err();
+        assert!(
+            e.contains("`s1.n_pkey`: the database already has index `s1.n_pkey` on `s1.a`"),
+            "{e}"
+        );
+        let mut in_s2 = moves();
+        in_s2.push(add_index(&b));
+        let e = refused(in_s2).unwrap_err();
+        assert!(
+            e.contains(
+                "`s2.n_pkey`: this plan moves index `s1.n_pkey` on `s1.a` there first, with \
+                 the rename of `s1.a` to `s2.b`"
+            ),
+            "{e}"
+        );
+
+        // Negative: once `s1.a` has moved, its name in `s1` is free.
+        let mut after = moves();
+        after.push(add_index(&x));
+        refused(after).expect("s1.a's index left s1 with it");
     }
 
     /// #1084: a cross-schema rename carries its table's indexes and owned
