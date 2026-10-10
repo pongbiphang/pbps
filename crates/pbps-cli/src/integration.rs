@@ -433,6 +433,11 @@ mod tests {
                 serde_json::json!({"kind": "server", "url_env": "S", "baseline": ""}),
                 false,
             ),
+            // Null is an omitted baseline, in both (#1673 review).
+            (
+                serde_json::json!({"kind": "server", "url_env": "S", "baseline": null}),
+                true,
+            ),
             (
                 serde_json::json!({"kind": "docker", "image": "pg:18", "baseline": "db/baseline.sql"}),
                 false,

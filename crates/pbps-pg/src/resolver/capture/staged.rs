@@ -200,8 +200,13 @@ fn shapes(
             "pg_class" => {
                 relations.insert(root.clone());
             }
+            // A composite type's attributes, and their order, which a row
+            // constructor cast to it binds by: the backing relation holds it.
             "pg_type" => {
                 if let Some(relation) = reference(&input.properties, "typrelid") {
+                    if let Some(backing) = inputs.get(&relation) {
+                        shapes.insert(relation.clone(), projected(&relation, &backing.properties));
+                    }
                     relations.insert(relation);
                 }
             }
@@ -519,6 +524,41 @@ mod tests {
                 &described
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_composite_type_is_compared_by_the_order_of_its_attributes() {
+        let pair = id("pg_type", &["ext", "pair"], vec![]);
+        let backing = id("pg_class", &["ext", "pair"], vec![]);
+        let roots = BTreeSet::from([pair.clone()]);
+        let composite = |order: [&str; 2]| {
+            let mut inputs = BTreeMap::from([
+                (
+                    pair.clone(),
+                    input(json!({"typtype": "c", "typrelid": backing})),
+                ),
+                (
+                    backing.clone(),
+                    input(json!({"relkind": "c", "column_order": order})),
+                ),
+            ]);
+            for name in ["a", "b"] {
+                inputs.insert(
+                    id("column", &[name], vec![backing.clone()]),
+                    input(json!({"attname": name})),
+                );
+            }
+            inputs
+        };
+        assert_eq!(
+            shapes(&composite(["a", "b"]), &roots),
+            shapes(&composite(["a", "b"]), &roots)
+        );
+        // Negative: the same attributes in another order differ.
+        assert_ne!(
+            shapes(&composite(["a", "b"]), &roots),
+            shapes(&composite(["b", "a"]), &roots)
         );
     }
 

@@ -423,7 +423,11 @@ impl Run<'_> {
         let links = baseline::links(target)
             .await
             .map_err(db("the target's recorded dependencies"))?;
-        let chains = baseline::chains(&links, &desired_managed, &base_managed);
+        let kept = self.routine_oids(target, binding.desired).await?;
+        let mut any = self.routine_oids(target, binding.base).await?;
+        any.extend(kept.iter().copied());
+        let routines = baseline::ManagedRoutines { desired: kept, any };
+        let chains = baseline::chains(&links, &desired_managed, &base_managed, &routines);
         if !chains.is_empty() {
             return Err(Error::Baseline(chains));
         }
@@ -1082,6 +1086,31 @@ pub fn declared_standard(declared: Option<&pbps_config::resolver::ScratchStandar
 /// leftover, a polluted template, or someone else's work. Compiling over it
 /// would bind to whatever it is.
 impl Run<'_> {
+    /// The OIDs on the target of the routines `schema` declares, each found
+    /// by its declared signature under the path its declaration compiles
+    /// with.
+    async fn routine_oids(
+        &self,
+        target: &mut Conn,
+        schema: &pbps_model::Schema,
+    ) -> Result<BTreeSet<u32>, Error> {
+        let declared = schema
+            .modules
+            .iter()
+            .filter(|(id, _)| matches!(id, pbps_model::ModuleId::Routine(_)))
+            .map(|(id, module)| (id.clone(), module.kind))
+            .collect();
+        let signatures: Vec<_> =
+            engine::dropped_signatures(&self.request.write_path_extras, declared)
+                .map_err(Error::Binding)?
+                .into_iter()
+                .filter_map(|(_, signature)| signature)
+                .collect();
+        baseline::routine_oids(target, &signatures)
+            .await
+            .map_err(|error| Error::Read(format!("the target's managed routines: {error}")))
+    }
+
     /// Compares what the baseline created with the target, and reproduces
     /// the target deployer's USAGE on each schema it created (#1673).
     async fn stage(

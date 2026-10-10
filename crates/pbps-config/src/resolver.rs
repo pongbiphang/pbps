@@ -251,11 +251,12 @@ fn settings<'de, D: serde::Deserializer<'de>>(
 fn baseline_path<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<std::path::PathBuf>, D::Error> {
-    let value = String::deserialize(d)?;
-    if value.is_empty() {
-        Err(serde::de::Error::custom("a baseline names its SQL file"))
-    } else {
-        Ok(Some(value.into()))
+    // `null` is what the published schema allows for an omitted baseline.
+    match Option::<String>::deserialize(d)? {
+        Some(value) if value.is_empty() => {
+            Err(serde::de::Error::custom("a baseline names its SQL file"))
+        }
+        value => Ok(value.map(Into::into)),
     }
 }
 
@@ -484,16 +485,24 @@ mod tests {
             panic!("a server profile");
         };
         assert_eq!(baseline.as_deref(), Some(Path::new("db/baseline.sql")));
-        // Negative: omitted, there is none.
-        let config = Config::parse(
-            "dialect: postgres\nresolvers:\n  s: {kind: server, url_env: S}\n",
-            Path::new("pbps.yml"),
-        )
-        .unwrap();
-        assert!(matches!(
-            &config.resolvers["s"],
-            ResolverProfile::Server { baseline: None, .. }
-        ));
+        // Negative: omitted or null, there is none.
+        for entry in [
+            "{kind: server, url_env: S}",
+            "{kind: server, url_env: S, baseline: null}",
+        ] {
+            let config = Config::parse(
+                &format!("dialect: postgres\nresolvers:\n  s: {entry}\n"),
+                Path::new("pbps.yml"),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    &config.resolvers["s"],
+                    ResolverProfile::Server { baseline: None, .. }
+                ),
+                "{entry}"
+            );
+        }
     }
 
     #[test]

@@ -428,12 +428,13 @@ pub struct Link {
     pub named: Address,
 }
 
-/// An object as `pg_identify_object_as_address` gives it.
+/// An object as `pg_identify_object_as_address` gives it, with its OID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Address {
     pub described: String,
     pub kind: String,
     pub names: Vec<String>,
+    pub oid: u32,
 }
 
 /// Every one-hop link through a relation's row type or a parent on the
@@ -451,6 +452,9 @@ pub async fn links(conn: &mut impl QueryConnection) -> Result<Vec<Link>, DbError
             // comma or a quote.
             names: serde_json::from_str(&text(row, &format!("{prefix}_names"))?)
                 .map_err(|_| DbError::BadRow(format!("{prefix}_names was no list of names")))?,
+            oid: text(row, &format!("{prefix}_oid"))?
+                .parse()
+                .map_err(|_| DbError::BadRow(format!("{prefix}_oid was not a number")))?,
         })
     };
     rows.iter()
@@ -527,6 +531,8 @@ link AS ( \
      AND NOT (b.classid = s.classid AND b.objid = s.objid) \
 ) \
 SELECT pg_catalog.pg_describe_object(l.binder_class, l.binder_oid, 0) AS binder_described, \
+       l.binder_oid::text AS binder_oid, l.middle_oid::text AS middle_oid, \
+       l.relation::text AS named_oid, \
        bi.type AS binder_kind, pg_catalog.array_to_json(bi.object_names)::text AS binder_names, \
        pg_catalog.pg_describe_object(l.middle_class, l.middle_oid, 0) AS middle_described, \
        mi.type AS middle_kind, pg_catalog.array_to_json(mi.object_names)::text AS middle_names, \
@@ -540,6 +546,49 @@ SELECT pg_catalog.pg_describe_object(l.binder_class, l.binder_oid, 0) AS binder_
     'pg_catalog.pg_class'::pg_catalog.regclass, l.relation, 0) ni \
  ORDER BY 1, 4, 7";
 
+/// The managed routines' OIDs on the connected database: each declared
+/// signature looked up with the engine's own signature lookup under the
+/// write path its declaration is compiled with. A routine is managed by its
+/// signature, not its name, since an unmanaged overload may share the name
+/// (#1673 review). A signature naming a type that does not exist yet finds
+/// nothing (measured on 16 and 18).
+pub async fn routine_oids(
+    conn: &mut impl QueryConnection,
+    signatures: &[super::capture::DroppedSignature],
+) -> Result<BTreeSet<u32>, DbError> {
+    let mut oids = BTreeSet::new();
+    for signature in signatures {
+        // One statement: the path it sets is local to its own transaction.
+        let rows = conn
+            .query(&format!(
+                "SELECT pg_catalog.to_regprocedure({})::pg_catalog.oid::text AS oid \
+                   FROM (SELECT pg_catalog.set_config('search_path', {}, true)) p",
+                crate::emit::value_literal(&signature.spelled),
+                crate::emit::value_literal(&signature.path)
+            ))
+            .await?;
+        if let Some(oid) = rows
+            .first()
+            .and_then(|row| row.try_get::<&str>("oid").ok().flatten())
+        {
+            oids.insert(
+                oid.parse()
+                    .map_err(|_| DbError::BadRow("a routine OID was not a number".into()))?,
+            );
+        }
+    }
+    Ok(oids)
+}
+
+/// The managed routines by OID on the target.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedRoutines {
+    /// What the desired side declares.
+    pub desired: BTreeSet<u32>,
+    /// What either side declares.
+    pub any: BTreeSet<u32>,
+}
+
 /// The chains among `links`: a binder `desired` keeps, through an object
 /// outside the managed set, to a relation either side manages. Each names
 /// its remedies (SPEC §9.3.2).
@@ -547,25 +596,28 @@ pub fn chains(
     links: &[Link],
     desired: &super::capture::Managed,
     base: &super::capture::Managed,
+    routines: &ManagedRoutines,
 ) -> Vec<String> {
-    let relation = |managed: &super::capture::Managed, address: &Address| match (
-        address.kind.as_str(),
-        address.names.as_slice(),
-    ) {
-        (
-            "table" | "view" | "materialized view" | "foreign table" | "composite type"
-            | "sequence" | "index",
-            [schema, name],
-        ) => managed.relation(schema, name),
-        ("function" | "procedure" | "aggregate", [schema, name]) => managed.routine(schema, name),
-        _ => false,
+    let holds =
+        |managed: &super::capture::Managed, routines: &BTreeSet<u32>, address: &Address| match (
+            address.kind.as_str(),
+            address.names.as_slice(),
+        ) {
+            (
+                "table" | "view" | "materialized view" | "foreign table" | "composite type"
+                | "sequence" | "index",
+                [schema, name],
+            ) => managed.relation(schema, name),
+            ("function" | "procedure" | "aggregate", _) => routines.contains(&address.oid),
+            _ => false,
+        };
+    let kept = |address: &Address| holds(desired, &routines.desired, address);
+    let managed = |address: &Address| {
+        holds(desired, &routines.any, address) || holds(base, &routines.any, address)
     };
-    let managed = |address: &Address| relation(desired, address) || relation(base, address);
     links
         .iter()
-        .filter(|link| {
-            relation(desired, &link.binder) && !managed(&link.middle) && managed(&link.named)
-        })
+        .filter(|link| kept(&link.binder) && !managed(&link.middle) && managed(&link.named))
         .map(|link| {
             format!(
                 "{} binds {}, whose shape names the managed {}: no baseline can stage it before \
@@ -804,6 +856,7 @@ mod tests {
             described: described.into(),
             kind: kind.into(),
             names: names.iter().map(|s| s.to_string()).collect(),
+            oid: 0,
         }
     }
 
@@ -829,13 +882,40 @@ mod tests {
         ];
         let desired = managed(&["app.m", "app.own"], &["app.v"]);
         let base = managed(&["app.m", "app.own"], &["app.v", "app.gone"]);
-        let chains = chains(&links, &desired, &base);
+        let none = ManagedRoutines::default();
+        let chains = chains(&links, &desired, &base, &none);
         assert_eq!(chains.len(), 1, "{chains:?}");
         assert!(chains[0].starts_with(
             "view app.v binds table ext.e, whose shape names the managed table app.m"
         ));
         // Negative: a named relation nobody manages is no chain.
-        assert!(super::chains(&links, &managed(&[], &["app.v"]), &managed(&[], &[])).is_empty());
+        assert!(
+            super::chains(&links, &managed(&[], &["app.v"]), &managed(&[], &[]), &none).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_routine_binder_is_managed_by_its_overload_not_its_name() {
+        let routine = |oid| Link {
+            binder: Address {
+                oid,
+                ..address("function app.f(ext.e)", "function", &["app", "f"])
+            },
+            middle: address("table ext.e", "table", &["ext", "e"]),
+            named: address("table app.m", "table", &["app", "m"]),
+        };
+        let tables = managed(&["app.m"], &[]);
+        let routines = ManagedRoutines {
+            desired: BTreeSet::from([5]),
+            any: BTreeSet::from([5]),
+        };
+        assert_eq!(
+            chains(&[routine(5)], &tables, &tables, &routines).len(),
+            1,
+            "the declared overload"
+        );
+        // Negative: an unmanaged overload of the same name is no binder.
+        assert!(chains(&[routine(7)], &tables, &tables, &routines).is_empty());
     }
 
     #[tokio::test]

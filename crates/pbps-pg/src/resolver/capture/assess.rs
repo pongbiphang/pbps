@@ -120,12 +120,6 @@ impl Managed {
         self.relations.contains(&key) || self.indexes.contains(&key)
     }
 
-    /// Whether a routine of this name is managed, in any overload.
-    pub fn routine(&self, schema: &str, name: &str) -> bool {
-        self.routines
-            .contains_key(&(schema.to_owned(), name.to_owned()))
-    }
-
     /// Whether an object a baseline created holds a managed name: a
     /// relation, index or row type the project declares (#1673). A routine
     /// is not matched by name, since an unmanaged overload may share one; a

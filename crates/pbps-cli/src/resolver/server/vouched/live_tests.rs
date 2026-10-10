@@ -1751,14 +1751,20 @@ async fn vouched_compares_an_external_table_without_its_foreign_keys_and_trigger
 async fn vouched_refuses_a_baseline_that_differs_from_the_target() {
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
-        let target_db = staging_target(&mut fixture, &guarded_target()).await;
+        let mut setup = guarded_target();
+        setup.push(format!(
+            "CREATE TYPE {EXTERNAL}.pair AS (a integer, b text)"
+        ));
+        let target_db = staging_target(&mut fixture, &setup).await;
         let (login, scratch_db) = fixture.confined().await;
         let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
         let key = ProjectKey::new(true);
-        // A column of another type, and a unique key left out.
+        // A column of another type, a unique key left out, and a composite
+        // type's attributes in another order.
         let baseline = format!(
             "CREATE SCHEMA {EXTERNAL};\n\
-             CREATE TABLE {EXTERNAL}.t (id bigint PRIMARY KEY, name text, p integer, n integer);"
+             CREATE TABLE {EXTERNAL}.t (id bigint PRIMARY KEY, name text, p integer, n integer);\n\
+             CREATE TYPE {EXTERNAL}.pair AS (b text, a integer);"
         );
         let refused = baseline_refusal(
             produce_staged(
@@ -1780,6 +1786,12 @@ async fn vouched_refuses_a_baseline_that_differs_from_the_target() {
         );
         assert!(
             refused.contains(&format!("the target has index {EXTERNAL}.t_name_key")),
+            "{server}: {refused}"
+        );
+        assert!(
+            refused.contains(&format!(
+                "the baseline's relation {EXTERNAL}.pair differs from the target's in column_order"
+            )),
             "{server}: {refused}"
         );
         assert_eq!(left.1, 0, "{server}: a refused run empties its database");
@@ -2225,4 +2237,56 @@ async fn vouched_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates
     .await;
     target.drop().await;
     assert_staged(result, "t", "a deployer with USAGE");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_takes_an_unmanaged_overload_of_a_managed_routine_for_no_chain() {
+    // `f(integer)` is managed; `f(e)` shares its name and is not, and binds
+    // an external table whose column is of a managed table's row type.
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let setup = vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!("CREATE TABLE {MANAGED}.m (id integer)"),
+        format!("CREATE TABLE {EXTERNAL}.e (id integer, m {MANAGED}.m)"),
+        format!("CREATE FUNCTION {MANAGED}.f(integer) RETURNS integer LANGUAGE sql RETURN $1"),
+        format!(
+            "CREATE FUNCTION {MANAGED}.f({EXTERNAL}.e) RETURNS integer LANGUAGE sql RETURN ($1).id"
+        ),
+        format!("CREATE VIEW {MANAGED}.a AS SELECT 1 AS x"),
+    ];
+    let target_db = staging_target(&mut target, &setup).await;
+    let routine = |mut schema: pbps_model::Schema| {
+        schema.modules.insert(
+            format!("{MANAGED}.f(integer)").parse().unwrap(),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::Function,
+                description: None,
+                definition: "(integer) RETURNS integer LANGUAGE sql RETURN $1".into(),
+            },
+        );
+        schema
+    };
+    let inputs = Inputs::from_pair((
+        routine(declared(&[("a", "SELECT 1 AS x")], &["m"])),
+        routine(declared(
+            &[("a", "SELECT 1 AS x"), ("b", "SELECT 2 AS y")],
+            &["m"],
+        )),
+    ));
+    let key = ProjectKey::new(true);
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &format!("CREATE SCHEMA {EXTERNAL};"),
+    )
+    .await;
+    target.drop().await;
+    if let Err(error) = result {
+        panic!("{error}");
+    }
 }
