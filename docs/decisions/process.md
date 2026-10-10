@@ -1074,3 +1074,27 @@ no direction and direction for another PR/action. Removing the early disposition
 must restore false failure; removing only the authorization alternative must
 restore false refusal. Keep changed-content, unknown-evidence and timestamp
 boundary controls so neither alternative weakens the other checks.
+
+<a id="dec-1133-1"></a>
+
+**DEC-1133.1. Release qualification executes the hashed artifact in a native,
+source-free consumer.** A host test build proves neither the distributed
+target's linkage nor the absence of an accidental runtime dependency. Build the
+locked musl/MSVC release, inspect its linkage/imports, and copy only that
+artifact and generated user inputs into the consumer. Keep Git as the existing
+provenance prerequisite; do not add Cargo or database client packages to make a
+broken artifact pass. Record the artifact hash again inside the consumer and
+require both engines' complete named cases before publishing qualification
+evidence. An unreachable fixture is not a successful TLS refusal: the refusal
+must identify a TLS handshake or certificate error, followed by restored-trust
+success.
+
+Windows uses native owned PostgreSQL and SQL Server fixtures on a disposable
+administrator runner and a process-isolated Windows consumer. Hosted WSL tooling
+does not prove a supported Linux container backend, and a new remote-fixture
+service would expand the scope without qualifying another product property. The
+native fixture owns a unique SQL instance, private PostgreSQL data directory,
+personal-store server certificates and narrowly scoped firewall rules; its
+cleanup record survives setup failure. Client trust stays in explicit PEM files.
+This ordinary CLI qualification does not extend frozen peer-verification
+profiles or lift unsupported Windows resolver/compose refusals.

@@ -236,3 +236,66 @@ each change: remove each generation guard independently, break a used DOM
 selector, remove the sandbox or token header, or substitute unsafe insertion.
 Restore the source, rebuild and pass the same selected case before accepting
 the evidence. A build/setup failure is not a causal browser failure.
+
+## Standalone release artifacts
+
+`release-linux` and `release-windows` build `pbps-cli --bin pbps` with
+`--locked --release` for `x86_64-unknown-linux-musl` and
+`x86_64-pc-windows-msvc`. Windows explicitly enables the static CRT. The Linux
+ELF must have neither an interpreter nor a dynamic `NEEDED` entry; MSVC import
+inspection refuses redistributable C++ runtimes and database/TLS client DLLs.
+The required gate waits for both jobs. A compiler target alone is not runtime
+qualification.
+
+`scripts/qualify-release.py` accepts an already-built binary. It hashes that
+file, copies it into a generated staging directory and verifies its hash again
+inside a native consumer container. Only that staging directory is mounted:
+the product checkout, Cargo cache and producer toolchain are absent. The Linux
+consumer adds Git to a pinned Alpine image; the Windows consumer copies Git
+into a pinned Server Core image. Git is the existing provenance prerequisite,
+not a database driver. Neither recipe installs ODBC, database clients or Rust.
+Windows system DLLs and the base operating system remain available. The
+fixture-side administration tools never enter the consumer.
+
+Each engine executes twelve named cases in order: identity, offline preview,
+trusted bootstrap, wrong-name refusal, unrelated-root refusal, restored trust,
+connected saved plan, wrong-checksum refusal, unchanged schema and ledger after
+that refusal, approved apply, convergence and the two-entry ledger. Refusals
+must identify a TLS handshake/certificate error or the checksum as appropriate; a missing executable,
+unreachable server or unrelated CLI error does not count. Both engine case
+lists must be complete before the evidence file is written. Evidence records
+the artifact and lockfile hashes, compiler, consumer image identity, actual
+engine versions and completed cases. A changed artifact cannot inherit an old
+consumer result.
+
+Linux prerequisites are Docker, OpenSSL, Git, Python 3.12+, Rust's musl target
+and a musl C compiler. Build outputs and temporary files belong outside the
+checkout. For example, after building the locked release binary:
+
+```sh
+mkdir -p "$TMPDIR/release-consumer"
+cp scripts/release-consumer.Dockerfile "$TMPDIR/release-consumer/Dockerfile"
+docker build -t pbps-release-consumer "$TMPDIR/release-consumer"
+python3 scripts/qualify-release.py \
+  --binary "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/pbps" \
+  --consumer-image pbps-release-consumer \
+  --evidence "$TMPDIR/release-evidence.json"
+```
+
+Windows qualification requires a disposable administrator runner with native
+PostgreSQL tools (`PGBIN`), OpenSSL, MSVC inspection tools and a Windows Docker
+daemon capable of process-isolated Server Core 2025 containers. It does not
+assume WSL2 or a Linux Docker backend. `release-windows-fixture.ps1` is restricted
+to disposable GitHub Windows runners. It installs a unique SQL Server Express
+2022 instance from SHA-256-pinned, signature-checked Microsoft media, creates
+an owned PostgreSQL cluster and publishes only their two ports to the Windows
+container NAT subnet. Both use a disposable certificate. No client trust root
+is installed in the host trust store: the consumers select their PEM roots
+explicitly. The server's certificate/private key uses the personal store;
+cleanup removes the recorded certificates, instance, cluster and firewall rules.
+The always-run cleanup reads an ownership record even after setup failure.
+
+These are ordinary CLI TLS flows. They do not extend frozen peer-verification
+profiles, enable resolver/compose operations on Windows, qualify macOS, or
+replace the separate server-version/edition matrix. A missing native fixture
+fails the job; cross-compilation and Wine cannot stand in for its execution.
