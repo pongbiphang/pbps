@@ -241,7 +241,9 @@ pub async fn resolve(request: &Request<'_>) -> Result<pbps_model::ChangeSet, Ref
 /// it is never a file elsewhere on the planning machine: an absolute path, a
 /// `..` or a symlink that leads outside the root is refused. Judged on the
 /// resolved path, not lexically, because a symlink inside the root can point
-/// anywhere. The file read is the one judged.
+/// anywhere. The file read is the one judged. Linux only, with the producer
+/// that reads it.
+#[cfg(target_os = "linux")]
 fn read_baseline(root: &std::path::Path, path: &std::path::Path) -> Result<String, String> {
     let unreadable = |error: std::io::Error| format!("could not be read: {error}");
     let root = root.canonicalize().map_err(unreadable)?;
@@ -441,7 +443,10 @@ mod tests {
     use super::*;
     use pbps_model::{Column, Hints, IdsFile, Module, ModuleKind, Schema, Table};
 
+    // Linux only: the reader lives with the Linux producer, and the fixture
+    // makes Unix symlinks.
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_baseline_is_read_only_from_under_the_project_root() {
         use std::path::{Path, PathBuf};
         let dir = std::env::temp_dir().join(format!(
