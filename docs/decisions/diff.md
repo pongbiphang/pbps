@@ -4438,8 +4438,8 @@ detaches is gone in class 6, and a new one starts empty.
      false, `coninhcount` 1), every column is inherited with its parent's
      default and generation, and the key and indexes are clones.
 3. A `DO` block that reads the parent's stored columns and its key from the
-   catalog when it runs, then moves the rows with one `DELETE ... RETURNING`
-   into an `INSERT`.
+   catalog when it runs, asks again what the delete would set off (below),
+   then moves the rows with one `DELETE ... RETURNING` into an `INSERT`.
    - A column change earlier in the plan cannot leave the column list stale.
    - A generated column is the engine's to compute, so it is not copied.
    - The predicate is the one the #1171 probe counts with
@@ -4469,6 +4469,11 @@ on 16 and 18:
 - A foreign key referencing the parent has a clone on every partition, the
   DEFAULT among them. With `ON DELETE CASCADE` the move deleted the
   referencing rows; with `NO ACTION` the move refused.
+- A key to a table above the parent reaches the DEFAULT the same way, down a
+  chain of clones. The last references the DEFAULT itself and owns the
+  delete trigger on it. With that trigger disabled, or `O` under
+  `session_replication_role = replica`, the delete left the referencing rows
+  alone.
 - A row trigger cloned from the parent ran once per moved row, and the
   insert into the plain table fires nothing to answer it.
 - A statement trigger or rule on the DEFAULT itself ran even when no row
@@ -4477,10 +4482,14 @@ on 16 and 18:
 So the apply's pre-flight asks four counts, under the names the catalog
 has before the plan runs:
 - **The rows referencing a moved row.** These are rows referencing the
-  DEFAULT's rows in the range, through a key to the parent or to the DEFAULT,
-  counted as #1171 counts the rows referencing a dropped partition. A key
-  or a table the plan removes first is left out. A key with nothing pointing
-  at a moved row fires nothing, so it does not refuse the plan.
+  DEFAULT's rows in the range, counted as #1171 counts the rows referencing
+  a dropped partition. A key is asked down its clones for the DEFAULT's own
+  delete trigger, firing in this session, rather than by the table it names.
+  `confrelid IN (parent, default)` missed a key to a grandparent and
+  counted one whose action is off (#1763 review). A key or a table the plan
+  removes first is left out, and so are the rows of a referencing table's
+  partitions the plan drops first, as for a detach. A key with nothing
+  pointing at a moved row fires nothing, so it does not refuse the plan.
 - **The referencing tables the session cannot fully read.** These are
   tables with such a key on which row-level security is active, or that
   the session has no `SELECT` on. They are counted when there are rows to
@@ -4503,6 +4512,16 @@ has before the plan runs:
 
 Any of them refuses by name, with the remedy #1171 gave: repoint or delete
 the rows, or drop or disable the trigger, or move the rows, and plan again.
+
+**Asked again inside the statement** (#1763 review). A probe that cannot run
+is reported as unchecked and the apply goes on (SPEC 7.5): the engine
+enforces, inside the transaction, what the probe asked. Here the engine enforces nothing: a cascade
+is the engine doing what it was told. So the `DO` block asks the same four
+questions before its delete, from the catalog as the plan leaves it at that
+point, and raises over any of them. An answer it cannot get, such as a
+referencing table it has no `SELECT` on, is an error too. Either way the
+statement aborts, and the plan with it, before a row moves. The pre-flight
+stays: it refuses before any statement runs, and names the rows.
 
 The names matter. A parent renamed in the same plan (DEC-1690.1 refuses only
 attaches, detaches and drops beside a rename) is found under its old name.

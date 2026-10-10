@@ -3924,7 +3924,7 @@ fn partition_probes(
             };
             let gone = dropped_triggers(changes, &stored, &parent);
             for probe in [
-                default_reference_probe(name, &parent, &stored, names, from, to),
+                default_reference_probe(name, &parent, &stored, names, &dropped_before, from, to),
                 default_hidden_referencers_probe(name, &parent, &stored, names, from, to),
                 default_trigger_probe(name, &parent, &stored, &gone, from, to),
                 default_statement_probe(name, &stored, &gone),
@@ -4133,9 +4133,19 @@ fn default_reference_probe(
     parent: &TableName,
     default: &TableName,
     names: &AsStored,
+    dropped_before: &[&TableName],
     from: &[pbps_model::BoundDatum],
     to: &[pbps_model::BoundDatum],
 ) -> Result<Probe, DialectError> {
+    // The rows of a referencing table's partitions dropped before the move
+    // are gone by then, as for a detach (#1763 review).
+    let mut gone_rows = String::new();
+    for earlier in dropped_before {
+        gone_rows.push_str(&format!(
+            " AND c.tableoid IS DISTINCT FROM pg_catalog.to_regclass({})",
+            value_literal(&qualified(earlier)?)
+        ));
+    }
     let child = value_literal(&format!(
         " AS c WHERE EXISTS (SELECT 1 FROM ONLY {} AS r WHERE ",
         qualified(default)?
@@ -4150,8 +4160,9 @@ fn default_reference_probe(
     let text = format!(
         "'SELECT count(*) AS n FROM ' || CASE WHEN cl.relkind = 'p' THEN '' ELSE 'ONLY ' END \
          || pg_catalog.quote_ident(ns.nspname) || '.' || pg_catalog.quote_ident(cl.relname) \
-         || {child} || {matched} || ' AND ' || {} || ')'",
-        range_predicate(from, to)
+         || {child} || {matched} || ' AND ' || {} || ')' || {}",
+        range_predicate(from, to),
+        value_literal(&gone_rows)
     );
     Ok(Probe::new(
         format!(
@@ -4171,21 +4182,44 @@ fn default_reference_probe(
                  JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace \
                  CROSS JOIN pg_catalog.pg_partitioned_table pt \
                  WHERE pt.partrelid = pg_catalog.to_regclass({p}) \
-                 AND con.contype = 'f' AND con.conparentid = 0 \
-                 AND con.confrelid IN (pg_catalog.to_regclass({p}), pg_catalog.to_regclass({d})) \
+                 AND con.contype = 'f' AND con.conparentid = 0 AND {} \
                  {}), 0)",
+                delete_reaches(&format!(
+                    "pg_catalog.to_regclass({})",
+                    value_literal(&qualified(default)?)
+                )),
                 gone_keys(names),
                 p = value_literal(&qualified(parent)?),
-                d = value_literal(&qualified(default)?),
             ))
         ),
     ))
 }
 
+/// Whether the delete-action trigger of the foreign key `con`, a root
+/// constraint (`conparentid = 0`), fires on a delete from `default` in this
+/// session (#1547 review). Measured on 16 and 18: a key to the parent, or to
+/// any table above it, reaches the DEFAULT through a chain of clones, the
+/// last of which references the DEFAULT itself and owns the delete trigger
+/// on it; with that trigger off, or `O` under `session_replication_role =
+/// replica`, the delete leaves the referencing rows as they are. So the key
+/// is asked down its clones for the DEFAULT's own trigger, not by the table
+/// it names: `confrelid IN (parent, default)` missed a key to a grandparent,
+/// and counted one whose action does not fire. `default` is a SQL
+/// expression of type `regclass`.
+pub(crate) fn delete_reaches(default: &str) -> String {
+    format!(
+        "EXISTS (WITH RECURSIVE down(oid) AS (SELECT con.oid UNION ALL \
+         SELECT k.oid FROM pg_catalog.pg_constraint k JOIN down ON k.conparentid = down.oid) \
+         SELECT 1 FROM down JOIN pg_catalog.pg_trigger t ON t.tgconstraint = down.oid \
+         WHERE t.tgrelid = {default} AND (t.tgtype::int & 8) <> 0 AND {})",
+        fires_here("t.tgenabled")
+    )
+}
+
 /// Whether a trigger or rule enabled as `column` holds fires in this
 /// session: `D` never, `A` always, `O` outside and `R` under
 /// `session_replication_role = replica`, as `data_triggers` asks it.
-fn fires_here(column: &str) -> String {
+pub(crate) fn fires_here(column: &str) -> String {
     format!(
         "({column} = 'A' OR {column} = CASE WHEN \
          pg_catalog.current_setting('session_replication_role') = 'replica' THEN 'R' ELSE 'O' END)"
@@ -4268,12 +4302,12 @@ fn default_hidden_referencers_probe(
     from: &[pbps_model::BoundDatum],
     to: &[pbps_model::BoundDatum],
 ) -> Result<Probe, DialectError> {
-    let p = value_literal(&qualified(parent)?);
     let d = value_literal(&qualified(default)?);
     Ok(Probe::new(
         format!(
-            "tables with a foreign key to {parent} or {default} that this session cannot fully \
-             read (row-level security, or no SELECT): moving the rows of {default} inside the \
+            "tables with a foreign key whose action a delete from {default}, {parent}'s DEFAULT \
+             partition, fires, that this session cannot fully read (row-level security, or no \
+             SELECT): moving the rows of {default} inside the \
              range of {partition} fires that key's action on rows the pre-flight cannot count; \
              apply as a role that reads them, or move the rows first, then plan again"
         ),
@@ -4284,12 +4318,12 @@ fn default_hidden_referencers_probe(
                 "(SELECT count(DISTINCT cl.oid) FROM pg_catalog.pg_constraint con \
                  JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid \
                  JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace \
-                 WHERE con.contype = 'f' AND con.conparentid = 0 \
-                 AND con.confrelid IN (pg_catalog.to_regclass({p}), pg_catalog.to_regclass({d})) \
+                 WHERE con.contype = 'f' AND con.conparentid = 0 AND {} \
                  {} \
                  AND (pg_catalog.row_security_active(cl.oid) \
                  OR NOT (pg_catalog.has_schema_privilege(cl.relnamespace, 'USAGE') \
                  AND pg_catalog.has_table_privilege(cl.oid, 'SELECT'))))",
+                delete_reaches(&format!("pg_catalog.to_regclass({d})")),
                 gone_keys(names)
             ))
         ),
@@ -4908,19 +4942,31 @@ mod tests {
         assert!(
             refs.contains("FROM ONLY \"app\".\"ev_rest\" AS r WHERE ")
                 && refs.contains("pt.partrelid = pg_catalog.to_regclass(E'\"app\".\"ev_old\"')")
-                && refs.contains(
-                    "con.confrelid IN (pg_catalog.to_regclass(E'\"app\".\"ev_old\"'), \
-                     pg_catalog.to_regclass(E'\"app\".\"ev_rest\"'))"
-                )
                 && !refs.contains("E'\"app\".\"ev\"'"),
             "{refs}"
         );
+        // Keys asked down their clones for the DEFAULT's own delete trigger
+        // that fires here, not by the table they name: a key to a table
+        // above the parent reaches it too, and one whose action is off
+        // leaves the referencing rows alone (#1763 review).
+        for p in &asked[..2] {
+            assert!(
+                p.sql.contains("JOIN down ON k.conparentid = down.oid")
+                    && p.sql.contains(
+                        "t.tgrelid = pg_catalog.to_regclass(E'\"app\".\"ev_rest\"') AND \
+                         (t.tgtype::int & 8) <> 0 AND (t.tgenabled = 'A'"
+                    )
+                    && !p.sql.contains("con.confrelid IN"),
+                "{}",
+                p.sql
+            );
+        }
         // The referencing tables it cannot fully read, asked only over rows
         // to move.
         assert!(
             asked[1]
                 .description
-                .contains("tables with a foreign key to app.ev_old or app.ev_rest")
+                .contains("tables with a foreign key whose action a delete from app.ev_rest")
                 && asked[1].sql.contains("row_security_active(cl.oid)")
                 && asked[1]
                     .sql
@@ -4976,6 +5022,32 @@ mod tests {
             "{}",
             without[3].sql
         );
+        // A referencing table's partition the plan drops first takes its
+        // rows with it, and they are not counted (#1763 review).
+        let mut leaf_dropped = vec![pbps_model::PlannedChange::new(Change::DropTable {
+            uid: "t_dddddd".parse().unwrap(),
+            name: "ext.child_1".parse().unwrap(),
+            detach_from: Some("ext.child".parse().unwrap()),
+        })];
+        leaf_dropped.extend(asked_plan.changes.iter().cloned());
+        let after_drop = probes(&ChangeSet {
+            changes: leaf_dropped,
+        });
+        let refs = &after_drop
+            .iter()
+            .find(|p| {
+                p.description
+                    .starts_with("rows that reference rows of app.ev_rest")
+            })
+            .expect("the reference probe")
+            .sql;
+        assert!(
+            refs.contains(
+                "AND c.tableoid IS DISTINCT FROM pg_catalog.to_regclass(E''\"ext\".\"child_1\"'')"
+            ),
+            "{refs}"
+        );
+        assert!(!asked[0].sql.contains("c.tableoid"), "{}", asked[0].sql);
         // Negative: neither is the refusal over the DEFAULT's rows a plain
         // create asks for.
         assert!(

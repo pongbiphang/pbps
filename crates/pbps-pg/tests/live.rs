@@ -4243,6 +4243,15 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         let over_step = plan(&added, &added_ids, &over, &mint_ids(&over, &added_ids, &[]));
         let probes = pg.preflight(&over_step).probes;
         assert_eq!(probes.len(), 4, "{probes:#?}");
+        // The moving statement, which asks the same questions again before
+        // its delete (#1763 review).
+        assert_eq!(over_step.changes.len(), 1, "{over_step:#?}");
+        let moving = &over_step.changes[0];
+        let moving = pg
+            .emit(&moving.change, moving.strategy)
+            .expect("emit")
+            .remove(0)
+            .sql;
         for probe in &probes {
             assert_eq!(
                 counted(&mut conn, &probe.sql).await,
@@ -4283,6 +4292,86 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             probes[0].description
         );
         rollback(&mut conn).await;
+        // Under a cascading key the statement stops itself before its
+        // delete, where a pre-flight that could not run would have let it
+        // go on, and the referencing row stays (#1763 review). Under
+        // `replica` the key's action does not fire, nor with the DEFAULT's
+        // own delete trigger for it off: nothing is counted then, and the
+        // move leaves the row referencing what is now in the new partition.
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!(
+            "ALTER TABLE {s}.r DROP CONSTRAINT r_ev, ADD CONSTRAINT r_ev \
+                 FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.ev (id, ts) ON DELETE CASCADE; \
+             INSERT INTO {s}.r VALUES (2, 2, '2027-03-01'); SAVEPOINT before_move"
+        ))
+        .await
+        .unwrap();
+        let stopped = conn
+            .execute(&moving)
+            .await
+            .expect_err("the move stops on the referencing row");
+        assert!(
+            format!("{stopped:?}").contains("would fire the action of their foreign key"),
+            "{stopped:?}"
+        );
+        conn.execute("ROLLBACK TO SAVEPOINT before_move")
+            .await
+            .unwrap();
+        let referencing = format!("SELECT count(*)::int FROM {s}.r WHERE id = 2");
+        assert_eq!(counted(&mut conn, &referencing).await, 1);
+        conn.execute("SET LOCAL session_replication_role = replica")
+            .await
+            .unwrap();
+        assert_eq!(counted(&mut conn, &probes[0].sql).await, 0, "under replica");
+        conn.execute(&format!(
+            "SET LOCAL session_replication_role = origin; \
+             ALTER TABLE {s}.ev_rest DISABLE TRIGGER ALL"
+        ))
+        .await
+        .unwrap();
+        for probe in &probes[..2] {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        conn.execute(&moving)
+            .await
+            .expect("the move, with the key's action off");
+        assert_eq!(counted(&mut conn, &referencing).await, 1);
+        assert_eq!(
+            counted(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM ONLY {s}.ev_2027 WHERE id = 2")
+            )
+            .await,
+            1
+        );
+        rollback(&mut conn).await;
+        // A key to a table above the parent reaches the DEFAULT too, through
+        // its clones: counted (#1763 review, found by sweeping the keys the
+        // probe selected by the table they name).
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!(
+            "CREATE TABLE {s}.g (id integer NOT NULL, ts date NOT NULL, PRIMARY KEY (id, ts)) \
+                 PARTITION BY LIST (id); \
+             ALTER TABLE {s}.r DROP CONSTRAINT r_ev; \
+             ALTER TABLE {s}.g ATTACH PARTITION {s}.ev FOR VALUES IN (1, 2, 3); \
+             CREATE TABLE {s}.gr (ev_id integer, ev_ts date, \
+                 FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.g (id, ts) ON DELETE CASCADE); \
+             INSERT INTO {s}.gr VALUES (2, '2027-03-01')"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[0].sql).await,
+            1,
+            "{}",
+            probes[0].description
+        );
+        rollback(&mut conn).await;
         // The same referencing row, in a table this session cannot fully
         // read: row-level security hides it from the count, so the table is
         // asked about instead (#1547 review).
@@ -4290,8 +4379,8 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         in_a_transaction(&mut conn).await;
         conn.execute(&format!(
             "INSERT INTO {s}.r VALUES (2, 2, '2027-03-01'); CREATE ROLE {role}; \
-             GRANT USAGE ON SCHEMA {s} TO {role}; \
-             GRANT SELECT ON ALL TABLES IN SCHEMA {s} TO {role}; \
+             GRANT USAGE, CREATE ON SCHEMA {s} TO {role}; \
+             GRANT ALL ON ALL TABLES IN SCHEMA {s} TO {role}; \
              ALTER TABLE {s}.r ENABLE ROW LEVEL SECURITY; SET LOCAL ROLE {role}"
         ))
         .await
@@ -4307,6 +4396,29 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             "{}",
             probes[1].description
         );
+        // The moving statement asks it again and stops, and stops as well
+        // over a table it cannot read at all (#1763 review).
+        conn.execute("SAVEPOINT hidden").await.unwrap();
+        let stopped = conn
+            .execute(&moving)
+            .await
+            .expect_err("the move stops over the hidden rows");
+        assert!(
+            format!("{stopped:?}").contains("row-level security"),
+            "{stopped:?}"
+        );
+        conn.execute(&format!(
+            "ROLLBACK TO SAVEPOINT hidden; RESET ROLE; \
+             ALTER TABLE {s}.r DISABLE ROW LEVEL SECURITY; \
+             REVOKE SELECT ON {s}.r FROM {role}; SET LOCAL ROLE {role}"
+        ))
+        .await
+        .unwrap();
+        let stopped = conn
+            .execute(&moving)
+            .await
+            .expect_err("the move stops over the unreadable table");
+        assert_eq!(sqlstate(&stopped), "42501", "{stopped:?}");
         rollback(&mut conn).await;
         // A row trigger fires by the session's replication role: one enabled
         // for replicas is asked about under `replica`, and not otherwise.
@@ -4510,6 +4622,51 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         let alone_probes = pg.preflight(&alone_step).probes;
         assert_eq!(alone_probes.len(), 1, "{alone_probes:#?}");
         assert_eq!(counted(&mut conn, &alone_probes[0].sql).await, 1);
+        // The same for a move out of the DEFAULT: a row referencing a moved
+        // row from a partition the plan drops first is gone by the move, so
+        // it counts none, and the move goes (#1763 review).
+        conn.execute(&format!(
+            "INSERT INTO {s}.aref VALUES (2, 2, '2027-03-01', 6)"
+        ))
+        .await
+        .unwrap();
+        let moved_ref = |kept: bool| {
+            let mut wanted = with_aref.clone();
+            if !kept {
+                wanted.tables.remove(&t("aref_1"));
+            }
+            wanted.tables.insert(
+                t("ev_2027"),
+                partition(
+                    "ev",
+                    range(vec![value("2027-01-01")], vec![value("2028-01-01")]),
+                ),
+            );
+            let intents = [Intent::DropTable {
+                table: t("aref_1"),
+                reason: "gone".into(),
+            }];
+            let wanted_ids = mint_ids(&wanted, &aref_ids, if kept { &[] } else { &intents });
+            plan(&with_aref, &aref_ids, &wanted, &wanted_ids)
+        };
+        let reference_count = |step: &pbps_model::ChangeSet| {
+            pg.preflight(step)
+                .probes
+                .into_iter()
+                .find(|p| p.description.starts_with("rows that reference rows of"))
+                .expect("the reference probe")
+                .sql
+        };
+        let leaf_gone = moved_ref(false);
+        assert_eq!(counted(&mut conn, &reference_count(&leaf_gone)).await, 0);
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &leaf_gone).await;
+        rollback(&mut conn).await;
+        // Negative: the partition kept, its row is counted.
+        assert_eq!(
+            counted(&mut conn, &reference_count(&moved_ref(true))).await,
+            1
+        );
         conn.execute(&format!("DROP TABLE {s}.aref")).await.unwrap();
         // A range split in the same plan: the partition's rows go with its
         // drop, so the halves created over them count none. Each half is made
