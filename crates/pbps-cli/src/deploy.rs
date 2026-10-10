@@ -2195,44 +2195,37 @@ pub(crate) fn warn_unasked(unasked: &[String]) {
 /// each a plan that never converges or never applies, and each a question
 /// only the engine answers the same way it will answer at read time.
 ///
-/// Returns, as warnings, what it could not ask: a partition's own default it
+/// Hands back, as warnings, what it could not ask: a partition's own default it
 /// could not deparse (DEC-1609.1). Not a finding and not a pass — the apply's
 /// closing check still refuses one stored as the parent's, after its
 /// statement — so each caller reports them where its other warnings go: a
 /// connected plan in its JSON envelope (#1660), the rest on stderr through
-/// [`warn_unasked`]. A refusal carries them on its error instead
-/// ([`crate::output::Warned`]), to land beside it in either (#1702).
+/// [`warn_unasked`]. They go to `unasked` whether or not it refuses: beside
+/// the error, never inside it, so a refusal is the plain error every caller
+/// and every downcast already knows, and the caller writes the warnings
+/// wherever it writes the refusal (#1702, DEC-1726.1).
 pub(crate) async fn refuse_misspelt(
     conn: &mut Conn,
     schema: &Schema,
     at: &pbps_db::catalog::CatalogNames,
-) -> anyhow::Result<Vec<String>> {
+    unasked: &mut Vec<String>,
+) -> anyhow::Result<()> {
     let found = crate::engine::misspelt(conn, schema, at)
         .await
         .context("cannot ask the engine how it reads the declared rows")?;
-    let unasked: Vec<String> = found
-        .defaults_unasked
-        .iter()
-        .map(|why| {
-            format!(
-                "not checked before the plan whether the engine stores it as the parent's \
-                 default: {why}"
-            )
-        })
-        .collect();
+    unasked.extend(found.defaults_unasked.iter().map(|why| {
+        format!(
+            "not checked before the plan whether the engine stores it as the parent's \
+             default: {why}"
+        )
+    }));
     if found.misspelt.is_empty()
         && found.conflicts.is_empty()
         && found.bounds.is_empty()
         && found.defaults_as_parents.is_empty()
     {
-        return Ok(unasked);
+        return Ok(());
     }
-    // Refused for what was asked: what was not still says so, beside it, in
-    // the envelope or on stderr, wherever the refusal is written (#1702).
-    let unasked: Vec<crate::output::Finding> = unasked
-        .into_iter()
-        .map(|w| crate::output::Finding::warning("plan.partition-default-unasked", w))
-        .collect();
     // Two keys the engine reads as one row would insert twice and fail on
     // the second; the alias check (74) cannot see them on a table that holds
     // neither yet (DECISIONS 106).
@@ -2279,16 +2272,13 @@ pub(crate) async fn refuse_misspelt(
             d.partition, d.column, d.declared, d.stored
         )
     }));
-    Err(crate::output::warned(
-        anyhow::anyhow!(
-            "{} declared value(s) would not come back as written:\n  {}\n\
-             A declaration that disagrees with its own database on every plan is worse \
-             than none; the engine's spelling is the one to write (DECISIONS 101, 106).",
-            lines.len(),
-            lines.join("\n  ")
-        ),
-        unasked,
-    ))
+    bail!(
+        "{} declared value(s) would not come back as written:\n  {}\n\
+         A declaration that disagrees with its own database on every plan is worse \
+         than none; the engine's spelling is the one to write (DECISIONS 101, 106).",
+        lines.len(),
+        lines.join("\n  ")
+    )
 }
 
 /// Every schema name a declaration spells, and one declaration that spells it
@@ -6114,7 +6104,12 @@ pub fn cmd_bootstrap(
             // from the declaration on the next plan (DECISIONS 101).
             // Into an empty database, so nothing is under an older name: the
             // declared names are the only ones the catalog could have.
-            warn_unasked(&refuse_misspelt(&mut conn, &loaded.schema, &Default::default()).await?);
+            let mut unasked = Vec::new();
+            let refused =
+                refuse_misspelt(&mut conn, &loaded.schema, &Default::default(), &mut unasked).await;
+            // Printed before the refusal, beside it, as the plan prints them.
+            warn_unasked(&unasked);
+            refused?;
             refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
 
             // The empty-target check is protected by the same lock as the
@@ -6410,42 +6405,12 @@ pub fn cmd_unlock(target: &Target) -> anyhow::Result<()> {
 /// settled when the MR was reviewed; a `plan --db` that quietly rewrote it
 /// would mean the artifact the gate approves was computed against a mapping
 /// nobody read.
-pub fn cmd_plan_db(
-    project: &Project,
-    target: &Target,
-    out: Option<&std::path::Path>,
-    sql_out: Option<&std::path::Path>,
-    staged: bool,
-    json: bool,
-    resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
-) -> anyhow::Result<()> {
-    // The warnings a step after the probe would drop with its error: that
-    // step's `?` or `bail!` leaves the plan's own findings behind, and the
-    // envelope written for the failure would hold the refusal alone (#1703).
-    let mut carried = Vec::new();
-    plan_db(
-        project,
-        target,
-        out,
-        sql_out,
-        staged,
-        json,
-        resolver_selection,
-        &mut carried,
-    )
-    .map_err(|e| {
-        // A typed refusal already wrote its envelope, warnings and all, and
-        // `main` tells it apart by its type (DECISIONS 485).
-        if e.is::<crate::Found>() {
-            e
-        } else {
-            crate::output::warned(e, carried)
-        }
-    })
-}
-
+///
+/// `carried` receives the warnings the plan had gathered when it failed, in
+/// JSON mode, for `main` to put beside the failure in the one envelope; human
+/// mode printed them when they were found (#1703, DEC-1726.1).
 #[allow(clippy::too_many_arguments)]
-fn plan_db(
+pub fn cmd_plan_db(
     project: &Project,
     target: &Target,
     out: Option<&std::path::Path>,
@@ -6555,12 +6520,14 @@ fn plan_db(
         // Every declared text, as the engine reads it: a spelling it would
         // read back differently is refused before a plan is written that
         // could never converge (DECISIONS 101).
-        let unasked = refuse_misspelt(
+        let mut unasked = Vec::new();
+        let refused = refuse_misspelt(
             &mut conn,
             &loaded.schema,
             &catalogued_as(&loaded.schema, &resolved.ids, &recorded_ids),
+            &mut unasked,
         )
-        .await?;
+        .await;
         // In the envelope, not beside it: a warning-only result of a
         // read-only command stays in its one JSON report (SPEC §9.8; #1660).
         for w in unasked {
@@ -6573,10 +6540,12 @@ fn plan_db(
             ));
         }
         // Printed already in human mode; in JSON they are carried to the
-        // envelope of any failure from here on (#1703).
+        // envelope of any failure from here on, the spelling refusal just
+        // below included (#1702, #1703).
         if json {
             carried.clone_from(&findings);
         }
+        refused?;
         refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
         let managed = managed_state_full(
             &mut conn,
