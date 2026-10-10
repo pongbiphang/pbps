@@ -2386,12 +2386,20 @@ impl Change {
             // (#1547): its own checks and uniqueness ask those rows what an
             // added one asks a table's, and its own NOT NULL what a tightened
             // column does. Its parent's it shares with the DEFAULT the rows
-            // come from, so they hold already.
+            // come from, so they hold already. An unlogged partition takes
+            // rows that were durable, as switching a table to unlogged does
+            // (#1443): the gate asks the same of it (#1763 review). The
+            // DEFAULT may be unlogged itself, which the change does not
+            // carry; the gate then asks for nothing that is lost, and asking
+            // is the safe side.
             Change::CreateTable {
                 table,
                 beside_default: Some(_),
                 ..
             } => {
+                if table.unlogged {
+                    r.insert(RiskClass::Destructive);
+                }
                 if !table.checks.is_empty()
                     || !table.unique.is_empty()
                     || table.indexes.values().any(|i| i.unique)
@@ -2911,6 +2919,15 @@ mod tests {
                 .collect()
         );
         // Negative: made empty, it asks nothing of rows.
+        assert!(create(&partition, false).intrinsic_risks().is_empty());
+        // Unlogged, it holds rows that were durable: destructive, as the
+        // switch to unlogged is (#1763 review). Made empty, it holds none.
+        partition.unlogged = true;
+        assert!(
+            create(&partition, true)
+                .intrinsic_risks()
+                .contains(&RiskClass::Destructive)
+        );
         assert!(create(&partition, false).intrinsic_risks().is_empty());
     }
 
