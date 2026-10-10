@@ -2373,6 +2373,67 @@ async fn vouched_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_reproduces_the_deployers_usage_of_a_schema_an_extension_carries() {
+    // An extension can create its own schema (`pg_cron`'s `cron`); built
+    // here with `ALTER EXTENSION ... ADD SCHEMA`. It is the extension's
+    // member, not a root, yet the deployer's USAGE on it must be reproduced.
+    let carried = [
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!(
+            "CREATE TABLE {EXTERNAL}.t (id integer PRIMARY KEY, name text UNIQUE, p integer, n integer)"
+        ),
+        "CREATE EXTENSION fuzzystrmatch SCHEMA pg_catalog".to_owned(),
+        format!("ALTER EXTENSION fuzzystrmatch ADD SCHEMA {EXTERNAL}"),
+    ];
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let deployer = target.login("d", "NOSUPERUSER").await;
+    let mut setup = vec![format!(
+        "CREATE SCHEMA {MANAGED} AUTHORIZATION {}",
+        deployer.0
+    )];
+    setup.extend(carried.iter().cloned());
+    setup.extend([
+        format!("GRANT USAGE ON SCHEMA {EXTERNAL} TO {}", deployer.0),
+        format!("GRANT SELECT ON {EXTERNAL}.t TO {}", deployer.0),
+        format!("GRANT pg_read_all_settings TO {}", deployer.0),
+    ]);
+    let target_db = staging_target(&mut target, &setup).await;
+    let mut as_deployer = Conn::connect(Driver::Postgres, &target.as_login(&target_db, &deployer))
+        .await
+        .unwrap();
+    as_deployer
+        .execute(&format!(
+            "CREATE VIEW {MANAGED}.a AS {}",
+            reading("id", "t")
+        ))
+        .await
+        .unwrap();
+    drop(as_deployer);
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    let baseline = carried
+        .iter()
+        .map(|s| format!("{s};\n"))
+        .collect::<String>();
+    let result = produce_staged(
+        &scratch.server,
+        &target.as_login(&target_db, &deployer),
+        &inputs,
+        &key,
+        &baseline,
+    )
+    .await;
+    target.drop().await;
+    assert_staged(
+        result,
+        "t",
+        "a deployer with USAGE on an extension's schema",
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_takes_an_unmanaged_overload_of_a_managed_routine_for_no_chain() {
     // `f(integer)` is managed; `f(e)` shares its name and is not, and binds
     // an external table whose column is of a managed table's row type.

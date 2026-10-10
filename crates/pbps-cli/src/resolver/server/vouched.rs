@@ -325,6 +325,8 @@ struct Prepared {
     differences: Vec<String>,
     /// The roots of what the baseline created (#1673).
     created: BTreeSet<Object>,
+    /// The OID of every schema the baseline created, a root or not.
+    created_schemas: BTreeSet<u32>,
     /// The role a run-owned layout gives USAGE on a schema the baseline
     /// created; `None` where the scratch account compiles as itself.
     grantee: Option<String>,
@@ -640,7 +642,7 @@ impl Run<'_> {
         // After the reproduction, which drops and recreates each in-scope
         // schema, and before any managed object (DEC-1673.1). Its own
         // session, so its `SET`s reach nothing after it.
-        let created = match self.baseline {
+        let (created, created_schemas) = match self.baseline {
             Some(statements) => {
                 let before = inventory(&mut owner).await?;
                 let mut setup = Conn::connect_with(driver, self.scratch, names.database(), None)
@@ -652,9 +654,10 @@ impl Run<'_> {
                     .map_err(db("the baseline session's role"))?;
                 run_baseline(&mut setup, statements).await?;
                 drop(setup);
-                baseline::created(&before, &inventory(&mut owner).await?).roots
+                let created = baseline::created(&before, &inventory(&mut owner).await?);
+                (created.roots, created.schemas)
             }
-            None => BTreeSet::new(),
+            None => (BTreeSet::new(), BTreeSet::new()),
         };
         // Opened after the reproduction, so the login defaults it stored
         // load into this session as they load on the target's.
@@ -700,6 +703,7 @@ impl Run<'_> {
             map,
             differences,
             created,
+            created_schemas,
             grantee,
         })
     }
@@ -771,7 +775,7 @@ impl Run<'_> {
         // any usage, on the checked connection like every write here
         // (DEC-1673.1). `DISCARD ALL` then keeps its `SET`s from the
         // compile that follows on this same session.
-        let created = match self.baseline {
+        let (created, created_schemas) = match self.baseline {
             Some(statements) => {
                 let before = inventory(admin).await?;
                 run_baseline(admin, statements).await?;
@@ -780,9 +784,10 @@ impl Run<'_> {
                     .await
                     .map_err(db("the scratch session's role"))?;
                 pinned(admin, self.backend).await?;
-                baseline::created(&before, &inventory(admin).await?).roots
+                let created = baseline::created(&before, &inventory(admin).await?);
+                (created.roots, created.schemas)
             }
-            None => BTreeSet::new(),
+            None => (BTreeSet::new(), BTreeSet::new()),
         };
         let unusable = authorization
             .unusable_schemas(&request.planned)
@@ -820,6 +825,7 @@ impl Run<'_> {
             map,
             differences: Vec::new(),
             created,
+            created_schemas,
             grantee: None,
         })
     }
@@ -1135,12 +1141,12 @@ impl Run<'_> {
                     StageError::Capture(error) => engine::catalog_read_failed(error),
                     StageError::Refused(findings) => Error::Baseline(findings),
                 })?;
-        let schemas: Vec<String> = staged
-            .roots()
-            .iter()
-            .filter(|root| root.class == "pg_namespace")
-            .filter_map(|root| root.name.first().cloned())
-            .collect();
+        // Every schema the baseline created, an extension's member too
+        // (`pg_cron`'s `cron`): a member is no root, but the deployer's
+        // calls into it need USAGE all the same.
+        let schemas = baseline::schema_names(capture, &prepared.created_schemas)
+            .await
+            .map_err(db("the schemas the baseline created"))?;
         if schemas.is_empty() {
             return Ok(staged);
         }

@@ -2185,6 +2185,7 @@
         "resolver::server::vouched::live_tests::vouched_compares_an_extension_member_in_a_system_schema_in_full",
         "resolver::server::vouched::live_tests::vouched_stages_an_operator_over_built_in_types_in_the_baseline",
         "resolver::server::vouched::live_tests::vouched_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates",
+        "resolver::server::vouched::live_tests::vouched_reproduces_the_deployers_usage_of_a_schema_an_extension_carries",
         "resolver::server::vouched::live_tests::vouched_takes_an_unmanaged_overload_of_a_managed_routine_for_no_chain",
         "resolver::server::vouched::live_tests::vouched_answers_a_plan_that_takes_a_view_off_a_chain",
         "resolver::server::vouched::live_tests::vouched_refuses_a_public_grant_chain_it_cannot_revoke_and_leaves_the_acl",

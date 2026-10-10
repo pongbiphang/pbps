@@ -1689,8 +1689,8 @@ scratch compile (#1616).
     the declarations.
   - What it created is the difference between the database's objects
     before and after it. The target deployer's USAGE on a schema it
-    created is reproduced as an in-scope schema's is, not left to the
-    baseline to grant.
+    created, an extension's own schema included, is reproduced as an
+    in-scope schema's is, not left to the baseline to grant.
   - No privilege rule is needed, so any SQL may be written: an extension, a
     cast, an operator, a `DO` block.
   - **So a baseline's statements name nothing managed.** A legacy view over

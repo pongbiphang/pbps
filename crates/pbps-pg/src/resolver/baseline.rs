@@ -69,6 +69,9 @@ pub struct Created {
     /// Members of an extension the baseline created, which its version
     /// covers.
     pub members: usize,
+    /// The OID of every schema it created, a root or an extension's member:
+    /// the deployer's USAGE is reproduced on each.
+    pub schemas: BTreeSet<u32>,
 }
 
 /// Every object in the connected database that initdb did not create, each
@@ -129,6 +132,9 @@ pub fn created(before: &Inventory, after: &Inventory) -> Created {
         if before.contains_key(&(catalog.clone(), *oid)) {
             continue;
         }
+        if catalog == "pg_namespace" {
+            created.schemas.insert(*oid);
+        }
         match carried {
             None => {
                 created.roots.insert(Object {
@@ -142,6 +148,28 @@ pub fn created(before: &Inventory, after: &Inventory) -> Created {
         }
     }
     created
+}
+
+/// The names of the schemas with these OIDs in the connected database.
+pub async fn schema_names(
+    conn: &mut impl QueryConnection,
+    oids: &BTreeSet<u32>,
+) -> Result<Vec<String>, DbError> {
+    if oids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = oids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rows = conn
+        .query(&format!(
+            "SELECT n.nspname::text AS schema FROM pg_catalog.pg_namespace n \
+              WHERE n.oid IN ({list})"
+        ))
+        .await?;
+    rows.iter().map(|row| text(row, "schema")).collect()
 }
 
 /// Whether the session's role may use each named schema, as the engine
@@ -436,6 +464,7 @@ mod tests {
             object("pg_class", 16394, "index ext.t_pkey", Some('i')),
             object("pg_extension", 16400, "extension citext", None),
             object("pg_type", 16401, "type citext", Some('e')),
+            object("pg_namespace", 16402, "schema cron", Some('e')),
         ]);
         let created = created(&before, &after);
         assert_eq!(
@@ -447,7 +476,9 @@ mod tests {
             // Ordered by catalog, then OID.
             ["table ext.t", "extension citext", "schema ext"]
         );
-        assert_eq!(created.members, 1);
+        assert_eq!(created.members, 2);
+        // Every new schema, the extension's member too.
+        assert_eq!(created.schemas, BTreeSet::from([16390, 16402]));
         // Negative: nothing new, nothing created.
         assert_eq!(created_none(&after), Created::default());
     }

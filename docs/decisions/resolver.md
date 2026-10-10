@@ -2181,8 +2181,9 @@ target whose recreated `public` has none, the difference #688 removed.
   lives on no other: a table's row and array types, its indexes and owned
   sequences, a range's constructors and an extension's members come with
   their root.
-- **USAGE on a schema it created** is the target deployer's answer,
-  reproduced as an in-scope schema's is and checked as the compile session.
+- **USAGE on a schema it created**, an extension's own schema included,
+  is the target deployer's answer, reproduced as an in-scope schema's is
+  and checked as the compile session.
   The baseline does not grant it: it cannot know a run-owned deployer's
   generated name, and a supplied account owns what it creates, so its
   usage is the owner's and nothing would compare it.
