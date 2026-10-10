@@ -4525,8 +4525,10 @@ has before the plan runs:
 - **Publications.** These are publications that publish deletes from the
   DEFAULT, through itself or any table above it, counted when there are rows
   to move. `pg_publication_tables` expands `FOR ALL TABLES`, a schema and a
-  partitioned table into what each one sends. pbps does not manage
-  publications (DEC-1444.1); it reads them so as not to break one silently.
+  partitioned table into what each one sends. A row filter sends only the
+  deletes of the rows it holds, so a publication whose filter holds none of
+  the moved rows is not counted. pbps does not manage publications
+  (DEC-1444.1); it reads them so as not to break one silently.
 
 "Fires" is asked as `data_triggers` asks it:
 - `A` always fires; `O` fires outside, and `R` under,

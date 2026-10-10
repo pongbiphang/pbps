@@ -4545,10 +4545,51 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             format!("{stopped:?}").contains("a publication publishes deletes from"),
             "{stopped:?}"
         );
-        conn.execute(
+        // A row filter sends the deletes of the rows it holds only: one that
+        // holds the moved row is counted, and the move stops; one that holds
+        // none of them sends nothing, and the move goes (#1763 review).
+        conn.execute(&format!(
             "ROLLBACK TO SAVEPOINT published; \
-             ALTER PUBLICATION pbps_pub_1547 SET (publish = 'insert, update')",
-        )
+             ALTER PUBLICATION pbps_pub_1547 SET TABLE {s}.ev WHERE (id = 2); \
+             SAVEPOINT filtered"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[4].sql).await,
+            1,
+            "{}",
+            probes[4].description
+        );
+        let stopped = conn
+            .execute(&moving)
+            .await
+            .expect_err("the move stops over a filter holding the moved row");
+        assert!(
+            format!("{stopped:?}").contains("a publication publishes deletes from"),
+            "{stopped:?}"
+        );
+        conn.execute(&format!(
+            "ROLLBACK TO SAVEPOINT filtered; \
+             ALTER PUBLICATION pbps_pub_1547 SET TABLE {s}.ev WHERE (ts < DATE '2025-01-01'); \
+             SAVEPOINT unfiltered"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[4].sql).await,
+            0,
+            "{}",
+            probes[4].description
+        );
+        conn.execute(&moving)
+            .await
+            .expect("the move, with no moved row in the filter");
+        conn.execute(&format!(
+            "ROLLBACK TO SAVEPOINT unfiltered; \
+             ALTER PUBLICATION pbps_pub_1547 SET TABLE {s}.ev; \
+             ALTER PUBLICATION pbps_pub_1547 SET (publish = 'insert, update')"
+        ))
         .await
         .unwrap();
         assert_eq!(

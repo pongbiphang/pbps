@@ -4255,7 +4255,8 @@ pub(crate) fn delete_reaches(default: &str) -> String {
 }
 
 /// The publications that publish a delete from `default`, a SQL expression
-/// of type `regclass`, as a `FROM ... WHERE` over `p` (#1763 review).
+/// of type `regclass`, as a `FROM ... WHERE` over `p`, with each one's row
+/// filter as `pubt.rowfilter` (#1763 review).
 /// `pg_publication_tables` expands `FOR ALL TABLES`, `FOR TABLES IN SCHEMA`
 /// and a partitioned table into what each publication sends, under the
 /// partition or under its root, so the DEFAULT and each of its ancestors are
@@ -4265,14 +4266,20 @@ pub(crate) fn delete_reaches(default: &str) -> String {
 /// attach; the subscriber lost the moved row while the publisher kept it.
 /// pbps does not manage publications (DEC-1444.1); it reads them so as not to
 /// break one silently.
+///
+/// A row filter sends only the deletes of the rows it holds, so a
+/// publication whose filter holds none of the moved rows sends nothing, and
+/// is not counted. The filter is the view's text, deparsed with unqualified
+/// columns of the published table, whose names a partition shares, so it is
+/// asked of the DEFAULT's rows as they stand ([`filter_holds_moved`]).
 pub(crate) fn publications_of(default: &str) -> String {
     format!(
         "FROM pg_catalog.pg_publication p \
-         JOIN pg_catalog.pg_publication_tables pt ON pt.pubname = p.pubname \
+         JOIN pg_catalog.pg_publication_tables pubt ON pubt.pubname = p.pubname \
          JOIN pg_catalog.pg_partition_ancestors({default}) AS a(relid) ON true \
          JOIN pg_catalog.pg_class pc ON pc.oid = a.relid \
          JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
-         WHERE p.pubdelete AND pt.schemaname = pn.nspname AND pt.tablename = pc.relname"
+         WHERE p.pubdelete AND pubt.schemaname = pn.nspname AND pubt.tablename = pc.relname"
     )
 }
 
@@ -4296,13 +4303,39 @@ fn default_publication_probe(
             "SELECT CASE WHEN {} > 0 THEN {} ELSE 0 END",
             default_rows_in_range(parent, default, from, to)?,
             saturated_count(&format!(
-                "(SELECT count(DISTINCT p.pubname) {})",
+                "(SELECT count(DISTINCT p.pubname) {} AND (pubt.rowfilter IS NULL OR {}))",
                 publications_of(&format!(
                     "pg_catalog.to_regclass({})",
                     value_literal(&qualified(default)?)
-                ))
+                )),
+                filter_holds_moved(parent, default, from, to)?
             ))
         ),
+    ))
+}
+
+/// Whether the row filter `pubt.rowfilter` holds any row of `default`
+/// inside the range, asked through `query_to_xml` as the other counts are.
+fn filter_holds_moved(
+    parent: &TableName,
+    default: &TableName,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+) -> Result<String, DialectError> {
+    let text = format!(
+        "{} || {} || ' AND (' || pubt.rowfilter || ')'",
+        value_literal(&format!(
+            "SELECT count(*) AS n FROM ONLY {} AS r WHERE ",
+            qualified(default)?
+        )),
+        range_predicate(from, to),
+    );
+    Ok(format!(
+        "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()', \
+         pg_catalog.query_to_xml({text}, false, true, '')))[1]::text::numeric \
+         FROM pg_catalog.pg_partitioned_table pt \
+         WHERE pt.partrelid = pg_catalog.to_regclass({})), 0) > 0",
+        value_literal(&qualified(parent)?)
     ))
 }
 

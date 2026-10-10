@@ -3323,6 +3323,7 @@ fn beside_its_default(
          \x20   n bigint;\n\
          \x20   hit boolean;\n\
          \x20   fk record;\n\
+         \x20   pubf record;\n\
          BEGIN\n\
          \x20   LOCK TABLE ONLY {d} IN SHARE MODE;\n\
          {create_sql}\n\
@@ -3344,9 +3345,16 @@ fn beside_its_default(
          \x20   END IF;\n\
          \x20   EXECUTE {count} || keep || ' FOR UPDATE) AS locked' INTO n;\n\
          \x20   IF n > 0 THEN\n\
-         \x20       IF EXISTS (SELECT 1 {publications}) THEN\n\
-         \x20           {published}\n\
-         \x20       END IF;\n\
+         \x20       FOR pubf IN SELECT pubt.rowfilter {publications} LOOP\n\
+         \x20           IF pubf.rowfilter IS NULL THEN\n\
+         \x20               {published}\n\
+         \x20           END IF;\n\
+         \x20           EXECUTE 'SELECT EXISTS (SELECT 1 FROM ONLY ' || {ld} || ' AS r WHERE '\n\
+         \x20               || keep || ' AND (' || pubf.rowfilter || '))' INTO hit;\n\
+         \x20           IF hit THEN\n\
+         \x20               {published}\n\
+         \x20           END IF;\n\
+         \x20       END LOOP;\n\
          \x20       IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t\n\
          \x20                  WHERE t.tgrelid = {ld}::pg_catalog.regclass AND NOT t.tgisinternal\n\
          \x20                    AND {trigger_fires} AND (t.tgtype::int & 9) = 9) THEN\n\
