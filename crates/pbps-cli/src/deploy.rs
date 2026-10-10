@@ -449,10 +449,16 @@ pub(crate) fn refuse_uninventoried_occupants(
     if taken.is_empty() {
         return Ok(());
     }
+    // A clash with a holder a later rename moves away is refused too: this
+    // engine's plans are not reordered from catalog facts, so as ordered the
+    // `SET SCHEMA` fails, and the remedy is that rename in a plan of its own.
     bail!(
-        "`{label}` already uses {} name(s) this plan would create, for objects that share \
-         PostgreSQL's relation namespace with tables and views:\n  {}\nEach `CREATE` would be \
-         refused at apply. Rename the declaration, or drop or rename the object in the database.",
+        "`{label}` already uses {} name(s) this plan would create or move an object onto, for \
+         objects that share PostgreSQL's relation namespace with tables and views:\n  {}\nEach \
+         `CREATE`, or the `SET SCHEMA` of each cross-schema rename, would be refused at apply. \
+         Rename the declaration, or drop or rename the object in the database. Where a later \
+         rename in this plan moves the holder away, apply that rename in a plan of its own \
+         first.",
         taken.len(),
         taken.join("\n  ")
     );
@@ -11090,6 +11096,10 @@ mod tests {
                  of `s1.a` to `s2.b` moves there first"
             ),
             "{e}"
+        );
+        assert!(
+            e.contains("apply that rename in a plan of its own first"),
+            "the remedy for a holder a later rename moves away: {e}"
         );
         // One already there, owned by nothing the plan moves.
         let held = occupant(&TableName::new("s2", "x_id_seq"), "sequence", None);
