@@ -3196,11 +3196,13 @@ pub struct KeyNameHolder {
     /// index of one name on one table are two holders, and dropping one
     /// leaves the other.
     pub constraint: bool,
-    /// Whether it is a constraint trigger's `pg_constraint` row (`contype =
-    /// 't'`), named after the trigger, which `DROP TRIGGER` frees (measured
-    /// on 16 and 18, #1738). An ordinary trigger has no row and holds no
-    /// name.
-    pub trigger: bool,
+    /// The trigger whose `pg_constraint` row it is (`contype = 't'`), by the
+    /// trigger's own name, which `DROP TRIGGER` frees it with (measured on 16
+    /// and 18, #1738). The row is named after the trigger when it is created,
+    /// but `ALTER TRIGGER ... RENAME` renames only the trigger, and an
+    /// ordinary trigger may then take the row's name (measured, #1752
+    /// review). An ordinary trigger has no row and holds no name.
+    pub trigger: Option<String>,
 }
 
 /// The [`KeyNameHolder`]s whose names start with one of `prefixes`, each a
@@ -3227,7 +3229,7 @@ pub async fn key_name_holders(
          SELECT n.nspname AS schema_name, c.relname::text AS holder_name,\n       \
                 ownns.nspname AS owner_schema, own.relname AS owner_name,\n       \
                 COALESCE(i.indisprimary, false) AS primary_key,\n       \
-                false AS is_constraint, false AS is_trigger\n  \
+                false AS is_constraint, NULL::text AS trigger_name\n  \
            FROM pg_catalog.pg_class c\n  \
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n  \
            LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid\n  \
@@ -3244,7 +3246,8 @@ pub async fn key_name_holders(
                            AND starts_with(c.relname::text, w.prefix))\n\
          UNION ALL\n\
          SELECT n.nspname, con.conname::text, tn.nspname, t.relname, con.contype = 'p', true,\n       \
-                con.contype = 't'\n  \
+                (SELECT tg.tgname::text FROM pg_catalog.pg_trigger tg\n                  \
+                  WHERE con.contype = 't' AND tg.tgconstraint = con.oid)\n  \
            FROM pg_catalog.pg_constraint con\n  \
            JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace\n  \
            LEFT JOIN pg_catalog.pg_class t ON t.oid = con.conrelid\n  \
@@ -3281,9 +3284,7 @@ pub async fn key_name_holders(
             constraint: row.try_get::<bool>("is_constraint")?.ok_or_else(|| {
                 DbError::BadRow("the key-name holder query returned a NULL is_constraint".into())
             })?,
-            trigger: row.try_get::<bool>("is_trigger")?.ok_or_else(|| {
-                DbError::BadRow("the key-name holder query returned a NULL is_trigger".into())
-            })?,
+            trigger: row.try_get::<&str>("trigger_name")?.map(str::to_owned),
         });
     }
     Ok(out)

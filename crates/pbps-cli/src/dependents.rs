@@ -2507,11 +2507,13 @@ fn replay(present: &mut Vec<KeyNameHolder>, change: &Change) {
             id: ModuleId::Named(name),
             kind: ModuleKind::View,
         } => present.retain(|h| !(!h.constraint && h.name == *name)),
-        // A constraint trigger's row goes with the trigger (#1738).
+        // A constraint trigger's row goes with the trigger, matched by the
+        // trigger's own name, which a rename leaves apart from the row's
+        // (#1738, #1752 review).
         Change::DropModule {
             id: ModuleId::Trigger { on, name },
             ..
-        } => present.retain(|h| !(h.trigger && owned(h, on) && h.name.name == *name)),
+        } => present.retain(|h| !(owned(h, on) && h.trigger.as_deref() == Some(name.as_str()))),
         _ => {}
     }
 }
@@ -7074,8 +7076,10 @@ mod tests {
     /// Dropped first, the key takes `n_pkey`, so a default naming it is
     /// refused. Negatives: kept, it numbers the key, so `n_pkey1` is refused
     /// instead; dropped and created again before the key, it holds the name
-    /// again; an ordinary trigger created in its place holds nothing; and a
-    /// trigger of that name on another table is another one.
+    /// again; an ordinary trigger created in its place holds nothing; a
+    /// trigger of that name on another table is another one; and a row whose
+    /// trigger was renamed to `kept` goes with `kept`, not with a trigger
+    /// that took the row's name since (#1752 review).
     #[test]
     fn a_constraint_triggers_name_goes_with_the_trigger() {
         let names = |what: &str| format!("('app.{what}'::regclass)::text");
@@ -7092,21 +7096,28 @@ mod tests {
                 table: Box::new(t),
             }
         };
-        let row = [KeyNameHolder {
-            name: TableName::new("app", "n_pkey"),
-            owner: Some(TableName::new("app", "t")),
-            primary_key: false,
-            constraint: true,
-            trigger: true,
-        }];
+        let row_of = |trigger: &str| {
+            [KeyNameHolder {
+                name: TableName::new("app", "n_pkey"),
+                owner: Some(TableName::new("app", "t")),
+                primary_key: false,
+                constraint: true,
+                trigger: Some(trigger.into()),
+            }]
+        };
+        let row = row_of("n_pkey");
         let on = |table: &str| ModuleId::Trigger {
             on: TableName::new("app", table),
             name: "n_pkey".into(),
         };
-        let drop = |table: &str| Change::DropModule {
-            id: on(table),
+        let drop_named = |table: &str, name: &str| Change::DropModule {
+            id: ModuleId::Trigger {
+                on: TableName::new("app", table),
+                name: name.into(),
+            },
             kind: ModuleKind::Trigger,
         };
+        let drop = |table: &str| drop_named(table, "n_pkey");
         let create = |marker: &str| Change::CreateModule {
             id: on("t"),
             module: Box::new(pbps_model::Module {
@@ -7117,12 +7128,13 @@ mod tests {
                 ),
             }),
         };
-        let refused = |changes: Vec<Change>| -> Vec<String> {
-            names_a_later_relation(&plan(changes), &*pg(), Some(&row))
+        let refused_over = |changes: Vec<Change>, holders: &[KeyNameHolder]| -> Vec<String> {
+            names_a_later_relation(&plan(changes), &*pg(), Some(holders))
                 .into_iter()
                 .map(|n| n.what)
                 .collect()
         };
+        let refused = |changes: Vec<Change>| refused_over(changes, &row);
 
         let found = refused(vec![drop("t"), keyed_as(&names("n_pkey"))]);
         assert_eq!(found.len(), 1, "{found:?}");
@@ -7139,6 +7151,19 @@ mod tests {
         let ordinary = refused(vec![drop("t"), create(""), keyed_as(&names("n_pkey"))]);
         assert_eq!(ordinary.len(), 1, "{ordinary:?}");
         assert!(refused(vec![drop("u"), keyed_as(&names("n_pkey"))]).is_empty());
+        let renamed = row_of("kept");
+        assert!(
+            refused_over(vec![drop("t"), keyed_as(&names("n_pkey"))], &renamed).is_empty(),
+            "the dropped `n_pkey` is an ordinary trigger, and the row stays `kept`'s"
+        );
+        assert_eq!(
+            refused_over(
+                vec![drop_named("t", "kept"), keyed_as(&names("n_pkey"))],
+                &renamed
+            )
+            .len(),
+            1
+        );
     }
 
     /// #1645: with what holds the candidates on the target now, an unnamed
@@ -7169,7 +7194,7 @@ mod tests {
             owner: owner.map(|o| TableName::new("app", o)),
             primary_key,
             constraint: false,
-            trigger: false,
+            trigger: None,
         };
         // What the planner refuses, with the target asked about nothing:
         // each name told is qualified here, so none is asked.
@@ -7375,7 +7400,7 @@ mod tests {
             owner: Some(TableName::new("app", "old")),
             primary_key: true,
             constraint: false,
-            trigger: false,
+            trigger: None,
         }];
         assert_eq!(refused(swapped("old_pkey"), &old_key), Vec::<String>::new());
         assert_eq!(refused(swapped("old_pkey1"), &old_key).len(), 1);
@@ -7393,14 +7418,14 @@ mod tests {
                 owner: None,
                 primary_key: false,
                 constraint: false,
-                trigger: false,
+                trigger: None,
             },
             KeyNameHolder {
                 name: TableName::new("archive", "n_pkey1"),
                 owner: Some(TableName::new("archive", "t")),
                 primary_key: false,
                 constraint: false,
-                trigger: false,
+                trigger: None,
             },
         ];
         assert_eq!(refused(moved("n_pkey1"), &held), Vec::<String>::new());
@@ -7449,7 +7474,7 @@ mod tests {
             owner: Some(TableName::new(schema, table)),
             primary_key: false,
             constraint: false,
-            trigger: false,
+            trigger: None,
         };
         let mut in_s2 = new_table(Some("('s2.n_pkey'::regclass)::text"), None, &[]);
         in_s2.primary_key = Some(unnamed());
@@ -7482,7 +7507,7 @@ mod tests {
             owner: Some(TableName::new("app", "t")),
             primary_key: false,
             constraint: true,
-            trigger: false,
+            trigger: None,
         }];
         let after_drop = vec![
             Change::DropTable {
