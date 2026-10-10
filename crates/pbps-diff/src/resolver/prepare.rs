@@ -202,7 +202,12 @@ pub(super) fn changes(
     let mut changes = Vec::new();
     for planned in &ordinary.changes {
         let expanded = match &planned.change {
-            Change::CreateTable { uid, name, table } => {
+            Change::CreateTable {
+                uid,
+                name,
+                table,
+                beside_default,
+            } => {
                 let mut bare = (**table).clone();
                 let checks = std::mem::take(&mut bare.checks);
                 let indexes = std::mem::take(&mut bare.indexes);
@@ -235,6 +240,7 @@ pub(super) fn changes(
                     uid: uid.clone(),
                     name: name.clone(),
                     table: Box::new(bare),
+                    beside_default: beside_default.clone(),
                 }];
                 parts.extend(defaults);
                 parts.extend(

@@ -4384,3 +4384,131 @@ Pinned by `a_partitioned_parent_is_renamed`, by
 `an_unlogged_partition_under_a_permanent_key_is_refused_by_name` for #1613,
 and by the CLI's `a_partitioned_parent_is_renamed_through_the_cli`, on 18 and
 on 16.
+
+<a id="dec-1547-1"></a>
+
+**DEC-1547.1. A range partition added beside a standing DEFAULT partition is
+made as a plain table of its parent's shape, filled with the DEFAULT's rows
+of its range, and attached, whether or not any row moves (#1547).**
+
+`CREATE TABLE ... PARTITION OF` refuses over a DEFAULT partition holding rows
+of the new range (DEC-1171.1). Three ways round it, each measured on 16.15
+and 18.6 with the locks read from `pg_locks` (the issue has the tables):
+
+- **Rows set aside in a temporary table** (B). The rows move twice, and the
+  parent is held at ACCESS EXCLUSIVE throughout, reads included.
+- **The DEFAULT detached and reattached** (A). It takes the strongest locks
+  for longest, and the reattach rescans the whole DEFAULT.
+- **A plain table, filled, then attached** (C). The parent is held at SHARE
+  UPDATE EXCLUSIVE, so its other partitions stay readable and writable. The
+  DEFAULT goes to ACCESS EXCLUSIVE only at the attach, which scans it.
+
+leon chose C (2026-10-10). Two further choices were made on the issue:
+
+- **Always, not only over rows.** The plan reads no rows (SPEC 7.2), so it
+  does not depend on whether any are there. An offline plan and a connected
+  one agree, and a row arriving after planning is moved rather than refused.
+  The attach's lock is also the lighter one even with nothing to move. This
+  amends the issue's line "with no such rows, the plan is #1171's plain
+  create".
+- **No index before the move.** Measured with 1,000,000 rows moved, the move
+  and the attach took:
+  - on 16, 1.6–2.2 s with no index on the plain table, against 2.6–3.9 s with
+    the parent's indexes made first;
+  - on 18, 3.4–4.6 s against 9.8–15 s.
+
+  The attach builds the clones over the loaded rows, under the new table's
+  own lock, which no other session can reach.
+
+**The statements**, in one change, `CreateTable` with `beside_default`
+naming the DEFAULT, and the first four in one statement. Its declared name is the right one, because renames run
+in class 1, before every create. Only a DEFAULT the base and the
+declarations both hold under that parent counts. A DEFAULT the plan drops or
+detaches is gone in class 6, and a new one starts empty.
+
+1. `LOCK TABLE ONLY <default> IN SHARE MODE`, so no row of the range can
+   arrive in it between the move and the attach.
+2. `CREATE TABLE <new> (LIKE <parent> INCLUDING DEFAULTS INCLUDING GENERATED
+   INCLUDING CONSTRAINTS INCLUDING STORAGE INCLUDING COMPRESSION) USING heap`,
+   with the partition's own persistence and storage parameters.
+   - The attach refuses a table that lacks one of its parent's checks.
+   - Storage and compression are what `PARTITION OF` copies.
+   - Read back after the attach, the table is what `PARTITION OF` makes,
+     field for field: every check and NOT NULL is inherited (`conislocal`
+     false, `coninhcount` 1), every column is inherited with its parent's
+     default and generation, and the key and indexes are clones.
+3. A `DO` block that reads the parent's stored columns and its key from the
+   catalog when it runs, then moves the rows with one `DELETE ... RETURNING`
+   into an `INSERT`.
+   - A column change earlier in the plan cannot leave the column list stale.
+   - A generated column is the engine's to compute, so it is not copied.
+   - The predicate is the one the #1171 probe counts with
+     (`range_predicate`), so the rows counted and the rows moved are one
+     set.
+   - It runs on the empty path. If a comparison picks other rows than the
+     range does (say, a key type whose operators live outside `pg_catalog`),
+     the attach refuses: it checks the new table against its range and the
+     DEFAULT against the rest. The result is the right rows or a rolled-back
+     plan.
+4. `ALTER TABLE <parent> ATTACH PARTITION <new> FOR VALUES ...`. Then, in
+   statements of their own, the partition's own defaults, NOT NULLs, checks
+   and indexes, as after #1171's create.
+
+**One statement.** The engine runs a batch as one transaction even outside
+an explicit one. Measured: `LOCK` is accepted there, and a refused attach
+takes the table and the move back with it. So no apply can stop with the
+rows out of the DEFAULT and the table not yet attached, as #1171's detach
+and drop are one statement. A staged apply is no exception, and
+`a_range_beside_a_default_takes_its_rows_through_the_cli` applies one
+staged. Emitted as four, the statements failed when run one at a time
+outside a transaction (`LOCK TABLE can only be used in transaction blocks`),
+and a staged run would have committed the moved rows outside the parent.
+
+**What the move sets off.** A `DELETE` from the DEFAULT is a delete. Measured
+on 16 and 18:
+- A foreign key referencing the parent has a clone on every partition, the
+  DEFAULT among them. With `ON DELETE CASCADE` the move deleted the
+  referencing rows; with `NO ACTION` the move refused.
+- A row trigger cloned from the parent ran once per moved row, and the
+  insert into the plain table fires nothing to answer it.
+- A statement trigger or rule on the DEFAULT itself ran even when no row
+  moved. The parent's own statement triggers did not run.
+
+So the apply's pre-flight asks three counts, under the names the catalog
+has before the plan runs:
+- **The rows referencing a moved row.** These are rows referencing the
+  DEFAULT's rows in the range, through a key to the parent or to the DEFAULT,
+  counted as #1171 counts the rows referencing a dropped partition. A key
+  or a table the plan removes first is left out. A key with nothing pointing
+  at a moved row fires nothing, so it does not refuse the plan.
+- **The rows moved under a delete row trigger.** These are the DEFAULT's
+  rows in the range, when an enabled row trigger on the DEFAULT fires on
+  delete.
+- **Statement triggers and rules.** These are the DEFAULT's enabled
+  statement triggers and rules that fire on delete.
+
+Any of them refuses by name, with the remedy #1171 gave: repoint or delete
+the rows, or drop or disable the trigger, or move the rows, and plan again.
+
+The names matter. A parent renamed in the same plan (DEC-1690.1 refuses only
+attaches, detaches and drops beside a rename) is found under its old name.
+Under the new one the key is not found, the count reads zero, and a cascade
+deleted the referencing row. #1171's own count for a plain create had the
+same gap; the engine's refusal was its backstop, and it now reads the old
+name too.
+
+**The rest of the plan.**
+- **Risk.** The partition's own checks and uniqueness are a `constraint`
+  risk, and its own NOT NULLs a `not_null` risk. An empty partition faced
+  neither, and the moved rows face both. The parent's hold already, since
+  the rows come from a partition of the same parent.
+- **Estimate.** Made on the DEFAULT: ACCESS EXCLUSIVE, every row read.
+- **Plan version 34.** It carries the field.
+
+Pinned by `a_range_added_beside_a_standing_default_names_it`,
+`a_range_beside_a_default_is_filled_from_it_and_attached`,
+`a_partition_beside_a_default_asks_what_its_move_would_fire`,
+`a_partition_beside_a_default_risks_what_its_own_parts_ask_of_rows`,
+`range_partitions_are_added_and_dropped_on_populated_trees`, which checks the
+moved rows against the engine's routing for two-column bounds, and the CLI's
+`a_range_beside_a_default_takes_its_rows_through_the_cli`, on 18 and on 16.

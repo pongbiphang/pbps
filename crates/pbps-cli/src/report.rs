@@ -668,7 +668,12 @@ pub fn describe(c: &Change) -> String {
     match c {
         // A partition has no columns of its own to count; what it is, is its
         // parent and the rows it takes (#1170).
-        Change::CreateTable { name, table, .. } => match &table.partition_of {
+        Change::CreateTable {
+            name,
+            table,
+            beside_default,
+            ..
+        } => match &table.partition_of {
             Some(of) => match &of.bound {
                 pbps_model::PartitionBound::Default => {
                     format!(
@@ -687,12 +692,20 @@ pub fn describe(c: &Change) -> String {
                             .collect::<Vec<_>>()
                             .join(", ")
                     };
-                    format!(
+                    let made = format!(
                         "+ create table {name}, a partition of {} for rows from ({}) to ({})",
                         of.parent,
                         list(from),
                         list(to)
-                    )
+                    );
+                    // The rows it takes from the DEFAULT are the change's to
+                    // say, since they leave that partition (#1547).
+                    match beside_default {
+                        Some(default) => format!(
+                            "{made}, moving those rows out of the default partition {default}"
+                        ),
+                        None => made,
+                    }
                 }
             },
             None => format!("+ create table {name} ({} columns)", table.columns.len()),
@@ -1035,6 +1048,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            beside_default: None,
         };
         assert_eq!(
             super::describe(&create(Some(B::Range {
@@ -1047,6 +1061,27 @@ mod tests {
         assert_eq!(
             super::describe(&create(Some(B::Default))),
             "+ create table app.p1, the default partition of app.ev"
+        );
+        // Beside a standing DEFAULT, it says which rows it takes from where
+        // (#1547).
+        let Change::CreateTable {
+            uid, name, table, ..
+        } = create(Some(B::Range {
+            from: vec![D::Value("1".into())],
+            to: vec![D::Value("2".into())],
+        }))
+        else {
+            unreachable!("a create");
+        };
+        assert_eq!(
+            super::describe(&Change::CreateTable {
+                uid,
+                name,
+                table,
+                beside_default: Some("app.ev_rest".parse().unwrap()),
+            }),
+            "+ create table app.p1, a partition of app.ev for rows from (\"1\") to (\"2\"), \
+             moving those rows out of the default partition app.ev_rest"
         );
         assert_eq!(
             super::describe(&create(None)),

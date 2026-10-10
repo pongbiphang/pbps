@@ -2339,8 +2339,13 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
     match change {
         // The first statement is the one that brings the table into being; it
         // says so, and a staged checkpoint adopts the table from there.
-        Change::CreateTable { name, table, .. } => {
-            let mut out = create_table(pg, name, table)?;
+        Change::CreateTable {
+            name,
+            table,
+            beside_default,
+            ..
+        } => {
+            let mut out = create_table(pg, name, table, beside_default.as_ref())?;
             if let Some(first) = out.first_mut() {
                 first.creates.push(Created::Table(name.clone()));
             }
@@ -3238,7 +3243,101 @@ fn bound_clause(bound: &pbps_model::PartitionBound) -> String {
     }
 }
 
-fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
+/// A range partition made beside its parent's DEFAULT partition, which may
+/// hold rows of its range (#1547, DEC-1547.1). `CREATE ... PARTITION OF`
+/// refuses over such rows (#1171), so the partition is made as a plain table
+/// of its parent's shape, the DEFAULT's rows in its range are moved into it,
+/// and it is attached. Measured on 16 and 18:
+///
+/// - **Locks.** The parent is held at SHARE UPDATE EXCLUSIVE, the attach's,
+///   where `PARTITION OF` takes ACCESS EXCLUSIVE: the other partitions stay
+///   readable and writable. The DEFAULT is locked in SHARE mode first, so no
+///   row of the range can arrive in it between the move and the attach,
+///   which then takes it to ACCESS EXCLUSIVE and scans it.
+/// - **Shape.** The `LIKE` clauses give the table its parent's columns,
+///   defaults, generation, checks, storage and compression; the attach then
+///   makes each of them inherited, and its key and indexes the parent's
+///   clones. Read back, it is what `PARTITION OF` makes, field for field.
+///   The attach refuses a table missing one of the parent's checks.
+/// - **No index before the move.** The attach builds the clones over the
+///   moved rows, which is faster than maintaining indexes row by row (on 18,
+///   about a third of the time for a million rows), and the build is under
+///   the new table's own lock, which no other session can reach.
+/// - **One statement.** The lock, the table, the move and the attach are
+///   one batch, which the engine runs as one transaction even outside an
+///   explicit one (measured: `LOCK` is accepted there, and a refused attach
+///   takes the table and the move back with it). So no apply, staged or
+///   not, can stop with the rows out of the DEFAULT and the table not yet
+///   attached, as #1171's detach and drop are one statement.
+/// - **The rows.** Moved once, in one statement, by the key the engine
+///   bounds the range with ([`crate::preflight::range_predicate`]). The
+///   columns and the key are read from the catalog when the block runs, so a
+///   column change earlier in the plan cannot leave the list stale; a
+///   generated column is the engine's to compute. If the comparison took any
+///   row the range does not, or left one it does, the attach would refuse:
+///   it checks the new table against its range and the DEFAULT against the
+///   rest, so the result is the right rows or a rolled-back plan.
+#[allow(clippy::too_many_arguments)]
+fn beside_its_default(
+    pg: &Postgres,
+    name: &TableName,
+    create: &str,
+    storage: &str,
+    parent: &TableName,
+    default: &TableName,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+) -> Sql {
+    let q = qualified(name)?;
+    let p = qualified(parent)?;
+    let d = qualified(default)?;
+    let body = format!(
+        "DECLARE\n\
+         \x20   keep text;\n\
+         \x20   cols text;\n\
+         BEGIN\n\
+         \x20   SELECT {range} INTO STRICT keep\n\
+         \x20     FROM pg_catalog.pg_partitioned_table pt\n\
+         \x20    WHERE pt.partrelid = {lp}::pg_catalog.regclass;\n\
+         \x20   SELECT pg_catalog.string_agg(pg_catalog.quote_ident(a.attname), ', ' ORDER BY a.attnum)\n\
+         \x20     INTO STRICT cols\n\
+         \x20     FROM pg_catalog.pg_attribute a\n\
+         \x20    WHERE a.attrelid = {lp}::pg_catalog.regclass AND a.attnum > 0\n\
+         \x20      AND NOT a.attisdropped AND a.attgenerated = '';\n\
+         \x20   EXECUTE {delete} || keep || ' RETURNING ' || cols\n\
+         \x20       || {insert} || cols || ') SELECT * FROM moved';\n\
+         END",
+        range = crate::preflight::range_predicate(from, to),
+        lp = literal(&p),
+        delete = literal(&format!("WITH moved AS (DELETE FROM {d} AS r WHERE ")),
+        insert = literal(&format!(") INSERT INTO {q} (")),
+    );
+    let tag = dollar_tag(&body);
+    let create = on(
+        pg,
+        name,
+        &format!(
+            "{create} (LIKE {p} INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING CONSTRAINTS \
+             INCLUDING STORAGE INCLUDING COMPRESSION) USING heap{storage};"
+        ),
+    )?;
+    Ok(vec![Statement::new(format!(
+        "LOCK TABLE ONLY {d} IN SHARE MODE;\n{}\nDO {tag}\n{body}\n{tag};\nALTER TABLE {p} ATTACH \
+         PARTITION {q} {};",
+        create.sql,
+        bound_clause(&pbps_model::PartitionBound::Range {
+            from: from.to_vec(),
+            to: to.to_vec(),
+        })
+    ))])
+}
+
+fn create_table(
+    pg: &Postgres,
+    name: &TableName,
+    table: &Table,
+    beside_default: Option<&TableName>,
+) -> Sql {
     // A partition is its parent's columns, keys and indexes, which the
     // engine gives it as it is created (#1170): one statement, after the
     // parent's. Then its own checks and indexes (#1577), added as a table's
@@ -3248,24 +3347,30 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
     // refuses it by name.
     if let Some(of) = &table.partition_of {
         let q = qualified(name)?;
-        let mut out = vec![on(
-            pg,
-            name,
-            &format!(
-                "CREATE {}TABLE {q} PARTITION OF {} {} USING heap{};",
-                // Its persistence and storage parameters are its own, in the
-                // `CREATE` as a table's are (#1580): measured on 16 and 18,
-                // the parent has neither to give it.
-                if table.unlogged { "UNLOGGED " } else { "" },
-                qualified(&of.parent)?,
-                bound_clause(&of.bound),
-                if table.storage_parameters.is_empty() {
-                    String::new()
-                } else {
-                    format!(" WITH ({})", storage_list(&table.storage_parameters)?)
-                }
-            ),
-        )?];
+        // Its persistence and storage parameters are its own, in the
+        // `CREATE` as a table's are (#1580): measured on 16 and 18, the
+        // parent has neither to give it.
+        let unlogged = if table.unlogged { "UNLOGGED " } else { "" };
+        let storage = if table.storage_parameters.is_empty() {
+            String::new()
+        } else {
+            format!(" WITH ({})", storage_list(&table.storage_parameters)?)
+        };
+        let mut out = match (beside_default, &of.bound) {
+            (Some(default), pbps_model::PartitionBound::Range { from, to }) => {
+                let create = format!("CREATE {unlogged}TABLE {q}");
+                beside_its_default(pg, name, &create, &storage, &of.parent, default, from, to)?
+            }
+            _ => vec![on(
+                pg,
+                name,
+                &format!(
+                    "CREATE {unlogged}TABLE {q} PARTITION OF {} {} USING heap{storage};",
+                    qualified(&of.parent)?,
+                    bound_clause(&of.bound),
+                ),
+            )?],
+        };
         // Its own defaults and NOT NULLs (#1578), one statement: measured on
         // 16 and 18, set after the `CREATE` they are what the same words in it
         // give, the NOT NULL row on 18 under the same engine name.
@@ -4394,6 +4499,94 @@ mod tests {
         assert!(!sql[0].contains("search_path"), "{sql:?}");
     }
 
+    /// A range partition beside a standing DEFAULT is made as a plain table
+    /// of its parent's shape, filled from the DEFAULT and attached, with the
+    /// DEFAULT locked first, all in one statement that is the table's
+    /// creation; its own parts follow the attach as they follow a
+    /// `PARTITION OF` (#1547).
+    #[test]
+    fn a_range_beside_a_default_is_filled_from_it_and_attached() {
+        let mut partition = pbps_model::Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: pbps_model::PartitionBound::Range {
+                    from: vec![
+                        pbps_model::BoundDatum::Value("2025-01-01".into()),
+                        pbps_model::BoundDatum::MinValue,
+                    ],
+                    to: vec![pbps_model::BoundDatum::Value("2026-01-01".into())],
+                },
+                columns: Default::default(),
+            }),
+            unlogged: true,
+            ..Default::default()
+        };
+        partition.checks.insert(
+            "own_ck".into(),
+            pbps_model::CheckConstraint {
+                expression: "ts > '2000-01-01'".into(),
+            },
+        );
+        let emitted = |beside_default: Option<&str>| {
+            Postgres::new()
+                .emit(
+                    &Change::CreateTable {
+                        uid: "t_aaaaaa".parse().unwrap(),
+                        name: "app.ev_2025".parse().unwrap(),
+                        table: Box::new(partition.clone()),
+                        beside_default: beside_default.map(|d| d.parse().unwrap()),
+                    },
+                    Default::default(),
+                )
+                .expect("emit")
+        };
+        let moved = emitted(Some("app.ev_rest"));
+        let sql: Vec<&str> = moved.iter().map(|s| s.sql.as_str()).collect();
+        assert_eq!(sql.len(), 2, "{sql:?}");
+        // The lock, the table, the move and the attach are one statement,
+        // which the engine runs as one transaction, so no apply can stop in
+        // between; and that statement is the table's creation.
+        let one = sql[0];
+        let at = |part: &str| {
+            one.find(part)
+                .unwrap_or_else(|| panic!("{part} is missing from {one}"))
+        };
+        assert!(
+            one.starts_with("LOCK TABLE ONLY \"app\".\"ev_rest\" IN SHARE MODE;\n"),
+            "{one}"
+        );
+        let create = at(
+            "CREATE UNLOGGED TABLE \"app\".\"ev_2025\" (LIKE \"app\".\"ev\" INCLUDING DEFAULTS \
+             INCLUDING GENERATED INCLUDING CONSTRAINTS INCLUDING STORAGE INCLUDING COMPRESSION) \
+             USING heap;",
+        );
+        let block = at("\nDO ");
+        let delete = at("DELETE FROM \"app\".\"ev_rest\" AS r WHERE ");
+        let insert = at("INSERT INTO \"app\".\"ev_2025\" (");
+        let attach = at(
+            "ALTER TABLE \"app\".\"ev\" ATTACH PARTITION \"app\".\"ev_2025\" FOR VALUES FROM \
+             (E'2025-01-01', MINVALUE) TO (E'2026-01-01');",
+        );
+        assert!(
+            create < block && block < delete && delete < insert && insert < attach,
+            "{one}"
+        );
+        assert!(one.ends_with(';'), "{one}");
+        assert!(!moved[0].creates.is_empty(), "{one}");
+        // The partition's own parts follow, as after a `PARTITION OF`.
+        assert!(sql[1].contains("ADD CONSTRAINT \"own_ck\""), "{sql:?}");
+        assert!(moved[1].creates.is_empty());
+        // Negative: with no DEFAULT beside it, the partition is #1171's one
+        // `CREATE ... PARTITION OF`, which is also its creation.
+        let plain = emitted(None);
+        assert_eq!(plain.len(), 2, "{plain:?}");
+        assert!(
+            plain[0].sql.contains("PARTITION OF \"app\".\"ev\""),
+            "{plain:?}"
+        );
+        assert!(!plain[0].creates.is_empty() && !plain[0].sql.contains("LOCK"));
+    }
+
     /// A partitioned parent is created with its key and no access method,
     /// and a partition as one statement naming its parent and its bound,
     /// each value a literal no session setting reinterprets (#1170).
@@ -4414,6 +4607,7 @@ mod tests {
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: name.parse().unwrap(),
                         table: Box::new(table.clone()),
+                        beside_default: None,
                     },
                     Default::default(),
                 )
@@ -4826,6 +5020,7 @@ mod tests {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
                 table: Box::new(created),
+                beside_default: None,
             },
         );
         assert!(
@@ -4902,6 +5097,7 @@ mod tests {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
                 table: Box::new(created.clone()),
+                beside_default: None,
             },
         );
         assert!(
@@ -4915,6 +5111,7 @@ mod tests {
                 uid: "t_000000".parse().unwrap(),
                 name: table,
                 table: Box::new(created),
+                beside_default: None,
             },
         );
         assert!(plain[0].contains(") USING heap;"), "{plain:?}");
@@ -5004,6 +5201,7 @@ mod tests {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
                 table: Box::new(created.clone()),
+                beside_default: None,
             },
         );
         let at = |needle: &str| {
@@ -5024,6 +5222,7 @@ mod tests {
                 uid: "t_000000".parse().unwrap(),
                 name: table,
                 table: Box::new(created),
+                beside_default: None,
             },
         );
         assert!(!plain.join("\n").contains("REPLICA IDENTITY"), "{plain:?}");
@@ -5109,11 +5308,13 @@ mod tests {
                     uid: Uid::generate(UidKind::Table),
                     name: table.clone(),
                     table: Box::new(clustered_table.clone()),
+                    beside_default: None,
                 },
                 Change::CreateTable {
                     uid: Uid::generate(UidKind::Table),
                     name: table.clone(),
                     table: Box::new(created.clone()),
+                    beside_default: None,
                 },
             ),
         ] {
@@ -6425,6 +6626,7 @@ mod tests {
                 uid: Uid::generate(UidKind::Table),
                 name: name("app", "t"),
                 table: Box::new(table),
+                beside_default: None,
             },
         );
         assert_eq!(
@@ -6655,6 +6857,7 @@ mod tests {
                 uid: Uid::generate(UidKind::Table),
                 name: name("app", "t"),
                 table: Box::new(table),
+                beside_default: None,
             },
         );
         assert!(
@@ -7016,6 +7219,7 @@ mod tests {
                 uid: Uid::generate(UidKind::Table),
                 name: name("app", "t"),
                 table: Box::new(table),
+                beside_default: None,
             },
         )
         .remove(0);
@@ -7077,6 +7281,7 @@ mod tests {
                     uid: Uid::generate(UidKind::Table),
                     name: name("app", "empty"),
                     table: Box::new(Table::default()),
+                    beside_default: None,
                 },
                 Strategy::default(),
             )

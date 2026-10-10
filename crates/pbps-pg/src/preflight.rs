@@ -3905,13 +3905,45 @@ fn partition_probes(
     // their rows are gone, and so are their references.
     let mut dropped_before: Vec<&TableName> = Vec::new();
     for p in &changes.changes {
-        let probe = if let Change::CreateTable { name, table, .. } = &p.change
+        let probe = if let Change::CreateTable {
+            name,
+            table,
+            beside_default: Some(default),
+            ..
+        } = &p.change
+            && let Some(of) = &table.partition_of
+            && let pbps_model::PartitionBound::Range { from, to } = &of.bound
+        {
+            // Its rows are moved, not refused (#1547), unless the move would
+            // set off what a delete from the DEFAULT sets off. Both are read
+            // under the names the catalog has before the plan runs: a parent
+            // renamed in the same plan is found under its old one.
+            let (Some(stored), Some(parent)) = (names.table(default), names.table(&of.parent))
+            else {
+                continue;
+            };
+            for probe in [
+                default_reference_probe(name, &parent, &stored, names, from, to),
+                default_trigger_probe(name, &parent, &stored, from, to),
+                default_statement_probe(name, &stored),
+            ] {
+                match probe {
+                    Ok(probe) => out.push(probe),
+                    Err(error) => {
+                        unchecked.push(Unchecked::for_change(&p.change, error.to_string()))
+                    }
+                }
+            }
+            continue;
+        } else if let Change::CreateTable { name, table, .. } = &p.change
             && let Some(of) = &table.partition_of
             && let pbps_model::PartitionBound::Range { from, to } = &of.bound
             && !created.contains(&of.parent)
         {
+            // Under the parent's name before the plan's renames, as above.
             let leaving = dropped.get(&of.parent).map_or(&[][..], Vec::as_slice);
-            partition_range_probe(name, &of.parent, from, to, leaving, "create a partition")
+            let parent = names.table(&of.parent).unwrap_or_else(|| of.parent.clone());
+            partition_range_probe(name, &parent, from, to, leaving, "create a partition")
         } else if let Change::DropTable {
             name,
             detach_from: Some(parent),
@@ -3974,6 +4006,27 @@ fn key_prefix(count: usize) -> String {
     )
 }
 
+/// The rows of a range, as SQL the engine evaluates, over `pt`, the parent's
+/// `pg_partitioned_table` row, to the text of a predicate on `r`: no key
+/// column NULL, which a range never takes, and the key between its two
+/// ends. Shared by the probes counting a range's rows and the move that
+/// fills a partition from its DEFAULT (#1547), so that the rows counted and
+/// the rows moved are one set.
+pub(crate) fn range_predicate(
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+) -> String {
+    format!(
+        "(SELECT pg_catalog.string_agg('r.' || pg_catalog.quote_ident(a.attname) || \
+         ' IS NOT NULL', ' AND ' ORDER BY k.n) \
+         FROM pg_catalog.unnest(pt.partattrs::int2[]) WITH ORDINALITY AS k(attnum, n) \
+         JOIN pg_catalog.pg_attribute a \
+         ON a.attrelid = pt.partrelid AND a.attnum = k.attnum) || ' AND ' || {} || ' AND ' || {}",
+        range_end(from, true),
+        range_end(to, false)
+    )
+}
+
 /// One end of a range as a comparison of the key's leading columns, the way
 /// the engine bounds a RANGE partition: lexicographic, and the first
 /// `MINVALUE` or `MAXVALUE` decides everything after it. `lower` is the
@@ -4027,11 +4080,6 @@ fn partition_range_probe(
     leaving: &[&TableName],
     making: &str,
 ) -> Result<Probe, DialectError> {
-    let not_null = "(SELECT pg_catalog.string_agg('r.' || pg_catalog.quote_ident(a.attname) || \
-                    ' IS NOT NULL', ' AND ' ORDER BY k.n) \
-                    FROM pg_catalog.unnest(pt.partattrs::int2[]) WITH ORDINALITY AS k(attnum, n) \
-                    JOIN pg_catalog.pg_attribute a \
-                    ON a.attrelid = pt.partrelid AND a.attnum = k.attnum)";
     let mut excluded = String::new();
     for child in leaving {
         excluded.push_str(&format!(
@@ -4040,13 +4088,12 @@ fn partition_range_probe(
         ));
     }
     let text = format!(
-        "{} || {not_null} || ' AND ' || {} || ' AND ' || {} || {}",
+        "{} || {} || {}",
         value_literal(&format!(
             "SELECT count(*) AS n FROM {} AS r WHERE ",
             qualified(parent)?
         )),
-        range_end(from, true),
-        range_end(to, false),
+        range_predicate(from, to),
         value_literal(&excluded),
     );
     Ok(Probe::new(
@@ -4068,6 +4115,142 @@ fn partition_range_probe(
     ))
 }
 
+/// The rows referencing a row of `default` inside the range of the
+/// partition made beside it (#1547). The move deletes those rows from the
+/// DEFAULT, and measured on 16 and 18 a delete from a partition fires the
+/// foreign keys that reach it: `ON DELETE CASCADE` deleted the referencing
+/// rows, `NO ACTION` refused the move, and the other actions rewrite them.
+/// A key to the parent reaches the DEFAULT through its clone, so the keys
+/// asked are the parent's and the DEFAULT's own, a partitioned referencing
+/// table counted with its partitions, as for a detach
+/// ([`partition_reference_probe`]); a key or a table the plan removes, which
+/// goes in class 2 or 6 before the move, is left out ([`gone_keys`]). A row
+/// in the range that nothing references moves without setting anything off.
+fn default_reference_probe(
+    partition: &TableName,
+    parent: &TableName,
+    default: &TableName,
+    names: &AsStored,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+) -> Result<Probe, DialectError> {
+    let child = value_literal(&format!(
+        " AS c WHERE EXISTS (SELECT 1 FROM ONLY {} AS r WHERE ",
+        qualified(default)?
+    ));
+    let matched = "(SELECT pg_catalog.string_agg('c.' || pg_catalog.quote_ident(ra.attname) || \
+                   ' = r.' || pg_catalog.quote_ident(pa.attname), ' AND ' ORDER BY s.i) \
+                   FROM pg_catalog.generate_subscripts(con.conkey, 1) AS s(i) \
+                   JOIN pg_catalog.pg_attribute ra \
+                   ON ra.attrelid = con.conrelid AND ra.attnum = con.conkey[s.i] \
+                   JOIN pg_catalog.pg_attribute pa \
+                   ON pa.attrelid = con.confrelid AND pa.attnum = con.confkey[s.i])";
+    let text = format!(
+        "'SELECT count(*) AS n FROM ' || CASE WHEN cl.relkind = 'p' THEN '' ELSE 'ONLY ' END \
+         || pg_catalog.quote_ident(ns.nspname) || '.' || pg_catalog.quote_ident(cl.relname) \
+         || {child} || {matched} || ' AND ' || {} || ')'",
+        range_predicate(from, to)
+    );
+    Ok(Probe::new(
+        format!(
+            "rows that reference rows of {default} inside the range of {partition}, its parent \
+             {parent}'s new partition beside it: moving those rows into {partition} deletes \
+             them from {default}, which fires the foreign key's action on the rows referencing \
+             them; delete or repoint the referencing rows, or move the rows first, then plan \
+             again"
+        ),
+        format!(
+            "SELECT {}",
+            saturated_count(&format!(
+                "COALESCE((SELECT sum((pg_catalog.xpath('/row/n/text()', \
+                 pg_catalog.query_to_xml({text}, false, true, '')))[1]::text::numeric) \
+                 FROM pg_catalog.pg_constraint con \
+                 JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid \
+                 JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace \
+                 CROSS JOIN pg_catalog.pg_partitioned_table pt \
+                 WHERE pt.partrelid = pg_catalog.to_regclass({p}) \
+                 AND con.contype = 'f' AND con.conparentid = 0 \
+                 AND con.confrelid IN (pg_catalog.to_regclass({p}), pg_catalog.to_regclass({d})) \
+                 {}), 0)",
+                gone_keys(names),
+                p = value_literal(&qualified(parent)?),
+                d = value_literal(&qualified(default)?),
+            ))
+        ),
+    ))
+}
+
+/// The rows of `default` in the range of the partition made beside it, when
+/// an enabled row trigger on the DEFAULT fires on delete (#1547): measured
+/// on 16 and 18, one cloned from the parent ran once per moved row, and the
+/// insert into the new table fires none to answer it. With no such trigger,
+/// or no row to move, the count is zero.
+fn default_trigger_probe(
+    partition: &TableName,
+    parent: &TableName,
+    default: &TableName,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+) -> Result<Probe, DialectError> {
+    let d = value_literal(&qualified(default)?);
+    let text = format!(
+        "{} || {}",
+        value_literal(&format!(
+            "SELECT count(*) AS n FROM {} AS r WHERE ",
+            qualified(default)?
+        )),
+        range_predicate(from, to),
+    );
+    Ok(Probe::new(
+        format!(
+            "rows of {default} inside the range of {partition}, its parent {parent}'s new \
+             partition beside it, under a row trigger on {default} that fires on delete: moving \
+             them into {partition} deletes them from {default}, which runs the trigger for each; \
+             drop or disable it, or move the rows first, then plan again"
+        ),
+        format!(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t \
+             WHERE t.tgrelid = pg_catalog.to_regclass({d}) AND NOT t.tgisinternal \
+             AND t.tgenabled IN ('O', 'A') AND (t.tgtype::int & 9) = 9) THEN {} ELSE 0 END",
+            saturated_count(&format!(
+                "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()', \
+                 pg_catalog.query_to_xml({text}, false, true, '')))[1]::text::numeric \
+                 FROM pg_catalog.pg_partitioned_table pt \
+                 WHERE pt.partrelid = pg_catalog.to_regclass({})), 0)",
+                value_literal(&qualified(parent)?)
+            ))
+        ),
+    ))
+}
+
+/// The statement triggers and rules on `default` that a `DELETE` from it
+/// fires (#1547): unlike a row trigger, they run whether or not a row moves,
+/// so the move beside it is refused while any stands.
+fn default_statement_probe(
+    partition: &TableName,
+    default: &TableName,
+) -> Result<Probe, DialectError> {
+    let d = value_literal(&qualified(default)?);
+    Ok(Probe::new(
+        format!(
+            "statement triggers or rules on {default} that a DELETE fires: making {partition} \
+             beside it moves the rows of its range out with one, which fires them even when no \
+             row moves; drop or disable them first, then plan again"
+        ),
+        format!(
+            "SELECT {}",
+            saturated_count(&format!(
+                "(SELECT count(*) FROM pg_catalog.pg_trigger t \
+                 WHERE t.tgrelid = pg_catalog.to_regclass({d}) AND NOT t.tgisinternal \
+                 AND t.tgenabled IN ('O', 'A') AND (t.tgtype::int & 9) = 8) \
+                 + (SELECT count(*) FROM pg_catalog.pg_rewrite w \
+                 WHERE w.ev_class = pg_catalog.to_regclass({d}) AND w.ev_type = '4' \
+                 AND w.ev_enabled IN ('O', 'A'))"
+            ))
+        ),
+    ))
+}
+
 /// The rows of `table`, about to be attached to `parent` over the range from
 /// `from` to `to`, that the range does not take: outside it, or with a NULL
 /// in any key column. The engine scans for them and refuses the attach on the
@@ -4080,19 +4263,13 @@ fn attach_range_probe(
     from: &[pbps_model::BoundDatum],
     to: &[pbps_model::BoundDatum],
 ) -> Result<Probe, DialectError> {
-    let not_null = "(SELECT pg_catalog.string_agg('r.' || pg_catalog.quote_ident(a.attname) || \
-                    ' IS NOT NULL', ' AND ' ORDER BY k.n) \
-                    FROM pg_catalog.unnest(pt.partattrs::int2[]) WITH ORDINALITY AS k(attnum, n) \
-                    JOIN pg_catalog.pg_attribute a \
-                    ON a.attrelid = pt.partrelid AND a.attnum = k.attnum)";
     let text = format!(
-        "{} || {not_null} || ' AND ' || {} || ' AND ' || {} || ')'",
+        "{} || {} || ')'",
         value_literal(&format!(
             "SELECT count(*) AS n FROM {} AS r WHERE NOT (",
             qualified(table)?
         )),
-        range_end(from, true),
-        range_end(to, false),
+        range_predicate(from, to),
     );
     Ok(Probe::new(
         format!(
@@ -4463,6 +4640,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            beside_default: None,
         };
         let range = B::Range {
             from: vec![pbps_model::BoundDatum::Value("1".into())],
@@ -4487,6 +4665,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "app.ev".parse().unwrap(),
                     table: Box::default(),
+                    beside_default: None,
                 }),
                 pbps_model::PlannedChange::new(partition(range)),
             ],
@@ -4565,6 +4744,87 @@ mod tests {
         );
         // Negative: a DEFAULT bound, which the differ refuses, asks nothing.
         assert!(attach(B::Default).is_empty());
+    }
+
+    /// A partition made beside a standing DEFAULT moves the DEFAULT's rows
+    /// instead of being refused over them, so it asks what the move would
+    /// fire: the rows referencing the ones it moves, the rows it moves under
+    /// a row trigger, and statement triggers and rules always, each under
+    /// the name the catalog has before the plan's renames (#1547).
+    #[test]
+    fn a_partition_beside_a_default_asks_what_its_move_would_fire() {
+        let create = Change::CreateTable {
+            uid: "t_bbbbbb".parse().unwrap(),
+            name: "app.ev_1".parse().unwrap(),
+            table: Box::new(pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Range {
+                        from: vec![pbps_model::BoundDatum::Value("1".into())],
+                        to: vec![pbps_model::BoundDatum::MaxValue],
+                    },
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            }),
+            beside_default: Some("app.ev_rest".parse().unwrap()),
+        };
+        let renamed = Change::RenameTable {
+            uid: "t_cccccc".parse().unwrap(),
+            from: "app.ev_old".parse().unwrap(),
+            to: "app.ev".parse().unwrap(),
+            defaults: Default::default(),
+        };
+        let asked = probes(&ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(renamed),
+                pbps_model::PlannedChange::new(create),
+            ],
+        });
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        // The rows referencing the moved ones, through a key to the parent or
+        // to the DEFAULT; the parent under the name it has before the plan's
+        // rename: under the new one the key is not found, and the count
+        // reads zero.
+        assert!(
+            asked[0]
+                .description
+                .contains("rows that reference rows of app.ev_rest inside the range of app.ev_1"),
+            "{asked:?}"
+        );
+        let refs = &asked[0].sql;
+        assert!(
+            refs.contains("FROM ONLY \"app\".\"ev_rest\" AS r WHERE ")
+                && refs.contains("pt.partrelid = pg_catalog.to_regclass(E'\"app\".\"ev_old\"')")
+                && refs.contains(
+                    "con.confrelid IN (pg_catalog.to_regclass(E'\"app\".\"ev_old\"'), \
+                     pg_catalog.to_regclass(E'\"app\".\"ev_rest\"'))"
+                )
+                && !refs.contains("E'\"app\".\"ev\"'"),
+            "{refs}"
+        );
+        assert!(
+            asked[1]
+                .description
+                .contains("rows of app.ev_rest inside the range of app.ev_1")
+                && asked[1].sql.contains("(t.tgtype::int & 9) = 9")
+                && asked[1].sql.contains("to_regclass(E'\"app\".\"ev_old\"')"),
+            "{asked:?}"
+        );
+        assert!(
+            asked[2]
+                .description
+                .contains("statement triggers or rules on app.ev_rest"),
+            "{asked:?}"
+        );
+        // Negative: neither is the refusal over the DEFAULT's rows a plain
+        // create asks for.
+        assert!(
+            asked
+                .iter()
+                .all(|p| !p.description.contains("will not create a partition")),
+            "{asked:?}"
+        );
     }
 
     #[test]
@@ -5048,6 +5308,7 @@ mod tests {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                     name: parent.clone(),
                     table: Box::new(table),
+                    beside_default: None,
                 },
                 Change::AddForeignKey {
                     table: child.clone(),

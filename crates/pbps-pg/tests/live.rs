@@ -4217,21 +4217,11 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             1
         );
 
-        // A range over a row the DEFAULT partition holds: counted, and the
-        // engine refuses the same `CREATE`.
-        let mut over = added.clone();
-        over.tables.insert(
-            t("ev_2027"),
-            partition(
-                "ev",
-                range(vec![value("2027-01-01")], vec![value("2028-01-01")]),
-            ),
-        );
-        let over_step = plan(&added, &added_ids, &over, &mint_ids(&over, &added_ids, &[]));
-        let probes = pg.preflight(&over_step).probes;
-        assert_eq!(probes.len(), 1, "{probes:#?}");
-        assert_eq!(counted(&mut conn, &probes[0].sql).await, 1);
-        assert!(probes[0].description.contains("DEFAULT partition"));
+        // A range over a row the DEFAULT partition holds: the engine refuses
+        // `CREATE ... PARTITION OF` over it, so the plan moves the row (#1547).
+        // A key references the parent, but no row references the one moved,
+        // and no trigger fires: every probe counts zero, and the row is the
+        // new partition's.
         in_a_transaction(&mut conn).await;
         let refused = conn
             .execute(&format!(
@@ -4242,10 +4232,62 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             .expect_err("the engine refuses the range over the DEFAULT row");
         assert_eq!(sqlstate(&refused), "23514", "{refused:?}");
         rollback(&mut conn).await;
+        let mut over = added.clone();
+        over.tables.insert(
+            t("ev_2027"),
+            partition(
+                "ev",
+                range(vec![value("2027-01-01")], vec![value("2028-01-01")]),
+            ),
+        );
+        let over_step = plan(&added, &added_ids, &over, &mint_ids(&over, &added_ids, &[]));
+        let probes = pg.preflight(&over_step).probes;
+        assert_eq!(probes.len(), 3, "{probes:#?}");
+        for probe in &probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &over_step).await;
+        assert_eq!(
+            counted(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM ONLY {s}.ev_2027 WHERE id = 2")
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            counted(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM ONLY {s}.ev_rest")
+            )
+            .await,
+            0
+        );
+        rollback(&mut conn).await;
+        // A row referencing the one the move takes: the key's action would
+        // fire, so it is counted.
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!("INSERT INTO {s}.r VALUES (2, 2, '2027-03-01')"))
+            .await
+            .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[0].sql).await,
+            1,
+            "{}",
+            probes[0].description
+        );
+        rollback(&mut conn).await;
 
-        // Two key columns, with unbounded ends: each count is the rows the
-        // engine would route into the range, NULL keys never among them, and
-        // the engine refuses exactly the ranges counted above zero.
+        // Two key columns, with unbounded ends: the engine refuses
+        // `PARTITION OF` over exactly the ranges holding rows, and the move
+        // takes exactly the rows it would route into the range, NULL keys
+        // never among them.
         for (from, to, expected, sql) in [
             (
                 vec![value("5"), D::MinValue],
@@ -4272,14 +4314,6 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 "FROM (7, 0) TO (8, 0)",
             ),
         ] {
-            let mut wanted = base.clone();
-            wanted
-                .tables
-                .insert(t("m_new"), partition("m", range(from, to)));
-            let step = plan(&base, &ids, &wanted, &mint_ids(&wanted, &ids, &[]));
-            let probes = pg.preflight(&step).probes;
-            assert_eq!(probes.len(), 1, "{sql}: {probes:#?}");
-            assert_eq!(counted(&mut conn, &probes[0].sql).await, expected, "{sql}");
             in_a_transaction(&mut conn).await;
             let engine = conn
                 .execute(&format!(
@@ -4287,6 +4321,28 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 ))
                 .await;
             assert_eq!(engine.is_err(), expected > 0, "{sql}: {engine:?}");
+            rollback(&mut conn).await;
+            let mut wanted = base.clone();
+            wanted
+                .tables
+                .insert(t("m_new"), partition("m", range(from, to)));
+            let step = plan(&base, &ids, &wanted, &mint_ids(&wanted, &ids, &[]));
+            in_a_transaction(&mut conn).await;
+            apply(&mut conn, &pg, &step).await;
+            assert_eq!(
+                counted(
+                    &mut conn,
+                    &format!("SELECT count(*)::int FROM ONLY {s}.m_new")
+                )
+                .await,
+                expected,
+                "{sql}"
+            );
+            assert_eq!(
+                counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.m")).await,
+                6,
+                "{sql}: no row lost or doubled"
+            );
             rollback(&mut conn).await;
         }
 
@@ -4404,7 +4460,8 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         assert_eq!(counted(&mut conn, &alone_probes[0].sql).await, 1);
         conn.execute(&format!("DROP TABLE {s}.aref")).await.unwrap();
         // A range split in the same plan: the partition's rows go with its
-        // drop, so the halves created over them count none.
+        // drop, so the halves created over them count none. Each half is made
+        // beside the DEFAULT, and asks its three questions of it (#1547).
         let mut split = fewer.clone();
         for (name, from, to) in [
             ("ev_h1", "2025-01-01", "2025-07-01"),
@@ -4422,7 +4479,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &mint_ids(&split, &added_ids, &archive),
         );
         let split_probes = pg.preflight(&split_step).probes;
-        assert_eq!(split_probes.len(), 3, "{split_probes:#?}");
+        assert_eq!(split_probes.len(), 7, "{split_probes:#?}");
         for probe in &split_probes {
             assert_eq!(
                 counted(&mut conn, &probe.sql).await,
@@ -5641,6 +5698,7 @@ async fn temporary_relations_and_types_follow_the_declared_write_path() {
         uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
         name: TableName::new(schema, "bound"),
         table: Box::new(table.clone()),
+        beside_default: None,
     };
     // The same emitted statement without the final entry is the negative
     // control, even in a session whose explicit path names only the project.
@@ -5946,6 +6004,7 @@ async fn the_framing_pins_the_settings_that_decide_what_a_definition_means() {
         uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
         name: TableName::new(&s, "pinned"),
         table: Box::new(t),
+        beside_default: None,
     };
     let statements = Postgres::new()
         .emit(&change, Strategy::default())
@@ -6214,6 +6273,7 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
             name: TableName::new(&s, "t"),
             table: Box::new(t),
+            beside_default: None,
         }
     };
     for spelling in [
@@ -6251,6 +6311,7 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                 name: TableName::new(&s, "plain"),
                 table: Box::new(plain),
+                beside_default: None,
             },
             Strategy::default(),
         )
@@ -6952,6 +7013,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                     name: name.clone(),
                     table: Box::new(table),
+                    beside_default: None,
                 },
                 Strategy::default(),
             )
@@ -7058,6 +7120,7 @@ async fn installed_default_operator_classes_can_make_json_keys_valid() {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                     name,
                     table: Box::new(table),
+                    beside_default: None,
                 },
                 Strategy::default(),
             )
@@ -7339,6 +7402,7 @@ async fn the_framing_pins_what_an_ambiguous_temporal_literal_means() {
         uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
         name: TableName::new(&s, "temporal"),
         table: Box::new(t),
+        beside_default: None,
     };
     let statements = Postgres::new()
         .emit(&change, Strategy::default())
@@ -23026,6 +23090,7 @@ async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_colu
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: child.clone(),
                         table: Box::new(table),
+                        beside_default: None,
                     });
                 }
                 "retype" => changes.push(Change::AlterColumnType {
@@ -25321,6 +25386,7 @@ async fn a_key_into_a_created_empty_parent_counts_every_reference_the_child_hold
             uid: "t_aaaaaa".parse().expect("a uid"),
             name: parent.clone(),
             table: Box::new(declared),
+            beside_default: None,
         },
         Change::AddForeignKey {
             table: TableName::new(&s, "child"),

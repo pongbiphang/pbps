@@ -3878,6 +3878,7 @@ mod tests {
             uid: Uid::derived(UidKind::Table, "app.n", 0),
             name: n.clone(),
             table: Box::new(t.clone()),
+            beside_default: None,
         };
         #[allow(clippy::wildcard_enum_match_arm)]
         let table_of = |cs: &ChangeSet| match &cs.changes[0].change {
@@ -3939,11 +3940,13 @@ mod tests {
                     uid: Uid::derived(UidKind::Table, "app.n", 0),
                     name: n.clone(),
                     table: Box::new(parent.clone()),
+                    beside_default: None,
                 },
                 Change::CreateTable {
                     uid: Uid::derived(UidKind::Table, "app.n_1", 0),
                     name: p1.clone(),
                     table: Box::new(partition(column)),
+                    beside_default: None,
                 },
                 alter(&s, "app.f(integer)"),
             ]);
@@ -4131,6 +4134,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.n", 0),
                 name: n,
                 table: Box::new(t),
+                beside_default: None,
             },
             alter(&s, "app.f(integer)"),
         ]);
@@ -4198,6 +4202,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, name, 0),
                 name: name.parse().unwrap(),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let mut cs = plan(vec![
@@ -4253,6 +4258,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, name, 0),
                 name: name.parse().unwrap(),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let mut parent = Table::default();
@@ -4267,6 +4273,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.ev", 0),
                 name: "app.ev".parse().unwrap(),
                 table: Box::new(parent),
+                beside_default: None,
             },
             partition("app.ev_new", "app.f(1)"),
             partition("app.ev_plain", "7"),
@@ -4311,6 +4318,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, name, 0),
                 name: name.parse().unwrap(),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let partition = |name: &str, of: &str| Change::CreateTable {
@@ -4324,6 +4332,7 @@ mod tests {
                 }),
                 ..Table::default()
             }),
+            beside_default: None,
         };
         let mut cs = plan(vec![
             parent("app.ev", Some("app.f(k)")),
@@ -4372,6 +4381,7 @@ mod tests {
                 }),
                 ..Table::default()
             }),
+            beside_default: None,
         };
         let index_on = |column: &str| pbps_model::Index {
             columns: vec![pbps_model::IndexColumn {
@@ -4392,12 +4402,18 @@ mod tests {
                 uid,
                 name,
                 mut table,
+                ..
             } = partition(name, "v")
             else {
                 unreachable!("a partition is created");
             };
             table.indexes.insert(index.into(), index_on(column));
-            Change::CreateTable { uid, name, table }
+            Change::CreateTable {
+                uid,
+                name,
+                table,
+                beside_default: None,
+            }
         };
         // A standing partition's own changes on the column, and a default
         // on another parent's column of the same name.
@@ -4535,6 +4551,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, name, 0),
                 name: name.parse().unwrap(),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         // A later new table naming app.n only inside an OID-alias literal.
@@ -4547,6 +4564,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.literal", 0),
                 name: "app.literal".parse().unwrap(),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         // And a new partition naming it only in its own default (#1578).
@@ -4568,6 +4586,7 @@ mod tests {
                 }),
                 ..Table::default()
             }),
+            beside_default: None,
         };
         let mut cs = plan(vec![
             new_table("app.n", &[("id", None), ("g", Some("app.f(id)"))], None),
@@ -4636,6 +4655,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.other", 0),
                 name: "app.other".parse().unwrap(),
                 table: Box::new(other),
+                beside_default: None,
             },
             routine("app.f(integer)", "SELECT count(*)::integer FROM app.other"),
         ]);
@@ -6291,6 +6311,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.t", 1),
                 name: TableName::new("app", "t"),
                 table: Box::new(s.tables[&TableName::new("app", "t")].clone()),
+                beside_default: None,
             },
         ]);
         let found = BTreeMap::from([(
@@ -6817,6 +6838,7 @@ mod tests {
                 }),
                 ..Table::default()
             }),
+            beside_default: None,
         };
         let refused =
             refusal_of(&plan(vec![partition, add_index("ix_new", None)]), &*pg()).unwrap_err();
@@ -6859,6 +6881,7 @@ mod tests {
             uid: Uid::derived(UidKind::Table, "app.n", 0),
             name: TableName::new("app", "n"),
             table: Box::new(table),
+            beside_default: None,
         }
     }
 
@@ -7053,6 +7076,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, &format!("app.{table}"), 0),
                 name: TableName::new("app", table),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let cut = format!("{}_pkey", "t".repeat(58));
@@ -7094,6 +7118,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, &format!("app.{table}"), 0),
                 name: TableName::new("app", table),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let holder = |name: &str, owner: Option<&str>, primary_key: bool| KeyNameHolder {
@@ -7270,6 +7295,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, &format!("app.{table}"), 0),
                 name: TableName::new("app", table),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let rename = |from: TableName, to: TableName| Change::RenameTable {
@@ -7391,6 +7417,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "s2.n", 0),
                 name: TableName::new("s2", "n"),
                 table: Box::new(in_s2),
+                beside_default: None,
             },
         ];
         let prefixes = key_name_prefixes(&plan(chain.clone()));
@@ -7447,6 +7474,7 @@ mod tests {
             uid: Uid::derived(UidKind::Table, "app.long", 0),
             name: TableName::new("app", &long),
             table: Box::new(t.clone()),
+            beside_default: None,
         }]));
         assert_eq!(prefixes, [("app".to_owned(), "t".repeat(49))]);
         for n in [0, 1, 10, 1000] {
