@@ -1326,6 +1326,7 @@
         "pbps_sql_calls_no_operator_a_schema_user_could_add",
         "permission_versions_are_checked_before_planning_bootstrap_apply_and_resume",
         "a_restrict_foreign_key_round_trips_and_its_actions_change_on_both_servers",
+        "a_dropped_constraint_trigger_frees_its_name_for_a_key",
         "an_index_follows_its_table_through_a_chain_of_moves",
         "postgres_rename_impact_reaches_the_cli_as_advisory_and_requires_explicit_approval",
         "pull_adopts_a_cluster_role_only_once_this_database_grants_it_something",

@@ -26577,6 +26577,8 @@ async fn relation_name_occupants_name_each_kind_and_its_owner() {
 /// every relation, with the table an index is on or whose column owns a
 /// sequence, and every constraint, with its table. A sequence no column owns
 /// stands alone, and a constraint of the name in another schema is not read.
+/// A constraint trigger's row is a constraint that says it is a trigger's,
+/// which its `DROP TRIGGER` frees (#1738); an ordinary trigger has no row.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn key_name_holders_name_each_holder_its_owner_and_its_kind() {
@@ -26593,7 +26595,11 @@ async fn key_name_holders_name_each_holder_its_owner_and_its_kind() {
          CREATE SEQUENCE {s}.n_pkey2;
          CREATE TABLE {s}.n_pkey4 (x integer);
          CREATE TABLE {s}.unrelated (x integer);
-         CREATE TABLE {other}.u (x integer, CONSTRAINT n_pkey5 CHECK (x > 0))"
+         CREATE TABLE {other}.u (x integer, CONSTRAINT n_pkey5 CHECK (x > 0));
+         CREATE FUNCTION {s}.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+         CREATE CONSTRAINT TRIGGER n_pkey6 AFTER INSERT ON {s}.t
+             FOR EACH ROW EXECUTE FUNCTION {s}.f();
+         CREATE TRIGGER n_pkey7 AFTER INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.f()"
     ))
     .await
     .expect("the holders");
@@ -26601,7 +26607,7 @@ async fn key_name_holders_name_each_holder_its_owner_and_its_kind() {
         .await
         .expect("the read");
     found.sort_by(|a, b| (&a.name, a.constraint).cmp(&(&b.name, b.constraint)));
-    let seen: Vec<(String, Option<String>, bool, bool)> = found
+    let seen: Vec<(String, Option<String>, bool, bool, bool)> = found
         .iter()
         .map(|h| {
             assert_eq!(h.name.schema, s);
@@ -26610,19 +26616,22 @@ async fn key_name_holders_name_each_holder_its_owner_and_its_kind() {
                 h.owner.as_ref().map(|t| t.name.clone()),
                 h.primary_key,
                 h.constraint,
+                h.trigger,
             )
         })
         .collect();
     assert_eq!(
         seen,
         [
-            ("n_pkey".into(), Some("t".into()), false, false),
-            ("n_pkey1".into(), Some("t".into()), false, false),
-            ("n_pkey2".into(), None, false, false),
-            ("n_pkey3".into(), Some("t".into()), false, true),
-            ("n_pkey4".into(), None, false, false),
+            ("n_pkey".into(), Some("t".into()), false, false, false),
+            ("n_pkey1".into(), Some("t".into()), false, false, false),
+            ("n_pkey2".into(), None, false, false, false),
+            ("n_pkey3".into(), Some("t".into()), false, true, false),
+            ("n_pkey4".into(), None, false, false, false),
+            ("n_pkey6".into(), Some("t".into()), false, true, true),
         ],
-        "`t_pkey`, `unrelated` and the other schema's check do not start with the prefix there"
+        "`t_pkey`, `unrelated` and the other schema's check do not start with the prefix \
+         there, and the ordinary trigger `n_pkey7` is no holder"
     );
     // A key's own index and constraint say so.
     let keyed = key_name_holders(&mut conn, &[(s.clone(), "t_pkey".to_owned())])
