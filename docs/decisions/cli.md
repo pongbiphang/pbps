@@ -811,3 +811,34 @@ set (#1740 review).
 Moving the version now, as DEC-997.1 reads, was the alternative. It pays
 the costs above for a consumer that does not exist, and the release then
 resets it anyway.
+
+<a id="dec-1703-1"></a>
+
+**DEC-1703.1. A connected plan carries its unasked warnings to any failure
+after the probe (#1703).** DEC-1702.1 carried them on the spelling refusal
+alone. Any later step of `plan --db` (the drift check, a policy refusal, the
+plan write) still failed through `?` or `bail!`, and its findings were
+dropped with the error. The `plan.failed` envelope then held the refusal
+without the warning.
+
+`cmd_plan_db` now runs the plan in `plan_db`, which hands back the warnings
+gathered so far through a `carried` vector. Every error but a `Found` leaves
+`cmd_plan_db` wrapped by `output::warned`, carrying them.
+
+- **One wrapper, not one per step.** About thirty fallible steps follow the
+  probe. Wrapping each would leave the next one added to drop the warning
+  again. The wrapper around the whole command catches them all, the ones not
+  yet written included.
+- **JSON only.** Human mode printed the warning when it was found, so
+  carrying it there would print it twice.
+- **A `Found` is left alone.** A typed refusal already wrote its own envelope,
+  with the plan's findings in it, and `main` tells it apart by its type
+  (DECISIONS 485). Wrapped, it would read as an operational failure and get a
+  second envelope.
+
+Pinned on 16 and 18 by the CLI's
+`an_unasked_partition_default_stays_in_the_envelope_when_a_later_step_fails`:
+a drifted target with a pair left unasked fails with one `plan.failed` and
+one `plan.partition-default-unasked` in the JSON envelope, and neither its
+text on stderr. In human output the warning line appears once beside the
+refusal.
