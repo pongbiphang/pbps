@@ -290,7 +290,9 @@ assume WSL2 or a Linux Docker backend. `release-windows-fixture.ps1` is restrict
 to disposable GitHub Windows runners. It installs a unique SQL Server Express
 2022 instance from SHA-256-pinned, signature-checked Microsoft media, creates
 an owned PostgreSQL cluster and publishes only their two ports to the Windows
-container NAT subnet. Both use a disposable certificate. No client trust root
+container NAT subnet. Each owned Windows consumer gets an explicit hosts entry
+for that NAT gateway and must resolve it before running product commands; the
+Windows daemon does not implement `--add-host`. Both use a disposable certificate. No client trust root
 is installed in the host trust store: the consumers select their PEM roots
 explicitly. The server's certificate/private key uses the personal store. The fixture uses
 Desktop's CAPI private-key interface to grant the SQL service read access to

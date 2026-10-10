@@ -8,6 +8,7 @@ files enter the consumer. Git remains a runtime prerequisite for provenance.
 import argparse
 from contextlib import contextmanager
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -341,7 +342,7 @@ def main():
                 consumer = Consumer(name, windows, stage)
                 try:
                     if windows:
-                        command = ["--isolation=process", "--add-host", f"pbps-db:{native['gateway']}",
+                        command = ["--isolation=process", "--network", "nat",
                                    "-v", f"{stage}:C:\\work", args.consumer_image,
                                    "cmd.exe", "/c", "ping -t 127.0.0.1 >NUL"]
                     else:
@@ -350,6 +351,18 @@ def main():
                                    args.consumer_image, "sleep", "infinity"]
                     run("docker", "run", "-d", "--name", name, *command)
                     if windows:
+                        # Windows Docker ignores --add-host (moby/moby#41165).
+                        # Edit only this owned consumer, then exercise its resolver
+                        # before any TLS refusal can be mistaken for a DNS failure.
+                        gateway = str(ipaddress.IPv4Address(native["gateway"]))
+                        consumer.exec("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                                      "$ErrorActionPreference='Stop'; "
+                                      "Add-Content -LiteralPath (Join-Path $env:SystemRoot 'System32\\drivers\\etc\\hosts') "
+                                      f'-Encoding ASCII -Value "`n{gateway} pbps-db"; '
+                                      "$addresses=@([Net.Dns]::GetHostAddresses('pbps-db') | "
+                                      "ForEach-Object { $_.IPAddressToString }); "
+                                      f"if ($addresses.Count -ne 1 -or $addresses[0] -ne '{gateway}') "
+                                      "{ throw 'Fixture hostname did not resolve to the NAT gateway' }")
                         fixture = native[engine]
                         print(json.dumps({"engine": engine, "fixture": fixture}), flush=True)
                         cases = workload(consumer, engine, fixture, artifact_hash)
