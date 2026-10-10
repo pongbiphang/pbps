@@ -109,6 +109,7 @@ jobs:
       - run: scripts/ci-event-policy-test.sh
       - run: python3 scripts/ci_pr_checkout_test.py
       - run: python3 scripts/live_test_runners_test.py
+      - run: python3 scripts/check_live_fixture_test.py
       # Before the toolchain: it needs none, and a duplicate decision
       # identifier from two branches merges without a textual conflict, so this
       # is the only place it is caught (DEC-671.1).
@@ -783,9 +784,28 @@ jobs:
   # passes. Nothing here is meant to be skipped; if something ever is, the gate
   # should shut rather than open, and a `paths` filter added later cannot
   # quietly qualify a pull request that nothing ran on.
+  compatibility:
+    name: compatibility (${{ matrix.cell }})
+    needs: [approve, lint]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: [mssql2022, mssql2025, mssql2025-express, pg16, pg18]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Qualify the pinned engine and core CLI contract
+        env:
+          CELL: ${{ matrix.cell }}
+        run: scripts/compatibility-tests.sh "$CELL"
+
   gate:
     name: ci-gate
-    needs: [approve, lint, quick, windows, live, live-transport-mssql, live-editions, live-pg, dev-rehearsal, resolver, release-linux, release-windows, msrv]
+    needs: [approve, lint, quick, windows, live, live-transport-mssql, live-editions, live-pg, dev-rehearsal, resolver, release-linux, release-windows, msrv, compatibility]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

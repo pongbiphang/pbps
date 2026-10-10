@@ -1098,3 +1098,17 @@ personal-store server certificates and narrowly scoped firewall rules; its
 cleanup record survives setup failure. Client trust stays in explicit PEM files.
 This ordinary CLI qualification does not extend frozen peer-verification
 profiles or lift unsupported Windows resolver/compose refusals.
+
+<a id="dec-1134-1"></a>
+
+**DEC-1134.1. Qualify a finite engine matrix with real core operations and
+verify reused fixture identity before writing.** A source-level image digest
+says nothing about a same-named container left running from an older test.
+Resolve the digest to its concrete image ID, inspect the running fixture and
+published port, and read actual server properties; the CLI contract also checks
+the identity through its own endpoint before setup. SQL Server 2022 Developer,
+2025 Enterprise Developer and Express under a case-sensitive collation, and
+PostgreSQL 16 and 18 run one compact shared contract. Each row has an explicit
+CI owner and reaches the required gate. Primary full suites keep their existing
+scope. Capability floors and native release qualification remain separate
+claims: a new version string in a unit test cannot qualify catalogs or DDL.

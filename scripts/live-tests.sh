@@ -16,13 +16,12 @@ PASSWORD='Pbps!Test12345'
 # between two runs of the same commit, which is the one thing a suite that
 # exists to answer "what does the engine actually do" cannot afford.
 #
-# An existing `pbps-test-mssql` is reused as-is, so a container started from an
-# earlier image keeps running; `docker rm -f pbps-test-mssql` to move it onto
-# this digest.
+# Existing fixtures must match the pin and endpoint before client tests run.
+# A stale fixture is refused; its owner decides when to replace it.
 IMAGE=mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
 
-if ! docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
-    docker rm -f "$NAME" >/dev/null 2>&1 || true
+containers=$(docker ps -a --format '{{.Names}}')
+if ! grep -qx "$NAME" <<< "$containers"; then
     docker run -d --name "$NAME" -e ACCEPT_EULA=Y \
         -e "MSSQL_SA_PASSWORD=$PASSWORD" -p "$PORT:1433" "$IMAGE" >/dev/null
 fi
@@ -44,8 +43,8 @@ export PBPS_TEST_DB="Server=localhost,$PORT;User Id=sa;Password=$PASSWORD;TrustS
 # Express, so it stays small beside the first one.
 EXPRESS_NAME=pbps-test-mssql-express
 EXPRESS_PORT=${PBPS_TEST_EXPRESS_PORT:-14331}
-if ! docker ps --format '{{.Names}}' | grep -qx "$EXPRESS_NAME"; then
-    docker rm -f "$EXPRESS_NAME" >/dev/null 2>&1 || true
+containers=$(docker ps -a --format '{{.Names}}')
+if ! grep -qx "$EXPRESS_NAME" <<< "$containers"; then
     docker run -d --name "$EXPRESS_NAME" -e ACCEPT_EULA=Y -e MSSQL_PID=Express \
         -e MSSQL_COLLATION=Latin1_General_100_CS_AS \
         -e "MSSQL_SA_PASSWORD=$PASSWORD" -p "$EXPRESS_PORT:1433" "$IMAGE" >/dev/null
@@ -59,6 +58,9 @@ for _ in $(seq 1 60); do
     sleep 2
 done
 export PBPS_TEST_EXPRESS_DB="Server=localhost,$EXPRESS_PORT;User Id=sa;Password=$PASSWORD;TrustServerCertificate=true"
+
+python3 scripts/check-live-fixture.py --cell mssql2025 --container "$NAME" --port "$PORT"
+python3 scripts/check-live-fixture.py --cell mssql2025-express --container "$EXPRESS_NAME" --port "$EXPRESS_PORT"
 
 # The `--dev docker://` path starts a *second*, throwaway server of its own, so
 # it stays opt-in: naming an image here is what enables it. CI covers it in a

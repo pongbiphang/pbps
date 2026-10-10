@@ -21,9 +21,8 @@ DB=pbps_test
 # between two runs of the same commit, which is the one thing a suite that
 # exists to answer "what does the engine actually do" cannot afford.
 #
-# An existing `pbps-test-pg` is reused as-is, so a container started from an
-# earlier image keeps running; `docker rm -f pbps-test-pg` to move it onto
-# this digest.
+# Existing fixtures must match the pin and endpoint before client tests run.
+# A stale fixture is refused; its owner decides when to replace it.
 IMAGE=postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
 
 # A second server, older than PostgreSQL 17, and it earns its cost: the
@@ -42,8 +41,9 @@ OLD_IMAGE=postgres@sha256:485935f94cc7165afa896978809c37b592dc07f0a37d2c8f645f12
 
 start() {
     local name=$1 port=$2 image=$3
-    if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
-        docker rm -f "$name" >/dev/null 2>&1 || true
+    local containers
+    containers=$(docker ps -a --format '{{.Names}}')
+    if ! grep -qx "$name" <<< "$containers"; then
         docker run -d --name "$name" \
             -e "POSTGRES_PASSWORD=$PASSWORD" -e "POSTGRES_DB=$DB" \
             -p "$port:5432" "$image" >/dev/null
@@ -77,6 +77,10 @@ for name in "$NAME" "$OLD_NAME" "$SCRATCH_NAME"; do
         exit 1
     fi
 done
+
+python3 scripts/check-live-fixture.py --cell pg18 --container "$NAME" --port "$PORT"
+python3 scripts/check-live-fixture.py --cell pg16 --container "$OLD_NAME" --port "$OLD_PORT"
+python3 scripts/check-live-fixture.py --cell pg18 --container "$SCRATCH_NAME" --port "$SCRATCH_PORT"
 
 # A libpq keyword string rather than a URL: both are accepted, and this one
 # does not need the password percent-encoded.

@@ -1,0 +1,41 @@
+{
+  "mssql2022": {
+    "engine": "mssql",
+    "image": "mcr.microsoft.com/mssql/server@sha256:4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090",
+    "version": "16.0.4295.3",
+    "edition": "Developer Edition (64-bit)",
+    "engine_edition": 3,
+    "collation": "SQL_Latin1_General_CP1_CI_AS",
+    "port": 1433
+  },
+  "mssql2025": {
+    "engine": "mssql",
+    "image": "mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1",
+    "version": "17.0.4075.5",
+    "edition": "Enterprise Developer Edition (64-bit)",
+    "engine_edition": 3,
+    "collation": "SQL_Latin1_General_CP1_CI_AS",
+    "port": 1433
+  },
+  "mssql2025-express": {
+    "engine": "mssql",
+    "image": "mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1",
+    "version": "17.0.4075.5",
+    "edition": "Express Edition (64-bit)",
+    "engine_edition": 4,
+    "collation": "Latin1_General_100_CS_AS",
+    "port": 1433
+  },
+  "pg16": {
+    "engine": "postgres",
+    "image": "postgres@sha256:485935f94cc7165afa896978809c37b592dc07f0a37d2c8f645f12412d0212c8",
+    "version": "160015",
+    "port": 5432
+  },
+  "pg18": {
+    "engine": "postgres",
+    "image": "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
+    "version": "180006",
+    "port": 5432
+  }
+}

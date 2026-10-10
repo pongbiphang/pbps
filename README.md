@@ -14,6 +14,8 @@ out the rest.
   [docs/CI.md](docs/CI.md)
 - Why each non-obvious choice was made: [docs/DECISIONS.md](docs/DECISIONS.md)
 - Bugs shipped or nearly shipped, and their shapes: [docs/PITFALLS.md](docs/PITFALLS.md)
+- Tested engine versions, editions and qualification scope:
+  [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)
 - Current phase, command surface, open items: [docs/STATUS.md](docs/STATUS.md)
 
 **Phases 0 through 5 are complete as scoped**, with SQL Server and PostgreSQL
