@@ -679,10 +679,13 @@ fn roles_are_the_clusters(question: &str) -> anyhow::Error {
 /// Refuses a name this plan creates that a PostgreSQL relation-namespace
 /// entry outside the catalog inventory already holds (#951). SQL Server's
 /// `sys.objects` walk also orders the plan, so it runs after every pass that
-/// changes the plan: [`order_created_object_names`].
+/// changes the plan: [`order_created_object_names`]. On PostgreSQL it first
+/// hoists a table rename that moves a carried object's holder away, where
+/// that clears the plan (#1767, DEC-1767.1); the passes after it move no
+/// table rename.
 pub async fn refuse_created_name_occupants(
     conn: &mut Conn,
-    cs: &ChangeSet,
+    cs: &mut ChangeSet,
     label: &str,
 ) -> anyhow::Result<()> {
     match conn.driver() {
@@ -708,6 +711,9 @@ pub async fn refuse_created_name_occupants(
                 }
             }
             let relations = pbps_pg::catalog::relations_at(conn, &carried).await?;
+            // A holder a later rename moves away is cleared by hoisting that
+            // rename, where one hoist does it (#1767, DEC-1767.1).
+            crate::deploy::order_carried_moves(cs, &occupants, &relations);
             crate::deploy::refuse_uninventoried_occupants(cs, &occupants, &relations, label)
         }
         Driver::Mssql => Ok(()),

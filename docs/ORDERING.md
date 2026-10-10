@@ -78,6 +78,14 @@ Then, in this order:
   order, it tries the other orders of the table renames among the drops and
   keeps the first one it clears (`object_order`, DEC-1366.1). A name only a
   later class frees is refused with that change named (DEC-1366.2).
+- **On a connected PostgreSQL plan, `order_carried_moves`** (in
+  `crates/pbps-cli/src/deploy.rs`, called from `refuse_created_name_occupants`
+  before the module passes, none of which moves a table rename) replays the
+  catalog's name occupants and the tables and views at the carried names
+  through the plan. Where a cross-schema rename carries an index or owned
+  sequence onto a name that a later table rename moves away, it hoists that
+  rename ahead of the move. It moves one rename at a time, and only across
+  other table renames that do not free its target (DEC-1767.1).
 - **On a connected plan, `order_role_drops`** (called from `deploy.rs`, once
   `plan --db` has read the dropped roles' members) ranks the role drops by
   membership again. The differ saw no members when it sorted (DECISIONS 127,
@@ -231,6 +239,7 @@ namespace. Renames *into* a name (classes 1 and 3) are the exception, and
 | A table rename chain | fixed | `rename_order` | ✓ DEC-536.1 |
 | A table rename cycle | — | left out of `rename_order`'s graph; refused at `plan --db` with the remedy | ✓ refused by design, DEC-1366.2 |
 | A catalog-only holder (adopted or fallback default, unrecorded object, collation pair) → `RenameTable` into its name | engine-sourced | `object_order` on a connected SQL Server plan | ✓ DEC-1366.1 |
+| A later table rename moving a holder away (P) → a cross-schema rename carrying an index or owned sequence onto the held name | engine-sourced | on a connected PostgreSQL plan, the later rename is hoisted ahead where one hoist clears; refused at `plan --db` with the remedy otherwise | ✓ DEC-1767.1 |
 | `RenameColumn` or another later class freeing a default name → `RenameTable` into it | — | refused at `plan --db` with the remedy | ✓ refused by design, DEC-1366.2 |
 | Index (P) or named constraint (S) drop → `RenameTable` into its name | fixed | `rename_order` | ✓ DECISIONS 496, DEC-496.1 |
 | Constraint or index drop → add of the same name | fixed | class 2 before 13 | ✓ DECISIONS 168 (namespaces) |

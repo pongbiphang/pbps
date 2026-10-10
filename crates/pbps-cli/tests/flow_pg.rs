@@ -9969,6 +9969,91 @@ fn a_move_onto_a_managed_table_holding_its_carried_name_is_refused() {
     );
 }
 
+/// #1767: `s2.b` was `s2.a` once, so its identity sequence is still
+/// `s2.a_id_seq`, and `s1.a` moving to `s2.a` carries `s1.a_id_seq` onto that
+/// name. The differ puts that move first; `s2.b`'s own move to `s3` frees the
+/// name, so connected planning hoists it ahead (DEC-1767.1). The plan is
+/// written in that order and applies, on 16 and on 18.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_rename_that_moves_a_carried_names_holder_away_runs_first_on_both_servers() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        let own = OwnDatabase::new(server, "hoist1767");
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA s1; CREATE SCHEMA s2; CREATE SCHEMA s3; \
+             CREATE TABLE s1.a (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY); \
+             CREATE TABLE s2.a (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY); \
+             ALTER TABLE s2.a RENAME TO b; ALTER INDEX s2.a_pkey RENAME TO b_pkey",
+        );
+        let d = Demo::new(&format!("hoist1767-{k}"));
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let moved = |from: &str, to: &str| {
+            let path = d.dir.join(format!("schema/{from}.yml"));
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(
+                d.dir.join(format!("schema/{to}.yml")),
+                text.replace(&format!("table: {from}"), &format!("table: {to}")),
+            )
+            .unwrap();
+            succeeds(d.run(&["rename-table", from, to]));
+        };
+        moved("s2.b", "s3.b");
+        moved("s1.a", "s2.a");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+
+        let plan = d.dir.join("plan.json");
+        let sql = d.dir.join("plan.sql");
+        succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            plan.to_str().unwrap(),
+            "--sql",
+            sql.to_str().unwrap(),
+        ]));
+        let script = std::fs::read_to_string(&sql).unwrap();
+        let at = |needle: &str| {
+            script
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+        };
+        assert!(
+            at("ALTER TABLE \"s2\".\"b\" SET SCHEMA \"s3\"")
+                < at("ALTER TABLE \"s1\".\"a\" SET SCHEMA \"s2\""),
+            "{script}"
+        );
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "rename"],
+        ));
+        for sequence in ["s2.a_id_seq", "s3.a_id_seq"] {
+            assert_eq!(
+                scalar(
+                    connection,
+                    &format!(
+                        "SELECT count(*) FROM pg_class WHERE oid = to_regclass('{sequence}') \
+                         AND relkind = 'S'"
+                    )
+                ),
+                1,
+                "{sequence}"
+            );
+        }
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    }
+}
+
 /// #1633: a foreign key's `RESTRICT` is pulled as `restrict` on delete and
 /// on update, bootstrapped into an empty database, and pulled back the same,
 /// with nothing left to plan. Changing an action between `restrict` and

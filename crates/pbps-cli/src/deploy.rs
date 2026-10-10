@@ -402,14 +402,95 @@ pub(crate) fn refuse_uninventoried_occupants(
     relations: &[(TableName, &'static str)],
     label: &str,
 ) -> anyhow::Result<()> {
+    let taken: Vec<String> = name_clashes(&cs.changes, occupants, relations)
+        .into_iter()
+        .map(|(_, clash)| clash)
+        .collect();
+    if taken.is_empty() {
+        return Ok(());
+    }
+    // A clash with a holder a later rename moves away is left here only when
+    // no hoist of that rename cleared it ([`order_carried_moves`]): a cycle,
+    // or something else between them. The remedy is that rename in a plan of
+    // its own.
+    bail!(
+        "`{label}` already uses {} name(s) this plan would create or move an object onto, for \
+         objects that share PostgreSQL's relation namespace with tables and views:\n  {}\nEach \
+         `CREATE`, or the `SET SCHEMA` of each cross-schema rename, would be refused at apply. \
+         Rename the declaration, or drop or rename the object in the database. Where a later \
+         rename in this plan moves the holder away, apply that rename in a plan of its own \
+         first.",
+        taken.len(),
+        taken.join("\n  ")
+    );
+}
+
+/// Moves a cross-schema rename's carried objects clear of a holder that a
+/// later rename of this plan moves away (#1767, DEC-1767.1). At the first
+/// move [`name_clashes`] finds landing on a held name, each later table rename
+/// is tried just before it, and the first that leaves the whole plan with
+/// fewer clashes is kept; then the next clash. A rename is only hoisted
+/// across other table renames, none of which frees its target: anything else
+/// between them, or a rename waiting on one of them, keeps the order and the
+/// refusal. One rename moves at a time: a holder that needs a chain of moves
+/// to clear stays refused, as before.
+// The complement is every change that is not a table rename.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn order_carried_moves(
+    cs: &mut pbps_model::ChangeSet,
+    occupants: &[pbps_pg::catalog::NameOccupant],
+    relations: &[(TableName, &'static str)],
+) {
+    use pbps_model::Change;
+    let hoistable =
+        |changes: &[pbps_model::PlannedChange], at: usize, r: usize| match &changes[r].change {
+            Change::RenameTable { to: target, .. } => changes[at..r]
+                .iter()
+                .all(|p| matches!(&p.change, Change::RenameTable { from, .. } if from != target)),
+            _ => false,
+        };
+    let renames = cs
+        .changes
+        .iter()
+        .filter(|p| matches!(p.change, Change::RenameTable { .. }))
+        .count();
+    for _ in 0..renames {
+        let clashes = name_clashes(&cs.changes, occupants, relations);
+        let Some(at) = clashes.iter().find_map(|(at, _)| *at) else {
+            return;
+        };
+        let hoisted = (at + 1..cs.changes.len())
+            .filter(|&r| hoistable(&cs.changes, at, r))
+            .map(|r| {
+                let mut changes = cs.changes.clone();
+                let rename = changes.remove(r);
+                changes.insert(at, rename);
+                changes
+            })
+            .find(|changes| name_clashes(changes, occupants, relations).len() < clashes.len());
+        match hoisted {
+            Some(changes) => cs.changes = changes,
+            None => return,
+        }
+    }
+}
+
+/// Each name [`refuse_uninventoried_occupants`] refuses, described, with the
+/// position of the cross-schema rename whose carried object meets a holder,
+/// or `None` for a name a change creates.
+fn name_clashes(
+    changes: &[pbps_model::PlannedChange],
+    occupants: &[pbps_pg::catalog::NameOccupant],
+    relations: &[(TableName, &'static str)],
+) -> Vec<(Option<usize>, String)> {
     let mut present = Occupant::all(occupants);
     let mut held: Vec<(TableName, String)> = relations
         .iter()
         .map(|(name, kind)| (name.clone(), format!("{kind} `{name}` already is")))
         .collect();
     let mut created: BTreeSet<TableName> = BTreeSet::new();
-    let mut taken: Vec<String> = Vec::new();
-    for p in &cs.changes {
+    let mut taken: Vec<(Option<usize>, String)> = Vec::new();
+    for (at, p) in changes.iter().enumerate() {
         present.retain(|o| !o.freed_by(&p.change));
         held.retain(|(name, _)| !relation_freed_by(&p.change, name));
         if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
@@ -423,7 +504,7 @@ pub(crate) fn refuse_uninventoried_occupants(
                 // there, one an earlier rename carried in included
                 // (measured on 16 and 18, #1749).
                 if created.contains(&o.name) {
-                    taken.push(o.taken());
+                    taken.push((None, o.taken()));
                 }
                 let holder = present
                     .iter()
@@ -443,10 +524,13 @@ pub(crate) fn refuse_uninventoried_occupants(
                         .map(|(_, there)| there.clone()),
                 };
                 if let Some(there) = there {
-                    taken.push(format!(
-                        "`{}`: this plan moves {} `{}` on `{from}` there, with the rename of \
-                         `{from}` to `{to}`, where {there}",
-                        o.name, o.found.kind, o.found.name
+                    taken.push((
+                        Some(at),
+                        format!(
+                            "`{}`: this plan moves {} `{}` on `{from}` there, with the rename of \
+                             `{from}` to `{to}`, where {there}",
+                            o.name, o.found.kind, o.found.name
+                        ),
                     ));
                 }
             }
@@ -461,27 +545,12 @@ pub(crate) fn refuse_uninventoried_occupants(
                 present
                     .iter()
                     .filter(|o| o.name == name)
-                    .map(Occupant::taken),
+                    .map(|o| (None, o.taken())),
             );
             created.insert(name);
         }
     }
-    if taken.is_empty() {
-        return Ok(());
-    }
-    // A clash with a holder a later rename moves away is refused too: this
-    // engine's plans are not reordered from catalog facts, so as ordered the
-    // `SET SCHEMA` fails, and the remedy is that rename in a plan of its own.
-    bail!(
-        "`{label}` already uses {} name(s) this plan would create or move an object onto, for \
-         objects that share PostgreSQL's relation namespace with tables and views:\n  {}\nEach \
-         `CREATE`, or the `SET SCHEMA` of each cross-schema rename, would be refused at apply. \
-         Rename the declaration, or drop or rename the object in the database. Where a later \
-         rename in this plan moves the holder away, apply that rename in a plan of its own \
-         first.",
-        taken.len(),
-        taken.join("\n  ")
-    );
+    taken
 }
 
 /// Whether `change` frees the table or view name `name` (#1765): its table
@@ -6934,7 +7003,7 @@ pub fn cmd_plan_db(
             // the names this plan creates, asked of PostgreSQL's whole
             // relation namespace, not only of what the inventory reports
             // (#951). SQL Server's is asked after the passes below (#1077).
-            crate::engine::refuse_created_name_occupants(&mut conn, &cs, &target.label).await?;
+            crate::engine::refuse_created_name_occupants(&mut conn, &mut cs, &target.label).await?;
             crate::engine::refuse_unlogged_partition_referencers(&mut conn, &cs, staged).await?;
             let rename_evidence = crate::engine::external_role_renames(
                 &mut conn,
@@ -11253,6 +11322,89 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("table `s2.n` already is"), "{e}");
+    }
+
+    /// #1767: a move whose carried sequence lands on a name a later rename of
+    /// this plan moves away runs after that rename, which is hoisted ahead of
+    /// it (DEC-1767.1). Negatives keep the order and the refusal: a plan that
+    /// clears as it is, two moves that each wait for the other, a change other
+    /// than a table rename between them, and a rename whose own target an
+    /// earlier rename frees.
+    #[test]
+    fn a_rename_moving_a_carried_names_holder_away_is_hoisted_ahead_of_the_move() {
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        use pbps_pg::catalog::NameOccupant;
+        let t = TableName::new;
+        let rename = |from: TableName, to: TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, &from.to_string(), 0),
+                from,
+                to,
+                defaults: Vec::new(),
+            })
+        };
+        let sequence = |name: TableName, owner: TableName| NameOccupant {
+            name,
+            kind: "sequence",
+            owner: Some(owner),
+            owner_column: Some("id".into()),
+        };
+        // `s1.a` owns `s1.a_id_seq`; `s2.b` owns `s2.a_id_seq`.
+        let occupants = [
+            sequence(t("s1", "a_id_seq"), t("s1", "a")),
+            sequence(t("s2", "a_id_seq"), t("s2", "b")),
+        ];
+        let a_in = || rename(t("s1", "a"), t("s2", "a"));
+        let b_out = || rename(t("s2", "b"), t("s3", "b"));
+        let ordered = |changes: Vec<PlannedChange>| {
+            let mut cs = ChangeSet { changes };
+            order_carried_moves(&mut cs, &occupants, &[]);
+            let refused = refuse_uninventoried_occupants(&cs, &occupants, &[], "prod")
+                .map_err(|e| e.to_string());
+            (cs.changes, refused)
+        };
+
+        let (changes, refused) = ordered(vec![a_in(), b_out()]);
+        assert_eq!(changes, vec![b_out(), a_in()]);
+        refused.expect("hoisted, the move lands on a free name");
+
+        // Negatives.
+        let (changes, refused) = ordered(vec![b_out(), a_in()]);
+        assert_eq!(
+            changes,
+            vec![b_out(), a_in()],
+            "already clear: left as it is"
+        );
+        refused.expect("already clear");
+
+        let swap = || rename(t("s2", "b"), t("s1", "b"));
+        let cyclic = [
+            sequence(t("s1", "q"), t("s1", "a")),
+            sequence(t("s2", "q"), t("s2", "b")),
+        ];
+        let mut cs = ChangeSet {
+            changes: vec![a_in(), swap()],
+        };
+        order_carried_moves(&mut cs, &cyclic, &[]);
+        assert_eq!(cs.changes, vec![a_in(), swap()], "a cycle keeps its order");
+        refuse_uninventoried_occupants(&cs, &cyclic, &[], "prod")
+            .expect_err("each move waits for the other");
+
+        let between = PlannedChange::new(Change::DropIndex {
+            table: t("s9", "z"),
+            name: "z_ix".into(),
+        });
+        let (changes, refused) = ordered(vec![a_in(), between.clone(), b_out()]);
+        assert_eq!(changes, vec![a_in(), between, b_out()]);
+        refused.expect_err("only table renames are hoisted across");
+
+        // `s2.b` moves to `s3.c`, which only the rename after `s1.a`'s move
+        // frees: it cannot run ahead of that rename.
+        let b_waits = || rename(t("s2", "b"), t("s3", "c"));
+        let frees = || rename(t("s3", "c"), t("s3", "d"));
+        let (changes, refused) = ordered(vec![a_in(), frees(), b_waits()]);
+        assert_eq!(changes, vec![a_in(), frees(), b_waits()]);
+        refused.expect_err("the rename waits on one between");
     }
 
     /// #1749: what the cross-schema renames carry, by the name each lands

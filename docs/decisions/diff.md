@@ -4384,3 +4384,41 @@ Pinned by `a_partitioned_parent_is_renamed`, by
 `an_unlogged_partition_under_a_permanent_key_is_refused_by_name` for #1613,
 and by the CLI's `a_partitioned_parent_is_renamed_through_the_cli`, on 18 and
 on 16.
+
+<a id="dec-1767-1"></a>
+
+**DEC-1767.1. A connected PostgreSQL plan hoists the one later table rename
+that moves a carried name's holder away ahead of the cross-schema rename that
+carries an object onto that name; nothing else moves, and a holder one hoist
+does not clear is still refused (#1767).**
+
+`ALTER TABLE ... SET SCHEMA` carries a table's indexes and owned sequences
+under their catalog names, and PostgreSQL refuses one whose name the
+destination holds (#1749, #1765). The declarations know neither an owned
+sequence's name nor, after a rename, an unnamed key's index name, so
+`rename_order` cannot order a move after the rename that frees such a name.
+For example, `s2.b`, once `s2.a`, still owns `s2.a_id_seq`, and `s1.a -> s2.a`
+carries `s1.a_id_seq` onto it. The differ ran that move first, and the plan
+was refused, although running `s2.b -> s3.b` first frees the name.
+
+The replay that refuses these clashes already holds the catalog facts. So at
+the first move it refuses, each later table rename is tried just before the
+move. The first one that leaves the whole plan with fewer clashes is kept,
+and the replay runs again for the next clash.
+
+The rename moves only across other table renames, none of which frees its
+target, so no name a rename waits for is taken from it. A drop or any other
+change in between keeps the order. Two moves that each wait for the other
+are left as they are. Every case that stays is refused with the two-plan
+remedy, as before.
+
+The alternative was the search DEC-1366.1 gives SQL Server, which tries every
+order of the renames among the drops. Sharing it would mean rebuilding a walk
+written around `sys.objects` for PostgreSQL's relation namespace, for a case
+that needs a table renamed in an earlier plan and a cross-schema shuffle in
+this one. A holder that only a chain of moves clears stays refused until a
+plan needs it.
+
+Pinned by `a_rename_moving_a_carried_names_holder_away_is_hoisted_ahead_of_the_move`
+and by `a_rename_that_moves_a_carried_names_holder_away_runs_first_on_both_servers`,
+on 16 and on 18.
