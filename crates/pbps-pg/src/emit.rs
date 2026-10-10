@@ -3333,13 +3333,7 @@ fn beside_its_default(
          \x20       END IF;\n\
          \x20       FOR fk IN\n\
          \x20           SELECT con.conrelid, cl.relkind, ns.nspname, cl.relname,\n\
-         \x20                  (SELECT pg_catalog.string_agg('c.' || pg_catalog.quote_ident(ra.attname)\n\
-         \x20                          || ' = r.' || pg_catalog.quote_ident(pa.attname), ' AND ' ORDER BY s.i)\n\
-         \x20                   FROM pg_catalog.generate_subscripts(con.conkey, 1) AS s(i)\n\
-         \x20                   JOIN pg_catalog.pg_attribute ra\n\
-         \x20                     ON ra.attrelid = con.conrelid AND ra.attnum = con.conkey[s.i]\n\
-         \x20                   JOIN pg_catalog.pg_attribute pa\n\
-         \x20                     ON pa.attrelid = con.confrelid AND pa.attnum = con.confkey[s.i]) AS matched\n\
+         \x20                  {matched} AS matched\n\
          \x20             FROM pg_catalog.pg_constraint con\n\
          \x20             JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid\n\
          \x20             JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace\n\
@@ -3365,11 +3359,12 @@ fn beside_its_default(
         ld = literal(&d),
         trigger_fires = fires("t.tgenabled"),
         rule_fires = fires("w.ev_enabled"),
+        matched = crate::preflight::moved_row_match(),
         reaches =
             crate::preflight::delete_reaches(&format!("{}::pg_catalog.regclass", literal(&d))),
         count = literal(&format!("SELECT count(*) FROM ONLY {d} AS r WHERE ")),
         referencing = literal(&format!(
-            " AS c WHERE EXISTS (SELECT 1 FROM ONLY {d} AS r WHERE "
+            " AS ch WHERE EXISTS (SELECT 1 FROM ONLY {d} AS r WHERE "
         )),
         statement = refuse(format!(
             "a statement trigger or rule on {default} fires on the delete that moves its rows of \

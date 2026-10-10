@@ -4490,6 +4490,11 @@ has before the plan runs:
   removes first is left out, and so are the rows of a referencing table's
   partitions the plan drops first, as for a detach. A key with nothing
   pointing at a moved row fires nothing, so it does not refuse the plan.
+  Each column of the key is compared as the engine's referential check
+  compares it, under the referenced column's collation and through the
+  constraint's operator (DECISIONS 352). A bare `=` between columns
+  collated differently fails to compare, and inside the moving statement
+  that failure aborted a move the engine takes (#1763 review).
 - **The referencing tables the session cannot fully read.** These are
   tables with such a key on which row-level security is active, or that
   the session has no `SELECT` on. They are counted when there are rows to

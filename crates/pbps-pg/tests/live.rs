@@ -4510,6 +4510,70 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             rollback(&mut conn).await;
         }
 
+        // A key between columns collated differently, which the engine
+        // enforces: a bare `=` between them fails to compare, and inside the
+        // moving statement that failure aborted a move the engine takes.
+        // Compared as the engine compares, a row referencing one outside the
+        // range counts none, and the move goes (#1763 review).
+        conn.execute(&format!(
+            "CREATE TABLE {s}.cm (code text COLLATE \"C\" PRIMARY KEY) PARTITION BY RANGE (code);
+             CREATE TABLE {s}.cm_rest PARTITION OF {s}.cm DEFAULT;
+             CREATE TABLE {s}.cr (code text COLLATE \"POSIX\"
+                 REFERENCES {s}.cm (code) ON DELETE CASCADE);
+             INSERT INTO {s}.cm VALUES ('a'), ('b');
+             INSERT INTO {s}.cr VALUES ('a');"
+        ))
+        .await
+        .expect("the collated tree");
+        let collated = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
+        let collated_ids = mint_ids(&collated, &added_ids, &[]);
+        let mut collated_split = collated.clone();
+        collated_split.tables.insert(
+            t("cm_b"),
+            partition("cm", range(vec![value("b")], vec![value("c")])),
+        );
+        let collated_step = plan(
+            &collated,
+            &collated_ids,
+            &collated_split,
+            &mint_ids(&collated_split, &collated_ids, &[]),
+        );
+        let collated_probes = pg.preflight(&collated_step).probes;
+        assert_eq!(collated_probes.len(), 4, "{collated_probes:#?}");
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &collated_step).await;
+        assert_eq!(
+            counted(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM ONLY {s}.cm_b")
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.cr")).await,
+            1
+        );
+        rollback(&mut conn).await;
+        for probe in &collated_probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        // Negative: a row referencing the moved one is counted.
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!("INSERT INTO {s}.cr VALUES ('b')"))
+            .await
+            .unwrap();
+        assert_eq!(counted(&mut conn, &collated_probes[0].sql).await, 1);
+        rollback(&mut conn).await;
+        conn.execute(&format!("DROP TABLE {s}.cr, {s}.cm"))
+            .await
+            .unwrap();
+
         // A partition another table's rows still reference: counted, and the
         // engine refuses its detach.
         let mut fewer = added.clone();

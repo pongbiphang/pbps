@@ -189,6 +189,22 @@ const PARENT_SIDE: &str = "'p.' || pg_catalog.quote_ident(rc.attname) \
 /// The child's stored cell, as the child side of a column of the key.
 const STORED: &str = "'ch.' || pg_catalog.quote_ident(c.attname)";
 
+/// The match, as SQL text, between a referencing row `ch` and a row `r` of
+/// a DEFAULT partition the move out of it would delete, for the foreign key
+/// `con` (#1547). Compared as the engine's referential check compares, the
+/// way the delete probes do (DECISIONS 352): a bare `=` between a child
+/// column and the column it references, collated explicitly and
+/// differently, fails `could not determine which collation to use`, and
+/// inside the moving statement that failure aborts a move the engine would
+/// take (#1763 review). The referenced column's name is the DEFAULT's too:
+/// a partition has its parent's columns by name.
+pub(crate) fn moved_row_match() -> String {
+    format!(
+        "(SELECT pg_catalog.string_agg({} || {STORED}, ' AND ' ORDER BY k.ord) {KEY_COLUMNS})",
+        PARENT_SIDE.replacen("'p.'", "'r.'", 1)
+    )
+}
+
 /// Where a planned key compares a stored parent column against a stored child
 /// column, the parent side is followed by one of these — `\u{1}<n>\u{1}` —
 /// standing for the referenced column's own collation, which only the catalog
@@ -4142,21 +4158,15 @@ fn default_reference_probe(
     let mut gone_rows = String::new();
     for earlier in dropped_before {
         gone_rows.push_str(&format!(
-            " AND c.tableoid IS DISTINCT FROM pg_catalog.to_regclass({})",
+            " AND ch.tableoid IS DISTINCT FROM pg_catalog.to_regclass({})",
             value_literal(&qualified(earlier)?)
         ));
     }
     let child = value_literal(&format!(
-        " AS c WHERE EXISTS (SELECT 1 FROM ONLY {} AS r WHERE ",
+        " AS ch WHERE EXISTS (SELECT 1 FROM ONLY {} AS r WHERE ",
         qualified(default)?
     ));
-    let matched = "(SELECT pg_catalog.string_agg('c.' || pg_catalog.quote_ident(ra.attname) || \
-                   ' = r.' || pg_catalog.quote_ident(pa.attname), ' AND ' ORDER BY s.i) \
-                   FROM pg_catalog.generate_subscripts(con.conkey, 1) AS s(i) \
-                   JOIN pg_catalog.pg_attribute ra \
-                   ON ra.attrelid = con.conrelid AND ra.attnum = con.conkey[s.i] \
-                   JOIN pg_catalog.pg_attribute pa \
-                   ON pa.attrelid = con.confrelid AND pa.attnum = con.confkey[s.i])";
+    let matched = moved_row_match();
     let text = format!(
         "'SELECT count(*) AS n FROM ' || CASE WHEN cl.relkind = 'p' THEN '' ELSE 'ONLY ' END \
          || pg_catalog.quote_ident(ns.nspname) || '.' || pg_catalog.quote_ident(cl.relname) \
@@ -5043,11 +5053,23 @@ mod tests {
             .sql;
         assert!(
             refs.contains(
-                "AND c.tableoid IS DISTINCT FROM pg_catalog.to_regclass(E''\"ext\".\"child_1\"'')"
+                "AND ch.tableoid IS DISTINCT FROM pg_catalog.to_regclass(E''\"ext\".\"child_1\"'')"
             ),
             "{refs}"
         );
-        assert!(!asked[0].sql.contains("c.tableoid"), "{}", asked[0].sql);
+        assert!(!asked[0].sql.contains("ch.tableoid"), "{}", asked[0].sql);
+        // A key compared as the engine compares it, under the referenced
+        // column's collation and through the constraint's operator (#1763
+        // review).
+        assert!(
+            asked[0]
+                .sql
+                .contains("'r.' || pg_catalog.quote_ident(rc.attname)")
+                && asked[0].sql.contains("o.oid = con.conpfeqop[k.ord]")
+                && !asked[0].sql.contains("' = r.'"),
+            "{}",
+            asked[0].sql
+        );
         // Negative: neither is the refusal over the DEFAULT's rows a plain
         // create asks for.
         assert!(
