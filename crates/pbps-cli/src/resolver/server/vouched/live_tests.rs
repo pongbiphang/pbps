@@ -1869,7 +1869,8 @@ async fn vouched_runs_the_baseline_before_any_managed_object() {
     .await;
     target.drop().await;
     assert!(
-        refused.contains("its statement at line 4 (CREATE VIEW")
+        refused.contains("the engine refused it")
+            && refused.contains(&format!("{MANAGED}.a"))
             && refused.contains("write such an object as a shape view"),
         "{refused}"
     );

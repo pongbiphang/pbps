@@ -2190,6 +2190,14 @@ target whose recreated `public` has none, the difference #688 removed.
   where every write goes, then `DISCARD ALL`, so its `SET`s do not reach
   the compile on that session. A transaction it leaves open is rolled back
   and refused: its work would otherwise vanish with the session unseen.
+- **One script** (decided with the maintainer on #1769). The file is sent
+  whole, as one simple query, and the engine decides where each statement
+  ends. So it is one implicit transaction: a statement that cannot run in a
+  transaction block (`CREATE INDEX CONCURRENTLY`, `VACUUM`) is refused by
+  the engine, and a refused file leaves nothing. And it is read whole under
+  the session's settings when it starts: a setting it changes, such as
+  `standard_conforming_strings`, does not change how the rest is read. A
+  refusal carries the engine's error, which names the object or token.
 - **Chains are one hop**, read from the target's `pg_depend` before
   compiling, as §9.3.2 words them. A chain refuses when the compile fails,
   and the refusal names it: the target's dependencies are the current
@@ -2228,6 +2236,14 @@ a binding verdict and stays unresolved.
 - **Run first, then adopt the baseline's schemas** in the reproduction:
   reopens #688 on `public`.
 - **Let the baseline grant USAGE:** wrong for both layouts, above.
+- **Split the file in pbps** and run each statement on its own. Where a
+  statement ends is the server's lexer and grammar, which depend on its
+  version and on settings the file can change. A client-side copy refused
+  valid files on ever narrower inputs in #1754's review (a `begin` name, a
+  continued `E''` string, a qualified `ext.end()` in a `BEGIN ATOMIC` body).
+  Letting the engine confirm each cut needs savepoints and protocol rules;
+  PostgreSQL's parser as a library pins one version's grammar and adds a C
+  dependency; a stricter file format breaks `pg_dump` output.
 
 Recorded in SPEC §9.3.2 and ADR-0016's amendment. Pinned by the
 `vouched_` baseline live tests in `resolver::server::vouched`, and by the

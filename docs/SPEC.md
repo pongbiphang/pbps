@@ -1678,6 +1678,12 @@ scratch compile (#1616).
   EXISTS`. It runs as the setup role: in the run-owned layout in a session
   of its own, in the supplied one on the checked connection, which `DISCARD
   ALL` then resets. A transaction it leaves open refuses the run.
+  - **It runs as one script**: pbps sends the file whole and the engine
+    splits it (#1769). It is one implicit transaction, so a statement that
+    cannot run in a transaction block, such as `CREATE INDEX CONCURRENTLY`,
+    is refused, and a refused file leaves nothing. The file is read whole
+    under the session's settings when it starts: a setting it changes, such
+    as `standard_conforming_strings`, does not change how the rest is read.
   - So it can change nothing pbps staged, because nothing is staged yet. Its
     `SET`s, `search_path` included, never reach the session that compiles
     the declarations.
@@ -1692,7 +1698,7 @@ scratch compile (#1616).
     An object whose own shape uses a managed type, such as a column or an
     argument of a managed domain, cannot be written that early, and scratch
     needs it only in a chain (below). A statement that fails is reported
-    with the engine's error and the statement; when what it names is
+    with the engine's error, which names what failed; when what it names is
     managed, the remedy is a shape view or leaving the object out. The
     planned draft command and fill write shape views, and order by the
     target's `pg_depend`.

@@ -30,7 +30,7 @@ use pbps_db::resolver::environment::{CatalogFacts, Verdict};
 use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::ResolverRuntime;
-use pbps_pg::resolver::baseline::{self, Object, Stopped};
+use pbps_pg::resolver::baseline::{self, Object};
 use pbps_pg::resolver::capture::{StageError, Staged};
 use pbps_pg::resolver::standard::{self, Standard};
 use pbps_pg::resolver::vouched::{self as sql, Placement};
@@ -1242,36 +1242,14 @@ async fn inventory(conn: &mut Conn) -> Result<baseline::Inventory, Error> {
         .map_err(|error| Error::Read(format!("the scratch database's objects: {error}")))
 }
 
-/// Runs the baseline's statements in order on `session`, and refuses at the
-/// first that cannot be read or that the engine refuses, naming it. A
-/// transaction it leaves open is rolled back and refused: its work would
-/// otherwise vanish unseen with the session, or reach the compile.
+/// Runs the baseline on `session` as one script (#1769), and refuses with
+/// the engine's error when the engine refuses it. A transaction it leaves
+/// open is rolled back and refused: its work would otherwise vanish unseen
+/// with the session, or reach the compile.
 async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
-    let stopped = baseline::run(session, sql).await;
-    if stopped.is_err() {
+    if let Err(failed) = baseline::run(session, sql).await {
         let _ = session.execute("ROLLBACK").await;
-    }
-    let failed = match stopped {
-        Ok(()) => None,
-        Err(Stopped::Failed(failed)) => Some(failed),
-        Err(Stopped::Unreadable(unreadable)) => {
-            return Err(Error::Baseline(vec![format!(
-                "line {} has {}",
-                unreadable.line, unreadable.what
-            )]));
-        }
-        Err(Stopped::Read(error)) => {
-            return Err(Error::Read(format!(
-                "the baseline session's string mode: {error}"
-            )));
-        }
-    };
-    if let Some(failed) = failed {
-        let first = failed.statement.text.lines().next().unwrap_or_default();
-        let mut finding = format!(
-            "its statement at line {} ({first}) failed: {}",
-            failed.statement.line, failed.error
-        );
+        let mut finding = format!("the engine refused it: {}", failed.error);
         if failed.names_something_missing() {
             finding.push_str(
                 "; the baseline runs before any managed object, so a statement that names one \

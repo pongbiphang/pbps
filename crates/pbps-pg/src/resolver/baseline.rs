@@ -3,319 +3,19 @@
 //!
 //! The baseline is a reviewed SQL file that creates the objects outside the
 //! managed set that managed objects reference. It runs on scratch only, after
-//! the authorization reproduction and before any managed object, one
-//! statement at a time, so a statement that fails is named with the engine's
-//! error. What it created is the difference between two inventories taken
-//! around it; each root of that difference is then compared with the target.
+//! the authorization reproduction and before any managed object, as one
+//! script the engine itself splits (#1769). What it created is the
+//! difference between two inventories taken around it; each root of that
+//! difference is then compared with the target.
 
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// One statement of a baseline, as written, with the line it starts on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Statement {
-    pub text: String,
-    pub line: usize,
-}
-
-/// A baseline the splitter cannot read: an unterminated quote or comment
-/// would otherwise swallow every statement after it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unreadable {
-    pub line: usize,
-    pub what: &'static str,
-}
-
-/// Splits a baseline into its statements, every string read with standard
-/// conforming strings on. [`Script`] reads each with the mode the session
-/// has when it gets there.
-pub fn split(sql: &str) -> Result<Vec<Statement>, Unreadable> {
-    let mut script = Script::new(sql);
-    let mut statements = Vec::new();
-    while let Some(statement) = script.next(true)? {
-        statements.push(statement);
-    }
-    Ok(statements)
-}
-
-/// A baseline read one statement at a time. Where a statement ends depends
-/// on how strings are read, which the baseline itself may change
-/// (`SET standard_conforming_strings = off`, measured on 18: `'it\'s'` is
-/// then one string), so each statement is cut when the previous one has
-/// run, under the session's mode at that point (#1754 review).
-pub struct Script {
-    chars: Vec<char>,
-    at: usize,
-    line: usize,
-}
-
-impl Script {
-    pub fn new(sql: &str) -> Self {
-        Self {
-            chars: sql.chars().collect(),
-            at: 0,
-            line: 1,
-        }
-    }
-
-    /// The next statement, or `None` at the end. `conforming` is whether a
-    /// plain string takes its backslashes literally.
-    pub fn next(&mut self, conforming: bool) -> Result<Option<Statement>, Unreadable> {
-        let (statement, at, line) = scan(&self.chars, self.at, self.line, conforming)?;
-        self.at = at;
-        self.line = line;
-        Ok(statement)
-    }
-}
-
-/// The first statement from `from`, the way `psql` cuts one: a `;` ends it
-/// outside quotes, comments and parentheses, and outside the
-/// `BEGIN ATOMIC ... END` body of a `CREATE FUNCTION` or `CREATE PROCEDURE`.
-/// Text that is only whitespace and comments is no statement. Returns where
-/// the scan stopped and the line there.
-fn scan(
-    chars: &[char],
-    from: usize,
-    line: usize,
-    conforming: bool,
-) -> Result<(Option<Statement>, usize, usize), Unreadable> {
-    let mut start = from;
-    let mut line = line;
-    let mut start_line = line;
-    // Whether anything but whitespace and comments has been seen since
-    // `start`.
-    let mut substantive = false;
-    let mut parens = 0usize;
-    let mut words: Vec<String> = Vec::new();
-    let mut begin_depth = 0usize;
-    // The token just before, when it was a word; comments and whitespace
-    // between two words do not separate them.
-    let mut previous: Option<String> = None;
-    let mut i = from;
-    let at = |i: usize| chars.get(i).copied();
-    let identifier_start = |c: char| c.is_alphabetic() || c == '_' || !c.is_ascii();
-    let identifier_part = |c: char| c.is_alphanumeric() || c == '_' || c == '$' || !c.is_ascii();
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\n' {
-            line += 1;
-        }
-        match c {
-            '-' if at(i + 1) == Some('-') => {
-                while i < chars.len() && chars[i] != '\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            '/' if at(i + 1) == Some('*') => {
-                let opened = line;
-                let mut depth = 0usize;
-                loop {
-                    match (at(i), at(i + 1)) {
-                        (Some('/'), Some('*')) => {
-                            depth += 1;
-                            i += 2;
-                        }
-                        (Some('*'), Some('/')) => {
-                            depth -= 1;
-                            i += 2;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        (Some(c), _) => {
-                            if c == '\n' {
-                                line += 1;
-                            }
-                            i += 1;
-                        }
-                        (None, _) => {
-                            return Err(Unreadable {
-                                line: opened,
-                                what: "a comment that is never closed",
-                            });
-                        }
-                    }
-                }
-                continue;
-            }
-            '\'' => {
-                // `E'...'` takes backslash escapes, and so does a plain
-                // string when strings are not standard conforming; any
-                // other string only doubles its quote.
-                let escapes = !conforming
-                    || i > 0
-                        && matches!(chars[i - 1], 'e' | 'E')
-                        && (i < 2 || !identifier_part(chars[i - 2]));
-                let opened = line;
-                i += 1;
-                loop {
-                    match at(i) {
-                        None => {
-                            return Err(Unreadable {
-                                line: opened,
-                                what: "a string that is never closed",
-                            });
-                        }
-                        Some('\\') if escapes => i += 2,
-                        Some('\'') if at(i + 1) == Some('\'') => i += 2,
-                        Some('\'') => {
-                            i += 1;
-                            break;
-                        }
-                        Some(c) => {
-                            if c == '\n' {
-                                line += 1;
-                            }
-                            i += 1;
-                        }
-                    }
-                }
-                substantive = true;
-                previous = None;
-                continue;
-            }
-            '"' => {
-                let opened = line;
-                i += 1;
-                loop {
-                    match at(i) {
-                        None => {
-                            return Err(Unreadable {
-                                line: opened,
-                                what: "a quoted name that is never closed",
-                            });
-                        }
-                        Some('"') if at(i + 1) == Some('"') => i += 2,
-                        Some('"') => {
-                            i += 1;
-                            break;
-                        }
-                        Some(c) => {
-                            if c == '\n' {
-                                line += 1;
-                            }
-                            i += 1;
-                        }
-                    }
-                }
-                substantive = true;
-                previous = None;
-                continue;
-            }
-            '$' if i == 0 || !identifier_part(chars[i - 1]) => {
-                // `$tag$ ... $tag$`; `$1` is a parameter, not a quote.
-                let mut end = i + 1;
-                while end < chars.len() && identifier_part(chars[end]) && chars[end] != '$' {
-                    end += 1;
-                }
-                let tagged =
-                    at(end) == Some('$') && (end == i + 1 || identifier_start(chars[i + 1]));
-                if tagged {
-                    let tag: String = chars[i..=end].iter().collect();
-                    let opened = line;
-                    let body = end + 1;
-                    let rest: String = chars[body..].iter().collect();
-                    let Some(found) = rest.find(&tag) else {
-                        return Err(Unreadable {
-                            line: opened,
-                            what: "a dollar-quoted string that is never closed",
-                        });
-                    };
-                    let closed = body + rest[..found].chars().count();
-                    line += chars[body..closed].iter().filter(|&&c| c == '\n').count();
-                    i = closed + tag.chars().count();
-                    substantive = true;
-                    previous = None;
-                    continue;
-                }
-            }
-            '(' => parens += 1,
-            ')' => parens = parens.saturating_sub(1),
-            ';' if parens == 0 && begin_depth == 0 => {
-                if substantive {
-                    let statement = Statement {
-                        text: chars[start..i].iter().collect::<String>().trim().to_owned(),
-                        line: start_line,
-                    };
-                    return Ok((Some(statement), i + 1, line));
-                }
-                start = i + 1;
-                substantive = false;
-                words.clear();
-                previous = None;
-                i += 1;
-                continue;
-            }
-            c if identifier_start(c) => {
-                let mut end = i + 1;
-                while end < chars.len() && identifier_part(chars[end]) {
-                    end += 1;
-                }
-                let word = chars[i..end]
-                    .iter()
-                    .collect::<String>()
-                    .to_ascii_lowercase();
-                if !substantive {
-                    start_line = line;
-                    substantive = true;
-                }
-                // In a routine's definition, `BEGIN ATOMIC` opens the
-                // SQL-standard body and `END` closes it, so the body's own
-                // `;` do not end the statement; inside it, `CASE` opens a
-                // block that `END` also closes. Not psql's rule, which counts
-                // every `BEGIN`: `begin` is a valid routine, schema, type or
-                // parameter name, and the pair is the only place a body
-                // opens. Only outside parentheses, where a `;` would end
-                // anything at all.
-                if parens == 0 && creates_routine(&words) {
-                    match word.as_str() {
-                        "atomic" if previous.as_deref() == Some("begin") => begin_depth += 1,
-                        "case" if begin_depth > 0 => begin_depth += 1,
-                        "end" => begin_depth = begin_depth.saturating_sub(1),
-                        _ => {}
-                    }
-                }
-                if words.len() < 4 {
-                    words.push(word.clone());
-                }
-                previous = Some(word);
-                i = end;
-                continue;
-            }
-            _ => {}
-        }
-        if !c.is_whitespace() {
-            previous = None;
-            if !substantive {
-                start_line = line;
-                substantive = true;
-            }
-        }
-        i += 1;
-    }
-    let statement = substantive.then(|| Statement {
-        text: chars[start..].iter().collect::<String>().trim().to_owned(),
-        line: start_line,
-    });
-    Ok((statement, chars.len(), line))
-}
-
-/// `CREATE [OR REPLACE] FUNCTION|PROCEDURE`, from a statement's first words.
-fn creates_routine(words: &[String]) -> bool {
-    let words: Vec<&str> = words.iter().map(String::as_str).collect();
-    matches!(
-        words.as_slice(),
-        ["create", "function" | "procedure", ..]
-            | ["create", "or", "replace", "function" | "procedure", ..]
-    )
-}
-
-/// A baseline statement the engine refused, with its error.
+/// A baseline the engine refused, with its error. Nothing it ran stays:
+/// the script runs as one implicit transaction.
 #[derive(Debug)]
 pub struct Failed {
-    pub statement: Statement,
     pub error: DbError,
 }
 
@@ -331,41 +31,24 @@ impl Failed {
     }
 }
 
-/// Why a baseline stopped.
-#[derive(Debug)]
-pub enum Stopped {
-    /// Its text could not be cut into a statement.
-    Unreadable(Unreadable),
-    /// The engine refused a statement.
-    Failed(Failed),
-    /// The session's string mode could not be read.
-    Read(DbError),
-}
-
-/// Runs each statement on its own, in order, and stops at the first the
-/// engine refuses. Each is cut under the session's string mode as the
-/// statements before it left it. Statements are not wrapped in a
-/// transaction: a baseline may hold its own, and the database is the run's
-/// to discard.
-pub async fn run(conn: &mut impl ExecuteConnection, sql: &str) -> Result<(), Stopped> {
-    let mut script = Script::new(sql);
-    loop {
-        let rows = conn
-            .query("SELECT pg_catalog.current_setting('standard_conforming_strings') AS conforming")
-            .await
-            .map_err(Stopped::Read)?;
-        let conforming = rows
-            .first()
-            .and_then(|row| row.try_get::<&str>("conforming").ok().flatten())
-            .ok_or_else(|| Stopped::Read(DbError::BadRow("no string mode".into())))?
-            == "on";
-        let Some(statement) = script.next(conforming).map_err(Stopped::Unreadable)? else {
-            return Ok(());
-        };
-        if let Err(error) = conn.execute(&statement.text).await {
-            return Err(Stopped::Failed(Failed { statement, error }));
-        }
-    }
+/// Runs the baseline as one script, in one simple query, so the engine
+/// decides where each statement ends (#1769). Not split here: where a
+/// statement ends depends on the server's own lexer and grammar, and a
+/// client-side copy of them kept refusing valid files on ever narrower
+/// inputs (review of #1754: a `begin` name, a continued `E''` string, a
+/// qualified `ext.end()` in a `BEGIN ATOMIC` body).
+///
+/// What that costs, by decision on #1769:
+/// - the script is one implicit transaction, so a statement that cannot run
+///   in a transaction block (`CREATE INDEX CONCURRENTLY`, `VACUUM`) is
+///   refused by the engine, and a refused script leaves nothing behind;
+/// - the whole text is read under the session's settings when it starts, so
+///   a setting the script changes (`standard_conforming_strings`) does not
+///   change how the rest of it is read.
+///
+/// What a misread creates is still compared with the target afterwards.
+pub async fn run(conn: &mut impl ExecuteConnection, sql: &str) -> Result<(), Failed> {
+    conn.execute(sql).await.map_err(|error| Failed { error })
 }
 
 /// One object in the scratch database: its catalog, its OID there, and the
@@ -739,136 +422,6 @@ fn text(row: &Row, field: &str) -> Result<String, DbError> {
 mod tests {
     use super::*;
 
-    fn texts(sql: &str) -> Vec<String> {
-        split(sql).unwrap().into_iter().map(|s| s.text).collect()
-    }
-
-    #[test]
-    fn a_baseline_splits_at_each_top_level_semicolon() {
-        assert_eq!(
-            texts("CREATE SCHEMA ext;\nCREATE TABLE ext.t (a int, b text);\n"),
-            ["CREATE SCHEMA ext", "CREATE TABLE ext.t (a int, b text)"]
-        );
-        // The last statement needs no `;`.
-        assert_eq!(texts("SELECT 1; SELECT 2"), ["SELECT 1", "SELECT 2"]);
-        // Negative: comments and blank statements are no statements.
-        assert!(texts("-- nothing\n/* still nothing */ ;;\n").is_empty());
-    }
-
-    #[test]
-    fn a_semicolon_inside_quotes_comments_or_parentheses_ends_nothing() {
-        assert_eq!(
-            texts(
-                "SELECT 'a;b', \"c;d\", E'e\\';f' -- g;h\n; /* i; /* nested; */ j; */ \
-                 SELECT $$k;l$$, $tag$m;$$;n$tag$, $1;"
-            ),
-            [
-                "SELECT 'a;b', \"c;d\", E'e\\';f' -- g;h",
-                "/* i; /* nested; */ j; */ SELECT $$k;l$$, $tag$m;$$;n$tag$, $1"
-            ]
-        );
-        // `''` doubles a quote; a plain string has no backslash escapes.
-        assert_eq!(
-            texts("SELECT 'it''s;'; SELECT 'a\\'; SELECT 2"),
-            ["SELECT 'it''s;'", "SELECT 'a\\'", "SELECT 2"]
-        );
-    }
-
-    #[test]
-    fn a_plain_string_takes_backslash_escapes_when_strings_are_not_conforming() {
-        let sql = "SELECT 'it\\'s; one'; SELECT 2";
-        let mut script = Script::new(sql);
-        assert_eq!(
-            script.next(false).unwrap().unwrap().text,
-            "SELECT 'it\\'s; one'"
-        );
-        assert_eq!(script.next(false).unwrap().unwrap().text, "SELECT 2");
-        assert_eq!(script.next(false).unwrap(), None);
-        // Negative: conforming, the backslash is literal and the quote
-        // after it closes the string.
-        assert_eq!(
-            Script::new(sql).next(true).unwrap().unwrap().text,
-            "SELECT 'it\\'s"
-        );
-    }
-
-    #[test]
-    fn a_sql_standard_routine_body_is_one_statement() {
-        assert_eq!(
-            texts(
-                "CREATE OR REPLACE FUNCTION ext.f(x int) RETURNS int LANGUAGE sql\n\
-                 BEGIN ATOMIC\n  SELECT CASE WHEN x > 0 THEN 1 ELSE 0 END;\n  SELECT 2;\nEND;\n\
-                 CREATE PROCEDURE ext.p() LANGUAGE sql BEGIN ATOMIC SELECT 1; END;\n\
-                 BEGIN; SELECT 3; END;"
-            ),
-            [
-                "CREATE OR REPLACE FUNCTION ext.f(x int) RETURNS int LANGUAGE sql\n\
-                 BEGIN ATOMIC\n  SELECT CASE WHEN x > 0 THEN 1 ELSE 0 END;\n  SELECT 2;\nEND",
-                "CREATE PROCEDURE ext.p() LANGUAGE sql BEGIN ATOMIC SELECT 1; END",
-                // Negative: a transaction's `BEGIN` opens no block.
-                "BEGIN",
-                "SELECT 3",
-                "END"
-            ]
-        );
-    }
-
-    #[test]
-    fn only_begin_atomic_opens_a_routine_body() {
-        assert_eq!(
-            texts(
-                "CREATE FUNCTION ext.f(begin integer) RETURNS TABLE (begin integer)\n\
-                 LANGUAGE sql AS 'SELECT 1';\n\
-                 CREATE FUNCTION begin.begin() RETURNS begin.begin LANGUAGE sql\n\
-                 RETURN CASE WHEN true THEN 1 END;\n\
-                 CREATE FUNCTION ext.g() RETURNS int LANGUAGE sql\n\
-                 BEGIN /* body */ ATOMIC SELECT 1; END;\n\
-                 SELECT 2;"
-            ),
-            [
-                // Negative: `begin` as a parameter, result column, schema,
-                // routine or type name opens nothing.
-                "CREATE FUNCTION ext.f(begin integer) RETURNS TABLE (begin integer)\n\
-                 LANGUAGE sql AS 'SELECT 1'",
-                "CREATE FUNCTION begin.begin() RETURNS begin.begin LANGUAGE sql\n\
-                 RETURN CASE WHEN true THEN 1 END",
-                "CREATE FUNCTION ext.g() RETURNS int LANGUAGE sql\n\
-                 BEGIN /* body */ ATOMIC SELECT 1; END",
-                "SELECT 2"
-            ]
-        );
-    }
-
-    #[test]
-    fn each_statement_carries_the_line_it_starts_on() {
-        let statements =
-            split("-- header\n\nCREATE SCHEMA ext;\n\n  /* c */\nSELECT\n 1;").unwrap();
-        assert_eq!(
-            statements.iter().map(|s| s.line).collect::<Vec<_>>(),
-            [3, 6]
-        );
-    }
-
-    #[test]
-    fn an_unterminated_quote_or_comment_is_named_where_it_opens() {
-        for (sql, line, what) in [
-            (
-                "SELECT 1;\nSELECT 'open",
-                2,
-                "a string that is never closed",
-            ),
-            ("SELECT \"open", 1, "a quoted name that is never closed"),
-            ("SELECT 1;\n\n/* open", 3, "a comment that is never closed"),
-            (
-                "SELECT $x$ open",
-                1,
-                "a dollar-quoted string that is never closed",
-            ),
-        ] {
-            assert_eq!(split(sql), Err(Unreadable { line, what }), "{sql}");
-        }
-    }
-
     #[test]
     fn what_a_baseline_created_is_its_roots_without_what_they_carry() {
         let object = |catalog: &str, oid, described: &str, carried| {
@@ -905,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires the pinned PostgreSQL servers"]
-    async fn a_baseline_runs_statement_by_statement_and_its_roots_are_found() {
+    async fn a_baseline_runs_as_one_script_and_its_roots_are_found() {
         use pbps_db::{Conn, Driver};
         for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
             let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
@@ -936,10 +489,14 @@ mod tests {
                  BEGIN ATOMIC SELECT x; END;\n\
                  CREATE TYPE ext.r AS RANGE (subtype = int4);\n\
                  CREATE TABLE ext.pg_class (id int);\n\
-                 -- A string mode the baseline sets cuts what follows.\n\
-                 SET standard_conforming_strings = off;\n\
-                 COMMENT ON SCHEMA ext IS 'it\\'s; one';\n\
-                 RESET standard_conforming_strings;";
+                 -- What a client-side splitter misread (#1769), the engine\n\
+                 -- reads: names that are keywords, a qualified `end()` in a\n\
+                 -- body, a continued escape string and a `;` in quotes.\n\
+                 CREATE FUNCTION ext.\"end\"() RETURNS int LANGUAGE sql RETURN 1;\n\
+                 CREATE FUNCTION ext.begin(begin int) RETURNS int LANGUAGE sql\n\
+                 BEGIN ATOMIC SELECT ext.end(); SELECT CASE WHEN begin > 0 THEN 1 END; END;\n\
+                 COMMENT ON SCHEMA ext IS E'it\\'s'\n\
+                 'one; \\'two\\'';";
             let ran = run(&mut conn, statements).await;
             // A path on which a catalog's name means another relation reads
             // each catalog by its own name all the same.
@@ -947,11 +504,31 @@ mod tests {
                 .await
                 .unwrap();
             let after = inventory(&mut conn).await.unwrap();
-            // Negative: a statement naming what does not exist is refused
-            // by name, and stops the run there.
+            let comment = schema_comment(&mut conn).await;
+            // Negative: a statement naming what does not exist refuses the
+            // script, and what ran before it in the script is gone.
             let failed = run(
                 &mut conn,
-                "CREATE VIEW ext.w AS SELECT * FROM app.t;\nCREATE SCHEMA never;",
+                "CREATE SCHEMA never;\nCREATE VIEW ext.w AS SELECT * FROM app.t;",
+            )
+            .await;
+            let never = schema_exists(&mut conn, "never").await;
+            // Negative: a statement that cannot run in a transaction block
+            // is refused by the engine, not run.
+            let concurrently = run(
+                &mut conn,
+                "CREATE TABLE ext.c (a int);\nCREATE INDEX CONCURRENTLY ON ext.c (a);",
+            )
+            .await;
+            let c =
+                schema_exists(&mut conn, "ext").await && relation_exists(&mut conn, "ext.c").await;
+            // Negative: a setting the script changes does not change how the
+            // rest of it is read: the escape below is read as a standard
+            // string, and the script is refused rather than misread.
+            let reread = run(
+                &mut conn,
+                "SET standard_conforming_strings = off;\n\
+                 COMMENT ON SCHEMA ext IS 'x\\'y';",
             )
             .await;
             drop(conn);
@@ -969,6 +546,8 @@ mod tests {
             assert_eq!(
                 roots,
                 [
+                    "function ext.\"end\"()",
+                    "function ext.begin(integer)",
                     "function ext.f(integer)",
                     "schema ext",
                     "table ext.pg_class",
@@ -978,16 +557,63 @@ mod tests {
                 ],
                 "{variable}"
             );
-            let Err(Stopped::Failed(failed)) = failed else {
-                panic!("{variable}: {failed:?}");
+            // A continued escape string stays an escape string, as the engine
+            // reads it.
+            assert_eq!(comment.as_deref(), Some("it'sone; 'two'"), "{variable}");
+            let Err(failed) = failed else {
+                panic!("{variable}: the missing relation was not refused");
             };
-            assert_eq!(failed.statement.line, 1, "{variable}");
             assert!(
                 failed.names_something_missing(),
                 "{variable}: {}",
                 failed.error
             );
+            assert!(!never, "{variable}: a refused script left its schema");
+            let Err(concurrently) = concurrently else {
+                panic!("{variable}: CONCURRENTLY ran inside the script");
+            };
+            assert_eq!(
+                concurrently.error.server_error_code().as_deref(),
+                Some("25001"),
+                "{variable}: {}",
+                concurrently.error
+            );
+            assert!(!c, "{variable}: a refused script left its table");
+            assert!(
+                reread.is_err(),
+                "{variable}: a mid-script setting re-read the rest"
+            );
         }
+    }
+
+    async fn schema_comment(conn: &mut pbps_db::Conn) -> Option<String> {
+        let rows = conn
+            .query("SELECT pg_catalog.obj_description('ext'::regnamespace, 'pg_namespace') AS c")
+            .await
+            .unwrap();
+        rows.first()
+            .and_then(|row| row.try_get::<&str>("c").ok().flatten())
+            .map(str::to_owned)
+    }
+
+    async fn schema_exists(conn: &mut pbps_db::Conn, name: &str) -> bool {
+        !conn
+            .query(&format!(
+                "SELECT 1 AS one FROM pg_catalog.pg_namespace WHERE nspname = '{name}'"
+            ))
+            .await
+            .unwrap()
+            .is_empty()
+    }
+
+    async fn relation_exists(conn: &mut pbps_db::Conn, name: &str) -> bool {
+        !conn
+            .query(&format!(
+                "SELECT 1 AS one WHERE pg_catalog.to_regclass('{name}') IS NOT NULL"
+            ))
+            .await
+            .unwrap()
+            .is_empty()
     }
 
     fn managed(tables: &[&str], views: &[&str]) -> crate::resolver::capture::Managed {

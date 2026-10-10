@@ -1780,7 +1780,7 @@
         "resolver::capture::tests::retained_roots_are_read_even_when_nothing_reaches_them",
         "resolver::capture::tests::coherent_inputs_pin_properties_membership_and_actual_bindings",
         "resolver::vouched::tests::the_cleanup_names_what_another_role_owns_and_what_changed_on_the_login",
-        "resolver::baseline::tests::a_baseline_runs_statement_by_statement_and_its_roots_are_found",
+        "resolver::baseline::tests::a_baseline_runs_as_one_script_and_its_roots_are_found",
         "resolver::baseline::tests::the_target_records_each_link_through_a_row_type_or_a_parent",
         "resolver::standard::tests::a_declared_standard_in_the_engines_own_spelling_reads_back_as_declared",
         "resolver::standard::tests::a_fresh_database_is_the_built_in_standard_and_public_is_its_only_owned_initdb_object",
