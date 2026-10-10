@@ -3291,10 +3291,22 @@ fn beside_its_default(
     let q = qualified(name)?;
     let p = qualified(parent)?;
     let d = qualified(default)?;
+    // What the move sets off is asked again here, inside the statement that
+    // moves, before the delete (#1547, #1763 review). The pre-flight asks it
+    // first, by name, but a probe that cannot run is reported as unchecked
+    // and the apply goes on; here a question that cannot be answered aborts
+    // the statement, and the plan with it. It also reads the catalog as the
+    // plan leaves it at this point: the triggers, keys and partitions the
+    // plan drops first are gone.
+    let fires = crate::preflight::fires_here;
+    let refuse = |why: String| format!("RAISE EXCEPTION USING MESSAGE = {};", literal(&why));
     let body = format!(
         "DECLARE\n\
          \x20   keep text;\n\
          \x20   cols text;\n\
+         \x20   n bigint;\n\
+         \x20   hit boolean;\n\
+         \x20   fk record;\n\
          BEGIN\n\
          \x20   SELECT {range} INTO STRICT keep\n\
          \x20     FROM pg_catalog.pg_partitioned_table pt\n\
@@ -3304,11 +3316,78 @@ fn beside_its_default(
          \x20     FROM pg_catalog.pg_attribute a\n\
          \x20    WHERE a.attrelid = {lp}::pg_catalog.regclass AND a.attnum > 0\n\
          \x20      AND NOT a.attisdropped AND a.attgenerated = '';\n\
+         \x20   IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t\n\
+         \x20              WHERE t.tgrelid = {ld}::pg_catalog.regclass AND NOT t.tgisinternal\n\
+         \x20                AND {trigger_fires} AND (t.tgtype::int & 9) = 8)\n\
+         \x20      OR EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite w\n\
+         \x20                 WHERE w.ev_class = {ld}::pg_catalog.regclass AND w.ev_type = '4'\n\
+         \x20                   AND {rule_fires}) THEN\n\
+         \x20       {statement}\n\
+         \x20   END IF;\n\
+         \x20   EXECUTE {count} || keep INTO n;\n\
+         \x20   IF n > 0 THEN\n\
+         \x20       IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t\n\
+         \x20                  WHERE t.tgrelid = {ld}::pg_catalog.regclass AND NOT t.tgisinternal\n\
+         \x20                    AND {trigger_fires} AND (t.tgtype::int & 9) = 9) THEN\n\
+         \x20           {row}\n\
+         \x20       END IF;\n\
+         \x20       FOR fk IN\n\
+         \x20           SELECT con.conrelid, cl.relkind, ns.nspname, cl.relname,\n\
+         \x20                  (SELECT pg_catalog.string_agg('c.' || pg_catalog.quote_ident(ra.attname)\n\
+         \x20                          || ' = r.' || pg_catalog.quote_ident(pa.attname), ' AND ' ORDER BY s.i)\n\
+         \x20                   FROM pg_catalog.generate_subscripts(con.conkey, 1) AS s(i)\n\
+         \x20                   JOIN pg_catalog.pg_attribute ra\n\
+         \x20                     ON ra.attrelid = con.conrelid AND ra.attnum = con.conkey[s.i]\n\
+         \x20                   JOIN pg_catalog.pg_attribute pa\n\
+         \x20                     ON pa.attrelid = con.confrelid AND pa.attnum = con.confkey[s.i]) AS matched\n\
+         \x20             FROM pg_catalog.pg_constraint con\n\
+         \x20             JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid\n\
+         \x20             JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace\n\
+         \x20            WHERE con.contype = 'f' AND con.conparentid = 0 AND {reaches}\n\
+         \x20       LOOP\n\
+         \x20           IF pg_catalog.row_security_active(fk.conrelid) THEN\n\
+         \x20               {hidden}\n\
+         \x20           END IF;\n\
+         \x20           EXECUTE 'SELECT EXISTS (SELECT 1 FROM '\n\
+         \x20               || CASE WHEN fk.relkind = 'p' THEN '' ELSE 'ONLY ' END\n\
+         \x20               || pg_catalog.quote_ident(fk.nspname) || '.' || pg_catalog.quote_ident(fk.relname)\n\
+         \x20               || {referencing} || fk.matched || ' AND ' || keep || '))' INTO hit;\n\
+         \x20           IF hit THEN\n\
+         \x20               {referenced}\n\
+         \x20           END IF;\n\
+         \x20       END LOOP;\n\
+         \x20   END IF;\n\
          \x20   EXECUTE {delete} || keep || ' RETURNING ' || cols\n\
          \x20       || {insert} || cols || ') SELECT * FROM moved';\n\
          END",
         range = crate::preflight::range_predicate(from, to),
         lp = literal(&p),
+        ld = literal(&d),
+        trigger_fires = fires("t.tgenabled"),
+        rule_fires = fires("w.ev_enabled"),
+        reaches =
+            crate::preflight::delete_reaches(&format!("{}::pg_catalog.regclass", literal(&d))),
+        count = literal(&format!("SELECT count(*) FROM ONLY {d} AS r WHERE ")),
+        referencing = literal(&format!(
+            " AS c WHERE EXISTS (SELECT 1 FROM ONLY {d} AS r WHERE "
+        )),
+        statement = refuse(format!(
+            "a statement trigger or rule on {default} fires on the delete that moves its rows of \
+             the range of {name} into it; nothing was moved"
+        )),
+        row = refuse(format!(
+            "a row trigger on {default} fires on the delete that would move its rows of the range \
+             of {name} into it; nothing was moved"
+        )),
+        hidden = refuse(format!(
+            "a table with a foreign key whose action a delete from {default} fires is under \
+             row-level security, so the rows referencing the rows the move would take into \
+             {name} cannot all be counted; nothing was moved"
+        )),
+        referenced = refuse(format!(
+            "rows reference rows of {default} the move would take into {name}, and the delete \
+             would fire the action of their foreign key; nothing was moved"
+        )),
         delete = literal(&format!("WITH moved AS (DELETE FROM {d} AS r WHERE ")),
         insert = literal(&format!(") INSERT INTO {q} (")),
     );
@@ -4569,6 +4648,25 @@ mod tests {
         );
         assert!(
             create < block && block < delete && delete < insert && insert < attach,
+            "{one}"
+        );
+        // What the delete would set off is asked again inside the statement,
+        // and stops it, before the delete: the pre-flight's answer may be
+        // unchecked (#1763 review).
+        for refusal in [
+            "a statement trigger or rule on app.ev_rest fires",
+            "a row trigger on app.ev_rest fires",
+            "is under row-level security",
+            "would fire the action of their foreign key; nothing was moved",
+        ] {
+            let at = at(refusal);
+            assert!(block < at && at < delete, "{refusal}: {one}");
+        }
+        assert!(
+            at("JOIN down ON k.conparentid = down.oid") < delete
+                && at(
+                    "t.tgrelid = '\"app\".\"ev_rest\"'::pg_catalog.regclass AND (t.tgtype::int & 8)"
+                ) < delete,
             "{one}"
         );
         assert!(one.ends_with(';'), "{one}");
