@@ -645,3 +645,4 @@ other numbers before landing. Some records still mention them as proposals.
 | DEC-1717.1 | [doctor](decisions/doctor.md#dec-1717-1) | `SELECT` on SQL Server's referencing-entities function is advice; an apply that renames refuses by name, before its first statement, a login denied it. |
 | DEC-1734.1 | [cli](decisions/cli.md#dec-1734-1) | Until the first tagged release the envelope's wire version stays 1; a change DEC-997.1 would count as moving it is recorded by the schema-set version and raises DEC-1038.1's archive floor to its own set, and DEC-997.1 applies from that release on. |
 | DEC-1720.1 | [connection](decisions/connection.md#dec-1720-1) | A target connection reaches one cluster for its whole life; a proxy that hands its transactions to different clusters is unsupported. |
+| DEC-1133.1 | [process](decisions/process.md#dec-1133-1) | Release qualification executes the hashed artifact in a native, source-free consumer. |

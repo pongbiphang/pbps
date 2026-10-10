@@ -124,6 +124,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: python3 scripts/live_transport_test.py
+      - run: python3 scripts/release_qualification_test.py
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
 
@@ -185,6 +186,9 @@ jobs:
           INSTA_FORCE_PASS: "0"
       - run: python3 scripts/ignored_test_inventory_test.py
       - run: python3 scripts/ignored_test_inventory.py
+      - name: Native fixture subnet selection
+        shell: powershell
+        run: ./scripts/release-windows-network-test.ps1
 
   # The SPEC 11.5 invariants against a real SQL Server (bootstrap == introspect,
   # apply(plan(A->B)) converges on B). Linux only: the service container needs a
@@ -643,6 +647,96 @@ jobs:
         if: matrix.engine == 'pg' && matrix.half == 'second'
         run: sudo python3 scripts/live-resolver-sockets.py --test-binary "$PBPS_FIXTURE_BINARY"
 
+  release-linux:
+    needs: [approve, lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Keep release build outputs outside the checkout
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/release-build" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --locked --release --target x86_64-unknown-linux-musl -p pbps-cli --bin pbps
+      - name: Build a consumer with no source or development tools
+        run: |
+          mkdir "$RUNNER_TEMP/release-consumer"
+          cp scripts/release-consumer.Dockerfile "$RUNNER_TEMP/release-consumer/Dockerfile"
+          docker build -t pbps-release-consumer "$RUNNER_TEMP/release-consumer"
+      - name: Exact musl artifact, both engines and TLS refusals
+        run: python3 scripts/qualify-release.py --binary "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/pbps" --consumer-image pbps-release-consumer --evidence "$RUNNER_TEMP/release-evidence.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-evidence-linux
+          path: ${{ runner.temp }}/release-evidence.json
+          if-no-files-found: error
+
+  release-windows:
+    needs: [approve, lint]
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: -D warnings -C target-feature=+crt-static
+    steps:
+      - name: Keep release build outputs outside the checkout
+        shell: pwsh
+        run: '"CARGO_TARGET_DIR=$env:RUNNER_TEMP/release-build" >> $env:GITHUB_ENV'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: cargo build --locked --release --target x86_64-pc-windows-msvc -p pbps-cli --bin pbps
+      - name: Build a clean native Windows consumer with only Git added
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $context = Join-Path $env:RUNNER_TEMP 'release-consumer'
+          New-Item -ItemType Directory $context | Out-Null
+          Copy-Item scripts/release-consumer-windows.Dockerfile (Join-Path $context 'Dockerfile')
+          $git = Split-Path (Split-Path (Get-Command git.exe).Source)
+          Copy-Item -Recurse $git (Join-Path $context 'git')
+          docker build --isolation=process -t pbps-release-consumer $context
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Owned native PostgreSQL and SQL Server TLS fixtures
+        shell: powershell
+        run: ./scripts/release-windows-fixture.ps1 -Action Start -Root (Join-Path $env:RUNNER_TEMP 'release-fixture')
+      - name: Exact MSVC artifact, both engines and TLS refusals
+        shell: pwsh
+        run: |
+          python scripts/qualify-release.py --binary "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/pbps.exe" --consumer-image pbps-release-consumer --windows-fixture "$env:RUNNER_TEMP/release-fixture/fixture.json" --evidence "$env:RUNNER_TEMP/release-evidence.json"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Native fixture diagnostics after a failure
+        if: ${{ failure() }}
+        shell: powershell
+        run: |
+          if (Test-Path "$env:RUNNER_TEMP/release-fixture/owner.json") {
+            ./scripts/release-windows-fixture.ps1 -Action Diagnose -Root (Join-Path $env:RUNNER_TEMP 'release-fixture')
+          }
+      - name: Remove only owned native fixtures
+        if: ${{ always() }}
+        shell: powershell
+        run: |
+          if (Test-Path "$env:RUNNER_TEMP/release-fixture/owner.json") {
+            ./scripts/release-windows-fixture.ps1 -Action Stop -Root (Join-Path $env:RUNNER_TEMP 'release-fixture')
+          }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-evidence-windows
+          path: ${{ runner.temp }}/release-evidence.json
+          if-no-files-found: error
+
   # The MSRV is set by serde-saphyr (see docs/ADR-0001). It gets its own job so
   # that accidentally using newer syntax is caught here rather than by a user.
   msrv:
@@ -691,7 +785,7 @@ jobs:
   # quietly qualify a pull request that nothing ran on.
   gate:
     name: ci-gate
-    needs: [approve, lint, quick, windows, live, live-transport-mssql, live-editions, live-pg, dev-rehearsal, resolver, msrv]
+    needs: [approve, lint, quick, windows, live, live-transport-mssql, live-editions, live-pg, dev-rehearsal, resolver, release-linux, release-windows, msrv]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
