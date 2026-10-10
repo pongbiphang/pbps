@@ -9579,6 +9579,76 @@ fn omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload() {
     assert_omitted_modules(&after_role_drop, false);
 }
 
+/// #1723: each relation-namespace occupant follows its table through the
+/// plan's renames in the plan's order. `s2.b` moves to `s3.c` and its
+/// index `n_ix` is rebuilt there, then `s1.a`, with an `n_ix` of its own,
+/// moves to `s2.b`. Each table's index goes where its table goes, so the
+/// rebuilt index's name in `s3` is free, and the plan applies.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_index_follows_its_table_through_a_chain_of_moves() {
+    let own = OwnDatabase::new(&server(), "chain1723");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA s1; CREATE SCHEMA s2; CREATE SCHEMA s3",
+    );
+    let d = Demo::new("chain1723");
+    let declare = |name: &str, body: Option<&str>| {
+        let path = d.dir.join(format!("schema/{name}.yml"));
+        match body {
+            Some(body) => std::fs::write(path, format!("table: {name}\n{body}")).unwrap(),
+            None => std::fs::remove_file(path).unwrap(),
+        }
+    };
+    let table = |key: &str, column: &str, index: &str| {
+        format!(
+            "columns:\n  id: {{type: bigint, nullable: false}}\n  {column}: {{type: bigint}}\n\
+             primary_key: {{name: {key}, columns: [id]}}\n\
+             indexes:\n  n_ix: {{columns: [{index}]}}\n"
+        )
+    };
+    let step = |d: &Demo| {
+        succeeds(d.run(&["plan"]));
+        d.commit();
+    };
+    declare("s1.a", Some(&table("pk_a", "v", "v")));
+    declare("s2.b", Some(&table("pk_b", "w", "w")));
+    step(&d);
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+
+    declare("s2.b", None);
+    declare("s3.c", Some(&table("pk_b", "w", "w, id")));
+    succeeds(d.run(&["rename-table", "s2.b", "s3.c"]));
+    step(&d);
+    declare("s1.a", None);
+    declare("s2.b", Some(&table("pk_a", "v", "v")));
+    succeeds(d.run(&["rename-table", "s1.a", "s2.b"]));
+    step(&d);
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename", "--allow", "destructive"],
+    ));
+    let at = |schema: &str| {
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relname = 'n_ix' AND n.nspname = '{schema}'"
+            ),
+        )
+    };
+    assert_eq!((at("s1"), at("s2"), at("s3")), (0, 1, 1));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 /// #1633: a foreign key's `RESTRICT` is pulled as `restrict` on delete and
 /// on update, bootstrapped into an empty database, and pulled back the same,
 /// with nothing left to plan. Changing an action between `restrict` and
