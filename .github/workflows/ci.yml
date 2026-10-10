@@ -707,7 +707,7 @@ jobs:
           docker build --isolation=process -t pbps-release-consumer $context
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Owned native PostgreSQL and SQL Server TLS fixtures
-        shell: pwsh
+        shell: powershell
         run: ./scripts/release-windows-fixture.ps1 -Action Start -Root (Join-Path $env:RUNNER_TEMP 'release-fixture')
       - name: Exact MSVC artifact, both engines and TLS refusals
         shell: pwsh
@@ -716,7 +716,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Remove only owned native fixtures
         if: ${{ always() }}
-        shell: pwsh
+        shell: powershell
         run: |
           if (Test-Path "$env:RUNNER_TEMP/release-fixture/owner.json") {
             ./scripts/release-windows-fixture.ps1 -Action Stop -Root (Join-Path $env:RUNNER_TEMP 'release-fixture')

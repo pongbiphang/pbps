@@ -283,7 +283,8 @@ python3 scripts/qualify-release.py \
 ```
 
 Windows qualification requires a disposable administrator runner with native
-PostgreSQL tools (`PGBIN`), OpenSSL, MSVC inspection tools and a Windows Docker
+Windows PowerShell 5.1 (Desktop), PostgreSQL tools (`PGBIN`), OpenSSL,
+MSVC inspection tools and a Windows Docker
 daemon capable of process-isolated Server Core 2025 containers. It does not
 assume WSL2 or a Linux Docker backend. `release-windows-fixture.ps1` is restricted
 to disposable GitHub Windows runners. It installs a unique SQL Server Express
@@ -291,8 +292,11 @@ to disposable GitHub Windows runners. It installs a unique SQL Server Express
 an owned PostgreSQL cluster and publishes only their two ports to the Windows
 container NAT subnet. Both use a disposable certificate. No client trust root
 is installed in the host trust store: the consumers select their PEM roots
-explicitly. The server's certificate/private key uses the personal store;
-cleanup removes the recorded certificates, instance, cluster and firewall rules.
+explicitly. The server's certificate/private key uses the personal store. The fixture uses
+Desktop's CAPI private-key interface to grant the SQL service read access to
+the persisted key container; a CNG wrapper does not expose that container.
+Fixture JSON is UTF-8 without a BOM for the Python consumer.
+Cleanup removes the recorded certificates, instance, cluster and firewall rules.
 The always-run cleanup reads an ownership record even after setup failure.
 
 These are ordinary CLI TLS flows. They do not extend frozen peer-verification

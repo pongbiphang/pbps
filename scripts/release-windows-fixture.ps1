@@ -1,3 +1,5 @@
+#requires -Version 5.1
+#requires -PSEdition Desktop
 # Owned native engines for release qualification; never run on a shared host.
 param(
     [Parameter(Mandatory)][ValidateSet('Start', 'Stop')][string]$Action,
@@ -19,7 +21,7 @@ function Invoke-Checked([string]$File, [string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "$File exited $LASTEXITCODE" }
 }
 function Save-Owner($Owner) {
-    $Owner | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $record
+    [IO.File]::WriteAllText($record, ($Owner | ConvertTo-Json -Depth 5))
 }
 function Export-Pem($Cert, [string]$Path) {
     $body = [Convert]::ToBase64String($Cert.RawData, [Base64FormattingOptions]::InsertLineBreaks)
@@ -79,7 +81,7 @@ try {
         if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) { throw "Fixture port $port is already occupied" }
     }
     $installer = Join-Path $Root 'SQLEXPR_x64_ENU.exe'
-    Invoke-WebRequest -Uri 'https://download.microsoft.com/download/3/8/d/38de7036-2433-4207-8eae-06e247e17b25/SQLEXPR_x64_ENU.exe' -OutFile $installer
+    Invoke-WebRequest -UseBasicParsing -Uri 'https://download.microsoft.com/download/3/8/d/38de7036-2433-4207-8eae-06e247e17b25/SQLEXPR_x64_ENU.exe' -OutFile $installer
     if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne '2e61c8bbde6021f9026c54ad9db4bbb1227e68761d4c00a6a50a2c70fe7afe05') { throw 'SQL Server media checksum mismatch' }
     if ((Get-AuthenticodeSignature $installer).Status -ne 'Valid') { throw 'SQL Server media signature is not valid' }
     $media = Join-Path $Root 'media'
@@ -109,7 +111,9 @@ try {
     $pfx = Join-Path $Root 'peer.pfx'
     Export-PfxCertificate -Cert $peer -FilePath $pfx -Password (ConvertTo-SecureString 'pbps-fixture' -AsPlainText -Force) | Out-Null
     Invoke-Checked 'openssl' @('pkcs12', '-in', $pfx, '-passin', 'pass:pbps-fixture', '-nodes', '-nocerts', '-out', (Join-Path $Root 'peer.key'))
-    $rsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($peer)
+    # SQL Server's CAPI key needs its persisted container ACL. Desktop's
+    # PrivateKey preserves that provider; GetRSAPrivateKey may return a CNG wrapper.
+    $rsa = [Security.Cryptography.RSACryptoServiceProvider]$peer.PrivateKey
     $keyPath = Join-Path $env:ProgramData "Microsoft\Crypto\RSA\MachineKeys\$($rsa.CspKeyContainerInfo.UniqueKeyContainerName)"
     $acl = Get-Acl $keyPath
     $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new("NT SERVICE\MSSQL`$$instance", 'Read', 'Allow'))
@@ -150,10 +154,12 @@ try {
         $owner.firewalls += $name; Save-Owner $owner
         New-NetFirewallRule -Name $name -DisplayName $name -Direction Inbound -Action Allow -Protocol TCP -LocalPort $port -RemoteAddress $subnet | Out-Null
     }
-    @{ trust=$Root; gateway=$gateway;
+    $fixture = @{ trust=$Root; gateway=$gateway;
        postgres=@{port=15432; wrong_host=$gateway; version=$pgVersion};
        mssql=@{port=14333; wrong_host=$gateway; version=$version} } |
-        ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $Root 'fixture.json')
+        ConvertTo-Json -Depth 5
+    # Windows PowerShell's UTF8 Set-Content adds a BOM; Python reads plain UTF-8.
+    [IO.File]::WriteAllText((Join-Path $Root 'fixture.json'), $fixture)
 } catch {
     Write-Error -ErrorAction Continue $_
     # CI must retain the engine's reason before the owned instance is removed.
