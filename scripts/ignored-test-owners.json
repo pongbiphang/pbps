@@ -2180,6 +2180,7 @@
         "resolver::server::vouched::live_tests::vouched_refuses_an_external_view_staged_as_a_table",
         "resolver::server::vouched::live_tests::vouched_reports_a_write_through_a_shape_view_with_the_real_definition_remedy",
         "resolver::server::vouched::live_tests::vouched_refuses_a_question_that_needs_routine_source_the_baseline_lacks",
+        "resolver::server::vouched::live_tests::vouched_stages_a_routine_in_a_system_schema_by_its_header",
         "resolver::server::vouched::live_tests::vouched_stages_a_cast_and_an_operator_over_external_types_in_the_baseline",
         "resolver::server::vouched::live_tests::vouched_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates",
         "resolver::server::vouched::live_tests::vouched_takes_an_unmanaged_overload_of_a_managed_routine_for_no_chain",

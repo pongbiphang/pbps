@@ -501,11 +501,16 @@ pub(super) fn assess_with(
             let system = set.class == CandidateClass::Cast
                 || member.name.first().is_some_and(|schema| is_system(schema));
             if system {
+                // A system schema may also hold what a superuser created
+                // there. The baseline's comparison already accepted such a
+                // member by its header, without the body (SPEC §9.3.2), so
+                // only an initdb member is compared in full here.
+                let staged = staged.is_some_and(|staged| carries(&target.inputs, staged, member));
                 return match (target.inputs.get(member), desired.inputs.get(member)) {
                     (Some(left), Some(right)) => {
                         on_target.contains(member)
                             && on_scratch.contains(member)
-                            && properties_equal(&left.properties, &right.properties)
+                            && (staged || properties_equal(&left.properties, &right.properties))
                     }
                     _ => false,
                 };

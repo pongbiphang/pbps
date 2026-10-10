@@ -2144,6 +2144,50 @@ async fn vouched_refuses_a_question_that_needs_routine_source_the_baseline_lacks
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_stages_a_routine_in_a_system_schema_by_its_header() {
+    // A superuser may create a routine in `information_schema` (measured on
+    // 16 and 18). Staged there, it is compared by its header like any staged
+    // routine: the baseline need not repeat the target's body (SPEC §9.3.2).
+    let routine = "information_schema.pbps_staged_1754";
+    let call = format!("SELECT {routine}(1) AS r");
+    let setup = vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        format!(
+            "CREATE FUNCTION {routine}(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 + 1"
+        ),
+        format!("CREATE VIEW {MANAGED}.a AS {call}"),
+    ];
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let inputs = staging_inputs(&call, &call, &[]);
+    let key = ProjectKey::new(true);
+    let baseline = format!(
+        "CREATE FUNCTION {routine}(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 0;"
+    );
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &baseline,
+    )
+    .await;
+    target.drop().await;
+    let plan = match result {
+        Ok(plan) => plan,
+        Err(error) => panic!("a staged system-schema routine: {error}"),
+    };
+    plan.evidence.validate(&plan.changes).unwrap();
+    let created =
+        plan.changes.changes.iter().any(
+            |step| matches!(&step.change, Change::CreateModule { id, .. } if id.name() == "b"),
+        );
+    assert!(created, "the plan creates b");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_stages_a_cast_and_an_operator_over_external_types_in_the_baseline() {
     let external = [
         format!("CREATE SCHEMA {EXTERNAL}"),
