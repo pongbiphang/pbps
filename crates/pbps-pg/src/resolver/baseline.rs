@@ -256,8 +256,11 @@ fn scan(
                 }
                 // psql's rule: inside a routine's definition, `BEGIN` and
                 // `CASE` open a block that `END` closes, so a SQL-standard
-                // body's own `;` do not end the statement.
-                if creates_routine(&words) {
+                // body's own `;` do not end the statement. Only outside
+                // parentheses: `begin` is a valid parameter or result column
+                // name in the signature, and a `;` inside parentheses ends
+                // nothing anyway.
+                if parens == 0 && creates_routine(&words) {
                     match word.as_str() {
                         "begin" | "case" => begin_depth += 1,
                         "end" => begin_depth = begin_depth.saturating_sub(1),
@@ -792,6 +795,22 @@ mod tests {
                 "BEGIN",
                 "SELECT 3",
                 "END"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_routine_parameter_named_begin_opens_no_block() {
+        assert_eq!(
+            texts(
+                "CREATE FUNCTION ext.f(begin integer) RETURNS TABLE (begin integer)\n\
+                 LANGUAGE sql AS 'SELECT 1';\n\
+                 SELECT 2;"
+            ),
+            [
+                "CREATE FUNCTION ext.f(begin integer) RETURNS TABLE (begin integer)\n\
+                 LANGUAGE sql AS 'SELECT 1'",
+                "SELECT 2"
             ]
         );
     }
