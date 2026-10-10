@@ -4530,6 +4530,15 @@ referencing table it has no `SELECT` on, is an error too. Either way the
 statement aborts, and the plan with it, before a row moves. The pre-flight
 stays: it refuses before any statement runs, and names the rows.
 
+The block counts the rows to move `FOR UPDATE` before it asks about their
+references, as the delete guard locks its row (DECISIONS 129, 326). A row
+referencing one of them, inserted by a session that has not committed,
+holds `FOR KEY SHARE` on it. The lock waits for that session, and the next
+statement of the block, under the apply's READ COMMITTED, sees what it
+committed. Unlocked, the question was asked before the insert was visible,
+and the delete then waited for the same session and cascaded into its row
+(#1763 review).
+
 The names matter. A parent renamed in the same plan (DEC-1690.1 refuses only
 attaches, detaches and drops beside a rename) is found under its old name.
 Under the new one the key is not found, the count reads zero, and a cascade
@@ -4547,7 +4556,10 @@ name too.
   transaction. A change before the create is counted as before (#1763
   review).
 - **Risk.** The partition's own checks and uniqueness are a `constraint`
-  risk, and its own NOT NULLs a `not_null` risk. An empty partition faced
+  risk, and its own NOT NULLs a `not_null` risk. An unlogged partition is a
+  `destructive` risk: it takes rows that were durable, as a switch to
+  unlogged does (DEC-1443.1). The change does not carry whether the DEFAULT
+  is unlogged too, so the gate asks even then (#1763 review). An empty partition faced
   neither, and the moved rows face both. The parent's hold already, since
   the rows come from a partition of the same parent.
 - **Estimate.** Made on the DEFAULT: ACCESS EXCLUSIVE, every row read.

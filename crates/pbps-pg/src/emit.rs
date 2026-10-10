@@ -3324,7 +3324,7 @@ fn beside_its_default(
          \x20                   AND {rule_fires}) THEN\n\
          \x20       {statement}\n\
          \x20   END IF;\n\
-         \x20   EXECUTE {count} || keep INTO n;\n\
+         \x20   EXECUTE {count} || keep || ' FOR UPDATE) AS locked' INTO n;\n\
          \x20   IF n > 0 THEN\n\
          \x20       IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t\n\
          \x20                  WHERE t.tgrelid = {ld}::pg_catalog.regclass AND NOT t.tgisinternal\n\
@@ -3362,7 +3362,18 @@ fn beside_its_default(
         matched = crate::preflight::moved_row_match(),
         reaches =
             crate::preflight::delete_reaches(&format!("{}::pg_catalog.regclass", literal(&d))),
-        count = literal(&format!("SELECT count(*) FROM ONLY {d} AS r WHERE ")),
+        // The rows to move are counted *and locked*, before anything is asked
+        // about what references them: a row referencing one of them,
+        // inserted by a session that has not committed, holds `FOR KEY
+        // SHARE` on it, so the lock waits for that session, and each later
+        // statement of the block, under the apply's READ COMMITTED, sees the
+        // row it committed. Unlocked, the question was asked before the
+        // insert was visible, and the delete then waited for it and cascaded
+        // into it. The rule DECISIONS 129 and 326 keep for a deleted row
+        // (#1763 review).
+        count = literal(&format!(
+            "SELECT count(*) FROM (SELECT 1 FROM ONLY {d} AS r WHERE "
+        )),
         referencing = literal(&format!(
             " AS ch WHERE EXISTS (SELECT 1 FROM ONLY {d} AS r WHERE "
         )),

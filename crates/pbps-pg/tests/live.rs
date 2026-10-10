@@ -4350,6 +4350,41 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             1
         );
         rollback(&mut conn).await;
+        // A row referencing one the move takes, inserted by another session
+        // that has not committed yet: the move locks the rows it takes before
+        // asking what references them, so it waits for that session, then
+        // sees its row and stops over it. Asked unlocked, it saw nothing, and
+        // its delete waited for the same session and cascaded into the row
+        // (#1763 review).
+        conn.execute(&format!(
+            "CREATE TABLE {s}.rc (ev_id integer, ev_ts date, \
+                 FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.ev (id, ts) ON DELETE CASCADE)"
+        ))
+        .await
+        .unwrap();
+        let mut other = Conn::connect(Driver::Postgres, &own).await.unwrap();
+        other.execute("BEGIN").await.unwrap();
+        other
+            .execute(&format!("INSERT INTO {s}.rc VALUES (2, '2027-03-01')"))
+            .await
+            .unwrap();
+        in_a_transaction(&mut conn).await;
+        let (moved, committed) = tokio::join!(conn.execute(&moving), async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            other.execute("COMMIT").await
+        });
+        committed.expect("the other session commits");
+        let stopped = moved.expect_err("the move stops on the row committed while it waited");
+        assert!(
+            format!("{stopped:?}").contains("would fire the action of their foreign key"),
+            "{stopped:?}"
+        );
+        rollback(&mut conn).await;
+        assert_eq!(
+            counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.rc")).await,
+            1
+        );
+        conn.execute(&format!("DROP TABLE {s}.rc")).await.unwrap();
         // A key to a table above the parent reaches the DEFAULT too, through
         // its clones: counted (#1763 review, found by sweeping the keys the
         // probe selected by the table they name).
