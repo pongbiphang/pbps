@@ -2240,6 +2240,43 @@ async fn vouched_stages_a_cast_and_an_operator_over_external_types_in_the_baseli
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_compares_an_extension_member_in_a_system_schema_in_full() {
+    // The baseline stages the extension, not its members: one the target
+    // altered in place is not what scratch reproduced, so its managed
+    // caller is refused rather than accepted on membership alone.
+    let call = "SELECT pg_catalog.soundex('pbps') AS r";
+    let setup = vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        "CREATE EXTENSION fuzzystrmatch SCHEMA pg_catalog".to_owned(),
+        "ALTER FUNCTION pg_catalog.soundex(text) VOLATILE".to_owned(),
+        format!("CREATE VIEW {MANAGED}.a AS {call}"),
+    ];
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let inputs = staging_inputs(call, call, &[]);
+    let key = ProjectKey::new(true);
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        "CREATE EXTENSION fuzzystrmatch SCHEMA pg_catalog;",
+    )
+    .await;
+    target.drop().await;
+    let reason = match result {
+        Err(ProduceError::Run(Error::Binding(reason))) => reason,
+        other => panic!(
+            "not a binding refusal: {:?}",
+            other.err().map(|e| e.to_string())
+        ),
+    };
+    assert!(reason.contains("not reconstructed on scratch"), "{reason}");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_stages_an_operator_over_built_in_types_in_the_baseline() {
     // An operator's identity hangs off its operand types; over built-in
     // types those are not staged, so the operator itself is.

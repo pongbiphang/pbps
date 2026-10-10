@@ -505,9 +505,11 @@ pub(super) fn assess_with(
             if system {
                 // A system schema may also hold what a superuser created
                 // there. The baseline's comparison already accepted such a
-                // member by its header, without the body (SPEC §9.3.2), so
-                // only an initdb member is compared in full here.
-                let staged = staged.is_some_and(|staged| carries(&target.inputs, staged, member));
+                // root by its header, without the body (SPEC §9.3.2). Only
+                // the root itself: an extension's member there was compared
+                // through its extension's version alone, so it is compared
+                // in full here, like an initdb member.
+                let staged = staged.is_some_and(|staged| staged.holds(member));
                 return match (target.inputs.get(member), desired.inputs.get(member)) {
                     (Some(left), Some(right)) => {
                         on_target.contains(member)
