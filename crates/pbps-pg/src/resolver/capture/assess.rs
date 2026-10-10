@@ -400,7 +400,9 @@ fn carries(
         if !seen.insert(object) {
             continue;
         }
-        if staged.holds(owner(object)) {
+        // The object itself first: an operator's owner is its operand type,
+        // which over built-in types is not what the baseline staged.
+        if staged.holds(object) || staged.holds(owner(object)) {
             return true;
         }
         pending.extend(makers.get(object).into_iter().flatten().copied());

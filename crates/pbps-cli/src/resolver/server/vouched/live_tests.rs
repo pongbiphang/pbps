@@ -2240,6 +2240,56 @@ async fn vouched_stages_a_cast_and_an_operator_over_external_types_in_the_baseli
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_stages_an_operator_over_built_in_types_in_the_baseline() {
+    // An operator's identity hangs off its operand types; over built-in
+    // types those are not staged, so the operator itself is.
+    let external = [
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!(
+            "CREATE FUNCTION {EXTERNAL}.join_ints(integer, integer) RETURNS integer \
+             LANGUAGE sql IMMUTABLE RETURN $1 + $2"
+        ),
+        format!(
+            "CREATE OPERATOR {EXTERNAL}.<%> (LEFTARG = integer, RIGHTARG = integer, \
+             FUNCTION = {EXTERNAL}.join_ints)"
+        ),
+    ];
+    let a = format!("SELECT 1 OPERATOR({EXTERNAL}.<%>) 2 AS s");
+    let mut setup = vec![format!("CREATE SCHEMA {MANAGED}")];
+    setup.extend(external.iter().cloned());
+    setup.push(format!("CREATE VIEW {MANAGED}.a AS {a}"));
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let inputs = staging_inputs(&a, &a, &[]);
+    let key = ProjectKey::new(true);
+    let baseline = external
+        .iter()
+        .map(|s| format!("{s};\n"))
+        .collect::<String>();
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &baseline,
+    )
+    .await;
+    target.drop().await;
+    let plan = match result {
+        Ok(plan) => plan,
+        Err(error) => panic!("an operator over built-in types: {error}"),
+    };
+    plan.evidence.validate(&plan.changes).unwrap();
+    let created =
+        plan.changes.changes.iter().any(
+            |step| matches!(&step.change, Change::CreateModule { id, .. } if id.name() == "b"),
+        );
+    assert!(created, "the plan creates b");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates() {
     // A deployer that is no superuser: without its USAGE on the external
     // schema reproduced, its views there would not compile on scratch.
