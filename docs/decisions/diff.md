@@ -4567,7 +4567,11 @@ has before the plan runs:
   compares it, under the referenced column's collation and through the
   constraint's operator (DECISIONS 352). A bare `=` between columns
   collated differently fails to compare, and inside the moving statement
-  that failure aborted a move the engine takes (#1763 review).
+  that failure aborted a move the engine takes (#1763 review). With a
+  generated column recomputed in the same plan, the count is unchecked
+  rather than taken over the old values, as a deleted row's is
+  (DEC-1168.1). The new values may be written before the move, and the
+  moving statement asks the values it meets.
 - **The referencing tables the session cannot fully read.** These are
   tables with such a key on which row-level security is active, or that
   the session cannot read the key's columns of: `SELECT` on the table, or

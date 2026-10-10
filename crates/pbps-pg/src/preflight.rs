@@ -3963,8 +3963,36 @@ fn partition_probes(
                 continue;
             };
             let gone = dropped_triggers(changes, &stored, &parent);
+            // A generated column this plan recomputes may be a referencing
+            // column of a key the count finds in the catalog, and its new
+            // values may be written before the move (a create at (9, 5)
+            // follows the expression change): the count is unchecked rather
+            // than taken over the old values, as a deleted row's is
+            // (DEC-1168.1). The moving statement asks the values it meets
+            // (#1763 review).
+            if names.recomputed.is_empty() {
+                match default_reference_probe(
+                    name,
+                    &parent,
+                    &stored,
+                    names,
+                    &dropped_before,
+                    from,
+                    to,
+                ) {
+                    Ok(probe) => out.push(probe),
+                    Err(error) => {
+                        unchecked.push(Unchecked::for_change(&p.change, error.to_string()))
+                    }
+                }
+            } else {
+                unchecked.push(Unchecked::for_change(
+                    &p.change,
+                    "a generated column this plan recomputes may reference the moved rows, and \
+                     its new values cannot be evaluated before apply",
+                ));
+            }
             for probe in [
-                default_reference_probe(name, &parent, &stored, names, &dropped_before, from, to),
                 default_hidden_referencers_probe(name, &parent, &stored, names, from, to),
                 default_trigger_probe(name, &parent, &stored, &gone, from, to),
                 default_statement_probe(name, &stored, &gone),
@@ -5203,6 +5231,71 @@ mod tests {
                 .all(|p| !p.description.contains("will not create a partition")),
             "{asked:?}"
         );
+    }
+
+    /// A generated column the plan recomputes may be a referencing column of
+    /// a key into the moved rows, its new values written before the move:
+    /// the count of what references them is unchecked rather than taken over
+    /// the old values, and the rest is still asked (#1763 review).
+    #[test]
+    fn a_move_beside_a_recomputation_leaves_its_reference_count_unchecked() {
+        let create = Change::CreateTable {
+            uid: "t_bbbbbb".parse().unwrap(),
+            name: "app.ev_1".parse().unwrap(),
+            table: Box::new(pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Range {
+                        from: vec![pbps_model::BoundDatum::Value("1".into())],
+                        to: vec![pbps_model::BoundDatum::MaxValue],
+                    },
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            }),
+            beside_default: Some("app.ev_rest".parse().unwrap()),
+        };
+        let recomputed = Change::AlterColumnExpression {
+            uid: "c_cccccc".parse().unwrap(),
+            column: "ext.child.ev_id".parse().unwrap(),
+            from: "id".into(),
+            to: "NULL::integer".into(),
+        };
+        let asked = preflight(&ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(recomputed),
+                pbps_model::PlannedChange::new(create.clone()),
+            ],
+        });
+        assert!(
+            asked
+                .probes
+                .iter()
+                .all(|p| !p.description.starts_with("rows that reference rows of")),
+            "{:?}",
+            asked.probes
+        );
+        assert_eq!(asked.probes.len(), 4, "{:?}", asked.probes);
+        assert!(
+            asked
+                .unchecked
+                .iter()
+                .any(|u| u.reason.contains("a generated column this plan recomputes")),
+            "{:?}",
+            asked.unchecked
+        );
+        // Negative: with no recomputation, the count is asked.
+        let plain = preflight(&ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(create)],
+        });
+        assert!(
+            plain.probes[0]
+                .description
+                .starts_with("rows that reference rows of app.ev_rest"),
+            "{:?}",
+            plain.probes
+        );
+        assert!(plain.unchecked.is_empty(), "{:?}", plain.unchecked);
     }
 
     #[test]
