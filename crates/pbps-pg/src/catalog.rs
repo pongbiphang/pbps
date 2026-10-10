@@ -3178,6 +3178,64 @@ pub async fn relation_name_occupants(
     Ok(out)
 }
 
+/// The tables and views at `names`, managed or not, each with its kind, read
+/// in the caller's transaction (#1765): what a cross-schema rename's carried
+/// indexes and owned sequences meet beside the [`NameOccupant`]s. `SET
+/// SCHEMA` refuses to carry one onto a name any of them holds (measured on
+/// 18). The declarations cannot answer this: what is carried keeps its
+/// catalog name, an unnamed key's index and an owned sequence included.
+pub async fn relations_at(
+    conn: &mut Conn,
+    names: &[TableName],
+) -> Result<Vec<(TableName, &'static str)>, DbError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let params: Vec<Param<'_>> = names
+        .iter()
+        .flat_map(|n| [Param::Str(n.schema.as_str()), Param::Str(n.name.as_str())])
+        .collect();
+    let rows: Vec<String> = (0..names.len())
+        .map(|i| format!("(${}::text, ${}::text)", 2 * i + 1, 2 * i + 2))
+        .collect();
+    let sql = format!(
+        "WITH wanted(schema_name, relation_name) AS (VALUES {})\n\
+         SELECT n.nspname AS schema_name, c.relname AS relation_name, c.relkind::text AS relkind\n  \
+           FROM pg_catalog.pg_class c\n  \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n  \
+           JOIN wanted w ON w.schema_name = n.nspname AND w.relation_name = c.relname\n \
+          WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')",
+        rows.join(", ")
+    );
+    let mut out = Vec::new();
+    for row in &conn.query_with(&sql, &params).await? {
+        let text = |column: &str| -> Result<String, DbError> {
+            row.try_get::<&str>(column)?
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    DbError::BadRow(format!("the relation query returned a NULL {column}"))
+                })
+        };
+        let kind = match text("relkind")?.as_str() {
+            "r" => "table",
+            "p" => "partitioned table",
+            "v" => "view",
+            "m" => "materialized view",
+            "f" => "foreign table",
+            other => {
+                return Err(DbError::BadRow(format!(
+                    "the relation query returned relkind `{other}`"
+                )));
+            }
+        };
+        out.push((
+            TableName::new(text("schema_name")?, text("relation_name")?),
+            kind,
+        ));
+    }
+    Ok(out)
+}
+
 /// A name in a schema that an unnamed primary key's index cannot take
 /// (#1645): a relation's of any kind, a composite type's included, or a
 /// constraint's in that schema, on any of its tables. Measured on 16 and 18:

@@ -9849,7 +9849,7 @@ fn a_move_onto_an_unmanaged_table_or_view_is_refused() {
         assert!(
             stderr(&out).contains(&format!(
                 "`s2.n`: this plan moves index `s1.n` on `s1.t` there, with the rename of \
-                 `s1.t` to `s2.t`, where the database already has {what} `s2.n`"
+                 `s1.t` to `s2.t`, where {what} `s2.n` already is"
             )),
             "{}",
             stderr(&out)
@@ -9871,6 +9871,99 @@ fn a_move_onto_an_unmanaged_table_or_view_is_refused() {
             connection,
             "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = 's2' AND c.relname = 'n' AND c.relkind = 'i'"
+        ),
+        1
+    );
+}
+
+/// #1765: what a cross-schema rename carries keeps its catalog name, so a
+/// managed table holding it is no declaration conflict: `s1.old`'s unnamed
+/// key's index is `old_pkey`, moved to `s2` beside a managed `s2.old_pkey`,
+/// while the declarations name the key `new_pkey`. The plan is refused
+/// before it is written, naming both, where it used to fail at `SET SCHEMA`;
+/// renaming the holder away in the same plan frees the name first.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_move_onto_a_managed_table_holding_its_carried_name_is_refused() {
+    let own = OwnDatabase::new(&server(), "managed1765");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA s1; CREATE SCHEMA s2");
+    let d = Demo::new("managed1765");
+    let keyed = "columns:\n  id: {type: bigint, nullable: false}\nprimary_key: {columns: [id]}\n";
+    let holder = "columns:\n  x: {type: integer}\n";
+    std::fs::write(
+        d.dir.join("schema/s1.old.yml"),
+        format!("table: s1.old\n{keyed}"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/s2.old_pkey.yml"),
+        format!("table: s2.old_pkey\n{holder}"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    std::fs::remove_file(d.dir.join("schema/s1.old.yml")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/s2.new.yml"),
+        format!("table: s2.new\n{keyed}"),
+    )
+    .unwrap();
+    succeeds(d.run(&["rename-table", "s1.old", "s2.new"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+
+    let artifact = d.dir.join("refused-plan.json");
+    let out = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&out), 0, "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains(
+            "`s2.old_pkey`: this plan moves index `s1.old_pkey` on `s1.old` there, with the \
+             rename of `s1.old` to `s2.new`, where table `s2.old_pkey` already is"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!artifact.exists(), "a refused plan writes no artifact");
+
+    std::fs::remove_file(d.dir.join("schema/s2.old_pkey.yml")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/s2.kept.yml"),
+        format!("table: s2.kept\n{holder}"),
+    )
+    .unwrap();
+    succeeds(d.run(&["rename-table", "s2.old_pkey", "s2.kept"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    let out = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]);
+    succeeds(out);
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename"],
+    ));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class WHERE oid = to_regclass('s2.old_pkey') AND relkind = 'i'"
         ),
         1
     );
