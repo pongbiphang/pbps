@@ -1668,9 +1668,9 @@ that references anything outside the managed set otherwise fails the whole
 scratch compile (#1616).
 
 - **The baseline is a SQL file in the repository**, named by the resolver
-  entry's `baseline`. It is reviewed history like the declarations. A path
-  that resolves outside the project root (absolute, through `..`, or through a
-  symlink) is refused. It runs on scratch only, never on the target.
+  entry's `baseline`. It is reviewed history like the declarations. An
+  absolute path is refused, and so is a relative one that resolves outside
+  the project root through `..` or a symlink. It runs on scratch only, never on the target.
 - **It runs whole, before any managed object** (#1664, DEC-1673.1), in
   both layouts. It runs after the separation and emptiness checks and after
   the deployer's authorization is reproduced, which recreates each in-scope

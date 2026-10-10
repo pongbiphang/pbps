@@ -246,6 +246,12 @@ pub async fn resolve(request: &Request<'_>) -> Result<pbps_model::ChangeSet, Ref
 #[cfg(target_os = "linux")]
 fn read_baseline(root: &std::path::Path, path: &std::path::Path) -> Result<String, String> {
     let unreadable = |error: std::io::Error| format!("could not be read: {error}");
+    // Relative, as the configuration says: an absolute path would work from
+    // one checkout only, even one inside the root (`join` replaces the root
+    // with it).
+    if path.has_root() {
+        return Err("is an absolute path; name the baseline relative to the project root".into());
+    }
     let root = root.canonicalize().map_err(unreadable)?;
     let file = root.join(path).canonicalize().map_err(unreadable)?;
     if !file.starts_with(&root) {
@@ -473,11 +479,20 @@ mod tests {
             read_baseline(&root, Path::new("inside.sql")).as_deref(),
             Ok("CREATE SCHEMA ext;")
         );
-        // Negative: a parent step, an absolute path and a symlink each lead
-        // outside the project root, to a file that exists.
+        // A parent step that comes back inside the root is still relative.
+        assert_eq!(
+            read_baseline(&root, Path::new("db/../db/baseline.sql")).as_deref(),
+            Ok("CREATE SCHEMA ext;")
+        );
+        // Negative: an absolute path is refused even inside the root.
+        for path in [root.join("db/baseline.sql"), dir.join("outside.sql")] {
+            let refused = read_baseline(&root, &path).unwrap_err();
+            assert!(refused.starts_with("is an absolute path"), "{refused}");
+        }
+        // Negative: a parent step and a symlink each lead outside the
+        // project root, to a file that exists.
         for path in [
             PathBuf::from("../outside.sql"),
-            dir.join("outside.sql"),
             PathBuf::from("db/link.sql"),
         ] {
             let refused = read_baseline(&root, &path).unwrap_err();
