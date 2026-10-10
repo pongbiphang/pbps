@@ -21630,3 +21630,12 @@ fn abrupt_staged_apply_resumes_from_a_durable_checkpoint_before_the_next_step() 
         );
     }
 }
+
+#[path = "support/compatibility.rs"]
+mod compatibility;
+
+#[test]
+#[ignore = "needs a qualified live engine; run scripts/compatibility-tests.sh"]
+fn compatibility_core_contract() {
+    compatibility::run(pbps_db::Driver::Mssql, "PBPS_TEST_DB", "mssql2025");
+}

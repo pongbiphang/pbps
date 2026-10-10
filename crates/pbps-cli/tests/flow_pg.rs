@@ -22279,3 +22279,12 @@ fn renamed_parent_generated_flow(server: &str, slug: &str) {
     );
     assert_eq!(holds("SELECT count(*) FROM app.events"), 1);
 }
+
+#[path = "support/compatibility.rs"]
+mod compatibility;
+
+#[test]
+#[ignore = "needs a qualified live engine; run scripts/compatibility-tests.sh"]
+fn compatibility_core_contract() {
+    compatibility::run(pbps_db::Driver::Postgres, "PBPS_TEST_PG_DB", "pg18");
+}

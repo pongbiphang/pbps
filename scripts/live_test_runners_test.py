@@ -89,6 +89,9 @@ class LiveExecution(unittest.TestCase):
             probes = [c for c in calls[:first_client] if c[:3] == ["docker", "exec", name]]
             self.assertEqual(len(probes), 3)
         self.assertEqual([c for c in calls if c[0] in ("cargo", "python3")], [
+            ["python3", "scripts/check-live-fixture.py", "--cell", "pg18", "--container", "pbps-test-pg", "--port", "54320"],
+            ["python3", "scripts/check-live-fixture.py", "--cell", "pg16", "--container", "pbps-test-pg16", "--port", "54321"],
+            ["python3", "scripts/check-live-fixture.py", "--cell", "pg18", "--container", "pbps-test-pg-scratch", "--port", "54322"],
             ["cargo", "test", "-p", "pbps-pg", "--test", "live", "--", "--ignored"],
             ["cargo", "test", "--profile", "live-test", "-p", "pbps-pg", "--lib", "--", "--ignored", "--test-threads=1"],
             ["cargo", "test", "-p", "pbps-db", "--test", "live_pg", "--", "--ignored"],
@@ -97,6 +100,12 @@ class LiveExecution(unittest.TestCase):
             ["cargo", "test", "-p", "pbps-cli", "--lib", "--", "--ignored", "--test-threads=1", "resolver::server::vouched::live_tests"],
             ["cargo", "test", "-p", "pbps-cli", "--test", "flow_pg", "--", "--ignored", "--test-threads=1"],
         ])
+
+    def test_wrong_fixture_identity_stops_before_test_writes(self):
+        result, calls = self.local_pg_script("wrong-identity")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(c[0] == "cargo" for c in calls))
+        self.assertFalse(any(c[:2] == ["docker", "rm"] for c in calls))
 
     def local_pg_script(self, mode):
         # Run the real shell control flow. Only external clients are replaced;
@@ -126,6 +135,8 @@ elif command[:2] == ["docker", "exec"]:
     sys.exit(2 if tcp and (deadline or mode == "initializing" and count <= 2) else 0)
 elif command[:2] == ["docker", "logs"]:
     print("controlled server still initializing", file=sys.stderr)
+elif command[:2] == ["python3", "scripts/check-live-fixture.py"]:
+    sys.exit(1 if os.environ["PBPS_ADMISSION_MODE"] == "wrong-identity" else 0)
 elif command[0] not in ("cargo", "python3", "sleep"):
     raise RuntimeError("Unexpected external command: " + repr(command))
 ''')
