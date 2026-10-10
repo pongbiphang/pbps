@@ -54,6 +54,9 @@ The differ sorts every planned change by, in order:
    - a foreign key comes after the key it references;
    - a partition is created after every other creation of class 7, its
      parent's included, at (7, 2) (DEC-1170.1);
+   - a DEFAULT partition's own NOT NULL, tightened in a plan that moves rows
+     out of it, comes at (9, 6), after every create that moves them, (9, 5)
+     included (DEC-1547.1);
    - a clustered index comes before the other indexes of its table
      (DEC-1178.1);
    - a replica identity whose target the plan adds, or whose columns become
@@ -183,7 +186,7 @@ requirement is common to all of them, so it is listed once,
 | `AlterColumnNullability` | 9 | Tightening: the values non-null | Accepts or refuses NULL |
 | `AlterColumnDefault` | 9 | Functions the default calls: *content* | The default |
 | `SetPartitionDefault` | 9; (9, 4) after its parent's default or NOT NULL change on the column | Functions the default calls: *content*. P: after its parent's default set by the plan (`after_their_parents_defaults`) | One partition's default: its own, or its parent's again (DEC-1581.1) |
-| `SetPartitionNotNull` | 9; (9, 4) after its parent's default or NOT NULL change on the column | Tightening: the partition's values non-null | One partition's column accepts or refuses NULL (DEC-1581.1) |
+| `SetPartitionNotNull` | 9; (9, 4) after its parent's default or NOT NULL change on the column; a DEFAULT's tightening (9, 6) in a plan that moves rows out of it | Tightening: the partition's values non-null | One partition's column accepts or refuses NULL (DEC-1581.1) |
 | `AlterColumnExpression` | 9 | P: its inputs, a relaxation of its own column. Functions it calls: *content* | Recomputed stored values |
 | `AddComputedColumn` | 9 (9, 3) | S: the columns it reads, in their final type. Functions it calls exist (one this plan creates is refused by name) | A computed column at the end of its table (DEC-1174.1) |
 | `SetColumnDeprecated` | 10 | Nothing | Metadata only |
@@ -338,6 +341,7 @@ one class and the dependents a class cannot see.
 | `DetachPartition` → `CreateTable` of a partition over its range | fixed | class 6 before 7; the new range's pre-flight count leaves the detached partition's rows out | ✓ DEC-1544.1 |
 | `DropTable` or `DetachPartition` of the DEFAULT partition → `CreateTable` of a range partition beside it | fixed | class 6 before 7; the DEFAULT is gone, and the partition is a plain create | ✓ DEC-1547.1 |
 | `RenameTable` of a parent → `CreateTable` of a partition beside its DEFAULT | fixed | class 1 before 7; the move names the parent as renamed, its pre-flight as stored | ✓ DEC-1547.1 |
+| `CreateTable` of a partition beside a DEFAULT → the DEFAULT's own tightening: `SetPartitionNotNull` to NOT NULL, `AddCheck`, `AddUnique`, a unique `AddIndex` | fixed | the moved rows may be what the tightening refuses. `SetPartitionNotNull` at (9, 6), after the create at (7, 2) or (9, 5); the others are of class 13. Each one's pre-flight probe is unchecked: it would count rows the move takes | ✓ DEC-1547.1 |
 | `DropTable` or `DetachPartition` of a partition → `AttachPartition` over its range | fixed | class 6 before 7; the new range's pre-flight count leaves the leaving partition's rows out | ✓ DEC-1545.1 |
 | A table's own `DropIndex` or `DropCheck` → its `AttachPartition` | fixed | class 2 before 7; the engine takes either order, an own index or check staying the table's across the attach | ✓ DEC-1545.1 |
 | `SetPrimaryKey { to: None }` → relaxing a key column's nullability | fixed | class 2 before 9 | ✓ DECISIONS 269 |

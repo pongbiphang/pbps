@@ -4753,6 +4753,95 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         assert_eq!(alone_probes.len(), 1, "{alone_probes:#?}");
         assert_eq!(counted(&mut conn, &alone_probes[0].sql).await, 1);
 
+        // A DEFAULT's own NOT NULL, tightened in the plan that moves its only
+        // NULL out, under a parent whose column default changes too, which
+        // puts the create among the column alterations: the tightening
+        // follows the move, so the engine finds no NULL left, and its probe
+        // is unchecked rather than counted over the row that leaves (#1763
+        // review).
+        conn.execute(&format!(
+            "CREATE TABLE {s}.nn (id integer NOT NULL, ts date NOT NULL, v integer)
+                 PARTITION BY RANGE (ts);
+             CREATE TABLE {s}.nn_rest PARTITION OF {s}.nn DEFAULT;
+             INSERT INTO {s}.nn VALUES (1, '2030-06-01', NULL), (2, '2040-06-01', 5);"
+        ))
+        .await
+        .expect("the tree");
+        let nn_base = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
+        let nn_ids = mint_ids(&nn_base, &added_ids, &[]);
+        let tightened = |moving: bool| {
+            let mut wanted = nn_base.clone();
+            wanted
+                .tables
+                .get_mut(&t("nn"))
+                .unwrap()
+                .columns
+                .get_mut("v")
+                .unwrap()
+                .default = Some("1".into());
+            wanted
+                .tables
+                .get_mut(&t("nn_rest"))
+                .unwrap()
+                .partition_of
+                .as_mut()
+                .unwrap()
+                .columns
+                .insert(
+                    "v".into(),
+                    pbps_model::PartitionColumn {
+                        default: None,
+                        not_null: true,
+                    },
+                );
+            if moving {
+                wanted.tables.insert(
+                    t("nn_2030"),
+                    partition(
+                        "nn",
+                        range(vec![value("2030-01-01")], vec![value("2031-01-01")]),
+                    ),
+                );
+            }
+            plan(&nn_base, &nn_ids, &wanted, &mint_ids(&wanted, &nn_ids, &[]))
+        };
+        let nn_step = tightened(true);
+        let nn_preflight = pg.preflight(&nn_step);
+        for probe in &nn_preflight.probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        assert_eq!(
+            nn_preflight.unchecked.len(),
+            1,
+            "{:#?}",
+            nn_preflight.unchecked
+        );
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &nn_step).await;
+        assert_eq!(
+            counted(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM ONLY {s}.nn_2030 WHERE v IS NULL")
+            )
+            .await,
+            1
+        );
+        rollback(&mut conn).await;
+        // Negative: with no range added, the tightening is counted over the
+        // NULL that stays.
+        let kept = pg.preflight(&tightened(false)).probes;
+        let mut nulls = 0;
+        for probe in &kept {
+            nulls += counted(&mut conn, &probe.sql).await;
+        }
+        assert_eq!(nulls, 1, "{kept:#?}");
+        conn.execute(&format!("DROP TABLE {s}.nn")).await.unwrap();
+
         // A key between columns collated differently, which the engine
         // enforces: a bare `=` between them fails to compare, and inside the
         // moving statement that failure aborted a move the engine takes.

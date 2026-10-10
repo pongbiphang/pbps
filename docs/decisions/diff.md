@@ -4627,6 +4627,13 @@ same gap; the engine's refusal was its backstop, and it now reads the old
 name too.
 
 **The rest of the plan.**
+- **The DEFAULT's own tightenings follow the move.** A NOT NULL of the
+  DEFAULT's own that the plan tightens comes at (9, 6), after every create
+  that moves rows out of it. The create is at (7, 2), or at (9, 5) under a
+  parent whose columns change, where a tightening at (9, 1) or (9, 4)
+  counted, and the engine refused, the NULL the move takes away. Its own
+  checks, uniques and unique indexes are of class 13, after every create
+  already (#1763 review, leon's choice of one ordering rule).
 - **Probes of the DEFAULT after the move.** A change the plan makes to the
   DEFAULT after the create, such as a check of its own, would be counted
   over rows the move has taken away by then. A check that only a moved row
