@@ -9649,6 +9649,84 @@ fn an_index_follows_its_table_through_a_chain_of_moves() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+/// #1738: a constraint trigger's `pg_constraint` row holds `n_pkey`, and the
+/// plan drops the trigger before it creates `app.n`, whose unnamed key then
+/// takes `n_pkey` (measured on 16 and 18). A default of `app.n` naming
+/// `app.n_pkey` names the key's index before it exists: the plan is refused,
+/// writing no artifact. Without that default it applies, and the key's
+/// index is `n_pkey`.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_dropped_constraint_trigger_frees_its_name_for_a_key() {
+    let own = OwnDatabase::new(&server(), "trigger_holder");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.t (id integer PRIMARY KEY); \
+         CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$; \
+         CREATE CONSTRAINT TRIGGER n_pkey AFTER INSERT ON app.t \
+             FOR EACH ROW EXECUTE FUNCTION app.f()",
+    );
+    let d = Demo::new("trigger-holder");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let trigger = std::fs::read_dir(d.dir.join("schema"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .lines()
+                .any(|l| l.starts_with("trigger:") && l.contains("n_pkey"))
+        })
+        .expect("the constraint trigger is pulled");
+    std::fs::remove_file(trigger).unwrap();
+    let new_table = |default: &str| {
+        format!(
+            "table: app.n\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+             label: {{type: text, default: \"{default}\"}}\nprimary_key: [id]\n"
+        )
+    };
+    let declared = d.dir.join("schema/app.n.yml");
+    std::fs::write(&declared, new_table("('app.n_pkey'::regclass)::text")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let artifact = d.dir.join("refused-plan.json");
+    let out = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&out), 0, "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("names app.n_pkey"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!artifact.exists(), "a refused plan writes no artifact");
+
+    std::fs::write(&declared, new_table("''")).unwrap();
+    let plan = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_index WHERE indisprimary \
+             AND indexrelid = 'app.n_pkey'::regclass"
+        ),
+        1
+    );
+}
+
 /// #1633: a foreign key's `RESTRICT` is pulled as `restrict` on delete and
 /// on update, bootstrapped into an empty database, and pulled back the same,
 /// with nothing left to plan. Changing an action between `restrict` and
