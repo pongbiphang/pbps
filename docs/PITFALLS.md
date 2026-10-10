@@ -320,6 +320,16 @@ comment said what the code did not do — which reads as covered, and is worse
 than an absence that is named. Both are pinned now, and each comment points at
 the other (#273).
 
+**A name the plan gives, read through `to_regclass`.** `AsStored` translates
+renames only for the probes that ask it. The partition probes built their SQL
+from the changes' names, which are the declared ones, and looked the parent up
+with `to_regclass`. With the parent renamed in the same plan, it found no
+partition key, and `COALESCE(..., 0)` read zero. For a plain create the
+engine's own refusal inside the transaction was the backstop. For a partition
+made beside its DEFAULT it was not: the move ran, and a foreign key's
+`ON DELETE CASCADE` deleted the row that referenced a moved one. Zero is a
+count of no rows only when the relation was found (#1547, DEC-1547.1).
+
 ## The engine fills in a type's defaulted arguments
 
 `decimal` is stored as `decimal(18,0)`, `char` as `char(1)`, `float` as

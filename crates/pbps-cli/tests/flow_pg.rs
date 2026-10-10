@@ -374,6 +374,12 @@ fn approved_apply(d: &Demo, connection: &str, plan: &std::path::Path, extra: &[&
 /// Use psql's actual statement scanner: sending the whole file in one simple
 /// query would parse the DDL before the leading SETs take effect (decision 458).
 fn psql_script(db: &OwnDatabase, script: &str) -> Output {
+    psql_script_in("PBPS_TEST_PG_CONTAINER", db, script)
+}
+
+/// [`psql_script`] through the psql of the container `container` names, the
+/// one serving `db`'s server.
+fn psql_script_in(container: &str, db: &OwnDatabase, script: &str) -> Output {
     use std::io::Write;
     use std::process::Stdio;
 
@@ -388,7 +394,7 @@ fn psql_script(db: &OwnDatabase, script: &str) -> Output {
             .arg(db.connection())
             .env("PGOPTIONS", options);
         command
-    } else if let Some(container) = std::env::var_os("PBPS_TEST_PG_CONTAINER") {
+    } else if let Some(container) = std::env::var_os(container) {
         let mut command = Command::new("docker");
         command.args(["exec", "-i", "-e", &format!("PGOPTIONS={options}")]);
         command
@@ -6748,11 +6754,11 @@ fn a_partition_tree_round_trips_through_the_cli() {
 /// (#1171): a partition added in the parent's file applies through a saved
 /// plan, verifies and replans empty; one dropped with `drop-table`, its grant
 /// with it (#1579), is detached and dropped behind `--allow destructive`, its
-/// parent's other rows kept. A range over rows the DEFAULT partition holds, and a saved plan whose
-/// tree changed by hand after planning, are each refused before the apply's
-/// first statement; with the rows moved and the tree restored, the same saved
-/// plan applies. The partition added declares its own default calling a
-/// function the same plan creates, and is created after it (#1578).
+/// parent's other rows kept. A range over rows the DEFAULT partition holds
+/// takes them (#1547); a saved plan whose tree changed by hand after planning
+/// is refused before the apply's first statement, and with the tree restored
+/// the same saved plan applies. The partition added declares its own default
+/// calling a function the same plan creates, and is created after it (#1578).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn partitions_are_added_and_dropped_through_the_cli() {
@@ -6853,34 +6859,15 @@ fn partitions_are_added_and_dropped_through_the_cli() {
         1
     );
 
-    // A range over the row the DEFAULT partition holds: planned, since a
-    // plan reads no rows (SPEC 7.2), and refused by name by the apply's
-    // pre-flight before its first statement.
+    // A range over the row the DEFAULT partition holds, which it takes
+    // (#1547). Its saved plan, replayed after a partition was added by hand,
+    // is refused before its first statement; once that partition is gone it
+    // applies.
     let p2030 = "  ev_2030: {from: [\"2030-01-01\"], to: [\"2031-01-01\"]}\n";
     tree(&format!("{p2025}{p2026}{p2030}{rest}"));
     succeeds(d.run(&["plan"]));
     d.commit();
     succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
-    let o = approved_apply(&d, &connection, &plan, &[]);
-    assert_ne!(code(&o), 0, "{}", stdout(&o));
-    assert!(
-        stderr(&o).contains("rows of app.ev inside the range of its new partition app.ev_2030"),
-        "{}",
-        stderr(&o)
-    );
-    assert_eq!(
-        scalar(
-            &connection,
-            "SELECT count(*) FROM pg_class WHERE relname = 'ev_2030'"
-        ),
-        0
-    );
-
-    // The remedy the refusal names: the row moved out of that range. The
-    // same saved plan, replayed after a partition was added by hand, is
-    // refused before its first statement; once that partition is gone it
-    // applies.
-    on_server(&connection, "DELETE FROM app.ev WHERE id = 2");
     on_server(
         &connection,
         "CREATE TABLE app.ev_hand PARTITION OF app.ev \
@@ -6903,6 +6890,18 @@ fn partitions_are_added_and_dropped_through_the_cli() {
     );
     on_server(&connection, "DROP TABLE app.ev_hand");
     succeeds(approved_apply(&d, &connection, &plan, &[]));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM ONLY app.ev_2030 WHERE id = 2"
+        ),
+        1,
+        "the DEFAULT's row of the range is the new partition's"
+    );
+    assert_eq!(
+        scalar(&connection, "SELECT count(*) FROM ONLY app.ev_rest"),
+        0
+    );
     on_server(&connection, "INSERT INTO app.ev VALUES (3, '2026-06-01')");
 
     assert_eq!(
@@ -6938,7 +6937,7 @@ fn partitions_are_added_and_dropped_through_the_cli() {
     let next = succeeds(d.run(&["plan", "--db", &connection]));
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
     // The dropped partition's row went with it; the others stayed.
-    assert_eq!(scalar(&connection, "SELECT count(*) FROM app.ev"), 1);
+    assert_eq!(scalar(&connection, "SELECT count(*) FROM app.ev"), 2);
     assert_eq!(
         scalar(&connection, "SELECT count(*) FROM app.ev_2026 WHERE id = 3"),
         1
@@ -20059,6 +20058,270 @@ fn parent_keys_flow(server: &str, slug: &str) {
         "\nchecks:\n  ev_2025_ck: r > 0\n",
     );
     refused("a name app.ev_2025 holds as its own check");
+}
+
+/// #1547: a range partition added beside a standing DEFAULT partition takes
+/// the DEFAULT's rows of its range through the CLI. A first plan whose
+/// partition's own check refuses a moved row rolls back whole: no partition,
+/// every row where it was, the DEFAULT still attached. Without that check the
+/// plan applies: each row ends in the partition its key belongs to, none lost
+/// or doubled, the parent's index cloned onto the new partition, `verify` is
+/// clean and the next plan is empty, applied staged, outside a transaction. A move whose rows a foreign key with a
+/// delete action references is refused, before
+/// any statement runs and with the referencing row kept, the parent renamed in
+/// the same plan or not.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_range_beside_a_default_takes_its_rows_through_the_cli() {
+    default_move_flow(&server(), "default-move-1547", "PBPS_TEST_PG_CONTAINER");
+}
+
+/// [`a_range_beside_a_default_takes_its_rows_through_the_cli`] on a pre-17
+/// server.
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn a_range_beside_a_default_takes_its_rows_through_the_cli_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE \
+         EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    default_move_flow(
+        &server,
+        "default-move-1547-old",
+        "PBPS_TEST_PG_OLD_CONTAINER",
+    );
+}
+
+fn default_move_flow(server: &str, slug: &str, container: &str) {
+    let db = OwnDatabase::new(server, slug);
+    let conn = db.connection().to_owned();
+    on_server(
+        &conn,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, r integer DEFAULT 7, \
+             note text, PRIMARY KEY (id, ts), CONSTRAINT ev_r_ck CHECK (r > 0)) \
+             PARTITION BY RANGE (ts); \
+         CREATE INDEX ev_r ON app.ev (r); \
+         ALTER TABLE app.ev ALTER COLUMN note SET STORAGE EXTERNAL; \
+         CREATE TABLE app.ev_2024 PARTITION OF app.ev \
+             FOR VALUES FROM ('2024-01-01') TO ('2025-01-01'); \
+         CREATE TABLE app.ev_rest PARTITION OF app.ev DEFAULT; \
+         INSERT INTO app.ev VALUES (1, '2024-06-01', 1, 'a'), (2, '2025-03-01', 2, 'b'), \
+             (3, '2025-12-31', 3, 'c'), (4, '2026-01-01', 4, 'd'), (5, '2030-01-01', 5, 'e')",
+    );
+    let d = Demo::new(slug);
+    succeeds(d.run(&["pull", "--db", &conn]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+    let holds = |sql: &str| scalar(&conn, &format!("SELECT ({sql})::int::int8"));
+    let ids_in = |partition: &str| -> String {
+        text_of(
+            &conn,
+            &format!(
+                "SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '-') FROM {partition}"
+            ),
+        )
+    };
+    let path = d.dir.join("schema/app.ev.yml");
+    let pulled = std::fs::read_to_string(&path).unwrap();
+    assert!(pulled.contains("\npartitions:\n"), "{pulled}");
+    let with = |entries: &str| {
+        std::fs::write(
+            &path,
+            pulled.replacen("\npartitions:\n", &format!("\npartitions:\n{entries}"), 1),
+        )
+        .unwrap();
+    };
+    let plan = d.dir.join("move.json");
+    let connected = |d: &Demo| {
+        let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        stdout(&o)
+    };
+    let planned = |d: &Demo| {
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.commit();
+        connected(d)
+    };
+
+    // Its own check refuses row 3, moved in before the check is added: the
+    // whole plan rolls back.
+    with(
+        "  ev_2025:\n    from: [\"2025-01-01\"]\n    to: [\"2026-01-01\"]\n    checks:\n      \
+         ev_2025_ck: ts < '2025-12-01'\n",
+    );
+    let shown = planned(&d);
+    assert!(
+        shown.contains(
+            "+ create table app.ev_2025, a partition of app.ev for rows from (\"2025-01-01\") to \
+             (\"2026-01-01\"), moving those rows out of the default partition app.ev_rest"
+        ),
+        "{shown}"
+    );
+    // Its own check faces the moved rows, which is the gate's to approve.
+    let o = approved_apply(&d, &conn, &plan, &[]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("--allow constraint"), "{}", stderr(&o));
+    let o = approved_apply(&d, &conn, &plan, &["--allow", "constraint"]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("check constraint \"ev_2025_ck\" of relation \"ev_2025\" is violated"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_class WHERE relname = 'ev_2025'"),
+        0,
+        "the partition is rolled back"
+    );
+    assert_eq!(ids_in("ONLY app.ev_rest"), "2,3,4,5");
+    assert_eq!(ids_in("ONLY app.ev_2024"), "1");
+    assert_eq!(
+        holds(
+            "SELECT count(*) FROM pg_inherits WHERE inhparent = 'app.ev'::regclass \
+             AND inhrelid = 'app.ev_rest'::regclass"
+        ),
+        1,
+        "the DEFAULT is still attached"
+    );
+
+    with("  ev_2025:\n    from: [\"2025-01-01\"]\n    to: [\"2026-01-01\"]\n");
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+
+    // Without the check, the rows move, and staged too: the lock, the table,
+    // the move and the attach are one statement, which the engine runs as one
+    // transaction outside an explicit one.
+    let o = d.run(&[
+        "plan",
+        "--db",
+        &conn,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("app.ev_2025"), "{}", stdout(&o));
+    succeeds(approved_apply(&d, &conn, &plan, &["--staged"]));
+    succeeds(d.run(&["verify", "--db", &conn]));
+    let next = succeeds(d.run(&["plan", "--db", &conn]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(ids_in("ONLY app.ev_2024"), "1");
+    assert_eq!(ids_in("ONLY app.ev_2025"), "2,3");
+    assert_eq!(ids_in("ONLY app.ev_rest"), "4,5");
+    assert_eq!(ids_in("app.ev"), "1,2,3,4,5", "no row lost or doubled");
+    assert_eq!(
+        holds("SELECT count(*) FROM app.ev_2025 WHERE id = 2 AND r = 2 AND note = 'b'"),
+        1
+    );
+    assert_eq!(
+        holds(
+            "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+             WHERE i.inhparent = 'app.ev_r'::regclass AND c.relname LIKE 'ev_2025%'"
+        ),
+        1,
+        "the parent's index is cloned onto the new partition"
+    );
+    assert_eq!(
+        holds(
+            "SELECT count(*) FROM pg_attribute WHERE attrelid = 'app.ev_2025'::regclass \
+             AND attname = 'note' AND attstorage = 'e'"
+        ),
+        1,
+        "a column's storage is its parent's, as `PARTITION OF` gives it"
+    );
+
+    // A key with a delete action references a row the next range would
+    // move: refused by name before the first statement, the row kept.
+    on_server(
+        &conn,
+        "CREATE SCHEMA ext; \
+         CREATE TABLE ext.child (id integer, ts date, \
+             FOREIGN KEY (id, ts) REFERENCES app.ev ON DELETE CASCADE); \
+         INSERT INTO ext.child VALUES (4, '2026-01-01')",
+    );
+    let now = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        now.replacen(
+            "\npartitions:\n",
+            "\npartitions:\n  ev_2026:\n    from: [\"2026-01-01\"]\n    to: [\"2027-01-01\"]\n",
+            1,
+        ),
+    )
+    .unwrap();
+    planned(&d);
+    let o = approved_apply(&d, &conn, &plan, &[]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o)
+            .contains("rows that reference rows of app.ev_rest inside the range of app.ev_2026"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_class WHERE relname = 'ev_2026'"),
+        0
+    );
+    assert_eq!(
+        holds("SELECT count(*) FROM ext.child"),
+        1,
+        "the referencing row is kept"
+    );
+    assert_eq!(ids_in("ONLY app.ev_rest"), "4,5");
+
+    // The same, with the parent renamed in the plan: the pre-flight reads it
+    // under the name it has before the rename, and still refuses.
+    let now = std::fs::read_to_string(&path).unwrap();
+    assert!(now.starts_with("table: app.ev\n"), "{now}");
+    std::fs::write(
+        d.dir.join("schema/app.events.yml"),
+        now.replacen(
+            "table: app.ev\n",
+            "table: app.events\nrenamed_from: app.ev\n",
+            1,
+        ),
+    )
+    .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    planned(&d);
+    let o = approved_apply(&d, &conn, &plan, &["--allow", "rename"]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o)
+            .contains("rows that reference rows of app.ev_rest inside the range of app.ev_2026"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        holds("SELECT count(*) FROM ext.child"),
+        1,
+        "the referencing row is kept"
+    );
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_class WHERE relname = 'events'"),
+        0,
+        "nothing ran"
+    );
+
+    // The same plan, with nothing referencing the row, as the `plan --sql`
+    // script psql reads one command at a time (SPEC 7.3): the lock, the table,
+    // the move and the attach are one `DO` block there too, so the lock is
+    // taken and the row moves. As a batch of four, psql ran `LOCK` alone,
+    // outside a transaction, and refused it (#1763 review).
+    on_server(&conn, "DELETE FROM ext.child");
+    let script = d.dir.join("move.sql");
+    succeeds(d.run(&["plan", "--db", &conn, "--sql", script.to_str().unwrap()]));
+    let generated = std::fs::read_to_string(&script).unwrap();
+    assert!(generated.contains("LOCK TABLE ONLY"), "{generated}");
+    succeeds(psql_script_in(container, &db, &generated));
+    assert_eq!(ids_in("ONLY app.ev_2026"), "4");
+    assert_eq!(ids_in("ONLY app.ev_rest"), "5");
+    assert_eq!(ids_in("app.events"), "1,2,3,4,5", "no row lost or doubled");
 }
 
 /// #1690: a standing range-partitioned parent is renamed as any table is, a

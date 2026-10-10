@@ -1391,6 +1391,8 @@
         "a_partitioned_parent_is_renamed_through_the_cli_before_postgres_17",
         "a_renamed_parents_generated_column_goes_with_its_function",
         "a_renamed_parents_generated_column_goes_with_its_function_before_postgres_17",
+        "a_range_beside_a_default_takes_its_rows_through_the_cli",
+        "a_range_beside_a_default_takes_its_rows_through_the_cli_before_postgres_17",
         "a_function_rebuilt_under_partition_defaults_keeps_each_partitions_own",
         "a_partitions_default_taken_back_resolves_under_its_parents_schema",
         "a_partitions_own_default_stored_as_its_parents_is_refused_before_the_plan",

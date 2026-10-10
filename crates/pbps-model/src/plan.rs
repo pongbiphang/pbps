@@ -215,7 +215,11 @@ use crate::schema::Schema;
 ///
 /// Bumped to 33 for a foreign key's `restrict` action (DEC-1633.1), which an
 /// older build cannot read.
-pub const CURRENT_VERSION: u32 = 33;
+///
+/// Bumped to 34 for a partition made beside its DEFAULT partition
+/// (DEC-1547.1): a `CreateTable`'s `beside_default`, which an older build
+/// cannot read.
+pub const CURRENT_VERSION: u32 = 34;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -674,7 +678,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 33);
+        assert_eq!(CURRENT_VERSION, 34);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads
@@ -754,6 +758,7 @@ mod tests {
                             .remove(&TableName::new("dbo", "customer"))
                             .unwrap(),
                     ),
+                    beside_default: None,
                 })],
             })
             .checksum()
@@ -923,6 +928,7 @@ mod tests {
                 uid: "t_a1b2c3".parse().unwrap(),
                 name: TableName::new("dbo", "customer"),
                 table: Box::new(Table::default()),
+                beside_default: None,
             })],
         }))
         .unwrap();

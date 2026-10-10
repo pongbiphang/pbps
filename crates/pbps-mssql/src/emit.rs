@@ -2217,6 +2217,7 @@ mod tests {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.customer"),
             table: Box::new(t),
+            beside_default: None,
         });
         assert_eq!(
             sql[0],
@@ -2242,6 +2243,7 @@ mod tests {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.t"),
             table: Box::new(t),
+            beside_default: None,
         });
         assert_eq!(
             sql[0],
@@ -2284,6 +2286,7 @@ mod tests {
                 uid: uid("t_k7x2mq"),
                 name: tname("dbo.t"),
                 table: Box::new(t.clone()),
+                beside_default: None,
             })
         };
         // Negative first: an ordinary table says none of it.
@@ -2412,6 +2415,7 @@ mod tests {
                 uid: uid("t_k7x2mq"),
                 name: tname("dbo.t"),
                 table: Box::new(t),
+                beside_default: None,
             })
         };
         let sql = create(None);
@@ -2577,6 +2581,7 @@ mod tests {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.t"),
             table: Box::new(t),
+            beside_default: None,
         });
         assert!(
             created[0].contains("[code] varchar(10) COLLATE Latin1_General_CS_AS NOT NULL"),
@@ -2641,6 +2646,7 @@ mod tests {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.t"),
             table: Box::new(t),
+            beside_default: None,
         });
         assert!(sql[0].contains("[a] int NULL"));
         assert!(sql[0].contains("[b] int NOT NULL"));
@@ -2662,6 +2668,7 @@ mod tests {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.t"),
             table: Box::new(t),
+            beside_default: None,
         });
         assert!(sql[0].contains("[id] bigint IDENTITY(1,1) NOT NULL"));
         assert!(
@@ -2999,6 +3006,7 @@ mod tests {
             uid: uid("t_k7x2mq"),
             name: table.clone(),
             table: Box::new(t),
+            beside_default: None,
         });
         assert!(created[0].contains(&format!("CONSTRAINT [{name}] DEFAULT (0\n)")));
 
@@ -3271,6 +3279,7 @@ mod tests {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.t"),
             table: Box::new(t),
+            beside_default: None,
         });
         assert!(
             created[0].contains("DEFAULT (0 -- why\n)"),
@@ -3497,6 +3506,7 @@ mod tests {
                 uid: uid("t_k7x2mq"),
                 name: tname("dbo.empty"),
                 table: Box::new(Table::default()),
+                beside_default: None,
             },
             Strategy::default(),
         );
@@ -3654,6 +3664,7 @@ mod tests {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.order_line"),
             table: Box::new(t),
+            beside_default: None,
         });
         assert!(sql.iter().all(|s| !s.contains("ONLINE")), "{sql:?}");
     }

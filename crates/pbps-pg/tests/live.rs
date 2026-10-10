@@ -4217,21 +4217,11 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             1
         );
 
-        // A range over a row the DEFAULT partition holds: counted, and the
-        // engine refuses the same `CREATE`.
-        let mut over = added.clone();
-        over.tables.insert(
-            t("ev_2027"),
-            partition(
-                "ev",
-                range(vec![value("2027-01-01")], vec![value("2028-01-01")]),
-            ),
-        );
-        let over_step = plan(&added, &added_ids, &over, &mint_ids(&over, &added_ids, &[]));
-        let probes = pg.preflight(&over_step).probes;
-        assert_eq!(probes.len(), 1, "{probes:#?}");
-        assert_eq!(counted(&mut conn, &probes[0].sql).await, 1);
-        assert!(probes[0].description.contains("DEFAULT partition"));
+        // A range over a row the DEFAULT partition holds: the engine refuses
+        // `CREATE ... PARTITION OF` over it, so the plan moves the row (#1547).
+        // A key references the parent, but no row references the one moved,
+        // and no trigger fires: every probe counts zero, and the row is the
+        // new partition's.
         in_a_transaction(&mut conn).await;
         let refused = conn
             .execute(&format!(
@@ -4242,10 +4232,381 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             .expect_err("the engine refuses the range over the DEFAULT row");
         assert_eq!(sqlstate(&refused), "23514", "{refused:?}");
         rollback(&mut conn).await;
+        let mut over = added.clone();
+        over.tables.insert(
+            t("ev_2027"),
+            partition(
+                "ev",
+                range(vec![value("2027-01-01")], vec![value("2028-01-01")]),
+            ),
+        );
+        let over_step = plan(&added, &added_ids, &over, &mint_ids(&over, &added_ids, &[]));
+        let probes = pg.preflight(&over_step).probes;
+        assert_eq!(probes.len(), 5, "{probes:#?}");
+        // The moving statement, which asks the same questions again before
+        // its delete (#1763 review).
+        assert_eq!(over_step.changes.len(), 1, "{over_step:#?}");
+        let moving = &over_step.changes[0];
+        let moving = pg
+            .emit(&moving.change, moving.strategy)
+            .expect("emit")
+            .remove(0)
+            .sql;
+        for probe in &probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &over_step).await;
+        assert_eq!(
+            counted(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM ONLY {s}.ev_2027 WHERE id = 2")
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            counted(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM ONLY {s}.ev_rest")
+            )
+            .await,
+            0
+        );
+        rollback(&mut conn).await;
+        // A row referencing the one the move takes: the key's action would
+        // fire, so it is counted.
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!("INSERT INTO {s}.r VALUES (2, 2, '2027-03-01')"))
+            .await
+            .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[0].sql).await,
+            1,
+            "{}",
+            probes[0].description
+        );
+        rollback(&mut conn).await;
+        // Under a cascading key the statement stops itself before its
+        // delete, where a pre-flight that could not run would have let it
+        // go on, and the referencing row stays (#1763 review). Under
+        // `replica` the key's action does not fire, nor with the DEFAULT's
+        // own delete trigger for it off: nothing is counted then, and the
+        // move leaves the row referencing what is now in the new partition.
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!(
+            "ALTER TABLE {s}.r DROP CONSTRAINT r_ev, ADD CONSTRAINT r_ev \
+                 FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.ev (id, ts) ON DELETE CASCADE; \
+             INSERT INTO {s}.r VALUES (2, 2, '2027-03-01'); SAVEPOINT before_move"
+        ))
+        .await
+        .unwrap();
+        let stopped = conn
+            .execute(&moving)
+            .await
+            .expect_err("the move stops on the referencing row");
+        assert!(
+            format!("{stopped:?}").contains("would fire the action of their foreign key"),
+            "{stopped:?}"
+        );
+        conn.execute("ROLLBACK TO SAVEPOINT before_move")
+            .await
+            .unwrap();
+        let referencing = format!("SELECT count(*)::int FROM {s}.r WHERE id = 2");
+        assert_eq!(counted(&mut conn, &referencing).await, 1);
+        conn.execute("SET LOCAL session_replication_role = replica")
+            .await
+            .unwrap();
+        assert_eq!(counted(&mut conn, &probes[0].sql).await, 0, "under replica");
+        conn.execute(&format!(
+            "SET LOCAL session_replication_role = origin; \
+             ALTER TABLE {s}.ev_rest DISABLE TRIGGER ALL"
+        ))
+        .await
+        .unwrap();
+        for probe in &probes[..2] {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        conn.execute(&moving)
+            .await
+            .expect("the move, with the key's action off");
+        assert_eq!(counted(&mut conn, &referencing).await, 1);
+        assert_eq!(
+            counted(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM ONLY {s}.ev_2027 WHERE id = 2")
+            )
+            .await,
+            1
+        );
+        rollback(&mut conn).await;
+        // A row referencing one the move takes, inserted by another session
+        // that has not committed yet: the move locks the rows it takes before
+        // asking what references them, so it waits for that session, then
+        // sees its row and stops over it. Asked unlocked, it saw nothing, and
+        // its delete waited for the same session and cascaded into the row
+        // (#1763 review).
+        conn.execute(&format!(
+            "CREATE TABLE {s}.rc (ev_id integer, ev_ts date, \
+                 FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.ev (id, ts) ON DELETE CASCADE)"
+        ))
+        .await
+        .unwrap();
+        let mut other = Conn::connect(Driver::Postgres, &own).await.unwrap();
+        other.execute("BEGIN").await.unwrap();
+        other
+            .execute(&format!("INSERT INTO {s}.rc VALUES (2, '2027-03-01')"))
+            .await
+            .unwrap();
+        in_a_transaction(&mut conn).await;
+        let (moved, committed) = tokio::join!(conn.execute(&moving), async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            other.execute("COMMIT").await
+        });
+        committed.expect("the other session commits");
+        let stopped = moved.expect_err("the move stops on the row committed while it waited");
+        assert!(
+            format!("{stopped:?}").contains("would fire the action of their foreign key"),
+            "{stopped:?}"
+        );
+        rollback(&mut conn).await;
+        assert_eq!(
+            counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.rc")).await,
+            1
+        );
+        conn.execute(&format!("DROP TABLE {s}.rc")).await.unwrap();
+        // A key to a table above the parent reaches the DEFAULT too, through
+        // its clones: counted (#1763 review, found by sweeping the keys the
+        // probe selected by the table they name).
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!(
+            "CREATE TABLE {s}.g (id integer NOT NULL, ts date NOT NULL, PRIMARY KEY (id, ts)) \
+                 PARTITION BY LIST (id); \
+             ALTER TABLE {s}.r DROP CONSTRAINT r_ev; \
+             ALTER TABLE {s}.g ATTACH PARTITION {s}.ev FOR VALUES IN (1, 2, 3); \
+             CREATE TABLE {s}.gr (ev_id integer, ev_ts date, \
+                 FOREIGN KEY (ev_id, ev_ts) REFERENCES {s}.g (id, ts) ON DELETE CASCADE); \
+             INSERT INTO {s}.gr VALUES (2, '2027-03-01')"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[0].sql).await,
+            1,
+            "{}",
+            probes[0].description
+        );
+        rollback(&mut conn).await;
+        // The same referencing row, in a table this session cannot fully
+        // read: row-level security hides it from the count, so the table is
+        // asked about instead (#1547 review).
+        let role = format!("pbps_rls_1547_{}", std::process::id());
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!(
+            "INSERT INTO {s}.r VALUES (2, 2, '2027-03-01'); CREATE ROLE {role}; \
+             GRANT USAGE, CREATE ON SCHEMA {s} TO {role}; \
+             GRANT ALL ON ALL TABLES IN SCHEMA {s} TO {role}; \
+             ALTER TABLE {s}.r ENABLE ROW LEVEL SECURITY; SET LOCAL ROLE {role}"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[0].sql).await,
+            0,
+            "the policy hides the row"
+        );
+        assert_eq!(
+            counted(&mut conn, &probes[1].sql).await,
+            1,
+            "{}",
+            probes[1].description
+        );
+        // The moving statement asks it again and stops, and stops as well
+        // over a table it cannot read at all (#1763 review).
+        conn.execute("SAVEPOINT hidden").await.unwrap();
+        let stopped = conn
+            .execute(&moving)
+            .await
+            .expect_err("the move stops over the hidden rows");
+        assert!(
+            format!("{stopped:?}").contains("row-level security"),
+            "{stopped:?}"
+        );
+        conn.execute(&format!(
+            "ROLLBACK TO SAVEPOINT hidden; RESET ROLE; \
+             ALTER TABLE {s}.r DISABLE ROW LEVEL SECURITY; \
+             REVOKE SELECT ON {s}.r FROM {role}; SET LOCAL ROLE {role}"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[1].sql).await,
+            1,
+            "{}",
+            probes[1].description
+        );
+        conn.execute("SAVEPOINT unreadable").await.unwrap();
+        let stopped = conn
+            .execute(&moving)
+            .await
+            .expect_err("the move stops over the unreadable table");
+        assert_eq!(sqlstate(&stopped), "42501", "{stopped:?}");
+        // SELECT on the key's own columns is enough to count through it, as
+        // for a deleted row: the table is not refused as unreadable, the
+        // referencing row is counted, and the moving statement stops over it
+        // by name (#1763 review).
+        conn.execute(&format!(
+            "ROLLBACK TO SAVEPOINT unreadable; RESET ROLE; \
+             GRANT SELECT (ev_id, ev_ts) ON {s}.r TO {role}; SET LOCAL ROLE {role}"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[1].sql).await,
+            0,
+            "{}",
+            probes[1].description
+        );
+        assert_eq!(
+            counted(&mut conn, &probes[0].sql).await,
+            1,
+            "{}",
+            probes[0].description
+        );
+        let stopped = conn
+            .execute(&moving)
+            .await
+            .expect_err("the move stops on the referencing row");
+        assert!(
+            format!("{stopped:?}").contains("would fire the action of their foreign key"),
+            "{stopped:?}"
+        );
+        rollback(&mut conn).await;
+        // A row trigger fires by the session's replication role: one enabled
+        // for replicas is asked about under `replica`, and not otherwise.
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!(
+            "CREATE FUNCTION {s}.tf() RETURNS trigger LANGUAGE plpgsql \
+                 AS $$BEGIN RETURN NULL; END$$; \
+             CREATE TRIGGER tr AFTER DELETE ON {s}.ev_rest FOR EACH ROW EXECUTE FUNCTION {s}.tf(); \
+             ALTER TABLE {s}.ev_rest ENABLE REPLICA TRIGGER tr"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[2].sql).await,
+            0,
+            "{}",
+            probes[2].description
+        );
+        conn.execute("SET LOCAL session_replication_role = replica")
+            .await
+            .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[2].sql).await,
+            1,
+            "{}",
+            probes[2].description
+        );
+        rollback(&mut conn).await;
 
-        // Two key columns, with unbounded ends: each count is the rows the
-        // engine would route into the range, NULL keys never among them, and
-        // the engine refuses exactly the ranges counted above zero.
+        // A publication that publishes deletes from the DEFAULT, through its
+        // parent's root: the move's delete would reach a subscriber and its
+        // insert would not, so it is counted, and the moving statement stops
+        // over it. One that publishes no delete is not (#1763 review).
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!(
+            "CREATE PUBLICATION pbps_pub_1547 FOR TABLE {s}.ev \
+                 WITH (publish_via_partition_root = true); SAVEPOINT published"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[4].sql).await,
+            1,
+            "{}",
+            probes[4].description
+        );
+        let stopped = conn
+            .execute(&moving)
+            .await
+            .expect_err("the move stops over the publication");
+        assert!(
+            format!("{stopped:?}").contains("a publication publishes deletes from"),
+            "{stopped:?}"
+        );
+        // A row filter sends the deletes of the rows it holds only: one that
+        // holds the moved row is counted, and the move stops; one that holds
+        // none of them sends nothing, and the move goes (#1763 review).
+        conn.execute(&format!(
+            "ROLLBACK TO SAVEPOINT published; \
+             ALTER PUBLICATION pbps_pub_1547 SET TABLE {s}.ev WHERE (id = 2); \
+             SAVEPOINT filtered"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[4].sql).await,
+            1,
+            "{}",
+            probes[4].description
+        );
+        let stopped = conn
+            .execute(&moving)
+            .await
+            .expect_err("the move stops over a filter holding the moved row");
+        assert!(
+            format!("{stopped:?}").contains("a publication publishes deletes from"),
+            "{stopped:?}"
+        );
+        conn.execute(&format!(
+            "ROLLBACK TO SAVEPOINT filtered; \
+             ALTER PUBLICATION pbps_pub_1547 SET TABLE {s}.ev WHERE (ts < DATE '2025-01-01'); \
+             SAVEPOINT unfiltered"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[4].sql).await,
+            0,
+            "{}",
+            probes[4].description
+        );
+        conn.execute(&moving)
+            .await
+            .expect("the move, with no moved row in the filter");
+        conn.execute(&format!(
+            "ROLLBACK TO SAVEPOINT unfiltered; \
+             ALTER PUBLICATION pbps_pub_1547 SET TABLE {s}.ev; \
+             ALTER PUBLICATION pbps_pub_1547 SET (publish = 'insert, update')"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[4].sql).await,
+            0,
+            "{}",
+            probes[4].description
+        );
+        conn.execute(&moving)
+            .await
+            .expect("the move, with no delete published");
+        rollback(&mut conn).await;
+
+        // Two key columns, with unbounded ends: the engine refuses
+        // `PARTITION OF` over exactly the ranges holding rows, and the move
+        // takes exactly the rows it would route into the range, NULL keys
+        // never among them.
         for (from, to, expected, sql) in [
             (
                 vec![value("5"), D::MinValue],
@@ -4272,14 +4633,6 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 "FROM (7, 0) TO (8, 0)",
             ),
         ] {
-            let mut wanted = base.clone();
-            wanted
-                .tables
-                .insert(t("m_new"), partition("m", range(from, to)));
-            let step = plan(&base, &ids, &wanted, &mint_ids(&wanted, &ids, &[]));
-            let probes = pg.preflight(&step).probes;
-            assert_eq!(probes.len(), 1, "{sql}: {probes:#?}");
-            assert_eq!(counted(&mut conn, &probes[0].sql).await, expected, "{sql}");
             in_a_transaction(&mut conn).await;
             let engine = conn
                 .execute(&format!(
@@ -4288,7 +4641,178 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 .await;
             assert_eq!(engine.is_err(), expected > 0, "{sql}: {engine:?}");
             rollback(&mut conn).await;
+            let mut wanted = base.clone();
+            wanted
+                .tables
+                .insert(t("m_new"), partition("m", range(from, to)));
+            let step = plan(&base, &ids, &wanted, &mint_ids(&wanted, &ids, &[]));
+            in_a_transaction(&mut conn).await;
+            apply(&mut conn, &pg, &step).await;
+            assert_eq!(
+                counted(
+                    &mut conn,
+                    &format!("SELECT count(*)::int FROM ONLY {s}.m_new")
+                )
+                .await,
+                expected,
+                "{sql}"
+            );
+            assert_eq!(
+                counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.m")).await,
+                6,
+                "{sql}: no row lost or doubled"
+            );
+            rollback(&mut conn).await;
         }
+
+        // A check the same plan adds to the DEFAULT, which only the moved row
+        // breaks: the check comes after the move, so counting the DEFAULT's
+        // rows before it refused a plan the engine takes. Its probe is
+        // unchecked instead, and the plan applies (#1763 review).
+        let mut checked = over.clone();
+        checked
+            .tables
+            .get_mut(&t("ev_rest"))
+            .unwrap()
+            .checks
+            .insert(
+                "rest_not_2".into(),
+                pbps_model::CheckConstraint {
+                    expression: "id <> 2".into(),
+                },
+            );
+        let checked_step = plan(
+            &added,
+            &added_ids,
+            &checked,
+            &mint_ids(&checked, &added_ids, &[]),
+        );
+        let order: Vec<&str> = checked_step
+            .changes
+            .iter()
+            .map(|p| {
+                if let pbps_model::Change::CreateTable { .. } = &p.change {
+                    "create"
+                } else if let pbps_model::Change::AddCheck { .. } = &p.change {
+                    "check"
+                } else {
+                    "other"
+                }
+            })
+            .collect();
+        assert_eq!(order, ["create", "check"], "{checked_step:#?}");
+        let checked_preflight = pg.preflight(&checked_step);
+        assert_eq!(
+            checked_preflight.probes.len(),
+            5,
+            "{:#?}",
+            checked_preflight.probes
+        );
+        assert_eq!(
+            checked_preflight.unchecked.len(),
+            1,
+            "{:#?}",
+            checked_preflight.unchecked
+        );
+        for probe in &checked_preflight.probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &checked_step).await;
+        rollback(&mut conn).await;
+        // Negative: the check alone, with no move before it, is still counted
+        // against the row that breaks it.
+        let mut alone_checked = added.clone();
+        alone_checked
+            .tables
+            .get_mut(&t("ev_rest"))
+            .unwrap()
+            .checks
+            .insert(
+                "rest_not_2".into(),
+                pbps_model::CheckConstraint {
+                    expression: "id <> 2".into(),
+                },
+            );
+        let alone_probes = pg
+            .preflight(&plan(
+                &added,
+                &added_ids,
+                &alone_checked,
+                &mint_ids(&alone_checked, &added_ids, &[]),
+            ))
+            .probes;
+        assert_eq!(alone_probes.len(), 1, "{alone_probes:#?}");
+        assert_eq!(counted(&mut conn, &alone_probes[0].sql).await, 1);
+
+        // A key between columns collated differently, which the engine
+        // enforces: a bare `=` between them fails to compare, and inside the
+        // moving statement that failure aborted a move the engine takes.
+        // Compared as the engine compares, a row referencing one outside the
+        // range counts none, and the move goes (#1763 review).
+        conn.execute(&format!(
+            "CREATE TABLE {s}.cm (code text COLLATE \"C\" PRIMARY KEY) PARTITION BY RANGE (code);
+             CREATE TABLE {s}.cm_rest PARTITION OF {s}.cm DEFAULT;
+             CREATE TABLE {s}.cr (code text COLLATE \"POSIX\"
+                 REFERENCES {s}.cm (code) ON DELETE CASCADE);
+             INSERT INTO {s}.cm VALUES ('a'), ('b');
+             INSERT INTO {s}.cr VALUES ('a');"
+        ))
+        .await
+        .expect("the collated tree");
+        let collated = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
+        let collated_ids = mint_ids(&collated, &added_ids, &[]);
+        let mut collated_split = collated.clone();
+        collated_split.tables.insert(
+            t("cm_b"),
+            partition("cm", range(vec![value("b")], vec![value("c")])),
+        );
+        let collated_step = plan(
+            &collated,
+            &collated_ids,
+            &collated_split,
+            &mint_ids(&collated_split, &collated_ids, &[]),
+        );
+        let collated_probes = pg.preflight(&collated_step).probes;
+        assert_eq!(collated_probes.len(), 5, "{collated_probes:#?}");
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &collated_step).await;
+        assert_eq!(
+            counted(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM ONLY {s}.cm_b")
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.cr")).await,
+            1
+        );
+        rollback(&mut conn).await;
+        for probe in &collated_probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        // Negative: a row referencing the moved one is counted.
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!("INSERT INTO {s}.cr VALUES ('b')"))
+            .await
+            .unwrap();
+        assert_eq!(counted(&mut conn, &collated_probes[0].sql).await, 1);
+        rollback(&mut conn).await;
+        conn.execute(&format!("DROP TABLE {s}.cr, {s}.cm"))
+            .await
+            .unwrap();
 
         // A partition another table's rows still reference: counted, and the
         // engine refuses its detach.
@@ -4402,9 +4926,55 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         let alone_probes = pg.preflight(&alone_step).probes;
         assert_eq!(alone_probes.len(), 1, "{alone_probes:#?}");
         assert_eq!(counted(&mut conn, &alone_probes[0].sql).await, 1);
+        // The same for a move out of the DEFAULT: a row referencing a moved
+        // row from a partition the plan drops first is gone by the move, so
+        // it counts none, and the move goes (#1763 review).
+        conn.execute(&format!(
+            "INSERT INTO {s}.aref VALUES (2, 2, '2027-03-01', 6)"
+        ))
+        .await
+        .unwrap();
+        let moved_ref = |kept: bool| {
+            let mut wanted = with_aref.clone();
+            if !kept {
+                wanted.tables.remove(&t("aref_1"));
+            }
+            wanted.tables.insert(
+                t("ev_2027"),
+                partition(
+                    "ev",
+                    range(vec![value("2027-01-01")], vec![value("2028-01-01")]),
+                ),
+            );
+            let intents = [Intent::DropTable {
+                table: t("aref_1"),
+                reason: "gone".into(),
+            }];
+            let wanted_ids = mint_ids(&wanted, &aref_ids, if kept { &[] } else { &intents });
+            plan(&with_aref, &aref_ids, &wanted, &wanted_ids)
+        };
+        let reference_count = |step: &pbps_model::ChangeSet| {
+            pg.preflight(step)
+                .probes
+                .into_iter()
+                .find(|p| p.description.starts_with("rows that reference rows of"))
+                .expect("the reference probe")
+                .sql
+        };
+        let leaf_gone = moved_ref(false);
+        assert_eq!(counted(&mut conn, &reference_count(&leaf_gone)).await, 0);
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &leaf_gone).await;
+        rollback(&mut conn).await;
+        // Negative: the partition kept, its row is counted.
+        assert_eq!(
+            counted(&mut conn, &reference_count(&moved_ref(true))).await,
+            1
+        );
         conn.execute(&format!("DROP TABLE {s}.aref")).await.unwrap();
         // A range split in the same plan: the partition's rows go with its
-        // drop, so the halves created over them count none.
+        // drop, so the halves created over them count none. Each half is made
+        // beside the DEFAULT, and asks its four questions of it (#1547).
         let mut split = fewer.clone();
         for (name, from, to) in [
             ("ev_h1", "2025-01-01", "2025-07-01"),
@@ -4422,7 +4992,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &mint_ids(&split, &added_ids, &archive),
         );
         let split_probes = pg.preflight(&split_step).probes;
-        assert_eq!(split_probes.len(), 3, "{split_probes:#?}");
+        assert_eq!(split_probes.len(), 11, "{split_probes:#?}");
         for probe in &split_probes {
             assert_eq!(
                 counted(&mut conn, &probe.sql).await,
@@ -5641,6 +6211,7 @@ async fn temporary_relations_and_types_follow_the_declared_write_path() {
         uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
         name: TableName::new(schema, "bound"),
         table: Box::new(table.clone()),
+        beside_default: None,
     };
     // The same emitted statement without the final entry is the negative
     // control, even in a session whose explicit path names only the project.
@@ -5946,6 +6517,7 @@ async fn the_framing_pins_the_settings_that_decide_what_a_definition_means() {
         uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
         name: TableName::new(&s, "pinned"),
         table: Box::new(t),
+        beside_default: None,
     };
     let statements = Postgres::new()
         .emit(&change, Strategy::default())
@@ -6214,6 +6786,7 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
             name: TableName::new(&s, "t"),
             table: Box::new(t),
+            beside_default: None,
         }
     };
     for spelling in [
@@ -6251,6 +6824,7 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                 name: TableName::new(&s, "plain"),
                 table: Box::new(plain),
+                beside_default: None,
             },
             Strategy::default(),
         )
@@ -6952,6 +7526,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                     name: name.clone(),
                     table: Box::new(table),
+                    beside_default: None,
                 },
                 Strategy::default(),
             )
@@ -7058,6 +7633,7 @@ async fn installed_default_operator_classes_can_make_json_keys_valid() {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                     name,
                     table: Box::new(table),
+                    beside_default: None,
                 },
                 Strategy::default(),
             )
@@ -7339,6 +7915,7 @@ async fn the_framing_pins_what_an_ambiguous_temporal_literal_means() {
         uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
         name: TableName::new(&s, "temporal"),
         table: Box::new(t),
+        beside_default: None,
     };
     let statements = Postgres::new()
         .emit(&change, Strategy::default())
@@ -23026,6 +23603,7 @@ async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_colu
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: child.clone(),
                         table: Box::new(table),
+                        beside_default: None,
                     });
                 }
                 "retype" => changes.push(Change::AlterColumnType {
@@ -25321,6 +25899,7 @@ async fn a_key_into_a_created_empty_parent_counts_every_reference_the_child_hold
             uid: "t_aaaaaa".parse().expect("a uid"),
             name: parent.clone(),
             table: Box::new(declared),
+            beside_default: None,
         },
         Change::AddForeignKey {
             table: TableName::new(&s, "child"),

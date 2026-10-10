@@ -150,7 +150,11 @@ impl Reconstruction {
         let mut foreign = BTreeSet::new();
         for change in bootstrap {
             match change {
-                Change::CreateTable { uid, name, table } => {
+                // A bootstrap starts from nothing, so no partition is made
+                // beside a standing DEFAULT (#1547).
+                Change::CreateTable {
+                    uid, name, table, ..
+                } => {
                     let first = steps.len();
                     let generated: Vec<String> = table
                         .columns
@@ -194,6 +198,7 @@ impl Reconstruction {
                             uid: uid.clone(),
                             name: name.clone(),
                             table: Box::new(bare),
+                            beside_default: None,
                         },
                         relation(&name.schema, &name.name),
                         None,
