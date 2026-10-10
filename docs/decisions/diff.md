@@ -4474,18 +4474,32 @@ on 16 and 18:
 - A statement trigger or rule on the DEFAULT itself ran even when no row
   moved. The parent's own statement triggers did not run.
 
-So the apply's pre-flight asks three counts, under the names the catalog
+So the apply's pre-flight asks four counts, under the names the catalog
 has before the plan runs:
 - **The rows referencing a moved row.** These are rows referencing the
   DEFAULT's rows in the range, through a key to the parent or to the DEFAULT,
   counted as #1171 counts the rows referencing a dropped partition. A key
   or a table the plan removes first is left out. A key with nothing pointing
   at a moved row fires nothing, so it does not refuse the plan.
+- **The referencing tables the session cannot fully read.** These are
+  tables with such a key on which row-level security is active, or that
+  the session has no `SELECT` on. They are counted when there are rows to
+  move. The count above reads zero through either, which would mean "cannot
+  see" rather than "nothing there", and an unreadable table fails the count,
+  which the runner reports as unchecked and does not stop on. It is the
+  rule `hidden_children_probe` keeps for a deleted row (DECISIONS 333, 335),
+  asked by table (#1763 review).
 - **The rows moved under a delete row trigger.** These are the DEFAULT's
-  rows in the range, when an enabled row trigger on the DEFAULT fires on
-  delete.
-- **Statement triggers and rules.** These are the DEFAULT's enabled
-  statement triggers and rules that fire on delete.
+  rows in the range, when a row trigger on the DEFAULT fires on delete.
+- **Statement triggers and rules.** These are the DEFAULT's statement
+  triggers and rules that fire on delete.
+
+"Fires" is asked as `data_triggers` asks it:
+- `A` always fires; `O` fires outside, and `R` under,
+  `session_replication_role = replica`; `D` never fires.
+- A trigger the plan drops (class 0, before the move) is not asked about.
+  That covers a trigger on the DEFAULT, and one on the parent, whose clone
+  goes with it (#1763 review).
 
 Any of them refuses by name, with the remedy #1171 gave: repoint or delete
 the rows, or drop or disable the trigger, or move the rows, and plan again.

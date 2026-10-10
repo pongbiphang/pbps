@@ -4242,7 +4242,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         );
         let over_step = plan(&added, &added_ids, &over, &mint_ids(&over, &added_ids, &[]));
         let probes = pg.preflight(&over_step).probes;
-        assert_eq!(probes.len(), 3, "{probes:#?}");
+        assert_eq!(probes.len(), 4, "{probes:#?}");
         for probe in &probes {
             assert_eq!(
                 counted(&mut conn, &probe.sql).await,
@@ -4281,6 +4281,58 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             1,
             "{}",
             probes[0].description
+        );
+        rollback(&mut conn).await;
+        // The same referencing row, in a table this session cannot fully
+        // read: row-level security hides it from the count, so the table is
+        // asked about instead (#1547 review).
+        let role = format!("pbps_rls_1547_{}", std::process::id());
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!(
+            "INSERT INTO {s}.r VALUES (2, 2, '2027-03-01'); CREATE ROLE {role}; \
+             GRANT USAGE ON SCHEMA {s} TO {role}; \
+             GRANT SELECT ON ALL TABLES IN SCHEMA {s} TO {role}; \
+             ALTER TABLE {s}.r ENABLE ROW LEVEL SECURITY; SET LOCAL ROLE {role}"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[0].sql).await,
+            0,
+            "the policy hides the row"
+        );
+        assert_eq!(
+            counted(&mut conn, &probes[1].sql).await,
+            1,
+            "{}",
+            probes[1].description
+        );
+        rollback(&mut conn).await;
+        // A row trigger fires by the session's replication role: one enabled
+        // for replicas is asked about under `replica`, and not otherwise.
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!(
+            "CREATE FUNCTION {s}.tf() RETURNS trigger LANGUAGE plpgsql \
+                 AS $$BEGIN RETURN NULL; END$$; \
+             CREATE TRIGGER tr AFTER DELETE ON {s}.ev_rest FOR EACH ROW EXECUTE FUNCTION {s}.tf(); \
+             ALTER TABLE {s}.ev_rest ENABLE REPLICA TRIGGER tr"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[2].sql).await,
+            0,
+            "{}",
+            probes[2].description
+        );
+        conn.execute("SET LOCAL session_replication_role = replica")
+            .await
+            .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[2].sql).await,
+            1,
+            "{}",
+            probes[2].description
         );
         rollback(&mut conn).await;
 
@@ -4461,7 +4513,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         conn.execute(&format!("DROP TABLE {s}.aref")).await.unwrap();
         // A range split in the same plan: the partition's rows go with its
         // drop, so the halves created over them count none. Each half is made
-        // beside the DEFAULT, and asks its three questions of it (#1547).
+        // beside the DEFAULT, and asks its four questions of it (#1547).
         let mut split = fewer.clone();
         for (name, from, to) in [
             ("ev_h1", "2025-01-01", "2025-07-01"),
@@ -4479,7 +4531,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &mint_ids(&split, &added_ids, &archive),
         );
         let split_probes = pg.preflight(&split_step).probes;
-        assert_eq!(split_probes.len(), 7, "{split_probes:#?}");
+        assert_eq!(split_probes.len(), 9, "{split_probes:#?}");
         for probe in &split_probes {
             assert_eq!(
                 counted(&mut conn, &probe.sql).await,

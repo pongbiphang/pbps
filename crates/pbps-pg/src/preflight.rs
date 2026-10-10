@@ -3922,10 +3922,12 @@ fn partition_probes(
             else {
                 continue;
             };
+            let gone = dropped_triggers(changes, &stored, &parent);
             for probe in [
                 default_reference_probe(name, &parent, &stored, names, from, to),
-                default_trigger_probe(name, &parent, &stored, from, to),
-                default_statement_probe(name, &stored),
+                default_hidden_referencers_probe(name, &parent, &stored, names, from, to),
+                default_trigger_probe(name, &parent, &stored, &gone, from, to),
+                default_statement_probe(name, &stored, &gone),
             ] {
                 match probe {
                     Ok(probe) => out.push(probe),
@@ -4180,19 +4182,59 @@ fn default_reference_probe(
     ))
 }
 
-/// The rows of `default` in the range of the partition made beside it, when
-/// an enabled row trigger on the DEFAULT fires on delete (#1547): measured
-/// on 16 and 18, one cloned from the parent ran once per moved row, and the
-/// insert into the new table fires none to answer it. With no such trigger,
-/// or no row to move, the count is zero.
-fn default_trigger_probe(
-    partition: &TableName,
+/// Whether a trigger or rule enabled as `column` holds fires in this
+/// session: `D` never, `A` always, `O` outside and `R` under
+/// `session_replication_role = replica`, as `data_triggers` asks it.
+fn fires_here(column: &str) -> String {
+    format!(
+        "({column} = 'A' OR {column} = CASE WHEN \
+         pg_catalog.current_setting('session_replication_role') = 'replica' THEN 'R' ELSE 'O' END)"
+    )
+}
+
+/// The triggers this plan drops that would otherwise fire on `default`: its
+/// own, and its parent's, whose clone on the DEFAULT goes with it. A
+/// `DropModule` sorts first (class 0), before the partition is made, so the
+/// move does not meet them (#1547 review).
+fn dropped_triggers(changes: &ChangeSet, default: &TableName, parent: &TableName) -> String {
+    let clauses: Vec<String> = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::DropModule {
+                id: pbps_model::ModuleId::Trigger { on, name },
+                ..
+            } = &p.change
+            {
+                let own = on.schema == default.schema && on.name == default.name;
+                let cloned = on.schema == parent.schema && on.name == parent.name;
+                (own || cloned).then(|| {
+                    format!(
+                        "(t.tgname = {}{})",
+                        value_literal(name),
+                        if own { "" } else { " AND t.tgparentid <> 0" }
+                    )
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    if clauses.is_empty() {
+        "false".to_owned()
+    } else {
+        clauses.join(" OR ")
+    }
+}
+
+/// The rows of `default` inside the range, as a saturated count over the
+/// parent's key, read from the catalog when the probe runs.
+fn default_rows_in_range(
     parent: &TableName,
     default: &TableName,
     from: &[pbps_model::BoundDatum],
     to: &[pbps_model::BoundDatum],
-) -> Result<Probe, DialectError> {
-    let d = value_literal(&qualified(default)?);
+) -> Result<String, DialectError> {
     let text = format!(
         "{} || {}",
         value_literal(&format!(
@@ -4201,6 +4243,74 @@ fn default_trigger_probe(
         )),
         range_predicate(from, to),
     );
+    Ok(saturated_count(&format!(
+        "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()', \
+         pg_catalog.query_to_xml({text}, false, true, '')))[1]::text::numeric \
+         FROM pg_catalog.pg_partitioned_table pt \
+         WHERE pt.partrelid = pg_catalog.to_regclass({})), 0)",
+        value_literal(&qualified(parent)?)
+    )))
+}
+
+/// The tables with a foreign key to `parent` or `default` whose rows this
+/// session cannot all count, when the DEFAULT has rows to move (#1547
+/// review): row-level security active on it, or no `USAGE` on its schema or
+/// `SELECT` on it. [`default_reference_probe`] counts zero through either,
+/// for "cannot see" rather than "nothing there", and the move would then
+/// fire the key's action on rows nobody counted. The rule
+/// [`hidden_children_probe`] keeps for a deleted row, by table rather than
+/// by row; with no row to move, nothing fires and nothing is asked.
+fn default_hidden_referencers_probe(
+    partition: &TableName,
+    parent: &TableName,
+    default: &TableName,
+    names: &AsStored,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+) -> Result<Probe, DialectError> {
+    let p = value_literal(&qualified(parent)?);
+    let d = value_literal(&qualified(default)?);
+    Ok(Probe::new(
+        format!(
+            "tables with a foreign key to {parent} or {default} that this session cannot fully \
+             read (row-level security, or no SELECT): moving the rows of {default} inside the \
+             range of {partition} fires that key's action on rows the pre-flight cannot count; \
+             apply as a role that reads them, or move the rows first, then plan again"
+        ),
+        format!(
+            "SELECT CASE WHEN {} > 0 THEN {} ELSE 0 END",
+            default_rows_in_range(parent, default, from, to)?,
+            saturated_count(&format!(
+                "(SELECT count(DISTINCT cl.oid) FROM pg_catalog.pg_constraint con \
+                 JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid \
+                 JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace \
+                 WHERE con.contype = 'f' AND con.conparentid = 0 \
+                 AND con.confrelid IN (pg_catalog.to_regclass({p}), pg_catalog.to_regclass({d})) \
+                 {} \
+                 AND (pg_catalog.row_security_active(cl.oid) \
+                 OR NOT (pg_catalog.has_schema_privilege(cl.relnamespace, 'USAGE') \
+                 AND pg_catalog.has_table_privilege(cl.oid, 'SELECT'))))",
+                gone_keys(names)
+            ))
+        ),
+    ))
+}
+
+/// The rows of `default` in the range of the partition made beside it, when
+/// a row trigger on the DEFAULT that fires in this session fires on delete
+/// (#1547): measured on 16 and 18, one cloned from the parent ran once per
+/// moved row, and the insert into the new table fires none to answer it. A
+/// trigger the plan drops first is not asked. With no such trigger, or no
+/// row to move, the count is zero.
+fn default_trigger_probe(
+    partition: &TableName,
+    parent: &TableName,
+    default: &TableName,
+    gone: &str,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+) -> Result<Probe, DialectError> {
+    let d = value_literal(&qualified(default)?);
     Ok(Probe::new(
         format!(
             "rows of {default} inside the range of {partition}, its parent {parent}'s new \
@@ -4211,24 +4321,21 @@ fn default_trigger_probe(
         format!(
             "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t \
              WHERE t.tgrelid = pg_catalog.to_regclass({d}) AND NOT t.tgisinternal \
-             AND t.tgenabled IN ('O', 'A') AND (t.tgtype::int & 9) = 9) THEN {} ELSE 0 END",
-            saturated_count(&format!(
-                "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()', \
-                 pg_catalog.query_to_xml({text}, false, true, '')))[1]::text::numeric \
-                 FROM pg_catalog.pg_partitioned_table pt \
-                 WHERE pt.partrelid = pg_catalog.to_regclass({})), 0)",
-                value_literal(&qualified(parent)?)
-            ))
+             AND {} AND (t.tgtype::int & 9) = 9 AND NOT ({gone})) THEN {} ELSE 0 END",
+            fires_here("t.tgenabled"),
+            default_rows_in_range(parent, default, from, to)?
         ),
     ))
 }
 
 /// The statement triggers and rules on `default` that a `DELETE` from it
-/// fires (#1547): unlike a row trigger, they run whether or not a row moves,
-/// so the move beside it is refused while any stands.
+/// fires in this session (#1547): unlike a row trigger, they run whether or
+/// not a row moves, so the move beside it is refused while any stands. A
+/// trigger the plan drops first is not asked.
 fn default_statement_probe(
     partition: &TableName,
     default: &TableName,
+    gone: &str,
 ) -> Result<Probe, DialectError> {
     let d = value_literal(&qualified(default)?);
     Ok(Probe::new(
@@ -4242,10 +4349,11 @@ fn default_statement_probe(
             saturated_count(&format!(
                 "(SELECT count(*) FROM pg_catalog.pg_trigger t \
                  WHERE t.tgrelid = pg_catalog.to_regclass({d}) AND NOT t.tgisinternal \
-                 AND t.tgenabled IN ('O', 'A') AND (t.tgtype::int & 9) = 8) \
+                 AND {} AND (t.tgtype::int & 9) = 8 AND NOT ({gone})) \
                  + (SELECT count(*) FROM pg_catalog.pg_rewrite w \
-                 WHERE w.ev_class = pg_catalog.to_regclass({d}) AND w.ev_type = '4' \
-                 AND w.ev_enabled IN ('O', 'A'))"
+                 WHERE w.ev_class = pg_catalog.to_regclass({d}) AND w.ev_type = '4' AND {})",
+                fires_here("t.tgenabled"),
+                fires_here("w.ev_enabled")
             ))
         ),
     ))
@@ -4775,13 +4883,17 @@ mod tests {
             to: "app.ev".parse().unwrap(),
             defaults: Default::default(),
         };
-        let asked = probes(&ChangeSet {
+        let asked_plan = ChangeSet {
             changes: vec![
                 pbps_model::PlannedChange::new(renamed),
                 pbps_model::PlannedChange::new(create),
             ],
-        });
-        assert_eq!(asked.len(), 3, "{asked:?}");
+        };
+        let asked = probes(&asked_plan);
+        for p in &asked {
+            println!("-- {}\n{};", p.description, p.sql);
+        }
+        assert_eq!(asked.len(), 4, "{asked:?}");
         // The rows referencing the moved ones, through a key to the parent or
         // to the DEFAULT; the parent under the name it has before the plan's
         // rename: under the new one the key is not found, and the count
@@ -4803,19 +4915,66 @@ mod tests {
                 && !refs.contains("E'\"app\".\"ev\"'"),
             "{refs}"
         );
+        // The referencing tables it cannot fully read, asked only over rows
+        // to move.
         assert!(
             asked[1]
                 .description
-                .contains("rows of app.ev_rest inside the range of app.ev_1")
-                && asked[1].sql.contains("(t.tgtype::int & 9) = 9")
-                && asked[1].sql.contains("to_regclass(E'\"app\".\"ev_old\"')"),
+                .contains("tables with a foreign key to app.ev_old or app.ev_rest")
+                && asked[1].sql.contains("row_security_active(cl.oid)")
+                && asked[1]
+                    .sql
+                    .contains("has_table_privilege(cl.oid, 'SELECT')")
+                && asked[1].sql.starts_with("SELECT CASE WHEN LEAST("),
             "{asked:?}"
         );
+        // Triggers by what fires in this session, as `data_triggers` asks.
         assert!(
             asked[2]
                 .description
-                .contains("statement triggers or rules on app.ev_rest"),
+                .contains("rows of app.ev_rest inside the range of app.ev_1")
+                && asked[2].sql.contains("(t.tgtype::int & 9) = 9")
+                && asked[2]
+                    .sql
+                    .contains("current_setting('session_replication_role')")
+                && asked[2].sql.contains("AND NOT (false)")
+                && asked[2].sql.contains("to_regclass(E'\"app\".\"ev_old\"')"),
             "{asked:?}"
+        );
+        assert!(
+            asked[3]
+                .description
+                .contains("statement triggers or rules on app.ev_rest")
+                && asked[3]
+                    .sql
+                    .contains("w.ev_enabled = 'A' OR w.ev_enabled = CASE"),
+            "{asked:?}"
+        );
+        // A trigger the plan drops first, on the DEFAULT or cloned from the
+        // parent, is not asked about (#1547 review).
+        let mut dropping = vec![
+            pbps_model::PlannedChange::new(Change::DropModule {
+                id: "app.ev_rest.own_tr".parse().unwrap(),
+                kind: pbps_model::ModuleKind::Trigger,
+            }),
+            pbps_model::PlannedChange::new(Change::DropModule {
+                id: "app.ev_old.parent_tr".parse().unwrap(),
+                kind: pbps_model::ModuleKind::Trigger,
+            }),
+        ];
+        dropping.extend(asked_plan.changes.iter().cloned());
+        let without = probes(&ChangeSet { changes: dropping });
+        assert!(
+            without[2].sql.contains(
+                "AND NOT ((t.tgname = E'own_tr') OR (t.tgname = E'parent_tr' AND t.tgparentid <> 0))"
+            ),
+            "{}",
+            without[2].sql
+        );
+        assert!(
+            without[3].sql.contains("AND NOT ((t.tgname = E'own_tr')"),
+            "{}",
+            without[3].sql
         );
         // Negative: neither is the refusal over the DEFAULT's rows a plain
         // create asks for.
