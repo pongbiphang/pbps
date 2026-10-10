@@ -260,10 +260,23 @@ mod producer {
         if let pbps_config::resolver::ResolverProfile::Server {
             url_env,
             standard,
-            baseline: _,
+            baseline,
         } = &request.selection.profile
         {
             let scratch = scratch_connection(request, url_env)?;
+            let baseline = baseline
+                .as_ref()
+                .map(|path| {
+                    std::fs::read_to_string(request.project.root().join(path)).map_err(|error| {
+                        Refused::Unanswerable(anyhow::anyhow!(
+                            "the resolver `{}` names the baseline {}, which could not be read: \
+                             {error}",
+                            request.selection.name,
+                            path.display()
+                        ))
+                    })
+                })
+                .transpose()?;
             let Some(identity) = request.target_identity else {
                 return Err(Refused::Unanswerable(anyhow::anyhow!(
                     "the planning read recorded no cluster identity for the resolver to bind"
@@ -282,6 +295,7 @@ mod producer {
                 request.project,
                 request.target.environment(),
                 &pbps_cli::resolver::server::vouched::declared_standard(standard.as_ref()),
+                baseline.as_deref(),
             )
             .await
             .map(|resolved| resolved.changes)
@@ -376,8 +390,10 @@ mod producer {
             | Error::Consumed
             | Error::Scope(_)
             | Error::Read(_)
-            // A scratch that cannot be used as configured answered nothing.
-            | Error::Vouched(_) => false,
+            // A scratch that cannot be used as configured answered nothing,
+            // nor did one whose baseline is not the target's.
+            | Error::Vouched(_)
+            | Error::Baseline(_) => false,
         }
     }
 }

@@ -103,7 +103,7 @@ impl Inputs {
         Self::from_pair(cases::pair_with_cross_kind_surfaces())
     }
 
-    fn from_pair((base, desired): (Schema, Schema)) -> Self {
+    pub(super) fn from_pair((base, desired): (Schema, Schema)) -> Self {
         Self::from_pair_with_extras((base, desired), &[])
     }
 

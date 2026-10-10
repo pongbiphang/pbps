@@ -231,6 +231,7 @@ async fn produce_planned_on(
         &key.project,
         Some(ENVIRONMENT),
         standard,
+        None,
     )
     .await
 }
@@ -1454,6 +1455,7 @@ async fn vouched_run_owned_keeps_what_the_reproduction_put_on_its_database() {
                 &key.project,
                 Some(ENVIRONMENT),
                 &standard,
+                None,
             )
             .await,
         );
@@ -1524,4 +1526,703 @@ async fn vouched_run_owned_compiles_under_the_declared_standard() {
         before, after,
         "the run-owned database and roles are dropped"
     );
+}
+
+// ---- The baseline (#1673) ----------------------------------------------
+//
+// A managed schema and an external one. The target holds external objects
+// the managed views bind; the baseline stages them on scratch.
+
+const MANAGED: &str = "pbps_v1673";
+const EXTERNAL: &str = "pbps_x1673";
+
+/// Declarations of views alone, plus any tables, in the managed schema.
+fn declared(views: &[(&str, &str)], tables: &[&str]) -> pbps_model::Schema {
+    let mut schema = pbps_model::Schema::default();
+    for (name, definition) in views {
+        schema.modules.insert(
+            format!("{MANAGED}.{name}").parse().unwrap(),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::View,
+                description: None,
+                definition: (*definition).to_owned(),
+            },
+        );
+    }
+    for table in tables {
+        let mut declared = pbps_model::Table::default();
+        declared.columns.insert(
+            "id".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+        schema
+            .tables
+            .insert(format!("{MANAGED}.{table}").parse().unwrap(), declared);
+    }
+    schema
+}
+
+/// A plan that keeps `a` and adds `b`, both reading what `read` names.
+fn staging_inputs(a: &str, b: &str, tables: &[&str]) -> Inputs {
+    Inputs::from_pair((
+        declared(&[("a", a)], tables),
+        declared(&[("a", a), ("b", b)], tables),
+    ))
+}
+
+async fn produce_staged(
+    scratch: &str,
+    target: &str,
+    inputs: &Inputs,
+    key: &ProjectKey,
+    baseline: &str,
+) -> Result<ResolvedPlan, ProduceError> {
+    let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
+    let identity = pbps_pg::resolver::vouched::cluster_identity(&mut planning)
+        .await
+        .unwrap();
+    super::produce(
+        Driver::Postgres,
+        scratch,
+        target,
+        &identity,
+        &inputs.binding(),
+        inputs.base(),
+        inputs.desired(),
+        &inputs.hints,
+        &[],
+        &key.project,
+        Some(ENVIRONMENT),
+        &Standard::default(),
+        Some(baseline),
+    )
+    .await
+}
+
+/// The baseline's refusal, or what came instead. Never panics, so the
+/// caller can drop its fixture first.
+fn baseline_refusal(result: Result<ResolvedPlan, ProduceError>) -> String {
+    match result {
+        Err(ProduceError::Run(Error::Baseline(findings))) => findings.join("; "),
+        Err(other) => format!("not a baseline refusal: {other}"),
+        Ok(_) => "not a baseline refusal: a plan".into(),
+    }
+}
+
+/// The plan answered, and what the baseline staged was sealed on the
+/// target's side.
+fn assert_staged(result: Result<ResolvedPlan, ProduceError>, staged: &str, context: &str) {
+    let plan = match result {
+        Ok(plan) => plan,
+        Err(error) => panic!("{context}: {error}"),
+    };
+    plan.evidence.validate(&plan.changes).unwrap();
+    pbps_pg::resolver::validate_evidence(&plan.evidence).unwrap();
+    let sealed = plan
+        .evidence
+        .before()
+        .scope()
+        .retained
+        .iter()
+        .any(|object| object.name == [EXTERNAL, staged]);
+    assert!(sealed, "{context}: {staged} is sealed");
+    let created =
+        plan.changes.changes.iter().any(
+            |step| matches!(&step.change, Change::CreateModule { id, .. } if id.name() == "b"),
+        );
+    assert!(created, "{context}: the plan creates b");
+}
+
+/// The external table, with what the comparison skips: a foreign key, a
+/// CHECK, a default, a trigger and a plain index.
+fn guarded_target() -> Vec<String> {
+    vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!("CREATE TABLE {EXTERNAL}.p (id integer PRIMARY KEY)"),
+        format!(
+            "CREATE TABLE {EXTERNAL}.t (id integer PRIMARY KEY, name text UNIQUE, \
+             p integer REFERENCES {EXTERNAL}.p, n integer DEFAULT 1 CHECK (n > 0))"
+        ),
+        format!("CREATE INDEX t_n ON {EXTERNAL}.t (n)"),
+        format!(
+            "CREATE FUNCTION {EXTERNAL}.audit() RETURNS trigger LANGUAGE plpgsql \
+             AS $$BEGIN RETURN NEW; END$$"
+        ),
+        format!(
+            "CREATE TRIGGER t_audit BEFORE INSERT ON {EXTERNAL}.t \
+             FOR EACH ROW EXECUTE FUNCTION {EXTERNAL}.audit()"
+        ),
+        format!("CREATE VIEW {MANAGED}.a AS SELECT id FROM {EXTERNAL}.t"),
+    ]
+}
+
+/// The table as a baseline writes it: its shape, nothing that guards it.
+fn plain_baseline(id_type: &str) -> String {
+    format!(
+        "-- The external table the managed views read.\n\
+         CREATE SCHEMA {EXTERNAL};\n\
+         CREATE TABLE {EXTERNAL}.t (id {id_type} PRIMARY KEY, name text UNIQUE, p integer, n integer);\n"
+    )
+}
+
+async fn staging_target(fixture: &mut Fixture, setup: &[String]) -> String {
+    let target = fixture.database("t", None).await;
+    let statements: Vec<&str> = setup.iter().map(String::as_str).collect();
+    fixture.run(&target, &statements).await;
+    target
+}
+
+fn reading(column: &str, relation: &str) -> String {
+    format!("SELECT {column} FROM {EXTERNAL}.{relation}")
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_compiles_a_managed_view_over_a_baseline_table() {
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    // Run-owned: a superuser scratch on another cluster.
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &guarded_target()).await;
+    let before = scratch.inventory().await;
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &plain_baseline("integer"),
+    )
+    .await;
+    let after = scratch.inventory().await;
+    target.drop().await;
+    assert_staged(result, "t", "run-owned");
+    assert_eq!(before, after, "the run-owned database is dropped");
+    // Supplied: a confined account in its own database, on both servers.
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = staging_target(&mut fixture, &guarded_target()).await;
+        let (login, scratch_db) = fixture.confined().await;
+        let result = produce_staged(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+            &plain_baseline("integer"),
+        )
+        .await;
+        let left = fixture.foreign_objects(&scratch_db).await;
+        fixture.drop().await;
+        assert_staged(result, "t", server);
+        assert_eq!(
+            left.1, 0,
+            "{server}: the baseline's objects are dropped too"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_compares_an_external_table_without_its_foreign_keys_and_triggers() {
+    // The baseline leaves out the referenced table, the CHECK, the default,
+    // the trigger and its function, and the plain index.
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = staging_target(&mut fixture, &guarded_target()).await;
+        let (login, scratch_db) = fixture.confined().await;
+        let inputs = staging_inputs(&reading("id", "t"), &reading("n", "t"), &[]);
+        let key = ProjectKey::new(true);
+        let result = produce_staged(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+            &plain_baseline("integer"),
+        )
+        .await;
+        fixture.drop().await;
+        assert_staged(result, "t", server);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_baseline_that_differs_from_the_target() {
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = staging_target(&mut fixture, &guarded_target()).await;
+        let (login, scratch_db) = fixture.confined().await;
+        let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+        let key = ProjectKey::new(true);
+        // A column of another type, and a unique key left out.
+        let baseline = format!(
+            "CREATE SCHEMA {EXTERNAL};\n\
+             CREATE TABLE {EXTERNAL}.t (id bigint PRIMARY KEY, name text, p integer, n integer);"
+        );
+        let refused = baseline_refusal(
+            produce_staged(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+                &baseline,
+            )
+            .await,
+        );
+        let left = fixture.foreign_objects(&scratch_db).await;
+        fixture.drop().await;
+        assert!(
+            refused.contains(&format!(
+                "the baseline's column id of relation {EXTERNAL}.t differs from the target's in"
+            )) && refused.contains("atttypid"),
+            "{server}: {refused}"
+        );
+        assert!(
+            refused.contains(&format!("the target has index {EXTERNAL}.t_name_key")),
+            "{server}: {refused}"
+        );
+        assert_eq!(left.1, 0, "{server}: a refused run empties its database");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_baseline_that_creates_a_managed_object() {
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &guarded_target()).await;
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    let baseline = format!(
+        "{}CREATE VIEW {MANAGED}.b AS SELECT NULL::text AS name WHERE false;",
+        plain_baseline("integer")
+    );
+    let refused = baseline_refusal(
+        produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &baseline,
+        )
+        .await,
+    );
+    target.drop().await;
+    assert!(
+        refused.contains(&format!(
+            "the baseline created view {MANAGED}.b, which is in the managed set"
+        )),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_runs_the_baseline_before_any_managed_object() {
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    // A statement naming a managed object fails: nothing managed exists yet.
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &guarded_target()).await;
+    let naming = format!(
+        "{}CREATE VIEW {EXTERNAL}.w AS SELECT id FROM {MANAGED}.a;",
+        plain_baseline("integer")
+    );
+    let refused = baseline_refusal(
+        produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &naming,
+        )
+        .await,
+    );
+    // A database default the baseline changes is read by the compatibility
+    // qualification, as the target's is.
+    let defaulting = format!(
+        "{}DO $$BEGIN EXECUTE format('ALTER DATABASE %I SET search_path = {EXTERNAL}', \
+         current_database()); END$$;",
+        plain_baseline("integer")
+    );
+    let incompatible = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &defaulting,
+    )
+    .await;
+    target.drop().await;
+    assert!(
+        refused.contains("its statement at line 4 (CREATE VIEW")
+            && refused.contains("write such an object as a shape view"),
+        "{refused}"
+    );
+    assert!(
+        matches!(incompatible, Err(ProduceError::Run(Error::Incompatible(_)))),
+        "{:?}",
+        incompatible.err().map(|e| e.to_string())
+    );
+    // Its `SET`s stay in its session: on the supplied layout the compile
+    // runs on that session afterwards, and still answers.
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = staging_target(&mut fixture, &guarded_target()).await;
+        let (login, scratch_db) = fixture.confined().await;
+        let baseline = format!(
+            "CREATE SCHEMA {EXTERNAL};\n\
+             SET search_path = {EXTERNAL};\n\
+             CREATE TABLE t (id integer PRIMARY KEY, name text UNIQUE, p integer, n integer);\n\
+             SET statement_timeout = '1ms';"
+        );
+        let result = produce_staged(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+            &baseline,
+        )
+        .await;
+        fixture.drop().await;
+        assert_staged(result, "t", server);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_baseline_object_left_uncompared() {
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let mut setup = guarded_target();
+    setup.push(format!(
+        "CREATE TEXT SEARCH CONFIGURATION {EXTERNAL}.words (COPY = pg_catalog.english)"
+    ));
+    let target_db = staging_target(&mut target, &setup).await;
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    let baseline = format!(
+        "{}CREATE TEXT SEARCH CONFIGURATION {EXTERNAL}.words (COPY = pg_catalog.english);",
+        plain_baseline("integer")
+    );
+    let refused = baseline_refusal(
+        produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &baseline,
+        )
+        .await,
+    );
+    target.drop().await;
+    assert!(
+        refused.contains(&format!(
+            "the baseline created text search configuration {EXTERNAL}.words, which the \
+             comparison with the target does not cover"
+        )),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_chain_through_an_external_object_naming_it() {
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let setup = vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!("CREATE TABLE {MANAGED}.m (id integer)"),
+        format!("CREATE TABLE {EXTERNAL}.e (id integer, m {MANAGED}.m)"),
+        format!("CREATE VIEW {MANAGED}.a AS SELECT id FROM {EXTERNAL}.e"),
+    ];
+    let target_db = staging_target(&mut target, &setup).await;
+    let inputs = staging_inputs(&reading("id", "e"), &reading("m", "e"), &["m"]);
+    let key = ProjectKey::new(true);
+    let refused = baseline_refusal(
+        produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &format!("CREATE SCHEMA {EXTERNAL};"),
+        )
+        .await,
+    );
+    target.drop().await;
+    assert!(
+        refused.contains(&format!(
+            "view {MANAGED}.a binds table {EXTERNAL}.e, whose shape names the managed table \
+             {MANAGED}.m"
+        )) && refused.contains("adopt"),
+        "{refused}"
+    );
+}
+
+/// The external view over its table, and a managed view reading it.
+fn view_target() -> Vec<String> {
+    let mut setup = guarded_target();
+    setup.push(format!(
+        "CREATE VIEW {EXTERNAL}.v AS SELECT id, name FROM {EXTERNAL}.t WHERE n > 0"
+    ));
+    setup.push(format!(
+        "CREATE VIEW {MANAGED}.c AS SELECT id FROM {EXTERNAL}.v"
+    ));
+    setup
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view() {
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &view_target()).await;
+    let inputs = staging_inputs(&reading("id", "v"), &reading("name", "v"), &[]);
+    let key = ProjectKey::new(true);
+    // Only the view, as its output columns over typed NULLs.
+    let baseline = format!(
+        "CREATE SCHEMA {EXTERNAL};\n\
+         CREATE VIEW {EXTERNAL}.v AS SELECT NULL::integer AS id, NULL::text AS name WHERE false;"
+    );
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &baseline,
+    )
+    .await;
+    target.drop().await;
+    assert_staged(result, "v", "a shape view");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_an_external_view_staged_as_a_table() {
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &view_target()).await;
+    let inputs = staging_inputs(&reading("id", "v"), &reading("name", "v"), &[]);
+    let key = ProjectKey::new(true);
+    let baseline =
+        format!("CREATE SCHEMA {EXTERNAL};\nCREATE TABLE {EXTERNAL}.v (id integer, name text);");
+    let refused = baseline_refusal(
+        produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &baseline,
+        )
+        .await,
+    );
+    target.drop().await;
+    assert!(
+        refused.contains(&format!(
+            "the baseline's table {EXTERNAL}.v differs from the target's in"
+        )) && refused.contains("relkind"),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_reports_a_write_through_a_shape_view_with_the_real_definition_remedy() {
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &view_target()).await;
+    // A managed routine that writes through the external view.
+    let mut base = declared(&[("a", &reading("id", "v"))], &[]);
+    let mut desired = base.clone();
+    desired.modules.insert(
+        format!("{MANAGED}.w()").parse().unwrap(),
+        pbps_model::Module {
+            kind: pbps_model::ModuleKind::Function,
+            description: None,
+            definition: format!(
+                "() RETURNS void LANGUAGE sql BEGIN ATOMIC \
+                 INSERT INTO {EXTERNAL}.v (id, name) VALUES (1, 'x'); END"
+            ),
+        },
+    );
+    base.modules
+        .remove(&format!("{MANAGED}.w()").parse().unwrap());
+    let inputs = Inputs::from_pair((base, desired));
+    let key = ProjectKey::new(true);
+    let baseline = format!(
+        "CREATE SCHEMA {EXTERNAL};\n\
+         CREATE VIEW {EXTERNAL}.v AS SELECT NULL::integer AS id, NULL::text AS name WHERE false;"
+    );
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &baseline,
+    )
+    .await;
+    target.drop().await;
+    let reason = match result {
+        Err(ProduceError::Run(Error::Binding(reason))) => reason,
+        other => panic!(
+            "not a binding refusal: {:?}",
+            other.err().map(|e| e.to_string())
+        ),
+    };
+    assert!(
+        reason.contains(&format!(
+            "the baseline stages {EXTERNAL}.v as a view no statement can write through: stage \
+             its real definition"
+        )),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_question_that_needs_routine_source_the_baseline_lacks() {
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let setup = vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!(
+            "CREATE FUNCTION {EXTERNAL}.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1"
+        ),
+        format!(
+            "CREATE FUNCTION {EXTERNAL}.f(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1"
+        ),
+        format!("CREATE VIEW {MANAGED}.a AS SELECT {EXTERNAL}.f(1) AS r"),
+    ];
+    let target_db = staging_target(&mut target, &setup).await;
+    let call = format!("SELECT {EXTERNAL}.f(1) AS r");
+    let inputs = staging_inputs(&call, &call, &[]);
+    let key = ProjectKey::new(true);
+    // The integer overload the target's call binds is not staged.
+    let baseline = format!(
+        "CREATE SCHEMA {EXTERNAL};\n\
+         CREATE FUNCTION {EXTERNAL}.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;"
+    );
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &baseline,
+    )
+    .await;
+    target.drop().await;
+    let reason = match result {
+        Err(ProduceError::Run(Error::Binding(reason))) => reason,
+        other => panic!(
+            "not a binding refusal: {:?}",
+            other.err().map(|e| e.to_string())
+        ),
+    };
+    assert!(
+        reason.contains("a same-named routine on the target is not in the resolver's baseline")
+            && reason.contains("select no resolver"),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_stages_a_cast_and_an_operator_over_external_types_in_the_baseline() {
+    let external = [
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!("CREATE TYPE {EXTERNAL}.pair AS (a integer, b integer)"),
+        format!(
+            "CREATE FUNCTION {EXTERNAL}.total({EXTERNAL}.pair) RETURNS integer LANGUAGE sql \
+             IMMUTABLE RETURN ($1).a + ($1).b"
+        ),
+        format!(
+            "CREATE CAST ({EXTERNAL}.pair AS integer) WITH FUNCTION {EXTERNAL}.total({EXTERNAL}.pair)"
+        ),
+        format!(
+            "CREATE FUNCTION {EXTERNAL}.join_pairs({EXTERNAL}.pair, {EXTERNAL}.pair) \
+             RETURNS integer LANGUAGE sql IMMUTABLE RETURN ($1).a + ($2).b"
+        ),
+        format!(
+            "CREATE OPERATOR {EXTERNAL}.<%> (LEFTARG = {EXTERNAL}.pair, RIGHTARG = {EXTERNAL}.pair, \
+             FUNCTION = {EXTERNAL}.join_pairs)"
+        ),
+    ];
+    let a = format!(
+        "SELECT ROW(1, 2)::{EXTERNAL}.pair OPERATOR({EXTERNAL}.<%>) ROW(3, 4)::{EXTERNAL}.pair AS s"
+    );
+    let b = format!("SELECT (ROW(1, 2)::{EXTERNAL}.pair)::integer AS i");
+    let mut setup = vec![format!("CREATE SCHEMA {MANAGED}")];
+    setup.extend(external.iter().cloned());
+    setup.push(format!("CREATE VIEW {MANAGED}.a AS {a}"));
+    for (server, scratch_server) in [("PBPS_TEST_PG_DB", SCRATCH_SERVER)] {
+        let mut target = Fixture::new(server);
+        let scratch = Fixture::new(scratch_server);
+        let target_db = staging_target(&mut target, &setup).await;
+        let inputs = staging_inputs(&a, &b, &[]);
+        let key = ProjectKey::new(true);
+        let baseline = external
+            .iter()
+            .map(|s| format!("{s};\n"))
+            .collect::<String>();
+        let result = produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &baseline,
+        )
+        .await;
+        target.drop().await;
+        assert_staged(result, "pair", server);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates() {
+    // A deployer that is no superuser: without its USAGE on the external
+    // schema reproduced, its views there would not compile on scratch.
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let deployer = target.login("d", "NOSUPERUSER").await;
+    let mut setup = vec![
+        format!("CREATE SCHEMA {MANAGED} AUTHORIZATION {}", deployer.0),
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!(
+            "CREATE TABLE {EXTERNAL}.t (id integer PRIMARY KEY, name text UNIQUE, p integer, n integer)"
+        ),
+        format!("GRANT USAGE ON SCHEMA {EXTERNAL} TO {}", deployer.0),
+        format!("GRANT SELECT ON {EXTERNAL}.t TO {}", deployer.0),
+        // The compatibility rule compares settings only this role reads.
+        format!("GRANT pg_read_all_settings TO {}", deployer.0),
+    ];
+    let target_db = staging_target(&mut target, &setup).await;
+    setup.clear();
+    let mut as_deployer = Conn::connect(Driver::Postgres, &target.as_login(&target_db, &deployer))
+        .await
+        .unwrap();
+    as_deployer
+        .execute(&format!(
+            "CREATE VIEW {MANAGED}.a AS {}",
+            reading("id", "t")
+        ))
+        .await
+        .unwrap();
+    drop(as_deployer);
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    let result = produce_staged(
+        &scratch.server,
+        &target.as_login(&target_db, &deployer),
+        &inputs,
+        &key,
+        &plain_baseline("integer"),
+    )
+    .await;
+    target.drop().await;
+    assert_staged(result, "t", "a deployer with USAGE");
 }
