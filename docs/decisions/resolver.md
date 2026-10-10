@@ -2188,9 +2188,13 @@ target whose recreated `public` has none, the difference #688 removed.
   the compile on that session. A transaction it leaves open is rolled back
   and refused: its work would otherwise vanish with the session unseen.
 - **Chains are one hop**, read from the target's `pg_depend` before
-  compiling, as §9.3.2 words them. A deeper chain fails as a baseline
-  statement, since its shape names a managed object that does not exist
-  yet, and that failure names the shape-view remedy.
+  compiling, as §9.3.2 words them. A chain refuses when the compile fails,
+  and the refusal names it: the target's dependencies are the current
+  declarations', and a desired one may no longer read through it. A
+  binder routine is managed by its declared signature, looked up on the
+  target, not by its name. A deeper chain fails as a baseline statement,
+  since its shape names a managed object that does not exist yet, and that
+  failure names the shape-view remedy.
 
 **How it is compared.** Both sides are read with the capture's owned
 snapshot, so the identities are those the sealed manifest uses, and the

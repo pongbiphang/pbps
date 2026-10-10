@@ -2290,3 +2290,38 @@ async fn vouched_takes_an_unmanaged_overload_of_a_managed_routine_for_no_chain()
         panic!("{error}");
     }
 }
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_answers_a_plan_that_takes_a_view_off_a_chain() {
+    // The target's `a` reads through a chain; the desired `a` reads the
+    // managed table itself, so the compile never needs the external table.
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let setup = vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!("CREATE TABLE {MANAGED}.m (id integer)"),
+        format!("CREATE TABLE {EXTERNAL}.e (id integer, m {MANAGED}.m)"),
+        format!("CREATE VIEW {MANAGED}.a AS SELECT id FROM {EXTERNAL}.e"),
+    ];
+    let target_db = staging_target(&mut target, &setup).await;
+    let direct = format!("SELECT id FROM {MANAGED}.m");
+    let inputs = Inputs::from_pair((
+        declared(&[("a", &reading("id", "e"))], &["m"]),
+        declared(&[("a", &direct), ("b", &direct)], &["m"]),
+    ));
+    let key = ProjectKey::new(true);
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &format!("CREATE SCHEMA {EXTERNAL};"),
+    )
+    .await;
+    target.drop().await;
+    if let Err(error) = result {
+        panic!("{error}");
+    }
+}

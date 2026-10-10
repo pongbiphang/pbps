@@ -417,9 +417,11 @@ impl Run<'_> {
         }
         let base_managed = engine::Managed::from_schema(binding.base);
         let desired_managed = engine::Managed::from_schema(binding.desired);
-        // Before anything compiles: a chain through the boundary would fail
-        // the compile on an object no baseline can stage, so it is named
-        // instead (SPEC §9.3.2).
+        // Read before anything compiles: a chain through the boundary fails
+        // the compile on an object no baseline can stage, and that failure
+        // is then named as the chain (SPEC §9.3.2). Only a failure refuses:
+        // the target's dependencies are the current declarations', and a
+        // desired one may no longer read through the chain (#1754 review).
         let links = baseline::links(target)
             .await
             .map_err(db("the target's recorded dependencies"))?;
@@ -428,9 +430,6 @@ impl Run<'_> {
         any.extend(kept.iter().copied());
         let routines = baseline::ManagedRoutines { desired: kept, any };
         let chains = baseline::chains(&links, &desired_managed, &base_managed, &routines);
-        if !chains.is_empty() {
-            return Err(Error::Baseline(chains));
-        }
         let staged = match self.baseline {
             Some(_) => {
                 self.stage(
@@ -453,7 +452,17 @@ impl Run<'_> {
         };
         engine::compile(&mut reconstruction, extras, driver, compile)
             .await
-            .map_err(|error| through_shape_view(error, &staged))?;
+            .map_err(|error| {
+                let error = through_shape_view(error, &staged);
+                if let Error::Binding(reason) = &error
+                    && !chains.is_empty()
+                {
+                    return Error::Baseline(
+                        chains.iter().cloned().chain([reason.clone()]).collect(),
+                    );
+                }
+                error
+            })?;
         let dropped = engine::dropped_signatures(extras, base_managed.dropped_by(&desired_managed))
             .map_err(Error::Binding)?;
         let signatures: BTreeSet<_> = dropped.iter().filter_map(|(_, s)| s.clone()).collect();
