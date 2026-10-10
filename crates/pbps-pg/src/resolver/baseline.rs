@@ -4,16 +4,18 @@
 //! The baseline is a reviewed SQL file that creates the objects outside the
 //! managed set that managed objects reference. It runs on scratch only, after
 //! the authorization reproduction and before any managed object, as one
-//! script the engine itself splits (#1769). What it created is the
-//! difference between two inventories taken around it; each root of that
-//! difference is then compared with the target.
+//! script the engine itself splits (#1769), inside one transaction pbps
+//! opens, which nothing outside the scratch database may outlast (#1783).
+//! What it created is the difference between two inventories taken around
+//! it; each root of that difference, and each extension member, is then
+//! compared with the target.
 
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A baseline the engine refused, with its error. Nothing it ran stays:
-/// the script runs as one implicit transaction.
+/// the script runs inside one transaction, which is rolled back.
 #[derive(Debug)]
 pub struct Failed {
     pub error: DbError,
@@ -51,6 +53,103 @@ pub async fn run(conn: &mut impl ExecuteConnection, sql: &str) -> Result<(), Fai
     conn.execute(sql).await.map_err(|error| Failed { error })
 }
 
+/// When the session's transaction began. The baseline runs inside one
+/// transaction pbps opens; a different answer after it means the script
+/// ended that transaction itself.
+pub async fn transaction_began(conn: &mut impl QueryConnection) -> Result<String, DbError> {
+    let rows = conn
+        .query("SELECT pg_catalog.transaction_timestamp()::text AS began")
+        .await?;
+    rows.first()
+        .map(|row| text(row, "began"))
+        .unwrap_or_else(|| Err(DbError::BadRow("no transaction start".into())))
+}
+
+/// The cluster state outside the scratch database that a transaction can
+/// change, one row per object, each with its name: roles, role
+/// memberships, role and database settings, shared comments and security
+/// labels, tablespaces, and other databases. Read twice in one
+/// `REPEATABLE READ` transaction around the baseline, so another session's
+/// writes are in neither read (measured on 16 and 18) and only the
+/// baseline's differ. The scratch database's own settings, attributes and
+/// comment are its own, gone with it, and its settings are read by the
+/// compatibility qualification, so they are left out. A database row keeps
+/// only what a statement changes: VACUUM rewrites its frozen-transaction
+/// horizons in place, past any snapshot.
+pub async fn shared_state(
+    conn: &mut impl QueryConnection,
+) -> Result<BTreeSet<(String, String)>, DbError> {
+    let rows = conn
+        .query(
+            "SELECT 'role ' || pg_catalog.quote_ident(r.rolname) AS name, \
+                    pg_catalog.row_to_json(r)::text AS detail \
+               FROM pg_catalog.pg_roles r \
+             UNION ALL \
+             SELECT 'the membership of role ' \
+                      || pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(m.member)) \
+                      || ' in role ' \
+                      || pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(m.roleid)), \
+                    pg_catalog.row_to_json(m)::text \
+               FROM pg_catalog.pg_auth_members m \
+             UNION ALL \
+             SELECT 'the settings of ' \
+                      || CASE WHEN s.setrole = 0 THEN 'every role' ELSE 'role ' \
+                         || pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(s.setrole)) END \
+                      || ' in ' \
+                      || CASE WHEN s.setdatabase = 0 THEN 'every database' ELSE 'database ' \
+                         || pg_catalog.quote_ident(d.datname) END, \
+                    pg_catalog.row_to_json(s)::text \
+               FROM pg_catalog.pg_db_role_setting s \
+               LEFT JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase \
+              WHERE d.datname IS DISTINCT FROM pg_catalog.current_database() \
+             UNION ALL \
+             SELECT 'the comment on ' || COALESCE( \
+                      pg_catalog.pg_describe_object(c.classoid, c.objoid, 0), 'a shared object'), \
+                    pg_catalog.row_to_json(c)::text \
+               FROM pg_catalog.pg_shdescription c \
+              WHERE NOT (c.classoid = 'pg_catalog.pg_database'::pg_catalog.regclass \
+                     AND c.objoid = (SELECT o.oid FROM pg_catalog.pg_database o \
+                                      WHERE o.datname = pg_catalog.current_database())) \
+             UNION ALL \
+             SELECT 'the security label on ' || COALESCE( \
+                      pg_catalog.pg_describe_object(l.classoid, l.objoid, 0), 'a shared object'), \
+                    pg_catalog.row_to_json(l)::text \
+               FROM pg_catalog.pg_shseclabel l \
+              WHERE NOT (l.classoid = 'pg_catalog.pg_database'::pg_catalog.regclass \
+                     AND l.objoid = (SELECT o.oid FROM pg_catalog.pg_database o \
+                                      WHERE o.datname = pg_catalog.current_database())) \
+             UNION ALL \
+             SELECT 'tablespace ' || pg_catalog.quote_ident(t.spcname), \
+                    pg_catalog.row_to_json(t)::text \
+               FROM pg_catalog.pg_tablespace t \
+             UNION ALL \
+             SELECT 'database ' || pg_catalog.quote_ident(d.datname), \
+                    pg_catalog.json_build_array(d.datname, d.datdba, d.encoding, \
+                      d.datistemplate, d.datallowconn, d.datconnlimit, d.dattablespace, \
+                      d.datacl)::text \
+               FROM pg_catalog.pg_database d \
+              WHERE d.datname <> pg_catalog.current_database()",
+        )
+        .await?;
+    rows.iter()
+        .map(|row| Ok((text(row, "name")?, text(row, "detail")?)))
+        .collect()
+}
+
+/// Each object whose shared state differs between the two reads, named
+/// once.
+pub fn shared_changes(
+    before: &BTreeSet<(String, String)>,
+    after: &BTreeSet<(String, String)>,
+) -> Vec<String> {
+    before
+        .symmetric_difference(after)
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// One object in the scratch database: its catalog, its OID there, and the
 /// engine's name for it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -66,9 +165,10 @@ pub struct Created {
     /// Created objects that live on no other created object: what is
     /// compared with the target.
     pub roots: BTreeSet<Object>,
-    /// Members of an extension the baseline created, which its version
-    /// covers.
-    pub members: usize,
+    /// Members of an extension, whichever extension it is: compared one by
+    /// one like the roots, since an extension's version says nothing of a
+    /// member altered in place, nor of one the baseline added to it (#1783).
+    pub members: BTreeSet<Object>,
     /// The OID of every schema it created, a root or an extension's member:
     /// the deployer's USAGE is reproduced on each.
     pub schemas: BTreeSet<u32>,
@@ -86,20 +186,14 @@ pub async fn inventory(conn: &mut impl QueryConnection) -> Result<Inventory, DbE
     let read = async {
         conn.query("SELECT pg_catalog.set_config('search_path', '', true)")
             .await?;
-        // Membership of an extension initdb made (`plpgsql`) carries
-        // nothing: the baseline did not create that extension, so no
-        // version comparison covers what it adds to it, and it is a root.
-        // Scratch holds no other extension before the baseline runs.
         conn.query(&format!(
             "SELECT (SELECT c.relname::text FROM pg_catalog.pg_class c WHERE c.oid = f.classid) \
                       AS catalog, f.objid::text AS oid, \
                     pg_catalog.pg_describe_object(f.classid, f.objid, 0) AS described, \
                     (SELECT pg_catalog.min(d.deptype::text) FROM pg_catalog.pg_depend d \
                       WHERE d.classid = f.classid AND d.objid = f.objid \
-                        AND d.deptype IN ('i', 'a', 'e') \
-                        AND NOT (d.deptype = 'e' AND d.refobjid < {})) AS carried \
+                        AND d.deptype IN ('i', 'a', 'e')) AS carried \
                FROM ({}) f",
-            super::vouched::FIRST_NORMAL_OBJECT_ID,
             super::vouched::user_objects()
         ))
         .await
@@ -130,8 +224,8 @@ pub async fn inventory(conn: &mut impl QueryConnection) -> Result<Inventory, DbE
 /// description and how it lives on another object, if it does.
 pub type Inventory = BTreeMap<(String, u32), (String, Option<char>)>;
 
-/// What appeared between two inventories: its roots, and how many extension
-/// members came with them.
+/// What appeared between two inventories: its roots, the extension members
+/// that came with them, and every schema among either.
 pub fn created(before: &Inventory, after: &Inventory) -> Created {
     let mut created = Created::default();
     for ((catalog, oid), (described, carried)) in after {
@@ -141,15 +235,18 @@ pub fn created(before: &Inventory, after: &Inventory) -> Created {
         if catalog == "pg_namespace" {
             created.schemas.insert(*oid);
         }
+        let object = || Object {
+            catalog: catalog.clone(),
+            oid: *oid,
+            described: described.clone(),
+        };
         match carried {
             None => {
-                created.roots.insert(Object {
-                    catalog: catalog.clone(),
-                    oid: *oid,
-                    described: described.clone(),
-                });
+                created.roots.insert(object());
             }
-            Some('e') => created.members += 1,
+            Some('e') => {
+                created.members.insert(object());
+            }
             Some(_) => {}
         }
     }
@@ -482,11 +579,40 @@ mod tests {
             // Ordered by catalog, then OID.
             ["table ext.t", "extension citext", "schema ext"]
         );
-        assert_eq!(created.members, 2);
+        assert_eq!(
+            created
+                .members
+                .iter()
+                .map(|o| o.described.as_str())
+                .collect::<Vec<_>>(),
+            ["schema cron", "type citext"]
+        );
         // Every new schema, the extension's member too.
         assert_eq!(created.schemas, BTreeSet::from([16390, 16402]));
         // Negative: nothing new, nothing created.
         assert_eq!(created_none(&after), Created::default());
+    }
+
+    #[test]
+    fn a_shared_change_is_named_once_whichever_way_it_differs() {
+        let row = |name: &str, detail: &str| (name.to_owned(), detail.to_owned());
+        let before = BTreeSet::from([
+            row("role app", "{\"rolcanlogin\":false}"),
+            row("role gone", "{}"),
+            row("tablespace pg_default", "{}"),
+        ]);
+        let after = BTreeSet::from([
+            row("role app", "{\"rolcanlogin\":true}"),
+            row("role new", "{}"),
+            row("tablespace pg_default", "{}"),
+        ]);
+        // Changed, added and removed alike; a changed one once, not twice.
+        assert_eq!(
+            shared_changes(&before, &after),
+            ["role app", "role gone", "role new"]
+        );
+        // Negative: the same state twice is no change.
+        assert!(shared_changes(&before, &before).is_empty());
     }
 
     fn created_none(inventory: &BTreeMap<(String, u32), (String, Option<char>)>) -> Created {

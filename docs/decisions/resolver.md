@@ -2179,8 +2179,8 @@ target whose recreated `public` has none, the difference #688 removed.
 - **What it created** is the difference between two inventories of every
   object initdb did not make, taken around it. A root is an object that
   lives on no other: a table's row and array types, its indexes and owned
-  sequences, a range's constructors and an extension's members come with
-  their root.
+  sequences and a range's constructors come with their root. An extension's
+  members are no root's parts: each is compared on its own (#1783).
 - **USAGE on a schema it created**, an extension's own schema included,
   is the target deployer's answer, reproduced as an in-scope schema's is
   and checked as the compile session.
@@ -2190,16 +2190,27 @@ target whose recreated `public` has none, the difference #688 removed.
 - **Both layouts.** The run-owned one runs it in a fresh session as the
   scratch superuser. The supplied one runs it on the checked connection,
   where every write goes, then `DISCARD ALL`, so its `SET`s do not reach
-  the compile on that session. A transaction it leaves open is rolled back
-  and refused: its work would otherwise vanish with the session unseen.
+  the compile on that session. Both run it inside one `REPEATABLE READ`
+  transaction pbps opens and commits; a file that ends that transaction
+  itself (`COMMIT`, `ROLLBACK`) is refused, rolled back as far as it can be.
 - **One script** (decided with the maintainer on #1769). The file is sent
   whole, as one simple query, and the engine decides where each statement
-  ends. So it is one implicit transaction: a statement that cannot run in a
+  ends. So it is one transaction: a statement that cannot run in a
   transaction block (`CREATE INDEX CONCURRENTLY`, `VACUUM`) is refused by
   the engine, and a refused file leaves nothing. And it is read whole under
   the session's settings when it starts: a setting it changes, such as
   `standard_conforming_strings`, does not change how the rest is read. A
   refusal carries the engine's error, which names the object or token.
+- **Nothing outside the scratch database** (decided with the maintainer on
+  #1783). Roles, role memberships, role settings and other databases'
+  settings, shared comments and security labels, tablespaces and other
+  databases are read before and after the file, under the transaction's one
+  snapshot, so another session's writes meanwhile are in neither read
+  (measured on 16 and 18). A difference rolls the transaction back and
+  refuses, naming each object, so nothing is left to clean up. The scratch
+  database's own settings, attributes and comment are its own and go with
+  it; the compatibility qualification reads its settings. A role's password
+  is not in the views a supplied account reads, and is not compared.
 - **Chains are one hop**, read from the target's `pg_depend` before
   compiling, as §9.3.2 words them. A chain refuses when the compile fails,
   and the refusal names it: the target's dependencies are the current
@@ -2221,9 +2232,15 @@ comparison is a projection of the manifest's properties.
   compile, which never replaces a routine.
 - An enum's labels are compared by their place: the engine's sort keys
   differ with the order the labels were added in.
-- A staged object, and what it made, counts as reconstructed in the
-  assessment. A same-named routine the target has, that neither the
-  project nor the baseline does, names the routine-source remedy.
+- **Accepted means compared** (#1783). An object counts as reconstructed
+  in the assessment when it was compared itself, or is a part of one that
+  was: its row and array types, indexes, owned sequences. Extension
+  membership is no such part. Each member the capture has an identity for
+  is compared on its own, with the roots' projection; one it has none for
+  is no binding candidate. An operator family's operators and support
+  routines are compared with it, by strategy and support number. A
+  same-named routine the target has, that neither the project nor the
+  baseline does, names the routine-source remedy.
 - A routine body is checked against the views it writes when it is created
   (measured on 18: `cannot insert into view`, SQLSTATE 55000), so a write
   through a view staged as a shape view fails the compile; that failure
@@ -2238,6 +2255,12 @@ a binding verdict and stays unresolved.
 - **Run first, then adopt the baseline's schemas** in the reproduction:
   reopens #688 on `public`.
 - **Let the baseline grant USAGE:** wrong for both layouts, above.
+- **Take an extension's version for its members.** A member the target
+  altered in place, or one the baseline adds with `ALTER EXTENSION ... ADD`,
+  leaves the version as it was (#1754's review, #1766).
+- **Compare the shared state across separate transactions.** Other runs on
+  a shared scratch cluster create and drop their own roles meanwhile, so it
+  would refuse at random.
 - **Split the file in pbps** and run each statement on its own. Where a
   statement ends is the server's lexer and grammar, which depend on its
   version and on settings the file can change. A client-side copy refused

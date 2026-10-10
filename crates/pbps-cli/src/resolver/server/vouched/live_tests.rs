@@ -2282,10 +2282,261 @@ async fn vouched_stages_a_cast_and_an_operator_over_external_types_in_the_baseli
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_compares_each_extension_member_with_the_target() {
+    // The extension's version matches; one member the target altered in
+    // place does not, and is named (#1766, #1783).
+    let call = format!("SELECT {EXTERNAL}.soundex('pbps') AS r");
+    let baseline =
+        format!("CREATE SCHEMA {EXTERNAL};\nCREATE EXTENSION fuzzystrmatch SCHEMA {EXTERNAL};");
+    for altered in [true, false] {
+        let mut setup = vec![
+            format!("CREATE SCHEMA {MANAGED}"),
+            format!("CREATE SCHEMA {EXTERNAL}"),
+            format!("CREATE EXTENSION fuzzystrmatch SCHEMA {EXTERNAL}"),
+        ];
+        if altered {
+            setup.push(format!("ALTER FUNCTION {EXTERNAL}.soundex(text) VOLATILE"));
+        }
+        setup.push(format!("CREATE VIEW {MANAGED}.a AS {call}"));
+        let mut target = Fixture::new("PBPS_TEST_PG_DB");
+        let scratch = Fixture::new(SCRATCH_SERVER);
+        let target_db = staging_target(&mut target, &setup).await;
+        let inputs = staging_inputs(&call, &call, &[]);
+        let key = ProjectKey::new(true);
+        let result = produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &baseline,
+        )
+        .await;
+        target.drop().await;
+        if altered {
+            let refused = baseline_refusal(result);
+            assert!(
+                refused.contains(&format!(
+                    "{EXTERNAL}.soundex(text) differs from the target's in provolatile"
+                )),
+                "{refused}"
+            );
+        } else {
+            // Negative: the same extension, unaltered, is staged.
+            let plan = result.unwrap_or_else(|error| panic!("an unaltered extension: {error}"));
+            plan.evidence.validate(&plan.changes).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_compares_an_operator_familys_members_with_the_target() {
+    // A row comparison binds by the strategy its operator serves in a
+    // btree family; the same family header with another strategy is a
+    // different family to it (#1768, #1783).
+    let family = |strategy: u8| {
+        vec![
+            format!("CREATE SCHEMA {EXTERNAL}"),
+            format!(
+                "CREATE FUNCTION {EXTERNAL}.lt(integer, integer) RETURNS boolean \
+                 LANGUAGE sql IMMUTABLE RETURN $1 < $2"
+            ),
+            format!(
+                "CREATE OPERATOR {EXTERNAL}.<% (LEFTARG = integer, RIGHTARG = integer, \
+                 FUNCTION = {EXTERNAL}.lt)"
+            ),
+            format!("CREATE OPERATOR FAMILY {EXTERNAL}.fam USING btree"),
+            format!(
+                "ALTER OPERATOR FAMILY {EXTERNAL}.fam USING btree \
+                 ADD OPERATOR {strategy} {EXTERNAL}.<% (integer, integer)"
+            ),
+        ]
+    };
+    let call = format!("SELECT ROW(1, 2) OPERATOR({EXTERNAL}.<%) ROW(3, 4) AS r");
+    for staged_strategy in [2, 1] {
+        let mut setup = vec![format!("CREATE SCHEMA {MANAGED}")];
+        setup.extend(family(1));
+        setup.push(format!("CREATE VIEW {MANAGED}.a AS {call}"));
+        let mut target = Fixture::new("PBPS_TEST_PG_DB");
+        let scratch = Fixture::new(SCRATCH_SERVER);
+        let target_db = staging_target(&mut target, &setup).await;
+        let inputs = staging_inputs(&call, &call, &[]);
+        let key = ProjectKey::new(true);
+        let baseline = family(staged_strategy)
+            .iter()
+            .map(|s| format!("{s};\n"))
+            .collect::<String>();
+        let result = produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &baseline,
+        )
+        .await;
+        target.drop().await;
+        if staged_strategy == 1 {
+            // Negative: the same members are staged.
+            let plan = result.unwrap_or_else(|error| panic!("an identical family: {error}"));
+            plan.evidence.validate(&plan.changes).unwrap();
+        } else {
+            let refused = baseline_refusal(result);
+            assert!(
+                refused.contains("the target has") && refused.contains("the baseline does not"),
+                "{refused}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_baseline_that_writes_outside_the_scratch_database() {
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    // Run-owned: the baseline runs as the scratch superuser.
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &guarded_target()).await;
+    let role = format!("pbps_v1783_r_{}", scratch.token);
+    let cases = [
+        (
+            format!("CREATE ROLE {role};\nGRANT pg_monitor TO {role};"),
+            vec![
+                format!("it changed role {role}, outside the scratch database"),
+                format!("the membership of role {role} in role pg_monitor"),
+            ],
+        ),
+        (
+            "ALTER ROLE ALL SET work_mem = '5MB';".to_owned(),
+            vec!["the settings of every role in every database".to_owned()],
+        ),
+        (
+            "DO $$BEGIN EXECUTE format('COMMENT ON ROLE %I IS ''pbps''', current_user); END$$;"
+                .to_owned(),
+            vec!["the comment on role".to_owned()],
+        ),
+        (
+            "COMMIT;".to_owned(),
+            vec!["it ends the transaction it runs in".to_owned()],
+        ),
+    ];
+    for (statements, named) in &cases {
+        let baseline = format!("{}{statements}\n", plain_baseline("integer"));
+        let refused = baseline_refusal(
+            produce_staged(
+                &scratch.server,
+                &target.on(&target_db),
+                &inputs,
+                &key,
+                &baseline,
+            )
+            .await,
+        );
+        for name in named {
+            assert!(refused.contains(name.as_str()), "{statements}: {refused}");
+        }
+    }
+    target.drop().await;
+    // Refused by rolling back: the role is not left on the scratch cluster.
+    let (_, roles) = scratch.inventory().await;
+    assert!(!roles.contains(&role), "{role} was left behind");
+    // Supplied: the confined account changes its own role's settings.
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = staging_target(&mut fixture, &guarded_target()).await;
+        let (login, scratch_db) = fixture.confined().await;
+        let baseline = format!(
+            "{}ALTER ROLE CURRENT_USER SET work_mem = '5MB';\n",
+            plain_baseline("integer")
+        );
+        let refused = baseline_refusal(
+            produce_staged(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+                &baseline,
+            )
+            .await,
+        );
+        let left = fixture
+            .admin()
+            .await
+            .query(&format!(
+                "SELECT 1 FROM pg_catalog.pg_db_role_setting s \
+                   JOIN pg_catalog.pg_roles r ON r.oid = s.setrole WHERE r.rolname = '{}'",
+                login.0
+            ))
+            .await
+            .unwrap()
+            .len();
+        fixture.drop().await;
+        assert!(
+            refused.contains(&format!(
+                "the settings of role {} in every database",
+                login.0
+            )),
+            "{server}: {refused}"
+        );
+        assert_eq!(left, 0, "{server}: the setting is rolled back");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_ignores_another_sessions_cluster_writes_during_the_baseline() {
+    // Other runs share the scratch cluster: a role one creates while this
+    // baseline runs is in neither of its reads, so nothing is refused.
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let mut scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &guarded_target()).await;
+    let marker = format!("pbps_v1783_marker_{}", scratch.token);
+    let baseline = format!(
+        "{}SELECT pg_catalog.pg_sleep(3) AS {marker};\n",
+        plain_baseline("integer")
+    );
+    let other = format!("pbps_v1783_other_{}", scratch.token);
+    let mut admin = scratch.admin().await;
+    let concurrent = async {
+        // Once the baseline is running, another session creates a role.
+        loop {
+            let running = admin
+                .query(&format!(
+                    "SELECT 1 FROM pg_catalog.pg_stat_activity \
+                      WHERE query LIKE '%{marker}%' AND pid <> pg_catalog.pg_backend_pid()"
+                ))
+                .await
+                .unwrap();
+            if !running.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        admin
+            .execute(&format!("CREATE ROLE {other} NOLOGIN"))
+            .await
+            .unwrap();
+    };
+    let target_url = target.on(&target_db);
+    let (result, ()) = tokio::join!(
+        produce_staged(&scratch.server, &target_url, &inputs, &key, &baseline),
+        concurrent
+    );
+    scratch.roles.push(other);
+    target.drop().await;
+    scratch.drop().await;
+    assert_staged(result, "t", "a concurrent role");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_compares_an_extension_member_in_a_system_schema_in_full() {
-    // The baseline stages the extension, not its members: one the target
-    // altered in place is not what scratch reproduced, so its managed
-    // caller is refused rather than accepted on membership alone.
+    // An extension's member is compared on its own, here in a system
+    // schema: one the target altered in place is refused by name, not
+    // accepted for its extension's version (#1783).
     let call = "SELECT pg_catalog.soundex('pbps') AS r";
     let setup = vec![
         format!("CREATE SCHEMA {MANAGED}"),
@@ -2298,23 +2549,21 @@ async fn vouched_compares_an_extension_member_in_a_system_schema_in_full() {
     let target_db = staging_target(&mut target, &setup).await;
     let inputs = staging_inputs(call, call, &[]);
     let key = ProjectKey::new(true);
-    let result = produce_staged(
-        &scratch.server,
-        &target.on(&target_db),
-        &inputs,
-        &key,
-        "CREATE EXTENSION fuzzystrmatch SCHEMA pg_catalog;",
-    )
-    .await;
+    let refused = baseline_refusal(
+        produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            "CREATE EXTENSION fuzzystrmatch SCHEMA pg_catalog;",
+        )
+        .await,
+    );
     target.drop().await;
-    let reason = match result {
-        Err(ProduceError::Run(Error::Binding(reason))) => reason,
-        other => panic!(
-            "not a binding refusal: {:?}",
-            other.err().map(|e| e.to_string())
-        ),
-    };
-    assert!(reason.contains("not reconstructed on scratch"), "{reason}");
+    assert!(
+        refused.contains("soundex(text) differs from the target's in provolatile"),
+        "{refused}"
+    );
 }
 
 #[tokio::test]

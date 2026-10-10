@@ -15,7 +15,7 @@ use pbps_db::{DbError, Row};
 /// was created afterwards, in this database or in the template it was cloned
 /// from (`FirstNormalObjectId`, the boundary pg_dump uses for the same
 /// question).
-pub(crate) const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
+const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
 
 /// The catalogs whose rows are objects a declaration could bind to or a
 /// later compilation would collide with. An object that lives on another

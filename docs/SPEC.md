@@ -1677,9 +1677,11 @@ scratch compile (#1616).
   schema; a baseline that writes into one writes `CREATE SCHEMA IF NOT
   EXISTS`. It runs as the setup role: in the run-owned layout in a session
   of its own, in the supplied one on the checked connection, which `DISCARD
-  ALL` then resets. A transaction it leaves open refuses the run.
+  ALL` then resets. It runs inside one `REPEATABLE READ` transaction pbps
+  opens and commits; a file that ends it (`COMMIT`, `ROLLBACK`) refuses the
+  run.
   - **It runs as one script**: pbps sends the file whole and the engine
-    splits it (#1769). It is one implicit transaction, so a statement that
+    splits it (#1769). It is one transaction, so a statement that
     cannot run in a transaction block, such as `CREATE INDEX CONCURRENTLY`,
     is refused, and a refused file leaves nothing. The file is read whole
     under the session's settings when it starts: a setting it changes, such
@@ -1708,15 +1710,28 @@ scratch compile (#1616).
     or a baseline object in the managed set refuses, and the finding names
     the object. So does an object the comparison cannot read, such as a
     text search configuration or a foreign table.
+  - An extension's members are each compared like an object it creates:
+    an extension's version says nothing of a member altered in place, or
+    one the baseline adds to an extension (#1783).
+  - It changes nothing outside the scratch database. Roles, role
+    memberships, role and other databases' settings, shared comments and
+    security labels, tablespaces and other databases are read before and
+    after it, in its own transaction's snapshot, so another session's writes
+    meanwhile do not count. A change refuses, naming each object, and is
+    rolled back.
   - The shared compatibility qualification reads scratch after the
-    baseline, so a setting the baseline changed must match the target too.
+    baseline, so a setting the baseline changed must match the target too:
+    the scratch database's own settings are its to change.
 - **What is compared is what a creation-time binding can read:**
   - an object's own class-specific properties, as the evidence manifest
     fingerprints them;
   - of a relation's children, its columns, the primary-key and unique
     constraints and indexes that a `GROUP BY` functional dependency or an
     `ON CONFLICT` inference relies on, and its inheritance and partition
-    parents, which a row-type coercion such as `c::ext.parent` relies on.
+    parents, which a row-type coercion such as `c::ext.parent` relies on;
+  - of an operator family, which operator serves each strategy and which
+    routine each support number, which an index, an `ORDER BY` and a row
+    comparison bind by.
 
   Examples:
   - a relation's kind, and its column names, types, collations and order
@@ -1725,7 +1740,7 @@ scratch compile (#1616).
     order, a domain's base type and collation;
   - a routine's header: signature, return type, argument names and modes,
     defaults, variadic, volatility;
-  - an extension's version.
+  - an extension's version, and each of its members as itself.
 - **What is not compared:**
   - a relation's other children: foreign keys, CHECKs, column defaults,
     triggers, policies, rules and non-unique indexes;

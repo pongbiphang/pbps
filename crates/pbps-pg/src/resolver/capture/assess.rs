@@ -371,13 +371,12 @@ pub fn managed_scope(desired: &Managed) -> CaptureScope {
     }
 }
 
-/// Properties with every role reference removed. The engine's own objects
-/// are owned by the bootstrap superuser, whose name is the installation's,
-/// and neither ownership nor ACL decides what a name binds to.
-/// Whether `member` is a staged root or something one made, directly or
-/// through what it made: a table's row and array types, an index, an owned
-/// sequence, an extension's members (#1673). Read from the dependencies the
-/// capture holds of `inputs`' own side.
+/// Whether `member` was compared itself, or is a part of what was, directly
+/// or through what it made: a table's row and array types, an index, an
+/// owned sequence (#1673). Read from the dependencies the capture holds of
+/// `inputs`' own side. Extension membership is not followed: an extension's
+/// members were each compared on their own, and one that was not is no part
+/// its extension's comparison covers (#1783).
 fn carries(
     inputs: &BTreeMap<ObjectIdentity, super::manifest::Input>,
     staged: &super::Staged,
@@ -389,7 +388,7 @@ fn carries(
             dependency.class.as_str(),
             dependency.name.as_slice(),
             dependency.signature.as_slice(),
-        ) && matches!(kind.as_str(), "i" | "a" | "e")
+        ) && matches!(kind.as_str(), "i" | "a")
         {
             makers.entry(made).or_default().push(maker);
         }
@@ -411,6 +410,9 @@ fn carries(
     false
 }
 
+/// Properties with every role reference removed. The engine's own objects
+/// are owned by the bootstrap superuser, whose name is the installation's,
+/// and neither ownership nor ACL decides what a name binds to.
 pub(super) fn without_roles(value: &Value) -> Value {
     match value {
         Value::Object(map) if map.get("class") == Some(&Value::from("pg_authid")) => Value::Null,

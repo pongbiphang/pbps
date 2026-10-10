@@ -30,7 +30,7 @@ use pbps_db::resolver::environment::{CatalogFacts, Verdict};
 use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::ResolverRuntime;
-use pbps_pg::resolver::baseline::{self, Object};
+use pbps_pg::resolver::baseline;
 use pbps_pg::resolver::capture::{StageError, Staged};
 use pbps_pg::resolver::standard::{self, Standard};
 use pbps_pg::resolver::vouched::{self as sql, Placement};
@@ -323,10 +323,8 @@ struct Prepared {
     map: scope::Principals,
     /// Authorization keys the reproduction did not reproduce.
     differences: Vec<String>,
-    /// The roots of what the baseline created (#1673).
-    created: BTreeSet<Object>,
-    /// The OID of every schema the baseline created, a root or not.
-    created_schemas: BTreeSet<u32>,
+    /// What the baseline created (#1673).
+    created: baseline::Created,
     /// The role a run-owned layout gives USAGE on a schema the baseline
     /// created; `None` where the scratch account compiles as itself.
     grantee: Option<String>,
@@ -481,7 +479,7 @@ impl Run<'_> {
             &reconstruction,
             &namespaces,
             &signatures,
-            staged.roots(),
+            staged.compared(),
         )
         .await?;
         let routines = base
@@ -642,7 +640,7 @@ impl Run<'_> {
         // After the reproduction, which drops and recreates each in-scope
         // schema, and before any managed object (DEC-1673.1). Its own
         // session, so its `SET`s reach nothing after it.
-        let (created, created_schemas) = match self.baseline {
+        let created = match self.baseline {
             Some(statements) => {
                 let before = inventory(&mut owner).await?;
                 let mut setup = Conn::connect_with(driver, self.scratch, names.database(), None)
@@ -654,10 +652,9 @@ impl Run<'_> {
                     .map_err(db("the baseline session's role"))?;
                 run_baseline(&mut setup, statements).await?;
                 drop(setup);
-                let created = baseline::created(&before, &inventory(&mut owner).await?);
-                (created.roots, created.schemas)
+                baseline::created(&before, &inventory(&mut owner).await?)
             }
-            None => (BTreeSet::new(), BTreeSet::new()),
+            None => baseline::Created::default(),
         };
         // Opened after the reproduction, so the login defaults it stored
         // load into this session as they load on the target's.
@@ -703,7 +700,6 @@ impl Run<'_> {
             map,
             differences,
             created,
-            created_schemas,
             grantee,
         })
     }
@@ -775,7 +771,7 @@ impl Run<'_> {
         // any usage, on the checked connection like every write here
         // (DEC-1673.1). `DISCARD ALL` then keeps its `SET`s from the
         // compile that follows on this same session.
-        let (created, created_schemas) = match self.baseline {
+        let created = match self.baseline {
             Some(statements) => {
                 let before = inventory(admin).await?;
                 run_baseline(admin, statements).await?;
@@ -784,10 +780,9 @@ impl Run<'_> {
                     .await
                     .map_err(db("the scratch session's role"))?;
                 pinned(admin, self.backend).await?;
-                let created = baseline::created(&before, &inventory(admin).await?);
-                (created.roots, created.schemas)
+                baseline::created(&before, &inventory(admin).await?)
             }
-            None => (BTreeSet::new(), BTreeSet::new()),
+            None => baseline::Created::default(),
         };
         let unusable = authorization
             .unusable_schemas(&request.planned)
@@ -825,7 +820,6 @@ impl Run<'_> {
             map,
             differences: Vec::new(),
             created,
-            created_schemas,
             grantee: None,
         })
     }
@@ -1144,7 +1138,7 @@ impl Run<'_> {
         // Every schema the baseline created, an extension's member too
         // (`pg_cron`'s `cron`): a member is no root, but the deployer's
         // calls into it need USAGE all the same.
-        let schemas = baseline::schema_names(capture, &prepared.created_schemas)
+        let schemas = baseline::schema_names(capture, &prepared.created.schemas)
             .await
             .map_err(db("the schemas the baseline created"))?;
         if schemas.is_empty() {
@@ -1227,7 +1221,7 @@ fn through_shape_view(error: Error, staged: &Staged) -> Error {
         });
     let staged_view = written.and_then(|view| {
         staged
-            .roots()
+            .compared()
             .iter()
             .find(|root| root.class == "pg_class" && root.name.last() == Some(&view))
             .map(|root| root.name.join("."))
@@ -1252,25 +1246,81 @@ async fn inventory(conn: &mut Conn) -> Result<baseline::Inventory, Error> {
 /// the engine's error when the engine refuses it. A transaction it leaves
 /// open is rolled back and refused: its work would otherwise vanish unseen
 /// with the session, or reach the compile.
+/// Runs the baseline inside one `REPEATABLE READ` transaction pbps opens,
+/// and refuses it, rolled back so it leaves nothing, when it changed the
+/// cluster outside the scratch database or ended that transaction itself
+/// (#1783). One snapshot serves both reads of the shared state, so another
+/// session's writes during the script are in neither.
 async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
-    if let Err(failed) = baseline::run(session, sql).await {
-        let _ = session.execute("ROLLBACK").await;
-        let mut finding = format!("the engine refused it: {}", failed.error);
-        if failed.names_something_missing() {
-            finding.push_str(
-                "; the baseline runs before any managed object, so a statement that names one \
-                 fails: write such an object as a shape view (a view of typed NULLs that \
-                 returns no row), or leave it out of the baseline",
-            );
+    let read =
+        |what: &'static str| move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"));
+    session
+        .execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .map_err(read("the baseline's transaction"))?;
+    let outcome = async {
+        let began = baseline::transaction_began(session)
+            .await
+            .map_err(read("the baseline's transaction"))?;
+        let before = baseline::shared_state(session)
+            .await
+            .map_err(read("the cluster's shared state"))?;
+        if let Err(failed) = baseline::run(session, sql).await {
+            let mut finding = format!("the engine refused it: {}", failed.error);
+            if failed.names_something_missing() {
+                finding.push_str(
+                    "; the baseline runs before any managed object, so a statement that names \
+                     one fails: write such an object as a shape view (a view of typed NULLs \
+                     that returns no row), or leave it out of the baseline",
+                );
+            }
+            return Err(Error::Baseline(vec![finding]));
         }
-        return Err(Error::Baseline(vec![finding]));
+        let still = baseline::transaction_began(session)
+            .await
+            .map_err(read("the baseline's transaction"))?;
+        if still != began {
+            return Err(Error::Baseline(vec![
+                "it ends the transaction it runs in; leave out COMMIT and ROLLBACK, since pbps \
+                 runs the whole baseline as one transaction"
+                    .into(),
+            ]));
+        }
+        let after = baseline::shared_state(session)
+            .await
+            .map_err(read("the cluster's shared state"))?;
+        let changed = baseline::shared_changes(&before, &after);
+        if changed.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Baseline(
+                changed
+                    .into_iter()
+                    .map(|name| {
+                        format!(
+                            "it changed {name}, outside the scratch database; a baseline \
+                             creates only objects in the database"
+                        )
+                    })
+                    .collect(),
+            ))
+        }
     }
-    if session.execute("DISCARD ALL").await.is_err() {
+    .await;
+    if let Err(error) = outcome {
         let _ = session.execute("ROLLBACK").await;
-        return Err(Error::Baseline(vec![
-            "it leaves a transaction open; end each transaction it begins".into(),
-        ]));
+        return Err(error);
     }
+    session
+        .execute("COMMIT")
+        .await
+        .map_err(read("the baseline's transaction"))?;
+    // Its `SET`s outlast the transaction; the supplied layout compiles on
+    // this same session next.
+    session
+        .execute("DISCARD ALL")
+        .await
+        .map_err(read("the baseline session's settings"))?;
     Ok(())
 }
 

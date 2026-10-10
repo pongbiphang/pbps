@@ -2,8 +2,11 @@
 //! (SPEC §9.3.2; #1673).
 //!
 //! Each object the baseline created is compared by what a creation-time
-//! binding can read: its own class properties, and of a relation its
-//! columns, primary-key and unique constraints and indexes, and parents.
+//! binding can read: its own class properties, of a relation its columns,
+//! primary-key and unique constraints and indexes, and parents, and of an
+//! operator family its operators and support routines. An extension's
+//! members are compared each on its own: nothing is accepted for belonging
+//! to something compared (#1783).
 //! Foreign keys, CHECKs, defaults, triggers, policies, rules, non-unique
 //! indexes and the source of a routine's body or a view's query are not
 //! compared: a binding reads an object's shape, not how it computes or
@@ -14,27 +17,29 @@
 use super::logical::Catalog;
 use super::manifest::Input;
 use super::{CaptureError, CaptureScope, CapturedInputs, Managed};
-use crate::resolver::baseline::Object;
+use crate::resolver::baseline::{Created, Object};
 use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_db::transport::QueryConnection;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The objects a baseline staged and the comparison accepted. Their target
-/// fingerprints join the sealed capture, and the assessment takes them, and
-/// what they carry, as reconstructed.
+/// The objects a baseline staged whose own shapes the comparison accepted:
+/// its roots and the members of its extensions. Their target fingerprints
+/// join the sealed capture, and the assessment takes them, and their parts,
+/// as reconstructed. Nothing is in it for being a member of something
+/// compared (#1783).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Staged {
-    roots: BTreeSet<ObjectIdentity>,
+    compared: BTreeSet<ObjectIdentity>,
 }
 
 impl Staged {
-    pub fn roots(&self) -> &BTreeSet<ObjectIdentity> {
-        &self.roots
+    pub fn compared(&self) -> &BTreeSet<ObjectIdentity> {
+        &self.compared
     }
 
     pub(super) fn holds(&self, object: &ObjectIdentity) -> bool {
-        self.roots.contains(object)
+        self.compared.contains(object)
     }
 }
 
@@ -48,18 +53,19 @@ pub enum StageError {
 }
 
 /// Compares what the baseline created on `scratch`, `created` as the
-/// inventory found it there, with the same objects on `target`. `managed`
-/// is every side of the managed set the plan touches.
+/// inventory found it there, with the same objects on `target`: each root,
+/// and each extension member, on its own. `managed` is every side of the
+/// managed set the plan touches.
 pub async fn compare(
     scratch: &mut impl QueryConnection,
     target: &mut impl QueryConnection,
-    created: &BTreeSet<Object>,
+    created: &Created,
     managed: &[&Managed],
 ) -> Result<Staged, StageError> {
     let mut resolved: BTreeMap<ObjectIdentity, String> = BTreeMap::new();
     let mut refused = Vec::new();
     let staged = read(scratch, |catalog| {
-        for object in created {
+        for object in &created.roots {
             match comparable(catalog, object) {
                 Some(identity) => {
                     resolved.insert(identity, object.described.clone());
@@ -69,6 +75,14 @@ pub async fn compare(
                      cover; leave it out of the baseline",
                     object.described
                 )),
+            }
+        }
+        // An extension's member of a class the capture has no identity for
+        // is no binding candidate, so nothing reads it as reconstructed;
+        // the baseline cannot leave it out, so it is not refused either.
+        for object in &created.members {
+            if let Some(identity) = comparable(catalog, object) {
+                resolved.insert(identity, object.described.clone());
             }
         }
         resolved.keys().cloned().collect()
@@ -109,9 +123,9 @@ pub async fn compare(
             )
         })
         .collect();
-    let roots: BTreeSet<ObjectIdentity> = resolved.keys().cloned().collect();
-    // A root the target lacks is named once, not with each of its parts.
-    let present: BTreeSet<ObjectIdentity> = roots
+    let compared: BTreeSet<ObjectIdentity> = resolved.keys().cloned().collect();
+    // An object the target lacks is named once, not with each of its parts.
+    let present: BTreeSet<ObjectIdentity> = compared
         .iter()
         .filter(|root| !absent.contains(root))
         .cloned()
@@ -122,7 +136,7 @@ pub async fn compare(
         &resolved,
     ));
     if findings.is_empty() {
-        Ok(Staged { roots })
+        Ok(Staged { compared })
     } else {
         Err(StageError::Refused(findings))
     }
@@ -226,11 +240,16 @@ fn shapes(
             }),
             "pg_index" => reference(properties, "indrelid")
                 .filter(|_| properties.get("indisunique") == Some(&Value::Bool(true))),
+            // An operator family's members: which operator serves each
+            // strategy and which routine each support number, which an
+            // index, an ORDER BY and a row comparison bind by (#1783).
             "pg_inherits"
             | "pg_partitioned_table"
             | "pg_sequence"
             | "pg_range"
-            | "pg_aggregate" => first(object, 0),
+            | "pg_aggregate"
+            | "pg_amop"
+            | "pg_amproc" => first(object, 0),
             "pg_enum" => {
                 if let (Some(owner), Some(order)) = (
                     first(object, 0),
