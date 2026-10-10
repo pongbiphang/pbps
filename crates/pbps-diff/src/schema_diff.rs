@@ -3315,11 +3315,19 @@ fn refuse_partition_changes(
                 .get(name)
                 .is_some_and(|t| t.partition_by.is_some() && t.partition_of.is_none())
         };
-        // A standing parent's index (#1688): the engine recurses `CREATE
-        // INDEX` and `DROP INDEX` into every partition, under SHARE on each,
-        // a clone on each partition that the reader leaves to the parent
-        // (DEC-1577.1). A new name is a drop and an add, as on any table.
-        if let Change::AddIndex { table, .. } | Change::DropIndex { table, .. } = change
+        // A standing parent's indexes (#1688), keys, checks and foreign keys
+        // (#1689): the engine recurses each into every partition, a clone on
+        // each that the reader leaves to the parent (DEC-1577.1). A new name
+        // is a drop and an add, as on any table.
+        if let Change::AddIndex { table, .. }
+        | Change::DropIndex { table, .. }
+        | Change::SetPrimaryKey { table, .. }
+        | Change::AddUnique { table, .. }
+        | Change::DropUnique { table, .. }
+        | Change::AddCheck { table, .. }
+        | Change::DropCheck { table, .. }
+        | Change::AddForeignKey { table, .. }
+        | Change::DropForeignKey { table, .. } = change
             && parent_standing(base.schema, table)
             && parent_standing(declared.schema, table)
         {
@@ -3332,7 +3340,7 @@ fn refuse_partition_changes(
                 refuse(
                     table,
                     format!(
-                        "{} while this plan attaches, detaches or drops {}; change the indexes and \
+                        "{} while this plan attaches, detaches or drops {}; change the parent and \
                          the partitions in separate plans",
                         change_in_words(change),
                         tables.join(", ")
@@ -3442,8 +3450,8 @@ fn refuse_partition_changes(
     );
 }
 
-/// Why a standing parent's index change cannot be planned, if it cannot
-/// (#1688). Each is measured on 16.15 and 18.6:
+/// Why a standing parent's index (#1688), key or check change (#1689) cannot
+/// be planned, if it cannot. Each is measured on 16.15 and 18.6:
 /// - `CONCURRENTLY` is refused on a partitioned table, building or dropping,
 ///   so `strategy: online` cannot be honoured, and leaving it off would lock
 ///   every partition the operator asked to keep writable;
@@ -3453,7 +3461,13 @@ fn refuse_partition_changes(
 /// - a new index adopts a partition's own index that matches it (DEC-1577.1),
 ///   which then becomes the parent's clone, and the partition's own is gone
 ///   from every later read. Refused by name (leon, 2026-10-08), the remedy
-///   being to drop or rename the partition's own first.
+///   being to drop or rename the partition's own first;
+/// - a primary key or unique constraint lacking a partition-key column is
+///   refused by the engine as a unique index is;
+/// - a new check absorbs a partition's own check of its name.
+///
+/// `strategy: online` asks only of an index: a key, a check and a foreign
+/// key drop the hint on every table, a partitioned one included (`emit.rs`).
 fn refuse_parent_index(
     table: &TableName,
     change: &Change,
@@ -3462,17 +3476,67 @@ fn refuse_parent_index(
     hints: &Hints,
     changes: &[Change],
 ) -> Option<String> {
-    if hints.strategies.get(table).is_some_and(|s| s.online) {
+    if matches!(change, Change::AddIndex { .. } | Change::DropIndex { .. })
+        && hints.strategies.get(table).is_some_and(|s| s.online)
+    {
         return Some(format!(
             "{} with `strategy: online`, which PostgreSQL cannot build or drop concurrently on a \
              partitioned table; remove the table's `strategy: online` for this plan",
             change_in_words(change)
         ));
     }
+    let parent = declared.schema.tables.get(table)?;
+    let partitions = || {
+        declared.schema.tables.iter().filter(|(_, t)| {
+            t.partition_of
+                .as_ref()
+                .is_some_and(|of| of.parent == *table)
+        })
+    };
+    // A key holds every partition-key column, or the engine refuses it, as
+    // it does a unique index (#1689).
+    let missing_key = |columns: &[String]| {
+        parent.partition_by.as_ref().and_then(|by| {
+            by.columns
+                .iter()
+                .find(|key| !columns.contains(key))
+                .cloned()
+        })
+    };
+    let without_key = |missing: String| {
+        format!(
+            "{} without the partition key column `{missing}`, which PostgreSQL refuses on a \
+             partitioned table; add `{missing}` to its columns",
+            change_in_words(change)
+        )
+    };
+    if let Change::SetPrimaryKey { to: Some(pk), .. } = change {
+        return missing_key(&pk.columns).map(without_key);
+    }
+    if let Change::AddUnique { constraint, .. } = change {
+        return missing_key(&constraint.columns).map(without_key);
+    }
+    // A partition's own check under the parent's new check's name is
+    // absorbed into it, measured on 16 and 18: the same expression makes it
+    // the parent's clone, which the parent's later drop removes, and another
+    // is refused by the engine. Refused by name (leon, 2026-10-08), the
+    // remedy being to drop or rename the partition's own first.
+    if let Change::AddCheck { name, .. } = change {
+        let held: Vec<String> = partitions()
+            .filter(|(_, t)| t.checks.contains_key(name.as_str()))
+            .map(|(partition, _)| partition.to_string())
+            .collect();
+        return (!held.is_empty()).then(|| {
+            format!(
+                "add check `{name}`, a name {} holds as its own check, which the parent's would \
+                 absorb; drop or rename the partition's own check in an earlier plan",
+                held.join(", ")
+            )
+        });
+    }
     let Change::AddIndex { name, index, .. } = change else {
         return None;
     };
-    let parent = declared.schema.tables.get(table)?;
     if index.unique
         && let Some(by) = &parent.partition_by
         && let Some(missing) = by.columns.iter().find(|key| {
@@ -3493,15 +3557,7 @@ fn refuse_parent_index(
     // the plan adds to a standing partition is built after its parent's, and
     // is its own. Held, not equal: across a column rename the index is
     // compared as renamed and kept, not dropped (#1737 review).
-    let adopted: Vec<String> = declared
-        .schema
-        .tables
-        .iter()
-        .filter(|(_, t)| {
-            t.partition_of
-                .as_ref()
-                .is_some_and(|of| of.parent == *table)
-        })
+    let adopted: Vec<String> = partitions()
         .flat_map(|(partition, t)| {
             let before = declared
                 .ids
@@ -3543,7 +3599,7 @@ fn refuse_parent_index(
 /// An expression key or a predicate is a match whatever its text, as the
 /// attach path takes it (DEC-1545.1): the engine compares what each parses
 /// and binds to, so `n+1` and `n + 1` are one index to it (#1737 review).
-fn adopts(parent: &pbps_model::Index, own: &pbps_model::Index) -> bool {
+pub fn adopts(parent: &pbps_model::Index, own: &pbps_model::Index) -> bool {
     parent.method == own.method
         && parent.unique == own.unique
         && parent.filter.is_some() == own.filter.is_some()
@@ -6777,11 +6833,11 @@ mod tests {
             .remove(&"app.ev_1".parse::<TableName>().unwrap());
         refused(
             outcome(&plain, &unique_without, false),
-            "change the indexes and the partitions in separate plans",
+            "change the parent and the partitions in separate plans",
         );
         refused(
             outcome(&indexed, &plain_without, false),
-            "change the indexes and the partitions in separate plans",
+            "change the parent and the partitions in separate plans",
         );
         // Negative: the partition dropped alone is planned.
         assert!(outcome(&indexed, &without_partition, false).is_ok());
@@ -6901,6 +6957,224 @@ mod tests {
                 Ok(vec!["AddIndex".to_owned()])
             );
         }
+    }
+
+    /// A standing parent's keys, checks and foreign keys change as a
+    /// table's do (#1689), the engine recursing each into every partition,
+    /// and a foreign key may reference it. Refused by name: a key without a
+    /// partition-key column, a check under a name a partition holds as its
+    /// own, and any of them in a plan that drops a partition under it.
+    /// `strategy: online` is no refusal here: only an index honours it.
+    #[test]
+    fn a_partitioned_parents_keys_checks_and_foreign_keys_change() {
+        use pbps_model::{
+            CheckConstraint, ForeignKey, PartitionBound, PartitionBy, PartitionOf, PrimaryKey,
+            UniqueConstraint,
+        };
+        let ev: TableName = "app.ev".parse().unwrap();
+        let ev_1: TableName = "app.ev_1".parse().unwrap();
+        let check = |e: &str| CheckConstraint {
+            expression: e.into(),
+        };
+        let key = |columns: &[&str]| columns.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+        let tree = |edit: &dyn Fn(&mut Table, &mut Table, &mut Schema)| {
+            let mut parent = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("ts", Column::new(ty("date")).not_null()),
+                ("r", Column::new(ty("int"))),
+            ]);
+            parent.partition_by = Some(PartitionBy {
+                columns: vec!["ts".into()],
+            });
+            let mut partition = Table {
+                partition_of: Some(PartitionOf {
+                    parent: ev.clone(),
+                    bound: PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            };
+            let mut s = schema_of("app.ref", {
+                let mut t = table(&[("id", Column::new(ty("int")).not_null())]);
+                t.primary_key = Some(PrimaryKey {
+                    name: None,
+                    columns: key(&["id"]),
+                    storage_parameters: Default::default(),
+                });
+                t
+            });
+            s.tables.insert(
+                "app.child".parse().unwrap(),
+                table(&[
+                    ("id", Column::new(ty("int")).not_null()),
+                    ("ts", Column::new(ty("date")).not_null()),
+                ]),
+            );
+            edit(&mut parent, &mut partition, &mut s);
+            s.tables.insert(ev.clone(), parent);
+            s.tables.insert(ev_1.clone(), partition);
+            s
+        };
+        let outcome = |base: &Schema, declared: &Schema, online: bool| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let dropped: Vec<Intent> = base
+                .tables
+                .keys()
+                .filter(|t| !declared.tables.contains_key(*t))
+                .map(|t| Intent::DropTable {
+                    table: t.clone(),
+                    reason: "gone".into(),
+                })
+                .collect();
+            let declared_ids = crate::resolve(declared, &base_ids, &dropped, &ctx())
+                .unwrap()
+                .ids;
+            let mut hints = Hints::default();
+            if online {
+                hints
+                    .strategies
+                    .insert(ev.clone(), pbps_model::Strategy { online: true });
+            }
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &hints,
+            )
+            .map(|cs| kinds(&cs))
+            .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let refused = |result: Result<Vec<String>, Vec<String>>, what: &str| {
+            let errors = result.expect_err(what);
+            assert!(errors.iter().any(|e| e.contains(what)), "{errors:?}");
+        };
+        let plain = tree(&|_, _, _| {});
+        let pk = |columns: &'static [&'static str]| {
+            move |p: &mut Table, _: &mut Table, _: &mut Schema| {
+                p.primary_key = Some(PrimaryKey {
+                    name: None,
+                    columns: key(columns),
+                    storage_parameters: Default::default(),
+                });
+            }
+        };
+        let unique = |columns: &'static [&'static str]| {
+            move |p: &mut Table, _: &mut Table, _: &mut Schema| {
+                p.unique.insert(
+                    "ev_u".into(),
+                    UniqueConstraint {
+                        columns: key(columns),
+                        storage_parameters: Default::default(),
+                    },
+                );
+            }
+        };
+        let checked = tree(&|p, _, _| {
+            p.checks.insert("ev_ck".into(), check("r > 0"));
+        });
+        let fk = tree(&|p, _, _| {
+            p.foreign_keys.insert(
+                "ev_r_fk".into(),
+                ForeignKey {
+                    columns: key(&["r"]),
+                    references_table: "app.ref".parse().unwrap(),
+                    references_columns: key(&["id"]),
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+        });
+        // Each added and dropped.
+        for (declared, kind) in [
+            (tree(&pk(&["id", "ts"])), "SetPrimaryKey"),
+            (tree(&unique(&["id", "ts"])), "AddUnique"),
+            (checked.clone(), "AddCheck"),
+            (fk.clone(), "AddForeignKey"),
+        ] {
+            assert_eq!(outcome(&plain, &declared, false), Ok(vec![kind.to_owned()]));
+            assert!(outcome(&declared, &plain, false).is_ok(), "{kind} dropped");
+        }
+        // A foreign key referencing the parent's key.
+        let keyed = tree(&pk(&["id", "ts"]));
+        let referenced = tree(&|p, q, s| {
+            pk(&["id", "ts"])(p, q, s);
+            s.tables
+                .get_mut(&"app.child".parse::<TableName>().unwrap())
+                .unwrap()
+                .foreign_keys
+                .insert(
+                    "child_ev_fk".into(),
+                    ForeignKey {
+                        columns: key(&["id", "ts"]),
+                        references_table: ev.clone(),
+                        references_columns: key(&["id", "ts"]),
+                        on_delete: Default::default(),
+                        on_update: Default::default(),
+                    },
+                );
+        });
+        assert_eq!(
+            outcome(&keyed, &referenced, false),
+            Ok(vec!["AddForeignKey".to_owned()])
+        );
+        // Without the partition key column.
+        refused(
+            outcome(&plain, &tree(&pk(&["id"])), false),
+            "without the partition key column `ts`",
+        );
+        refused(
+            outcome(&plain, &tree(&unique(&["id"])), false),
+            "without the partition key column `ts`",
+        );
+        // A check under a name the partition holds as its own; under another
+        // name, planned.
+        let own = |name: &'static str| {
+            move |_: &mut Table, q: &mut Table, _: &mut Schema| {
+                q.checks.insert(name.into(), check("r > 1"));
+            }
+        };
+        refused(
+            outcome(
+                &tree(&own("ev_ck")),
+                &tree(&|p, q, s| {
+                    own("ev_ck")(p, q, s);
+                    p.checks.insert("ev_ck".into(), check("r > 0"));
+                }),
+                false,
+            ),
+            "a name app.ev_1 holds as its own check",
+        );
+        assert_eq!(
+            outcome(
+                &tree(&own("ev_1_ck")),
+                &tree(&|p, q, s| {
+                    own("ev_1_ck")(p, q, s);
+                    p.checks.insert("ev_ck".into(), check("r > 0"));
+                }),
+                false,
+            ),
+            Ok(vec!["AddCheck".to_owned()])
+        );
+        // In a plan that drops a partition under the parent.
+        let mut checked_without = checked.clone();
+        checked_without.tables.remove(&ev_1);
+        refused(
+            outcome(&plain, &checked_without, false),
+            "change the parent and the partitions in separate plans",
+        );
+        // `strategy: online` asks nothing of a check or a key.
+        assert_eq!(
+            outcome(&plain, &checked, true),
+            Ok(vec!["AddCheck".to_owned()])
+        );
     }
 
     #[test]

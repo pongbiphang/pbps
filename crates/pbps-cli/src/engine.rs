@@ -2830,6 +2830,10 @@ pub async fn account_for_module_dependents(
     let added = added
         + crate::dependents::after_their_parents_defaults(changes, declared, ids, dialect)
             .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
+    // And a parent's new index ahead of the partition indexes it could take
+    // (#1745 review).
+    crate::dependents::before_its_partitions_indexes(changes, declared, dialect)
+        .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     // On the final order: every pass above may move what an expression
     // names, or the expression (#1576).
     // Which name each unnamed key's index takes depends on what holds its

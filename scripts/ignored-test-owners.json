@@ -1382,6 +1382,8 @@
         "a_partitioned_parents_column_changes_reach_its_partitions_own_through_the_cli_before_postgres_17",
         "a_partitioned_parents_indexes_change_through_the_cli",
         "a_partitioned_parents_indexes_change_through_the_cli_before_postgres_17",
+        "a_partitioned_parents_keys_checks_and_foreign_keys_change_through_the_cli",
+        "a_partitioned_parents_keys_checks_and_foreign_keys_change_through_the_cli_before_postgres_17",
         "a_function_rebuilt_under_partition_defaults_keeps_each_partitions_own",
         "a_partitions_default_taken_back_resolves_under_its_parents_schema",
         "a_partitions_own_default_stored_as_its_parents_is_refused_before_the_plan",

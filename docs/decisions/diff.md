@@ -4205,7 +4205,10 @@ for a column change (DEC-1687.1).
   after a replica identity naming it. A rank is no edge, and the resolver
   keeps only edges, so its graph carries a structural one from a parent's
   `AddIndex` to each `AddIndex` on its partitions (#1737 review). The
-  dependents' weave keeps the plan's order among what it moves.
+  dependents' weave keeps the plan's order among what it moves. Around a
+  rebuilt function it restores the dependents it takes down itself, in the
+  reverse of the order it takes them, so it takes a parent's index after its
+  partitions' to restore it first (#1745 review).
 - **an index change in a plan that attaches, detaches or drops a partition
   under the parent**, the same two plans a column change takes (DEC-1687.1).
   A detach checks its shape against the parent's indexes as they stood, and
@@ -4233,3 +4236,93 @@ partition's index is attached by hand, which is not one statement.
 Pinned by `a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken`
 and by the CLI's `a_partitioned_parents_indexes_change_through_the_cli`, on 18
 and on 16.
+
+<a id="dec-1689-1"></a>
+
+**DEC-1689.1. A standing range-partitioned parent's primary key, unique
+constraints, checks and foreign keys are added and dropped as a table's are,
+the engine recursing each into every partition, and two combinations are
+refused by name (#1689).**
+
+The third of #1546's four slices (leon, 2026-10-08). Measured on 16.15 and
+18.6, on a populated tree:
+- **Keys.** A primary key or unique constraint added to the parent recurses,
+  each partition getting the engine's clone. One without every
+  partition-key column is refused: "unique constraint on partitioned table
+  must include all partitioning columns". A drop takes the clones with it.
+- **Checks.** A check recurses as a clone. A partition's own check under
+  the same name and expression is absorbed into it: it becomes inherited,
+  and the parent's later drop removes it. With another expression, the
+  engine refuses the add.
+- **Foreign keys.** A foreign key from the parent recurses. A foreign key
+  referencing the parent works. `NOT VALID` on one from the parent is
+  refused on 16 and accepted on 18. The PostgreSQL emitter never writes
+  `NOT VALID`, so the issue's refusal on 16 has nothing to refuse.
+- **A partition's own key.** A parent key adopts a partition's own key, and
+  a parent's unique index adopts the index behind one. Neither case is
+  reachable: a partition entry declares no key of its own (the loader
+  rejects one), and the reader refuses a tree whose partition holds one
+  (#1170). So DEC-1688.1's guard needs nothing more.
+
+**What is planned.** On a parent standing before and after the plan:
+`SetPrimaryKey`, `AddUnique`, `DropUnique`, `AddCheck`, `DropCheck`,
+`AddForeignKey` and `DropForeignKey`, with no new kind of change. A foreign
+key from another table referencing the parent was never refused, since its
+change is the other table's. The pre-flight probes a new key or check over
+the parent, which reads every partition's rows. `strategy: online` asks
+nothing of these, as on any table: only an index honours it (`emit.rs`).
+
+**Refused by name, before any DDL:**
+- **a primary key or unique constraint without every partition-key
+  column**, naming the missing column;
+- **a new check under a name a declared partition holds as its own** (leon,
+  2026-10-08, on #1546). The remedy is to drop or rename the partition's own
+  check in an earlier plan. Only the name is asked, since the engine merges
+  or refuses on the name alone;
+- **any of these in a plan that attaches, detaches or drops a partition
+  under the parent**, the two plans DEC-1687.1 and DEC-1688.1 already
+  require.
+
+**A clone is its parent's to a module rebuild.** When a function is rebuilt,
+its dependents are read from `pg_depend`. A parent's check or index that
+calls the function is found there on every partition too, as clones no
+declaration names: a partition's inherited check, and the index attached to
+the parent's. Each was refused as unmanaged. The parent's own index, of
+relkind `I`, was refused as "a relation of a kind this reader does not
+know". The dependents query now reports a partition's clone as the parent's
+object: its table, its name and its description. So the parent's drop and
+add around the rebuild, or its removal in the same plan, account for every
+clone, in planning and in the saved-plan check alike, and the plan never
+needs to name the clones (#1745 review). This was not new with this slice:
+a parent created with a check or index calling a function met it on that
+function's first rebuild.
+
+Two consequences, both from the #1745 review:
+- **A rebuild alongside a detach under the parent is refused by name.**
+  The parent's drop, placed before the function's, takes every copy while
+  the partitions are attached, and its add after the function's create puts
+  them back. A detach runs between the two, finds no copy to give its
+  declared name, and would leave the detached table without it. The remedy
+  is the two plans DEC-1687.1 already asks for. An attach needs nothing: the
+  table's check is its own until the attach and the parent's after
+  (DEC-1545.1, #1642 review). A partition dropped goes with its copy.
+- **A parent's new index goes ahead of the partition indexes it could
+  take.** A partition's new own index that calls the rebuilt function moves
+  after the rebuild, but ahead of the parent's restoration, which would then
+  take it as its clone. The last reordering of `plan --db` moves the
+  parent's index, not the partition's: what rests on a partition's index
+  (a foreign key on a unique one, a sibling naming it in a literal) keeps
+  its place after it. The parent's index takes with it what it rests on
+  between them, closed over what those rest on: a relation a literal in its
+  text may name, the key a foreign key references, a drop that may free its
+  name. Read wide, a dependency imagined only moves a change that could
+  have stayed. Moving the partition's index instead was tried first, and
+  each fix of what rested on it found another dependent; the closure is the
+  general form of both directions. Refused by name: a closure that holds a
+  partition index the parent's could take (no order satisfies it), and a
+  change between them that could create a table, a column or a module.
+
+Pinned by `a_partitioned_parents_keys_checks_and_foreign_keys_change`, and by
+the CLI's
+`a_partitioned_parents_keys_checks_and_foreign_keys_change_through_the_cli`,
+on 18 and on 16.

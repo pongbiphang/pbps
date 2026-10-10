@@ -322,9 +322,14 @@ indexes:
   added and dropped, a new name being a drop and an add, each recursing as
   the partitions' clones; `strategy: online`, a unique index without a key
   column, and a new index that can take a partition's own as its clone are
-  refused by name (DEC-1688.1). Every other change stays refused by name: the
-  parent's keys, checks and foreign keys, and its rename, until #1689–#1690,
-  and attaching as the DEFAULT partition until #1639.
+  refused by name (DEC-1688.1). Its primary key, unique constraints, checks
+  and foreign keys are added and dropped the same way, and a foreign key may
+  reference it; a key without a partition-key column, and a check under a
+  name a partition holds as its own, are refused by name (DEC-1689.1). The
+  indexes, keys, checks and foreign keys do not change in a plan that
+  attaches, detaches or drops under the parent either. Every other change
+  stays refused by name: the parent's rename until #1690, and attaching as
+  the DEFAULT partition until #1639.
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first
