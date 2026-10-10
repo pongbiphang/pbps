@@ -4474,7 +4474,13 @@ fn refuse_unplanned_movement(
                     .filter(|(_, held)| *held != (false, false))
                     .collect()
             };
-            let parent = now.partition_of.as_ref().map(|of| &of.parent);
+            // The parent under the name the plan leaves it, which its changes
+            // name: both reads are brought back before this plan's renames,
+            // the partition's parent included (#1690 review).
+            let parent = now
+                .partition_of
+                .as_ref()
+                .map(|of| *renamed.get(&of.parent).unwrap_or(&&of.parent));
             // A parent whose column names change hands in this plan
             // (DEC-541.1): undone, two of its columns would share a name, and
             // a partition's own entries on them one key. Both reads are then
@@ -8992,11 +8998,21 @@ async fn preflight(
         );
     }
 
+    // The probes take the plan's changes, which name a parent it renames by
+    // its new name, so the stored relation is brought under those names
+    // (#1751 review).
+    let renames = plan.changes.changes.iter().filter_map(|p| {
+        if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
+            Some((from, to))
+        } else {
+            None
+        }
+    });
     run_probes(
         conn,
         dialect,
         &plan.changes,
-        &pbps_model::Partitions::of(stored),
+        &pbps_model::Partitions::of(stored).renamed(renames),
     )
     .await
 }

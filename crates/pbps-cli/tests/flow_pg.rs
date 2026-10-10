@@ -19869,7 +19869,8 @@ fn parent_rename_flow(server: &str, slug: &str) {
     on_server(
         &conn,
         "CREATE SCHEMA app; \
-         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, r integer, \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, r integer, note text, \
+             v numeric(10,2), \
              PRIMARY KEY (id, ts), CONSTRAINT ev_r_ck CHECK (r > 0)) \
              PARTITION BY RANGE (ts); \
          CREATE INDEX ev_r ON app.ev (r); \
@@ -19878,7 +19879,9 @@ fn parent_rename_flow(server: &str, slug: &str) {
          CREATE TABLE app.ev_2025 PARTITION OF app.ev \
              FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
          CREATE INDEX ev_2024_own ON app.ev_2024 (id, r); \
-         INSERT INTO app.ev VALUES (1, '2024-06-01', 1), (2, '2025-06-01', 2); \
+         ALTER TABLE app.ev_2024 ALTER COLUMN note SET DEFAULT 'x'; \
+         INSERT INTO app.ev VALUES (1, '2024-06-01', 1, NULL, 1.50), \
+             (2, '2025-06-01', 2, NULL, 2.00); \
          CREATE TABLE app.child (id integer NOT NULL, ts date NOT NULL, \
              CONSTRAINT child_ev_fk FOREIGN KEY (id, ts) REFERENCES app.ev (id, ts)); \
          INSERT INTO app.child VALUES (1, '2024-06-01')",
@@ -19955,9 +19958,17 @@ fn parent_rename_flow(server: &str, slug: &str) {
         2
     );
 
-    // Renamed again, in the plan that also renames a column and adds an
-    // index: the parent's changes name it as declared, and each reaches the
-    // partitions under the new name.
+    let text_before = std::fs::read_to_string(d.dir.join("schema/app.events.yml")).unwrap();
+    assert!(
+        text_before.contains("  v:\n    type: \"numeric(10, 2)\"\n"),
+        "{text_before}"
+    );
+    // Renamed again, in the plan that also renames a column, drops one a
+    // partition holds its own default on, and adds an index: the parent's
+    // changes name it as declared, and each reaches the partitions under the
+    // new name. The drop takes the partition's own default with it, which
+    // the apply's read-back expects under the parent's new name (#1751
+    // review).
     let from = d.dir.join("schema/app.events.yml");
     let text = std::fs::read_to_string(&from).unwrap();
     let head = "table: app.events\nrenamed_from: app.ev\n";
@@ -19977,7 +19988,26 @@ fn parent_rename_flow(server: &str, slug: &str) {
         )
         .replace("columns: [r]", "columns: [r2]")
         .replace("columns: [id, r]", "columns: [id, r2]")
-        .replace("r > 0", "r2 > 0");
+        .replace("r > 0", "r2 > 0")
+        .replacen("  note:\n    type: text\n", "", 1)
+        .replacen(
+            "    columns:\n      note: {default: \"'x'::text\"}\n",
+            "",
+            1,
+        )
+        // A retype the pre-flight probes through the partitions under the
+        // parent's new name: `1.50` is `2` once converted, which the
+        // partition's new check takes (#1751 review).
+        .replacen(
+            "  v:\n    type: \"numeric(10, 2)\"\n",
+            "  v:\n    type: \"numeric(10, 0)\"\n",
+            1,
+        )
+        .replacen(
+            "    indexes:\n      ev_2024_own:",
+            "    checks:\n      ev_2024_v: v = round(v)\n    indexes:\n      ev_2024_own:",
+            1,
+        );
     std::fs::write(d.dir.join("schema/app.ev2.yml"), text).unwrap();
     std::fs::remove_file(&from).unwrap();
     let text = std::fs::read_to_string(&child).unwrap();
@@ -19986,6 +20016,7 @@ fn parent_rename_flow(server: &str, slug: &str) {
         text.replace("app.events(id, ts)", "app.ev2(id, ts)"),
     )
     .unwrap();
+    succeeds(d.run(&["drop", "app.ev2.note", "--reason", "unused"]));
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     d.commit();
@@ -19998,7 +20029,7 @@ fn parent_rename_flow(server: &str, slug: &str) {
         &d,
         &conn,
         &plan,
-        &["--allow", "rename,constraint"],
+        &["--allow", "rename,constraint,destructive,narrowing"],
     ));
     succeeds(d.run(&["verify", "--db", &conn]));
     let next = succeeds(d.run(&["plan", "--db", &conn]));
@@ -20016,6 +20047,13 @@ fn parent_rename_flow(server: &str, slug: &str) {
         3
     );
     assert_eq!(holds("SELECT count(*) FROM app.ev2"), 2);
+    assert_eq!(
+        holds(
+            "SELECT count(*) FROM pg_attribute WHERE attname = 'note' AND NOT attisdropped \
+             AND attrelid IN ('app.ev2'::regclass, 'app.ev_2024'::regclass)"
+        ),
+        0
+    );
 
     // Outside the declarations, a permanent table's key to the parent. A
     // plan renaming the parent and adding an unlogged partition under the

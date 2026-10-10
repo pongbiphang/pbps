@@ -3210,18 +3210,35 @@ fn refuse_partition_changes(
             } else {
                 None
             };
+            // Under the name the plan leaves the parent: a detach's is the
+            // base's, brought forward; an attach's is already declared.
             if let Some(of) = parent {
+                let parent = if detached {
+                    declared_parent(&of.parent)
+                } else {
+                    of.parent.clone()
+                };
                 moving
-                    .entry(declared_parent(&of.parent))
+                    .entry(parent)
                     .or_default()
                     .push(declared_name.clone());
             }
-            // A partition's parent as declared: one the plan renames is the
-            // same parent under its new name (#1690).
-            let where_ = |t: &Table| {
-                t.partition_of
-                    .as_ref()
-                    .map(|of| (declared_parent(&of.parent), of.bound.clone()))
+            // A partition's parent as declared: the base's brought forward
+            // through the plan's renames, one it renames being the same
+            // parent under its new name (#1690). The declared side is already
+            // under the names the plan leaves; bringing it forward too would
+            // move a name another rename has taken (#1751 review).
+            let where_ = |t: &Table, forward: bool| {
+                t.partition_of.as_ref().map(|of| {
+                    (
+                        if forward {
+                            declared_parent(&of.parent)
+                        } else {
+                            of.parent.clone()
+                        },
+                        of.bound.clone(),
+                    )
+                })
             };
             // A key column renamed is the same key: the engine renames it in
             // the key as it does in the table (measured on 16 and 18, #1687).
@@ -3235,7 +3252,8 @@ fn refuse_partition_changes(
                         .collect(),
                 }
             };
-            if (b.partition_by.as_ref().map(renamed) != d.partition_by || where_(b) != where_(d))
+            if (b.partition_by.as_ref().map(renamed) != d.partition_by
+                || where_(b, true) != where_(d, false))
                 && !detached
                 && !attached
             {
@@ -7140,6 +7158,57 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.contains("drops app.ev_2")
                 && e.contains("rename it and change the partitions in separate plans")),
+            "{errors:?}"
+        );
+        // A chain across revisions, `b` to `c` and then `a` to `b`: each
+        // partition's base parent is brought forward once, and `a`'s,
+        // declared under `b`, is not brought forward again (#1751 review).
+        let two = |a: &str, a_1: &str, b: &str, b_1: &str| {
+            let mut s = tree(&a.parse().unwrap(), &[a_1]);
+            s.tables.extend(tree(&b.parse().unwrap(), &[b_1]).tables);
+            s
+        };
+        let (a, b, c): (TableName, TableName, TableName) = (
+            "app.a".parse().unwrap(),
+            "app.b".parse().unwrap(),
+            "app.c".parse().unwrap(),
+        );
+        // Two revisions, resolved in turn, as the ids file records them.
+        let across = |base: &Schema, mid: &Schema, declared: &Schema| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let mid_ids = crate::resolve(mid, &base_ids, &[rename(&b, &c)], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &mid_ids, &[rename(&a, &b)], &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .map(|cs| kinds(&cs))
+            .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let base_ab = two("app.a", "app.a_1", "app.b", "app.b_1");
+        let mid = two("app.a", "app.a_1", "app.c", "app.b_1");
+        let chained = across(&base_ab, &mid, &two("app.b", "app.a_1", "app.c", "app.b_1")).unwrap();
+        assert_eq!(chained, ["RenameTable", "RenameTable"]);
+        // Negative: a partition truly moved to another parent across the
+        // chain is still a change of its partitioning.
+        let errors = across(&base_ab, &mid, &two("app.b", "app.b_1", "app.c", "app.a_1"))
+            .expect_err("refused");
+        assert!(
+            errors.iter().any(|e| e.contains("change its partitioning")),
             "{errors:?}"
         );
         // Negative: a partition's own rename stays refused.

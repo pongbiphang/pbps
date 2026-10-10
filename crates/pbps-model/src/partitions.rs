@@ -87,6 +87,32 @@ impl Partitions {
         self
     }
 
+    /// The relation under the names a plan's table renames leave, for one
+    /// read before them: a parent the plan renames holds its partitions
+    /// under its new name, which the plan's changes to it name (#1751
+    /// review). Every rename at once, so a chain (`b` to `c`, then `a` to
+    /// `b`) moves each parent once. Only for a read before the plan: the
+    /// declarations are already under these names.
+    pub fn renamed<'a>(
+        self,
+        renames: impl IntoIterator<Item = (&'a TableName, &'a TableName)>,
+    ) -> Self {
+        let renames: BTreeMap<&TableName, &TableName> = renames.into_iter().collect();
+        let to = |t: TableName| renames.get(&t).map_or(t, |&n| n.clone());
+        Self {
+            parents: self
+                .parents
+                .into_iter()
+                .map(|(p, of)| (p, to(of)))
+                .collect(),
+            held: self
+                .held
+                .into_iter()
+                .map(|(of, held)| (to(of), held))
+                .collect(),
+        }
+    }
+
     /// Whether this schema has no partition at all.
     pub fn is_empty(&self) -> bool {
         self.parents.is_empty()
@@ -120,6 +146,28 @@ mod tests {
         s.tables.insert(name("app.p_a"), partition("app.p"));
         s.tables.insert(name("app.t"), Table::default());
         s
+    }
+
+    /// A read before a plan's renames, brought under the names they leave:
+    /// each parent moves once, a chain included (#1751 review).
+    #[test]
+    fn a_renamed_parent_holds_its_partitions_under_its_new_name() {
+        let mut s = schema();
+        s.tables.insert(name("app.q"), Table::default());
+        s.tables.insert(name("app.q_1"), partition("app.q"));
+        // `q` to `r`, then `p` to `q`: each once.
+        let (p, q, r) = (name("app.p"), name("app.q"), name("app.r"));
+        let moved = Partitions::of(&s).renamed([(&q, &r), (&p, &q)]);
+        assert_eq!(moved.of_parent(&q), [name("app.p_a"), name("app.p_b")]);
+        assert_eq!(moved.of_parent(&r), [name("app.q_1")]);
+        assert_eq!(moved.parent(&name("app.q_1")), Some(&r));
+        assert_eq!(
+            moved.column(&ColumnRef::new(name("app.p_a"), "v")),
+            ColumnRef::new(q.clone(), "v")
+        );
+        // Negative: the old name holds nothing, and no rename moves nothing.
+        assert!(moved.of_parent(&p).is_empty());
+        assert_eq!(Partitions::of(&s).renamed([]), Partitions::of(&s));
     }
 
     #[test]

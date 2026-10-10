@@ -4341,12 +4341,25 @@ it, as on any table. So the plan is the one `RenameTable`.
 
 What the rename touches beyond the parent's own statement:
 - **The partitions' declarations.** Each names its parent, so after the
-  rename `partition_of.parent` differs from the base. Compared through the
-  plan's renames, it is the same parent, and no "change its partitioning".
+  rename `partition_of.parent` differs from the base. The base's parent,
+  brought forward through the plan's renames, is the same parent, and no
+  "change its partitioning". Only the base's: the declared one is already
+  under the names the plan leaves, and in a chain across revisions (`b` to
+  `c`, then `a` to `b`) bringing it forward too moved it to `c` (#1751
+  review).
 - **The apply's read-back.** A partition has no change of its own, so the
-  apply compares it with what the plan was approved over. Its parent is
-  brought forward through the plan's renames there too (`Renames::apply`),
-  as a foreign key's referenced table already was.
+  apply compares it with what the plan was approved over. Both reads are
+  brought back before the plan's renames, its parent included
+  (`Renames::apply`), as a foreign key's referenced table already was. The
+  parent's own column changes name it as declared, so the field-wise check
+  of a partition's own defaults and NOT NULLs takes the parent back to that
+  name before matching them (#1751 review).
+- **The pre-flight probes.** They read the stored relation and the plan's
+  changes, which name the parent as declared, so the stored relation is
+  brought under the plan's names first (`Partitions::renamed`). Otherwise a
+  retype on the renamed parent did not reach its partitions, and a
+  partition's new check was probed against unconverted values (#1751
+  review).
 - **The parent's own changes in the same plan.** They name it as declared,
   so the standing-parent branches of `refuse_partition_changes` look the
   parent up on the base side under its base name. A rename with a new
