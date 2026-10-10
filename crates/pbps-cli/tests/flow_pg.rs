@@ -374,6 +374,12 @@ fn approved_apply(d: &Demo, connection: &str, plan: &std::path::Path, extra: &[&
 /// Use psql's actual statement scanner: sending the whole file in one simple
 /// query would parse the DDL before the leading SETs take effect (decision 458).
 fn psql_script(db: &OwnDatabase, script: &str) -> Output {
+    psql_script_in("PBPS_TEST_PG_CONTAINER", db, script)
+}
+
+/// [`psql_script`] through the psql of the container `container` names, the
+/// one serving `db`'s server.
+fn psql_script_in(container: &str, db: &OwnDatabase, script: &str) -> Output {
     use std::io::Write;
     use std::process::Stdio;
 
@@ -388,7 +394,7 @@ fn psql_script(db: &OwnDatabase, script: &str) -> Output {
             .arg(db.connection())
             .env("PGOPTIONS", options);
         command
-    } else if let Some(container) = std::env::var_os("PBPS_TEST_PG_CONTAINER") {
+    } else if let Some(container) = std::env::var_os(container) {
         let mut command = Command::new("docker");
         command.args(["exec", "-i", "-e", &format!("PGOPTIONS={options}")]);
         command
@@ -19916,7 +19922,7 @@ fn parent_keys_flow(server: &str, slug: &str) {
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_range_beside_a_default_takes_its_rows_through_the_cli() {
-    default_move_flow(&server(), "default-move-1547");
+    default_move_flow(&server(), "default-move-1547", "PBPS_TEST_PG_CONTAINER");
 }
 
 /// [`a_range_beside_a_default_takes_its_rows_through_the_cli`] on a pre-17
@@ -19930,10 +19936,14 @@ fn a_range_beside_a_default_takes_its_rows_through_the_cli_before_postgres_17() 
         "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE \
          EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
     );
-    default_move_flow(&server, "default-move-1547-old");
+    default_move_flow(
+        &server,
+        "default-move-1547-old",
+        "PBPS_TEST_PG_OLD_CONTAINER",
+    );
 }
 
-fn default_move_flow(server: &str, slug: &str) {
+fn default_move_flow(server: &str, slug: &str, container: &str) {
     let db = OwnDatabase::new(server, slug);
     let conn = db.connection().to_owned();
     on_server(
@@ -20146,6 +20156,21 @@ fn default_move_flow(server: &str, slug: &str) {
         0,
         "nothing ran"
     );
+
+    // The same plan, with nothing referencing the row, as the `plan --sql`
+    // script psql reads one command at a time (SPEC 7.3): the lock, the table,
+    // the move and the attach are one `DO` block there too, so the lock is
+    // taken and the row moves. As a batch of four, psql ran `LOCK` alone,
+    // outside a transaction, and refused it (#1763 review).
+    on_server(&conn, "DELETE FROM ext.child");
+    let script = d.dir.join("move.sql");
+    succeeds(d.run(&["plan", "--db", &conn, "--sql", script.to_str().unwrap()]));
+    let generated = std::fs::read_to_string(&script).unwrap();
+    assert!(generated.contains("LOCK TABLE ONLY"), "{generated}");
+    succeeds(psql_script_in(container, &db, &generated));
+    assert_eq!(ids_in("ONLY app.ev_2026"), "4");
+    assert_eq!(ids_in("ONLY app.ev_rest"), "5");
+    assert_eq!(ids_in("app.events"), "1,2,3,4,5", "no row lost or doubled");
 }
 
 /// #1690: a standing range-partitioned parent is renamed as any table is, a

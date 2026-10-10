@@ -4421,7 +4421,7 @@ leon chose C (2026-10-10). Two further choices were made on the issue:
   own lock, which no other session can reach.
 
 **The statements**, in one change, `CreateTable` with `beside_default`
-naming the DEFAULT, and the first four in one statement. Its declared name is the right one, because renames run
+naming the DEFAULT, and the first four in one `DO` block. Its declared name is the right one, because renames run
 in class 1, before every create. Only a DEFAULT the base and the
 declarations both hold under that parent counts. A DEFAULT the plan drops or
 detaches is gone in class 6, and a new one starts empty.
@@ -4454,15 +4454,23 @@ detaches is gone in class 6, and a new one starts empty.
    statements of their own, the partition's own defaults, NOT NULLs, checks
    and indexes, as after #1171's create.
 
-**One statement.** The engine runs a batch as one transaction even outside
-an explicit one. Measured: `LOCK` is accepted there, and a refused attach
+**One statement.** The lock, the create, the move and the attach are one
+`DO` block. A `DO` block is one statement wherever it runs, and a failure
+anywhere in it undoes all of it (DECISIONS 328). Measured on 16 and 18:
+`LOCK` is accepted inside it outside any transaction, and a refused attach
 takes the table and the move back with it. So no apply can stop with the
-rows out of the DEFAULT and the table not yet attached, as #1171's detach
-and drop are one statement. A staged apply is no exception, and
-`a_range_beside_a_default_takes_its_rows_through_the_cli` applies one
-staged. Emitted as four, the statements failed when run one at a time
-outside a transaction (`LOCK TABLE can only be used in transaction blocks`),
-and a staged run would have committed the moved rows outside the parent.
+rows out of the DEFAULT and the table not yet attached. A staged apply is no
+exception, and `a_range_beside_a_default_takes_its_rows_through_the_cli`
+applies one staged.
+
+Two weaker shapes failed:
+- **Four statements.** Run one at a time outside a transaction, `LOCK`
+  failed (`LOCK TABLE can only be used in transaction blocks`), and a staged
+  run would have committed the moved rows outside the parent.
+- **One batch of four commands.** A driver sending it as one query runs it as
+  one implicit transaction. But a `plan --sql` script is read by `psql`
+  command by command (SPEC 7.3), where it is four statements again (#1763
+  review). The same test runs that script through psql.
 
 **What the move sets off.** A `DELETE` from the DEFAULT is a delete. Measured
 on 16 and 18:

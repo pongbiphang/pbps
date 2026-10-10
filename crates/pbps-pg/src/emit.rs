@@ -3300,6 +3300,22 @@ fn beside_its_default(
     // plan drops first are gone.
     let fires = crate::preflight::fires_here;
     let refuse = |why: String| format!("RAISE EXCEPTION USING MESSAGE = {};", literal(&why));
+    let create = on(
+        pg,
+        name,
+        &format!(
+            "{create} (LIKE {p} INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING CONSTRAINTS \
+             INCLUDING STORAGE INCLUDING COMPRESSION) USING heap{storage};"
+        ),
+    )?;
+    // The lock, the table, the move and the attach are one `DO` block, not a
+    // batch of four: a batch is one transaction only when a driver sends it
+    // as one query, and a `plan --sql` script read by `psql -f` runs each
+    // command alone (SPEC 7.3), where `LOCK` fails outside a transaction and
+    // the rest commits piecemeal. A `DO` block is one statement wherever it
+    // runs, and a failure anywhere in it undoes all of it (DECISIONS 328):
+    // measured on 16 and 18 under psql's autocommit, a refused attach left
+    // no table and no row moved (#1763 review).
     let body = format!(
         "DECLARE\n\
          \x20   keep text;\n\
@@ -3308,6 +3324,8 @@ fn beside_its_default(
          \x20   hit boolean;\n\
          \x20   fk record;\n\
          BEGIN\n\
+         \x20   LOCK TABLE ONLY {d} IN SHARE MODE;\n\
+         {create_sql}\n\
          \x20   SELECT {range} INTO STRICT keep\n\
          \x20     FROM pg_catalog.pg_partitioned_table pt\n\
          \x20    WHERE pt.partrelid = {lp}::pg_catalog.regclass;\n\
@@ -3353,7 +3371,13 @@ fn beside_its_default(
          \x20   END IF;\n\
          \x20   EXECUTE {delete} || keep || ' RETURNING ' || cols\n\
          \x20       || {insert} || cols || ') SELECT * FROM moved';\n\
+         \x20   ALTER TABLE {p} ATTACH PARTITION {q} {bound};\n\
          END",
+        create_sql = create.sql,
+        bound = bound_clause(&pbps_model::PartitionBound::Range {
+            from: from.to_vec(),
+            to: to.to_vec(),
+        }),
         range = crate::preflight::range_predicate(from, to),
         lp = literal(&p),
         ld = literal(&d),
@@ -3398,23 +3422,7 @@ fn beside_its_default(
         insert = literal(&format!(") INSERT INTO {q} (")),
     );
     let tag = dollar_tag(&body);
-    let create = on(
-        pg,
-        name,
-        &format!(
-            "{create} (LIKE {p} INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING CONSTRAINTS \
-             INCLUDING STORAGE INCLUDING COMPRESSION) USING heap{storage};"
-        ),
-    )?;
-    Ok(vec![Statement::new(format!(
-        "LOCK TABLE ONLY {d} IN SHARE MODE;\n{}\nDO {tag}\n{body}\n{tag};\nALTER TABLE {p} ATTACH \
-         PARTITION {q} {};",
-        create.sql,
-        bound_clause(&pbps_model::PartitionBound::Range {
-            from: from.to_vec(),
-            to: to.to_vec(),
-        })
-    ))])
+    Ok(vec![Statement::new(format!("DO {tag}\n{body}\n{tag};"))])
 }
 
 fn create_table(
@@ -4628,24 +4636,25 @@ mod tests {
         let moved = emitted(Some("app.ev_rest"));
         let sql: Vec<&str> = moved.iter().map(|s| s.sql.as_str()).collect();
         assert_eq!(sql.len(), 2, "{sql:?}");
-        // The lock, the table, the move and the attach are one statement,
-        // which the engine runs as one transaction, so no apply can stop in
-        // between; and that statement is the table's creation.
+        // The lock, the table, the move and the attach are one `DO` block,
+        // which is one statement however the SQL is run, a `psql -f` script
+        // included, so nothing can stop in between; and that statement is
+        // the table's creation (#1763 review).
         let one = sql[0];
         let at = |part: &str| {
             one.find(part)
                 .unwrap_or_else(|| panic!("{part} is missing from {one}"))
         };
-        assert!(
-            one.starts_with("LOCK TABLE ONLY \"app\".\"ev_rest\" IN SHARE MODE;\n"),
-            "{one}"
-        );
+        assert!(one.starts_with("DO $pbps$\nDECLARE\n"), "{one}");
+        assert!(one.ends_with("\nEND\n$pbps$;"), "{one}");
+        let block = at("\nBEGIN\n");
+        let lock = at("LOCK TABLE ONLY \"app\".\"ev_rest\" IN SHARE MODE;");
+        assert!(block < lock, "{one}");
         let create = at(
             "CREATE UNLOGGED TABLE \"app\".\"ev_2025\" (LIKE \"app\".\"ev\" INCLUDING DEFAULTS \
              INCLUDING GENERATED INCLUDING CONSTRAINTS INCLUDING STORAGE INCLUDING COMPRESSION) \
              USING heap;",
         );
-        let block = at("\nDO ");
         let delete = at("DELETE FROM \"app\".\"ev_rest\" AS r WHERE ");
         let insert = at("INSERT INTO \"app\".\"ev_2025\" (");
         let attach = at(
@@ -4653,7 +4662,7 @@ mod tests {
              (E'2025-01-01', MINVALUE) TO (E'2026-01-01');",
         );
         assert!(
-            create < block && block < delete && delete < insert && insert < attach,
+            lock < create && create < delete && delete < insert && insert < attach,
             "{one}"
         );
         // What the delete would set off is asked again inside the statement,
