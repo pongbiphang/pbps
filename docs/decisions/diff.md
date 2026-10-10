@@ -4326,3 +4326,45 @@ Pinned by `a_partitioned_parents_keys_checks_and_foreign_keys_change`, and by
 the CLI's
 `a_partitioned_parents_keys_checks_and_foreign_keys_change_through_the_cli`,
 on 18 and on 16.
+
+<a id="dec-1690-1"></a>
+
+**DEC-1690.1. A standing range-partitioned parent is renamed as any table
+is, and its partitions follow it without that being a change of their
+partitioning (#1690).**
+
+The last of #1546's four slices (DEC-1687.1). Measured on 16.15 and 18.6, on
+a populated tree: `ALTER TABLE ... RENAME` of the parent is the parent's
+alone. Its partitions stay attached and keep their rows, their clones of its
+indexes and keys stay its clones, and a foreign key referencing it follows
+it, as on any table. So the plan is the one `RenameTable`.
+
+What the rename touches beyond the parent's own statement:
+- **The partitions' declarations.** Each names its parent, so after the
+  rename `partition_of.parent` differs from the base. Compared through the
+  plan's renames, it is the same parent, and no "change its partitioning".
+- **The apply's read-back.** A partition has no change of its own, so the
+  apply compares it with what the plan was approved over. Its parent is
+  brought forward through the plan's renames there too (`Renames::apply`),
+  as a foreign key's referenced table already was.
+- **The parent's own changes in the same plan.** They name it as declared,
+  so the standing-parent branches of `refuse_partition_changes` look the
+  parent up on the base side under its base name. A rename with a new
+  index, a column rename or a check is one plan, each recursing under the
+  new name.
+- **The catalog reads that take a parent's name.** The DEC-1595.1 check for
+  an unlogged partition under a permanent key reads the parent under the
+  name the catalog has now, through the plan's renames, as it already read
+  the referencing tables (#1613). Before #1690 no plan could hold both, so
+  the declared name was always the catalog's.
+
+Refused by name: a rename in a plan that attaches, detaches or drops a
+partition under the parent. Each of those changes names the parent on one
+side of the rename or the other, and two plans keep each simple, as for the
+parent's other changes (DEC-1687.1). A partition's own rename stays refused:
+no slice of #1546 asked for it.
+
+Pinned by `a_partitioned_parent_is_renamed`, by
+`an_unlogged_partition_under_a_permanent_key_is_refused_by_name` for #1613,
+and by the CLI's `a_partitioned_parent_is_renamed_through_the_cli`, on 18 and
+on 16.

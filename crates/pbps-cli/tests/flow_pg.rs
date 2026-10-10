@@ -19840,6 +19840,226 @@ fn parent_keys_flow(server: &str, slug: &str) {
     refused("a name app.ev_2025 holds as its own check");
 }
 
+/// #1690: a standing range-partitioned parent is renamed as any table is, a
+/// plain `ALTER TABLE ... RENAME`. Its partitions follow it without that
+/// being a change of their partitioning, its clones stay its own, and a
+/// foreign key referencing it follows it as it follows any table.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_partitioned_parent_is_renamed_through_the_cli() {
+    parent_rename_flow(&server(), "parent-rename-1690");
+}
+
+/// [`a_partitioned_parent_is_renamed_through_the_cli`] on a pre-17 server.
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn a_partitioned_parent_is_renamed_through_the_cli_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE \
+         EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    parent_rename_flow(&server, "parent-rename-1690-old");
+}
+
+fn parent_rename_flow(server: &str, slug: &str) {
+    let db = OwnDatabase::new(server, slug);
+    let conn = db.connection().to_owned();
+    on_server(
+        &conn,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, r integer, \
+             PRIMARY KEY (id, ts), CONSTRAINT ev_r_ck CHECK (r > 0)) \
+             PARTITION BY RANGE (ts); \
+         CREATE INDEX ev_r ON app.ev (r); \
+         CREATE TABLE app.ev_2024 PARTITION OF app.ev \
+             FOR VALUES FROM ('2024-01-01') TO ('2025-01-01'); \
+         CREATE TABLE app.ev_2025 PARTITION OF app.ev \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
+         CREATE INDEX ev_2024_own ON app.ev_2024 (id, r); \
+         INSERT INTO app.ev VALUES (1, '2024-06-01', 1), (2, '2025-06-01', 2); \
+         CREATE TABLE app.child (id integer NOT NULL, ts date NOT NULL, \
+             CONSTRAINT child_ev_fk FOREIGN KEY (id, ts) REFERENCES app.ev (id, ts)); \
+         INSERT INTO app.child VALUES (1, '2024-06-01')",
+    );
+    let d = Demo::new(slug);
+    succeeds(d.run(&["pull", "--db", &conn]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &conn, "--reason", "adopt"]));
+    let holds = |sql: &str| scalar(&conn, &format!("SELECT ({sql})::int::int8"));
+    let rows = || holds("SELECT count(*) FROM app.events");
+
+    let from = d.dir.join("schema/app.ev.yml");
+    let text = std::fs::read_to_string(&from).unwrap();
+    assert!(text.starts_with("table: app.ev\n"), "{text}");
+    std::fs::write(
+        d.dir.join("schema/app.events.yml"),
+        text.replacen(
+            "table: app.ev\n",
+            "table: app.events\nrenamed_from: app.ev\n",
+            1,
+        ),
+    )
+    .unwrap();
+    std::fs::remove_file(&from).unwrap();
+    let child = d.dir.join("schema/app.child.yml");
+    let text = std::fs::read_to_string(&child).unwrap();
+    assert!(text.contains("app.ev(id, ts)"), "{text}");
+    std::fs::write(&child, text.replace("app.ev(id, ts)", "app.events(id, ts)")).unwrap();
+
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+    let plan = d.dir.join("rename.json");
+    let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let planned = stdout(&o);
+    assert!(planned.contains("app.events"), "{planned}");
+    succeeds(approved_apply(&d, &conn, &plan, &["--allow", "rename"]));
+    succeeds(d.run(&["verify", "--db", &conn]));
+    let next = succeeds(d.run(&["plan", "--db", &conn]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    assert_eq!(rows(), 2, "the rows stay with the parent");
+    assert_eq!(
+        holds(
+            "SELECT count(*) FROM pg_inherits WHERE inhparent = 'app.events'::regclass \
+             AND inhrelid IN ('app.ev_2024'::regclass, 'app.ev_2025'::regclass)"
+        ),
+        2,
+        "both partitions are the renamed parent's"
+    );
+    assert_eq!(
+        holds(
+            "SELECT count(*) FROM pg_class WHERE relname = 'ev' AND relnamespace = 'app'::regnamespace"
+        ),
+        0
+    );
+    assert_eq!(
+        holds(
+            "SELECT count(*) FROM pg_constraint WHERE conname = 'child_ev_fk' \
+             AND confrelid = 'app.events'::regclass"
+        ),
+        1,
+        "the referencing key follows the parent"
+    );
+    // The partition's own index is still its own, the parent's still its
+    // clone on each partition.
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_inherits WHERE inhrelid = 'app.ev_2024_own'::regclass"),
+        0
+    );
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_inherits WHERE inhparent = 'app.ev_r'::regclass"),
+        2
+    );
+
+    // Renamed again, in the plan that also renames a column and adds an
+    // index: the parent's changes name it as declared, and each reaches the
+    // partitions under the new name.
+    let from = d.dir.join("schema/app.events.yml");
+    let text = std::fs::read_to_string(&from).unwrap();
+    let head = "table: app.events\nrenamed_from: app.ev\n";
+    assert!(text.starts_with(head), "{text}");
+    assert!(text.contains("\n  r:\n    type: integer\n"), "{text}");
+    let text = text
+        .replacen(head, "table: app.ev2\nrenamed_from: app.events\n", 1)
+        .replacen(
+            "\n  r:\n    type: integer\n",
+            "\n  r2:\n    type: integer\n    renamed_from: r\n",
+            1,
+        )
+        .replacen(
+            "\nindexes:\n",
+            "\nindexes:\n  ev2_id:\n    columns: [id]\n",
+            1,
+        )
+        .replace("columns: [r]", "columns: [r2]")
+        .replace("columns: [id, r]", "columns: [id, r2]")
+        .replace("r > 0", "r2 > 0");
+    std::fs::write(d.dir.join("schema/app.ev2.yml"), text).unwrap();
+    std::fs::remove_file(&from).unwrap();
+    let text = std::fs::read_to_string(&child).unwrap();
+    std::fs::write(
+        &child,
+        text.replace("app.events(id, ts)", "app.ev2(id, ts)"),
+    )
+    .unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+    let plan = d.dir.join("again.json");
+    let o = d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    // The check's text names the renamed column, so it is taken down and
+    // put back, as on any table.
+    succeeds(approved_apply(
+        &d,
+        &conn,
+        &plan,
+        &["--allow", "rename,constraint"],
+    ));
+    succeeds(d.run(&["verify", "--db", &conn]));
+    let next = succeeds(d.run(&["plan", "--db", &conn]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_inherits WHERE inhparent = 'app.ev2_id'::regclass"),
+        2,
+        "the new index reaches both partitions"
+    );
+    assert_eq!(
+        holds(
+            "SELECT count(*) FROM pg_attribute WHERE attname = 'r2' AND attrelid IN \
+             ('app.ev2'::regclass, 'app.ev_2024'::regclass, 'app.ev_2025'::regclass)"
+        ),
+        3
+    );
+    assert_eq!(holds("SELECT count(*) FROM app.ev2"), 2);
+
+    // Outside the declarations, a permanent table's key to the parent. A
+    // plan renaming the parent and adding an unlogged partition under the
+    // new name is refused by name: the catalog is read under the name the
+    // parent has now (#1613).
+    on_server(
+        &conn,
+        "CREATE SCHEMA ext; \
+         CREATE TABLE ext.r (id integer, ts date, \
+             CONSTRAINT r_ev_fk FOREIGN KEY (id, ts) REFERENCES app.ev2 (id, ts))",
+    );
+    let from = d.dir.join("schema/app.ev2.yml");
+    let text = std::fs::read_to_string(&from).unwrap();
+    let head = "table: app.ev2\nrenamed_from: app.events\n";
+    assert!(text.starts_with(head), "{text}");
+    std::fs::write(
+        d.dir.join("schema/app.ev3.yml"),
+        format!(
+            "{}  ev_2026:\n    from: [\"2026-01-01\"]\n    to: [\"2027-01-01\"]\n    unlogged: true\n",
+            text.replacen(head, "table: app.ev3\nrenamed_from: app.ev2\n", 1)
+        ),
+    )
+    .unwrap();
+    std::fs::remove_file(&from).unwrap();
+    // The declared child's key goes, or the declarations alone refuse the
+    // unlogged partition under it (DEC-1580.1) before the catalog is read.
+    let text = std::fs::read_to_string(&child).unwrap();
+    let cut = text.find("\nforeign_keys:").expect("the child's key");
+    std::fs::write(&child, &text[..=cut]).unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+    let o = d.run(&["plan", "--db", &conn]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains(
+            "app.ev_2026 would be created unlogged under app.ev3, which ext.r's foreign key \
+             `r_ev_fk` references"
+        ),
+        "{}",
+        stderr(&o)
+    );
+}
+
 /// A standing range-partitioned parent's indexes change through the CLI
 /// (#1688), on a tree holding rows: an index added, renamed (a drop and an
 /// add) and dropped, and a unique one over the key column, each reaching

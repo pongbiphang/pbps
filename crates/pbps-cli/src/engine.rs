@@ -712,9 +712,22 @@ pub async fn refuse_unlogged_partition_referencers(
     if conn.driver() != Driver::Postgres {
         return Ok(());
     }
+    // Each parent under the name the catalog has it by: the partition names
+    // it as declared, after a rename this plan may run first (#1613, #1690).
+    let renamed_from: BTreeMap<&TableName, &TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
+                Some((to, from))
+            } else {
+                None
+            }
+        })
+        .collect();
     let parents: Vec<TableName> = crate::deploy::unlogged_partitions_created(cs)
         .into_iter()
-        .map(|(_, parent)| parent.clone())
+        .map(|(_, parent)| (*renamed_from.get(parent).unwrap_or(&parent)).clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();

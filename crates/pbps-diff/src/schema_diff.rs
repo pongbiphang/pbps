@@ -3155,6 +3155,39 @@ fn refuse_partition_changes(
             list.push(what);
         }
     };
+    // A standing parent this plan renames (#1690), by its declared name and
+    // by its base one. Its partitions follow it under the engine's plain
+    // `RENAME`, and its own changes in the plan name it as declared.
+    let standing_parent = |schema: &Schema, name: &TableName| {
+        schema
+            .tables
+            .get(name)
+            .is_some_and(|t| t.partition_by.is_some() && t.partition_of.is_none())
+    };
+    let renamed_parents: BTreeMap<&TableName, &TableName> = changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::RenameTable { from, to, .. } = c
+                && standing_parent(base.schema, from)
+                && standing_parent(declared.schema, to)
+            {
+                Some((to, from))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let base_name = |declared_name: &TableName| -> TableName {
+        renamed_parents
+            .get(declared_name)
+            .map_or_else(|| declared_name.clone(), |&from| from.clone())
+    };
+    let declared_parent = |base_name: &TableName| -> TableName {
+        renamed_parents
+            .iter()
+            .find(|(_, from)| **from == base_name)
+            .map_or_else(|| base_name.clone(), |(to, _)| (*to).clone())
+    };
     // A difference in the key or the bound itself, which no change carries.
     for (uid, declared_name) in &declared.ids.tables {
         let Some(base_name) = base.ids.tables.get(uid) else {
@@ -3179,13 +3212,17 @@ fn refuse_partition_changes(
             };
             if let Some(of) = parent {
                 moving
-                    .entry(of.parent.clone())
+                    .entry(declared_parent(&of.parent))
                     .or_default()
                     .push(declared_name.clone());
             }
-            fn where_(t: &Table) -> Option<(&TableName, &pbps_model::PartitionBound)> {
-                t.partition_of.as_ref().map(|of| (&of.parent, &of.bound))
-            }
+            // A partition's parent as declared: one the plan renames is the
+            // same parent under its new name (#1690).
+            let where_ = |t: &Table| {
+                t.partition_of
+                    .as_ref()
+                    .map(|of| (declared_parent(&of.parent), of.bound.clone()))
+            };
             // A key column renamed is the same key: the engine renames it in
             // the key as it does in the table (measured on 16 and 18, #1687).
             let renamed = |by: &pbps_model::PartitionBy| {
@@ -3241,7 +3278,10 @@ fn refuse_partition_changes(
             ..
         } = change
         {
-            moving.entry(parent.clone()).or_default().push(name.clone());
+            moving
+                .entry(declared_parent(parent))
+                .or_default()
+                .push(name.clone());
         }
     }
     for change in changes {
@@ -3310,10 +3350,11 @@ fn refuse_partition_changes(
         // dropped or retyped (measured on 16 and 18), and an identity column
         // on a partitioned table is not read back yet (#1681).
         let parent_standing = |schema: &Schema, name: &TableName| {
-            schema
-                .tables
-                .get(name)
-                .is_some_and(|t| t.partition_by.is_some() && t.partition_of.is_none())
+            if std::ptr::eq(schema, base.schema) {
+                standing_parent(schema, &base_name(name))
+            } else {
+                standing_parent(schema, name)
+            }
         };
         // A standing parent's indexes (#1688), keys, checks and foreign keys
         // (#1689): the engine recurses each into every partition, a clone on
@@ -3359,9 +3400,14 @@ fn refuse_partition_changes(
             && parent_standing(declared.schema, table)
         {
             let key = |schema: &Schema| {
+                let name = if std::ptr::eq(schema, base.schema) {
+                    base_name(table)
+                } else {
+                    table.clone()
+                };
                 schema
                     .tables
-                    .get(table)
+                    .get(&name)
                     .and_then(|t| t.partition_by.as_ref())
                     .is_some_and(|by| by.columns.iter().any(|c| c == column))
             };
@@ -3401,6 +3447,32 @@ fn refuse_partition_changes(
                     format!(
                         "{} while this plan attaches, detaches or drops {}; change the columns and the \
                          partitions in separate plans",
+                        change_in_words(change),
+                        tables.join(", ")
+                    ),
+                );
+            }
+            continue;
+        }
+        // A standing parent's rename (#1690): a plain `RENAME`, which its
+        // partitions follow. A partition attached, detached or dropped under
+        // it in the same plan is named on one side or the other of it.
+        if let Change::RenameTable { from, to, .. } = change
+            && renamed_parents.get(to) == Some(&from)
+        {
+            let tables: Vec<String> = moving
+                .get(to)
+                .into_iter()
+                .flatten()
+                .map(ToString::to_string)
+                .collect();
+            if !tables.is_empty() {
+                changes_meet_moves.insert(to.clone());
+                refuse(
+                    to,
+                    format!(
+                        "{} while this plan attaches, detaches or drops {}; rename it and change \
+                         the partitions in separate plans",
                         change_in_words(change),
                         tables.join(", ")
                     ),
@@ -6957,6 +7029,135 @@ mod tests {
                 Ok(vec!["AddIndex".to_owned()])
             );
         }
+    }
+    /// #1690: a standing parent's rename is planned, a plain `RENAME` its
+    /// partitions follow, so their `partition_of.parent` naming the new name
+    /// is no change of their partitioning, and the parent's own changes in
+    /// the same plan, under its declared name, are its own. Refused by name:
+    /// a rename while the plan drops a partition under it. Still refused: a
+    /// partition's own rename.
+    #[test]
+    fn a_partitioned_parent_is_renamed() {
+        use pbps_model::{Index, IndexColumn, PartitionBound, PartitionBy, PartitionOf};
+        let ev: TableName = "app.ev".parse().unwrap();
+        let ev2: TableName = "app.ev2".parse().unwrap();
+        let tree = |parent_name: &TableName, partitions: &[&str]| {
+            let mut s = Schema::default();
+            let mut parent = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("ts", Column::new(ty("date")).not_null()),
+            ]);
+            parent.partition_by = Some(PartitionBy {
+                columns: vec!["ts".into()],
+            });
+            s.tables.insert(parent_name.clone(), parent);
+            for (k, name) in partitions.iter().enumerate() {
+                s.tables.insert(
+                    name.parse().unwrap(),
+                    Table {
+                        partition_of: Some(PartitionOf {
+                            parent: parent_name.clone(),
+                            bound: PartitionBound::Range {
+                                from: vec![pbps_model::BoundDatum::Value(format!("202{k}-01-01"))],
+                                to: vec![pbps_model::BoundDatum::Value(format!(
+                                    "202{}-01-01",
+                                    k + 1
+                                ))],
+                            },
+                            columns: Default::default(),
+                        }),
+                        ..Default::default()
+                    },
+                );
+            }
+            s
+        };
+        let outcome = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .map(|cs| kinds(&cs))
+            .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let rename = |from: &TableName, to: &TableName| Intent::RenameTable {
+            from: from.clone(),
+            to: to.clone(),
+        };
+        let base = tree(&ev, &["app.ev_1", "app.ev_2"]);
+
+        // Alone: the rename, and nothing on the partitions.
+        let renamed = tree(&ev2, &["app.ev_1", "app.ev_2"]);
+        assert_eq!(
+            outcome(&base, &renamed, &[rename(&ev, &ev2)]).unwrap(),
+            ["RenameTable"]
+        );
+        // With an index on the parent under its new name: its own.
+        let mut indexed = renamed.clone();
+        indexed.tables.get_mut(&ev2).unwrap().indexes.insert(
+            "ev2_id".into(),
+            Index {
+                columns: vec![IndexColumn::column("id")],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            },
+        );
+        assert_eq!(
+            outcome(&base, &indexed, &[rename(&ev, &ev2)]).unwrap(),
+            ["RenameTable", "AddIndex"]
+        );
+        // Negative: a partition dropped under it in the same plan.
+        let fewer = tree(&ev2, &["app.ev_1"]);
+        let errors = outcome(
+            &base,
+            &fewer,
+            &[
+                rename(&ev, &ev2),
+                Intent::DropTable {
+                    table: "app.ev_2".parse().unwrap(),
+                    reason: "gone".into(),
+                },
+            ],
+        )
+        .expect_err("refused");
+        assert!(
+            errors.iter().any(|e| e.contains("drops app.ev_2")
+                && e.contains("rename it and change the partitions in separate plans")),
+            "{errors:?}"
+        );
+        // Negative: a partition's own rename stays refused.
+        let errors = outcome(
+            &base,
+            &tree(&ev, &["app.ev_1", "app.ev_3"]),
+            &[rename(
+                &"app.ev_2".parse().unwrap(),
+                &"app.ev_3".parse().unwrap(),
+            )],
+        )
+        .expect_err("refused");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("app.ev_2") && e.contains("rename")),
+            "{errors:?}"
+        );
     }
 
     /// A standing parent's keys, checks and foreign keys change as a
