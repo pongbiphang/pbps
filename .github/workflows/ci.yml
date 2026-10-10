@@ -345,9 +345,11 @@ jobs:
       - name: start the two SQL Servers, one after the other
         run: |
           await() {
+            # A login can succeed while MSSQL_COLLATION is still being applied.
+            local collation=${2:-SQL_Latin1_General_CP1_CI_AS}
             for _ in $(seq 1 60); do
               if docker exec "$1" /opt/mssql-tools18/bin/sqlcmd \
-                   -C -S localhost -U sa -P "Pbps!Ci12345" -Q "SELECT 1" >/dev/null 2>&1; then
+                   -C -S localhost -U sa -P "Pbps!Ci12345" -b -Q "IF COALESCE(CONVERT(varchar(128), SERVERPROPERTY('Collation')), '') <> '$collation' THROW 50000, 'fixture collation is not ready', 1;" >/dev/null 2>&1; then
                 return 0
               fi
               sleep 2
@@ -363,7 +365,7 @@ jobs:
           docker run -d --name pbps-ci-mssql-express -e ACCEPT_EULA=Y -e MSSQL_PID=Express \
             -e MSSQL_COLLATION=Latin1_General_100_CS_AS \
             -e "MSSQL_SA_PASSWORD=Pbps!Ci12345" -p 14331:1433 "$IMAGE" >/dev/null
-          await pbps-ci-mssql-express
+          await pbps-ci-mssql-express Latin1_General_100_CS_AS
       # A name filter that matches nothing passes with zero tests, so the run
       # is required to have run the one test this job exists for.
       - name: the edition test
