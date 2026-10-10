@@ -746,8 +746,9 @@ lines before the error.
   ask every caller between the step and the envelope to thread them through.
   An error that holds them reaches the envelope through every `?` on the way.
 - **Its text is the wrapped error's.** `Display` shows the wrapped error's top
-  message and `source` continues its chain. So `{:#}`, every message a test
-  matches, and every `downcast` to the wrapped type are as before.
+  message and `source` continues its chain. So `{:#}` and every message a
+  test matches are as before. A `downcast` to the wrapped type is not: it
+  sees `Warned` and fails (#1726).
 - **Where it applies.** The partition-default probe's unasked pairs beside a
   spelling refusal (`refuse_misspelt`). A refusal with no warnings is the
   plain error, so nothing else changes.
@@ -758,6 +759,9 @@ one `plan.failed` and one `plan.partition-default-unasked` in the JSON
 envelope with no `warning:` on stderr, and the warning line beside the
 refusal in human output. The carrier's text and its empty case are pinned by
 `output`'s unit tests.
+
+*Amended by [DEC-1726.1](#dec-1726-1): the warnings travel beside the error,
+not on it. `Warned` is gone, and the refusal is the plain error again.*
 
 <a id="dec-1734-1"></a>
 
@@ -842,3 +846,38 @@ a drifted target with a pair left unasked fails with one `plan.failed` and
 one `plan.partition-default-unasked` in the JSON envelope, and neither its
 text on stderr. In human output the warning line appears once beside the
 refusal.
+
+*Amended by [DEC-1726.1](#dec-1726-1): `plan_db` is `cmd_plan_db` again,
+taking `carried` from `main`, which writes the warnings beside the failure
+through `output::or_unanswerable_beside`. Nothing wraps its error.*
+
+<a id="dec-1726-1"></a>
+
+**DEC-1726.1. Warnings gathered before a failure travel beside its error,
+never on it (#1726).** DEC-1702.1's `output::Warned` held the warnings on the
+error. Its `Display` and `source` read as the wrapped error, but a `downcast`
+to the wrapped type saw `Warned` and failed. `main`'s test for a typed refusal
+(DECISIONS 485), or any caller asking for a typed cause, could then miss it
+whenever warnings were present.
+
+`refuse_misspelt` now pushes its unasked pairs into a vector the caller passes
+in and returns the plain refusal. A connected plan hands them up through
+`cmd_plan_db`'s `carried`, and `main` writes them after the `plan.failed`
+finding with `output::or_unanswerable_beside`. The other callers print them on
+stderr before they return the refusal.
+
+- **Not anyhow's `context`.** `e.context(warned)` keeps both downcasts, to the
+  context and to the error below it. But `{:#}` then prints the top message
+  twice: `refused: refused: typed cause`, measured on anyhow 1.0.104. Any
+  wrapper either hides the type or repeats the text.
+- **Threaded, as DEC-1702.1 declined.** That entry wanted to spare the
+  callers between the step and the envelope. There are only two such layers
+  here, `cmd_plan_db` and `main`. Two parameters cost less than an error
+  whose type depends on whether a warning happened to be found.
+- **Human mode is the caller's.** Each caller prints the warnings when it
+  gathers them, before the error, so `main` prints nothing extra.
+
+Pinned by `output`'s unit tests, which require the typed cause to downcast
+and `{:#}` to be undoubled through `or_unanswerable_beside` in both modes.
+The envelope behaviour stays pinned on 16 and 18 by DEC-1702.1's and
+DEC-1703.1's tests.

@@ -569,13 +569,6 @@ fn main() {
             }
             std::process::exit(EXIT_FINDING);
         }
-        // What a command learnt before it failed, which no envelope took
-        // (#1702).
-        if let Some(w) = e.downcast_ref::<output::Warned>() {
-            for f in &w.warnings {
-                eprintln!("warning: {}", f.message);
-            }
-        }
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
@@ -830,6 +823,7 @@ fn run() -> anyhow::Result<()> {
                     "environment.unconfigured",
                     target.resolve(&project),
                 )?;
+                let mut carried = Vec::new();
                 let planned = deploy::cmd_plan_db(
                     &project,
                     &target,
@@ -838,13 +832,21 @@ fn run() -> anyhow::Result<()> {
                     staged,
                     json,
                     resolver_selection,
+                    &mut carried,
                 );
                 // A typed refusal already emitted its findings envelope. Only
                 // operational failures need the unanswerable wrapper (DECISIONS 485).
                 if planned.as_ref().is_err_and(|e| e.is::<Found>()) {
                     return planned;
                 }
-                return output::or_unanswerable("plan", json, "plan.failed", planned);
+                // With what the plan had gathered beside the failure (#1703).
+                return output::or_unanswerable_beside(
+                    "plan",
+                    json,
+                    "plan.failed",
+                    planned,
+                    carried,
+                );
             }
             if resolve_with.is_some() {
                 refuse(
