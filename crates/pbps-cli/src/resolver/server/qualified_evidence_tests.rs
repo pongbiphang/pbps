@@ -524,6 +524,7 @@ async fn produced(
                 ResolverProfile::Server {
                     url_env: "PBPS_SERVER_ENDPOINT".into(),
                     standard: None,
+                    baseline: None,
                 },
             )
         }
@@ -588,6 +589,7 @@ async fn the_production_run_connects_with_the_callers_driver() {
         &ResolverProfile::Server {
             url_env: "PBPS_1514_UNSET".into(),
             standard: None,
+            baseline: None,
         },
         "Server=localhost,1;User Id=sa;Password=x;Encrypt=false",
         &inputs.binding(),

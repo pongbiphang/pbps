@@ -55,6 +55,17 @@ pub enum ResolverProfile {
         /// run uses that.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         standard: Option<ScratchStandard>,
+        /// A SQL file, relative to the project root, that creates on scratch
+        /// the objects outside the managed set that managed objects reference
+        /// (#1673). It runs on scratch only, before any managed object, and
+        /// each object it creates is compared with the target.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "baseline_path"
+        )]
+        #[schemars(length(min = 1))]
+        baseline: Option<std::path::PathBuf>,
     },
 }
 
@@ -235,6 +246,17 @@ fn settings<'de, D: serde::Deserializer<'de>>(
         }
     }
     Ok(settings)
+}
+
+fn baseline_path<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<std::path::PathBuf>, D::Error> {
+    let value = String::deserialize(d)?;
+    if value.is_empty() {
+        Err(serde::de::Error::custom("a baseline names its SQL file"))
+    } else {
+        Ok(Some(value.into()))
+    }
 }
 
 fn role_name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -436,6 +458,9 @@ mod tests {
             "{kind: docker, image: 'postgres:18 --privileged'}",
             "{kind: unknown}",
             "{kind: docker, image: postgres:18, standard: {comment: c}}",
+            // Docker stays the measured profile until #1674.
+            "{kind: docker, image: postgres:18, baseline: baseline.sql}",
+            "{kind: server, url_env: S, baseline: ''}",
         ] {
             assert!(
                 Config::parse(
@@ -446,6 +471,29 @@ mod tests {
                 "{profile}"
             );
         }
+    }
+
+    #[test]
+    fn a_server_entry_names_its_baseline_file_relative_to_the_project() {
+        let config = Config::parse(
+            "dialect: postgres\nresolvers:\n  s: {kind: server, url_env: S, baseline: db/baseline.sql}\n",
+            Path::new("pbps.yml"),
+        )
+        .unwrap();
+        let ResolverProfile::Server { baseline, .. } = &config.resolvers["s"] else {
+            panic!("a server profile");
+        };
+        assert_eq!(baseline.as_deref(), Some(Path::new("db/baseline.sql")));
+        // Negative: omitted, there is none.
+        let config = Config::parse(
+            "dialect: postgres\nresolvers:\n  s: {kind: server, url_env: S}\n",
+            Path::new("pbps.yml"),
+        )
+        .unwrap();
+        assert!(matches!(
+            &config.resolvers["s"],
+            ResolverProfile::Server { baseline: None, .. }
+        ));
     }
 
     #[test]

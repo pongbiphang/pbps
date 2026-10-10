@@ -257,8 +257,11 @@ mod producer {
         // A supplied server is the operator-vouched resolver (DEC-1528.1);
         // Docker stays the measured profile until #1674 gives it a vouched
         // runtime.
-        if let pbps_config::resolver::ResolverProfile::Server { url_env, standard } =
-            &request.selection.profile
+        if let pbps_config::resolver::ResolverProfile::Server {
+            url_env,
+            standard,
+            baseline: _,
+        } = &request.selection.profile
         {
             let scratch = scratch_connection(request, url_env)?;
             let Some(identity) = request.target_identity else {
@@ -425,6 +428,7 @@ mod tests {
         let server = selection(ResolverProfile::Server {
             url_env: "PBPS_UNUSED".into(),
             standard: None,
+            baseline: None,
         });
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -524,6 +528,7 @@ mod tests {
             profile: pbps_config::resolver::ResolverProfile::Server {
                 url_env: "PBPS_RESOLVER_UNSET_1515".into(),
                 standard: None,
+                baseline: None,
             },
             status: pbps_config::resolver::SelectionStatus::NotAcquired,
         }
