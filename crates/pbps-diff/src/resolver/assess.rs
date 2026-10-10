@@ -702,6 +702,7 @@ mod tests {
                     uid: desired_ids.table_uid(&table).unwrap().clone(),
                     name: table.clone(),
                     table: Box::new(base_only.tables[&table].clone()),
+                    beside_default: None,
                 }),
             ],
         };

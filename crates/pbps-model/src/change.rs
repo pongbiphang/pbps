@@ -207,6 +207,12 @@ pub enum Change {
         uid: Uid,
         name: TableName,
         table: Box<Table>,
+        /// The DEFAULT partition of the standing parent a new range partition
+        /// goes under (#1547, DEC-1547.1): the partition is made as a plain
+        /// table, filled with the DEFAULT's rows in its range, and attached.
+        /// `None` for any other table, which an older plan's creates all are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        beside_default: Option<TableName>,
     },
     DropTable {
         uid: Uid,
@@ -2375,6 +2381,31 @@ impl Change {
             Change::AttachPartition { .. } => {
                 r.insert(RiskClass::Constraint);
             }
+            // Beside a standing DEFAULT the partition is filled with the
+            // DEFAULT's rows of its range before its own parts are added
+            // (#1547): its own checks and uniqueness ask those rows what an
+            // added one asks a table's, and its own NOT NULL what a tightened
+            // column does. Its parent's it shares with the DEFAULT the rows
+            // come from, so they hold already.
+            Change::CreateTable {
+                table,
+                beside_default: Some(_),
+                ..
+            } => {
+                if !table.checks.is_empty()
+                    || !table.unique.is_empty()
+                    || table.indexes.values().any(|i| i.unique)
+                {
+                    r.insert(RiskClass::Constraint);
+                }
+                if table
+                    .partition_of
+                    .as_ref()
+                    .is_some_and(|of| of.columns.values().any(|c| c.not_null))
+                {
+                    r.insert(RiskClass::NotNull);
+                }
+            }
             // What a dropped module destroys is the validity of whatever
             // depends on it, not data — so it faces the gate, but needs no
             // tombstone and no reason: the definition is in git history, which
@@ -2835,6 +2866,52 @@ mod tests {
     #[test]
     fn additive_changes_carry_no_risk() {
         assert!(add_column().intrinsic_risks().is_empty());
+    }
+
+    /// A partition filled from its DEFAULT faces the moved rows with its own
+    /// checks, uniqueness and NOT NULLs, which an empty one never does
+    /// (#1547).
+    #[test]
+    fn a_partition_beside_a_default_risks_what_its_own_parts_ask_of_rows() {
+        let mut partition = Table {
+            partition_of: Some(crate::PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: crate::PartitionBound::Range {
+                    from: vec![crate::BoundDatum::Value("1".into())],
+                    to: vec![crate::BoundDatum::Value("2".into())],
+                },
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let create = |table: &Table, beside: bool| Change::CreateTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            name: "app.ev_1".parse().unwrap(),
+            table: Box::new(table.clone()),
+            beside_default: beside.then(|| "app.ev_rest".parse().unwrap()),
+        };
+        assert!(create(&partition, true).intrinsic_risks().is_empty());
+        partition.checks.insert(
+            "ck".into(),
+            crate::CheckConstraint {
+                expression: "id > 0".into(),
+            },
+        );
+        partition.partition_of.as_mut().unwrap().columns.insert(
+            "id".into(),
+            crate::PartitionColumn {
+                default: None,
+                not_null: true,
+            },
+        );
+        assert_eq!(
+            create(&partition, true).intrinsic_risks(),
+            [RiskClass::NotNull, RiskClass::Constraint]
+                .into_iter()
+                .collect()
+        );
+        // Negative: made empty, it asks nothing of rows.
+        assert!(create(&partition, false).intrinsic_risks().is_empty());
     }
 
     /// Adding NOT NULL is risky, relaxing to nullable is not — the direction has

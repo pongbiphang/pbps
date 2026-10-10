@@ -3175,6 +3175,7 @@ mod tests {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: "dbo.t".parse().unwrap(),
                 table: Box::new(table),
+                beside_default: None,
             })],
         };
         let problems = pbps_mssql::temporal::refused_without_retention(&cs, &Default::default());

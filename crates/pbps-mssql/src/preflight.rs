@@ -2520,6 +2520,7 @@ mod tests {
                 uid: uid("t_aaaaaa"),
                 name: tname("dbo.customer"),
                 table: Box::new(pbps_model::Table::default()),
+                beside_default: None,
             },
             Change::AddColumn {
                 uid: uid("c_aaaaaa"),
@@ -3350,6 +3351,7 @@ mod tests {
                 uid: uid("t_bbbbbb"),
                 name: tname("dbo.region"),
                 table: Box::new(region),
+                beside_default: None,
             },
             Change::InsertRow {
                 table: tname("dbo.region"),
@@ -3455,6 +3457,7 @@ mod tests {
                 uid: uid("t_bbbbbb"),
                 name: tname("dbo.region"),
                 table: Box::new(region),
+                beside_default: None,
             },
             // The row leaves the key column to that default, so the probe
             // cannot say what it will hold.
@@ -3510,6 +3513,7 @@ mod tests {
                 uid: uid("t_bbbbbb"),
                 name: tname("dbo.region"),
                 table: Box::new(region),
+                beside_default: None,
             },
             // This one the probe can spell.
             Change::InsertRow {
@@ -4136,6 +4140,7 @@ mod tests {
                 uid: uid("t_bbbbbb"),
                 name: tname("dbo.region"),
                 table: Box::new(region),
+                beside_default: None,
             },
             fk(),
         ]))
@@ -4756,6 +4761,7 @@ mod tests {
                 uid: uid("t_aaaaaa"),
                 name: tname("dbo.status"),
                 table: Box::new(table),
+                beside_default: None,
             },
             Change::DeleteRow {
                 table: tname("dbo.status"),
@@ -4889,6 +4895,7 @@ mod tests {
             uid: uid("t_aaaaaa"),
             name: tname("dbo.brand_new"),
             table: Box::new(table),
+            beside_default: None,
         };
         let row = |key: &str, id: i64| Change::InsertRow {
             table: tname("dbo.brand_new"),

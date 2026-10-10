@@ -872,6 +872,7 @@ mod tests {
                     uid: "t_bbbbbb".parse().unwrap(),
                     name: t.clone(),
                     table: Box::default(),
+                    beside_default: None,
                 }),
             ],
         };

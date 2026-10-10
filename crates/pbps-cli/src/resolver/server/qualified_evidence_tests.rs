@@ -2355,6 +2355,7 @@ fn an_object_grant_after_a_same_name_replacement_names_the_replacement() {
                         uid: uid.clone(),
                         name: name.clone(),
                         table: Box::new(table.clone()),
+                        beside_default: None,
                     },
                 ],
                 Surface::Table(name.clone()),
@@ -3460,6 +3461,7 @@ fn create_and_add_stored_generation_keep_the_attrdef_child_inventory() {
                     uid: desired_ids.table_uid(&table).unwrap().clone(),
                     name: table.clone(),
                     table: Box::new(desired.tables[&table].clone()),
+                    beside_default: None,
                 },
                 compiled
                     .iter()
