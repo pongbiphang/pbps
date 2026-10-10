@@ -694,17 +694,21 @@ pub async fn refuse_created_name_occupants(
             )
             .await?;
             // What a cross-schema rename carries lands on names of its own,
-            // which something else may hold there now (#1749).
-            let landing: Vec<TableName> = crate::deploy::carried_names(cs, &occupants)
-                .into_iter()
-                .filter(|n| !occupants.iter().any(|o| &o.name == n))
+            // which something else may hold there now (#1749), a table or a
+            // view included (#1765).
+            let carried = crate::deploy::carried_names(cs, &occupants);
+            let landing: Vec<TableName> = carried
+                .iter()
+                .filter(|n| !occupants.iter().any(|o| &o.name == *n))
+                .cloned()
                 .collect();
             for found in pbps_pg::catalog::relation_name_occupants(conn, &landing, &[]).await? {
                 if !occupants.contains(&found) {
                     occupants.push(found);
                 }
             }
-            crate::deploy::refuse_uninventoried_occupants(cs, &occupants, label)
+            let relations = pbps_pg::catalog::relations_at(conn, &carried).await?;
+            crate::deploy::refuse_uninventoried_occupants(cs, &occupants, &relations, label)
         }
         Driver::Mssql => Ok(()),
     }

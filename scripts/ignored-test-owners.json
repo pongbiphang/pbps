@@ -1331,6 +1331,8 @@
         "a_dropped_constraint_trigger_frees_its_name_for_a_key",
         "an_index_follows_its_table_through_a_chain_of_moves",
         "a_move_onto_a_name_the_destination_holds_is_refused",
+        "a_move_onto_an_unmanaged_table_or_view_is_refused",
+        "a_move_onto_a_managed_table_holding_its_carried_name_is_refused",
         "postgres_rename_impact_reaches_the_cli_as_advisory_and_requires_explicit_approval",
         "pull_adopts_a_cluster_role_only_once_this_database_grants_it_something",
         "pull_data_on_a_table_validate_refuses_leaves_it_out_and_reads_the_rest",
