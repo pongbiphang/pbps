@@ -4497,7 +4497,9 @@ has before the plan runs:
   that failure aborted a move the engine takes (#1763 review).
 - **The referencing tables the session cannot fully read.** These are
   tables with such a key on which row-level security is active, or that
-  the session has no `SELECT` on. They are counted when there are rows to
+  the session cannot read the key's columns of: `SELECT` on the table, or
+  on each of the key's columns, is enough, as for a deleted row (#1763
+  review). They are counted when there are rows to
   move. The count above reads zero through either, which would mean "cannot
   see" rather than "nothing there", and an unreadable table fails the count,
   which the runner reports as unchecked and does not stop on. It is the
@@ -4536,6 +4538,14 @@ same gap; the engine's refusal was its backstop, and it now reads the old
 name too.
 
 **The rest of the plan.**
+- **Probes of the DEFAULT after the move.** A change the plan makes to the
+  DEFAULT after the create, such as a check of its own, would be counted
+  over rows the move has taken away by then. A check that only a moved row
+  breaks refused a plan the engine takes. Which rows stay is the catalog's
+  to say when the move runs, so such a change is reported unchecked
+  (SPEC 7.5), and the engine enforces its constraint inside the apply's
+  transaction. A change before the create is counted as before (#1763
+  review).
 - **Risk.** The partition's own checks and uniqueness are a `constraint`
   risk, and its own NOT NULLs a `not_null` risk. An empty partition faced
   neither, and the moved rows face both. The parent's hold already, since

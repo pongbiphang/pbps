@@ -4414,11 +4414,48 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         ))
         .await
         .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[1].sql).await,
+            1,
+            "{}",
+            probes[1].description
+        );
+        conn.execute("SAVEPOINT unreadable").await.unwrap();
         let stopped = conn
             .execute(&moving)
             .await
             .expect_err("the move stops over the unreadable table");
         assert_eq!(sqlstate(&stopped), "42501", "{stopped:?}");
+        // SELECT on the key's own columns is enough to count through it, as
+        // for a deleted row: the table is not refused as unreadable, the
+        // referencing row is counted, and the moving statement stops over it
+        // by name (#1763 review).
+        conn.execute(&format!(
+            "ROLLBACK TO SAVEPOINT unreadable; RESET ROLE; \
+             GRANT SELECT (ev_id, ev_ts) ON {s}.r TO {role}; SET LOCAL ROLE {role}"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[1].sql).await,
+            0,
+            "{}",
+            probes[1].description
+        );
+        assert_eq!(
+            counted(&mut conn, &probes[0].sql).await,
+            1,
+            "{}",
+            probes[0].description
+        );
+        let stopped = conn
+            .execute(&moving)
+            .await
+            .expect_err("the move stops on the referencing row");
+        assert!(
+            format!("{stopped:?}").contains("would fire the action of their foreign key"),
+            "{stopped:?}"
+        );
         rollback(&mut conn).await;
         // A row trigger fires by the session's replication role: one enabled
         // for replicas is asked about under `replica`, and not otherwise.
@@ -4509,6 +4546,91 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             );
             rollback(&mut conn).await;
         }
+
+        // A check the same plan adds to the DEFAULT, which only the moved row
+        // breaks: the check comes after the move, so counting the DEFAULT's
+        // rows before it refused a plan the engine takes. Its probe is
+        // unchecked instead, and the plan applies (#1763 review).
+        let mut checked = over.clone();
+        checked
+            .tables
+            .get_mut(&t("ev_rest"))
+            .unwrap()
+            .checks
+            .insert(
+                "rest_not_2".into(),
+                pbps_model::CheckConstraint {
+                    expression: "id <> 2".into(),
+                },
+            );
+        let checked_step = plan(
+            &added,
+            &added_ids,
+            &checked,
+            &mint_ids(&checked, &added_ids, &[]),
+        );
+        let order: Vec<&str> = checked_step
+            .changes
+            .iter()
+            .map(|p| {
+                if let pbps_model::Change::CreateTable { .. } = &p.change {
+                    "create"
+                } else if let pbps_model::Change::AddCheck { .. } = &p.change {
+                    "check"
+                } else {
+                    "other"
+                }
+            })
+            .collect();
+        assert_eq!(order, ["create", "check"], "{checked_step:#?}");
+        let checked_preflight = pg.preflight(&checked_step);
+        assert_eq!(
+            checked_preflight.probes.len(),
+            4,
+            "{:#?}",
+            checked_preflight.probes
+        );
+        assert_eq!(
+            checked_preflight.unchecked.len(),
+            1,
+            "{:#?}",
+            checked_preflight.unchecked
+        );
+        for probe in &checked_preflight.probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        in_a_transaction(&mut conn).await;
+        apply(&mut conn, &pg, &checked_step).await;
+        rollback(&mut conn).await;
+        // Negative: the check alone, with no move before it, is still counted
+        // against the row that breaks it.
+        let mut alone_checked = added.clone();
+        alone_checked
+            .tables
+            .get_mut(&t("ev_rest"))
+            .unwrap()
+            .checks
+            .insert(
+                "rest_not_2".into(),
+                pbps_model::CheckConstraint {
+                    expression: "id <> 2".into(),
+                },
+            );
+        let alone_probes = pg
+            .preflight(&plan(
+                &added,
+                &added_ids,
+                &alone_checked,
+                &mint_ids(&alone_checked, &added_ids, &[]),
+            ))
+            .probes;
+        assert_eq!(alone_probes.len(), 1, "{alone_probes:#?}");
+        assert_eq!(counted(&mut conn, &alone_probes[0].sql).await, 1);
 
         // A key between columns collated differently, which the engine
         // enforces: a bare `=` between them fails to compare, and inside the

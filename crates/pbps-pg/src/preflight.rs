@@ -3739,10 +3739,37 @@ pub(crate) fn probes(changes: &ChangeSet, partitions: &pbps_model::Partitions) -
     names.reach_partitions(partitions);
     let mut out = Vec::new();
     let mut unchecked = Vec::new();
+    // DEFAULT partitions a create earlier in the plan moves rows out of, in
+    // the plan's names (#1547).
+    let mut moved_out: Vec<&TableName> = Vec::new();
     for p in &changes.changes {
         match build(&p.change, &names, &mut unchecked) {
+            // A probe of a DEFAULT partition's own rows, after a move out of
+            // it, counts rows that are gone by then: a check the moved rows
+            // break, or a duplicate between a moved row and a kept one,
+            // refuses a plan the engine takes. Which rows the move leaves is
+            // the catalog's to say when it runs, so the change is reported
+            // unchecked, and its constraint is the engine's to enforce inside
+            // the apply's transaction (SPEC 7.5; #1763 review).
+            Ok(probes)
+                if !probes.is_empty()
+                    && p.change.table().is_some_and(|t| moved_out.contains(&t)) =>
+            {
+                unchecked.push(Unchecked::for_change(
+                    &p.change,
+                    "rows of this DEFAULT partition move into a partition the plan creates \
+                     before it, so the rows it keeps cannot be counted before apply",
+                ));
+            }
             Ok(probes) => out.extend(probes),
             Err(error) => unchecked.push(Unchecked::for_change(&p.change, error.to_string())),
+        }
+        if let Change::CreateTable {
+            beside_default: Some(default),
+            ..
+        } = &p.change
+        {
+            moved_out.push(default);
         }
         // Metadata compatibility remains checkable when the row projection
         // is unchecked. Include keys carried by a created table as well.
@@ -4332,7 +4359,9 @@ fn default_hidden_referencers_probe(
                  {} \
                  AND (pg_catalog.row_security_active(cl.oid) \
                  OR NOT (pg_catalog.has_schema_privilege(cl.relnamespace, 'USAGE') \
-                 AND pg_catalog.has_table_privilege(cl.oid, 'SELECT'))))",
+                 AND (pg_catalog.has_table_privilege(cl.oid, 'SELECT') \
+                 OR NOT EXISTS (SELECT 1 {KEY_COLUMNS} \
+                 AND NOT pg_catalog.has_column_privilege(con.conrelid, c.attnum, 'SELECT'))))))",
                 delete_reaches(&format!("pg_catalog.to_regclass({d})")),
                 gone_keys(names)
             ))
