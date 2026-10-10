@@ -89,6 +89,9 @@ fn scan(
     let mut parens = 0usize;
     let mut words: Vec<String> = Vec::new();
     let mut begin_depth = 0usize;
+    // The token just before, when it was a word; comments and whitespace
+    // between two words do not separate them.
+    let mut previous: Option<String> = None;
     let mut i = from;
     let at = |i: usize| chars.get(i).copied();
     let identifier_start = |c: char| c.is_alphabetic() || c == '_' || !c.is_ascii();
@@ -170,6 +173,7 @@ fn scan(
                     }
                 }
                 substantive = true;
+                previous = None;
                 continue;
             }
             '"' => {
@@ -197,6 +201,7 @@ fn scan(
                     }
                 }
                 substantive = true;
+                previous = None;
                 continue;
             }
             '$' if i == 0 || !identifier_part(chars[i - 1]) => {
@@ -222,6 +227,7 @@ fn scan(
                     line += chars[body..closed].iter().filter(|&&c| c == '\n').count();
                     i = closed + tag.chars().count();
                     substantive = true;
+                    previous = None;
                     continue;
                 }
             }
@@ -238,6 +244,7 @@ fn scan(
                 start = i + 1;
                 substantive = false;
                 words.clear();
+                previous = None;
                 i += 1;
                 continue;
             }
@@ -254,30 +261,37 @@ fn scan(
                     start_line = line;
                     substantive = true;
                 }
-                // psql's rule: inside a routine's definition, `BEGIN` and
-                // `CASE` open a block that `END` closes, so a SQL-standard
-                // body's own `;` do not end the statement. Only outside
-                // parentheses: `begin` is a valid parameter or result column
-                // name in the signature, and a `;` inside parentheses ends
-                // nothing anyway.
+                // In a routine's definition, `BEGIN ATOMIC` opens the
+                // SQL-standard body and `END` closes it, so the body's own
+                // `;` do not end the statement; inside it, `CASE` opens a
+                // block that `END` also closes. Not psql's rule, which counts
+                // every `BEGIN`: `begin` is a valid routine, schema, type or
+                // parameter name, and the pair is the only place a body
+                // opens. Only outside parentheses, where a `;` would end
+                // anything at all.
                 if parens == 0 && creates_routine(&words) {
                     match word.as_str() {
-                        "begin" | "case" => begin_depth += 1,
+                        "atomic" if previous.as_deref() == Some("begin") => begin_depth += 1,
+                        "case" if begin_depth > 0 => begin_depth += 1,
                         "end" => begin_depth = begin_depth.saturating_sub(1),
                         _ => {}
                     }
                 }
                 if words.len() < 4 {
-                    words.push(word);
+                    words.push(word.clone());
                 }
+                previous = Some(word);
                 i = end;
                 continue;
             }
             _ => {}
         }
-        if !c.is_whitespace() && !substantive {
-            start_line = line;
-            substantive = true;
+        if !c.is_whitespace() {
+            previous = None;
+            if !substantive {
+                start_line = line;
+                substantive = true;
+            }
         }
         i += 1;
     }
@@ -800,16 +814,26 @@ mod tests {
     }
 
     #[test]
-    fn a_routine_parameter_named_begin_opens_no_block() {
+    fn only_begin_atomic_opens_a_routine_body() {
         assert_eq!(
             texts(
                 "CREATE FUNCTION ext.f(begin integer) RETURNS TABLE (begin integer)\n\
                  LANGUAGE sql AS 'SELECT 1';\n\
+                 CREATE FUNCTION begin.begin() RETURNS begin.begin LANGUAGE sql\n\
+                 RETURN CASE WHEN true THEN 1 END;\n\
+                 CREATE FUNCTION ext.g() RETURNS int LANGUAGE sql\n\
+                 BEGIN /* body */ ATOMIC SELECT 1; END;\n\
                  SELECT 2;"
             ),
             [
+                // Negative: `begin` as a parameter, result column, schema,
+                // routine or type name opens nothing.
                 "CREATE FUNCTION ext.f(begin integer) RETURNS TABLE (begin integer)\n\
                  LANGUAGE sql AS 'SELECT 1'",
+                "CREATE FUNCTION begin.begin() RETURNS begin.begin LANGUAGE sql\n\
+                 RETURN CASE WHEN true THEN 1 END",
+                "CREATE FUNCTION ext.g() RETURNS int LANGUAGE sql\n\
+                 BEGIN /* body */ ATOMIC SELECT 1; END",
                 "SELECT 2"
             ]
         );
