@@ -3344,6 +3344,9 @@ fn beside_its_default(
          \x20   END IF;\n\
          \x20   EXECUTE {count} || keep || ' FOR UPDATE) AS locked' INTO n;\n\
          \x20   IF n > 0 THEN\n\
+         \x20       IF EXISTS (SELECT 1 {publications}) THEN\n\
+         \x20           {published}\n\
+         \x20       END IF;\n\
          \x20       IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t\n\
          \x20                  WHERE t.tgrelid = {ld}::pg_catalog.regclass AND NOT t.tgisinternal\n\
          \x20                    AND {trigger_fires} AND (t.tgtype::int & 9) = 9) THEN\n\
@@ -3384,6 +3387,12 @@ fn beside_its_default(
         trigger_fires = fires("t.tgenabled"),
         rule_fires = fires("w.ev_enabled"),
         matched = crate::preflight::moved_row_match(),
+        publications =
+            crate::preflight::publications_of(&format!("{}::pg_catalog.regclass", literal(&d))),
+        published = refuse(format!(
+            "a publication publishes deletes from {default}, so moving its rows of the range of \
+             {name} would send subscribers their delete and not their insert; nothing was moved"
+        )),
         reaches =
             crate::preflight::delete_reaches(&format!("{}::pg_catalog.regclass", literal(&d))),
         // The rows to move are counted *and locked*, before anything is asked
@@ -4673,6 +4682,7 @@ mod tests {
             "a row trigger on app.ev_rest fires",
             "is under row-level security",
             "would fire the action of their foreign key; nothing was moved",
+            "a publication publishes deletes from app.ev_rest",
         ] {
             let at = at(refusal);
             assert!(block < at && at < delete, "{refusal}: {one}");
