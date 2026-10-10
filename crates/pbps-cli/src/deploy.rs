@@ -230,25 +230,8 @@ fn refuse_occupied_names(
     label: &str,
 ) -> anyhow::Result<()> {
     use pbps_model::Change;
-    let relation = |name: &TableName| -> Option<String> {
-        if scoped.unmanaged.contains(name) && !unmanaged_relations.contains(name) {
-            return Some(format!("table `{name}`"));
-        }
-        // Only a relation shares this namespace: an unreadable aggregate
-        // `app.x(integer)` or a trigger named `x` coexists with a table
-        // `app.x`, and refusing it would refuse a plan the engine takes.
-        let a_relation = |t: &pbps_db::catalog::LimitationTarget| matches!(t, pbps_db::catalog::LimitationTarget::Relation(n) if n == name);
-        if let Some((_, why)) = unreadable.iter().find(|(t, _)| a_relation(t)) {
-            return Some(format!("`{name}`, which pbps cannot read ({why})"));
-        }
-        if unmanaged_relations.contains(name) {
-            return Some(format!("`{name}`, a relation pbps cannot read"));
-        }
-        scoped
-            .unmanaged_modules
-            .contains(&ModuleId::Named(name.clone()))
-            .then(|| format!("view `{name}`"))
-    };
+    let relation =
+        |name: &TableName| unmanaged_relation(scoped, unreadable, unmanaged_relations, name);
     let dropped: BTreeSet<&ModuleId> = cs
         .changes
         .iter()
@@ -298,6 +281,35 @@ fn refuse_occupied_names(
         taken.len(),
         taken.join("\n  ")
     );
+}
+
+/// What the catalog inventory found at `name` outside the recorded scope, in
+/// PostgreSQL's relation namespace: an unmanaged table or view, or a relation
+/// pbps cannot read, described for a refusal (#316, #320, #323). A plan never
+/// drops or renames one, so it holds its name for the whole plan.
+pub(crate) fn unmanaged_relation(
+    scoped: &pbps_diff::Scoped,
+    unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
+    unmanaged_relations: &[TableName],
+    name: &TableName,
+) -> Option<String> {
+    if scoped.unmanaged.contains(name) && !unmanaged_relations.contains(name) {
+        return Some(format!("table `{name}`"));
+    }
+    // Only a relation shares this namespace: an unreadable aggregate
+    // `app.x(integer)` or a trigger named `x` coexists with a table
+    // `app.x`, and refusing it would refuse a plan the engine takes.
+    let a_relation = |t: &pbps_db::catalog::LimitationTarget| matches!(t, pbps_db::catalog::LimitationTarget::Relation(n) if n == name);
+    if let Some((_, why)) = unreadable.iter().find(|(t, _)| a_relation(t)) {
+        return Some(format!("`{name}`, which pbps cannot read ({why})"));
+    }
+    if unmanaged_relations.contains(name) {
+        return Some(format!("`{name}`, a relation pbps cannot read"));
+    }
+    scoped
+        .unmanaged_modules
+        .contains(&ModuleId::Named(name.clone()))
+        .then(|| format!("view `{name}`"))
 }
 
 /// The relation names this plan creates: its tables, the views it creates
@@ -392,10 +404,15 @@ fn index_names_created(change: &pbps_model::Change) -> Vec<TableName> {
 /// The occupants are replayed through the plan in its order ([`Occupant`]),
 /// and each name a change creates is compared with them as they are at that
 /// change, after its own drops (#1723). A rename moves what its table owns,
-/// and a cross-schema one carries it into the destination schema (#1084).
+/// and a cross-schema one carries it into the destination schema (#1084),
+/// where it also meets the inventory's `unmanaged` relations (#1765): a table
+/// or view there is no occupant, and a managed one at that name is refused
+/// by the declarations' own validation, or moved out first by
+/// `pbps_diff::rename_order`.
 pub(crate) fn refuse_uninventoried_occupants(
     cs: &pbps_model::ChangeSet,
     occupants: &[pbps_pg::catalog::NameOccupant],
+    unmanaged: &dyn Fn(&TableName) -> Option<String>,
     label: &str,
 ) -> anyhow::Result<()> {
     let mut present = Occupant::all(occupants);
@@ -420,14 +437,17 @@ pub(crate) fn refuse_uninventoried_occupants(
                     .iter()
                     .enumerate()
                     .find(|&(j, q)| j != k && q.name == o.name);
-                if let Some((_, q)) = holder {
-                    let there = match &q.carried {
+                let there = match holder {
+                    Some((_, q)) => Some(match &q.carried {
                         Some((f, t)) => format!(
                             "{} `{}`, which the rename of `{f}` to `{t}` moves there first",
                             q.found.kind, q.found.name
                         ),
                         None => format!("{} `{}` already is", q.found.kind, q.name),
-                    };
+                    }),
+                    None => unmanaged(&o.name).map(|r| format!("the database already has {r}")),
+                };
+                if let Some(there) = there {
                     taken.push(format!(
                         "`{}`: this plan moves {} `{}` on `{from}` there, with the rename of \
                          `{from}` to `{to}`, where {there}",
@@ -6896,7 +6916,18 @@ pub fn cmd_plan_db(
             // the names this plan creates, asked of PostgreSQL's whole
             // relation namespace, not only of what the inventory reports
             // (#951). SQL Server's is asked after the passes below (#1077).
-            crate::engine::refuse_created_name_occupants(&mut conn, &cs, &target.label).await?;
+            // A carried object's landing name is judged against the same
+            // inventory as a created one (#1765).
+            let unmanaged = |name: &TableName| {
+                unmanaged_relation(
+                    &scoped,
+                    &managed.unreadable,
+                    &managed.unmanaged_relations,
+                    name,
+                )
+            };
+            crate::engine::refuse_created_name_occupants(&mut conn, &cs, &unmanaged, &target.label)
+                .await?;
             crate::engine::refuse_unlogged_partition_referencers(&mut conn, &cs, staged).await?;
             let rename_evidence = crate::engine::external_role_renames(
                 &mut conn,
@@ -10900,8 +10931,13 @@ mod tests {
         };
         let plan = |changes: Vec<PlannedChange>| ChangeSet { changes };
         let refused = |changes: Vec<PlannedChange>, occupant: &NameOccupant| {
-            refuse_uninventoried_occupants(&plan(changes), std::slice::from_ref(occupant), "prod")
-                .map_err(|e| e.to_string())
+            refuse_uninventoried_occupants(
+                &plan(changes),
+                std::slice::from_ref(occupant),
+                &|_| None,
+                "prod",
+            )
+            .map_err(|e| e.to_string())
         };
 
         for change in [add_index("s"), add_unique("s"), set_key(Some("s"))] {
@@ -11017,7 +11053,7 @@ mod tests {
         };
         let occupants = [held(&a), held(&b)];
         let refused = |changes: Vec<PlannedChange>| {
-            refuse_uninventoried_occupants(&ChangeSet { changes }, &occupants, "prod")
+            refuse_uninventoried_occupants(&ChangeSet { changes }, &occupants, &|_| None, "prod")
                 .map_err(|e| e.to_string())
         };
 
@@ -11072,7 +11108,7 @@ mod tests {
             owner_column: None,
         };
         let refused = |changes: Vec<PlannedChange>, occupants: &[NameOccupant]| {
-            refuse_uninventoried_occupants(&ChangeSet { changes }, occupants, "prod")
+            refuse_uninventoried_occupants(&ChangeSet { changes }, occupants, &|_| None, "prod")
                 .map_err(|e| e.to_string())
         };
         let (a, x) = (TableName::new("s1", "a"), TableName::new("s4", "x"));
@@ -11119,6 +11155,73 @@ mod tests {
         });
         refused(vec![drop_index, rename(&a, &a_to)], &[index, held])
             .expect("the index is dropped before its table moves");
+    }
+
+    /// #1765: a table or view outside the recorded scope holds its name for
+    /// the whole plan, and `SET SCHEMA` refuses to carry an index onto it
+    /// (measured on 18). Negatives: a holder elsewhere, a rename within the
+    /// schema, and an index dropped before its table moves all pass.
+    #[test]
+    fn a_carried_index_meets_an_unmanaged_table_or_view() {
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        use pbps_pg::catalog::NameOccupant;
+        let a = TableName::new("s1", "a");
+        let rename = |to: TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "s1.a", 0),
+                from: a.clone(),
+                to,
+                defaults: Vec::new(),
+            })
+        };
+        let index = NameOccupant {
+            name: TableName::new("s1", "n"),
+            kind: "index",
+            owner: Some(a.clone()),
+            owner_column: None,
+        };
+        let refused = |changes: Vec<PlannedChange>, held: &TableName, what: &str| {
+            let unmanaged = |name: &TableName| (name == held).then(|| format!("{what} `{name}`"));
+            refuse_uninventoried_occupants(
+                &ChangeSet { changes },
+                std::slice::from_ref(&index),
+                &unmanaged,
+                "prod",
+            )
+            .map_err(|e| e.to_string())
+        };
+        let landing = TableName::new("s2", "n");
+        for what in ["table", "view"] {
+            let e = refused(vec![rename(TableName::new("s2", "a"))], &landing, what).unwrap_err();
+            assert!(
+                e.contains(&format!(
+                    "`s2.n`: this plan moves index `s1.n` on `s1.a` there, with the rename of \
+                     `s1.a` to `s2.a`, where the database already has {what} `s2.n`"
+                )),
+                "{e}"
+            );
+        }
+
+        // Negatives: the holder is elsewhere; a rename within `s1` carries
+        // nothing out of it; the index is gone before its table moves.
+        refused(
+            vec![rename(TableName::new("s2", "a"))],
+            &TableName::new("s3", "n"),
+            "table",
+        )
+        .expect("nothing holds `s2.n`");
+        refused(vec![rename(TableName::new("s1", "b"))], &landing, "table")
+            .expect("a rename within `s1` lands nothing in `s2`");
+        let drop_index = PlannedChange::new(Change::DropIndex {
+            table: a.clone(),
+            name: "n".into(),
+        });
+        refused(
+            vec![drop_index, rename(TableName::new("s2", "a"))],
+            &landing,
+            "table",
+        )
+        .expect("the index is dropped before its table moves");
     }
 
     /// #1749: what the cross-schema renames carry, by the name each lands
@@ -11205,6 +11308,7 @@ mod tests {
         let e = refuse_uninventoried_occupants(
             &plan(vec![to_archive(), create(&carried)]),
             std::slice::from_ref(&sequence),
+            &|_| None,
             "prod",
         )
         .unwrap_err()
@@ -11220,6 +11324,7 @@ mod tests {
             refuse_uninventoried_occupants(
                 &plan(vec![to_archive(), create(&carried)]),
                 std::slice::from_ref(&index),
+                &|_| None,
                 "prod"
             )
             .is_err(),
@@ -11230,6 +11335,7 @@ mod tests {
         refuse_uninventoried_occupants(
             &plan(vec![rename(TableName::new("app", "new")), create(&carried)]),
             std::slice::from_ref(&sequence),
+            &|_| None,
             "prod",
         )
         .expect("a same-schema rename carries nothing into archive");
@@ -11247,6 +11353,7 @@ mod tests {
                 create(&carried),
             ]),
             std::slice::from_ref(&sequence),
+            &|_| None,
             "prod",
         )
         .expect("the column's drop takes its sequence");
@@ -11260,6 +11367,7 @@ mod tests {
                 create(&carried),
             ]),
             std::slice::from_ref(&index),
+            &|_| None,
             "prod",
         )
         .expect("the index is dropped before the table is created");
@@ -11281,10 +11389,14 @@ mod tests {
                 }),
             }),
         ];
-        let e =
-            refuse_uninventoried_occupants(&plan(rebuild), std::slice::from_ref(&sequence), "prod")
-                .unwrap_err()
-                .to_string();
+        let e = refuse_uninventoried_occupants(
+            &plan(rebuild),
+            std::slice::from_ref(&sequence),
+            &|_| None,
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             e.contains("`archive.old_n_seq`: this plan moves sequence"),
             "{e}"
@@ -11295,6 +11407,7 @@ mod tests {
                 create(&TableName::new("archive", "free")),
             ]),
             std::slice::from_ref(&sequence),
+            &|_| None,
             "prod",
         )
         .expect("a name nothing lands on is free");
@@ -11340,6 +11453,7 @@ mod tests {
         let e = refuse_uninventoried_occupants(
             &plan(vec![create_table()]),
             &[occupant("sequence", None)],
+            &|_| None,
             "prod",
         )
         .unwrap_err()
@@ -11348,6 +11462,7 @@ mod tests {
         let e = refuse_uninventoried_occupants(
             &plan(vec![create_table()]),
             &[occupant("index", Some(&owner))],
+            &|_| None,
             "prod",
         )
         .unwrap_err()
@@ -11362,6 +11477,7 @@ mod tests {
             refuse_uninventoried_occupants(
                 &plan(vec![new_view.clone()]),
                 &[occupant("composite type", None)],
+                &|_| None,
                 "prod"
             )
             .is_err()
@@ -11375,6 +11491,7 @@ mod tests {
         refuse_uninventoried_occupants(
             &plan(vec![drop_index, create_table()]),
             &[occupant("index", Some(&owner))],
+            &|_| None,
             "prod",
         )
         .expect("an index the plan drops first");
@@ -11387,6 +11504,7 @@ mod tests {
             refuse_uninventoried_occupants(
                 &plan(vec![drop_table.clone(), create_table()]),
                 &[occupant(kind, Some(&owner))],
+                &|_| None,
                 "prod",
             )
             .expect("it goes with the table the plan drops");
@@ -11413,6 +11531,7 @@ mod tests {
             refuse_uninventoried_occupants(
                 &plan(vec![dropped, create_table()]),
                 &[occupant("index", Some(&owner))],
+                &|_| None,
                 "prod",
             )
             .expect("a constraint's index the plan drops first");
@@ -11423,6 +11542,7 @@ mod tests {
             refuse_uninventoried_occupants(
                 &plan(vec![drop_key(None), create_table()]),
                 &[occupant("index", Some(&owner))],
+                &|_| None,
                 "prod"
             )
             .is_err()
@@ -11443,6 +11563,7 @@ mod tests {
                 create_table(),
             ]),
             &[occupant("index", Some(&owner))],
+            &|_| None,
             "prod",
         )
         .expect("the index moves to `archive` with its table");
@@ -11450,6 +11571,7 @@ mod tests {
             refuse_uninventoried_occupants(
                 &plan(vec![rename(TableName::new("app", "older")), create_table()]),
                 &[occupant("index", Some(&owner))],
+                &|_| None,
                 "prod"
             )
             .is_err()
@@ -11467,6 +11589,7 @@ mod tests {
         refuse_uninventoried_occupants(
             &plan(vec![drop_column.clone(), create_table()]),
             &[owned_by("id")],
+            &|_| None,
             "prod",
         )
         .expect("the sequence goes with its column");
@@ -11474,6 +11597,7 @@ mod tests {
             refuse_uninventoried_occupants(
                 &plan(vec![drop_column, create_table()]),
                 &[owned_by("other")],
+                &|_| None,
                 "prod"
             )
             .is_err()
@@ -11515,6 +11639,7 @@ mod tests {
                 create_at("old_pkey"),
             ]),
             &[at("old_pkey", "index", None)],
+            &|_| None,
             "prod",
         )
         .expect("the key's index is still `old_pkey`, and the plan drops it");
@@ -11522,6 +11647,7 @@ mod tests {
             refuse_uninventoried_occupants(
                 &plan(vec![unnamed_key_on(&renamed), create_at("old_pkey")]),
                 &[at("old_pkey", "index", None)],
+                &|_| None,
                 "prod"
             )
             .is_err(),
@@ -11538,6 +11664,7 @@ mod tests {
                 create_at("old_n_seq"),
             ]),
             &[at("old_n_seq", "sequence", Some("n"))],
+            &|_| None,
             "prod",
         )
         .expect("the sequence's owning column is dropped under its new table name");

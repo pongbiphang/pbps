@@ -679,10 +679,13 @@ fn roles_are_the_clusters(question: &str) -> anyhow::Error {
 /// Refuses a name this plan creates that a PostgreSQL relation-namespace
 /// entry outside the catalog inventory already holds (#951). SQL Server's
 /// `sys.objects` walk also orders the plan, so it runs after every pass that
-/// changes the plan: [`order_created_object_names`].
+/// changes the plan: [`order_created_object_names`]. `unmanaged` describes
+/// what the inventory itself found outside the recorded scope at a name: a
+/// cross-schema rename's carried objects meet that too (#1765).
 pub async fn refuse_created_name_occupants(
     conn: &mut Conn,
     cs: &ChangeSet,
+    unmanaged: &dyn Fn(&TableName) -> Option<String>,
     label: &str,
 ) -> anyhow::Result<()> {
     match conn.driver() {
@@ -704,7 +707,7 @@ pub async fn refuse_created_name_occupants(
                     occupants.push(found);
                 }
             }
-            crate::deploy::refuse_uninventoried_occupants(cs, &occupants, label)
+            crate::deploy::refuse_uninventoried_occupants(cs, &occupants, unmanaged, label)
         }
         Driver::Mssql => Ok(()),
     }
