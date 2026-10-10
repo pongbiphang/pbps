@@ -2230,6 +2230,7 @@ pub(crate) async fn refuse_misspelt(
         && found.conflicts.is_empty()
         && found.bounds.is_empty()
         && found.defaults_as_parents.is_empty()
+        && found.ambiguous.is_empty()
     {
         return Ok(());
     }
@@ -2279,13 +2280,71 @@ pub(crate) async fn refuse_misspelt(
             d.partition, d.column, d.declared, d.stored
         )
     }));
-    bail!(
-        "{} declared value(s) would not come back as written:\n  {}\n\
-         A declaration that disagrees with its own database on every plan is worse \
-         than none; the engine's spelling is the one to write (DECISIONS 101, 106).",
-        lines.len(),
-        lines.join("\n  ")
-    )
+    let mut sections = Vec::new();
+    if !lines.is_empty() {
+        sections.push(format!(
+            "{} declared value(s) would not come back as written:\n  {}\n\
+             A declaration that disagrees with its own database on every plan is worse \
+             than none; the engine's spelling is the one to write (DECISIONS 101, 106).",
+            lines.len(),
+            lines.join("\n  ")
+        ));
+    }
+    // A section of its own, because its remedy is the opposite of the one
+    // above: not "write what the engine reads", which would name the pinned
+    // reading as the meant one, but "write it so that there is one reading"
+    // (#1756, DEC-1756.1).
+    if !found.ambiguous.is_empty() {
+        let lines: Vec<String> = found.ambiguous.iter().map(ambiguous_line).collect();
+        sections.push(format!(
+            "{} declared date/time value(s) can be read more than one way:\n  {}\n\
+             What such a text means is decided by the settings of the session that reads \
+             it; this tool's would store one reading without saying which (DEC-1756.1).",
+            lines.len(),
+            lines.join("\n  ")
+        ));
+    }
+    bail!("{}", sections.join("\n\n"))
+}
+
+/// One ambiguous literal, where it is and what it can mean.
+fn ambiguous_line(a: &pbps_db::catalog::Ambiguous) -> String {
+    use pbps_db::catalog::LiteralAt;
+    let at = match &a.at {
+        LiteralAt::Cell {
+            table,
+            key,
+            column: None,
+        } => format!("{table} row key `{key}`"),
+        LiteralAt::Cell {
+            table,
+            key,
+            column: Some(c),
+        } => format!("{table} row `{key}`: `{c}`"),
+        LiteralAt::Bound { partition, column } => {
+            format!("partition {partition} bound on `{column}`")
+        }
+        LiteralAt::Default { table, column } => format!("{table} column `{column}` default"),
+    };
+    match &a.pinned {
+        None => format!(
+            "{at} {:?} is a {} decided by the moment the statement runs, not by its text; {}",
+            a.declared, a.ty, a.remedy
+        ),
+        Some(pinned) => {
+            let otherwise: Vec<String> = a
+                .otherwise
+                .iter()
+                .map(|(reading, under)| format!("{reading} under {under}"))
+                .collect();
+            format!(
+                "{at} {:?} is read as {pinned} under this tool's settings, but as {}; {}",
+                a.declared,
+                otherwise.join(", and as "),
+                a.remedy
+            )
+        }
+    }
 }
 
 /// Every schema name a declaration spells, and one declaration that spells it

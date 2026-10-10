@@ -342,6 +342,43 @@ pub struct DefaultAsParents {
     pub stored: String,
 }
 
+/// Where an [`Ambiguous`] literal is declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiteralAt {
+    /// A row's cell, or its key where `column` is `None`.
+    Cell {
+        table: TableName,
+        key: RowKey,
+        column: Option<String>,
+    },
+    /// One of a partition's bound values on a key column.
+    Bound {
+        partition: TableName,
+        column: String,
+    },
+    /// A column's default, or a partition's own default for it.
+    Default { table: TableName, column: String },
+}
+
+/// A declared date/time literal whose value is decided by the session that
+/// reads it rather than by its text (#1756).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ambiguous {
+    pub at: LiteralAt,
+    /// The text as declared: the cell's value, or the whole default.
+    pub declared: String,
+    /// The type the engine was asked to read it as.
+    pub ty: String,
+    /// What the engine reads it as under this tool's pinned settings, which
+    /// is what an apply stores; `None` where the value is decided by when it
+    /// runs (`now`, `today`, ...) rather than by a setting.
+    pub pinned: Option<String>,
+    /// The other readings, each beside the settings that produce it.
+    pub otherwise: Vec<(String, String)>,
+    /// What to write instead, for this type.
+    pub remedy: String,
+}
+
 /// What the engine says about the declared spellings of every table that
 /// declares rows: the ones it would not read back as written, and the keys
 /// it reads as one row. And of every partition bound's values.
@@ -359,4 +396,9 @@ pub struct Spellings {
     /// with why. Not a finding: the apply's closing check still refuses one
     /// that reads back as the parent's, after it runs (DEC-1609.1).
     pub defaults_unasked: Vec<String>,
+    /// Declared date/time literals the engine reads differently under
+    /// different session settings (#1756). A cell or bound listed here is left
+    /// out of `misspelt` and `bounds`, whose remedy — "write the engine's
+    /// spelling" — would name the pinned reading as the meant one.
+    pub ambiguous: Vec<Ambiguous>,
 }

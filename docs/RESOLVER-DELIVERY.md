@@ -211,8 +211,9 @@ agreed stage needs successful supported cases; permanent refusal is not delivery
   protected-storage design; sealing records the key identifier (#614).
 - [#587](https://github.com/pongbiphang/pbps/issues/587) owns existing `--dev`
   containment. Code reuse does not certify or remove preview workflows.
-- Keep #230 / PR #542, #173 / PR #487 and #232 / PR #546 protections until
-  their tested replacements are delivered; this parent does not close them.
+- Keep #230 / PR #542 and #232 / PR #546 protections until their tested
+  replacements are delivered; this parent does not close them. #173 closed
+  outside the resolver, as DEC-1756.1's connected refusal; PR #487 is closed.
 - Engine adapters supply facts. The differ and `Dialect` remain pure;
   deterministic evidence stays outside semantic `Schema` equality. The final
   typed plan remains the sole SQL-emission input, sealed before human approval.

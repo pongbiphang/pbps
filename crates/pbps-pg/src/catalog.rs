@@ -2528,6 +2528,26 @@ pub async fn misspelt(
         }
     };
     ask_about_partition_defaults(conn, schema, &mut out).await;
+    // A literal that reads two ways is reported as that, and not also as a
+    // misspelling: "write the engine's spelling" names the pinned reading,
+    // which is the very guess the refusal exists not to make (#1756).
+    out.ambiguous = crate::ambiguity::ask(conn, schema)
+        .await
+        .map_err(|e| read(&any, e))?;
+    for a in &out.ambiguous {
+        match &a.at {
+            pbps_db::catalog::LiteralAt::Cell { table, key, column } => {
+                out.misspelt
+                    .retain(|m| !(&m.table == table && &m.key == key && &m.column == column));
+            }
+            pbps_db::catalog::LiteralAt::Bound { partition, column } => {
+                out.bounds.retain(|b| {
+                    !(&b.partition == partition && &b.column == column && b.declared == a.declared)
+                });
+            }
+            pbps_db::catalog::LiteralAt::Default { .. } => {}
+        }
+    }
     Ok(out)
 }
 

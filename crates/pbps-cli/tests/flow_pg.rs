@@ -22206,3 +22206,132 @@ fn renamed_parent_generated_flow(server: &str, slug: &str) {
     );
     assert_eq!(holds("SELECT count(*) FROM app.events"), 1);
 }
+
+/// A date/time literal the engine reads two ways is refused by a connected
+/// plan and a connected bootstrap, each naming both readings and what to write
+/// instead: a row's cell, a column default and a partition bound, and a value
+/// read as the moment the statement runs (#1756). A `text` column holding the
+/// same characters is not one, and offline planning is unchanged. Written the
+/// one way they can be read, the same values plan, apply, verify and plan clean.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_ambiguous_date_or_time_literal_is_refused_with_both_readings() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "ambiguous-1756");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("ambiguous-1756");
+    let ev = d.dir.join("schema/app.ev.yml");
+    let p = d.dir.join("schema/app.p.yml");
+    let declare = |date: &str, default: &str, ts: &str, span: &str, clock: &str, bound: &str| {
+        std::fs::write(
+            &ev,
+            format!(
+                "table: app.ev\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                 d: {{type: date, default: \"'{default}'::date\"}}\n  \
+                 ts: {{type: timestamp with time zone}}\n  span: {{type: interval}}\n  \
+                 label: {{type: text, default: \"'01/02/2026'::text\"}}\n\
+                 primary_key: {{name: ev_pkey, columns: [id]}}\n\
+                 data:\n  mode: exact\n  rows:\n    \
+                 1: {{d: \"2026-01-02\", ts: \"2026-01-02 09:00:00+00\", span: \"1 day\", \
+                 label: \"01/02/2026\"}}\n    \
+                 2: {{d: \"{date}\"}}\n    3: {{ts: \"{ts}\"}}\n    4: {{span: \"{span}\"}}\n    \
+                 5: {{d: \"{clock}\"}}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &p,
+            format!(
+                "table: app.p\ncolumns:\n  d: {{type: date, nullable: false}}\n\
+                 partition_by: [d]\npartitions:\n  p_a:\n    from: [\"{bound}\"]\n    \
+                 to: [\"2026-06-01\"]\n"
+            ),
+        )
+        .unwrap();
+        d.commit();
+    };
+    declare(
+        "01/02/2026",
+        "01/02/2026",
+        "2026-01-02 09:00",
+        "-1 2:03:04",
+        "today",
+        "01/02/2026",
+    );
+
+    // Offline there is nothing to ask, and nothing changes (#1756 scope).
+    succeeds(d.run(&["plan"]));
+
+    for args in [
+        vec!["bootstrap", "--db", connection],
+        vec!["plan", "--db", connection],
+    ] {
+        if args[0] == "plan" {
+            // A plan needs a recorded state: the empty schema, adopted.
+            succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        }
+        let o = d.run(&args);
+        assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
+        let said = format!("{}{}", stdout(&o), stderr(&o));
+        for needle in [
+            "6 declared date/time value(s) can be read more than one way",
+            "app.ev row `2`: `d` \"01/02/2026\" is read as 2026-01-02 under this tool's \
+             settings, but as 2026-02-01 under DateStyle DMY",
+            "app.ev row `3`: `ts` \"2026-01-02 09:00\" is read as 2026-01-02 09:00:00+00 under \
+             this tool's settings",
+            "`YYYY-MM-DD HH:MM:SS+00`",
+            "app.ev row `4`: `span` \"-1 2:03:04\" is read as 0 months -1 days 7384",
+            "app.ev row `5`: `d` \"today\" is a date decided by the moment the statement runs",
+            "app.ev column `d` default \"'01/02/2026'::date\" is read as 2026-01-02",
+            "partition app.p_a bound on `d` \"01/02/2026\" is read as 2026-01-02",
+        ] {
+            assert!(
+                said.contains(needle),
+                "{args:?} missing {needle:?} in:\n{said}"
+            );
+        }
+        // The same characters in a `text` column mean one thing, and the
+        // pinned reading is not offered as the spelling to write.
+        assert!(!said.contains("label"), "{said}");
+        assert!(!said.contains("would not come back as written"), "{said}");
+    }
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_tables WHERE schemaname = 'app'"
+        ),
+        0,
+        "nothing was created"
+    );
+
+    // The one reading each can have, written so: the engine's own spelling.
+    declare(
+        "2026-02-01",
+        "2026-02-01",
+        "2026-01-02 01:00:00+00",
+        "-1 days -02:03:04",
+        "2026-03-01",
+        "2026-02-01",
+    );
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT (d = DATE '2026-02-01')::int::int8 FROM app.ev WHERE id = 2"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT extract(epoch FROM ts)::int8 FROM app.ev WHERE id = 3"
+        ),
+        1_767_315_600
+    );
+}
