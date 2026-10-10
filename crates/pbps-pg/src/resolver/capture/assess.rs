@@ -113,6 +113,36 @@ impl Managed {
             .collect()
     }
 
+    /// Whether a relation of this name is managed: a table, a view, or a
+    /// named index or key.
+    pub fn relation(&self, schema: &str, name: &str) -> bool {
+        let key = (schema.to_owned(), name.to_owned());
+        self.relations.contains(&key) || self.indexes.contains(&key)
+    }
+
+    /// Whether a routine of this name is managed, in any overload.
+    pub fn routine(&self, schema: &str, name: &str) -> bool {
+        self.routines
+            .contains_key(&(schema.to_owned(), name.to_owned()))
+    }
+
+    /// Whether an object a baseline created holds a managed name: a
+    /// relation, index or row type the project declares (#1673). A routine
+    /// is not matched by name, since an unmanaged overload may share one; a
+    /// baseline routine with a declared signature fails the compile instead,
+    /// which never replaces a routine.
+    pub(super) fn names(&self, object: &ObjectIdentity) -> bool {
+        let [schema, name] = object.name.as_slice() else {
+            return false;
+        };
+        let key = (schema.clone(), name.clone());
+        match object.class.as_str() {
+            "pg_class" => self.relations.contains(&key) || self.indexes.contains(&key),
+            "pg_type" => self.relations.contains(&key),
+            _ => false,
+        }
+    }
+
     fn holds(
         &self,
         class: CandidateClass,
@@ -223,8 +253,10 @@ fn is_system(schema: &str) -> bool {
 }
 
 /// The surfaces worth comparing: an object in a user schema that carries
-/// bindings on scratch. Scratch's user schemas hold only desired managed
-/// objects, so these are the managed declarations and their parts.
+/// bindings on scratch. Scratch's user schemas hold the desired managed
+/// objects and, for the vouched resolver, what its baseline staged, so
+/// these are the managed declarations and their parts, and the staged
+/// objects with bindings, whose verdicts no declaration reads.
 fn surfaces(
     desired: &CapturedInputs,
 ) -> impl Iterator<Item = (&ObjectIdentity, &super::manifest::Input)> {
@@ -348,7 +380,42 @@ pub fn managed_scope(desired: &Managed) -> CaptureScope {
 /// Properties with every role reference removed. The engine's own objects
 /// are owned by the bootstrap superuser, whose name is the installation's,
 /// and neither ownership nor ACL decides what a name binds to.
-fn without_roles(value: &Value) -> Value {
+/// Whether `member` is a staged root or something one made, directly or
+/// through what it made: a table's row and array types, an index, an owned
+/// sequence, an extension's members (#1673). Read from the dependencies the
+/// capture holds of `inputs`' own side.
+fn carries(
+    inputs: &BTreeMap<ObjectIdentity, super::manifest::Input>,
+    staged: &super::Staged,
+    member: &ObjectIdentity,
+) -> bool {
+    let mut makers: BTreeMap<&ObjectIdentity, Vec<&ObjectIdentity>> = BTreeMap::new();
+    for dependency in inputs.keys() {
+        if let ("pg_depend", [kind], [made, maker]) = (
+            dependency.class.as_str(),
+            dependency.name.as_slice(),
+            dependency.signature.as_slice(),
+        ) && matches!(kind.as_str(), "i" | "a" | "e")
+        {
+            makers.entry(made).or_default().push(maker);
+        }
+    }
+    let mut pending = vec![member];
+    let mut seen = BTreeSet::new();
+    while let Some(object) = pending.pop() {
+        if !seen.insert(object) {
+            continue;
+        }
+        if staged.holds(owner(object)) {
+            return true;
+        }
+        pending.extend(makers.get(object).into_iter().flatten().copied());
+        pending.extend(makers.get(owner(object)).into_iter().flatten().copied());
+    }
+    false
+}
+
+pub(super) fn without_roles(value: &Value) -> Value {
     match value {
         Value::Object(map) if map.get("class") == Some(&Value::from("pg_authid")) => Value::Null,
         Value::Object(map) => Value::Object(
@@ -370,6 +437,21 @@ pub fn assess(
     managed: &Managed,
     paths: &Paths,
     order: &crate::resolver::reconstruct::Reconstruction,
+) -> Assessment {
+    assess_with(target, desired, managed, paths, order, None)
+}
+
+/// [`assess`] where scratch also holds what a resolver baseline staged and
+/// the comparison accepted (#1673). A staged object, and what it carries,
+/// counts as reconstructed. One with bindings is assessed as a surface too,
+/// but only a declaration's verdict is read.
+pub(super) fn assess_with(
+    target: &CapturedInputs,
+    desired: &CapturedInputs,
+    managed: &Managed,
+    paths: &Paths,
+    order: &crate::resolver::reconstruct::Reconstruction,
+    staged: Option<&super::Staged>,
 ) -> Assessment {
     // What made each target member, as the target recorded it: the other end
     // of an internal dependency, which the engine alone creates for a part of
@@ -434,12 +516,31 @@ pub fn assess(
                     _ => false,
                 };
             }
-            // Scratch's user schemas hold only the declarations and what
-            // creating them made, so a member only scratch has was
-            // reproduced. A target member, whether scratch has the same
-            // identity or the plan drops it, must be the project's own.
-            !on_target.contains(member) || own(set.class, member)
+            // Scratch's user schemas hold only the declarations, what
+            // creating them made, and what the baseline staged, so a member
+            // only scratch has was reproduced. A target member, whether
+            // scratch has the same identity or the plan drops it, must be
+            // the project's own, or staged and compared.
+            !on_target.contains(member)
+                || own(set.class, member)
+                || on_scratch.contains(member)
+                    && staged.is_some_and(|staged| carries(&target.inputs, staged, member))
         })
+    };
+    // Unfaithful because the target has a routine that is neither managed
+    // nor staged: only the operator can stage it, since pbps sends no
+    // routine source of its own (SPEC §9.3.2).
+    let unstaged_routine = |(set, _): (&CandidateSet, &bool)| {
+        set.class == CandidateClass::Routine
+            && target.candidates.get(set).is_some_and(|members| {
+                members.iter().any(|member| {
+                    !own(set.class, member)
+                        && !desired
+                            .candidates
+                            .get(set)
+                            .is_some_and(|scratch| scratch.contains(member))
+                })
+            })
     };
     let mut assessment = Assessment::default();
     for (object, input) in surfaces(desired) {
@@ -457,12 +558,20 @@ pub fn assess(
             Verdict::Unresolved {
                 condition: "a binding names a role, which scratch reproduces under another name",
             }
-        } else if !derived(object, input, paths, &desired.inputs)
+        } else if let Some(unfaithful) = derived(object, input, paths, &desired.inputs)
             .iter()
-            .all(&faithful)
+            .filter(|set| !faithful(*set))
+            .map(&unstaged_routine)
+            .reduce(|any, routine| any || routine)
         {
             Verdict::Unresolved {
-                condition: "a same-named candidate on the target was not reconstructed on scratch",
+                condition: if unfaithful && staged.is_some() {
+                    "a same-named routine on the target is not in the resolver's baseline; \
+                     add it to the baseline, or select no resolver and keep ADR-0013's \
+                     conservative rebuild"
+                } else {
+                    "a same-named candidate on the target was not reconstructed on scratch"
+                },
             }
         } else if compiled_early(object, input, order, &desired.inputs, paths) {
             Verdict::Unresolved {
