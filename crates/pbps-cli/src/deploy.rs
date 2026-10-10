@@ -641,7 +641,11 @@ pub(crate) fn refuse_permanent_referencers(
         let Some((partition, parent)) = unlogged_partition(&p.change) else {
             continue;
         };
-        for r in referencers.iter().filter(|r| &r.parent == parent) {
+        // The parent too, which the plan can rename while it adds the
+        // partition under the new name (#1613, #1690); the message names it
+        // as declared.
+        let in_catalog = now(parent);
+        for r in referencers.iter().filter(|r| r.parent == in_catalog) {
             // A leaf's copy goes with the key its partitioned table declares,
             // which is the one a plan names.
             if removed_before(at, &r.table, &r.key)
@@ -4463,7 +4467,13 @@ fn refuse_unplanned_movement(
                     .filter(|(_, held)| *held != (false, false))
                     .collect()
             };
-            let parent = now.partition_of.as_ref().map(|of| &of.parent);
+            // The parent under the name the plan leaves it, which its changes
+            // name: both reads are brought back before this plan's renames,
+            // the partition's parent included (#1690 review).
+            let parent = now
+                .partition_of
+                .as_ref()
+                .map(|of| *renamed.get(&of.parent).unwrap_or(&&of.parent));
             // A parent whose column names change hands in this plan
             // (DEC-541.1): undone, two of its columns would share a name, and
             // a partition's own entries on them one key. Both reads are then
@@ -9001,11 +9011,15 @@ async fn preflight(
         );
     }
 
+    // The probes take the plan's changes, which name a parent it renames by
+    // its new name, so the stored relation is brought under those names
+    // (#1751 review).
     run_probes(
         conn,
         dialect,
         &plan.changes,
-        &pbps_model::Partitions::of(stored),
+        &pbps_model::Partitions::of(stored)
+            .renamed(crate::dependents::table_renames(&plan.changes)),
     )
     .await
 }
@@ -10530,7 +10544,8 @@ mod tests {
     /// `CREATE`, by dropping it, dropping its table or making that table
     /// unlogged, under the name the catalog has now when the plan also
     /// renames the table, and through the key a partitioned table declares
-    /// for its leaf's copy.
+    /// for its leaf's copy. A parent the plan renames is read back to the
+    /// catalog's name too (#1613).
     #[test]
     fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
         use pbps_model::{Change, ChangeSet, PartitionBound, PartitionOf, PlannedChange, Table};
@@ -10744,6 +10759,35 @@ mod tests {
         );
         let e = leaf_refused(vec![partition(true), drop_root]).unwrap_err();
         assert!(e.contains("ext.rp's foreign key `rp_k`"), "{e}");
+
+        // The parent renamed in the plan that adds the partition under its
+        // new name: the catalog's referencer names it as it is now, and is
+        // the same key (#1613).
+        let ev2 = TableName::new("app", "ev2");
+        let under_ev2 = PlannedChange::new(Change::CreateTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            name: TableName::new("app", "ev_u"),
+            table: Box::new(Table {
+                partition_of: Some(PartitionOf {
+                    parent: ev2.clone(),
+                    bound: PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                unlogged: true,
+                ..Table::default()
+            }),
+        });
+        let rename_parent = PlannedChange::new(Change::RenameTable {
+            uid: "t_dddddd".parse().unwrap(),
+            from: parent.clone(),
+            to: ev2.clone(),
+            defaults: Vec::new(),
+        });
+        let e = refused(vec![rename_parent.clone(), under_ev2.clone()], &parent).unwrap_err();
+        assert!(e.contains("ext.r's foreign key `r_ev_fkey`"), "{e}");
+        // Negative: a key under the new name, which no table the catalog
+        // reads holds, is another parent's.
+        refused(vec![rename_parent, under_ev2], &ev2).expect("the catalog's name is the old one");
     }
 
     /// An index the plan creates takes a relation name too (#1355): one at

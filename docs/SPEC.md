@@ -327,9 +327,12 @@ indexes:
   reference it; a key without a partition-key column, and a check under a
   name a partition holds as its own, are refused by name (DEC-1689.1). The
   indexes, keys, checks and foreign keys do not change in a plan that
-  attaches, detaches or drops under the parent either. Every other change
-  stays refused by name: the parent's rename until #1690, and attaching as
-  the DEFAULT partition until #1639.
+  attaches, detaches or drops under the parent either. The parent is renamed
+  as any table is, its partitions following it, and its own changes in the
+  same plan name it as declared; a rename in a plan that attaches, detaches
+  or drops under it is refused by name, as is a partition's own rename
+  (DEC-1690.1). Every other change stays refused by name: attaching as the
+  DEFAULT partition until #1639.
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

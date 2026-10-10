@@ -11,7 +11,8 @@
 //! key (including one a foreign key references), the unique constraints, and
 //! an index's key and `INCLUDE` columns; `sp_rename` on a table carries the
 //! `references_table` of every child's foreign key. Those are the parts
-//! [`Renames::apply`] rewrites, and they are the only ones it may.
+//! [`Renames::apply`] rewrites, and they are the only ones it may, with a
+//! partition's parent on PostgreSQL, which a parent's rename carries (#1690).
 
 use crate::name::{ColumnRef, TableName};
 use crate::schema::Table;
@@ -116,6 +117,11 @@ impl Renames {
                 .into_iter()
                 .map(|(c, own)| (self.column(name, &c), own))
                 .collect();
+            // A partition follows its parent through a rename, which is the
+            // engine's plain `RENAME` of the parent alone (measured on 16 and
+            // 18, #1690). Brought forward last: its columns are looked up
+            // under the name it was read with, as every column is.
+            of.parent = self.table(&of.parent);
         }
         Cow::Owned(t)
     }
