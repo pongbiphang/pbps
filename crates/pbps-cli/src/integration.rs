@@ -41,7 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 36;
+pub const SCHEMA_VERSION: u32 = 37;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
@@ -50,6 +50,7 @@ pub const SCHEMA_VERSION: u32 = 36;
 // 33: a partition's own `columns:` defaults and NOT NULLs under `partitions:` (issue #1578).
 // 35: a foreign key's `restrict` action (issue #1633).
 // 36: a server resolver's scratch `standard:` (issue #1708).
+// 37: a server resolver's `baseline:` file (issue #1673).
 // 26: index, key and unique-constraint `storage_parameters` (issue #1442).
 // 25: a table's `storage_parameters:` (issue #1441).
 // 24: a table's `replica_identity:` (issue #1444).
@@ -421,6 +422,24 @@ mod tests {
             ),
             (
                 serde_json::json!({"kind": "server", "url_env": "S", "standard": {"public": {"grants": [{"to": "r", "privileges": []}]}}}),
+                false,
+            ),
+            // A baseline file, in both (#1673).
+            (
+                serde_json::json!({"kind": "server", "url_env": "S", "baseline": "db/baseline.sql"}),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "server", "url_env": "S", "baseline": ""}),
+                false,
+            ),
+            // Null is an omitted baseline, in both (#1673 review).
+            (
+                serde_json::json!({"kind": "server", "url_env": "S", "baseline": null}),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "docker", "image": "pg:18", "baseline": "db/baseline.sql"}),
                 false,
             ),
         ] {

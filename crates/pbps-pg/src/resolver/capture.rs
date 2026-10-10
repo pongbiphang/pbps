@@ -89,7 +89,10 @@ pub use ownership::RecordedOwnership;
 
 mod assess;
 pub use assess::{Managed, Paths, assess, managed_scope, scope};
+
+mod staged;
 pub use pbps_db::resolver::capture::{Assessment, Verdict};
+pub use staged::{StageError, Staged, compare as compare_staged};
 
 /// Read coherent catalog inputs and release the transaction before returning.
 /// This does not qualify executable content or a scratch runtime. The native

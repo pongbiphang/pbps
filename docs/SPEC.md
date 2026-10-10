@@ -1610,6 +1610,7 @@ resolvers:
   scratch:
     kind: server
     url_env: PBPS_SCRATCH_DB
+    baseline: db/baseline.sql       # optional; relative to the project root
     standard:                       # optional; omitted = template0's state
       settings:                     # ALTER DATABASE <scratch> SET ...
         statement_timeout: 5min
@@ -1670,14 +1671,29 @@ that references anything outside the managed set otherwise fails the whole
 scratch compile (#1616).
 
 - **The baseline is a SQL file in the repository**, named by the resolver
-  entry's `baseline`. It is reviewed history like the declarations. It runs on
-  scratch only, never on the target.
-- **It runs whole and first** (#1664). It runs after the two separation checks,
-  on the empty run-owned database, as the setup role, in its own session, and
-  before pbps stages any managed object.
+  entry's `baseline`. It is reviewed history like the declarations. An
+  absolute path is refused, and so is a relative one that resolves outside
+  the project root through `..` or a symlink. It runs on scratch only, never on the target.
+- **It runs whole, before any managed object** (#1664, DEC-1673.1), in
+  both layouts. It runs after the separation and emptiness checks and after
+  the deployer's authorization is reproduced, which recreates each in-scope
+  schema; a baseline that writes into one writes `CREATE SCHEMA IF NOT
+  EXISTS`. It runs as the setup role: in the run-owned layout in a session
+  of its own, in the supplied one on the checked connection, which `DISCARD
+  ALL` then resets. A transaction it leaves open refuses the run.
+  - **It runs as one script**: pbps sends the file whole and the engine
+    splits it (#1769). It is one implicit transaction, so a statement that
+    cannot run in a transaction block, such as `CREATE INDEX CONCURRENTLY`,
+    is refused, and a refused file leaves nothing. The file is read whole
+    under the session's settings when it starts: a setting it changes, such
+    as `standard_conforming_strings`, does not change how the rest is read.
   - So it can change nothing pbps staged, because nothing is staged yet. Its
     `SET`s, `search_path` included, never reach the session that compiles
     the declarations.
+  - What it created is the difference between the database's objects
+    before and after it. The target deployer's USAGE on a schema it
+    created is reproduced as an in-scope schema's is, not left to the
+    baseline to grant.
   - No privilege rule is needed, so any SQL may be written: an extension, a
     cast, an operator, a `DO` block.
   - **So a baseline's statements name nothing managed.** A legacy view over
@@ -1685,7 +1701,7 @@ scratch compile (#1616).
     An object whose own shape uses a managed type, such as a column or an
     argument of a managed domain, cannot be written that early, and scratch
     needs it only in a chain (below). A statement that fails is reported
-    with the engine's error and the statement; when what it names is
+    with the engine's error, which names what failed; when what it names is
     managed, the remedy is a shape view or leaving the object out. The
     planned draft command and fill write shape views, and order by the
     target's `pg_depend`.
@@ -1693,7 +1709,8 @@ scratch compile (#1616).
   - Each object it creates is compared with the target before any binding
     question is answered. A mismatch, an object the target does not have,
     or a baseline object in the managed set refuses, and the finding names
-    the object.
+    the object. So does an object the comparison cannot read, such as a
+    text search configuration or a foreign table.
   - The shared compatibility qualification reads scratch after the
     baseline, so a setting the baseline changed must match the target too.
 - **What is compared is what a creation-time binding can read:**

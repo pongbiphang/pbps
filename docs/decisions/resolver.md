@@ -1632,7 +1632,9 @@ partial adoption, which is #1616's finding. Reconstructing them by reading
 their full definitions sends routine source no reviewer approved.
 - The baseline is a SQL file in the repository. It runs on scratch only.
 - **It runs whole and first, before any managed object is staged** (#1664).
-  It runs as the setup role, in its own session.
+  It runs as the setup role, in its own session. *Amended by
+  [DEC-1673.1](#dec-1673-1): it runs after the authorization reproduction,
+  still before any managed object, in both layouts.*
   - An earlier draft interleaved it with the managed declarations, so that
     an external routine could take a managed table's row type. That forced
     a confined role to keep the baseline away from objects already staged.
@@ -2149,3 +2151,101 @@ grants back what the give-up took.
 
 Recorded in SPEC §9.3.2. Pinned by the `vouched_` live tests in
 `resolver::server::vouched` and the live tests in `resolver::standard`.
+
+<a id="dec-1673-1"></a>
+
+**DEC-1673.1. The baseline runs after the authorization reproduction and
+before any managed object; what it created is the difference around it.**
+Decided with the maintainer on #1673.
+
+**The problem.** #1664 ran the baseline whole and first, on the empty
+database. The run-owned layout then reproduces the deployer's authorization
+by dropping and recreating every in-scope schema, `public` included
+(#688). A baseline that ran first would lose what it put there. Adopting
+the baseline's schemas instead would keep `public`'s template ACL against a
+target whose recreated `public` has none, the difference #688 removed.
+
+**The rule.**
+- **The file** lies under the project root, named relative to it. An
+  absolute path is refused, and so is a relative one that resolves outside
+  the root through `..` or a symlink, so a plan never runs SQL the project
+  does not hold.
+- **Order.** The baseline runs after the reproduction (run-owned) or after
+  the in-scope schemas are created (supplied), and before any managed
+  object is staged. That is what #1664 protects: the baseline meets nothing
+  managed. A baseline that writes into an in-scope schema writes
+  `CREATE SCHEMA IF NOT EXISTS`. A baseline that disturbs the reproduced
+  authorization is refused by the reproduction's own comparison.
+- **What it created** is the difference between two inventories of every
+  object initdb did not make, taken around it. A root is an object that
+  lives on no other: a table's row and array types, its indexes and owned
+  sequences, a range's constructors and an extension's members come with
+  their root.
+- **USAGE on a schema it created** is the target deployer's answer,
+  reproduced as an in-scope schema's is and checked as the compile session.
+  The baseline does not grant it: it cannot know a run-owned deployer's
+  generated name, and a supplied account owns what it creates, so its
+  usage is the owner's and nothing would compare it.
+- **Both layouts.** The run-owned one runs it in a fresh session as the
+  scratch superuser. The supplied one runs it on the checked connection,
+  where every write goes, then `DISCARD ALL`, so its `SET`s do not reach
+  the compile on that session. A transaction it leaves open is rolled back
+  and refused: its work would otherwise vanish with the session unseen.
+- **One script** (decided with the maintainer on #1769). The file is sent
+  whole, as one simple query, and the engine decides where each statement
+  ends. So it is one implicit transaction: a statement that cannot run in a
+  transaction block (`CREATE INDEX CONCURRENTLY`, `VACUUM`) is refused by
+  the engine, and a refused file leaves nothing. And it is read whole under
+  the session's settings when it starts: a setting it changes, such as
+  `standard_conforming_strings`, does not change how the rest is read. A
+  refusal carries the engine's error, which names the object or token.
+- **Chains are one hop**, read from the target's `pg_depend` before
+  compiling, as §9.3.2 words them. A chain refuses when the compile fails,
+  and the refusal names it: the target's dependencies are the current
+  declarations', and a desired one may no longer read through it. A
+  binder routine is managed by its declared signature, looked up on the
+  target, not by its name. A deeper chain fails as a baseline statement,
+  since its shape names a managed object that does not exist yet, and that
+  failure names the shape-view remedy.
+
+**How it is compared.** Both sides are read with the capture's owned
+snapshot, so the identities are those the sealed manifest uses, and the
+comparison is a projection of the manifest's properties.
+- A root the capture has no identity for (a text search object, a large
+  object, a subscription, a default privilege) or a foreign table is
+  refused as uncompared.
+- A root with a managed relation's or row type's name is refused as
+  managed. A routine is not matched by name, since an unmanaged overload
+  may share one; a baseline routine with a declared signature fails the
+  compile, which never replaces a routine.
+- An enum's labels are compared by their place: the engine's sort keys
+  differ with the order the labels were added in.
+- A staged object, and what it made, counts as reconstructed in the
+  assessment. A same-named routine the target has, that neither the
+  project nor the baseline does, names the routine-source remedy.
+- A routine body is checked against the views it writes when it is created
+  (measured on 18: `cannot insert into view`, SQLSTATE 55000), so a write
+  through a view staged as a shape view fails the compile; that failure
+  names the remedy, the view's real definition.
+
+**Answered or not.** A refused baseline is configuration the operator
+fixes, like a scratch that cannot be used as configured, so it is
+unanswerable rather than `resolver.unresolved`. The routine-source case is
+a binding verdict and stays unresolved.
+
+**Why not the alternatives.**
+- **Run first, then adopt the baseline's schemas** in the reproduction:
+  reopens #688 on `public`.
+- **Let the baseline grant USAGE:** wrong for both layouts, above.
+- **Split the file in pbps** and run each statement on its own. Where a
+  statement ends is the server's lexer and grammar, which depend on its
+  version and on settings the file can change. A client-side copy refused
+  valid files on ever narrower inputs in #1754's review (a `begin` name, a
+  continued `E''` string, a qualified `ext.end()` in a `BEGIN ATOMIC` body).
+  Letting the engine confirm each cut needs savepoints and protocol rules;
+  PostgreSQL's parser as a library pins one version's grammar and adds a C
+  dependency; a stricter file format breaks `pg_dump` output.
+
+Recorded in SPEC §9.3.2 and ADR-0016's amendment. Pinned by the
+`vouched_` baseline live tests in `resolver::server::vouched`, and by the
+tests in `resolver::baseline` and `resolver::capture::staged`.

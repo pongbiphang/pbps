@@ -33,6 +33,7 @@ impl fmt::Display for SafeFailure<'_> {
             Error::Binding(_) => f.write_str("Binding"),
             Error::Read(_) => f.write_str("Read"),
             Error::Vouched(_) => f.write_str("Vouched"),
+            Error::Baseline(_) => f.write_str("Baseline"),
         }?;
         write!(f, " recovery_names={:?}", self.0.recovery_names)
     }

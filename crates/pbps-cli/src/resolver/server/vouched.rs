@@ -30,6 +30,8 @@ use pbps_db::resolver::environment::{CatalogFacts, Verdict};
 use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::ResolverRuntime;
+use pbps_pg::resolver::baseline::{self, Object};
+use pbps_pg::resolver::capture::{StageError, Staged};
 use pbps_pg::resolver::standard::{self, Standard};
 use pbps_pg::resolver::vouched::{self as sql, Placement};
 use std::collections::BTreeSet;
@@ -52,6 +54,7 @@ pub async fn produce(
     project: &pbps_config::Project,
     environment: Option<&str>,
     standard: &Standard,
+    baseline: Option<&str>,
 ) -> Result<ResolvedPlan, ProduceError> {
     if driver != Driver::Postgres {
         return Err(ProduceError::Run(Error::Binding(
@@ -112,6 +115,7 @@ pub async fn produce(
         tokens: &tokens,
         backend: &backend,
         standard,
+        baseline,
         created: Created::Nothing,
     };
     let result = run
@@ -300,6 +304,10 @@ struct Run<'a> {
     backend: &'a sql::Backend,
     /// The state the scratch database is put into (#1708).
     standard: &'a Standard,
+    /// The resolver's baseline, as its file holds it (#1673). It is cut
+    /// into statements as it runs, since a statement can change how the
+    /// next is read.
+    baseline: Option<&'a str>,
     created: Created,
 }
 
@@ -315,6 +323,11 @@ struct Prepared {
     map: scope::Principals,
     /// Authorization keys the reproduction did not reproduce.
     differences: Vec<String>,
+    /// The roots of what the baseline created (#1673).
+    created: BTreeSet<Object>,
+    /// The role a run-owned layout gives USAGE on a schema the baseline
+    /// created; `None` where the scratch account compiles as itself.
+    grantee: Option<String>,
 }
 
 impl Run<'_> {
@@ -393,6 +406,34 @@ impl Run<'_> {
                 )));
             }
         }
+        let base_managed = engine::Managed::from_schema(binding.base);
+        let desired_managed = engine::Managed::from_schema(binding.desired);
+        // Read before anything compiles: a chain through the boundary fails
+        // the compile on an object no baseline can stage, and that failure
+        // is then named as the chain (SPEC §9.3.2). Only a failure refuses:
+        // the target's dependencies are the current declarations', and a
+        // desired one may no longer read through the chain (#1754 review).
+        let links = baseline::links(target)
+            .await
+            .map_err(db("the target's recorded dependencies"))?;
+        let kept = self.routine_oids(target, binding.desired).await?;
+        let mut any = self.routine_oids(target, binding.base).await?;
+        any.extend(kept.iter().copied());
+        let routines = baseline::ManagedRoutines { desired: kept, any };
+        let chains = baseline::chains(&links, &desired_managed, &base_managed, &routines);
+        let staged = match self.baseline {
+            Some(_) => {
+                self.stage(
+                    provisioning,
+                    &mut prepared,
+                    admin,
+                    target,
+                    &[&base_managed, &desired_managed],
+                )
+                .await?
+            }
+            None => Staged::default(),
+        };
         let extras = &request.write_path_extras;
         let mut reconstruction =
             engine::reconstruction(driver, extras, binding.bootstrap).map_err(Error::Binding)?;
@@ -400,9 +441,19 @@ impl Run<'_> {
             Some(compile) => compile,
             None => &mut *admin,
         };
-        engine::compile(&mut reconstruction, extras, driver, compile).await?;
-        let base_managed = engine::Managed::from_schema(binding.base);
-        let desired_managed = engine::Managed::from_schema(binding.desired);
+        engine::compile(&mut reconstruction, extras, driver, compile)
+            .await
+            .map_err(|error| {
+                let error = through_shape_view(error, &staged);
+                if let Error::Binding(reason) = &error
+                    && !chains.is_empty()
+                {
+                    return Error::Baseline(
+                        chains.iter().cloned().chain([reason.clone()]).collect(),
+                    );
+                }
+                error
+            })?;
         let dropped = engine::dropped_signatures(extras, base_managed.dropped_by(&desired_managed))
             .map_err(Error::Binding)?;
         let signatures: BTreeSet<_> = dropped.iter().filter_map(|(_, s)| s.clone()).collect();
@@ -428,6 +479,7 @@ impl Run<'_> {
             &reconstruction,
             &namespaces,
             &signatures,
+            staged.roots(),
         )
         .await?;
         let routines = base
@@ -473,7 +525,8 @@ impl Run<'_> {
                 })
                 .collect(),
         );
-        let assessment = compiled.assess(&current, &base_managed, &paths, &reconstruction);
+        let assessment =
+            compiled.assess_staged(&current, &base_managed, &paths, &reconstruction, &staged);
         let records = compiled
             .planning_records()
             .map_err(|error| Error::Binding(error.to_string()))?;
@@ -584,6 +637,25 @@ impl Run<'_> {
         )
         .await
         .map_err(db("the deployer's reproduced authorization"))?;
+        // After the reproduction, which drops and recreates each in-scope
+        // schema, and before any managed object (DEC-1673.1). Its own
+        // session, so its `SET`s reach nothing after it.
+        let created = match self.baseline {
+            Some(statements) => {
+                let before = inventory(&mut owner).await?;
+                let mut setup = Conn::connect_with(driver, self.scratch, names.database(), None)
+                    .await
+                    .map_err(db("the baseline's session"))?;
+                setup
+                    .execute("SET ROLE NONE")
+                    .await
+                    .map_err(db("the baseline session's role"))?;
+                run_baseline(&mut setup, statements).await?;
+                drop(setup);
+                baseline::created(&before, &inventory(&mut owner).await?).roots
+            }
+            None => BTreeSet::new(),
+        };
         // Opened after the reproduction, so the login defaults it stored
         // load into this session as they load on the target's.
         let mut session = Conn::connect_with(
@@ -600,6 +672,7 @@ impl Run<'_> {
         let deployer = map
             .deployer(authorization)
             .map_err(|reason| Error::Scope(reason.into()))?;
+        let grantee = Some(deployer.clone().unwrap_or_else(|| names.login().to_owned()));
         scope::enter(&mut session, driver, deployer.as_deref())
             .await
             .map_err(db("the reproduced deployer"))?;
@@ -626,6 +699,8 @@ impl Run<'_> {
             scratch_catalog,
             map,
             differences,
+            created,
+            grantee,
         })
     }
 
@@ -692,6 +767,23 @@ impl Run<'_> {
         sql::create_schemas(admin, scope_schemas)
             .await
             .map_err(db("the in-scope schemas"))?;
+        // After the in-scope schemas exist and before the deployer loses
+        // any usage, on the checked connection like every write here
+        // (DEC-1673.1). `DISCARD ALL` then keeps its `SET`s from the
+        // compile that follows on this same session.
+        let created = match self.baseline {
+            Some(statements) => {
+                let before = inventory(admin).await?;
+                run_baseline(admin, statements).await?;
+                admin
+                    .execute("SET ROLE NONE")
+                    .await
+                    .map_err(db("the scratch session's role"))?;
+                pinned(admin, self.backend).await?;
+                baseline::created(&before, &inventory(admin).await?).roots
+            }
+            None => BTreeSet::new(),
+        };
         let unusable = authorization
             .unusable_schemas(&request.planned)
             .into_iter()
@@ -727,6 +819,8 @@ impl Run<'_> {
             scratch_catalog,
             map,
             differences: Vec::new(),
+            created,
+            grantee: None,
         })
     }
 
@@ -991,6 +1085,189 @@ pub fn declared_standard(declared: Option<&pbps_config::resolver::ScratchStandar
 /// Refuses a scratch database holding anything initdb did not create: a
 /// leftover, a polluted template, or someone else's work. Compiling over it
 /// would bind to whatever it is.
+impl Run<'_> {
+    /// The OIDs on the target of the routines `schema` declares, each found
+    /// by its declared signature under the path its declaration compiles
+    /// with.
+    async fn routine_oids(
+        &self,
+        target: &mut Conn,
+        schema: &pbps_model::Schema,
+    ) -> Result<BTreeSet<u32>, Error> {
+        let declared = schema
+            .modules
+            .iter()
+            .filter(|(id, _)| matches!(id, pbps_model::ModuleId::Routine(_)))
+            .map(|(id, module)| (id.clone(), module.kind))
+            .collect();
+        let signatures: Vec<_> =
+            engine::dropped_signatures(&self.request.write_path_extras, declared)
+                .map_err(Error::Binding)?
+                .into_iter()
+                .filter_map(|(_, signature)| signature)
+                .collect();
+        baseline::routine_oids(target, &signatures)
+            .await
+            .map_err(|error| Error::Read(format!("the target's managed routines: {error}")))
+    }
+
+    /// Compares what the baseline created with the target, and reproduces
+    /// the target deployer's USAGE on each schema it created (#1673).
+    async fn stage(
+        &self,
+        provisioning: Provisioning,
+        prepared: &mut Prepared,
+        admin: &mut Conn,
+        target: &mut Conn,
+        managed: &[&engine::Managed],
+    ) -> Result<Staged, Error> {
+        let db = |what: &'static str| {
+            move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
+        };
+        let capture = match (prepared.capture.as_mut(), prepared.compile.as_mut()) {
+            (Some(capture), _) | (None, Some(capture)) => capture,
+            (None, None) => &mut *admin,
+        };
+        let staged =
+            pbps_pg::resolver::capture::compare_staged(capture, target, &prepared.created, managed)
+                .await
+                .map_err(|error| match error {
+                    StageError::Capture(error) => engine::catalog_read_failed(error),
+                    StageError::Refused(findings) => Error::Baseline(findings),
+                })?;
+        let schemas: Vec<String> = staged
+            .roots()
+            .iter()
+            .filter(|root| root.class == "pg_namespace")
+            .filter_map(|root| root.name.first().cloned())
+            .collect();
+        if schemas.is_empty() {
+            return Ok(staged);
+        }
+        // The deployer's answer, read on the target as the deployer.
+        let wanted = baseline::usage(target, &schemas)
+            .await
+            .map_err(db("the target deployer's usage of the baseline's schemas"))?;
+        match (provisioning, &prepared.grantee, prepared.capture.as_mut()) {
+            (Provisioning::RunOwned, Some(grantee), Some(owner)) => {
+                baseline::reproduce_usage(owner, grantee, &wanted)
+                    .await
+                    .map_err(db("the deployer's usage of the baseline's schemas"))?;
+            }
+            (Provisioning::Supplied, None, None) => {
+                // The account owns what its baseline created, so it already
+                // has USAGE; it gives up what the deployer lacks.
+                let unusable: Vec<String> = wanted
+                    .iter()
+                    .filter(|(_, usable)| !**usable)
+                    .map(|(schema, _)| schema.clone())
+                    .collect();
+                let kept = sql::revoke_usage(admin, &unusable)
+                    .await
+                    .map_err(db("the baseline's schemas the deployer cannot use"))?;
+                if !kept.is_empty() {
+                    return Err(Error::Vouched(format!(
+                        "the scratch account keeps USAGE on a schema the target's deployer \
+                         cannot use ({}); remove those privileges from the scratch account",
+                        kept.join("; ")
+                    )));
+                }
+            }
+            _ => {
+                return Err(Error::Scope(
+                    "the scratch layout and its sessions disagree".into(),
+                ));
+            }
+        }
+        let compile = match prepared.compile.as_mut() {
+            Some(compile) => compile,
+            None => &mut *admin,
+        };
+        let reproduced = baseline::usage(compile, &schemas)
+            .await
+            .map_err(db("the reproduced usage of the baseline's schemas"))?;
+        let differences: Vec<String> = wanted
+            .iter()
+            .filter(|(schema, usable)| reproduced.get(*schema) != Some(usable))
+            .map(|(schema, usable)| {
+                format!(
+                    "the target's deployer {} USAGE on schema {schema}, and the reproduction \
+                     does not",
+                    if *usable { "has" } else { "lacks" }
+                )
+            })
+            .collect();
+        if differences.is_empty() {
+            Ok(staged)
+        } else {
+            Err(Error::Baseline(differences))
+        }
+    }
+}
+
+/// A compile that failed writing through a view the baseline staged names
+/// the remedy: a shape view reads like the target's, but no statement can
+/// write through it, and a routine's body is checked against it when it is
+/// created (measured on 18: `cannot insert into view`, SQLSTATE 55000).
+fn through_shape_view(error: Error, staged: &Staged) -> Error {
+    let Error::Binding(reason) = error else {
+        return error;
+    };
+    let written = ["insert into", "update", "delete from", "merge into"]
+        .iter()
+        .find_map(|verb| {
+            let (_, rest) = reason.split_once(&format!("cannot {verb} view \""))?;
+            rest.split_once('"').map(|(view, _)| view.to_owned())
+        });
+    let staged_view = written.and_then(|view| {
+        staged
+            .roots()
+            .iter()
+            .find(|root| root.class == "pg_class" && root.name.last() == Some(&view))
+            .map(|root| root.name.join("."))
+    });
+    match staged_view {
+        Some(view) => Error::Binding(format!(
+            "{reason}; the baseline stages {view} as a view no statement can write through: \
+             stage its real definition in the baseline instead, with what it reads"
+        )),
+        None => Error::Binding(reason),
+    }
+}
+
+/// Every object in the scratch database initdb did not create.
+async fn inventory(conn: &mut Conn) -> Result<baseline::Inventory, Error> {
+    baseline::inventory(conn)
+        .await
+        .map_err(|error| Error::Read(format!("the scratch database's objects: {error}")))
+}
+
+/// Runs the baseline on `session` as one script (#1769), and refuses with
+/// the engine's error when the engine refuses it. A transaction it leaves
+/// open is rolled back and refused: its work would otherwise vanish unseen
+/// with the session, or reach the compile.
+async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
+    if let Err(failed) = baseline::run(session, sql).await {
+        let _ = session.execute("ROLLBACK").await;
+        let mut finding = format!("the engine refused it: {}", failed.error);
+        if failed.names_something_missing() {
+            finding.push_str(
+                "; the baseline runs before any managed object, so a statement that names one \
+                 fails: write such an object as a shape view (a view of typed NULLs that \
+                 returns no row), or leave it out of the baseline",
+            );
+        }
+        return Err(Error::Baseline(vec![finding]));
+    }
+    if session.execute("DISCARD ALL").await.is_err() {
+        let _ = session.execute("ROLLBACK").await;
+        return Err(Error::Baseline(vec![
+            "it leaves a transaction open; end each transaction it begins".into(),
+        ]));
+    }
+    Ok(())
+}
+
 async fn refuse_foreign_objects(conn: &mut Conn) -> Result<(), Error> {
     let (named, total) = sql::foreign_objects(conn)
         .await
