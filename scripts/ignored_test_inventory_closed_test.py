@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Actual-Python and independent rule-removal controls for DEC-1413.1."""
 
+import ast
+import copy
 import json
 from pathlib import Path
 import subprocess
@@ -166,6 +168,137 @@ class ClosedFixtures(unittest.TestCase):
                     # Module attribute access forces lazy evaluation on 3.14
                     # and still exposes the actual mutable selector on 3.12.
                     self.assertEqual(self.actual(source), [[], True])
+
+    def observe_alias_events(self, source, expected):
+        observed = self.root / 'alias-observed.py'
+        observed.write_text(source + '\nprint(EVENTS)\n', encoding='utf-8')
+        child = subprocess.run([sys.executable, '-B', str(observed)], cwd=self.root,
+                               capture_output=True, text=True, timeout=10)
+        if sys.version_info < (3, 12):
+            self.assertNotEqual(child.returncode, 0)
+            self.assertIn('SyntaxError', child.stderr)
+            with self.assertRaisesRegex(audit.InventoryError, 'invalid Python fixture'):
+                self.check(source)
+            return False
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(ast.literal_eval(child.stdout.strip()), expected)
+        return True
+
+    def assert_alias_projection_refusal(self, source, diagnostic):
+        with self.assertRaisesRegex(audit.InventoryError, diagnostic):
+            self.check(source)
+        # Restore only the old projection; the original admission rules and
+        # complete CI/owner inputs must still admit this false evidence.
+        with patch.object(audit.PruneInactive, 'visit_TypeAlias',
+                          audit.PruneInactive.generic_visit):
+            self.assertEqual(self.check(source), 1)
+        with self.assertRaisesRegex(audit.InventoryError, diagnostic):
+            self.check(source)
+
+    def test_lazy_alias_cannot_supply_function_or_module_invocation(self):
+        original = copy.deepcopy(self.inventory)
+        for scope in ('main', '<module>'):
+            for lazy in (True, False):
+                with self.subTest(scope=scope, lazy=lazy):
+                    self.inventory = copy.deepcopy(original)
+                    owner = self.inventory['owners']['live']
+                    body = 'EVENTS = []\ndef helper():\n    EVENTS.append("called")\n'
+                    statement = ('type Alias = ' if lazy else '') + 'helper()\n'
+                    main = MAIN
+                    if scope == 'main':
+                        main += '    ' + statement
+                        owner['witnesses'][1]['requires'].append('helper()')
+                    else:
+                        body += statement
+                        owner.pop('selection')
+                        owner['witnesses'] = [{'file': 'runner.py', 'language': 'python',
+                                               'scope': '<module>', 'requires': ['helper()']}]
+                    source = fixture(body, main=main)
+                    # Keep an ordinary alias in eager twins for the same syntax
+                    # qualification on Python versions without TypeAlias.
+                    if not lazy:
+                        source = 'type Ordinary = int\n' + source
+                    if not self.observe_alias_events(source, [] if lazy else ['called']):
+                        continue
+                    if lazy:
+                        self.assert_alias_projection_refusal(source, 'removed invocation.*helper')
+                    else:
+                        self.assertEqual(self.check(source), 1)
+
+    def test_lazy_alias_cannot_select_cases_after_independent_witness_passes(self):
+        original = copy.deepcopy(self.inventory)
+        for scope in ('main', '<module>'):
+            for lazy in (True, False):
+                with self.subTest(scope=scope, lazy=lazy):
+                    self.inventory = copy.deepcopy(original)
+                    owner = self.inventory['owners']['live']
+                    owner['selection'] = {'kind': 'calls', 'file': 'runner.py',
+                                          'scope': scope, 'callee': 'selected', 'argument': 0}
+                    owner['witnesses'] = [{'file': 'runner.py', 'language': 'python',
+                                          'scope': '<module>', 'requires': ['main()']}]
+                    prefix = ('EVENTS = []\nTEST = "owned"\n'
+                              'def selected(name):\n    EVENTS.append(name)\n')
+                    call = ('type Alias = ' if lazy else '') + 'selected(TEST)\n'
+                    source = prefix + (call + 'def main(): pass\n' if scope == '<module>'
+                                       else 'def main():\n    ' + call) + ENTRY
+                    if not lazy:
+                        source = 'type Ordinary = int\n' + source
+                    if not self.observe_alias_events(source, [] if lazy else ['owned']):
+                        continue
+                    if lazy:
+                        self.assert_alias_projection_refusal(source, 'no literal case calls')
+                    else:
+                        self.assertEqual(self.check(source), 1)
+
+    def test_lazy_alias_cannot_supply_command_literal_after_invocation_passes(self):
+        owner = self.inventory['owners']['live']
+        owner['witnesses'][1].update(requires=['helper()'], literal_contains=['cargo test'])
+        for lazy in (True, False):
+            source = fixture('EVENTS = []\ndef helper():\n    EVENTS.append("called")\n',
+                             main=MAIN + '    helper()\n    ' +
+                             ('type Alias = ' if lazy else 'command = ') + '"cargo test"\n')
+            if not lazy:
+                source = 'type Ordinary = int\n' + source
+            if not self.observe_alias_events(source, ['called']):
+                continue
+            if lazy:
+                self.assert_alias_projection_refusal(source, 'missing command literal')
+            else:
+                self.assertEqual(self.check(source), 1)
+
+    def test_forcing_alias_needs_independent_direct_invocation_evidence(self):
+        self.inventory['owners']['live']['witnesses'][1]['requires'].append('helper()')
+        for direct in (False, True):
+            source = fixture('EVENTS = []\ndef helper():\n    EVENTS.append("called")\n',
+                             main=MAIN + '    type Alias = helper()\n    Alias.__value__\n' +
+                             ('    helper()\n' if direct else ''))
+            if not self.observe_alias_events(source, ['called'] * (2 if direct else 1)):
+                continue
+            if direct:
+                self.assertEqual(self.check(source), 1)
+            else:
+                with self.assertRaisesRegex(audit.InventoryError, 'removed invocation.*helper'):
+                    self.check(source)
+
+    def test_alias_pruning_preserves_original_policy_and_statement_boundaries(self):
+        self.inventory['owners']['live']['witnesses'][1]['requires'].append('helper()')
+        source = fixture('EVENTS = []\ndef helper():\n    EVENTS.append("called")\n',
+                         main=MAIN + '    helper\n    type Alias = int\n    ()\n')
+        if not self.observe_alias_events(source, []):
+            return
+        tree = ast.parse(source)
+        before = ast.dump(tree)
+        audit.python_scope_tree(source, 'main', tree=tree)
+        self.assertEqual(ast.dump(tree), before)
+        with self.assertRaisesRegex(audit.InventoryError, 'removed invocation.*helper'):
+            self.check(source)
+        for alias, reason in [('type TESTS = int', 'protected binding TESTS'),
+                              ('type Alias[TESTS] = int', 'protected binding TESTS'),
+                              ('type Alias = globals()', 'reflective spelling globals')]:
+            with self.subTest(alias=alias):
+                source = fixture(alias + '\n')
+                with self.assertRaisesRegex(audit.InventoryError, reason):
+                    self.check(source)
 
     def test_unrelated_native_expressions_and_annotations_are_not_interpreted(self):
         for body in ('value = ~0\n', 'value = {1}\n', 'value: int\n',

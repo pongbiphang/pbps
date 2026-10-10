@@ -94,7 +94,12 @@ selector directly: existing named-function witnesses check the helper invocation
 route. Witness-only scripts without selector data retain direct module execution;
 this includes the sockets runner. No file-specific entry exception is configured.
 Function witnesses retain runtime branches and exclude inactive literal branches,
-nested definitions, comments and stringified calls. Tokens preserve statement
+nested definitions, lazy type-alias statements, comments and stringified calls.
+Lazy alias text supplies neither invocation tokens, command literals nor selected
+case calls, in function or module scopes. Explicit alias forcing may run Python
+code, but is not inferred as a direct-call witness; an independent supported call
+can still qualify. Source-form rules inspect the unchanged original AST, including
+alias values, names and type parameters (DEC-1413.1). Tokens preserve statement
 boundaries, so `run` followed by a separate `()` cannot manufacture `run()`;
 multiline, nested, continued and partial call fragments remain supported.
 
