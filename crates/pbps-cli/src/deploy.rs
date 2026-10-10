@@ -398,25 +398,41 @@ pub(crate) fn refuse_uninventoried_occupants(
     occupants: &[pbps_pg::catalog::NameOccupant],
     label: &str,
 ) -> anyhow::Result<()> {
-    let mut present: Vec<Occupant<'_>> = occupants
-        .iter()
-        .map(|found| Occupant {
-            found,
-            name: found.name.clone(),
-            owner: found.owner.clone(),
-            carried: None,
-        })
-        .collect();
+    let mut present = Occupant::all(occupants);
     let mut created: BTreeSet<TableName> = BTreeSet::new();
     let mut taken: Vec<String> = Vec::new();
     for p in &cs.changes {
         present.retain(|o| !o.freed_by(&p.change));
         if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
-            for o in &mut present {
+            let moved: Vec<usize> = (0..present.len())
+                .filter(|&k| present[k].moved(from, to))
+                .collect();
+            for &k in &moved {
+                let o = &present[k];
                 // `SET SCHEMA` refuses to carry one onto a name the plan
-                // already created there.
-                if o.moved(from, to) && created.contains(&o.name) {
+                // already created there, or that another relation holds
+                // there, one an earlier rename carried in included
+                // (measured on 16 and 18, #1749).
+                if created.contains(&o.name) {
                     taken.push(o.taken());
+                }
+                let holder = present
+                    .iter()
+                    .enumerate()
+                    .find(|&(j, q)| j != k && q.name == o.name);
+                if let Some((_, q)) = holder {
+                    let there = match &q.carried {
+                        Some((f, t)) => format!(
+                            "{} `{}`, which the rename of `{f}` to `{t}` moves there first",
+                            q.found.kind, q.found.name
+                        ),
+                        None => format!("{} `{}` already is", q.found.kind, q.name),
+                    };
+                    taken.push(format!(
+                        "`{}`: this plan moves {} `{}` on `{from}` there, with the rename of \
+                         `{from}` to `{to}`, where {there}",
+                        o.name, o.found.kind, o.found.name
+                    ));
                 }
             }
         }
@@ -433,13 +449,42 @@ pub(crate) fn refuse_uninventoried_occupants(
     if taken.is_empty() {
         return Ok(());
     }
+    // A clash with a holder a later rename moves away is refused too: this
+    // engine's plans are not reordered from catalog facts, so as ordered the
+    // `SET SCHEMA` fails, and the remedy is that rename in a plan of its own.
     bail!(
-        "`{label}` already uses {} name(s) this plan would create, for objects that share \
-         PostgreSQL's relation namespace with tables and views:\n  {}\nEach `CREATE` would be \
-         refused at apply. Rename the declaration, or drop or rename the object in the database.",
+        "`{label}` already uses {} name(s) this plan would create or move an object onto, for \
+         objects that share PostgreSQL's relation namespace with tables and views:\n  {}\nEach \
+         `CREATE`, or the `SET SCHEMA` of each cross-schema rename, would be refused at apply. \
+         Rename the declaration, or drop or rename the object in the database. Where a later \
+         rename in this plan moves the holder away, apply that rename in a plan of its own \
+         first.",
         taken.len(),
         taken.join("\n  ")
     );
+}
+
+/// The names this plan's cross-schema renames carry `occupants` onto, in
+/// their destination schemas (#1749). What holds one of them now is outside
+/// what the plan creates and what the moved tables own, so the caller reads
+/// it in a second pass before [`refuse_uninventoried_occupants`].
+pub(crate) fn carried_names(
+    cs: &pbps_model::ChangeSet,
+    occupants: &[pbps_pg::catalog::NameOccupant],
+) -> Vec<TableName> {
+    let mut present = Occupant::all(occupants);
+    let mut out = Vec::new();
+    for p in &cs.changes {
+        present.retain(|o| !o.freed_by(&p.change));
+        if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
+            for o in &mut present {
+                if o.moved(from, to) {
+                    out.push(o.name.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A [`pbps_pg::catalog::NameOccupant`] as the plan has left it so far: its
@@ -455,7 +500,20 @@ struct Occupant<'a> {
     carried: Option<(TableName, TableName)>,
 }
 
-impl Occupant<'_> {
+impl<'a> Occupant<'a> {
+    /// Each occupant as the catalog read it, before any change.
+    fn all(occupants: &'a [pbps_pg::catalog::NameOccupant]) -> Vec<Self> {
+        occupants
+            .iter()
+            .map(|found| Occupant {
+                found,
+                name: found.name.clone(),
+                owner: found.owner.clone(),
+                carried: None,
+            })
+            .collect()
+    }
+
     /// Whether `change` takes it away: an index it drops, a unique
     /// constraint's or a primary key's it drops, and what a table or a
     /// column it drops owns. Anything else, a dropped column's indexes among
@@ -10989,6 +11047,116 @@ mod tests {
         let mut after = moves();
         after.push(add_index(&x));
         refused(after).expect("s1.a's index left s1 with it");
+    }
+
+    /// #1749: `SET SCHEMA` refuses to carry an index or a sequence onto a
+    /// name another relation holds in the destination (measured on 16 and
+    /// 18), one an earlier rename carried there included. Negatives: distinct
+    /// names pass, and one the plan drops first frees the name.
+    #[test]
+    fn a_carried_occupant_meets_what_already_holds_its_name() {
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        use pbps_pg::catalog::NameOccupant;
+        let rename = |from: &TableName, to: &TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, &from.to_string(), 0),
+                from: from.clone(),
+                to: to.clone(),
+                defaults: Vec::new(),
+            })
+        };
+        let occupant = |at: &TableName, kind, owner: Option<&TableName>| NameOccupant {
+            name: at.clone(),
+            kind,
+            owner: owner.cloned(),
+            owner_column: None,
+        };
+        let refused = |changes: Vec<PlannedChange>, occupants: &[NameOccupant]| {
+            refuse_uninventoried_occupants(&ChangeSet { changes }, occupants, "prod")
+                .map_err(|e| e.to_string())
+        };
+        let (a, x) = (TableName::new("s1", "a"), TableName::new("s4", "x"));
+        let (a_to, x_to) = (TableName::new("s2", "b"), TableName::new("s2", "y"));
+        let index = occupant(&TableName::new("s1", "x_id_seq"), "index", Some(&a));
+        let sequence = NameOccupant {
+            owner_column: Some("id".into()),
+            ..occupant(&TableName::new("s4", "x_id_seq"), "sequence", Some(&x))
+        };
+
+        // Two moves land on `s2.x_id_seq`: the second is refused, naming both.
+        let e = refused(
+            vec![rename(&a, &a_to), rename(&x, &x_to)],
+            &[index.clone(), sequence.clone()],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains(
+                "`s2.x_id_seq`: this plan moves sequence `s4.x_id_seq` on `s4.x` there, with \
+                 the rename of `s4.x` to `s2.y`, where index `s1.x_id_seq`, which the rename \
+                 of `s1.a` to `s2.b` moves there first"
+            ),
+            "{e}"
+        );
+        assert!(
+            e.contains("apply that rename in a plan of its own first"),
+            "the remedy for a holder a later rename moves away: {e}"
+        );
+        // One already there, owned by nothing the plan moves.
+        let held = occupant(&TableName::new("s2", "x_id_seq"), "sequence", None);
+        let e = refused(vec![rename(&a, &a_to)], &[index.clone(), held.clone()]).unwrap_err();
+        assert!(e.contains("where sequence `s2.x_id_seq` already is"), "{e}");
+
+        // Negatives: another name lands free, and one dropped first frees it.
+        let other = occupant(&TableName::new("s1", "a_ix"), "index", Some(&a));
+        refused(
+            vec![rename(&a, &a_to), rename(&x, &x_to)],
+            &[other, sequence],
+        )
+        .expect("distinct names land apart");
+        let drop_index = PlannedChange::new(Change::DropIndex {
+            table: a.clone(),
+            name: "x_id_seq".into(),
+        });
+        refused(vec![drop_index, rename(&a, &a_to)], &[index, held])
+            .expect("the index is dropped before its table moves");
+    }
+
+    /// #1749: what the cross-schema renames carry, by the name each lands
+    /// on, for the second catalog read. A same-schema rename carries nothing.
+    #[test]
+    fn carried_names_are_where_each_move_lands() {
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        use pbps_pg::catalog::NameOccupant;
+        let a = TableName::new("s1", "a");
+        let rename = |to: TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "s1.a", 0),
+                from: a.clone(),
+                to,
+                defaults: Vec::new(),
+            })
+        };
+        let index = NameOccupant {
+            name: TableName::new("s1", "ix"),
+            kind: "index",
+            owner: Some(a.clone()),
+            owner_column: None,
+        };
+        let plan = |changes| ChangeSet { changes };
+        assert_eq!(
+            carried_names(
+                &plan(vec![rename(TableName::new("s2", "a"))]),
+                std::slice::from_ref(&index)
+            ),
+            [TableName::new("s2", "ix")]
+        );
+        assert!(
+            carried_names(
+                &plan(vec![rename(TableName::new("s1", "b"))]),
+                std::slice::from_ref(&index)
+            )
+            .is_empty()
+        );
     }
 
     /// #1084: a cross-schema rename carries its table's indexes and owned
