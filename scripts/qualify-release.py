@@ -365,6 +365,23 @@ def main():
                                       "{ throw 'Fixture hostname did not resolve to the NAT gateway' }")
                         fixture = native[engine]
                         print(json.dumps({"engine": engine, "fixture": fixture}), flush=True)
+                        # Distinguish native transport availability from TLS/CLI failures.
+                        port = int(fixture["port"])
+                        if not 1 <= port <= 65535:
+                            raise RuntimeError("invalid native fixture port")
+                        probe = consumer.exec(
+                            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                            "$ErrorActionPreference='Stop'; "
+                            "[Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | "
+                            "ForEach-Object { $_.GetIPProperties().UnicastAddresses } | "
+                            "ForEach-Object { $_.Address.IPAddressToString }; "
+                            "$client=[Net.Sockets.TcpClient]::new(); try { "
+                            f"$pending=$client.BeginConnect('pbps-db',{port},$null,$null); "
+                            "if (-not $pending.AsyncWaitHandle.WaitOne(5000)) "
+                            "{ throw 'Consumer TCP probe timed out before TLS' }; "
+                            "$client.EndConnect($pending); 'Consumer TCP probe connected' "
+                            "} finally { $client.Dispose() }")
+                        print(probe.stdout, flush=True)
                         cases = workload(consumer, engine, fixture, artifact_hash)
                         evidence["engines"][engine] = {"fixture": fixture, "cases": cases}
                     else:

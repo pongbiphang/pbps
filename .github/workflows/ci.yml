@@ -714,6 +714,13 @@ jobs:
         run: |
           python scripts/qualify-release.py --binary "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/pbps.exe" --consumer-image pbps-release-consumer --windows-fixture "$env:RUNNER_TEMP/release-fixture/fixture.json" --evidence "$env:RUNNER_TEMP/release-evidence.json"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Native fixture diagnostics after a failure
+        if: ${{ failure() }}
+        shell: powershell
+        run: |
+          if (Test-Path "$env:RUNNER_TEMP/release-fixture/owner.json") {
+            ./scripts/release-windows-fixture.ps1 -Action Diagnose -Root (Join-Path $env:RUNNER_TEMP 'release-fixture')
+          }
       - name: Remove only owned native fixtures
         if: ${{ always() }}
         shell: powershell

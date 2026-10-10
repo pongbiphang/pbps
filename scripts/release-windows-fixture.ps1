@@ -2,7 +2,7 @@
 #requires -PSEdition Desktop
 # Owned native engines for release qualification; never run on a shared host.
 param(
-    [Parameter(Mandatory)][ValidateSet('Start', 'Stop')][string]$Action,
+    [Parameter(Mandatory)][ValidateSet('Start', 'Stop', 'Diagnose')][string]$Action,
     [Parameter(Mandatory)][string]$Root
 )
 $ErrorActionPreference = 'Stop'
@@ -36,6 +36,47 @@ function Sql([string]$Instance, [string]$Statement) {
         $command.CommandText = $Statement
         return $command.ExecuteScalar()
     } finally { $connection.Dispose() }
+}
+
+if ($Action -eq 'Diagnose') {
+    if (-not (Test-Path $record)) { throw 'Missing owned fixture record' }
+    $owner = Get-Content -Raw $record | ConvertFrom-Json
+    # Read only bounded fixture topology, never credentials or certificate keys.
+    Get-NetTCPConnection -State Listen | Where-Object LocalPort -in @(15432, 14333) |
+        Select-Object LocalAddress, LocalPort, OwningProcess | Format-Table | Out-String | Write-Output
+    & docker network inspect nat --format '{{json .IPAM.Config}}'
+    if ($LASTEXITCODE) { throw 'Cannot inspect fixture NAT network' }
+    Get-NetIPAddress -AddressFamily IPv4 |
+        Select-Object InterfaceAlias, IPAddress, PrefixLength | Format-Table | Out-String | Write-Output
+    Get-NetFirewallProfile |
+        Select-Object Name, Enabled, DefaultInboundAction, AllowInboundRules, AllowLocalFirewallRules |
+        Format-Table | Out-String | Write-Output
+    foreach ($name in $owner.firewalls) {
+        $rule = Get-NetFirewallRule -Name $name -ErrorAction Stop
+        $rule | Select-Object Name, Enabled, Direction, Action, Profile, PolicyStoreSourceType |
+            Format-List | Out-String | Write-Output
+        $rule | Get-NetFirewallAddressFilter | Select-Object LocalAddress, RemoteAddress |
+            Format-List | Out-String | Write-Output
+        $rule | Get-NetFirewallPortFilter | Select-Object Protocol, LocalPort, RemotePort |
+            Format-List | Out-String | Write-Output
+    }
+    foreach ($address in @('127.0.0.1', ((& docker network inspect nat | ConvertFrom-Json)[0].IPAM.Config[0].Gateway))) {
+        foreach ($port in @(15432, 14333)) {
+            $client = [Net.Sockets.TcpClient]::new()
+            try {
+                $pending = $client.BeginConnect($address, $port, $null, $null)
+                if (-not $pending.AsyncWaitHandle.WaitOne(5000)) { throw 'TCP probe timed out' }
+                $client.EndConnect($pending)
+                Write-Output "Fixture host TCP probe ${address}:${port}: connected"
+            } catch { Write-Output "Fixture host TCP probe ${address}:${port}: $($_.Exception.Message)" }
+            finally { $client.Dispose() }
+        }
+    }
+    $pgLog = Join-Path $Root 'pg.log'
+    if (Test-Path $pgLog) {
+        Get-Content $pgLog -Tail 40 | ForEach-Object { $_.Replace('Pbps!Test12345', '[redacted]') }
+    }
+    return
 }
 
 if ($Action -eq 'Stop') {
