@@ -27,23 +27,69 @@ pub struct Unreadable {
     pub what: &'static str,
 }
 
-/// Splits a baseline into its statements the way `psql` does: a `;` ends a
-/// statement outside quotes, comments and parentheses, and outside the
-/// `BEGIN ATOMIC ... END` body of a `CREATE FUNCTION` or `CREATE PROCEDURE`.
-/// Text that is only whitespace and comments is no statement.
+/// Splits a baseline into its statements, every string read with standard
+/// conforming strings on. [`Script`] reads each with the mode the session
+/// has when it gets there.
 pub fn split(sql: &str) -> Result<Vec<Statement>, Unreadable> {
-    let chars: Vec<char> = sql.chars().collect();
+    let mut script = Script::new(sql);
     let mut statements = Vec::new();
-    let mut start = 0;
-    let mut line = 1;
-    let mut start_line = 1;
+    while let Some(statement) = script.next(true)? {
+        statements.push(statement);
+    }
+    Ok(statements)
+}
+
+/// A baseline read one statement at a time. Where a statement ends depends
+/// on how strings are read, which the baseline itself may change
+/// (`SET standard_conforming_strings = off`, measured on 18: `'it\'s'` is
+/// then one string), so each statement is cut when the previous one has
+/// run, under the session's mode at that point (#1754 review).
+pub struct Script {
+    chars: Vec<char>,
+    at: usize,
+    line: usize,
+}
+
+impl Script {
+    pub fn new(sql: &str) -> Self {
+        Self {
+            chars: sql.chars().collect(),
+            at: 0,
+            line: 1,
+        }
+    }
+
+    /// The next statement, or `None` at the end. `conforming` is whether a
+    /// plain string takes its backslashes literally.
+    pub fn next(&mut self, conforming: bool) -> Result<Option<Statement>, Unreadable> {
+        let (statement, at, line) = scan(&self.chars, self.at, self.line, conforming)?;
+        self.at = at;
+        self.line = line;
+        Ok(statement)
+    }
+}
+
+/// The first statement from `from`, the way `psql` cuts one: a `;` ends it
+/// outside quotes, comments and parentheses, and outside the
+/// `BEGIN ATOMIC ... END` body of a `CREATE FUNCTION` or `CREATE PROCEDURE`.
+/// Text that is only whitespace and comments is no statement. Returns where
+/// the scan stopped and the line there.
+fn scan(
+    chars: &[char],
+    from: usize,
+    line: usize,
+    conforming: bool,
+) -> Result<(Option<Statement>, usize, usize), Unreadable> {
+    let mut start = from;
+    let mut line = line;
+    let mut start_line = line;
     // Whether anything but whitespace and comments has been seen since
     // `start`.
     let mut substantive = false;
     let mut parens = 0usize;
     let mut words: Vec<String> = Vec::new();
     let mut begin_depth = 0usize;
-    let mut i = 0;
+    let mut i = from;
     let at = |i: usize| chars.get(i).copied();
     let identifier_start = |c: char| c.is_alphabetic() || c == '_' || !c.is_ascii();
     let identifier_part = |c: char| c.is_alphanumeric() || c == '_' || c == '$' || !c.is_ascii();
@@ -92,11 +138,13 @@ pub fn split(sql: &str) -> Result<Vec<Statement>, Unreadable> {
                 continue;
             }
             '\'' => {
-                // `E'...'` takes backslash escapes; any other string only
-                // doubles its quote.
-                let escapes = i > 0
-                    && matches!(chars[i - 1], 'e' | 'E')
-                    && (i < 2 || !identifier_part(chars[i - 2]));
+                // `E'...'` takes backslash escapes, and so does a plain
+                // string when strings are not standard conforming; any
+                // other string only doubles its quote.
+                let escapes = !conforming
+                    || i > 0
+                        && matches!(chars[i - 1], 'e' | 'E')
+                        && (i < 2 || !identifier_part(chars[i - 2]));
                 let opened = line;
                 i += 1;
                 loop {
@@ -181,10 +229,11 @@ pub fn split(sql: &str) -> Result<Vec<Statement>, Unreadable> {
             ')' => parens = parens.saturating_sub(1),
             ';' if parens == 0 && begin_depth == 0 => {
                 if substantive {
-                    statements.push(Statement {
+                    let statement = Statement {
                         text: chars[start..i].iter().collect::<String>().trim().to_owned(),
                         line: start_line,
-                    });
+                    };
+                    return Ok((Some(statement), i + 1, line));
                 }
                 start = i + 1;
                 substantive = false;
@@ -229,13 +278,11 @@ pub fn split(sql: &str) -> Result<Vec<Statement>, Unreadable> {
         }
         i += 1;
     }
-    if substantive {
-        statements.push(Statement {
-            text: chars[start..].iter().collect::<String>().trim().to_owned(),
-            line: start_line,
-        });
-    }
-    Ok(statements)
+    let statement = substantive.then(|| Statement {
+        text: chars[start..].iter().collect::<String>().trim().to_owned(),
+        line: start_line,
+    });
+    Ok((statement, chars.len(), line))
 }
 
 /// `CREATE [OR REPLACE] FUNCTION|PROCEDURE`, from a statement's first words.
@@ -267,22 +314,41 @@ impl Failed {
     }
 }
 
+/// Why a baseline stopped.
+#[derive(Debug)]
+pub enum Stopped {
+    /// Its text could not be cut into a statement.
+    Unreadable(Unreadable),
+    /// The engine refused a statement.
+    Failed(Failed),
+    /// The session's string mode could not be read.
+    Read(DbError),
+}
+
 /// Runs each statement on its own, in order, and stops at the first the
-/// engine refuses. Statements are not wrapped in a transaction: a baseline
-/// may hold its own, and the database is the run's to discard.
-pub async fn run(
-    conn: &mut impl ExecuteConnection,
-    statements: &[Statement],
-) -> Result<(), Failed> {
-    for statement in statements {
+/// engine refuses. Each is cut under the session's string mode as the
+/// statements before it left it. Statements are not wrapped in a
+/// transaction: a baseline may hold its own, and the database is the run's
+/// to discard.
+pub async fn run(conn: &mut impl ExecuteConnection, sql: &str) -> Result<(), Stopped> {
+    let mut script = Script::new(sql);
+    loop {
+        let rows = conn
+            .query("SELECT pg_catalog.current_setting('standard_conforming_strings') AS conforming")
+            .await
+            .map_err(Stopped::Read)?;
+        let conforming = rows
+            .first()
+            .and_then(|row| row.try_get::<&str>("conforming").ok().flatten())
+            .ok_or_else(|| Stopped::Read(DbError::BadRow("no string mode".into())))?
+            == "on";
+        let Some(statement) = script.next(conforming).map_err(Stopped::Unreadable)? else {
+            return Ok(());
+        };
         if let Err(error) = conn.execute(&statement.text).await {
-            return Err(Failed {
-                statement: statement.clone(),
-                error,
-            });
+            return Err(Stopped::Failed(Failed { statement, error }));
         }
     }
-    Ok(())
 }
 
 /// One object in the scratch database: its catalog, its OID there, and the
@@ -310,9 +376,16 @@ pub struct Created {
 /// constraint, a table's row type, an array type), automatically (an index,
 /// an owned sequence) or as an extension member. Measured on 18.
 pub async fn inventory(conn: &mut impl QueryConnection) -> Result<Inventory, DbError> {
-    let rows = conn
-        .query(&format!(
-            "SELECT f.classid::pg_catalog.regclass::text AS catalog, f.objid::text AS oid, \
+    // Under an empty path, so each description names its schema whatever
+    // path the session has: `pg_describe_object` leaves out a visible
+    // object's (measured on 16).
+    conn.query("BEGIN").await?;
+    let read = async {
+        conn.query("SELECT pg_catalog.set_config('search_path', '', true)")
+            .await?;
+        conn.query(&format!(
+            "SELECT (SELECT c.relname::text FROM pg_catalog.pg_class c WHERE c.oid = f.classid) \
+                      AS catalog, f.objid::text AS oid, \
                     pg_catalog.pg_describe_object(f.classid, f.objid, 0) AS described, \
                     (SELECT pg_catalog.min(d.deptype::text) FROM pg_catalog.pg_depend d \
                       WHERE d.classid = f.classid AND d.objid = f.objid \
@@ -320,7 +393,14 @@ pub async fn inventory(conn: &mut impl QueryConnection) -> Result<Inventory, DbE
                FROM ({}) f",
             super::vouched::user_objects()
         ))
-        .await?;
+        .await
+    }
+    .await;
+    let ended = conn
+        .query(if read.is_ok() { "COMMIT" } else { "ROLLBACK" })
+        .await;
+    let rows = read?;
+    ended?;
     rows.iter()
         .map(|row| {
             let oid = text(row, "oid")?
@@ -678,6 +758,24 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_string_takes_backslash_escapes_when_strings_are_not_conforming() {
+        let sql = "SELECT 'it\\'s; one'; SELECT 2";
+        let mut script = Script::new(sql);
+        assert_eq!(
+            script.next(false).unwrap().unwrap().text,
+            "SELECT 'it\\'s; one'"
+        );
+        assert_eq!(script.next(false).unwrap().unwrap().text, "SELECT 2");
+        assert_eq!(script.next(false).unwrap(), None);
+        // Negative: conforming, the backslash is literal and the quote
+        // after it closes the string.
+        assert_eq!(
+            Script::new(sql).next(true).unwrap().unwrap().text,
+            "SELECT 'it\\'s"
+        );
+    }
+
+    #[test]
     fn a_sql_standard_routine_body_is_one_statement() {
         assert_eq!(
             texts(
@@ -781,30 +879,44 @@ mod tests {
                 .await
                 .unwrap();
             conn.execute("CREATE SCHEMA app").await.unwrap();
+            // A relation from before: it is not the baseline's however the
+            // catalogs are named after it.
+            conn.execute("CREATE TABLE app.kept (id int)")
+                .await
+                .unwrap();
             let before = inventory(&mut conn).await.unwrap();
-            let statements = split(
-                "CREATE SCHEMA ext;\n\
+            let statements = "CREATE SCHEMA ext;\n\
                  CREATE TABLE ext.t (id serial PRIMARY KEY, a int UNIQUE, b text);\n\
                  CREATE INDEX ON ext.t (b);\n\
                  CREATE VIEW ext.v AS SELECT NULL::integer AS id WHERE false;\n\
                  CREATE FUNCTION ext.f(x int) RETURNS int LANGUAGE sql\n\
                  BEGIN ATOMIC SELECT x; END;\n\
-                 CREATE TYPE ext.r AS RANGE (subtype = int4);",
-            )
-            .unwrap();
-            let ran = run(&mut conn, &statements).await;
+                 CREATE TYPE ext.r AS RANGE (subtype = int4);\n\
+                 CREATE TABLE ext.pg_class (id int);\n\
+                 -- A string mode the baseline sets cuts what follows.\n\
+                 SET standard_conforming_strings = off;\n\
+                 COMMENT ON SCHEMA ext IS 'it\\'s; one';\n\
+                 RESET standard_conforming_strings;";
+            let ran = run(&mut conn, statements).await;
+            // A path on which a catalog's name means another relation reads
+            // each catalog by its own name all the same.
+            conn.execute("SET search_path = ext, pg_catalog")
+                .await
+                .unwrap();
             let after = inventory(&mut conn).await.unwrap();
             // Negative: a statement naming what does not exist is refused
             // by name, and stops the run there.
-            let missing =
-                split("CREATE VIEW ext.w AS SELECT * FROM app.t;\nCREATE SCHEMA never;").unwrap();
-            let failed = run(&mut conn, &missing).await.unwrap_err();
+            let failed = run(
+                &mut conn,
+                "CREATE VIEW ext.w AS SELECT * FROM app.t;\nCREATE SCHEMA never;",
+            )
+            .await;
             drop(conn);
             admin
                 .execute(&format!("DROP DATABASE {name}"))
                 .await
                 .unwrap();
-            assert!(ran.is_ok(), "{variable}: {:?}", ran.err().map(|f| f.error));
+            assert!(ran.is_ok(), "{variable}: {:?}", ran.err());
             let mut roots = created(&before, &after)
                 .roots
                 .into_iter()
@@ -816,12 +928,16 @@ mod tests {
                 [
                     "function ext.f(integer)",
                     "schema ext",
+                    "table ext.pg_class",
                     "table ext.t",
                     "type ext.r",
                     "view ext.v"
                 ],
                 "{variable}"
             );
+            let Err(Stopped::Failed(failed)) = failed else {
+                panic!("{variable}: {failed:?}");
+            };
             assert_eq!(failed.statement.line, 1, "{variable}");
             assert!(
                 failed.names_something_missing(),

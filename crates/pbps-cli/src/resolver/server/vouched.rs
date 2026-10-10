@@ -30,7 +30,7 @@ use pbps_db::resolver::environment::{CatalogFacts, Verdict};
 use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::ResolverRuntime;
-use pbps_pg::resolver::baseline::{self, Object, Statement};
+use pbps_pg::resolver::baseline::{self, Object, Stopped};
 use pbps_pg::resolver::capture::{StageError, Staged};
 use pbps_pg::resolver::standard::{self, Standard};
 use pbps_pg::resolver::vouched::{self as sql, Placement};
@@ -69,17 +69,6 @@ pub async fn produce(
     let key = crate::resolver::sealing::environment_key(project, environment)
         .map_err(|error| ProduceError::Run(Error::Binding(error.to_string())))?;
     let request = request(base, desired, hints, write_path_extras).map_err(ProduceError::Run)?;
-    // Read whole before any connection: a baseline that cannot be split
-    // would otherwise fail part-way through, on scratch.
-    let baseline = baseline
-        .map(pbps_pg::resolver::baseline::split)
-        .transpose()
-        .map_err(|unreadable| {
-            ProduceError::Run(Error::Baseline(vec![format!(
-                "line {} has {}",
-                unreadable.line, unreadable.what
-            )]))
-        })?;
     let mut target = Conn::connect(driver, target_connection)
         .await
         .map_err(|error| vouched(format!("the target could not be connected: {error}")))?;
@@ -126,7 +115,7 @@ pub async fn produce(
         tokens: &tokens,
         backend: &backend,
         standard,
-        baseline: baseline.as_deref(),
+        baseline,
         created: Created::Nothing,
     };
     let result = run
@@ -315,8 +304,10 @@ struct Run<'a> {
     backend: &'a sql::Backend,
     /// The state the scratch database is put into (#1708).
     standard: &'a Standard,
-    /// The resolver's baseline, split into its statements (#1673).
-    baseline: Option<&'a [Statement]>,
+    /// The resolver's baseline, as its file holds it (#1673). It is cut
+    /// into statements as it runs, since a statement can change how the
+    /// next is read.
+    baseline: Option<&'a str>,
     created: Created,
 }
 
@@ -1252,12 +1243,30 @@ async fn inventory(conn: &mut Conn) -> Result<baseline::Inventory, Error> {
 }
 
 /// Runs the baseline's statements in order on `session`, and refuses at the
-/// first the engine refuses, naming it. A transaction it leaves open is
-/// rolled back and refused: its work would otherwise vanish unseen with the
-/// session, or reach the compile.
-async fn run_baseline(session: &mut Conn, statements: &[Statement]) -> Result<(), Error> {
-    if let Err(failed) = baseline::run(session, statements).await {
+/// first that cannot be read or that the engine refuses, naming it. A
+/// transaction it leaves open is rolled back and refused: its work would
+/// otherwise vanish unseen with the session, or reach the compile.
+async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
+    let stopped = baseline::run(session, sql).await;
+    if stopped.is_err() {
         let _ = session.execute("ROLLBACK").await;
+    }
+    let failed = match stopped {
+        Ok(()) => None,
+        Err(Stopped::Failed(failed)) => Some(failed),
+        Err(Stopped::Unreadable(unreadable)) => {
+            return Err(Error::Baseline(vec![format!(
+                "line {} has {}",
+                unreadable.line, unreadable.what
+            )]));
+        }
+        Err(Stopped::Read(error)) => {
+            return Err(Error::Read(format!(
+                "the baseline session's string mode: {error}"
+            )));
+        }
+    };
+    if let Some(failed) = failed {
         let first = failed.statement.text.lines().next().unwrap_or_default();
         let mut finding = format!(
             "its statement at line {} ({first}) failed: {}",
