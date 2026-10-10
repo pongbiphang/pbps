@@ -186,6 +186,9 @@ jobs:
           INSTA_FORCE_PASS: "0"
       - run: python3 scripts/ignored_test_inventory_test.py
       - run: python3 scripts/ignored_test_inventory.py
+      - name: Native fixture subnet selection
+        shell: powershell
+        run: ./scripts/release-windows-network-test.ps1
 
   # The SPEC 11.5 invariants against a real SQL Server (bootstrap == introspect,
   # apply(plan(A->B)) converges on B). Linux only: the service container needs a

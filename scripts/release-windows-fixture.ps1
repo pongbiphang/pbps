@@ -189,7 +189,11 @@ try {
     $nat = (& docker network inspect nat | ConvertFrom-Json)[0]
     if ($LASTEXITCODE -ne 0) { throw 'Native Windows Docker NAT is required' }
     $gateway = $nat.IPAM.Config[0].Gateway
-    $subnet = $nat.IPAM.Config[0].Subnet
+    # Docker can report 0.0.0.0/0, which Windows stored as RemoteAddress
+    # 0.0.0.0 in the failed native run. Bind the rule to the gateway's real subnet.
+    . "$PSScriptRoot/release-windows-network.ps1"
+    $subnet = Get-FixtureSubnet $gateway @(Get-NetIPAddress -AddressFamily IPv4)
+    Write-Output "Fixture source network: $subnet (gateway $gateway)"
     foreach ($port in @(15432, 14333)) {
         $name = "$instance-$port"
         $owner.firewalls += $name; Save-Owner $owner
