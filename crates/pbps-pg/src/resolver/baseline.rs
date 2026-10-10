@@ -86,14 +86,20 @@ pub async fn inventory(conn: &mut impl QueryConnection) -> Result<Inventory, DbE
     let read = async {
         conn.query("SELECT pg_catalog.set_config('search_path', '', true)")
             .await?;
+        // Membership of an extension initdb made (`plpgsql`) carries
+        // nothing: the baseline did not create that extension, so no
+        // version comparison covers what it adds to it, and it is a root.
+        // Scratch holds no other extension before the baseline runs.
         conn.query(&format!(
             "SELECT (SELECT c.relname::text FROM pg_catalog.pg_class c WHERE c.oid = f.classid) \
                       AS catalog, f.objid::text AS oid, \
                     pg_catalog.pg_describe_object(f.classid, f.objid, 0) AS described, \
                     (SELECT pg_catalog.min(d.deptype::text) FROM pg_catalog.pg_depend d \
                       WHERE d.classid = f.classid AND d.objid = f.objid \
-                        AND d.deptype IN ('i', 'a', 'e')) AS carried \
+                        AND d.deptype IN ('i', 'a', 'e') \
+                        AND NOT (d.deptype = 'e' AND d.refobjid < {})) AS carried \
                FROM ({}) f",
+            super::vouched::FIRST_NORMAL_OBJECT_ID,
             super::vouched::user_objects()
         ))
         .await

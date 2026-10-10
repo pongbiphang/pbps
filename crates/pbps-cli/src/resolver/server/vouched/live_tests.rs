@@ -2144,6 +2144,48 @@ async fn vouched_refuses_a_question_that_needs_routine_source_the_baseline_lacks
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_compares_what_the_baseline_adds_to_an_extension_it_did_not_create() {
+    // `plpgsql` is there before the baseline runs, so a routine the
+    // baseline adds to it is compared on its own, not skipped as covered by
+    // an extension version nobody compared.
+    let external = [
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!(
+            "CREATE FUNCTION {EXTERNAL}.f(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1"
+        ),
+        format!("ALTER EXTENSION plpgsql ADD FUNCTION {EXTERNAL}.f(integer)"),
+    ];
+    let call = format!("SELECT {EXTERNAL}.f(1) AS r");
+    let mut setup = vec![format!("CREATE SCHEMA {MANAGED}")];
+    setup.extend(external.iter().cloned());
+    setup.push(format!("CREATE VIEW {MANAGED}.a AS {call}"));
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let inputs = staging_inputs(&call, &call, &[]);
+    let key = ProjectKey::new(true);
+    let baseline = external
+        .iter()
+        .map(|s| format!("{s};\n"))
+        .collect::<String>();
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &baseline,
+    )
+    .await;
+    target.drop().await;
+    let plan = match result {
+        Ok(plan) => plan,
+        Err(error) => panic!("a routine added to plpgsql: {error}"),
+    };
+    plan.evidence.validate(&plan.changes).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_stages_a_routine_in_a_system_schema_by_its_header() {
     // A superuser may create a routine in `information_schema` (measured on
     // 16 and 18). Staged there, it is compared by its header like any staged
