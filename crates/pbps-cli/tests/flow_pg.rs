@@ -9727,6 +9727,79 @@ fn a_dropped_constraint_trigger_frees_its_name_for_a_key() {
     );
 }
 
+/// #1749: `ALTER TABLE ... SET SCHEMA` takes a table's indexes along under
+/// their names, and refuses one whose name a relation of the destination
+/// holds (measured on 16 and 18). An unmanaged sequence `s2.n` and a table
+/// moved from `s1` to `s2` with an index `n`: the plan is refused before it
+/// is written, naming both. Without the sequence the move applies.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_move_onto_a_name_the_destination_holds_is_refused() {
+    let own = OwnDatabase::new(&server(), "landing1749");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA s1; CREATE SCHEMA s2; CREATE SEQUENCE s2.n",
+    );
+    let d = Demo::new("landing1749");
+    let body = "columns:\n  id: {type: bigint, nullable: false}\n\
+                primary_key: {name: pk_t, columns: [id]}\n\
+                indexes:\n  n: {columns: [id]}\n";
+    std::fs::write(
+        d.dir.join("schema/s1.t.yml"),
+        format!("table: s1.t\n{body}"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    std::fs::remove_file(d.dir.join("schema/s1.t.yml")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/s2.t.yml"),
+        format!("table: s2.t\n{body}"),
+    )
+    .unwrap();
+    succeeds(d.run(&["rename-table", "s1.t", "s2.t"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+
+    let artifact = d.dir.join("refused-plan.json");
+    let out = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&out), 0, "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains(
+            "`s2.n`: this plan moves index `s1.n` on `s1.t` there, with the rename of `s1.t` \
+             to `s2.t`, where sequence `s2.n` already is"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!artifact.exists(), "a refused plan writes no artifact");
+
+    on_server(connection, "DROP SEQUENCE s2.n");
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename"],
+    ));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 's2' AND c.relname = 'n'"
+        ),
+        1
+    );
+}
+
 /// #1633: a foreign key's `RESTRICT` is pulled as `restrict` on delete and
 /// on update, bootstrapped into an empty database, and pulled back the same,
 /// with nothing left to plan. Changing an action between `restrict` and

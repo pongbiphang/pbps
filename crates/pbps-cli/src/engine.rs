@@ -687,12 +687,23 @@ pub async fn refuse_created_name_occupants(
 ) -> anyhow::Result<()> {
     match conn.driver() {
         Driver::Postgres => {
-            let occupants = pbps_pg::catalog::relation_name_occupants(
+            let mut occupants = pbps_pg::catalog::relation_name_occupants(
                 conn,
                 &crate::deploy::created_relation_names(cs),
                 &crate::deploy::transferred_tables(cs),
             )
             .await?;
+            // What a cross-schema rename carries lands on names of its own,
+            // which something else may hold there now (#1749).
+            let landing: Vec<TableName> = crate::deploy::carried_names(cs, &occupants)
+                .into_iter()
+                .filter(|n| !occupants.iter().any(|o| &o.name == n))
+                .collect();
+            for found in pbps_pg::catalog::relation_name_occupants(conn, &landing, &[]).await? {
+                if !occupants.contains(&found) {
+                    occupants.push(found);
+                }
+            }
             crate::deploy::refuse_uninventoried_occupants(cs, &occupants, label)
         }
         Driver::Mssql => Ok(()),
