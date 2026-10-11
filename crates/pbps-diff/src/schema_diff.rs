@@ -7293,7 +7293,7 @@ mod tests {
         );
         let drop = Intent::DropTable {
             table: "app.ev_d".parse().unwrap(),
-            reason: "handed over".into(),
+            reason: "handed over".parse().unwrap(),
         };
         // Negative: external while pbps holds a partition, dropped with intent,
         // said once, not again for the drop.
