@@ -114,6 +114,10 @@ pub enum Error {
     /// empty (#1667, #1672). Nothing was written on it.
     #[error("the operator-vouched scratch cannot be used: {0}")]
     Vouched(String),
+    /// The resolver's baseline failed on scratch, or what it staged is not
+    /// the target's (#1673). Each finding names the object or statement.
+    #[error("the resolver's baseline was refused: {}", .0.join("; "))]
+    Baseline(Vec<String>),
 }
 
 /// Which premise of the named profile a refusal is about.
@@ -2210,6 +2214,8 @@ impl ScratchRun {
                 reconstruction,
                 &namespaces,
                 &dropped.iter().filter_map(|(_, s)| s.clone()).collect(),
+                // The measured profiles stage no baseline.
+                &Default::default(),
             )
             .await
             .map(|(captured, scope)| (Some(captured), None, scope, None)),

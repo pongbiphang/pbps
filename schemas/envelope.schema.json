@@ -565,6 +565,14 @@
                 }
               ]
             },
+            "baseline": {
+              "description": "A SQL file, relative to the project root, that creates on scratch\nthe objects outside the managed set that managed objects reference\n(#1673). It runs on scratch only, before any managed object, and\neach object it creates is compared with the target.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            },
             "kind": {
               "type": "string",
               "const": "server"
@@ -2031,6 +2039,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 36,
+  "x-pbps-schema-version": 37,
   "x-pbps-tool-version": "0.0.0"
 }

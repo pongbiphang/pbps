@@ -134,6 +134,25 @@ impl CompiledCapture {
         super::assess(target, &self.captured, base, paths, reconstruction)
     }
 
+    /// [`Self::assess`], with what a resolver baseline staged (#1673).
+    pub fn assess_staged(
+        &self,
+        target: &CapturedInputs,
+        base: &super::Managed,
+        paths: &super::Paths,
+        reconstruction: &crate::resolver::reconstruct::Reconstruction,
+        staged: &super::Staged,
+    ) -> pbps_db::resolver::capture::Assessment {
+        super::assess::assess_with(
+            target,
+            &self.captured,
+            base,
+            paths,
+            reconstruction,
+            Some(staged),
+        )
+    }
+
     /// Consume the fixed-key producer once. The compiled records only prove
     /// the plan's closing inventories and supply its own bindings and
     /// candidate members; the closing manifest does not predict their

@@ -603,7 +603,31 @@ pub async fn owns_database(conn: &mut impl QueryConnection) -> Result<bool, DbEr
 pub async fn foreign_objects(
     conn: &mut impl QueryConnection,
 ) -> Result<(Vec<String>, usize), DbError> {
-    let union = CATALOGS
+    let union = user_objects();
+    let rows = conn
+        .query(&format!(
+            "SELECT pg_catalog.pg_describe_object(f.classid, f.objid, 0) AS object, \
+                    pg_catalog.count(*) OVER ()::text AS total \
+               FROM ({union}) f ORDER BY 1 LIMIT {NAMED}"
+        ))
+        .await?;
+    let total = match rows.first() {
+        Some(row) => text(row, "total")?
+            .parse()
+            .map_err(|_| DbError::BadRow("an object count was not a number".into()))?,
+        None => 0,
+    };
+    let named = rows
+        .iter()
+        .map(|row| text(row, "object"))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((named, total))
+}
+
+/// A query of `(classid, objid)` for every object in the connected database
+/// that initdb did not create, in the catalogs [`foreign_objects`] reads.
+pub(crate) fn user_objects() -> String {
+    CATALOGS
         .iter()
         .map(|catalog| {
             format!(
@@ -626,25 +650,7 @@ pub async fn foreign_objects(
             )
         }))
         .collect::<Vec<_>>()
-        .join(" UNION ALL ");
-    let rows = conn
-        .query(&format!(
-            "SELECT pg_catalog.pg_describe_object(f.classid, f.objid, 0) AS object, \
-                    pg_catalog.count(*) OVER ()::text AS total \
-               FROM ({union}) f ORDER BY 1 LIMIT {NAMED}"
-        ))
-        .await?;
-    let total = match rows.first() {
-        Some(row) => text(row, "total")?
-            .parse()
-            .map_err(|_| DbError::BadRow("an object count was not a number".into()))?,
-        None => 0,
-    };
-    let named = rows
-        .iter()
-        .map(|row| text(row, "object"))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((named, total))
+        .join(" UNION ALL ")
 }
 
 /// Everything outside the run's own database that `DROP OWNED BY

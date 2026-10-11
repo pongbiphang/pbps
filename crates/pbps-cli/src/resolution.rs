@@ -235,6 +235,34 @@ pub async fn resolve(request: &Request<'_>) -> Result<pbps_model::ChangeSet, Ref
     producer::produce(request, driver, &bootstrap).await
 }
 
+/// A resolver's baseline file, read only from under the project root.
+///
+/// The baseline is reviewed history like the declarations (SPEC §9.3.2), so
+/// it is never a file elsewhere on the planning machine: an absolute path, a
+/// `..` or a symlink that leads outside the root is refused. Judged on the
+/// resolved path, not lexically, because a symlink inside the root can point
+/// anywhere. The file read is the one judged. Linux only, with the producer
+/// that reads it.
+#[cfg(target_os = "linux")]
+fn read_baseline(root: &std::path::Path, path: &std::path::Path) -> Result<String, String> {
+    let unreadable = |error: std::io::Error| format!("could not be read: {error}");
+    // Relative, as the configuration says: an absolute path would work from
+    // one checkout only, even one inside the root (`join` replaces the root
+    // with it).
+    if path.has_root() {
+        return Err("is an absolute path; name the baseline relative to the project root".into());
+    }
+    let root = root.canonicalize().map_err(unreadable)?;
+    let file = root.join(path).canonicalize().map_err(unreadable)?;
+    if !file.starts_with(&root) {
+        return Err(format!(
+            "lies outside the project root {}; a baseline is a file in the project",
+            root.display()
+        ));
+    }
+    std::fs::read_to_string(&file).map_err(unreadable)
+}
+
 /// The producers of the profiles pbps implements. Today every one is a
 /// measured profile (RESOLVER-RUNTIME): its run binds the target by observing
 /// the engine service that holds the connection (DEC-1514.1). That premise
@@ -257,10 +285,25 @@ mod producer {
         // A supplied server is the operator-vouched resolver (DEC-1528.1);
         // Docker stays the measured profile until #1674 gives it a vouched
         // runtime.
-        if let pbps_config::resolver::ResolverProfile::Server { url_env, standard } =
-            &request.selection.profile
+        if let pbps_config::resolver::ResolverProfile::Server {
+            url_env,
+            standard,
+            baseline,
+        } = &request.selection.profile
         {
             let scratch = scratch_connection(request, url_env)?;
+            let baseline = baseline
+                .as_ref()
+                .map(|path| {
+                    super::read_baseline(request.project.root(), path).map_err(|why| {
+                        Refused::Unanswerable(anyhow::anyhow!(
+                            "the resolver `{}` names the baseline {}, which {why}",
+                            request.selection.name,
+                            path.display()
+                        ))
+                    })
+                })
+                .transpose()?;
             let Some(identity) = request.target_identity else {
                 return Err(Refused::Unanswerable(anyhow::anyhow!(
                     "the planning read recorded no cluster identity for the resolver to bind"
@@ -279,6 +322,7 @@ mod producer {
                 request.project,
                 request.target.environment(),
                 &pbps_cli::resolver::server::vouched::declared_standard(standard.as_ref()),
+                baseline.as_deref(),
             )
             .await
             .map(|resolved| resolved.changes)
@@ -373,8 +417,10 @@ mod producer {
             | Error::Consumed
             | Error::Scope(_)
             | Error::Read(_)
-            // A scratch that cannot be used as configured answered nothing.
-            | Error::Vouched(_) => false,
+            // A scratch that cannot be used as configured answered nothing,
+            // nor did one whose baseline is not the target's.
+            | Error::Vouched(_)
+            | Error::Baseline(_) => false,
         }
     }
 }
@@ -403,6 +449,68 @@ mod tests {
     use super::*;
     use pbps_model::{Column, Hints, IdsFile, Module, ModuleKind, Schema, Table};
 
+    // Linux only: the reader lives with the Linux producer, and the fixture
+    // makes Unix symlinks.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_baseline_is_read_only_from_under_the_project_root() {
+        use std::path::{Path, PathBuf};
+        let dir = std::env::temp_dir().join(format!(
+            "pbps-baseline-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = dir.join("project");
+        std::fs::create_dir_all(root.join("db")).unwrap();
+        std::fs::write(root.join("db/baseline.sql"), "CREATE SCHEMA ext;").unwrap();
+        std::fs::write(dir.join("outside.sql"), "CREATE SCHEMA other;").unwrap();
+        std::os::unix::fs::symlink(dir.join("outside.sql"), root.join("db/link.sql")).unwrap();
+        std::os::unix::fs::symlink(root.join("db/baseline.sql"), root.join("inside.sql")).unwrap();
+
+        assert_eq!(
+            read_baseline(&root, Path::new("db/baseline.sql")).as_deref(),
+            Ok("CREATE SCHEMA ext;")
+        );
+        // A symlink that stays inside the project is the file it names.
+        assert_eq!(
+            read_baseline(&root, Path::new("inside.sql")).as_deref(),
+            Ok("CREATE SCHEMA ext;")
+        );
+        // A parent step that comes back inside the root is still relative.
+        assert_eq!(
+            read_baseline(&root, Path::new("db/../db/baseline.sql")).as_deref(),
+            Ok("CREATE SCHEMA ext;")
+        );
+        // Negative: an absolute path is refused even inside the root.
+        for path in [root.join("db/baseline.sql"), dir.join("outside.sql")] {
+            let refused = read_baseline(&root, &path).unwrap_err();
+            assert!(refused.starts_with("is an absolute path"), "{refused}");
+        }
+        // Negative: a parent step and a symlink each lead outside the
+        // project root, to a file that exists.
+        for path in [
+            PathBuf::from("../outside.sql"),
+            PathBuf::from("db/link.sql"),
+        ] {
+            let refused = read_baseline(&root, &path).unwrap_err();
+            assert!(
+                refused.starts_with("lies outside the project root"),
+                "{}: {refused}",
+                path.display()
+            );
+        }
+        // Negative: a missing file is unreadable, not empty.
+        assert!(
+            read_baseline(&root, Path::new("db/missing.sql"))
+                .unwrap_err()
+                .starts_with("could not be read")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// #1718 review: only a supplied server is bound by the planning
     /// identity, so a Docker profile plans for a role refused
     /// `pg_control_system()`, while a server profile refuses it and names the
@@ -425,6 +533,7 @@ mod tests {
         let server = selection(ResolverProfile::Server {
             url_env: "PBPS_UNUSED".into(),
             standard: None,
+            baseline: None,
         });
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -524,6 +633,7 @@ mod tests {
             profile: pbps_config::resolver::ResolverProfile::Server {
                 url_env: "PBPS_RESOLVER_UNSET_1515".into(),
                 standard: None,
+                baseline: None,
             },
             status: pbps_config::resolver::SelectionStatus::NotAcquired,
         }

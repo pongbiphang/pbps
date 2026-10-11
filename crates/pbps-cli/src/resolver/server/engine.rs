@@ -249,6 +249,7 @@ pub(crate) async fn capture_desired_for_plan(
     reconstruction: &Reconstruction,
     namespaces: &std::collections::BTreeSet<String>,
     dropped_signatures: &std::collections::BTreeSet<pbps_pg::resolver::capture::DroppedSignature>,
+    staged: &std::collections::BTreeSet<pbps_db::resolver::capture::ObjectIdentity>,
 ) -> Result<(CompiledCapture, CaptureScope), Error> {
     use pbps_pg::resolver::capture;
     // The principal map names the engine: only PostgreSQL's has an adapter.
@@ -257,7 +258,11 @@ pub(crate) async fn capture_desired_for_plan(
             let first = capture::capture(connection, &capture::managed_scope(desired))
                 .await
                 .map_err(catalog_read_failed)?;
-            let scope = capture::scope(&first, &[base, desired], paths);
+            // What a baseline staged is read and sealed on both sides, so
+            // the recheck compares the target's complete fingerprints of it
+            // (#1673).
+            let mut scope = capture::scope(&first, &[base, desired], paths);
+            scope.retained.extend(staged.iter().cloned());
             let routines = recorded
                 .schema
                 .modules

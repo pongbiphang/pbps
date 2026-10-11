@@ -117,6 +117,7 @@ fn only_a_server_profile_yields_an_endpoint() {
         ScratchEndpoint::from_profile(&ResolverProfile::Server {
             url_env: "PBPS_UNSET_DEDICATED_SERVER_609".into(),
             standard: None,
+            baseline: None,
         }),
         Err(Error::Endpoint)
     ));

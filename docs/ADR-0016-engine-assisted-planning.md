@@ -718,8 +718,9 @@ carries the normative text, and DEC-1528.1 the reasons.
     reviewer can always tell a vouched answer from a measured one.
 - **Decision 5, for the operator-vouched resolver.**
   - Objects outside the managed set come from a reviewed baseline in the
-    repository, run on scratch only. It runs whole and first (#1664), as the
-    setup role in its own session, before pbps stages any managed object.
+    repository, run on scratch only. It runs whole (#1664), as the setup
+    role, after the deployer's authorization is reproduced and before pbps
+    stages any managed object, in both layouts (DEC-1673.1).
     So it can change nothing pbps staged, and needs no privilege rule. Its
     statements therefore name nothing managed: a view over managed tables
     is written as a shape view.
@@ -783,6 +784,9 @@ carries the normative text, and DEC-1528.1 the reasons.
   - `vouched_refuses_an_external_view_staged_as_a_table` (the computed-field
     `xmin(ext.v)` case binds differently on a table)
   - `vouched_refuses_a_question_that_needs_routine_source_the_baseline_lacks`
+  - `vouched_reports_a_write_through_a_shape_view_with_the_real_definition_remedy`
+  - `vouched_stages_a_cast_and_an_operator_over_external_types_in_the_baseline`
+  - `vouched_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates`
   - `vouched_recheck_binds_the_target_by_engine_identity`
   - `vouched_recheck_refuses_an_external_shape_changed_after_planning`
 

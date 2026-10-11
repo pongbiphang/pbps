@@ -1622,6 +1622,7 @@ resolvers:
   scratch:
     kind: server
     url_env: PBPS_SCRATCH_DB
+    baseline: db/baseline.sql       # optional; relative to the project root
     standard:                       # optional; omitted = template0's state
       settings:                     # ALTER DATABASE <scratch> SET ...
         statement_timeout: 5min
@@ -1682,14 +1683,33 @@ that references anything outside the managed set otherwise fails the whole
 scratch compile (#1616).
 
 - **The baseline is a SQL file in the repository**, named by the resolver
-  entry's `baseline`. It is reviewed history like the declarations. It runs on
-  scratch only, never on the target.
-- **It runs whole and first** (#1664). It runs after the two separation checks,
-  on the empty run-owned database, as the setup role, in its own session, and
-  before pbps stages any managed object.
+  entry's `baseline`. It is reviewed history like the declarations. An
+  absolute path is refused, and so is a relative one that resolves outside
+  the project root through `..` or a symlink. It runs on scratch only, never on the target.
+- **It runs whole, before any managed object** (#1664, DEC-1673.1), in
+  both layouts. It runs after the separation and emptiness checks and after
+  the deployer's authorization is reproduced, which recreates each in-scope
+  schema; a baseline that writes into one writes `CREATE SCHEMA IF NOT
+  EXISTS`. It runs as the setup role: in the run-owned layout in a session
+  of its own, in the supplied one on the checked connection, which `DISCARD
+  ALL` then resets. It runs inside one `REPEATABLE READ` transaction pbps
+  opens and commits. Transaction control in it (`BEGIN`, `COMMIT`,
+  `ROLLBACK`) is refused by the engine before anything it did can commit.
+  It runs on the empty path every pbps session pins, so it names its
+  schemas or sets the path, as `pg_dump` output does.
+  - **It runs as one script**: pbps sends the file whole and the engine
+    splits it (#1769). It is one transaction, so a statement that
+    cannot run in a transaction block, such as `CREATE INDEX CONCURRENTLY`,
+    is refused, and a refused file leaves nothing. The file is read whole
+    under the session's settings when it starts: a setting it changes, such
+    as `standard_conforming_strings`, does not change how the rest is read.
   - So it can change nothing pbps staged, because nothing is staged yet. Its
     `SET`s, `search_path` included, never reach the session that compiles
     the declarations.
+  - What it created is the difference between the database's objects
+    before and after it. The target deployer's USAGE on a schema it
+    created, an extension's own schema included, is reproduced as an
+    in-scope schema's is, not left to the baseline to grant.
   - No privilege rule is needed, so any SQL may be written: an extension, a
     cast, an operator, a `DO` block.
   - **So a baseline's statements name nothing managed.** A legacy view over
@@ -1697,7 +1717,7 @@ scratch compile (#1616).
     An object whose own shape uses a managed type, such as a column or an
     argument of a managed domain, cannot be written that early, and scratch
     needs it only in a chain (below). A statement that fails is reported
-    with the engine's error and the statement; when what it names is
+    with the engine's error, which names what failed; when what it names is
     managed, the remedy is a shape view or leaving the object out. The
     planned draft command and fill write shape views, and order by the
     target's `pg_depend`.
@@ -1705,16 +1725,41 @@ scratch compile (#1616).
   - Each object it creates is compared with the target before any binding
     question is answered. A mismatch, an object the target does not have,
     or a baseline object in the managed set refuses, and the finding names
-    the object.
+    the object. So does an object the comparison cannot read, such as a
+    text search configuration or a foreign table.
+  - An extension's members are each compared like an object it creates:
+    an extension's version says nothing of a member altered in place, or
+    one the baseline adds to an extension (#1783). A member the comparison
+    cannot read refuses, naming it, as a root would.
+  - It changes nothing outside the scratch database. Roles, role
+    memberships, role and other databases' settings, shared comments and
+    security labels, tablespaces, other databases, parameter privileges,
+    replication origins, and any other shared catalog the engine lists, are
+    read before and after it, in its own transaction's snapshot, so another
+    session's writes meanwhile do not count. A change refuses, naming each
+    object, and is rolled back. What is compared is catalog state: an effect
+    a superuser can have outside catalogs and transactions (a replication
+    slot, a server file, `COPY ... TO PROGRAM`) is not seen and outlives the
+    rollback. It is the operator's, under the vouching for the scratch
+    (#1824).
   - The shared compatibility qualification reads scratch after the
-    baseline, so a setting the baseline changed must match the target too.
-- **What is compared is what a creation-time binding can read:**
-  - an object's own class-specific properties, as the evidence manifest
-    fingerprints them;
-  - of a relation's children, its columns, the primary-key and unique
-    constraints and indexes that a `GROUP BY` functional dependency or an
-    `ON CONFLICT` inference relies on, and its inheritance and partition
-    parents, which a row-type coercion such as `c::ext.parent` relies on.
+    baseline, so a setting the baseline changed must match the target too:
+    the scratch database's own settings are its to change.
+- **Everything is compared except what is listed as not compared** (#1783):
+  each object's own class-specific properties, as the evidence manifest
+  fingerprints them, and every part of it, however the part hangs off it
+  (by its identity, a reference, or an internal or automatic dependency), a
+  part of a part too. A kind of part no list names is compared, so it
+  refuses when it differs instead of passing unseen. Among the parts a
+  binding reads:
+  - of a relation, its columns, the primary-key and unique constraints and
+    indexes that a `GROUP BY` functional dependency or an `ON CONFLICT`
+    inference relies on, its inheritance and partition parents, which a
+    row-type coercion such as `c::ext.parent` relies on, and an identity
+    column's sequence;
+  - of an operator family, which operator serves each strategy and which
+    routine each support number, and each of its operator classes' headers,
+    which an index, an `ORDER BY` and a row comparison bind by.
 
   Examples:
   - a relation's kind, and its column names, types, collations and order
@@ -1723,7 +1768,7 @@ scratch compile (#1616).
     order, a domain's base type and collation;
   - a routine's header: signature, return type, argument names and modes,
     defaults, variadic, volatility;
-  - an extension's version.
+  - an extension's version, and each of its members as itself.
 - **What is not compared:**
   - a relation's other children: foreign keys, CHECKs, column defaults,
     triggers, policies, rules and non-unique indexes;
