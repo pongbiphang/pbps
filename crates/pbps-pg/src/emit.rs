@@ -1400,22 +1400,22 @@ fn one(pg: &Postgres, table: &TableName, body: String) -> Sql {
 /// one of its own that 18 kept (DEC-1687.1), dropped too. Found at apply
 /// time, since no declaration lists the partitions, and a partition holds no
 /// NOT NULL of its own while it is external (DEC-1533.1).
-fn clear_external_partitions(
-    pg: &Postgres,
-    table: &TableName,
-    column: &str,
-    mut sql: Vec<Statement>,
-) -> Sql {
+///
+/// pbps's own text, so on the empty path where nothing the parent's schema
+/// defines, an `=` operator say, can stand in for the catalog's (DEC-1564.1),
+/// and under a tag the names in it cannot close (#1833 review).
+fn clear_external_partitions(table: &TableName, column: &str, mut sql: Vec<Statement>) -> Sql {
     let body = format!(
-        "DO $pbps$\nDECLARE\n  p regclass;\nBEGIN\n  FOR p IN\n    SELECT i.inhrelid::regclass\n      \
-         FROM pg_catalog.pg_inherits i\n      JOIN pg_catalog.pg_attribute a\n        ON \
-         a.attrelid = i.inhrelid AND a.attname = {name} AND a.attnotnull\n     WHERE \
-         i.inhparent = {parent}::regclass\n  LOOP\n    EXECUTE pg_catalog.format('ALTER TABLE \
-         %s ALTER COLUMN %I DROP NOT NULL', p, {name});\n  END LOOP;\nEND\n$pbps$;",
+        "DECLARE\n  p pg_catalog.regclass;\nBEGIN\n  FOR p IN\n    SELECT \
+         i.inhrelid::pg_catalog.regclass\n      FROM pg_catalog.pg_inherits i\n      JOIN \
+         pg_catalog.pg_attribute a\n        ON a.attrelid = i.inhrelid AND a.attname = {name} \
+         AND a.attnotnull\n     WHERE i.inhparent = {parent}::pg_catalog.regclass\n  LOOP\n    \
+         EXECUTE pg_catalog.format('ALTER TABLE %s ALTER COLUMN %I DROP NOT NULL', p, \
+         {name});\n  END LOOP;\nEND",
         name = literal(column),
         parent = literal(&qualified(table)?),
     );
-    sql.push(on(pg, table, &body)?);
+    sql.push(Statement::new(atomically(&body)));
     Ok(sql)
 }
 
@@ -2609,7 +2609,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 ),
             )?;
             if !from_nullable && *to_nullable && *through_external_partitions {
-                clear_external_partitions(pg, &column.table, &column.name, sql)
+                clear_external_partitions(&column.table, &column.name, sql)
             } else {
                 Ok(sql)
             }
@@ -2640,7 +2640,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 ),
             )?;
             if *to_nullable && *through_external_partitions {
-                clear_external_partitions(pg, &column.table, &column.name, sql)
+                clear_external_partitions(&column.table, &column.name, sql)
             } else {
                 Ok(sql)
             }
@@ -5231,8 +5231,14 @@ mod tests {
             let sql = sql_of(&pg, &change);
             assert_eq!(sql.len(), 2, "{sql:?}");
             assert!(sql[0].contains("DROP NOT NULL"), "{sql:?}");
+            // pbps's own, on the session's empty path (DEC-1564.1).
             assert!(
-                sql[1].contains("i.inhparent = '\"app\".\"ev\"'::regclass")
+                sql[1].starts_with("DO $pbps$\n") && !sql[1].contains("search_path"),
+                "{}",
+                sql[1]
+            );
+            assert!(
+                sql[1].contains("i.inhparent = '\"app\".\"ev\"'::pg_catalog.regclass")
                     && sql[1].contains("a.attname = 'it''s'")
                     && sql[1]
                         .contains("ALTER TABLE %s ALTER COLUMN %I DROP NOT NULL', p, 'it''s')"),
@@ -5240,6 +5246,21 @@ mod tests {
                 sql[1]
             );
         }
+        // A name holding the block's usual tag takes another (#1833 review).
+        let tagged = Change::AlterColumnNullability {
+            uid: Uid::generate(UidKind::Column),
+            column: ColumnRef::new(name("app", "ev"), "x$pbps$y"),
+            ty: ty("integer"),
+            to_nullable: true,
+            through_external_partitions: true,
+            collation: None,
+        };
+        let sql = sql_of(&pg, &tagged);
+        assert!(
+            sql[1].starts_with("DO $pbps1$\n") && sql[1].ends_with("\n$pbps1$;"),
+            "{}",
+            sql[1]
+        );
         // Negative: a tightening, a retype that stays nullable, and a parent
         // whose partitions are declared.
         for change in [

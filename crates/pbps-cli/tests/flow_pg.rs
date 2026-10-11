@@ -6997,10 +6997,13 @@ fn pull_declares_a_named_parents_partitions_external_on(server: &str, k: usize) 
     // 18 and outlives the parent's `DROP NOT NULL` (DEC-1687.1). The parent's
     // change clears it from every partition after, which no declaration
     // lists, and the apply's closing read finds them its own (#1833 review).
+    // Its clearing is pbps's own SQL, on the empty path: the operators a user
+    // of the parent's schema could add are not called (DEC-1564.1).
     on_server(
         &connection,
         "ALTER TABLE app.ev_2025 ALTER COLUMN id2 SET NOT NULL",
     );
+    on_server(&connection, &trap_operators("app"));
     let path = schema.join("app.dc.yml");
     let declared = std::fs::read_to_string(&path).unwrap();
     assert!(
