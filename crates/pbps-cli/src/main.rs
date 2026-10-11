@@ -1800,11 +1800,16 @@ fn load_finding(e: &pbps_load::LoadError) -> output::Finding {
 /// and "empty" are the same thing.
 fn read_ids_opt(project: &Project) -> anyhow::Result<Option<IdsFile>> {
     let path = project.ids_file();
-    if !path
-        .try_exists()
-        .with_context(|| format!("cannot inspect identity file `{}`", path.display()))?
-    {
-        return Ok(None);
+    // Target existence follows symlinks: a broken history link would look
+    // absent and authorize fresh IDs. Inspect the directory entry instead,
+    // then let reading a dangling link fail as damaged history.
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("cannot inspect identity file `{}`", path.display()));
+        }
     }
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read identity file `{}`", path.display()))?;

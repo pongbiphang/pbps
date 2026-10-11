@@ -21724,6 +21724,56 @@ fn forced_pull_refuses_damaged_identity_history_before_connecting() {
 }
 
 #[test]
+#[cfg(unix)]
+fn forced_pull_distinguishes_dangling_identity_links_from_absent_history() {
+    let d = Demo::new("pull-ids-dangling-link");
+    d.table(ONE_COLUMN);
+    let initialized = d.run(&["plan"]);
+    assert_eq!(code(&initialized), 0, "{}", stderr(&initialized));
+    let target = d.dir.join("ids-history.json");
+    std::fs::rename(d.ids_path(), &target).unwrap();
+    std::os::unix::fs::symlink("ids-history.json", d.ids_path()).unwrap();
+    let valid = d.run(&["validate"]);
+    assert_eq!(code(&valid), 0, "{}", stderr(&valid));
+    d.commit();
+    std::fs::remove_file(&target).unwrap();
+
+    let args = [
+        "pull",
+        "--force",
+        "--db",
+        "Server=127.0.0.1,1;Database=missing",
+    ];
+    let refused = d.run(&args);
+    assert_eq!(code(&refused), 1);
+    let error = stderr(&refused);
+    assert!(error.contains("cannot read identity file"), "{error}");
+    assert!(
+        error.contains("restore the identity file from git"),
+        "{error}"
+    );
+    assert!(!error.contains("cannot connect"), "{error}");
+    assert_eq!(
+        std::fs::read_link(d.ids_path()).unwrap(),
+        std::path::Path::new("ids-history.json")
+    );
+    assert!(!target.exists());
+    assert_eq!(
+        std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap(),
+        ONE_COLUMN
+    );
+
+    // A genuinely absent entry still reaches the connection for new adoption.
+    std::fs::remove_file(d.ids_path()).unwrap();
+    let absent = d.run(&args);
+    assert_eq!(code(&absent), 1);
+    let error = stderr(&absent);
+    assert!(error.contains("cannot connect"), "{error}");
+    assert!(!error.contains("cannot read identity file"), "{error}");
+    assert!(!d.ids_path().exists());
+}
+
+#[test]
 #[ignore = "needs live SQL Server"]
 fn forced_pull_preserves_applied_column_rename_and_drop_history() {
     pull_identity::column_history(&std::env::var("PBPS_TEST_DB").unwrap(), false);
