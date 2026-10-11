@@ -100,6 +100,25 @@ class Rename(unittest.TestCase):
                                       lambda b, h: rs.diff_paths(b, h, cwd=directory))[0])
 
 
+    def test_a_non_ascii_or_quoted_name_is_read_as_its_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.root = directory
+            self.git("init", "--quiet")
+            self.git("commit", "--quiet", "--allow-empty", "-m", "base")
+            base = self.git("rev-parse", "HEAD")
+            fixtures = Path(directory) / "crates/pbps-db/tests/fixtures"
+            fixtures.mkdir(parents=True)
+            for name in ("caf\u00e9.pem", 'quote"d.pem', "tab\tname.pem"):
+                (fixtures / name).write_text("x\n")
+            self.git("add", ".")
+            self.git("commit", "--quiet", "-m", "names Git would quote")
+            head = self.git("rev-parse", "HEAD")
+            paths = rs.diff_paths(base, head, cwd=directory)
+            self.assertEqual(sorted(paths), sorted(f"crates/pbps-db/tests/fixtures/{n}"
+                                                   for n in ("caf\u00e9.pem", 'quote"d.pem', "tab\tname.pem")))
+            self.assertEqual(len(rs.triggered(paths)), 3)
+
+
 class Main(unittest.TestCase):
     def test_outputs_and_summary_are_written(self):
         with tempfile.TemporaryDirectory() as directory:

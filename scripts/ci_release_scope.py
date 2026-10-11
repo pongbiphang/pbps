@@ -76,10 +76,14 @@ def decide(event, base, head, changed):
 
 def diff_paths(base, head, cwd=None):
     """Every path on either side of the diff: a rename lists both names, so a
-    file moved out of the trigger set still counts as a change to it."""
-    out = subprocess.run(["git", "diff", "--no-renames", "--name-only", base, head],
-                         check=True, capture_output=True, text=True, cwd=cwd).stdout
-    return [line for line in out.splitlines() if line]
+    file moved out of the trigger set still counts as a change to it.
+
+    `-z` because Git otherwise quotes and escapes a name with non-ASCII or
+    control characters (`core.quotePath`); a quoted `crates/pbps-db/...` would
+    match no trigger and skip the qualification it should run."""
+    out = subprocess.run(["git", "diff", "--no-renames", "--name-only", "-z", base, head],
+                         check=True, capture_output=True, cwd=cwd).stdout
+    return [os.fsdecode(name) for name in out.split(b"\0") if name]
 
 
 def git_changed(base, head):
