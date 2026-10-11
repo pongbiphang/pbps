@@ -2428,6 +2428,56 @@ async fn vouched_compares_an_operator_familys_members_with_the_target() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_compares_an_operator_class_with_its_family() {
+    // The class lives on its family automatically; whether it is its type's
+    // default is in its own header, compared with the family (#1783).
+    let class = |default: bool| {
+        let default = if default { "DEFAULT " } else { "" };
+        vec![
+            format!("CREATE SCHEMA {EXTERNAL}"),
+            format!("CREATE TYPE {EXTERNAL}.e AS ENUM ('a', 'b')"),
+            format!(
+                "CREATE OPERATOR CLASS {EXTERNAL}.c {default}FOR TYPE {EXTERNAL}.e USING hash \
+                 AS OPERATOR 1 = (anyenum, anyenum), FUNCTION 1 hashenum(anyenum)"
+            ),
+        ]
+    };
+    let call = format!("SELECT 'a'::{EXTERNAL}.e AS v");
+    for staged_default in [false, true] {
+        let mut setup = vec![format!("CREATE SCHEMA {MANAGED}")];
+        setup.extend(class(true));
+        setup.push(format!("CREATE VIEW {MANAGED}.a AS {call}"));
+        let mut target = Fixture::new("PBPS_TEST_PG_DB");
+        let scratch = Fixture::new(SCRATCH_SERVER);
+        let target_db = staging_target(&mut target, &setup).await;
+        let inputs = staging_inputs(&call, &call, &[]);
+        let key = ProjectKey::new(true);
+        let baseline = class(staged_default)
+            .iter()
+            .map(|s| format!("{s};\n"))
+            .collect::<String>();
+        let result = produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &baseline,
+        )
+        .await;
+        target.drop().await;
+        if staged_default {
+            // Negative: the same class is staged.
+            let plan = result.unwrap_or_else(|error| panic!("an identical class: {error}"));
+            plan.evidence.validate(&plan.changes).unwrap();
+        } else {
+            let refused = baseline_refusal(result);
+            assert!(refused.contains("opcdefault"), "{refused}");
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_refuses_a_baseline_that_writes_outside_the_scratch_database() {
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
@@ -2452,6 +2502,10 @@ async fn vouched_refuses_a_baseline_that_writes_outside_the_scratch_database() {
             "DO $$BEGIN EXECUTE format('COMMENT ON ROLE %I IS ''pbps''', current_user); END$$;"
                 .to_owned(),
             vec!["the comment on role".to_owned()],
+        ),
+        (
+            "GRANT SET ON PARAMETER log_statement TO PUBLIC;".to_owned(),
+            vec!["the privileges on parameter log_statement".to_owned()],
         ),
         // Transaction control would commit the role before any check:
         // refused before it runs, and the role is never created.
@@ -2519,6 +2573,53 @@ async fn vouched_refuses_a_baseline_that_writes_outside_the_scratch_database() {
             "{server}: {refused}"
         );
         assert_eq!(left, 0, "{server}: the setting is rolled back");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_runs_the_baseline_on_the_empty_path_every_session_pins() {
+    // Every pbps session pins an empty path (DEC-1564.1), the baseline's
+    // too: a file written for `psql` names its schemas or sets the path, as
+    // `pg_dump` output does, and one that does neither is told so.
+    let call = "SELECT public.soundex('pbps') AS r";
+    let setup = vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        "CREATE EXTENSION fuzzystrmatch SCHEMA public".to_owned(),
+        format!("CREATE VIEW {MANAGED}.a AS {call}"),
+    ];
+    for (baseline, staged) in [
+        (
+            "SET search_path = public;\nCREATE EXTENSION fuzzystrmatch;",
+            true,
+        ),
+        ("CREATE EXTENSION fuzzystrmatch;", false),
+    ] {
+        let mut target = Fixture::new("PBPS_TEST_PG_DB");
+        let scratch = Fixture::new(SCRATCH_SERVER);
+        let target_db = staging_target(&mut target, &setup).await;
+        let inputs = staging_inputs(call, call, &[]);
+        let key = ProjectKey::new(true);
+        let result = produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            baseline,
+        )
+        .await;
+        target.drop().await;
+        if staged {
+            let plan = result.unwrap_or_else(|error| panic!("{baseline}: {error}"));
+            plan.evidence.validate(&plan.changes).unwrap();
+        } else {
+            // Negative: no schema on the path, and the refusal says why.
+            let refused = baseline_refusal(result);
+            assert!(
+                refused.contains("it runs on an empty search_path"),
+                "{refused}"
+            );
+        }
     }
 }
 

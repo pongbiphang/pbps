@@ -1260,18 +1260,17 @@ async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
         .await
         .map_err(read("the baseline's transaction"))?;
     let outcome = async {
-        // Under an empty path, here and after the script, whose `SET`s
-        // last until `DISCARD ALL`: a type it creates may be named `text`.
-        let pinned = "SELECT pg_catalog.set_config('search_path', '', true)";
-        session
-            .execute(pinned)
-            .await
-            .map_err(read("the baseline session's path"))?;
         let before = baseline::shared_state(session)
             .await
             .map_err(read("the cluster's shared state"))?;
         if let Err(failed) = baseline::run(session, sql).await {
             let mut finding = format!("the engine refused it: {}", failed.error);
+            if failed.no_schema() {
+                finding.push_str(
+                    "; it runs on an empty search_path, as every pbps session does, so name each \
+                     object's schema, or set the path in the file as pg_dump output does",
+                );
+            }
             if failed.unsupported() {
                 finding.push_str(
                     "; if it controls its transaction, leave out BEGIN, COMMIT and ROLLBACK: \
@@ -1287,8 +1286,12 @@ async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
             }
             return Err(Error::Baseline(vec![finding]));
         }
+        // Under an empty path: the script's `SET`s last on this session
+        // until `DISCARD ALL`, and a type it creates may be named `text`.
+        // Not before it: the file runs on the session's own path, and
+        // nothing it could shadow exists yet.
         session
-            .execute(pinned)
+            .execute("SELECT pg_catalog.set_config('search_path', '', true)")
             .await
             .map_err(read("the baseline session's path"))?;
         let after = baseline::shared_state(session)

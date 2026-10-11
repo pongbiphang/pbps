@@ -1680,6 +1680,8 @@ scratch compile (#1616).
   ALL` then resets. It runs inside one `REPEATABLE READ` transaction pbps
   opens and commits. Transaction control in it (`BEGIN`, `COMMIT`,
   `ROLLBACK`) is refused by the engine before anything it did can commit.
+  It runs on the empty path every pbps session pins, so it names its
+  schemas or sets the path, as `pg_dump` output does.
   - **It runs as one script**: pbps sends the file whole and the engine
     splits it (#1769). It is one transaction, so a statement that
     cannot run in a transaction block, such as `CREATE INDEX CONCURRENTLY`,
@@ -1716,8 +1718,8 @@ scratch compile (#1616).
     cannot read refuses, naming it, as a root would.
   - It changes nothing outside the scratch database. Roles, role
     memberships, role and other databases' settings, shared comments and
-    security labels, tablespaces and other databases are read before and
-    after it, in its own transaction's snapshot, so another session's writes
+    security labels, tablespaces, other databases, parameter privileges and
+    replication origins are read before and after it, in its own transaction's snapshot, so another session's writes
     meanwhile do not count. A change refuses, naming each object, and is
     rolled back.
   - The shared compatibility qualification reads scratch after the
@@ -1731,8 +1733,8 @@ scratch compile (#1616).
     `ON CONFLICT` inference relies on, and its inheritance and partition
     parents, which a row-type coercion such as `c::ext.parent` relies on;
   - of an operator family, which operator serves each strategy and which
-    routine each support number, which an index, an `ORDER BY` and a row
-    comparison bind by.
+    routine each support number, and each of its operator classes' headers,
+    which an index, an `ORDER BY` and a row comparison bind by.
 
   Examples:
   - a relation's kind, and its column names, types, collations and order

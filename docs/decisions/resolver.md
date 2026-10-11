@@ -2191,7 +2191,9 @@ target whose recreated `public` has none, the difference #688 removed.
   scratch superuser. The supplied one runs it on the checked connection,
   where every write goes, then `DISCARD ALL`, so its `SET`s do not reach
   the compile on that session. Both run it inside one `REPEATABLE READ`
-  transaction pbps opens and commits.
+  transaction pbps opens and commits, on the empty path every pbps session
+  pins (DEC-1564.1): the file names its schemas or sets the path, as
+  `pg_dump` output does, and a refusal for want of a schema says so.
 - **One script** (decided with the maintainer on #1769). The file is sent
   whole, through a `DO` block's `EXECUTE`, and the engine decides where each
   statement ends. `EXECUTE` refuses transaction control (`BEGIN`, `COMMIT`,
@@ -2206,10 +2208,13 @@ target whose recreated `public` has none, the difference #688 removed.
   refusal carries the engine's error, which names the object or token.
 - **Nothing outside the scratch database** (decided with the maintainer on
   #1783). Roles, role memberships, role settings and other databases'
-  settings, shared comments and security labels, tablespaces and other
-  databases are read before and after the file, under the transaction's one
+  settings, shared comments and security labels, tablespaces, other
+  databases, parameter privileges and replication origins are read before
+  and after the file, under the transaction's one
   snapshot, so another session's writes meanwhile are in neither read
-  (measured on 16 and 18). A difference rolls the transaction back and
+  (measured on 16 and 18). Each is compared by a key of OIDs and its row,
+  never by a rendered name, which reads past the snapshot. A difference
+  rolls the transaction back and
   refuses, naming each object, so nothing is left to clean up. The scratch
   database's own settings, attributes and comment are its own and go with
   it; the compatibility qualification reads its settings. A role's password
@@ -2238,8 +2243,10 @@ comparison is a projection of the manifest's properties.
 - **Accepted means compared** (#1783). An object counts as reconstructed
   in the assessment when it was compared itself, or is a part of one that
   was: its row and array types, indexes, owned sequences. Extension
-  membership is no such part. Each member is compared on its own, with the
-  roots' projection. A member the capture has no identity for (a text
+  membership is no such part, and neither is an operator class, which lives
+  on its family automatically: its header (default or not, input and
+  storage type) is compared with the family. Each member is compared on its
+  own, with the roots' projection. A member the capture has no identity for (a text
   search dictionary, as `unaccent` brings) refuses, naming it: a plan that
   reads an extension seals all its members, and the capture refuses one it
   cannot read rather than leave it out. An operator family's operators and support

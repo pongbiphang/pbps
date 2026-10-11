@@ -28,6 +28,13 @@ impl Failed {
         self.error.server_error_code().as_deref() == Some("0A000")
     }
 
+    /// Whether the engine found no schema to create in, or none of a name:
+    /// the baseline runs on the empty path every pbps session pins
+    /// (DEC-1564.1), so an unqualified name finds none.
+    pub fn no_schema(&self) -> bool {
+        self.error.server_error_code().as_deref() == Some("3F000")
+    }
+
     /// Whether the engine named something that does not exist. A baseline
     /// runs before any managed object, so such a name may be a managed
     /// object it may not refer to.
@@ -89,23 +96,24 @@ fn dollar_quoted(text: &str, stem: &str) -> String {
 /// compatibility qualification, so they are left out. A database row keeps
 /// only what a statement changes: VACUUM rewrites its frozen-transaction
 /// horizons in place, past any snapshot.
-pub async fn shared_state(
-    conn: &mut impl QueryConnection,
-) -> Result<BTreeSet<(String, String)>, DbError> {
+pub async fn shared_state(conn: &mut impl QueryConnection) -> Result<SharedState, DbError> {
     let rows = conn
         .query(
-            "SELECT 'role ' || pg_catalog.quote_ident(r.rolname) AS name, \
+            "SELECT 'role:' || r.oid AS key, \
+                    'role ' || pg_catalog.quote_ident(r.rolname) AS name, \
                     pg_catalog.row_to_json(r)::pg_catalog.text AS detail \
                FROM pg_catalog.pg_roles r \
              UNION ALL \
-             SELECT 'the membership of role ' \
+             SELECT 'membership:' || m.oid, \
+                    'the membership of role ' \
                       || pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(m.member)) \
                       || ' in role ' \
                       || pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(m.roleid)), \
                     pg_catalog.row_to_json(m)::pg_catalog.text \
                FROM pg_catalog.pg_auth_members m \
              UNION ALL \
-             SELECT 'the settings of ' \
+             SELECT 'setting:' || s.setdatabase || ':' || s.setrole, \
+                    'the settings of ' \
                       || CASE WHEN s.setrole = 0 THEN 'every role' ELSE 'role ' \
                          || pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(s.setrole)) END \
                       || ' in ' \
@@ -116,7 +124,8 @@ pub async fn shared_state(
                LEFT JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase \
               WHERE d.datname IS DISTINCT FROM pg_catalog.current_database() \
              UNION ALL \
-             SELECT 'the comment on ' || COALESCE( \
+             SELECT 'comment:' || c.classoid || ':' || c.objoid, \
+                    'the comment on ' || COALESCE( \
                       pg_catalog.pg_describe_object(c.classoid, c.objoid, 0), 'a shared object'), \
                     pg_catalog.row_to_json(c)::pg_catalog.text \
                FROM pg_catalog.pg_shdescription c \
@@ -124,7 +133,8 @@ pub async fn shared_state(
                      AND c.objoid = (SELECT o.oid FROM pg_catalog.pg_database o \
                                       WHERE o.datname = pg_catalog.current_database())) \
              UNION ALL \
-             SELECT 'the security label on ' || COALESCE( \
+             SELECT 'label:' || l.classoid || ':' || l.objoid || ':' || l.provider, \
+                    'the security label on ' || COALESCE( \
                       pg_catalog.pg_describe_object(l.classoid, l.objoid, 0), 'a shared object'), \
                     pg_catalog.row_to_json(l)::pg_catalog.text \
                FROM pg_catalog.pg_shseclabel l \
@@ -132,35 +142,59 @@ pub async fn shared_state(
                      AND l.objoid = (SELECT o.oid FROM pg_catalog.pg_database o \
                                       WHERE o.datname = pg_catalog.current_database())) \
              UNION ALL \
-             SELECT 'tablespace ' || pg_catalog.quote_ident(t.spcname), \
+             SELECT 'tablespace:' || t.oid, 'tablespace ' || pg_catalog.quote_ident(t.spcname), \
                     pg_catalog.row_to_json(t)::pg_catalog.text \
                FROM pg_catalog.pg_tablespace t \
              UNION ALL \
-             SELECT 'database ' || pg_catalog.quote_ident(d.datname), \
+             SELECT 'database:' || d.oid, 'database ' || pg_catalog.quote_ident(d.datname), \
                     pg_catalog.json_build_array(d.datname, d.datdba, d.encoding, \
                       d.datistemplate, d.datallowconn, d.datconnlimit, d.dattablespace, \
                       d.datacl)::pg_catalog.text \
                FROM pg_catalog.pg_database d \
-              WHERE d.datname <> pg_catalog.current_database()",
+              WHERE d.datname <> pg_catalog.current_database() \
+             UNION ALL \
+             SELECT 'parameter:' || p.oid, \
+                    'the privileges on parameter ' || pg_catalog.quote_ident(p.parname), \
+                    pg_catalog.row_to_json(p)::pg_catalog.text \
+               FROM pg_catalog.pg_parameter_acl p \
+             UNION ALL \
+             SELECT 'origin:' || o.roident, \
+                    'replication origin ' || pg_catalog.quote_ident(o.roname), \
+                    pg_catalog.row_to_json(o)::pg_catalog.text \
+               FROM pg_catalog.pg_replication_origin o",
         )
         .await?;
     rows.iter()
-        .map(|row| Ok((text(row, "name")?, text(row, "detail")?)))
+        .map(|row| {
+            Ok((
+                text(row, "key")?,
+                (text(row, "detail")?, text(row, "name")?),
+            ))
+        })
         .collect()
 }
 
-/// Each object whose shared state differs between the two reads, named
-/// once.
-pub fn shared_changes(
-    before: &BTreeSet<(String, String)>,
-    after: &BTreeSet<(String, String)>,
-) -> Vec<String> {
-    before
-        .symmetric_difference(after)
-        .map(|(name, _)| name.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+/// Each shared object, by a key of OIDs, with its row and its name. Only
+/// the key and the row are compared: a name renders through the system
+/// cache, which shows another session's committed rename past the
+/// transaction's snapshot (docs/PITFALLS.md), so it would read as a change.
+pub type SharedState = BTreeMap<String, (String, String)>;
+
+/// Each object whose shared state differs between the two reads, added,
+/// removed or changed, named once.
+pub fn shared_changes(before: &SharedState, after: &SharedState) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for (key, (detail, name)) in after {
+        if before.get(key).map(|(was, _)| was) != Some(detail) {
+            names.insert(name.clone());
+        }
+    }
+    for (key, (_, name)) in before {
+        if !after.contains_key(key) {
+            names.insert(name.clone());
+        }
+    }
+    names.into_iter().collect()
 }
 
 /// One object in the scratch database: its catalog, its OID there, and the
@@ -616,24 +650,34 @@ mod tests {
 
     #[test]
     fn a_shared_change_is_named_once_whichever_way_it_differs() {
-        let row = |name: &str, detail: &str| (name.to_owned(), detail.to_owned());
-        let before = BTreeSet::from([
-            row("role app", "{\"rolcanlogin\":false}"),
-            row("role gone", "{}"),
-            row("tablespace pg_default", "{}"),
+        let row = |key: &str, detail: &str, name: &str| {
+            (key.to_owned(), (detail.to_owned(), name.to_owned()))
+        };
+        let before = SharedState::from([
+            row("role:1", "{\"rolcanlogin\":false}", "role app"),
+            row("role:2", "{}", "role gone"),
+            row("tablespace:3", "{}", "tablespace pg_default"),
         ]);
-        let after = BTreeSet::from([
-            row("role app", "{\"rolcanlogin\":true}"),
-            row("role new", "{}"),
-            row("tablespace pg_default", "{}"),
+        let after = SharedState::from([
+            row("role:1", "{\"rolcanlogin\":true}", "role app"),
+            row("role:4", "{}", "role new"),
+            row("tablespace:3", "{}", "tablespace pg_default"),
         ]);
-        // Changed, added and removed alike; a changed one once, not twice.
+        // Changed, added and removed alike, each named once.
         assert_eq!(
             shared_changes(&before, &after),
             ["role app", "role gone", "role new"]
         );
         // Negative: the same state twice is no change.
         assert!(shared_changes(&before, &before).is_empty());
+        // Negative: a name another session's rename changed, through the
+        // system cache, is no change when the row is the same.
+        let renamed = SharedState::from([
+            row("role:1", "{\"rolcanlogin\":false}", "role app_renamed"),
+            row("role:2", "{}", "role gone"),
+            row("tablespace:3", "{}", "tablespace pg_default"),
+        ]);
+        assert!(shared_changes(&before, &renamed).is_empty());
     }
 
     fn created_none(inventory: &BTreeMap<(String, u32), (String, Option<char>)>) -> Created {

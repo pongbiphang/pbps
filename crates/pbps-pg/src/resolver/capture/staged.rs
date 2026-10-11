@@ -256,6 +256,11 @@ fn shapes(
             }),
             "pg_index" => reference(properties, "indrelid")
                 .filter(|_| properties.get("indisunique") == Some(&Value::Bool(true))),
+            // An operator class lives on its family, automatically, and is
+            // no root; its header (default or not, input and storage type)
+            // decides which class an index or ORDER BY picks, so it is
+            // compared with the family, not taken as covered by it.
+            "pg_opclass" => reference(properties, "opcfamily"),
             // An operator family's members: which operator serves each
             // strategy and which routine each support number, which an
             // index, an ORDER BY and a row comparison bind by (#1783).
