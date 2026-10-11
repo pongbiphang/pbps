@@ -232,8 +232,13 @@ takes it. Drops and renames away (classes 0 to 6) run before creates and adds
 (7, 8, 13, 14, 15). The rule is by class, not by kind, so it holds across the
 namespaces kinds share: on SQL Server tables and modules share one object
 namespace, and on PostgreSQL views, tables and indexes share the relation
-namespace. Renames *into* a name (classes 1 and 3) are the exception, and
-`rename_order` and `frees_a_renamed_column` order them.
+namespace. A rename *into* a name (classes 1 and 3) is held to the same rule
+by class: `RenameRole` (1) takes a name `DropRole` (0) freed with no pass.
+The exception is a rename whose freeing drop sits in a higher class than its
+own: `DropColumn` (5) before `RenameColumn` (3), and before `RenameTable` (1)
+a `DropTable` (6) or the drop of an index (P) or named constraint (S) holding
+the name (2). `frees_a_renamed_column` and `rename_order` order those; the
+rows below list each.
 
 | Pair | Kind | Order now | Verdict |
 |---|---|---|---|
@@ -255,6 +260,7 @@ namespace. Renames *into* a name (classes 1 and 3) are the exception, and
 | Constraint or index drop → add of the same name | fixed | class 2 before 13 | ✓ DECISIONS 168 (namespaces) |
 | `DropModule` → `CreateModule` of its id | fixed | class 0 before 14 | ✓ |
 | `DropRole` or `RenameRole` away → `CreateRole` of its name | fixed | class 0 or 1 before 15 | ✓ |
+| `DropRole` → `RenameRole` into its name (S) | fixed | class 0 before 1 | ✓ |
 | `DropRole` of a holder → `DropRole` of its member | fixed | `member_depth`, then `order_role_drops` once the members are read | ✓ DECISIONS 127, 139 |
 | Trigger and grants keyed by a table name that passes to another table | fixed | rebuilt as the occupant's | ✓ DEC-1118.1 |
 
@@ -321,9 +327,10 @@ and the expression-bearing changes that need a function.
 ### Something removed before what it blocks
 
 **Rule:** a change that removes a dependent runs in a lower class than the
-drop, rename or alteration it would block. Module drops (0) and constraint,
-index and key drops (2) come before renames (1, 3), column and table drops
-(5, 6) and alterations (9). The exceptions, listed here, are the pairs inside
+drop, rename, alteration or row delete it would block. Module drops (0) and
+constraint, index and key drops (2) come before renames (1, 3), column and
+table drops (5, 6), alterations (9) and row deletes (12), and so does a table
+drop before the deletes of rows it referenced. The exceptions, listed here, are the pairs inside
 one class and the dependents a class cannot see.
 
 | Pair | Kind | Order now | Verdict |
@@ -336,6 +343,7 @@ one class and the dependents a class cannot see.
 | Foreign key → the key it references | fixed | rank inside class 2 | ✓ |
 | Constraint, index or key drop → `DropColumn`, `RenameColumn` (S) | fixed | class 2 before 3 and 5 | ✓ DECISIONS 474 |
 | Inbound foreign key → `DropTable` | fixed | class 2 before 6 | ✓ |
+| `DropForeignKey` or `DropTable` of a child → `DeleteRow` of its parent | fixed | class 2 or 6 before 12; the pre-delete probe leaves the removed key or table out | ✓ DECISIONS 128 |
 | `DropTable` of a partition → `CreateTable` of a partition over its range | fixed | class 6 before 7; the new range's pre-flight count leaves the dropped partition's rows out | ✓ DEC-1171.1 |
 | `DropTable` → `DetachPartition` claiming a name the dropped table's index or key holds | fixed | (6, 1) before (6, 2) | ✓ DEC-1544.1 |
 | `DetachPartition` → `CreateTable` of a partition over its range | fixed | class 6 before 7; the new range's pre-flight count leaves the detached partition's rows out | ✓ DEC-1544.1 |
