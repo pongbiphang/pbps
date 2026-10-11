@@ -1599,6 +1599,24 @@ async fn produce_staged(
     .await
 }
 
+/// `produce_staged`, with `sql` run on the target after the baseline was
+/// compared with it and before the opening capture.
+async fn produce_staged_then(
+    sql: &str,
+    scratch: &str,
+    target: &str,
+    inputs: &Inputs,
+    key: &ProjectKey,
+    baseline: &str,
+) -> Result<ResolvedPlan, ProduceError> {
+    super::AFTER_STAGING
+        .scope(
+            Some(sql.to_owned()),
+            produce_staged(scratch, target, inputs, key, baseline),
+        )
+        .await
+}
+
 /// The baseline's refusal, or what came instead. Never panics, so the
 /// caller can drop its fixture first.
 fn baseline_refusal(result: Result<ResolvedPlan, ProduceError>) -> String {
@@ -2472,6 +2490,53 @@ async fn vouched_takes_a_routine_over_a_staged_type_as_no_part_of_it() {
     target.drop().await;
     let plan = result.unwrap_or_else(|error| panic!("a routine over a staged type: {error}"));
     plan.evidence.validate(&plan.changes).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_a_staged_shape_that_changes_before_the_opening_capture() {
+    // A writer between the baseline's comparison and the capture the plan
+    // seals: scratch compiled `SELECT *` against the compared table, and
+    // the evidence would seal the table with another column (#1755).
+    let inputs = staging_inputs(&reading("id", "t"), &reading("*", "t"), &[]);
+    let key = ProjectKey::new(true);
+    for (sql, changes) in [
+        (
+            format!("ALTER TABLE {EXTERNAL}.t ADD COLUMN extra integer"),
+            true,
+        ),
+        // Negative: a write to nothing the baseline staged.
+        (
+            format!("CREATE TABLE {EXTERNAL}.unrelated (x integer)"),
+            false,
+        ),
+    ] {
+        let mut target = Fixture::new("PBPS_TEST_PG_DB");
+        let scratch = Fixture::new(SCRATCH_SERVER);
+        let target_db = staging_target(&mut target, &guarded_target()).await;
+        let result = produce_staged_then(
+            &sql,
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &plain_baseline("integer"),
+        )
+        .await;
+        target.drop().await;
+        if changes {
+            match result {
+                Err(ProduceError::Run(Error::Read(reason))) => {
+                    assert!(reason.contains("the target changed"), "{reason}");
+                    assert!(reason.contains("extra"), "{reason}");
+                }
+                Err(other) => panic!("not a changed-target refusal: {other}"),
+                Ok(_) => panic!("a plan sealed over a shape the baseline was not compared with"),
+            }
+        } else {
+            assert_staged(result, "t", "an unrelated write");
+        }
+    }
 }
 
 #[tokio::test]

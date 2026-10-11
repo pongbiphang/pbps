@@ -27,9 +27,23 @@ use std::collections::{BTreeMap, BTreeSet};
 /// join the sealed capture, and the assessment takes them, and their parts,
 /// as reconstructed. Nothing is in it for being a member of something
 /// compared (#1783).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Staged {
     compared: BTreeSet<ObjectIdentity>,
+    /// The target's shapes the comparison accepted, which the opening
+    /// capture must still hold (#1755).
+    accepted: BTreeMap<ObjectIdentity, BTreeMap<String, Value>>,
+    described: BTreeMap<ObjectIdentity, String>,
+}
+
+/// The compared identities only: the accepted shapes are canonical catalog
+/// properties, which have no ordinary `Debug` path (DEC-612.3).
+impl std::fmt::Debug for Staged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Staged")
+            .field("compared", &self.compared)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Staged {
@@ -39,6 +53,55 @@ impl Staged {
 
     pub(super) fn holds(&self, object: &ObjectIdentity) -> bool {
         self.compared.contains(object)
+    }
+
+    /// What changed on the target, among the shapes the comparison
+    /// accepted, by the time of `current`, the capture the plan seals. The
+    /// comparison and that capture are two reads; a writer between them
+    /// would otherwise leave scratch compiled against one shape and the
+    /// evidence sealing another, which no later recheck against that
+    /// evidence can see (#1755).
+    pub fn changed_since(&self, current: &CapturedInputs) -> Vec<String> {
+        let roots: BTreeSet<ObjectIdentity> = self
+            .compared
+            .iter()
+            .filter(|root| self.accepted.contains_key(*root))
+            .cloned()
+            .collect();
+        let now = shapes(&current.inputs, &roots);
+        let name = |object: &ObjectIdentity| {
+            self.described
+                .get(object)
+                .cloned()
+                .unwrap_or_else(|| named(object))
+        };
+        let mut findings = Vec::new();
+        for (object, was) in &self.accepted {
+            match now.get(object) {
+                None => findings.push(format!("the target no longer has {}", name(object))),
+                Some(is) if is != was => {
+                    let fields: BTreeSet<&str> = was
+                        .keys()
+                        .chain(is.keys())
+                        .filter(|key| was.get(*key) != is.get(*key))
+                        .map(String::as_str)
+                        .collect();
+                    findings.push(format!(
+                        "the target's {} changed in {}",
+                        name(object),
+                        fields.into_iter().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        for object in now
+            .keys()
+            .filter(|object| !self.accepted.contains_key(*object))
+        {
+            findings.push(format!("the target gained {}", name(object)));
+        }
+        findings
     }
 }
 
@@ -145,13 +208,18 @@ pub async fn compare(
         .filter(|root| !absent.contains(root))
         .cloned()
         .collect();
+    let accepted = shapes(&on_target.inputs, &present);
     findings.extend(differences(
-        &shapes(&on_target.inputs, &present),
+        &accepted,
         &shapes(&staged.inputs, &present),
         &resolved,
     ));
     if findings.is_empty() {
-        Ok(Staged { compared })
+        Ok(Staged {
+            compared,
+            accepted,
+            described: resolved,
+        })
     } else {
         Err(StageError::Refused(findings))
     }
@@ -673,6 +741,24 @@ mod tests {
         assert!(!shaped.contains_key(&total));
         // Negative: what the identity names as its holder is a part.
         assert!(shaped.contains_key(&label));
+    }
+
+    #[test]
+    fn staged_debug_names_identities_not_the_accepted_properties() {
+        let f = id("pg_proc", &["ext", "f"], vec![]);
+        let staged = Staged {
+            compared: BTreeSet::from([f.clone()]),
+            accepted: BTreeMap::from([(
+                f.clone(),
+                BTreeMap::from([("proargdefaults".to_owned(), json!("'s3cret'::text"))]),
+            )]),
+            described: BTreeMap::from([(f, "function ext.f()".to_owned())]),
+        };
+        let shown = format!("{staged:?}");
+        assert!(shown.contains("compared"), "{shown}");
+        // Negative: no canonical property reaches the output.
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(!shown.contains("proargdefaults"), "{shown}");
     }
 
     #[test]
