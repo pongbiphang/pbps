@@ -4834,3 +4834,19 @@ Pinned by `moves_join_the_file_and_belong_to_a_live_table`,
 `range_partitions_are_added_and_dropped_on_populated_trees` on 18 and 16, and
 the CLI's `a_range_beside_a_default_takes_its_rows_through_the_cli` on 18 and
 16.
+
+<a id="dec-1771-2"></a>
+
+**DEC-1771.2. SQL Server CHECK probes do not read a name passed to another column.**
+Measured on 17.0.4075.5: with `n = -1` and `m = 1`, dropping `n`, renaming
+`m` to `n`, and adding `CHECK (n > 0)` succeeds. The old probe read the
+outgoing `n` and counted one violation. Renaming `n` away and adding a new
+`n` with default `1`, or a persisted computed `n AS m`, has the same shape.
+The recorded vacated names include ordinary and computed columns; intersect
+those names with rename destinations and added columns. A CHECK on that
+table is unchecked, as in DEC-1699.1: arbitrary SQL is not rewritten to guess
+which column its text will bind to. An unrelated drop or rename leaves the
+ordinary CHECK count intact. Live tests compare each case with applying the
+emitted plan and retain the failing CHECKs as negative controls. Filtered
+indexes already refuse a projection across added or renamed columns, so they
+need no additional handoff rule.
