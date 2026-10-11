@@ -1301,6 +1301,7 @@ mod tests {
                     to: ty("bigint"),
                     from_nullable: true,
                     to_nullable: true,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 }),
@@ -1320,6 +1321,7 @@ mod tests {
                     to: ty("bigint"),
                     from_nullable: true,
                     to_nullable: true,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 }),
@@ -1422,6 +1424,7 @@ mod tests {
                 to: ty("bigint"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             })
@@ -1435,6 +1438,7 @@ mod tests {
                     column: cref("app.customer.required"),
                     ty: ty("integer"),
                     to_nullable: false,
+                    through_external_partitions: false,
                     collation: None,
                 }),
                 PlannedChange::new(Change::RenameColumn {
@@ -1672,6 +1676,7 @@ mod tests {
                 column: cref("app.t.v"),
                 ty: ty("integer"),
                 to_nullable: false,
+                through_external_partitions: false,
                 collation: None,
             },
             Strategy::default(),
@@ -1692,6 +1697,7 @@ mod tests {
                 to: ty("varchar(20)"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             },
@@ -1716,6 +1722,7 @@ mod tests {
                     to: ty("varchar(20)"),
                     from_nullable,
                     to_nullable,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 },
@@ -1745,6 +1752,7 @@ mod tests {
                 column: tname(table).column("v"),
                 ty: ty("integer"),
                 to_nullable: false,
+                through_external_partitions: false,
                 collation: None,
             })
         };

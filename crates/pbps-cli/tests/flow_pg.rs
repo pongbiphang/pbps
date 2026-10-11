@@ -6992,6 +6992,46 @@ fn pull_declares_a_named_parents_partitions_external_on(server: &str, k: usize) 
         2,
         "the external parent took the name with its partitions"
     );
+
+    // A NOT NULL a partition sets of its own beside its parent's is local on
+    // 18 and outlives the parent's `DROP NOT NULL` (DEC-1687.1). The parent's
+    // change clears it from every partition after, which no declaration
+    // lists, and the apply's closing read finds them its own (#1833 review).
+    on_server(
+        &connection,
+        "ALTER TABLE app.ev_2025 ALTER COLUMN id2 SET NOT NULL",
+    );
+    let path = schema.join("app.dc.yml");
+    let declared = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        declared.contains("  id2:\n    type: integer\n    nullable: false\n"),
+        "{declared}"
+    );
+    std::fs::write(
+        &path,
+        declared.replacen(
+            "  id2:\n    type: integer\n    nullable: false\n",
+            "  id2:\n    type: integer\n",
+            1,
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    assert!(stdout(&o).contains("id2"), "{}", stdout(&o));
+    succeeds(approved_apply(&d, &connection, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_inherits i JOIN pg_attribute a \
+             ON a.attrelid = i.inhrelid AND a.attname = 'id2' AND a.attnotnull \
+             WHERE i.inhparent = 'app.dc'::regclass"
+        ),
+        0,
+        "a partition kept a NOT NULL of its own"
+    );
 }
 
 /// A RANGE partition tree goes the whole way through the CLI (#1170): pulled

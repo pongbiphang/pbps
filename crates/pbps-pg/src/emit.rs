@@ -1395,6 +1395,30 @@ fn one(pg: &Postgres, table: &TableName, body: String) -> Sql {
     Ok(vec![on(pg, table, &body)?])
 }
 
+/// After a parent with external partitions drops a column's NOT NULL
+/// (#1533): the NOT NULL each partition still holds on it, which can only be
+/// one of its own that 18 kept (DEC-1687.1), dropped too. Found at apply
+/// time, since no declaration lists the partitions, and a partition holds no
+/// NOT NULL of its own while it is external (DEC-1533.1).
+fn clear_external_partitions(
+    pg: &Postgres,
+    table: &TableName,
+    column: &str,
+    mut sql: Vec<Statement>,
+) -> Sql {
+    let body = format!(
+        "DO $pbps$\nDECLARE\n  p regclass;\nBEGIN\n  FOR p IN\n    SELECT i.inhrelid::regclass\n      \
+         FROM pg_catalog.pg_inherits i\n      JOIN pg_catalog.pg_attribute a\n        ON \
+         a.attrelid = i.inhrelid AND a.attname = {name} AND a.attnotnull\n     WHERE \
+         i.inhparent = {parent}::regclass\n  LOOP\n    EXECUTE pg_catalog.format('ALTER TABLE \
+         %s ALTER COLUMN %I DROP NOT NULL', p, {name});\n  END LOOP;\nEND\n$pbps$;",
+        name = literal(column),
+        parent = literal(&qualified(table)?),
+    );
+    sql.push(on(pg, table, &body)?);
+    Ok(sql)
+}
+
 /// The engine's keyword for a module kind.
 const fn keyword(kind: ModuleKind) -> &'static str {
     match kind {
@@ -2484,6 +2508,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             to,
             from_nullable,
             to_nullable,
+            through_external_partitions,
             ..
         } => {
             let normalized = types::normalize(to)?;
@@ -2574,7 +2599,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                     }
                 ));
             }
-            one(
+            let sql = one(
                 pg,
                 &column.table,
                 format!(
@@ -2582,7 +2607,12 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                     qualified(&column.table)?,
                     parts.join(", ")
                 ),
-            )
+            )?;
+            if !from_nullable && *to_nullable && *through_external_partitions {
+                clear_external_partitions(pg, &column.table, &column.name, sql)
+            } else {
+                Ok(sql)
+            }
         }
 
         // `ty` is carried for SQL Server, which restates the whole column
@@ -2592,21 +2622,29 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         Change::AlterColumnNullability {
             column,
             to_nullable,
+            through_external_partitions,
             ..
-        } => one(
-            pg,
-            &column.table,
-            format!(
-                "ALTER TABLE {} ALTER COLUMN {} {};",
-                qualified(&column.table)?,
-                quote(&column.name)?,
-                if *to_nullable {
-                    "DROP NOT NULL"
-                } else {
-                    "SET NOT NULL"
-                }
-            ),
-        ),
+        } => {
+            let sql = one(
+                pg,
+                &column.table,
+                format!(
+                    "ALTER TABLE {} ALTER COLUMN {} {};",
+                    qualified(&column.table)?,
+                    quote(&column.name)?,
+                    if *to_nullable {
+                        "DROP NOT NULL"
+                    } else {
+                        "SET NOT NULL"
+                    }
+                ),
+            )?;
+            if *to_nullable && *through_external_partitions {
+                clear_external_partitions(pg, &column.table, &column.name, sql)
+            } else {
+                Ok(sql)
+            }
+        }
 
         // A default is not a named object here — it is a property of the column
         // — so there is nothing to drop by name and no generated constraint
@@ -5161,6 +5199,60 @@ mod tests {
             .collect()
     }
 
+    /// A parent with external partitions dropping a NOT NULL (#1533) clears
+    /// the one each partition kept of its own after its own statement, found
+    /// at apply time through `pg_inherits`, with the names as literals. Not
+    /// on a tightening, a retype that keeps the column nullable, or a parent
+    /// whose partitions are declared (DEC-1687.1 brings those back itself).
+    #[test]
+    fn an_external_parents_dropped_not_null_is_cleared_from_its_partitions() {
+        let pg = Postgres::new();
+        let column = ColumnRef::new(name("app", "ev"), "it's");
+        let nullability = |to_nullable: bool, through: bool| Change::AlterColumnNullability {
+            uid: Uid::generate(UidKind::Column),
+            column: column.clone(),
+            ty: ty("integer"),
+            to_nullable,
+            through_external_partitions: through,
+            collation: None,
+        };
+        let retype = |from_nullable: bool, through: bool| Change::AlterColumnType {
+            uid: Uid::generate(UidKind::Column),
+            column: column.clone(),
+            from: ty("integer"),
+            to: ty("bigint"),
+            from_nullable,
+            to_nullable: true,
+            through_external_partitions: through,
+            from_collation: None,
+            to_collation: None,
+        };
+        for change in [nullability(true, true), retype(false, true)] {
+            let sql = sql_of(&pg, &change);
+            assert_eq!(sql.len(), 2, "{sql:?}");
+            assert!(sql[0].contains("DROP NOT NULL"), "{sql:?}");
+            assert!(
+                sql[1].contains("i.inhparent = '\"app\".\"ev\"'::regclass")
+                    && sql[1].contains("a.attname = 'it''s'")
+                    && sql[1]
+                        .contains("ALTER TABLE %s ALTER COLUMN %I DROP NOT NULL', p, 'it''s')"),
+                "{}",
+                sql[1]
+            );
+        }
+        // Negative: a tightening, a retype that stays nullable, and a parent
+        // whose partitions are declared.
+        for change in [
+            nullability(false, true),
+            retype(true, true),
+            nullability(true, false),
+            retype(false, false),
+        ] {
+            let sql = sql_of(&pg, &change);
+            assert!(!sql.iter().any(|s| s.contains("pg_inherits")), "{sql:?}");
+        }
+    }
+
     fn module(kind: ModuleKind, definition: &str) -> Module {
         Module {
             kind,
@@ -5198,6 +5290,7 @@ mod tests {
             to: ty(to),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         };
@@ -5246,6 +5339,7 @@ mod tests {
                 to: ty("text"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: collation.clone(),
             },
@@ -5254,6 +5348,7 @@ mod tests {
                 column: column.clone(),
                 ty: ty("text"),
                 to_nullable: false,
+                through_external_partitions: false,
                 collation: collation.clone(),
             },
             Change::AddColumn {
@@ -6925,6 +7020,7 @@ mod tests {
             to: ty(to),
             from_nullable: false,
             to_nullable: false,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         }

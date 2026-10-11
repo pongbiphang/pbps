@@ -4872,6 +4872,7 @@ mod tests {
             to: "numeric(4,1)".parse().unwrap(),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         };
@@ -4989,6 +4990,7 @@ mod tests {
             column: table.column(column),
             ty: "integer".parse().unwrap(),
             to_nullable: false,
+            through_external_partitions: false,
             collation: None,
         };
         let unique = |column: &str| Change::AddUnique {
@@ -5521,6 +5523,7 @@ mod tests {
                     to: "numeric(10,0)".parse().unwrap(),
                     from_nullable: true,
                     to_nullable: true,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 }),
@@ -5578,6 +5581,7 @@ mod tests {
                     column: table.column("v"),
                     ty: "integer".parse().unwrap(),
                     to_nullable: false,
+                    through_external_partitions: false,
                     collation: None,
                 },
             ),
@@ -5590,6 +5594,7 @@ mod tests {
                     to: "varchar(3)".parse().unwrap(),
                     from_nullable: true,
                     to_nullable: false,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 },
@@ -5707,6 +5712,7 @@ mod tests {
             column: table.column("v"),
             ty: "integer".parse().unwrap(),
             to_nullable: true,
+            through_external_partitions: false,
             collation: None,
         }]));
         assert!(relaxed.probes.is_empty() && relaxed.unchecked.is_empty());
@@ -5761,6 +5767,7 @@ mod tests {
             to: "numeric(10,0)".parse().expect("a type"),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         };
@@ -5826,6 +5833,7 @@ mod tests {
             to: "numeric(10,0)".parse().expect("a type"),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         };
@@ -6243,6 +6251,7 @@ mod tests {
             to: to.parse().expect("a type"),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         };
@@ -6393,6 +6402,7 @@ mod tests {
                 to: "integer".parse().expect("a type"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             },
@@ -6459,6 +6469,7 @@ mod tests {
                 to: "bigint".parse().expect("a type"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             },

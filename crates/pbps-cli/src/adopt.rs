@@ -45,14 +45,9 @@ pub(crate) async fn hand_over_external_partitions(
 ) -> anyhow::Result<()> {
     use std::collections::BTreeMap;
 
-    if conn.driver() == pbps_db::Driver::Mssql {
-        if let Some(name) = named.first() {
-            anyhow::bail!(
-                "--partitions-external {name}: partitioned tables are PostgreSQL's in this model"
-            );
-        }
-        return Ok(());
-    }
+    // No engine branch here: SQL Server has no partitioned table in this
+    // model, so a named parent is refused below as one pull does not keep,
+    // and the engine seam answers that no pg_partman is installed.
     let parent = |schema: &Schema, name: &pbps_model::TableName| {
         schema
             .tables
@@ -70,8 +65,8 @@ pub(crate) async fn hand_over_external_partitions(
         }
         external.insert(name.clone(), "named with --partitions-external".to_owned());
     }
-    if let Some(schema) = pbps_pg::partman::schema(conn).await? {
-        let maintained = pbps_pg::partman::maintained(conn, &schema)
+    if let Some(schema) = crate::engine::partman_schema(conn).await? {
+        let maintained = crate::engine::partman_maintained(conn, &schema)
             .await
             .with_context(|| {
                 format!(

@@ -3810,6 +3810,7 @@ mod tests {
             column: t.column(column),
             ty: "integer".parse().unwrap(),
             to_nullable: false,
+            through_external_partitions: false,
             collation: None,
         };
         let unique = |column: &str| Change::AddUnique {
@@ -6107,6 +6108,7 @@ mod tests {
             column: ColumnRef::new(ev.clone(), "m"),
             ty: "integer".parse().unwrap(),
             to_nullable: false,
+            through_external_partitions: false,
             collation: None,
         };
         for beside in [other, nullability] {

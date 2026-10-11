@@ -838,6 +838,7 @@ fn diff_partial_rebuilding(
     }
 
     split_tightenings_from_retypes(&mut changes);
+    clear_external_partitions_after_loosening(declared.schema, &mut changes);
     recreate_retyped_dependents(base, declared, &renames, dialect, &mut changes);
     recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
     rebind_foreign_keys_to_a_new_occupant(base, declared, &mut changes);
@@ -1794,6 +1795,7 @@ fn diff_columns(
                 to: to_ty.clone(),
                 from_nullable: base_col.nullable,
                 to_nullable: col.nullable || tightened_after,
+                through_external_partitions: false,
                 from_collation: base_col.collation.clone(),
                 to_collation: col.collation.clone(),
             });
@@ -1803,6 +1805,7 @@ fn diff_columns(
                     column: declared_ref.clone(),
                     ty: to_ty,
                     to_nullable: false,
+                    through_external_partitions: false,
                     collation: col.collation.clone(),
                 });
             }
@@ -1812,6 +1815,7 @@ fn diff_columns(
                 column: declared_ref.clone(),
                 ty: to_ty,
                 to_nullable: col.nullable,
+                through_external_partitions: false,
                 collation: col.collation.clone(),
             });
         }
@@ -2130,6 +2134,39 @@ fn row_table(change: &Change) -> Option<&TableName> {
 /// fills or removes its NULLs (#1367). The same split DEC-1168.1 makes for a
 /// recomputed column, for the same reason: the check has to meet the values
 /// the plan leaves, not the ones it found.
+/// A NOT NULL a parent with external partitions drops (#1533) reaches every
+/// partition, but on 18 one a partition set of its own outlives it
+/// (DEC-1687.1). A declared partition is brought back by its own change after
+/// the parent's; an external one is listed nowhere, so the parent's change
+/// carries the clearing itself (DEC-1533.1, #1833 review).
+fn clear_external_partitions_after_loosening(declared: &Schema, changes: &mut [Change]) {
+    let external = |table: &TableName| {
+        declared
+            .tables
+            .get(table)
+            .and_then(|t| t.partition_by.as_ref())
+            .is_some_and(|by| by.external)
+    };
+    for change in changes {
+        if let Change::AlterColumnNullability {
+            column,
+            to_nullable: true,
+            through_external_partitions,
+            ..
+        }
+        | Change::AlterColumnType {
+            column,
+            from_nullable: false,
+            to_nullable: true,
+            through_external_partitions,
+            ..
+        } = change
+        {
+            *through_external_partitions = external(&column.table);
+        }
+    }
+}
+
 fn split_tightenings_from_retypes(changes: &mut Vec<Change>) {
     let rows = tables_with_row_changes(changes);
     let mut split = Vec::new();
@@ -2152,6 +2189,7 @@ fn split_tightenings_from_retypes(changes: &mut Vec<Change>) {
                 column: column.clone(),
                 ty: to.clone(),
                 to_nullable: false,
+                through_external_partitions: false,
                 collation: to_collation.clone(),
             });
         }
@@ -15204,6 +15242,7 @@ mod tests {
                     },
                     ty: ty("int"),
                     to_nullable: true,
+                    through_external_partitions: false,
                     collation: None,
                 }),
             ],

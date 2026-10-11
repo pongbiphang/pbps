@@ -638,6 +638,7 @@ mod tests {
             column: table().column("name"),
             ty: "int".parse().unwrap(),
             to_nullable: false,
+            through_external_partitions: false,
             collation: None,
         });
         // A widening type change that also tightens: `Narrowing` is not among
@@ -649,6 +650,7 @@ mod tests {
             to: "bigint".parse().unwrap(),
             from_nullable: true,
             to_nullable: false,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         });
@@ -674,6 +676,7 @@ mod tests {
             column: table().column("name"),
             ty: "int".parse().unwrap(),
             to_nullable: true,
+            through_external_partitions: false,
             collation: None,
         });
         assert!(plan(&cs(vec![add.clone(), loosen]), &Policies::default(), &ctx()).is_empty());
@@ -710,6 +713,7 @@ mod tests {
             to: "int".parse().unwrap(),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         })

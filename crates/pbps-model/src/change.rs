@@ -324,6 +324,13 @@ pub enum Change {
         from_collation: Option<Collation>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_collation: Option<Collation>,
+        /// The table is a parent whose partitions are external (#1533), and
+        /// the change drops its NOT NULL: a NOT NULL a partition keeps of its
+        /// own, which PostgreSQL 18 leaves behind (DEC-1687.1), is dropped
+        /// after the parent's, since no declaration lists the partition to
+        /// bring it back (DEC-1533.1).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        through_external_partitions: bool,
     },
     AlterColumnNullability {
         uid: Uid,
@@ -339,6 +346,13 @@ pub enum Change {
         /// reason [`Change::AlterColumnType`] carries it (#1175).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         collation: Option<Collation>,
+        /// The table is a parent whose partitions are external (#1533), and
+        /// the change drops its NOT NULL: a NOT NULL a partition keeps of its
+        /// own, which PostgreSQL 18 leaves behind (DEC-1687.1), is dropped
+        /// after the parent's, since no declaration lists the partition to
+        /// bring it back (DEC-1533.1).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        through_external_partitions: bool,
     },
     AlterColumnDefault {
         uid: Uid,
@@ -2947,6 +2961,7 @@ mod tests {
             column: col("dbo.customer.email"),
             ty: ty("nvarchar(255)"),
             to_nullable,
+            through_external_partitions: false,
             collation: None,
         };
         let (tighten, loosen) = (make(false), make(true));
@@ -2989,6 +3004,7 @@ mod tests {
             to: ty("int"),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         };
@@ -3013,6 +3029,7 @@ mod tests {
             to: ty("nvarchar(100)"),
             from_nullable,
             to_nullable,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         };
@@ -3246,6 +3263,7 @@ mod tests {
                 to: ty("bigint"),
                 from_nullable: false,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             },
@@ -3254,6 +3272,7 @@ mod tests {
                 column: column.clone(),
                 ty: ty("int"),
                 to_nullable: true,
+                through_external_partitions: false,
                 collation: None,
             },
             Change::AlterColumnDefault {

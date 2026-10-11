@@ -2631,6 +2631,7 @@ fn a_column_edit_carries_its_whole_table_and_nothing_beyond_it() {
         to: "bigint".parse().unwrap(),
         from_nullable: true,
         to_nullable: true,
+        through_external_partitions: false,
         from_collation: None,
         to_collation: None,
     };
@@ -6910,6 +6911,7 @@ mod column_vector_parent {
                 to: "bigint".parse().unwrap(),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             },
@@ -6918,6 +6920,7 @@ mod column_vector_parent {
                 column: table.column("g"),
                 ty: "integer".parse().unwrap(),
                 to_nullable: false,
+                through_external_partitions: false,
                 collation: None,
             },
             Change::AlterColumnExpression {
