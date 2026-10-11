@@ -300,6 +300,110 @@ class ClosedFixtures(unittest.TestCase):
                 with self.assertRaisesRegex(audit.InventoryError, reason):
                     self.check(source)
 
+    def observe_annotation_events(self, source, expected):
+        observed = self.root / 'annotation-observed.py'
+        observed.write_text(source + '\nprint(EVENTS)\n', encoding='utf-8')
+        child = subprocess.run([sys.executable, '-B', str(observed)], cwd=self.root,
+                               capture_output=True, text=True, check=True, timeout=10)
+        self.assertEqual(ast.literal_eval(child.stdout.strip()), expected)
+
+    def assert_annotation_projection_refusal(self, source, diagnostic):
+        with self.assertRaisesRegex(audit.InventoryError, diagnostic):
+            self.check(source)
+        with patch.object(audit.PruneInactive, 'visit_AnnAssign',
+                          audit.PruneInactive.generic_visit):
+            self.assertEqual(self.check(source), 1)
+        with self.assertRaisesRegex(audit.InventoryError, diagnostic):
+            self.check(source)
+
+    def test_annotation_text_needs_independent_invocation_in_every_scope_and_version(self):
+        original = copy.deepcopy(self.inventory)
+        for scope in ('main', '<module>'):
+            for future in (False, True):
+                for assigned in (False, True):
+                    with self.subTest(scope=scope, future=future, assigned=assigned):
+                        self.inventory = copy.deepcopy(original)
+                        body = 'EVENTS = []\ndef helper():\n    EVENTS.append("called")\n'
+                        statement = ('value: int = helper()\n' if assigned
+                                     else 'value: helper()\n')
+                        main = MAIN + ('    ' + statement if scope == 'main' else '')
+                        if scope == '<module>':
+                            body += statement
+                        source = ('from __future__ import annotations\n' if future else '') + fixture(body, main=main)
+                        self.inventory['owners']['live']['witnesses'][
+                            1 if scope == 'main' else 0]['requires'].append('helper()')
+                        eager = assigned or (scope == '<module>' and not future and sys.version_info < (3, 14))
+                        self.observe_annotation_events(source, ['called'] if eager else [])
+                        if assigned:
+                            self.assertEqual(self.check(source), 1)
+                        else:
+                            # Even an eager annotation is not portable direct
+                            # evidence under the source contract (DEC-1233.1).
+                            self.assert_annotation_projection_refusal(source, 'removed invocation.*helper')
+
+    def test_annotation_cannot_select_cases_with_independent_entry_evidence(self):
+        original = copy.deepcopy(self.inventory)
+        for scope in ('main', '<module>'):
+            for assigned in (False, True):
+                with self.subTest(scope=scope, assigned=assigned):
+                    self.inventory = copy.deepcopy(original)
+                    owner = self.inventory['owners']['live']
+                    owner['selection'] = {'kind': 'calls', 'file': 'runner.py',
+                                          'scope': scope, 'callee': 'selected', 'argument': 0}
+                    owner['witnesses'] = [{'file': 'runner.py', 'language': 'python',
+                                          'scope': '<module>', 'requires': ['main()']}]
+                    prefix = ('from __future__ import annotations\nEVENTS = []\nTEST = "owned"\n'
+                              'def selected(name):\n    EVENTS.append(name)\n')
+                    statement = ('value: int = ' if assigned else 'value: ') + 'selected(TEST)\n'
+                    source = prefix + (statement + 'def main(): pass\n' if scope == '<module>'
+                                       else 'def main():\n    ' + statement) + ENTRY
+                    self.observe_annotation_events(source, ['owned'] if assigned else [])
+                    if assigned:
+                        self.assertEqual(self.check(source), 1)
+                    else:
+                        self.assert_annotation_projection_refusal(source, 'no literal case calls')
+
+    def test_annotation_cannot_supply_command_literal_but_assigned_value_can(self):
+        original = copy.deepcopy(self.inventory)
+        for scope in ('main', '<module>'):
+            for assigned in (False, True):
+                with self.subTest(scope=scope, assigned=assigned):
+                    self.inventory = copy.deepcopy(original)
+                    witness = self.inventory['owners']['live']['witnesses'][1 if scope == 'main' else 0]
+                    witness.update(requires=['helper()'], literal_contains=['cargo test'])
+                    body = 'EVENTS = []\ndef helper():\n    EVENTS.append("called")\n'
+                    statements = 'helper()\n' + ('command: str = ' if assigned else 'command: ') + '"cargo test"\n'
+                    main = MAIN
+                    if scope == 'main':
+                        main += ''.join('    ' + line + '\n' for line in statements.splitlines())
+                    else:
+                        body += statements
+                    source = fixture(body, main=main)
+                    self.observe_annotation_events(source, ['called'])
+                    if assigned:
+                        self.assertEqual(self.check(source), 1)
+                    else:
+                        self.assert_annotation_projection_refusal(source, 'missing command literal')
+
+    def test_annotation_projection_preserves_source_policy_and_statement_boundaries(self):
+        self.inventory['owners']['live']['witnesses'][1]['requires'].append('helper()')
+        source = fixture('EVENTS = []\ndef helper():\n    EVENTS.append("called")\n',
+                         main=MAIN + '    helper\n    value: int\n    ()\n')
+        self.observe_annotation_events(source, [])
+        tree = ast.parse(source)
+        before = ast.dump(tree)
+        audit.python_scope_tree(source, 'main', tree=tree)
+        self.assertEqual(ast.dump(tree), before)
+        with self.assertRaisesRegex(audit.InventoryError, 'removed invocation.*helper'):
+            self.check(source)
+        for statement, diagnostic in [('__name__: str', 'protected binding __name__'),
+                                      ('value: TESTS', 'list selector outside iteration TESTS'),
+                                      ('value: globals()', 'reflective spelling globals')]:
+            source = 'from __future__ import annotations\n' + fixture(statement + '\n')
+            with self.subTest(statement=statement):
+                with self.assertRaisesRegex(audit.InventoryError, diagnostic):
+                    self.check(source)
+
     def test_unrelated_native_expressions_and_annotations_are_not_interpreted(self):
         for body in ('value = ~0\n', 'value = {1}\n', 'value: int\n',
                      'from __future__ import annotations\n',

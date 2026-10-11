@@ -1112,3 +1112,24 @@ PostgreSQL 16 and 18 run one compact shared contract. Each row has an explicit
 CI owner and reaches the required gate. Primary full suites keep their existing
 scope. Capability floors and native release qualification remain separate
 claims: a new version string in a unit test cannot qualify catalogs or DDL.
+
+<a id="dec-1233-1"></a>
+
+**DEC-1233.1. Annotation text is not direct scheduling evidence.** Local
+variable annotations never evaluate their expressions; a future directive
+postpones module annotations, and Python 3.14 makes ordinary module annotations
+lazy. The ownership checker must not accept an uncalled helper merely because
+its spelling occurs there. Its copied scheduling projection excludes
+annotation-only statements and retains the value and target of an annotated
+assignment with a value. The same projection serves invocation tokens, command
+literals and selected-case calls. The original AST remains subject to every
+closed-form admission rule in DEC-1413.1.
+
+Use this portable source rule even where an older Python eagerly evaluates an
+annotation. Explicit annotation forcing, annotation-only target side effects,
+and definition-time defaults are not inferred as independent direct-call
+witnesses. Require a supported invocation instead of reviving a versioned
+Python effect interpreter. This does not relax protected bindings, selector
+reads or reflective spellings in otherwise inert annotations. Actual Python
+controls distinguish eager and deferred evaluation; full-owner controls and
+removed-projection counterfactuals pin the scheduling boundary.

@@ -392,6 +392,15 @@ class PruneInactive(ast.NodeTransformer):
     def visit_Lambda(self, node):
         return ast.Constant(value="unexecuted lambda")
 
+    def visit_AnnAssign(self, node):
+        # Annotation evaluation depends on scope, future flags and Python
+        # version. Only an assigned value supplies direct scheduling evidence;
+        # admission rules still inspect annotation text in the original AST.
+        if node.value is None:
+            return None
+        assignment = ast.Assign(targets=[node.target], value=node.value)
+        return self.generic_visit(ast.copy_location(assignment, node))
+
     def visit_TypeAlias(self, node):
         # Alias values and type parameters are lazy; their text cannot witness
         # a direct invocation. Source-form rules still inspect the original AST.
