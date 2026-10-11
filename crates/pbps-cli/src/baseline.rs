@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use pbps_config::Project;
-use pbps_model::{IdsFile, Schema, StateSnapshot};
+use pbps_model::{IdsFile, Schema, StateSnapshot, ValidIds};
 
 #[derive(Debug, Clone)]
 pub enum Source {
@@ -40,7 +40,7 @@ pub enum Source {
 /// impossible and a rename degrades into a drop plus an add.
 pub struct Baseline {
     pub schema: Schema,
-    pub ids: IdsFile,
+    pub ids: ValidIds,
     /// The annotations that travelled beside that revision's declarations.
     ///
     /// Only `depends_on:` survives usefully — it is an ordering edge the
@@ -75,9 +75,22 @@ pub fn load(
             // whichever field of its older shape serde reached first.
             let snap = StateSnapshot::from_json(&text)
                 .map_err(|e| anyhow::anyhow!("baseline file `{}`: {e}", path.display()))?;
+            let ids = snap
+                .ids
+                .validated()
+                .and_then(|ids| {
+                    ids.check_held_by(&snap.schema)?;
+                    Ok(ids)
+                })
+                .with_context(|| {
+                    format!(
+                        "baseline file `{}`: its identity mapping is inconsistent",
+                        path.display()
+                    )
+                })?;
             Ok(Baseline {
                 schema: snap.schema,
-                ids: snap.ids,
+                ids,
                 hints: pbps_model::Hints::default(),
                 declared: snap.declared,
                 description: format!("baseline file {}", path.display()),
@@ -87,7 +100,7 @@ pub fn load(
         Source::Git { rev } => load_from_git(project, rev, dialect),
         Source::Empty => Ok(Baseline {
             schema: Schema::default(),
-            ids: IdsFile::default(),
+            ids: IdsFile::default().validated()?,
             hints: pbps_model::Hints::default(),
             declared: pbps_model::Declared::default(),
             description: "empty baseline".into(),
@@ -306,7 +319,7 @@ fn load_from_git(
         refuse_unknown_revision(root, rev)?;
         return Ok(Baseline {
             schema: Schema::default(),
-            ids: IdsFile::default(),
+            ids: IdsFile::default().validated()?,
             hints: pbps_model::Hints::default(),
             declared: pbps_model::Declared::default(),
             description: format!(
@@ -404,18 +417,24 @@ fn load_from_git(
 ///
 /// Empty when that revision has none — a first run — which is the right
 /// answer rather than a failure: everything is new against it.
-pub fn ids_at(project: &Project, rev: &str) -> anyhow::Result<IdsFile> {
+pub fn ids_at(project: &Project, rev: &str) -> anyhow::Result<ValidIds> {
     let (_, ids_rel) = paths_at(project, rev)?;
     ids_from(&project.root, rev, &ids_rel)
 }
 
 /// The identity file at `rev`, under a path already resolved for that
 /// revision.
-fn ids_from(root: &Path, rev: &str, ids_rel: &str) -> anyhow::Result<IdsFile> {
+fn ids_from(root: &Path, rev: &str, ids_rel: &str) -> anyhow::Result<ValidIds> {
     match git(root, &["show", &format!("{rev}:{ids_rel}")]) {
-        Ok(text) => serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("the identity file at `{rev}` is malformed: {e}")),
-        Err(_) => Ok(IdsFile::default()),
+        Ok(text) => {
+            let ids: IdsFile = serde_json::from_str(&text)
+                .map_err(|e| anyhow::anyhow!("the identity file at `{rev}` is malformed: {e}"))?;
+            // A committed declaration may be deleted before its uid is retired.
+            // Internal validity is required here; schema membership is file-only.
+            ids.validated()
+                .with_context(|| format!("the identity file at `{rev}` is inconsistent"))
+        }
+        Err(_) => Ok(IdsFile::default().validated()?),
     }
 }
 

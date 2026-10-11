@@ -41,6 +41,22 @@ pub enum IdsError {
 
     #[error("a move is recorded for {uid}, but no live table entry has that uid")]
     OrphanMove { uid: Uid },
+
+    #[error("{uid} points at `{name}`, but the snapshot schema does not hold it")]
+    NotHeld { uid: Uid, name: String },
+}
+
+/// An internally consistent identity mapping. Admission checks stay valid:
+/// callers can read it, but cannot mutate or deserialize around validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidIds(IdsFile);
+
+impl std::ops::Deref for ValidIds {
+    type Target = IdsFile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -123,6 +139,48 @@ pub struct Tombstone {
 }
 
 impl IdsFile {
+    pub fn validated(self) -> Result<ValidIds, IdsError> {
+        self.validate()?;
+        Ok(ValidIds(self))
+    }
+
+    /// Checks only live membership, not complete schema coverage. Tombstones
+    /// name retired objects, while a schema may hold objects with no uid.
+    /// File baselines require this; Git revisions may retain ids beside a
+    /// declaration's deletion, and ledger recording has its own boundary
+    /// (DEC-1797.1, DEC-1600.1).
+    pub fn check_held_by(&self, schema: &crate::Schema) -> Result<(), IdsError> {
+        for (uid, name) in &self.tables {
+            if !schema.tables.contains_key(name) {
+                return Err(IdsError::NotHeld {
+                    uid: uid.clone(),
+                    name: name.to_string(),
+                });
+            }
+        }
+        for (uid, column) in &self.columns {
+            if !schema
+                .tables
+                .get(&column.table)
+                .is_some_and(|table| table.columns.contains_key(&column.name))
+            {
+                return Err(IdsError::NotHeld {
+                    uid: uid.clone(),
+                    name: column.to_string(),
+                });
+            }
+        }
+        for (uid, name) in &self.roles {
+            if !schema.roles.contains_key(name) {
+                return Err(IdsError::NotHeld {
+                    uid: uid.clone(),
+                    name: name.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// This mapping without the tables named and their columns: what a state
     /// records for a database that does not hold them.
     ///
@@ -344,7 +402,87 @@ mod tests {
 
     #[test]
     fn sample_is_valid() {
-        sample().validate().unwrap();
+        assert_eq!(*sample().validated().unwrap(), sample());
+    }
+
+    #[test]
+    fn a_validated_mapping_refuses_unsupported_identity_versions() {
+        for version in [0, CURRENT_VERSION + 1] {
+            let mut ids = sample();
+            ids.version = version;
+            assert_eq!(
+                ids.validated().unwrap_err(),
+                IdsError::UnsupportedVersion {
+                    found: version,
+                    supported: CURRENT_VERSION,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_membership_requires_every_live_identity_but_not_retired_or_untracked_objects() {
+        use crate::{Column, Role, Schema, Table};
+        let mut ids = sample();
+        ids.roles.insert(uid("r_aaaaaa"), "reader".into());
+        ids.tombstones.insert(
+            uid("c_zzzzzz"),
+            Tombstone {
+                was: "dbo.retired.old".into(),
+                dropped_at: "2026-10-12".into(),
+                reason: "retired".into(),
+                operator: "test".into(),
+            },
+        );
+        let ids = ids.validated().unwrap();
+        let mut table = Table::default();
+        for name in ["customer_id", "full_name", "untracked"] {
+            table
+                .columns
+                .insert(name.into(), Column::new("int".parse().unwrap()));
+        }
+        let mut schema = Schema::default();
+        let customer = "dbo.customer".parse().unwrap();
+        schema.tables.insert(customer, table.clone());
+        schema
+            .tables
+            .insert("dbo.untracked".parse().unwrap(), table);
+        schema.roles.insert("reader".into(), Role::default());
+        schema.roles.insert("untracked".into(), Role::default());
+        ids.check_held_by(&schema).unwrap();
+        IdsFile::default().check_held_by(&schema).unwrap();
+
+        let mut missing = schema.clone();
+        missing.tables.remove(&"dbo.customer".parse().unwrap());
+        assert_eq!(
+            ids.check_held_by(&missing).unwrap_err(),
+            IdsError::NotHeld {
+                uid: uid("t_a9k2mq"),
+                name: "dbo.customer".into(),
+            }
+        );
+        let mut missing = schema.clone();
+        missing
+            .tables
+            .get_mut(&"dbo.customer".parse().unwrap())
+            .unwrap()
+            .columns
+            .shift_remove("full_name");
+        assert_eq!(
+            ids.check_held_by(&missing).unwrap_err(),
+            IdsError::NotHeld {
+                uid: uid("c_p3n8vd"),
+                name: "dbo.customer.full_name".into(),
+            }
+        );
+        schema.roles.remove("reader");
+        assert_eq!(
+            ids.check_held_by(&schema).unwrap_err(),
+            IdsError::NotHeld {
+                uid: uid("r_aaaaaa"),
+                name: "reader".into(),
+            }
+        );
     }
 
     /// #1600: a state records only the uids of what the database holds. A
@@ -558,7 +696,7 @@ mod tests {
         let mut f = sample();
         f.version = 99;
         assert_eq!(
-            f.validate().unwrap_err(),
+            f.validated().unwrap_err(),
             IdsError::UnsupportedVersion {
                 found: 99,
                 supported: 1
@@ -573,7 +711,7 @@ mod tests {
         f.columns
             .insert(uid("c_zzzzzz"), col("dbo.customer.full_name"));
         assert!(matches!(
-            f.validate().unwrap_err(),
+            f.validated().unwrap_err(),
             IdsError::DuplicateName { .. }
         ));
     }
@@ -591,7 +729,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            f.validate().unwrap_err(),
+            f.validated().unwrap_err(),
             IdsError::LiveAndTombstoned { .. }
         ));
     }
@@ -604,7 +742,7 @@ mod tests {
         let mut f = sample();
         f.columns.insert(uid("c_qqqqqq"), col("dbo.ghost.x"));
         assert!(matches!(
-            f.validate().unwrap_err(),
+            f.validated().unwrap_err(),
             IdsError::OrphanColumn { .. }
         ));
     }
@@ -614,13 +752,13 @@ mod tests {
         let mut f = sample();
         f.columns.insert(uid("t_bbbbbb"), col("dbo.customer.x"));
         assert!(matches!(
-            f.validate().unwrap_err(),
+            f.validated().unwrap_err(),
             IdsError::KindMismatch { .. }
         ));
         let mut f = sample();
         f.roles.insert(uid("c_bbbbbb"), "app_reader".into());
         assert!(matches!(
-            f.validate().unwrap_err(),
+            f.validated().unwrap_err(),
             IdsError::KindMismatch { .. }
         ));
     }
@@ -646,7 +784,7 @@ mod tests {
 
         f.roles.insert(uid("r_bbbbbb"), "app_reader".into());
         assert!(matches!(
-            f.validate().unwrap_err(),
+            f.validated().unwrap_err(),
             IdsError::DuplicateName { .. }
         ));
     }
@@ -683,7 +821,7 @@ mod tests {
         // Negative: a move whose table has no live entry.
         f.moves.insert(uid("t_bbbbbb"), allowed);
         assert!(matches!(
-            f.validate().unwrap_err(),
+            f.validated().unwrap_err(),
             IdsError::OrphanMove { .. }
         ));
     }

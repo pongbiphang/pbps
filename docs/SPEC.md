@@ -1428,6 +1428,16 @@ Baseline precedence:
 3. An empty baseline, with a loud warning — everything is listed as newly created,
    which is dangerous if mistaken for a real plan.
 
+Every baseline's identity mapping must pass the same format and internal
+consistency checks as the working identity file. A file snapshot must also
+hold the table, column or role named by each live uid; tombstones describe
+retired objects and need no live counterpart. Unreadable or inconsistent
+baselines refuse before writing identities, a plan or SQL. Git revisions are
+checked for internal identity validity, but may legitimately keep identities
+beside deleted declarations. Repairing a corrupt historical identity file in
+the working tree alone does not repair `HEAD`: commit that repair before
+comparing against `HEAD`, or select an intact revision with `--since`.
+
 **Anything computed offline is a preview.** A plan that is actually going to be
 applied to an environment must be based on that environment's database as queried
 (Phase 3). The identity file stores only uid to name, from which type changes

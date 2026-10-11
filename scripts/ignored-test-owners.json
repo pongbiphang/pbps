@@ -1324,6 +1324,7 @@
         "every_sql_output_pins_the_parser_before_the_generated_definitions",
         "external_referenced_key_dependencies_are_refused_before_planning_and_writing",
         "failed_concurrent_index_builds_are_cleaned_recorded_and_retried_without_resume",
+        "a_real_ledger_snapshot_with_a_grantless_role_remains_an_offline_baseline",
         "grantless_cluster_role_additions_and_removals_update_the_recorded_scope",
         "identity_increments_at_the_sequence_span_produce_two_values",
         "indirect_constraint_trigger_effects_are_settled_before_recording",

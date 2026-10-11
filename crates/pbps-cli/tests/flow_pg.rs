@@ -21,6 +21,24 @@ const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 #[path = "support/envelope_archives.rs"]
 mod envelope_archives;
 
+#[path = "support/baseline_ids.rs"]
+mod baseline_ids;
+
+#[test]
+fn supported_file_baselines_keep_noops_additions_and_renames_without_git() {
+    baseline_ids::supported_files("postgres");
+}
+
+#[test]
+fn corrupt_file_baselines_refuse_before_any_identity_or_output_write() {
+    baseline_ids::corrupt_files("postgres");
+}
+
+#[test]
+fn git_baselines_require_committing_repairs_to_corrupt_identity_mappings() {
+    baseline_ids::corrupt_git("postgres");
+}
+
 #[path = "support/batch_intent.rs"]
 mod batch_intent;
 
@@ -405,6 +423,89 @@ fn latest_snapshot(connection: &str) -> pbps_model::StateSnapshot {
                 .unwrap()
                 .snapshot
         })
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_real_ledger_snapshot_with_a_grantless_role_remains_an_offline_baseline() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_baseline1797_{}", std::process::id()),
+    );
+    on_server(&server, &format!("CREATE ROLE {}", role.1));
+    let own = OwnDatabase::new(&server, "baseline1797");
+    on_server(own.connection(), "CREATE SCHEMA app");
+    let d = Demo::new("baseline1797-ledger");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {}\n", role.1),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", own.connection()]));
+    // Export the actual persisted bytes, including a role with no grant rows.
+    let text = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection())
+                .await
+                .unwrap();
+            conn.query("SELECT state_json FROM public.__pbps_state ORDER BY id DESC LIMIT 1")
+                .await
+                .unwrap()[0]
+                .try_get::<&str>("state_json")
+                .unwrap()
+                .unwrap()
+                .to_owned()
+        });
+    let snapshot = pbps_model::StateSnapshot::from_json(&text).unwrap();
+    assert!(snapshot.ids.role_uid(&role.1).is_some());
+    assert!(snapshot.schema.roles[&role.1].grants.is_empty());
+    let path = d.dir.join("export.json");
+    std::fs::write(&path, &text).unwrap();
+    let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    let args = [
+        "plan",
+        "--check",
+        "--base",
+        path.to_str().unwrap(),
+        "--format",
+        "json",
+    ];
+    let out = d.run(&args);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(report["data"]["changes"], 0, "{report}");
+
+    // A grantless role is still an object held; losing its schema entry is
+    // corrupt evidence, not the valid empty grant set above.
+    let mut damaged = snapshot.clone();
+    damaged.schema.roles.clear();
+    std::fs::write(&path, serde_json::to_vec(&damaged).unwrap()).unwrap();
+    let out = d.run(&args);
+    assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(report["findings"][0]["id"], "baseline.unreadable");
+    assert!(
+        report["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&role.1),
+        "{report}"
+    );
+    assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+    assert_eq!(latest_snapshot(own.connection()), snapshot);
 }
 
 fn connected_artifact(d: &Demo, connection: &str, staged: bool) -> PathBuf {
