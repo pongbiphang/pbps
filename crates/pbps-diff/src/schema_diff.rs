@@ -3658,41 +3658,6 @@ fn refuse_partition_changes(
     errs.retain(|e| {
         !matches!(e, DiffError::DetachedShape { parent, .. } if changes_meet_moves.contains(parent))
     });
-    // A partition pbps holds, dropped because its parent's partitions are now
-    // external (#1533): reached where the live parent is read as external
-    // already, as a connected plan reads it; a parent external on one side
-    // only is the switch refused above. pbps hands over no partition it
-    // holds; dropping it would take its rows.
-    let external = |schema: &Schema, name: &TableName| {
-        schema
-            .tables
-            .get(name)
-            .and_then(|t| t.partition_by.as_ref())
-            .is_some_and(|by| by.external)
-    };
-    for change in changes {
-        if let Change::DropTable {
-            name,
-            detach_from: Some(parent),
-            ..
-        } = change
-            && external(base.schema, parent)
-            && declared
-                .schema
-                .tables
-                .get(&declared_parent(parent))
-                .and_then(|t| t.partition_by.as_ref())
-                .is_some_and(|by| by.external)
-        {
-            refuse(
-                &declared_parent(parent),
-                format!(
-                    "make its partitions external while pbps holds {name}; drop or detach it in a \
-                     plan of its own first"
-                ),
-            );
-        }
-    }
     errs.extend(
         refused
             .into_iter()
@@ -7214,8 +7179,8 @@ mod tests {
     /// partitions is never a plan, which records only what its changes do:
     /// the switch is refused with the way to make it. Negatives: a switch to
     /// external with no partition held, one while pbps holds a partition,
-    /// the reverse, and a held partition dropped under a parent both sides
-    /// read as external.
+    /// and the reverse. A held partition under an external parent never reaches
+    /// the differ: `scope` refuses it.
     #[test]
     fn a_parent_with_external_partitions_hands_nothing_over() {
         use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
@@ -7306,19 +7271,6 @@ mod tests {
                 .matches("make its partitions external while pbps holds app.ev_d")
                 .count(),
             1,
-            "{errors:?}"
-        );
-        // Negative: the same drop where both sides read the parent external,
-        // as a connected plan's live side does.
-        let errors = outcome(
-            &tree(true, false, &["app.ev_d"]),
-            &tree(true, false, &[]),
-            std::slice::from_ref(&drop),
-        )
-        .expect_err("refused");
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(
-            errors[0].contains("make its partitions external while pbps holds app.ev_d"),
             "{errors:?}"
         );
         // Negative: external partitions declared by a plan.

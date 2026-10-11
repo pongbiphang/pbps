@@ -116,6 +116,24 @@ pub fn scope(
     let mut external = Vec::new();
     let mut unexpressible = Vec::new();
     for (name, table) in &schema.tables {
+        // A partition pbps holds under a parent whose partitions are
+        // external (#1533) is two owners for one table: recorded so, the
+        // ledger would say pbps keeps what the declarations hand to another
+        // tool, and no later plan could take it back (#1833 review). Refused
+        // wherever a read is scoped, the baseline that would record it first.
+        if managed.contains(name)
+            && let Some(of) = &table.partition_of
+            && managed.contains(&of.parent)
+            && external_parents.contains(&of.parent)
+        {
+            unexpressible.push(format!(
+                "{name} is a partition pbps holds of the managed table {}, whose partitions are \
+                 external; drop or detach it in a plan of its own while the parent's partitions \
+                 are declared, then make them external",
+                of.parent
+            ));
+            continue;
+        }
         if managed.contains(name) {
             let mut table = table.clone();
             if external_parents.contains(name)
@@ -495,8 +513,8 @@ mod tests {
     /// A managed parent whose partitions are external (#1533) is marked so,
     /// and a partition of it pbps holds no uid for is left out, neither
     /// unmanaged nor refused, while it is only what the parent makes it. One
-    /// with parts of its own is refused, naming them; a partition pbps does
-    /// hold stays managed; and a parent not named external still refuses its
+    /// with parts of its own is refused, naming them; one pbps holds a uid for
+    /// is refused too; and a parent not named external still refuses its
     /// undeclared partitions (#1170).
     #[test]
     fn an_external_parents_partitions_are_left_out_while_they_are_its_own() {
@@ -566,14 +584,23 @@ mod tests {
         );
         assert_eq!(scoped.external, [t("app.ev_p1")]);
 
-        // A partition pbps holds a uid for is managed as before.
+        // Negative: a partition pbps holds a uid for is two owners for one
+        // table, refused rather than kept or handed over (#1833 review).
         let scoped = scope(
             &live,
             &ids(&[("t_aaaaaa", "app.ev"), ("t_bbbbbb", "app.ev_p1")]),
             &BTreeSet::new(),
             &parents,
         );
-        assert!(scoped.schema.tables.contains_key(&t("app.ev_p1")));
+        assert!(!scoped.schema.tables.contains_key(&t("app.ev_p1")));
+        assert!(
+            scoped.unexpressible.iter().any(|u| u.contains(
+                "app.ev_p1 is a partition pbps holds of the managed table app.ev, whose \
+                 partitions are external"
+            )),
+            "{:?}",
+            scoped.unexpressible
+        );
         assert_eq!(scoped.external, [t("app.ev_p2")]);
 
         // Negative: not named external, the undeclared partitions are refused.

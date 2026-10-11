@@ -6796,6 +6796,33 @@ fn pull_declares_a_named_parents_partitions_external_on(server: &str, k: usize) 
     succeeds(d.run(&["pull", "--db", &connection]));
     let text = std::fs::read_to_string(d.dir.join("schema/app.ev.yml")).unwrap();
     assert!(text.contains("\npartitions:\n  ev_2025:"), "{text}");
+    // Negative: declared external while pbps holds the partitions, a
+    // baseline would record two owners for each; it is refused, naming the
+    // way, and the recorded state stays as it was (#1833 review).
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let held = text.find("\npartitions:\n").unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.ev.yml"),
+        format!("{}\npartitions: external\n", &text[..held]),
+    )
+    .unwrap();
+    d.commit();
+    let o = d.run(&["baseline", "--db", &connection, "--reason", "hand over"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains(
+            "app.ev_2025 is a partition pbps holds of the managed table app.ev, whose partitions \
+             are external"
+        ),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        scalar(&connection, "SELECT count(*) FROM public.__pbps_state"),
+        1,
+        "the refused baseline recorded an entry"
+    );
 
     let d = Demo::new(&format!("external-1533-{k}"));
     let o = succeeds(d.run(&[

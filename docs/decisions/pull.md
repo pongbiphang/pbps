@@ -762,10 +762,11 @@ the way to make it, as an adoption is (#1170):
 - A parent pbps holds no partition of becomes external through a baseline,
   once the declarations say so.
 - One whose partitions pbps holds drops or detaches them in a plan of their
-  own first, since handing them over would take their rows. That is refused
-  in the offline plan, where the setting differs, and in the connected one,
-  where the ledger already reads the parent as external and a drop is what
-  is left.
+  own first, since handing them over would take their rows. The offline plan
+  refuses the switch, where the setting differs. Every scoped read refuses a
+  partition pbps holds under a parent read as external, the baseline that
+  would record it first, so the ledger never says two owners hold one
+  table.
 - External partitions become declared through `pull` and a baseline. The
 setting is PostgreSQL's alone, as partitioning is, and SQL Server refuses
 the flag. Plan version 36 and state version 23 carry the setting, which an
