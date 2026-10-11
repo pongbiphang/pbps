@@ -32,8 +32,8 @@ use std::borrow::Cow;
 
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
 use pbps_model::{
-    Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, Role, RoutineArg, Schema,
-    Strategy, Table, TableName,
+    Change, ColumnType, Module, ModuleId, ModuleKind, Role, RoutineArg, Schema, Strategy, Table,
+    TableName,
 };
 
 mod ambiguity;
@@ -1378,16 +1378,16 @@ impl Dialect for Postgres {
     /// with no probe are named in [`preflight`]'s own documentation, and the
     /// caller reports how many could not be checked rather than counting them
     /// as passes.
-    fn preflight(&self, changes: &ChangeSet) -> pbps_dialect::Preflight {
-        preflight::probes(changes, &pbps_model::Partitions::default())
+    fn preflight(&self, names: &pbps_model::plan_names::PlanNames<'_>) -> pbps_dialect::Preflight {
+        preflight::probes(names, &pbps_model::Partitions::default())
     }
 
     fn preflight_with(
         &self,
-        changes: &ChangeSet,
+        names: &pbps_model::plan_names::PlanNames<'_>,
         partitions: &pbps_model::Partitions,
     ) -> pbps_dialect::Preflight {
-        preflight::probes(changes, partitions)
+        preflight::probes(names, partitions)
     }
 
     /// Whether an omitted cell in the read-back *means* at-default for this

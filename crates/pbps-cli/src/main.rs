@@ -2852,7 +2852,13 @@ fn cmd_plan(
 
     if !json {
         println!("Baseline: {}", base.description);
-        print!("{}", report::plan(&cs));
+        print!(
+            "{}",
+            report::plan(
+                &cs,
+                &pbps_model::plan_names::PlanNames::of(&cs.changes, &res.ids)?
+            )
+        );
         // Membership is each environment's own, so an offline plan cannot
         // list who a dropped role is taken from; saying so keeps "no members
         // listed" from reading as "no members".
@@ -3041,7 +3047,8 @@ fn cmd_plan(
     }
 
     if json {
-        let (tables, modules) = report::touched(&cs);
+        let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &res.ids)?;
+        let (tables, modules) = report::touched(&names);
         let report = output::Report::new(
             "plan",
             findings,
@@ -3050,7 +3057,7 @@ fn cmd_plan(
                 changes: cs.changes.len(),
                 tables,
                 modules,
-                roles: report::touched_roles(&cs),
+                roles: report::touched_roles(&names),
                 risks: cs.risks().iter().map(|r| r.as_str()).collect(),
                 connected_checks: Vec::new(),
                 cost: None,
@@ -3986,5 +3993,48 @@ mod tests {
         assert!(h.parse::<u32>().unwrap() < 24, "{n}");
         assert!(m.parse::<u32>().unwrap() < 60, "{n}");
         assert!(s.parse::<u32>().unwrap() < 60, "{n}");
+    }
+}
+
+#[cfg(test)]
+mod plan_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-dialect/tests/support/plan_ids.rs"
+    ));
+    pub fn chain() -> (ChangeSet, IdsFile) {
+        let table_uid: Uid = "t_aaaaaa".parse().unwrap();
+        let column_uid: Uid = "c_aaaaaa".parse().unwrap();
+        let table = |name| pbps_model::TableName::new("app", name);
+        let renamed_table = |from, to| Change::RenameTable {
+            uid: table_uid.clone(),
+            from: table(from),
+            to: table(to),
+            defaults: vec![],
+        };
+        let renamed_column = |from: &str, to: &str| Change::RenameColumn {
+            uid: column_uid.clone(),
+            table: table("final_table"),
+            from: from.into(),
+            to: to.into(),
+            table_was: Some(table("original_table")),
+        };
+        let changes = ChangeSet {
+            changes: vec![
+                renamed_table("original_table", "temporary_table"),
+                renamed_table("temporary_table", "final_table"),
+                renamed_column("original_column", "temporary_column"),
+                renamed_column("temporary_column", "final_column"),
+            ]
+            .into_iter()
+            .map(pbps_model::PlannedChange::new)
+            .collect(),
+        };
+        let ids = IdsFile {
+            tables: [(table_uid, table("final_table"))].into(),
+            columns: [(column_uid, table("final_table").column("final_column"))].into(),
+            ..IdsFile::default()
+        };
+        (changes, ids)
     }
 }

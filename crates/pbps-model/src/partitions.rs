@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::plan_names::{At, Holder, PlanNames};
 use crate::{ColumnRef, Schema, TableName};
 
 /// The partitions of a schema, by parent, and each partition's parent.
@@ -87,18 +88,15 @@ impl Partitions {
         self
     }
 
-    /// The relation under the names a plan's table renames leave, for one
-    /// read before them: a parent the plan renames holds its partitions
-    /// under its new name, which the plan's changes to it name (#1751
-    /// review). Every rename at once, so a chain (`b` to `c`, then `a` to
-    /// `b`) moves each parent once. Only for a read before the plan: the
-    /// declarations are already under these names.
-    pub fn renamed<'a>(
-        self,
-        renames: impl IntoIterator<Item = (&'a TableName, &'a TableName)>,
-    ) -> Self {
-        let renames: BTreeMap<&TableName, &TableName> = renames.into_iter().collect();
-        let to = |t: TableName| renames.get(&t).map_or(t, |&n| n.clone());
+    /// Bring a baseline relation to final parent names by identity. Partition
+    /// addresses stay as read: existing consumers match those separately.
+    /// Chains and temporary names must follow one UID, not a spelling that
+    /// another parent takes over later in the plan.
+    pub fn renamed(self, names: &PlanNames<'_>) -> Self {
+        let to = |table: TableName| match names.holder(&table, At::Start) {
+            Holder::Tracked(uid) => names.table_at(uid, At::End).cloned().unwrap_or(table),
+            Holder::Unmanaged | Holder::Vacant => table,
+        };
         Self {
             parents: self
                 .parents
@@ -148,6 +146,37 @@ mod tests {
         s
     }
 
+    #[test]
+    fn parents_swapped_through_a_temporary_name_keep_their_own_partitions() {
+        let mut s = schema();
+        s.tables.insert(name("app.q"), Table::default());
+        s.tables.insert(name("app.q_1"), partition("app.q"));
+        let p_uid = crate::Uid::derived(crate::UidKind::Table, "p", 0);
+        let q_uid = crate::Uid::derived(crate::UidKind::Table, "q", 0);
+        let rename = |uid: &crate::Uid, from: &str, to: &str| {
+            crate::PlannedChange::new(crate::Change::RenameTable {
+                uid: uid.clone(),
+                from: name(from),
+                to: name(to),
+                defaults: vec![],
+            })
+        };
+        let changes = [
+            rename(&p_uid, "app.p", "app.tmp"),
+            rename(&q_uid, "app.q", "app.p"),
+            rename(&p_uid, "app.tmp", "app.q"),
+        ];
+        let after = crate::IdsFile {
+            tables: [(p_uid, name("app.q")), (q_uid, name("app.p"))].into(),
+            ..crate::IdsFile::default()
+        };
+        let names = PlanNames::of(&changes, &after).unwrap();
+        let moved = Partitions::of(&s).renamed(&names);
+        assert_eq!(moved.parent(&name("app.p_a")), Some(&name("app.q")));
+        assert_eq!(moved.parent(&name("app.q_1")), Some(&name("app.p")));
+        assert!(moved.of_parent(&name("app.tmp")).is_empty());
+    }
+
     /// A read before a plan's renames, brought under the names they leave:
     /// each parent moves once, a chain included (#1751 review).
     #[test]
@@ -157,7 +186,28 @@ mod tests {
         s.tables.insert(name("app.q_1"), partition("app.q"));
         // `q` to `r`, then `p` to `q`: each once.
         let (p, q, r) = (name("app.p"), name("app.q"), name("app.r"));
-        let moved = Partitions::of(&s).renamed([(&q, &r), (&p, &q)]);
+        let p_uid = crate::Uid::derived(crate::UidKind::Table, "p", 0);
+        let q_uid = crate::Uid::derived(crate::UidKind::Table, "q", 0);
+        let changes = [
+            crate::PlannedChange::new(crate::Change::RenameTable {
+                uid: q_uid.clone(),
+                from: q.clone(),
+                to: r.clone(),
+                defaults: vec![],
+            }),
+            crate::PlannedChange::new(crate::Change::RenameTable {
+                uid: p_uid.clone(),
+                from: p.clone(),
+                to: q.clone(),
+                defaults: vec![],
+            }),
+        ];
+        let after = crate::IdsFile {
+            tables: [(p_uid, q.clone()), (q_uid, r.clone())].into(),
+            ..crate::IdsFile::default()
+        };
+        let names = PlanNames::of(&changes, &after).unwrap();
+        let moved = Partitions::of(&s).renamed(&names);
         assert_eq!(moved.of_parent(&q), [name("app.p_a"), name("app.p_b")]);
         assert_eq!(moved.of_parent(&r), [name("app.q_1")]);
         assert_eq!(moved.parent(&name("app.q_1")), Some(&r));
@@ -167,7 +217,10 @@ mod tests {
         );
         // Negative: the old name holds nothing, and no rename moves nothing.
         assert!(moved.of_parent(&p).is_empty());
-        assert_eq!(Partitions::of(&s).renamed([]), Partitions::of(&s));
+        assert_eq!(
+            Partitions::of(&s).renamed(&PlanNames::of(&[], &crate::IdsFile::default()).unwrap()),
+            Partitions::of(&s)
+        );
     }
 
     #[test]

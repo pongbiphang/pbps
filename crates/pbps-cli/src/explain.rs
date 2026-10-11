@@ -306,8 +306,9 @@ fn explain(
     env: Option<&str>,
 ) -> anyhow::Result<Explanation> {
     let cs = &plan.changes;
-    let (table_count, module_count) = report::touched(cs);
-    let role_count = report::touched_roles(cs);
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &plan.ids)?;
+    let (table_count, module_count) = report::touched(&names);
+    let role_count = report::touched_roles(&names);
 
     let present = cs.risks();
     let risks: Vec<RiskDetail> = RiskClass::ALL
@@ -394,7 +395,7 @@ fn explain(
         )
     };
 
-    let preflight = dialect.preflight(cs);
+    let preflight = dialect.preflight(&names);
     Ok(Explanation {
         applyable,
         apply_limitation,

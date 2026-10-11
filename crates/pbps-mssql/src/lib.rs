@@ -25,8 +25,7 @@ use std::borrow::Cow;
 
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
 use pbps_model::{
-    Change, ChangeSet, ColumnType, Module, ModuleId, RiskClass, Role, Schema, Strategy, Table,
-    TableName,
+    Change, ColumnType, Module, ModuleId, RiskClass, Role, Schema, Strategy, Table, TableName,
 };
 
 pub mod catalog;
@@ -263,8 +262,8 @@ impl Dialect for Mssql {
         emit::emit(change, strategy)
     }
 
-    fn preflight(&self, changes: &ChangeSet) -> pbps_dialect::Preflight {
-        preflight::probes(changes)
+    fn preflight(&self, names: &pbps_model::plan_names::PlanNames<'_>) -> pbps_dialect::Preflight {
+        preflight::probes(names)
     }
 
     fn reads_back_at_default(&self, column: &pbps_model::Column) -> bool {

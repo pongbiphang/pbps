@@ -29,7 +29,7 @@ async fn number(conn: &mut Conn, sql: &str) -> i32 {
 }
 
 async fn probe(conn: &mut Conn, cs: &ChangeSet) -> Result<i32, String> {
-    let sql = &Mssql.preflight(cs).probes.remove(0).sql;
+    let sql = &Mssql.fixture_preflight(cs).probes.remove(0).sql;
     let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows[0].try_get_at(0).unwrap().unwrap())
 }

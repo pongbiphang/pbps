@@ -40,7 +40,10 @@
 
 use std::collections::BTreeSet;
 
-use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
+use pbps_model::{
+    Change, ChangeSet, IdsFile, PlannedChange, TableName,
+    plan_names::{At, PlanNames},
+};
 use pbps_mssql::catalog::ExpressionEdge;
 
 /// Which spellings name one object, as the database's catalog collation
@@ -117,71 +120,37 @@ pub(crate) fn spellings(cs: &ChangeSet, edges: &[ExpressionEdge]) -> BTreeSet<St
     out
 }
 
-/// The plan's names, back to the catalog's: the edges were stored under the
-/// names the database has before this plan runs.
-struct CatalogNames {
-    tables: Vec<(TableName, TableName)>,
-    columns: Vec<(TableName, String, String)>,
-}
-
-impl CatalogNames {
-    fn of(cs: &ChangeSet) -> Self {
-        let mut tables = Vec::new();
-        let mut columns = Vec::new();
-        for p in &cs.changes {
-            if let Change::RenameTable { from, to, .. } = &p.change {
-                tables.push((to.clone(), from.clone()));
-            }
-            if let Change::RenameColumn {
-                table, from, to, ..
-            } = &p.change
-            {
-                columns.push((table.clone(), to.clone(), from.clone()));
-            }
-        }
-        Self { tables, columns }
-    }
-
-    fn table(&self, planned: &TableName) -> TableName {
-        self.tables
-            .iter()
-            .find(|(to, _)| to == planned)
-            .map_or_else(|| planned.clone(), |(_, from)| from.clone())
-    }
-
-    /// A column under the name the plan gives it, back to the catalog's.
-    fn column(&self, table: &TableName, planned: &str) -> String {
-        self.columns
-            .iter()
-            .find(|(t, to, _)| t == table && to == planned)
-            .map_or_else(|| planned.to_owned(), |(_, _, from)| from.clone())
-    }
+/// Edges use catalog addresses. Computed columns have no UID of their own,
+/// so their owning table is resolved at the change's actual position.
+fn catalog_table(names: &PlanNames<'_>, table: &TableName, at: usize) -> TableName {
+    names
+        .stored(table, At::Before(at))
+        .unwrap_or_else(|| table.clone())
 }
 
 /// The input a change renames, drops, retypes or tightens or relaxes, by its
 /// catalog table and column, and what the change does to it.
 fn input_change(
     change: &Change,
-    names: &CatalogNames,
+    names: &PlanNames<'_>,
 ) -> Option<(TableName, String, &'static str)> {
-    if let Change::RenameColumn { table, from, .. } = change {
-        return Some((names.table(table), from.clone(), "renames"));
-    }
-    // A drop names the column as the catalog does (DEC-1316.1).
-    if let Change::DropColumn { column, .. } = change {
-        return Some((names.table(&column.table), column.name.clone(), "drops"));
-    }
-    if let Change::AlterColumnType { column, .. } = change {
-        let table = names.table(&column.table);
-        let name = names.column(&column.table, &column.name);
-        return Some((table, name, "retypes or recollates"));
-    }
-    if let Change::AlterColumnNullability { column, .. } = change {
-        let table = names.table(&column.table);
-        let name = names.column(&column.table, &column.name);
-        return Some((table, name, "changes the nullability of"));
-    }
-    None
+    let (uid, what) = if let Change::RenameColumn { uid, .. } = change {
+        (uid, "renames")
+    } else if let Change::DropColumn { uid, .. } = change {
+        (uid, "drops")
+    } else if let Change::AlterColumnType { uid, .. } = change {
+        (uid, "retypes or recollates")
+    } else if let Change::AlterColumnNullability { uid, .. } = change {
+        (uid, "changes the nullability of")
+    } else {
+        return None;
+    };
+    let (owner, column) = names.column_at(uid, At::Start)?;
+    Some((
+        names.table_at(owner, At::Start)?.clone(),
+        column.into(),
+        what,
+    ))
 }
 
 /// Orders the plan's function drops after the computed columns that call
@@ -190,21 +159,22 @@ fn input_change(
 /// moved.
 pub(crate) fn order_by_edges(
     cs: &mut ChangeSet,
+    ids: &IdsFile,
     edges: &[ExpressionEdge],
     alike: &Alike,
 ) -> Result<usize, String> {
-    let names = CatalogNames::of(cs);
+    let names = PlanNames::of(&cs.changes, ids).map_err(|e| e.to_string())?;
     // A computed column by its catalog table and name.
     let mut dropped: Vec<(TableName, String)> = Vec::new();
     let mut added: Vec<(TableName, String)> = Vec::new();
     let mut tables_dropped: Vec<TableName> = Vec::new();
     let mut modules_dropped: Vec<TableName> = Vec::new();
-    for p in &cs.changes {
+    for (at, p) in cs.changes.iter().enumerate() {
         if let Change::DropComputedColumn { table, name, .. } = &p.change {
-            dropped.push((names.table(table), name.clone()));
+            dropped.push((catalog_table(&names, table, at), name.clone()));
         }
         if let Change::AddComputedColumn { table, name, .. } = &p.change {
-            added.push((names.table(table), name.clone()));
+            added.push((catalog_table(&names, table, at), name.clone()));
         }
         if let Change::DropTable { name, .. } = &p.change {
             tables_dropped.push(name.clone());
@@ -225,7 +195,7 @@ pub(crate) fn order_by_edges(
     let computed_edges = || edges.iter().filter(|e| e.from_column.is_some());
 
     let mut refused = Vec::new();
-    for p in &cs.changes {
+    for (at, p) in cs.changes.iter().enumerate() {
         if let Some((table, column, what)) = input_change(&p.change, &names) {
             for e in computed_edges() {
                 let computed = e.from_column.as_deref().unwrap_or_default();
@@ -270,7 +240,7 @@ pub(crate) fn order_by_edges(
             }
         }
         if let Change::DropComputedColumn { table, name, .. } = &p.change {
-            let table = names.table(table);
+            let table = catalog_table(&names, table, at);
             for e in edges {
                 if e.from_column.is_none()
                     && e.from_schema_bound
@@ -293,7 +263,7 @@ pub(crate) fn order_by_edges(
         refused.dedup();
         return Err(refused.join("\n"));
     }
-    release(cs, edges, &names, alike)
+    release(cs, ids, edges, alike)
 }
 
 /// A function this plan creates, alters or drops, by its catalog name, with
@@ -500,18 +470,18 @@ fn waits_for(
     changes: &[PlannedChange],
     at: usize,
     edges: &[ExpressionEdge],
-    names: &CatalogNames,
+    names: &PlanNames<'_>,
     alike: &Alike,
 ) -> Vec<usize> {
     let change = &changes[at].change;
-    let among = |waits: &dyn Fn(&Change) -> bool| -> Vec<usize> {
+    let among = |waits: &dyn Fn(usize, &Change) -> bool| -> Vec<usize> {
         (0..changes.len())
-            .filter(|&p| p != at && waits(&changes[p].change))
+            .filter(|&p| p != at && waits(p, &changes[p].change))
             .collect()
     };
     if let Change::DropComputedColumn { table, name, .. } = change {
-        let table = names.table(table);
-        return among(&|c: &Change| {
+        let table = catalog_table(names, table, at);
+        return among(&|_, c: &Change| {
             matches!(c, Change::DropModule { id, .. } if edges.iter().any(|e| {
                 e.from_column.is_none()
                     && e.from_schema_bound
@@ -521,12 +491,14 @@ fn waits_for(
             }))
         });
     }
-    if let Change::DropColumn { column, .. } = change {
-        let table = names.table(&column.table);
-        let read = names.column(&column.table, &column.name);
-        return among(&|c: &Change| {
+    if let Change::DropColumn { uid, column } = change {
+        let table = catalog_table(names, &column.table, at);
+        let read = names
+            .column_at(uid, At::Start)
+            .map_or(column.name.clone(), |(_, name)| name.into());
+        return among(&|position, c: &Change| {
             matches!(c, Change::DropComputedColumn { table: t, name: computed, .. }
-            if alike.object(&names.table(t), &table)
+            if alike.object(&catalog_table(names, t, position), &table)
                 && edges.iter().any(|e| {
                     alike.object(&e.from, &table)
                         && e.from_column.as_deref().is_some_and(|f| alike.same(f, computed))
@@ -540,12 +512,12 @@ fn waits_for(
     };
     let is_function = matches!(change, Change::DropModule { .. });
     // Whether a change removes a computed column that calls `object`.
-    let releases = |change: &Change| {
+    let releases = |position, change: &Change| {
         edges.iter().any(|e| {
             e.from_column.is_some()
                 && alike.object(&e.to, &object)
                 && (matches!(change, Change::DropComputedColumn { table, name, .. }
-                    if alike.object(&names.table(table), &e.from)
+                    if alike.object(&catalog_table(names, table, position), &e.from)
                         && e.from_column.as_deref().is_some_and(|c| alike.same(c, name)))
                     || matches!(change, Change::DropTable { name, .. } if alike.object(name, &e.from)))
         })
@@ -560,7 +532,7 @@ fn waits_for(
             })
         })
     };
-    among(&|c: &Change| (is_function && releases(c)) || bound(c))
+    among(&|position, c: &Change| (is_function && releases(position, c)) || bound(c))
 }
 
 /// Which drop runs before which, as `release` ordered them: each pair is a
@@ -569,13 +541,13 @@ fn waits_for(
 /// keeping the place `release` gave it among every drop.
 pub(crate) fn drop_precedence(
     cs: &ChangeSet,
+    names: &PlanNames<'_>,
     edges: &[ExpressionEdge],
     alike: &Alike,
 ) -> Vec<(Change, Change)> {
-    let names = CatalogNames::of(cs);
     let mut out = Vec::new();
     for at in 0..cs.changes.len() {
-        for p in waits_for(&cs.changes, at, edges, &names, alike) {
+        for p in waits_for(&cs.changes, at, edges, names, alike) {
             out.push((cs.changes[p].change.clone(), cs.changes[at].change.clone()));
         }
     }
@@ -588,8 +560,8 @@ pub(crate) fn drop_precedence(
 /// column's drop, and what that column reads, after a module bound to it.
 fn release(
     cs: &mut ChangeSet,
+    ids: &IdsFile,
     edges: &[ExpressionEdge],
-    names: &CatalogNames,
     alike: &Alike,
 ) -> Result<usize, String> {
     let mut moved = 0;
@@ -598,9 +570,10 @@ fn release(
     let limit = cs.changes.len() * cs.changes.len() + 1;
     let mut steps = 0;
     loop {
+        let names = PlanNames::of(&cs.changes, ids).map_err(|e| e.to_string())?;
         let mut changed = false;
         for at in 0..cs.changes.len() {
-            let Some(last) = waits_for(&cs.changes, at, edges, names, alike)
+            let Some(last) = waits_for(&cs.changes, at, edges, &names, alike)
                 .into_iter()
                 .max()
             else {
@@ -631,6 +604,24 @@ fn release(
 
 #[cfg(test)]
 mod tests {
+    fn order_by_edges(
+        cs: &mut ChangeSet,
+        edges: &[ExpressionEdge],
+        alike: &Alike,
+    ) -> Result<usize, String> {
+        let ids = crate::plan_fixture::ids(cs);
+        super::order_by_edges(cs, &ids, edges, alike)
+    }
+    fn drop_precedence(
+        cs: &ChangeSet,
+        edges: &[ExpressionEdge],
+        alike: &Alike,
+    ) -> Vec<(Change, Change)> {
+        let ids = crate::plan_fixture::ids(cs);
+        let names = PlanNames::of(&cs.changes, &ids).unwrap();
+        super::drop_precedence(cs, &names, edges, alike)
+    }
+
     use super::*;
     use pbps_model::{ComputedColumn, ModuleId, ModuleKind};
 
@@ -698,7 +689,7 @@ mod tests {
 
     fn drop_table(name: &str) -> PlannedChange {
         PlannedChange::new(Change::DropTable {
-            uid: "t_000000".parse().unwrap(),
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, name, 0),
             name: t(name),
             detach_from: None,
         })
@@ -1066,6 +1057,53 @@ mod tests {
                 &viewed
             )
             .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod plan_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_computed_reader_keeps_its_input_through_table_and_column_rename_chains() {
+        let (mut changes, ids) = crate::plan_fixture::chain();
+        changes
+            .changes
+            .push(PlannedChange::new(Change::AlterColumnNullability {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: TableName::new("app", "final_table").column("final_column"),
+                ty: "int".parse().unwrap(),
+                to_nullable: false,
+                through_external_partitions: false,
+                collation: None,
+            }));
+        let edge = ExpressionEdge {
+            from: TableName::new("app", "original_table"),
+            from_column: Some("g".into()),
+            from_schema_bound: false,
+            to: TableName::new("app", "original_table"),
+            to_column: Some("original_column".into()),
+            to_kind: "U".into(),
+        };
+        let error = order_by_edges(
+            &mut changes,
+            &ids,
+            std::slice::from_ref(&edge),
+            &Alike::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("computed column app.original_table.g reads `original_column`"),
+            "{error}"
+        );
+        let unrelated = ExpressionEdge {
+            to_column: Some("other".into()),
+            ..edge
+        };
+        assert_eq!(
+            order_by_edges(&mut changes, &ids, &[unrelated], &Alike::default()),
+            Ok(0)
         );
     }
 }

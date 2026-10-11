@@ -371,7 +371,7 @@ async fn a_check_does_not_read_the_column_giving_up_its_name() {
         });
         let cs = changes(steps);
         let counts = probe_counts(&mut db.conn, &cs).await;
-        let unchecked = Mssql.preflight(&cs).unchecked;
+        let unchecked = Mssql.fixture_preflight(&cs).unchecked;
         let applied = rolled_back(&mut db.conn, &cs).await;
         observations.push((case, counts, unchecked, applied));
         db.conn.execute("DROP TABLE dbo.t;").await.unwrap();

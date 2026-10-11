@@ -137,7 +137,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{DialectError, Preflight, Probe, Unchecked};
-use pbps_model::{Cell, Change, ChangeSet, ColumnRef, RowKey, TableName, Value};
+#[cfg(test)]
+use pbps_model::ChangeSet;
+use pbps_model::plan_names::{At, Holder, PlanNames};
+use pbps_model::{Cell, Change, ColumnRef, RowKey, TableName, Value};
 
 use crate::emit::{qualified, value_literal};
 use crate::quote;
@@ -481,11 +484,10 @@ struct Removed {
 /// be named as the catalog knows it *now*. A plan that renames a table and then
 /// deletes a row from it describes the table by its new name, and a probe built
 /// from the change alone would ask about a table that does not exist yet.
-#[derive(Debug, Default)]
-struct AsStored {
-    tables: BTreeMap<TableName, TableName>,
-    columns: BTreeMap<ColumnRef, String>,
-    created: BTreeSet<TableName>,
+#[derive(Debug)]
+struct AsStored<'a> {
+    plan_names: &'a PlanNames<'a>,
+    partitions: pbps_model::Partitions,
     moved: BTreeMap<TableName, Moved>,
     removed: BTreeSet<Removed>,
     /// Foreign keys this plan adds, which the catalog does not hold yet and
@@ -606,22 +608,29 @@ fn constant_default(default: &str) -> Option<&str> {
     crate::rows::is_constant(d).then_some(d)
 }
 
-impl AsStored {
-    fn of(changes: &ChangeSet) -> Self {
-        let mut this = Self::default();
-        for p in &changes.changes {
+impl<'a> AsStored<'a> {
+    fn of(plan_names: &'a PlanNames<'a>, partitions: &pbps_model::Partitions) -> Self {
+        let mut this = Self {
+            plan_names,
+            partitions: partitions.clone(),
+            moved: Default::default(),
+            removed: Default::default(),
+            added: Default::default(),
+            columns_added: Default::default(),
+            retyped: Default::default(),
+            retyped_from: Default::default(),
+            column_types: Default::default(),
+            recomputed: Default::default(),
+            attached: Default::default(),
+            vacated: Default::default(),
+        };
+        for (at, p) in plan_names.changes().iter().enumerate() {
             match &p.change {
-                Change::RenameTable { from, to, .. } => {
-                    this.tables.insert(to.clone(), from.clone());
-                }
-                Change::RenameColumn {
-                    table, from, to, ..
-                } => {
-                    this.columns.insert(table.column(to), from.clone());
+                Change::RenameTable { .. } => {}
+                Change::RenameColumn { table, from, .. } => {
                     this.vacated.insert(table.column(from));
                 }
                 Change::CreateTable { name, table, .. } => {
-                    this.created.insert(name.clone());
                     // A created table's columns are entirely in the plan, so
                     // its **key** has a type here where a stored table's has
                     // none: `InsertRow` carries the type of every non-key
@@ -664,13 +673,17 @@ impl AsStored {
                 }
                 Change::DropForeignKey { table, name } => {
                     this.removed.insert(Removed {
-                        stored_table: this.table(table).unwrap_or_else(|| table.clone()),
+                        stored_table: this
+                            .table_at(table, At::Before(at))
+                            .unwrap_or_else(|| table.clone()),
                         constraint: Some(name.clone()),
                     });
                 }
                 Change::DropTable { name, .. } => {
                     this.removed.insert(Removed {
-                        stored_table: this.table(name).unwrap_or_else(|| name.clone()),
+                        stored_table: this
+                            .table_at(name, At::Before(at))
+                            .unwrap_or_else(|| name.clone()),
                         constraint: None,
                     });
                 }
@@ -886,7 +899,6 @@ impl AsStored {
                 map.entry(column).or_insert(value);
             }
         }
-        reach(&mut self.columns, partitions);
         reach(&mut self.columns_added, partitions);
         reach(&mut self.retyped, partitions);
         reach(&mut self.retyped_from, partitions);
@@ -924,7 +936,7 @@ impl AsStored {
         self.vacated
             .iter()
             .filter(|c| c.table == *table)
-            .any(|c| self.columns.contains_key(c) || self.columns_added.contains_key(c))
+            .any(|c| self.renamed_column(c).is_some() || self.columns_added.contains_key(c))
     }
 
     /// Whether this plan retypes any column of a table.
@@ -984,26 +996,42 @@ impl AsStored {
     /// carries no foreign key, and probing it would only produce an error
     /// about a missing relation.
     fn table(&self, name: &TableName) -> Option<TableName> {
-        if self.created.contains(name) {
-            return None;
+        self.table_at(name, At::End)
+    }
+
+    fn table_at(&self, name: &TableName, at: At) -> Option<TableName> {
+        match self.plan_names.holder(name, at) {
+            Holder::Tracked(uid) => self.plan_names.table_at(uid, At::Start).cloned(),
+            Holder::Unmanaged => Some(name.clone()),
+            Holder::Vacant => None,
         }
-        Some(
-            self.tables
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| name.clone()),
-        )
+    }
+
+    fn created(&self, table: &TableName) -> bool {
+        match self.plan_names.holder(table, At::End) {
+            Holder::Tracked(uid) => self.plan_names.table_at(uid, At::Start).is_none(),
+            Holder::Unmanaged | Holder::Vacant => false,
+        }
+    }
+
+    fn renamed_column(&self, column: &ColumnRef) -> Option<&str> {
+        let source = self.partitions.column(column);
+        self.plan_names
+            .renamed_columns(&source.table)
+            .find(|(_, _, to)| *to == source.name)
+            .map(|(_, from, _)| from)
+    }
+
+    fn renames_in(&self, table: &TableName) -> bool {
+        let source = self.partitions.parent(table).unwrap_or(table);
+        self.plan_names.renamed_columns(source).next().is_some()
     }
 
     fn column(&self, r: &ColumnRef) -> Option<ColumnRef> {
-        let table = self.table(&r.table)?;
-        Some(ColumnRef::new(
-            table,
-            self.columns
-                .get(r)
-                .cloned()
-                .unwrap_or_else(|| r.name.clone()),
-        ))
+        Some(
+            self.table(&r.table)?
+                .column(self.renamed_column(r).unwrap_or(&r.name)),
+        )
     }
 }
 
@@ -1455,7 +1483,7 @@ enum Removal {
     Keys(Vec<String>),
 }
 
-impl AsStored {
+impl AsStored<'_> {
     /// The stored children whose key into `parent` this plan adds, under the
     /// names the catalog holds now (DECISIONS 336, 345).
     fn planned_children(&self, parent: &TableName) -> Vec<TableName> {
@@ -2001,7 +2029,7 @@ fn planned_key_probes(
     for a in names.added.iter().filter(|a| a.parent == *table) {
         // A child this plan creates is named as the plan names it, and holds
         // no stored rows: only its arrivals are counted (DECISIONS 343).
-        let created = names.created.contains(&a.child);
+        let created = names.created(&a.child);
         let stored_child = if created {
             a.child.clone()
         } else {
@@ -2758,7 +2786,7 @@ fn rows_after(
             // refuses a plan the engine accepts (the other dialect's
             // DECISIONS 236).
             if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty())
-                || names.columns.keys().any(|c| c.table == *table)
+                || names.renames_in(table)
                 || names.columns_added.keys().any(|c| c.table == *table)
                 || names.retypes_in(table)
             {
@@ -3664,8 +3692,7 @@ fn planned_collation(names: &AsStored, column: &ColumnRef) -> Result<String, Dia
         .or_else(|| names.columns_added.get(column).map(|added| &added.ty))
         .or_else(|| {
             names
-                .created
-                .contains(&column.table)
+                .created(&column.table)
                 .then(|| names.column_types.get(column))
                 .flatten()
         });
@@ -3743,15 +3770,15 @@ fn key_collation_probe(
 ///
 /// A probe that cannot be built is reported as unchecked, keeping it distinct
 /// from a change that needs no data question at all.
-pub(crate) fn probes(changes: &ChangeSet, partitions: &pbps_model::Partitions) -> Preflight {
-    let mut names = AsStored::of(changes);
+pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partitions) -> Preflight {
+    let mut names = AsStored::of(plan_names, partitions);
     names.reach_partitions(partitions);
     let mut out = Vec::new();
     let mut unchecked = Vec::new();
     // DEFAULT partitions a create earlier in the plan moves rows out of, in
     // the plan's names (#1547).
     let mut moved_out: Vec<&TableName> = Vec::new();
-    for p in &changes.changes {
+    for p in plan_names.changes() {
         match build(&p.change, &names, &mut unchecked) {
             // A probe of a DEFAULT partition's own rows, after a move out of
             // it, counts rows that are gone by then: a check the moved rows
@@ -3901,7 +3928,7 @@ pub(crate) fn probes(changes: &ChangeSet, partitions: &pbps_model::Partitions) -
             }
         }
     }
-    partition_probes(changes, &names, &mut out, &mut unchecked);
+    partition_probes(plan_names.changes(), &names, &mut out, &mut unchecked);
     Preflight {
         probes: out,
         unchecked,
@@ -3915,13 +3942,12 @@ pub(crate) fn probes(changes: &ChangeSet, partitions: &pbps_model::Partitions) -
 /// dropped, which the engine refuses to detach. Both are asked of the whole
 /// plan, because a partition the same plan drops takes its rows with it.
 fn partition_probes(
-    changes: &ChangeSet,
+    changes: &[pbps_model::PlannedChange],
     names: &AsStored,
     out: &mut Vec<Probe>,
     unchecked: &mut Vec<Unchecked>,
 ) {
     let created: BTreeSet<&TableName> = changes
-        .changes
         .iter()
         .filter_map(|p| {
             if let Change::CreateTable { name, .. } = &p.change {
@@ -3932,31 +3958,28 @@ fn partition_probes(
         })
         .collect();
     let dropped: BTreeMap<&TableName, Vec<&TableName>> =
-        changes
-            .changes
-            .iter()
-            .fold(BTreeMap::new(), |mut by_parent, p| {
-                // A detached partition's rows leave the parent as a dropped
-                // one's do (#1544).
-                if let Change::DropTable {
-                    name,
-                    detach_from: Some(parent),
-                    ..
-                }
-                | Change::DetachPartition {
-                    table: name,
-                    parent,
-                    ..
-                } = &p.change
-                {
-                    by_parent.entry(parent).or_insert_with(Vec::new).push(name);
-                }
-                by_parent
-            });
+        changes.iter().fold(BTreeMap::new(), |mut by_parent, p| {
+            // A detached partition's rows leave the parent as a dropped
+            // one's do (#1544).
+            if let Change::DropTable {
+                name,
+                detach_from: Some(parent),
+                ..
+            }
+            | Change::DetachPartition {
+                table: name,
+                parent,
+                ..
+            } = &p.change
+            {
+                by_parent.entry(parent).or_insert_with(Vec::new).push(name);
+            }
+            by_parent
+        });
     // Partitions dropped so far, in plan order: by a partition's own drop,
     // their rows are gone, and so are their references.
     let mut dropped_before: Vec<&TableName> = Vec::new();
-    for p in &changes.changes {
+    for p in changes {
         let probe = if let Change::CreateTable {
             name,
             table,
@@ -4502,9 +4525,12 @@ pub(crate) fn fires_here(column: &str) -> String {
 /// own, and its parent's, whose clone on the DEFAULT goes with it. A
 /// `DropModule` sorts first (class 0), before the partition is made, so the
 /// move does not meet them (#1547 review).
-fn dropped_triggers(changes: &ChangeSet, default: &TableName, parent: &TableName) -> String {
+fn dropped_triggers(
+    changes: &[pbps_model::PlannedChange],
+    default: &TableName,
+    parent: &TableName,
+) -> String {
     let clauses: Vec<String> = changes
-        .changes
         .iter()
         .filter_map(|p| {
             if let Change::DropModule {
@@ -4864,13 +4890,24 @@ fn skip(change: &Change, reason: &str, unchecked: &mut Vec<Unchecked>) -> Vec<Pr
 
 #[cfg(test)]
 mod tests {
+    mod plan_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pbps-dialect/tests/support/preflight.rs"
+        ));
+    }
+    use plan_fixture::FixturePreflight as _;
+
     use super::*;
     fn probes(changes: &ChangeSet) -> Vec<Probe> {
         preflight(changes).probes
     }
     /// The pre-flight with no partitions, as `Dialect::preflight` asks it.
     fn preflight(changes: &ChangeSet) -> Preflight {
-        super::probes(changes, &pbps_model::Partitions::default())
+        crate::Postgres::new().fixture_preflight(changes)
+    }
+    fn probes_with(changes: &ChangeSet, partitions: &pbps_model::Partitions) -> Preflight {
+        crate::Postgres::new().fixture_preflight_with(changes, partitions)
     }
     use pbps_model::{Change, PlannedChange};
 
@@ -4998,7 +5035,13 @@ mod tests {
             to: "COALESCE(a, 0)".into(),
         };
         let tighten = |column: &str| Change::AlterColumnNullability {
-            uid: "c_aaaaaa".parse().unwrap(),
+            uid: if column == "g" {
+                "c_aaaaaa"
+            } else {
+                "c_bbbbbb"
+            }
+            .parse()
+            .unwrap(),
             column: table.column(column),
             ty: "integer".parse().unwrap(),
             to_nullable: false,
@@ -5890,7 +5933,7 @@ mod tests {
             to_collation: None,
         };
         let plan = set(vec![retype.clone(), check.clone()]);
-        let told = super::probes(&plan, &partitions);
+        let told = probes_with(&plan, &partitions);
         assert!(
             told.probes.iter().all(|p| !p.sql.contains("v = round(v)")),
             "the parent's conversion runs first: {told:#?}"
@@ -5916,7 +5959,7 @@ mod tests {
             },
         };
         assert!(
-            super::probes(&set(vec![retype, elsewhere]), &partitions)
+            probes_with(&set(vec![retype, elsewhere]), &partitions)
                 .probes
                 .iter()
                 .any(|p| p.sql.contains("v = round(v)")),
@@ -5945,7 +5988,7 @@ mod tests {
             }),
             clustered: false,
         };
-        let renamed = super::probes(&set(vec![rename, unique]), &partitions);
+        let renamed = probes_with(&set(vec![rename, unique]), &partitions);
         assert_eq!(renamed.probes.len(), 1, "{renamed:#?}");
         let sql = &renamed.probes[0].sql;
         assert!(sql.contains("\"code\""), "{sql}");
@@ -6032,7 +6075,7 @@ mod tests {
             column: c.to_owned(),
             not_null: true,
         };
-        let readded = super::probes(
+        let readded = probes_with(
             &set(vec![
                 rename(&parent, "n", "n_old"),
                 add(&parent, "n"),
@@ -6049,7 +6092,7 @@ mod tests {
             "{readded:#?}"
         );
         // Negative: a NOT NULL on a column the parent keeps is probed.
-        let kept = super::probes(
+        let kept = probes_with(
             &set(vec![
                 rename(&parent, "n", "n_old"),
                 add(&parent, "n"),

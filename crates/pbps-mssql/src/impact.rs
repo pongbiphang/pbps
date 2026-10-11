@@ -25,7 +25,10 @@
 
 use pbps_db::{Conn, DbError};
 use pbps_dialect::DialectError;
-use pbps_model::{Change, TableName};
+use pbps_model::{
+    Change, TableName,
+    plan_names::{At, Holder, PlanNames},
+};
 
 use crate::catalog::{get, opt};
 use crate::emit::qualified;
@@ -37,26 +40,15 @@ use crate::emit::qualified;
 // module rename here.
 pub use pbps_db::impact::{ImpactError, ImpactReport, Referrer, RenameTarget};
 
-/// The original table at one statement's position. Reversing only the prefix
-/// keeps a name reused by CREATE from resolving to the previous occupant.
-fn stored_key_table(
-    cs: &pbps_model::ChangeSet,
-    index: usize,
-    table: &TableName,
-) -> Option<TableName> {
-    let mut name = table.clone();
-    for p in cs.changes[..index].iter().rev() {
-        if let Change::RenameTable { from, to, .. } = &p.change
-            && to == &name
-        {
-            name = from.clone();
-        } else if let Change::CreateTable { name: created, .. } = &p.change
-            && created == &name
-        {
-            return None;
-        }
+/// A key's holder at this statement, translated to the stored catalog.
+/// Unmanaged tables keep their supplied name; a vacated or new identity
+/// supplies no catalog table to probe.
+fn stored_key_table(names: &PlanNames<'_>, index: usize, table: &TableName) -> Option<TableName> {
+    match names.holder(table, At::Before(index)) {
+        Holder::Tracked(uid) => names.table_at(uid, At::Start).cloned(),
+        Holder::Unmanaged => Some(table.clone()),
+        Holder::Vacant => None,
     }
-    Some(name)
 }
 
 /// The original column at one statement's position, by identity rather than by
@@ -68,13 +60,13 @@ fn stored_key_table(
 /// two columns into each other's names, and walking the chain backwards by uid
 /// cannot follow the wrong one.
 fn stored_key_column(
-    cs: &pbps_model::ChangeSet,
+    changes: &[pbps_model::PlannedChange],
     index: usize,
     uid: &pbps_model::Uid,
     declared: &str,
 ) -> String {
     let mut name = declared.to_owned();
-    for p in cs.changes[..index].iter().rev() {
+    for p in changes[..index].iter().rev() {
         if let Change::RenameColumn {
             uid: renamed, from, ..
         } = &p.change
@@ -92,13 +84,13 @@ fn stored_key_column(
 /// decides which standing key an external foreign key actually depends on.
 pub async fn key_drop_blockers(
     conn: &mut Conn,
-    cs: &pbps_model::ChangeSet,
+    names: &PlanNames<'_>,
 ) -> Result<Vec<pbps_db::impact::DropReport>, ImpactError> {
     use pbps_db::{DbError, Param};
     use std::collections::BTreeSet;
 
-    let targets: Vec<_> = cs
-        .changes
+    let targets: Vec<_> = names
+        .changes()
         .iter()
         .enumerate()
         .filter_map(|(index, p)| {
@@ -152,7 +144,7 @@ pub async fn key_drop_blockers(
                 | Change::SetPartitionNotNull { .. }
                 | Change::PublicExecution { .. } => return None,
             };
-            let stored = stored_key_table(cs, index, table)?;
+            let stored = stored_key_table(names, index, table)?;
             Some((index, stored, kind, name))
         })
         .collect();
@@ -214,7 +206,7 @@ pub async fn key_drop_blockers(
         column: String,
     }
     let mut retypes = Vec::new();
-    for (index, p) in cs.changes.iter().enumerate() {
+    for (index, p) in names.changes().iter().enumerate() {
         let Change::AlterColumnType {
             uid,
             column,
@@ -228,13 +220,13 @@ pub async fn key_drop_blockers(
         if !crate::types::retype_dependents(from, to).foreign_keys {
             continue;
         }
-        let Some(table) = stored_key_table(cs, index, &column.table) else {
+        let Some(table) = stored_key_table(names, index, &column.table) else {
             continue;
         };
         retypes.push(Retyped {
             change_index: index,
             table,
-            column: stored_key_column(cs, index, uid, &column.name),
+            column: stored_key_column(names.changes(), index, uid, &column.name),
         });
     }
     if keys.is_empty() && retypes.is_empty() {
@@ -273,7 +265,7 @@ pub async fn key_drop_blockers(
         return Err(DbError::Refused("key_drop_blockers cannot prove external dependencies are visible: an effective object/schema metadata DENY overrides database VIEW DEFINITION".into()).into());
     }
     let mut removals = Vec::new();
-    for (index, p) in cs.changes.iter().enumerate() {
+    for (index, p) in names.changes().iter().enumerate() {
         let (table, fk) = match &p.change {
             Change::DropForeignKey { table, name } => (table, Some(name)),
             Change::DropTable { name, .. } => (name, None),
@@ -319,7 +311,7 @@ pub async fn key_drop_blockers(
             | Change::SetPartitionNotNull { .. }
             | Change::PublicExecution { .. } => continue,
         };
-        let Some(table) = stored_key_table(cs, index, table) else {
+        let Some(table) = stored_key_table(names, index, table) else {
             continue;
         };
         let qualified = qualified(&table)?;
@@ -444,8 +436,8 @@ pub async fn key_drop_blockers(
 
 /// Every rename in a plan, as the objects they are renamed *from* — which is
 /// the name the catalog still knows them by.
-pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
-    pbps_db::impact::rename_targets(changes, true)
+pub fn rename_targets(names: &pbps_model::plan_names::PlanNames<'_>) -> Vec<RenameTarget> {
+    pbps_db::impact::rename_targets(names, true)
 }
 
 /// What refers to the object, asked of `sys.dm_sql_referencing_entities`
@@ -954,7 +946,9 @@ mod tests {
                 }),
             ],
         };
-        let targets = rename_targets(&changes);
+        let ids = pbps_model::IdsFile::default();
+        let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
+        let targets = rename_targets(&names);
         assert_eq!(
             targets,
             vec![RenameTarget::Module("dbo.active_customer".parse().unwrap())]
@@ -997,7 +991,17 @@ mod tests {
                 }),
             ],
         };
-        let targets = rename_targets(&cs);
+        let after = pbps_model::IdsFile {
+            tables: [("t_aaaaaa".parse().unwrap(), tname("dbo.customer"))].into(),
+            columns: [(
+                "c_aaaaaa".parse().unwrap(),
+                "dbo.customer.contact_email".parse().unwrap(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &after).unwrap();
+        let targets = rename_targets(&names);
         assert_eq!(
             targets,
             [
@@ -1022,8 +1026,18 @@ mod tests {
             })],
         };
 
+        let after = pbps_model::IdsFile {
+            tables: [("t_aaaaaa".parse().unwrap(), tname("dbo.customer"))].into(),
+            columns: [(
+                "c_aaaaaa".parse().unwrap(),
+                "dbo.customer.contact_email".parse().unwrap(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &after).unwrap();
         assert_eq!(
-            rename_targets(&cs),
+            rename_targets(&names),
             [RenameTarget::Column("dbo.customer.email".parse().unwrap())]
         );
     }
@@ -1180,5 +1194,46 @@ mod tests {
             ..Default::default()
         };
         assert!(r.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod plan_name_tests {
+    use super::*;
+    use pbps_model::{IdsFile, PlannedChange, Uid};
+
+    #[test]
+    fn a_key_lookup_distinguishes_a_vacated_name_from_its_later_holder() {
+        let a = TableName::new("dbo", "a");
+        let b = TableName::new("dbo", "b");
+        let old: Uid = "t_aaaaaa".parse().unwrap();
+        let survivor: Uid = "t_bbbbbb".parse().unwrap();
+        let changes = vec![
+            PlannedChange::new(Change::DropTable {
+                uid: old,
+                name: a.clone(),
+                detach_from: None,
+            }),
+            PlannedChange::new(Change::RenameTable {
+                uid: survivor.clone(),
+                from: b.clone(),
+                to: a.clone(),
+                defaults: vec![],
+            }),
+            PlannedChange::new(Change::DropIndex {
+                table: a.clone(),
+                name: "key".into(),
+            }),
+        ];
+        let ids = IdsFile {
+            tables: [(survivor, a.clone())].into(),
+            ..IdsFile::default()
+        };
+        let names = PlanNames::of(&changes, &ids).unwrap();
+        assert_eq!(stored_key_table(&names, 0, &a), Some(a.clone()));
+        assert_eq!(stored_key_table(&names, 1, &a), None);
+        assert_eq!(stored_key_table(&names, 2, &a), Some(b));
+        let unmanaged = TableName::new("dbo", "external");
+        assert_eq!(stored_key_table(&names, 1, &unmanaged), Some(unmanaged));
     }
 }

@@ -757,9 +757,14 @@ mod tests {
     fn a_transfers_intermediate_name_is_claimed() {
         let moved = vec![rename("s1.old", "s2.new", &[])];
         assert!(
-            crate::deploy::object_reads(&ChangeSet {
-                changes: moved.clone()
-            })
+            {
+                let cs = ChangeSet {
+                    changes: moved.clone(),
+                };
+                let ids = crate::plan_fixture::ids(&cs);
+                let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();
+                crate::deploy::object_reads(&cs, &names)
+            }
             .0
             .contains(&name("s2.old")),
             "the intermediate name is read"

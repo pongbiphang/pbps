@@ -41,9 +41,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub mod estimate;
 
+#[cfg(test)]
+use pbps_model::ChangeSet;
 use pbps_model::{
-    Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, ObjectName, Partitions, RiskClass,
-    Role, RoutineArg, Schema, Strategy, Table, TableName,
+    Change, ColumnType, Module, ModuleId, ModuleKind, ObjectName, Partitions, RiskClass, Role,
+    RoutineArg, Schema, Strategy, Table, TableName,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -2562,7 +2564,7 @@ pub trait Dialect {
     /// not implemented them. A deliberately unbuilt check belongs in
     /// `unchecked`, with its object and reason; only executable queries belong
     /// in `probes`.
-    fn preflight(&self, _changes: &ChangeSet) -> Preflight {
+    fn preflight(&self, _names: &pbps_model::plan_names::PlanNames<'_>) -> Preflight {
         Preflight::default()
     }
 
@@ -2574,8 +2576,12 @@ pub trait Dialect {
     /// retypes and added columns as its own (DEC-1699.1). The relation is not
     /// in the plan; the caller derives it from the database read the plan's
     /// baseline was checked against. `preflight` is this with no partitions.
-    fn preflight_with(&self, changes: &ChangeSet, _partitions: &Partitions) -> Preflight {
-        self.preflight(changes)
+    fn preflight_with(
+        &self,
+        names: &pbps_model::plan_names::PlanNames<'_>,
+        _partitions: &Partitions,
+    ) -> Preflight {
+        self.preflight(names)
     }
 
     /// The line that separates batches in a script for this dialect, if the
@@ -4045,7 +4051,9 @@ mod tests {
                 detach_from: None,
             })],
         };
-        assert!(MinimalDialect.preflight(&changes).probes.is_empty());
+        let ids = pbps_model::IdsFile::default();
+        let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
+        assert!(MinimalDialect.preflight(&names).probes.is_empty());
     }
 
     // ---- module identity (ADR-0009 §1) ----

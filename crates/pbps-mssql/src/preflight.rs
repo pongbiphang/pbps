@@ -29,9 +29,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{DialectError, Preflight, Probe, Unchecked};
-use pbps_model::{
-    Cell, Change, ChangeSet, ColumnRef, ColumnType, RowKey, TableName, TypeArg, Uid, Value,
-};
+#[cfg(test)]
+use pbps_model::ChangeSet;
+use pbps_model::plan_names::{At, Holder, PlanNames};
+use pbps_model::{Cell, Change, ColumnRef, ColumnType, RowKey, TableName, TypeArg, Uid, Value};
 
 use crate::emit::{qualified, verbatim};
 use crate::ident::{literal, quote};
@@ -41,10 +42,10 @@ use crate::types;
 ///
 /// A question that cannot be built stays in the report as unchecked; it
 /// never becomes an executable query or a successful answer.
-pub fn probes(changes: &ChangeSet) -> Preflight {
-    let names = AsStored::of(changes);
+pub fn probes(plan_names: &PlanNames<'_>) -> Preflight {
+    let names = AsStored::of(plan_names);
     let mut report = Preflight::default();
-    for p in &changes.changes {
+    for p in plan_names.changes() {
         match build(&p.change, &names, &mut report.unchecked) {
             Ok(probes) => report.probes.extend(probes),
             Err(error) => report
@@ -90,20 +91,12 @@ enum Added {
 /// its new name, and a probe built from the change alone would ask about a
 /// column that does not exist yet — silently skipping the very check that
 /// mattered.
-#[derive(Debug, Default)]
-struct AsStored {
-    /// New table name → the name it currently has.
-    tables: BTreeMap<TableName, TableName>,
-    /// New column ref → its identity and the name it currently has.
-    columns: BTreeMap<ColumnRef, RenamedColumn>,
-    /// Owners relinquishing a name by a drop or rename. Reusing one makes a raw
-    /// predicate read the outgoing column successfully, but incorrectly.
-    /// Computed columns have no uid; their relinquished names can still be
-    /// taken by an ordinary column's rename.
+#[derive(Debug)]
+struct AsStored<'a> {
+    plan_names: &'a PlanNames<'a>,
+    /// Retained engine policy: SQL Server's catalog collation may identify
+    /// different spellings, so raw predicates exclude other relinquishing UIDs.
     vacated: BTreeMap<TableName, BTreeSet<Option<Uid>>>,
-    /// Tables this plan creates. They are empty, so nothing in them can violate
-    /// anything, and probing them would only produce "invalid object name".
-    created: BTreeSet<TableName>,
     /// The declared rows this plan updates or deletes, by table. A row the
     /// plan itself moves off a parent that is going away must not be counted
     /// as still pointing at it (see [`delete_probe`]) — and a row the plan
@@ -142,12 +135,6 @@ struct AsStored {
     /// through a constraint that will be gone refuses a delete the engine
     /// would have accepted (DECISIONS 128).
     removed: BTreeSet<Removed>,
-}
-
-#[derive(Debug)]
-struct RenamedColumn {
-    uid: Uid,
-    stored: String,
 }
 
 /// The rows of one table a plan writes, as the pre-delete probe has to see
@@ -348,13 +335,21 @@ fn unwrapped(default: &str) -> &str {
     d
 }
 
-impl AsStored {
-    fn of(changes: &ChangeSet) -> Self {
-        let mut this = Self::default();
+impl<'a> AsStored<'a> {
+    fn of(plan_names: &'a PlanNames<'a>) -> Self {
+        let mut this = Self {
+            plan_names,
+            vacated: Default::default(),
+            moved: Default::default(),
+            types: Default::default(),
+            added: Default::default(),
+            recollated: Default::default(),
+            removed: Default::default(),
+        };
         // Every collation this plan gives a column, first: a row change may
         // precede the change that creates or recollates its column, and its
         // defaults are assigned under that collation (#1247 review).
-        for p in &changes.changes {
+        for p in plan_names.changes() {
             match &p.change {
                 // A table this plan creates has exactly the collations it
                 // declares, and none of them is what the database default
@@ -444,15 +439,12 @@ impl AsStored {
                 | Change::PublicExecution { .. } => {}
             }
         }
-        for p in &changes.changes {
+        for (at, p) in plan_names.changes().iter().enumerate() {
             match &p.change {
-                Change::RenameTable { from, to, .. } => {
-                    this.tables.insert(to.clone(), from.clone());
-                }
+                Change::RenameTable { .. } => {}
                 Change::RenameColumn {
-                    uid, table, from, to, ..
+                    uid, table, ..
                 } => {
-                    this.columns.insert(table.column(to), RenamedColumn { uid: uid.clone(), stored: from.clone() });
                     this.vacated.entry(table.clone()).or_default().insert(Some(uid.clone()));
                 }
                 Change::DropColumn { uid, column } => {
@@ -462,7 +454,6 @@ impl AsStored {
                     this.vacated.entry(table.clone()).or_default().insert(None);
                 }
                 Change::CreateTable { name, table, .. } => {
-                    this.created.insert(name.clone());
                     for (column, spec) in &table.columns {
                         this.types.insert(name.column(column), spec.ty.clone());
                     }
@@ -504,13 +495,13 @@ impl AsStored {
                 // either would refuse a delete that will be valid by then.
                 Change::DropForeignKey { table, name } => {
                     this.removed.insert(Removed {
-                        stored_table: this.table(table).unwrap_or_else(|| table.clone()),
+                        stored_table: this.table_at(table, At::Before(at)).unwrap_or_else(|| table.clone()),
                         constraint: Some(name.clone()),
                     });
                 }
                 Change::DropTable { name, .. } => {
                     this.removed.insert(Removed {
-                        stored_table: this.table(name).unwrap_or_else(|| name.clone()),
+                        stored_table: this.table_at(name, At::Before(at)).unwrap_or_else(|| name.clone()),
                         // Every key the table holds goes with it.
                         constraint: None,
                     });
@@ -690,33 +681,32 @@ impl AsStored {
         vacated.iter().any(|owner| {
             added
                 || self
-                    .columns
-                    .iter()
-                    .any(|(c, renamed)| c.table == *table && owner.as_ref() != Some(&renamed.uid))
+                    .plan_names
+                    .renamed_columns(table)
+                    .any(|(uid, _, _)| owner.as_ref() != Some(uid))
         })
     }
 
-    /// `None` when the object does not exist yet, and so cannot be probed.
     fn table(&self, name: &TableName) -> Option<TableName> {
-        if self.created.contains(name) {
-            return None;
+        self.table_at(name, At::End)
+    }
+
+    fn table_at(&self, name: &TableName, at: At) -> Option<TableName> {
+        match self.plan_names.holder(name, at) {
+            Holder::Tracked(uid) => self.plan_names.table_at(uid, At::Start).cloned(),
+            Holder::Unmanaged => Some(name.clone()),
+            Holder::Vacant => None,
         }
-        Some(
-            self.tables
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| name.clone()),
-        )
     }
 
     fn column(&self, column: &ColumnRef) -> Option<ColumnRef> {
         let table = self.table(&column.table)?;
-        let name = self
-            .columns
-            .get(column)
-            .map(|renamed| renamed.stored.clone())
-            .unwrap_or_else(|| column.name.clone());
-        Some(table.column(&name))
+        let stored = self
+            .plan_names
+            .renamed_columns(&column.table)
+            .find(|(_, _, to)| *to == column.name)
+            .map_or(column.name.as_str(), |(_, from, _)| from);
+        Some(table.column(stored))
     }
 
     /// How a row already in the table reads in this column: `stored` where the
@@ -1214,7 +1204,7 @@ enum Removal {
     Keys(Vec<String>),
 }
 
-impl AsStored {
+impl AsStored<'_> {
     /// The keys this plan removes from `stored_child` before the deletes,
     /// under the names the catalog has now. Read by both probes over foreign
     /// keys: a constraint that will be gone must count nothing (DECISIONS
@@ -1933,7 +1923,7 @@ fn rows_after(
             // symmetric — `<>` in place of `=` misses a collision instead — so
             // the answer is the same as for the other three: no probe.
             if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty())
-                || names.columns.keys().any(|c| c.table == *table)
+                || names.plan_names.renamed_columns(table).next().is_some()
                 || names.added.keys().any(|c| c.table == *table)
                 || names.types.keys().any(|c| c.table == *table)
             {
@@ -2453,9 +2443,17 @@ fn conversion_probe(
 
 #[cfg(test)]
 mod tests {
+    mod plan_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pbps-dialect/tests/support/preflight.rs"
+        ));
+    }
+    use plan_fixture::FixturePreflight as _;
+
     use super::*;
     fn probes(changes: &ChangeSet) -> Vec<Probe> {
-        super::probes(changes).probes
+        crate::Mssql.fixture_preflight(changes).probes
     }
     use pbps_model::{
         CheckConstraint, ForeignKey, PlannedChange, PrimaryKey, ReferentialAction, UniqueConstraint,
@@ -4587,7 +4585,10 @@ mod tests {
             after_types: [("k".to_owned(), ty("varchar(10)"))].into_iter().collect(),
             key_type: None,
         };
-        let names = AsStored::of(&plan(vec![update]));
+        let changes = plan(vec![update]);
+        let ids = plan_fixture::ids(&changes);
+        let index = PlanNames::of(&changes.changes, &ids).unwrap();
+        let names = AsStored::of(&index);
         assert!(names.types.is_empty());
         assert_eq!(
             names.moved[&table].updated[&key]["k"].as_deref(),
