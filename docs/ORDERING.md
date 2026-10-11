@@ -86,7 +86,10 @@ Then, in this order:
   moves one rename at a time, and only across other table renames: none of
   them may free a name the hoisted rename takes on its way, which is its
   target or the name `SET SCHEMA` lands it on first, and none may take its
-  target on theirs. `refuse_created_name_occupants` calls it before the
+  target on theirs. The replay that judges each order also checks the names
+  every rename takes, read from the catalog, so an order that runs a rename
+  before what frees its name is not kept. `refuse_created_name_occupants`
+  calls it before the
   module passes. It runs again, over the same catalog reads, after the last
   pass that reorders, because a module pass may plan the revision again in
   the differ's order (DEC-1767.1).

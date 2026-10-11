@@ -4418,6 +4418,15 @@ A drop or any other change in between keeps the order. Two moves that each
 wait for the other are left as they are. Every case that stays is refused
 with the two-plan remedy, as before.
 
+The replay that judges an order also checks what each rename takes as it
+runs, both names, against the occupants and the tables and views still
+there, all read from the catalog (#1785 review). Table names alone did not
+show that a hoisted rename's target was an index which a table move it
+crossed carries away. With the check, an order that runs a rename before
+whatever frees its name has a clash, and the hoist does not keep it. The
+same check refuses a rename into a name the differ's own order leaves
+held, which used to fail at apply.
+
 The hoist runs where the occupant check runs, before the module passes. It
 runs again, over the same catalog reads, after the last pass that reorders
 the plan: a view rebuilt beside a dependent view the declarations leave

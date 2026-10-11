@@ -691,9 +691,13 @@ pub async fn refuse_created_name_occupants(
 ) -> anyhow::Result<Option<NameFacts>> {
     match conn.driver() {
         Driver::Postgres => {
+            // The names it creates, and those its table renames take on
+            // their way (#1785 review).
+            let mut asked = crate::deploy::created_relation_names(cs);
+            asked.extend(crate::deploy::rename_claims(cs));
             let mut occupants = pbps_pg::catalog::relation_name_occupants(
                 conn,
-                &crate::deploy::created_relation_names(cs),
+                &asked,
                 &crate::deploy::transferred_tables(cs),
             )
             .await?;
@@ -711,8 +715,10 @@ pub async fn refuse_created_name_occupants(
                     occupants.push(found);
                 }
             }
+            let mut at_names = carried;
+            at_names.extend(crate::deploy::rename_claims(cs));
             let facts = NameFacts {
-                relations: pbps_pg::catalog::relations_at(conn, &carried).await?,
+                relations: pbps_pg::catalog::relations_at(conn, &at_names).await?,
                 occupants,
             };
             facts.order_and_refuse(cs, label)?;
