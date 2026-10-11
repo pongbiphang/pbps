@@ -21,6 +21,14 @@
 //! when, and why", and no algorithm can produce the why. So a drop needs an
 //! intent as well — the difference being that what it asks for is not "was this a
 //! rename" but "why".
+//!
+//! # Why a move is recorded here too
+//!
+//! Whether a DEFAULT partition's rows may move into a new range partition, and
+//! how many, is not about identity, but it is the same kind of fact: in no
+//! file and no catalog, supplied once, kept in git. So `pbps move-rows` is an
+//! intent, and resolution records it against the partition's uid (#1788,
+//! DEC-1788.1).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -125,6 +133,10 @@ pub enum Blocker {
         /// name, a view's, or a routine's.
         table: Option<TableName>,
     },
+    /// A move was allowed for a table that is not a range partition whose
+    /// parent declares a DEFAULT partition, so no rows can ever move into it
+    /// (#1788).
+    MoveNotBesideDefault { table: TableName },
 }
 
 /// The half of a rename that two intents fought over.
@@ -287,6 +299,8 @@ fn resolve_with_provenance(
         &mut used,
     );
 
+    resolve_moves(declared, intents, ctx, &mut r, &mut blockers, &mut used);
+
     // An intent a conflict has already named is not unused, however many times
     // it was written and whatever the matching loop did with it. Asked by
     // equality rather than by index: the guard's own bookkeeping was the wrong
@@ -343,7 +357,8 @@ fn resolve_with_provenance(
             Intent::RenameTable { .. }
             | Intent::DropTable { .. }
             | Intent::RenameRole { .. }
-            | Intent::DropRole { .. } => None,
+            | Intent::DropRole { .. }
+            | Intent::MoveRows { .. } => None,
         };
         // The identities are read in the namespace this annotation was written
         // against, the declarations in the namespace the user wrote: a table
@@ -374,7 +389,8 @@ fn resolve_with_provenance(
             | Intent::RenameRole { .. }
             | Intent::DropTable { .. }
             | Intent::DropColumn { .. }
-            | Intent::DropRole { .. } => {
+            | Intent::DropRole { .. }
+            | Intent::MoveRows { .. } => {
                 intent_is_absorbed(original_intent.as_ref().unwrap_or(intent), ids, source)
             }
         };
@@ -411,7 +427,8 @@ fn resolve_with_provenance(
                     Intent::RenameTable { .. }
                     | Intent::DropTable { .. }
                     | Intent::RenameRole { .. }
-                    | Intent::DropRole { .. } => None,
+                    | Intent::DropRole { .. }
+                    | Intent::MoveRows { .. } => None,
                 },
                 Blocker::RenameTargetExists { target } if column_blockers.contains(&index) => {
                     provisional_tables
@@ -425,7 +442,8 @@ fn resolve_with_provenance(
                 | Blocker::AmbiguousRoles { .. }
                 | Blocker::DropRoleNeedsReason { .. }
                 | Blocker::RenameTargetExists { .. }
-                | Blocker::UnrepresentableName { .. } => None,
+                | Blocker::UnrepresentableName { .. }
+                | Blocker::MoveNotBesideDefault { .. } => None,
             };
             if let Some(table) = table
                 && let Some(assumptions) = provisional_tables.get(&table)
@@ -590,6 +608,13 @@ pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile, source: RenameSource) 
         Intent::DropColumn { column, .. } => !has_column(column),
         Intent::RenameRole { from, to } => has_role(to) && vacated(has_role(from)),
         Intent::DropRole { role, .. } => !has_role(role),
+        // Recorded already, with this bound.
+        Intent::MoveRows {
+            table, max_rows, ..
+        } => ids
+            .table_uid(table)
+            .and_then(|uid| ids.moves.get(uid))
+            .is_some_and(|m| m.max_rows == *max_rows),
     }
 }
 
@@ -634,8 +659,12 @@ impl RenameSource {
                 .get(table)
                 .is_some_and(|t| t.columns.contains_key(from)),
             Intent::RenameRole { from, .. } => declared.roles.contains_key(from),
-            // A drop vacates no name, and its absorption does not ask.
-            Intent::DropTable { .. } | Intent::DropColumn { .. } | Intent::DropRole { .. } => false,
+            // A drop vacates no name, and its absorption does not ask; nor
+            // does a move.
+            Intent::DropTable { .. }
+            | Intent::DropColumn { .. }
+            | Intent::DropRole { .. }
+            | Intent::MoveRows { .. } => false,
         };
         if redeclared {
             Self::Redeclared
@@ -1241,6 +1270,71 @@ fn rename_table_in_ids(ids: &mut IdsFile, uid: &Uid, from: &TableName, to: &Tabl
     }
 }
 
+/// Records each allowed move (#1788) against its partition's uid, which
+/// [`resolve_tables`] has minted by now for a partition declared this run.
+///
+/// The table must be a range partition whose parent declares a DEFAULT
+/// partition: only there can rows move. Whether it is new is the database's
+/// to say, which this layer never reads; a move for a partition that already
+/// exists is never consulted, since no plan creates it again (SPEC §6).
+/// Allowing the same bound again keeps the recorded move, so the command
+/// converges; another bound or reason replaces it.
+fn resolve_moves(
+    declared: &Schema,
+    intents: &[Intent],
+    ctx: &Context,
+    r: &mut Resolution,
+    blockers: &mut Vec<Blocker>,
+    used: &mut BTreeSet<usize>,
+) {
+    for (i, intent) in intents.iter().enumerate() {
+        let Intent::MoveRows {
+            table,
+            max_rows,
+            reason,
+        } = intent
+        else {
+            continue;
+        };
+        used.insert(i);
+        let beside_default = declared
+            .tables
+            .get(table)
+            .and_then(|t| t.partition_of.as_ref())
+            .filter(|of| matches!(of.bound, pbps_model::PartitionBound::Range { .. }))
+            .is_some_and(|of| {
+                declared.tables.values().any(|other| {
+                    other.partition_of.as_ref().is_some_and(|o| {
+                        o.parent == of.parent
+                            && matches!(o.bound, pbps_model::PartitionBound::Default)
+                    })
+                })
+            });
+        let Some(uid) = r.ids.table_uid(table).cloned().filter(|_| beside_default) else {
+            blockers.push(Blocker::MoveNotBesideDefault {
+                table: table.clone(),
+            });
+            continue;
+        };
+        let kept = r
+            .ids
+            .moves
+            .get(&uid)
+            .is_some_and(|m| m.max_rows == *max_rows && m.reason == *reason);
+        if !kept {
+            r.ids.moves.insert(
+                uid,
+                pbps_model::Move {
+                    max_rows: *max_rows,
+                    allowed_at: ctx.today.clone(),
+                    reason: reason.clone(),
+                    operator: ctx.operator.clone(),
+                },
+            );
+        }
+    }
+}
+
 fn drop_table_in_ids(ids: &mut IdsFile, uid: &Uid, table: &TableName, reason: &str, ctx: &Context) {
     let make = |was: String| Tombstone {
         was,
@@ -1250,6 +1344,7 @@ fn drop_table_in_ids(ids: &mut IdsFile, uid: &Uid, table: &TableName, reason: &s
     };
 
     ids.tables.remove(uid);
+    ids.moves.remove(uid);
     ids.tombstones.insert(uid.clone(), make(table.to_string()));
 
     let cols: Vec<(Uid, ColumnRef)> = ids

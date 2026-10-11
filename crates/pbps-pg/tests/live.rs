@@ -4194,7 +4194,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 range(vec![value("2026-01-01")], vec![value("2027-01-01")]),
             ),
         );
-        let added_ids = mint_ids(&added, &ids, &[]);
+        let added_ids = mint_moving(&added, &ids);
         let step = plan(&base, &ids, &added, &added_ids);
         for probe in pg.preflight(&step).probes {
             assert_eq!(
@@ -4243,9 +4243,50 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 range(vec![value("2027-01-01")], vec![value("2028-01-01")]),
             ),
         );
-        let over_step = plan(&added, &added_ids, &over, &mint_ids(&over, &added_ids, &[]));
+        // Nobody allowed the move (#1788): its one row is counted by the
+        // pre-flight and refused by the moving statement, before its delete.
+        let unallowed = plan(&added, &added_ids, &over, &mint_ids(&over, &added_ids, &[]));
+        let unallowed_probes = pg.preflight(&unallowed).probes;
+        assert_eq!(unallowed_probes.len(), 7, "{unallowed_probes:#?}");
+        let bound = unallowed_probes
+            .iter()
+            .find(|p| p.description.contains("no move of them was allowed"))
+            .expect("the move is asked whether it was allowed");
+        assert_eq!(
+            counted(&mut conn, &bound.sql).await,
+            1,
+            "{}",
+            bound.description
+        );
+        in_a_transaction(&mut conn).await;
+        let stopped = conn
+            .execute(
+                &pg.emit(&unallowed.changes[0].change, unallowed.changes[0].strategy)
+                    .expect("emit")
+                    .remove(0)
+                    .sql,
+            )
+            .await
+            .expect_err("the moving statement refuses a move nobody allowed");
+        assert!(format!("{stopped:?}").contains("1 rows of"), "{stopped:?}");
+        rollback(&mut conn).await;
+        // Allowed for exactly the one row it holds.
+        let over_step = plan(
+            &added,
+            &added_ids,
+            &over,
+            &mint_ids(
+                &over,
+                &added_ids,
+                &[Intent::MoveRows {
+                    table: t("ev_2027"),
+                    max_rows: 1,
+                    reason: "a live test of the move".into(),
+                }],
+            ),
+        );
         let probes = pg.preflight(&over_step).probes;
-        assert_eq!(probes.len(), 6, "{probes:#?}");
+        assert_eq!(probes.len(), 7, "{probes:#?}");
         // The moving statement, which asks the same questions again before
         // its delete (#1763 review).
         assert_eq!(over_step.changes.len(), 1, "{over_step:#?}");
@@ -4654,7 +4695,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         }
         assert_eq!(
             pg.preflight(&unlogged_step).probes.len(),
-            5,
+            6,
             "{unlogged_step:#?}"
         );
         let unlogged_moving = &unlogged_step.changes[0];
@@ -4727,7 +4768,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             wanted
                 .tables
                 .insert(t("m_new"), partition("m", range(from, to)));
-            let step = plan(&base, &ids, &wanted, &mint_ids(&wanted, &ids, &[]));
+            let step = plan(&base, &ids, &wanted, &mint_moving(&wanted, &ids));
             in_a_transaction(&mut conn).await;
             apply(&mut conn, &pg, &step).await;
             assert_eq!(
@@ -4767,7 +4808,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &added,
             &added_ids,
             &checked,
-            &mint_ids(&checked, &added_ids, &[]),
+            &mint_moving(&checked, &added_ids),
         );
         let order: Vec<&str> = checked_step
             .changes
@@ -4786,7 +4827,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         let checked_preflight = pg.preflight(&checked_step);
         assert_eq!(
             checked_preflight.probes.len(),
-            6,
+            7,
             "{:#?}",
             checked_preflight.probes
         );
@@ -4826,7 +4867,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 &added,
                 &added_ids,
                 &alone_checked,
-                &mint_ids(&alone_checked, &added_ids, &[]),
+                &mint_moving(&alone_checked, &added_ids),
             ))
             .probes;
         assert_eq!(alone_probes.len(), 1, "{alone_probes:#?}");
@@ -4850,7 +4891,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         .await
         .expect("the self-referencing tree");
         let sr_base = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
-        let sr_ids = mint_ids(&sr_base, &added_ids, &[]);
+        let sr_ids = mint_moving(&sr_base, &added_ids);
         let mut sr_split = sr_base.clone();
         sr_split.tables.insert(
             t("sr_2030"),
@@ -4863,7 +4904,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &sr_base,
             &sr_ids,
             &sr_split,
-            &mint_ids(&sr_split, &sr_ids, &[]),
+            &mint_moving(&sr_split, &sr_ids),
         );
         let sr_probes = pg.preflight(&sr_step).probes;
         for probe in &sr_probes {
@@ -4926,7 +4967,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         .await
         .expect("the tree with an unlogged DEFAULT");
         let ul_base = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
-        let ul_ids = mint_ids(&ul_base, &added_ids, &[]);
+        let ul_ids = mint_moving(&ul_base, &added_ids);
         let mut ul_split = ul_base.clone();
         ul_split.tables.insert(
             t("ul_2030"),
@@ -4939,7 +4980,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &ul_base,
             &ul_ids,
             &ul_split,
-            &mint_ids(&ul_split, &ul_ids, &[]),
+            &mint_moving(&ul_split, &ul_ids),
         );
         let ul_published = pg
             .preflight(&ul_step)
@@ -5026,7 +5067,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 conn.execute(&format!("DROP TABLE {s}.gx")).await.unwrap();
                 continue;
             }
-            let gx_ids = mint_ids(&gx_base, &added_ids, &[]);
+            let gx_ids = mint_moving(&gx_base, &added_ids);
             let mut gx_split = gx_base.clone();
             gx_split.tables.insert(
                 t("gx_2030"),
@@ -5039,7 +5080,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 &gx_base,
                 &gx_ids,
                 &gx_split,
-                &mint_ids(&gx_split, &gx_ids, &[]),
+                &mint_moving(&gx_split, &gx_ids),
             );
             let moving = &gx_step.changes[0];
             let moving = pg
@@ -5108,7 +5149,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         .await
         .expect("the tree");
         let nn_base = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
-        let nn_ids = mint_ids(&nn_base, &added_ids, &[]);
+        let nn_ids = mint_moving(&nn_base, &added_ids);
         let tightened = |moving: bool| {
             let mut wanted = nn_base.clone();
             wanted
@@ -5143,7 +5184,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                     ),
                 );
             }
-            plan(&nn_base, &nn_ids, &wanted, &mint_ids(&wanted, &nn_ids, &[]))
+            plan(&nn_base, &nn_ids, &wanted, &mint_moving(&wanted, &nn_ids))
         };
         let nn_step = tightened(true);
         let nn_preflight = pg.preflight(&nn_step);
@@ -5198,7 +5239,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         .await
         .expect("the collated tree");
         let collated = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
-        let collated_ids = mint_ids(&collated, &added_ids, &[]);
+        let collated_ids = mint_moving(&collated, &added_ids);
         let mut collated_split = collated.clone();
         collated_split.tables.insert(
             t("cm_b"),
@@ -5208,10 +5249,10 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &collated,
             &collated_ids,
             &collated_split,
-            &mint_ids(&collated_split, &collated_ids, &[]),
+            &mint_moving(&collated_split, &collated_ids),
         );
         let collated_probes = pg.preflight(&collated_step).probes;
-        assert_eq!(collated_probes.len(), 6, "{collated_probes:#?}");
+        assert_eq!(collated_probes.len(), 7, "{collated_probes:#?}");
         in_a_transaction(&mut conn).await;
         apply(&mut conn, &pg, &collated_step).await;
         assert_eq!(
@@ -5303,7 +5344,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         .await
         .expect("the referencing tree");
         let with_aref = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
-        let aref_ids = mint_ids(&with_aref, &added_ids, &[]);
+        let aref_ids = mint_moving(&with_aref, &added_ids);
         let mut both = with_aref.clone();
         both.tables.remove(&t("aref_1"));
         both.tables.remove(&t("ev_2025"));
@@ -5321,7 +5362,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &with_aref,
             &aref_ids,
             &both,
-            &mint_ids(&both, &aref_ids, &both_intents),
+            &mint_moving_and(&both, &aref_ids, &both_intents),
         );
         let order: Vec<String> = both_step
             .changes
@@ -5353,7 +5394,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &with_aref,
             &aref_ids,
             &alone,
-            &mint_ids(&alone, &aref_ids, &archive),
+            &mint_moving_and(&alone, &aref_ids, &archive),
         );
         let alone_probes = pg.preflight(&alone_step).probes;
         assert_eq!(alone_probes.len(), 1, "{alone_probes:#?}");
@@ -5382,7 +5423,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 table: t("aref_1"),
                 reason: "gone".into(),
             }];
-            let wanted_ids = mint_ids(&wanted, &aref_ids, if kept { &[] } else { &intents });
+            let wanted_ids = mint_moving_and(&wanted, &aref_ids, if kept { &[] } else { &intents });
             plan(&with_aref, &aref_ids, &wanted, &wanted_ids)
         };
         let reference_count = |step: &pbps_model::ChangeSet| {
@@ -5406,7 +5447,8 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         conn.execute(&format!("DROP TABLE {s}.aref")).await.unwrap();
         // A range split in the same plan: the partition's rows go with its
         // drop, so the halves created over them count none. Each half is made
-        // beside the DEFAULT, and asks its four questions of it (#1547).
+        // beside the DEFAULT, and asks its four questions of it (#1547); with
+        // no row to move, no move need be allowed (#1788).
         let mut split = fewer.clone();
         for (name, from, to) in [
             ("ev_h1", "2025-01-01", "2025-07-01"),
@@ -5424,7 +5466,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &mint_ids(&split, &added_ids, &archive),
         );
         let split_probes = pg.preflight(&split_step).probes;
-        assert_eq!(split_probes.len(), 13, "{split_probes:#?}");
+        assert_eq!(split_probes.len(), 15, "{split_probes:#?}");
         for probe in &split_probes {
             assert_eq!(
                 counted(&mut conn, &probe.sql).await,
@@ -5498,7 +5540,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 &tp_base,
                 &tp_ids,
                 &tp_split,
-                &mint_ids(&tp_split, &tp_ids, &[]),
+                &mint_moving(&tp_split, &tp_ids),
             );
             let tp_probes = pg.preflight(&tp_step).probes;
             let tp_moving = &tp_step.changes[0];
@@ -6340,6 +6382,41 @@ fn mint_ids(schema: &Schema, base: &IdsFile, intents: &[Intent]) -> IdsFile {
         .ids
 }
 
+/// [`mint_ids`], with a move allowed (#1788) into every range partition
+/// whose parent declares a DEFAULT: for a test about what a move does, not
+/// about whether one was allowed.
+fn mint_moving(schema: &Schema, base: &IdsFile) -> IdsFile {
+    mint_moving_and(schema, base, &[])
+}
+
+/// [`mint_moving`], with `intents` besides.
+fn mint_moving_and(schema: &Schema, base: &IdsFile, intents: &[Intent]) -> IdsFile {
+    let beside_default = |of: &pbps_model::PartitionOf| {
+        matches!(of.bound, pbps_model::PartitionBound::Range { .. })
+            && schema.tables.values().any(|t| {
+                t.partition_of.as_ref().is_some_and(|o| {
+                    o.parent == of.parent && matches!(o.bound, pbps_model::PartitionBound::Default)
+                })
+            })
+    };
+    let moves: Vec<Intent> = intents
+        .iter()
+        .cloned()
+        .chain(
+            schema
+                .tables
+                .iter()
+                .filter(|(_, t)| t.partition_of.as_ref().is_some_and(beside_default))
+                .map(|(name, _)| Intent::MoveRows {
+                    table: name.clone(),
+                    max_rows: 1_000_000,
+                    reason: "a live test of the move".into(),
+                }),
+        )
+        .collect();
+    mint_ids(schema, base, &moves)
+}
+
 fn plan(
     base_schema: &Schema,
     base_ids: &IdsFile,
@@ -6748,6 +6825,7 @@ async fn temporary_relations_and_types_follow_the_declared_write_path() {
         name: TableName::new(schema, "bound"),
         table: Box::new(table.clone()),
         beside_default: None,
+        moves_at_most: None,
     };
     // The same emitted statement without the final entry is the negative
     // control, even in a session whose explicit path names only the project.
@@ -7054,6 +7132,7 @@ async fn the_framing_pins_the_settings_that_decide_what_a_definition_means() {
         name: TableName::new(&s, "pinned"),
         table: Box::new(t),
         beside_default: None,
+        moves_at_most: None,
     };
     let statements = Postgres::new()
         .emit(&change, Strategy::default())
@@ -7323,6 +7402,7 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
             name: TableName::new(&s, "t"),
             table: Box::new(t),
             beside_default: None,
+            moves_at_most: None,
         }
     };
     for spelling in [
@@ -7361,6 +7441,7 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
                 name: TableName::new(&s, "plain"),
                 table: Box::new(plain),
                 beside_default: None,
+                moves_at_most: None,
             },
             Strategy::default(),
         )
@@ -8063,6 +8144,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                     name: name.clone(),
                     table: Box::new(table),
                     beside_default: None,
+                    moves_at_most: None,
                 },
                 Strategy::default(),
             )
@@ -8170,6 +8252,7 @@ async fn installed_default_operator_classes_can_make_json_keys_valid() {
                     name,
                     table: Box::new(table),
                     beside_default: None,
+                    moves_at_most: None,
                 },
                 Strategy::default(),
             )
@@ -8452,6 +8535,7 @@ async fn the_framing_pins_what_an_ambiguous_temporal_literal_means() {
         name: TableName::new(&s, "temporal"),
         table: Box::new(t),
         beside_default: None,
+        moves_at_most: None,
     };
     let statements = Postgres::new()
         .emit(&change, Strategy::default())
@@ -24140,6 +24224,7 @@ async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_colu
                         name: child.clone(),
                         table: Box::new(table),
                         beside_default: None,
+                        moves_at_most: None,
                     });
                 }
                 "retype" => changes.push(Change::AlterColumnType {
@@ -26436,6 +26521,7 @@ async fn a_key_into_a_created_empty_parent_counts_every_reference_the_child_hold
             name: parent.clone(),
             table: Box::new(declared),
             beside_default: None,
+            moves_at_most: None,
         },
         Change::AddForeignKey {
             table: TableName::new(&s, "child"),

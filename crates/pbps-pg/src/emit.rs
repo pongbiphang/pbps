@@ -2343,9 +2343,15 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             name,
             table,
             beside_default,
+            moves_at_most,
             ..
         } => {
-            let mut out = create_table(pg, name, table, beside_default.as_ref())?;
+            let mut out = create_table(
+                pg,
+                name,
+                table,
+                beside_default.as_ref().map(|d| (d, *moves_at_most)),
+            )?;
             if let Some(first) = out.first_mut() {
                 first.creates.push(Created::Table(name.clone()));
             }
@@ -3224,6 +3230,55 @@ fn no_clustered_layout(table: &TableName) -> DialectError {
 /// A RANGE partition's bound clause: `DEFAULT`, or `FOR VALUES FROM (…) TO
 /// (…)` with each value as a literal the session cannot reinterpret, which
 /// the engine converts to its key column's type (#1170).
+/// Why rows of `default` inside the range of `partition` may not move, and
+/// what to do (#1788): read after their count, as the moving statement and
+/// the pre-flight both report it. Without a move a human allowed, the command
+/// that allows one and the move written out to run by hand; with one, past
+/// its bound, the same, a batch at a time.
+pub(crate) fn moving_beyond_its_intent(
+    partition: &TableName,
+    parent: &TableName,
+    default: &TableName,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+    moves_at_most: Option<u64>,
+) -> Result<String, DialectError> {
+    let (q, p, d) = (
+        qualified(partition)?,
+        qualified(parent)?,
+        qualified(default)?,
+    );
+    let bound = bound_clause(&pbps_model::PartitionBound::Range {
+        from: from.to_vec(),
+        to: to.to_vec(),
+    });
+    // The move this statement would make, written out without the questions
+    // it asks first: the operator who runs it has answered them.
+    let by_hand = format!(
+        "LOCK TABLE ONLY {d} IN SHARE MODE; CREATE TABLE {q} (LIKE {p} INCLUDING DEFAULTS \
+         INCLUDING GENERATED INCLUDING CONSTRAINTS INCLUDING STORAGE INCLUDING COMPRESSION); \
+         WITH moved AS (DELETE FROM {d} WHERE <the partition key is in the range> RETURNING \
+         <every column but the generated ones>) INSERT INTO {q} <the same columns> SELECT * \
+         FROM moved; ALTER TABLE {p} ATTACH PARTITION {q} {bound};"
+    );
+    Ok(match moves_at_most {
+        None => format!(
+            "rows of {default} are inside the range of {partition}, its parent {parent}'s new \
+             partition beside it, and no move of them was allowed, which may be seen by \
+             whatever reads the database's changes; nothing was moved. Allow it with \
+             `pbps move-rows {partition} --max-rows <N> --reason <why>` and plan again, or \
+             move them by hand, in one transaction: {by_hand}"
+        ),
+        Some(most) => format!(
+            "rows of {default} are inside the range of {partition}, more than the {most} its \
+             allowed move may take; nothing was moved. Move them by hand: create the table and \
+             move the rows a batch at a time, then run the last batch and the attach in one \
+             transaction with the DEFAULT locked, as in: {by_hand} Or allow more with \
+             `pbps move-rows {partition} --max-rows <N> --reason <why>` and plan again."
+        ),
+    })
+}
+
 fn bound_clause(bound: &pbps_model::PartitionBound) -> String {
     let list = |data: &[pbps_model::BoundDatum]| {
         data.iter()
@@ -3277,6 +3332,10 @@ fn bound_clause(bound: &pbps_model::PartitionBound) -> String {
 ///   row the range does not, or left one it does, the attach would refuse:
 ///   it checks the new table against its range and the DEFAULT against the
 ///   rest, so the result is the right rows or a rolled-back plan.
+/// - **What a human allowed.** The rows counted and locked are refused,
+///   before anything is asked of them, unless a human allowed the move and
+///   then above the bound allowed (#1788, DEC-1788.1): the count seen when
+///   planning, if any, does not bind the database the plan reaches.
 #[allow(clippy::too_many_arguments)]
 fn beside_its_default(
     pg: &Postgres,
@@ -3287,6 +3346,7 @@ fn beside_its_default(
     default: &TableName,
     from: &[pbps_model::BoundDatum],
     to: &[pbps_model::BoundDatum],
+    moves_at_most: Option<u64>,
 ) -> Sql {
     let q = qualified(name)?;
     let p = qualified(parent)?;
@@ -3350,6 +3410,9 @@ fn beside_its_default(
          \x20       {statement}\n\
          \x20   END IF;\n\
          \x20   EXECUTE {count} || keep || ' FOR UPDATE) AS locked' INTO n;\n\
+         \x20   IF n > {allowed} THEN\n\
+         \x20       RAISE EXCEPTION USING MESSAGE = n::text || {beyond};\n\
+         \x20   END IF;\n\
          \x20   IF n > 0 THEN\n\
          \x20       FOR pubf IN SELECT pubt.rowfilter {publications} LOOP\n\
          \x20           IF pubf.rowfilter IS NULL THEN\n\
@@ -3475,6 +3538,15 @@ fn beside_its_default(
             "rows reference rows of {default} the move would take into {name}, and the delete \
              would fire the action of their foreign key; nothing was moved"
         )),
+        // The rows it counts and locks are the rows it would move: none
+        // without a move a human allowed, at most its bound with one
+        // (#1788). Asked before anything else of the move, so a refused
+        // move is refused for this reason first.
+        allowed = moves_at_most.unwrap_or(0),
+        beyond = literal(&format!(
+            " {}",
+            moving_beyond_its_intent(name, parent, default, from, to, moves_at_most)?
+        )),
         delete = literal(&format!("WITH moved AS (DELETE FROM {d} AS r WHERE ")),
         insert = literal(&format!(") INSERT INTO {q} (")),
         // The engine computes a generated column of each moved row again in
@@ -3502,7 +3574,7 @@ fn create_table(
     pg: &Postgres,
     name: &TableName,
     table: &Table,
-    beside_default: Option<&TableName>,
+    beside_default: Option<(&TableName, Option<u64>)>,
 ) -> Sql {
     // A partition is its parent's columns, keys and indexes, which the
     // engine gives it as it is created (#1170): one statement, after the
@@ -3523,9 +3595,19 @@ fn create_table(
             format!(" WITH ({})", storage_list(&table.storage_parameters)?)
         };
         let mut out = match (beside_default, &of.bound) {
-            (Some(default), pbps_model::PartitionBound::Range { from, to }) => {
+            (Some((default, moves_at_most)), pbps_model::PartitionBound::Range { from, to }) => {
                 let create = format!("CREATE {unlogged}TABLE {q}");
-                beside_its_default(pg, name, &create, &storage, &of.parent, default, from, to)?
+                beside_its_default(
+                    pg,
+                    name,
+                    &create,
+                    &storage,
+                    &of.parent,
+                    default,
+                    from,
+                    to,
+                    moves_at_most,
+                )?
             }
             _ => vec![on(
                 pg,
@@ -4665,6 +4747,80 @@ mod tests {
         assert!(!sql[0].contains("search_path"), "{sql:?}");
     }
 
+    /// The rows the move counts are refused unless a human allowed the move,
+    /// and then above the bound allowed (#1788): right after they are counted
+    /// and locked, before any other question of the move and before the
+    /// delete. A move nobody allowed refuses any row, with the command that
+    /// allows it and the move written out to run by hand; one allowed refuses
+    /// only past its bound, sending the operator to batches.
+    #[test]
+    fn a_move_is_bounded_by_the_rows_a_human_allowed() {
+        let partition = pbps_model::Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: pbps_model::PartitionBound::Range {
+                    from: vec![pbps_model::BoundDatum::Value("2025-01-01".into())],
+                    to: vec![pbps_model::BoundDatum::Value("2026-01-01".into())],
+                },
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let emitted = |moves_at_most: Option<u64>| {
+            Postgres::new()
+                .emit(
+                    &Change::CreateTable {
+                        uid: "t_aaaaaa".parse().unwrap(),
+                        name: "app.ev_2025".parse().unwrap(),
+                        table: Box::new(partition.clone()),
+                        beside_default: Some("app.ev_rest".parse().unwrap()),
+                        moves_at_most,
+                    },
+                    Default::default(),
+                )
+                .expect("emit")[0]
+                .sql
+                .clone()
+        };
+        let none = emitted(None);
+        let at = |sql: &str, part: &str| {
+            sql.find(part)
+                .unwrap_or_else(|| panic!("{part} is missing from {sql}"))
+        };
+        let counted = at(&none, "' FOR UPDATE) AS locked' INTO n;");
+        let refused = at(&none, "IF n > 0 THEN\n        RAISE EXCEPTION");
+        assert!(counted < refused, "{none}");
+        // Before every other question and the delete.
+        for later in [
+            "a publication publishes deletes from app.ev_rest",
+            "WITH moved AS (DELETE FROM \"app\".\"ev_rest\" AS r WHERE ",
+        ] {
+            assert!(refused < at(&none, later), "{later}: {none}");
+        }
+        for said in [
+            "no move of them was allowed",
+            "pbps move-rows app.ev_2025 --max-rows <N> --reason <why>",
+            "LOCK TABLE ONLY \"app\".\"ev_rest\" IN SHARE MODE; CREATE TABLE \"app\".\"ev_2025\"",
+            "ATTACH PARTITION \"app\".\"ev_2025\" FOR VALUES FROM (E''2025-01-01'') TO \
+             (E''2026-01-01'');",
+        ] {
+            at(&none, said);
+        }
+        let allowed = emitted(Some(5000));
+        at(&allowed, "IF n > 5000 THEN\n        RAISE EXCEPTION");
+        at(&allowed, "more than the 5000 its allowed move may take");
+        at(&allowed, "a batch at a time");
+        // Negative: an allowed move is not refused at zero rows over.
+        assert!(
+            !allowed.contains("IF n > 0 THEN\n        RAISE"),
+            "{allowed}"
+        );
+        assert!(
+            !allowed.contains("no move of them was allowed"),
+            "{allowed}"
+        );
+    }
+
     /// A range partition beside a standing DEFAULT is made as a plain table
     /// of its parent's shape, filled from the DEFAULT and attached, with the
     /// DEFAULT locked first, all in one statement that is the table's
@@ -4701,6 +4857,7 @@ mod tests {
                         name: "app.ev_2025".parse().unwrap(),
                         table: Box::new(partition.clone()),
                         beside_default: beside_default.map(|d| d.parse().unwrap()),
+                        moves_at_most: None,
                     },
                     Default::default(),
                 )
@@ -4709,11 +4866,20 @@ mod tests {
         let moved = emitted(Some("app.ev_rest"));
         let sql: Vec<&str> = moved.iter().map(|s| s.sql.as_str()).collect();
         assert_eq!(sql.len(), 2, "{sql:?}");
+        // The refusal of a move nobody allowed writes the move out to run
+        // by hand; it is taken out here, so the statements below are found
+        // where they run.
+        let refusal = "        RAISE EXCEPTION USING MESSAGE = n::text || ' rows of app.ev_rest";
+        let start = sql[0]
+            .find(refusal)
+            .unwrap_or_else(|| panic!("the move is not refused: {}", sql[0]));
+        let end = start + sql[0][start..].find("';\n").expect("the refusal ends");
+        let unrefused = format!("{}{}", &sql[0][..start], &sql[0][end..]);
         // The lock, the table, the move and the attach are one `DO` block,
         // which is one statement however the SQL is run, a `psql -f` script
         // included, so nothing can stop in between; and that statement is
         // the table's creation (#1763 review).
-        let one = sql[0];
+        let one = unrefused.as_str();
         let at = |part: &str| {
             one.find(part)
                 .unwrap_or_else(|| panic!("{part} is missing from {one}"))
@@ -4796,6 +4962,7 @@ mod tests {
                         name: name.parse().unwrap(),
                         table: Box::new(table.clone()),
                         beside_default: None,
+                        moves_at_most: None,
                     },
                     Default::default(),
                 )
@@ -5209,6 +5376,7 @@ mod tests {
                 name: table.clone(),
                 table: Box::new(created),
                 beside_default: None,
+                moves_at_most: None,
             },
         );
         assert!(
@@ -5286,6 +5454,7 @@ mod tests {
                 name: table.clone(),
                 table: Box::new(created.clone()),
                 beside_default: None,
+                moves_at_most: None,
             },
         );
         assert!(
@@ -5300,6 +5469,7 @@ mod tests {
                 name: table,
                 table: Box::new(created),
                 beside_default: None,
+                moves_at_most: None,
             },
         );
         assert!(plain[0].contains(") USING heap;"), "{plain:?}");
@@ -5390,6 +5560,7 @@ mod tests {
                 name: table.clone(),
                 table: Box::new(created.clone()),
                 beside_default: None,
+                moves_at_most: None,
             },
         );
         let at = |needle: &str| {
@@ -5411,6 +5582,7 @@ mod tests {
                 name: table,
                 table: Box::new(created),
                 beside_default: None,
+                moves_at_most: None,
             },
         );
         assert!(!plain.join("\n").contains("REPLICA IDENTITY"), "{plain:?}");
@@ -5497,12 +5669,14 @@ mod tests {
                     name: table.clone(),
                     table: Box::new(clustered_table.clone()),
                     beside_default: None,
+                    moves_at_most: None,
                 },
                 Change::CreateTable {
                     uid: Uid::generate(UidKind::Table),
                     name: table.clone(),
                     table: Box::new(created.clone()),
                     beside_default: None,
+                    moves_at_most: None,
                 },
             ),
         ] {
@@ -6815,6 +6989,7 @@ mod tests {
                 name: name("app", "t"),
                 table: Box::new(table),
                 beside_default: None,
+                moves_at_most: None,
             },
         );
         assert_eq!(
@@ -7046,6 +7221,7 @@ mod tests {
                 name: name("app", "t"),
                 table: Box::new(table),
                 beside_default: None,
+                moves_at_most: None,
             },
         );
         assert!(
@@ -7408,6 +7584,7 @@ mod tests {
                 name: name("app", "t"),
                 table: Box::new(table),
                 beside_default: None,
+                moves_at_most: None,
             },
         )
         .remove(0);
@@ -7470,6 +7647,7 @@ mod tests {
                     name: name("app", "empty"),
                     table: Box::new(Table::default()),
                     beside_default: None,
+                    moves_at_most: None,
                 },
                 Strategy::default(),
             )

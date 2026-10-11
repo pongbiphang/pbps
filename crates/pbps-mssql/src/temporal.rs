@@ -229,6 +229,7 @@ mod tests {
             name: tname(name),
             table: Box::new(table),
             beside_default: None,
+            moves_at_most: None,
         })
     }
 

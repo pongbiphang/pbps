@@ -2037,6 +2037,80 @@ fn unreleased(
     problems
 }
 
+/// The logical replication slots that would decode the rows this plan moves
+/// out of a DEFAULT partition (#1788), listed and never refused: a slot's
+/// consumer may take a delete and an insert in its stride, and whether it
+/// does is what the operator allowing the move answers. A publication is
+/// another matter, refused by the pre-flight, since a subscriber is known to
+/// lose the rows. Asked only of a plan that makes a partition beside a
+/// DEFAULT; whether it moves any row is the apply's to count.
+pub async fn logical_slots(conn: &mut Conn, changes: &ChangeSet) -> anyhow::Result<ConnectedCheck> {
+    if conn.driver() == Driver::Mssql {
+        return Ok(ConnectedCheck {
+            name: "logical_slots",
+            engine: "SQL Server",
+            status: "not_applicable",
+            message: "SQL Server has no partition this model moves rows into".to_owned(),
+        });
+    }
+    let moving: Vec<String> = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::CreateTable {
+                name,
+                beside_default: Some(default),
+                ..
+            } = &p.change
+            {
+                Some(format!("{default} into {name}"))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if moving.is_empty() {
+        return Ok(ConnectedCheck {
+            name: "logical_slots",
+            engine: "PostgreSQL",
+            status: "not_applicable",
+            message: "this plan makes no partition beside a DEFAULT, so it moves no rows"
+                .to_owned(),
+        });
+    }
+    let slots = pbps_pg::impact::logical_slots(conn).await?;
+    Ok(slots_listed(&moving, &slots))
+}
+
+/// [`logical_slots`]' answer over what the catalog said. Measured on 16 and
+/// 18 with `test_decoding`: a move decodes as the DEFAULT's delete and the
+/// new partition's insert.
+fn slots_listed(moving: &[String], slots: &[(String, String)]) -> ConnectedCheck {
+    let message = if slots.is_empty() {
+        format!(
+            "no logical replication slot on this database would decode the rows moved from {}",
+            moving.join(", ")
+        )
+    } else {
+        format!(
+            "logical replication slot(s) {} on this database will decode each row moved from {} \
+             as a delete and an insert",
+            slots
+                .iter()
+                .map(|(slot, plugin)| format!("{slot} ({plugin})"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            moving.join(", ")
+        )
+    };
+    ConnectedCheck {
+        name: "logical_slots",
+        engine: "PostgreSQL",
+        status: if slots.is_empty() { "passed" } else { "listed" },
+        message,
+    }
+}
+
 /// What a plan over generated columns needs of this server and of the columns
 /// already there, asked before anything is written (DEC-1168.1).
 ///
@@ -3179,6 +3253,7 @@ mod tests {
                 name: "dbo.t".parse().unwrap(),
                 table: Box::new(table),
                 beside_default: None,
+                moves_at_most: None,
             })],
         };
         let problems = pbps_mssql::temporal::refused_without_retention(&cs, &Default::default());
@@ -4142,5 +4217,36 @@ mod tests {
             assert!(human.contains("unavailable"));
             assert!(!human.contains("Rewrite: yes"));
         });
+    }
+
+    /// A logical slot on the database is listed with its plugin, by the
+    /// moves it would decode, and never refused; none is a pass that still
+    /// names the move (#1788).
+    #[test]
+    fn logical_slots_are_listed_not_refused() {
+        let moving = vec!["app.ev_rest into app.ev_2025".to_owned()];
+        let listed = slots_listed(
+            &moving,
+            &[
+                ("cdc".to_owned(), "pgoutput".to_owned()),
+                ("debezium".to_owned(), "decoderbufs".to_owned()),
+            ],
+        );
+        assert_eq!(listed.status, "listed");
+        assert_eq!(
+            listed.message,
+            "logical replication slot(s) cdc (pgoutput), debezium (decoderbufs) on this \
+             database will decode each row moved from app.ev_rest into app.ev_2025 as a delete \
+             and an insert"
+        );
+        // Negative: no slot is not a listing.
+        let none = slots_listed(&moving, &[]);
+        assert_eq!(none.status, "passed");
+        assert!(
+            none.message.contains("no logical replication slot")
+                && none.message.contains("app.ev_rest into app.ev_2025"),
+            "{}",
+            none.message
+        );
     }
 }

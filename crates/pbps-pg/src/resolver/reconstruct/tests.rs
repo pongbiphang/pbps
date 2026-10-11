@@ -77,6 +77,7 @@ fn bootstrap() -> Vec<Change> {
             name: TableName::new("app", "t"),
             table: Box::new(table()),
             beside_default: None,
+            moves_at_most: None,
         },
         module(
             "app.f(integer)",
@@ -245,12 +246,14 @@ fn a_split_foreign_key_follows_every_table() {
             name: child.clone(),
             table: Box::new(referencing),
             beside_default: None,
+            moves_at_most: None,
         },
         Change::CreateTable {
             uid: Uid::generate(UidKind::Table),
             name: parent.clone(),
             table: Box::new(keyed),
             beside_default: None,
+            moves_at_most: None,
         },
         Change::AddForeignKey {
             table: child,
@@ -615,6 +618,7 @@ fn an_index_replica_identity_is_set_after_its_index() {
         name: TableName::new("app", "t"),
         table: Box::new(t),
         beside_default: None,
+        moves_at_most: None,
     }];
     let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap).unwrap();
     let phases: Vec<_> = reconstruction

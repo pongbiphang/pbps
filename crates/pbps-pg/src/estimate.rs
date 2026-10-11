@@ -1127,6 +1127,7 @@ mod tests {
                     name: tname("app.ev_2025"),
                     table: Box::new(partition.clone()),
                     beside_default,
+                    moves_at_most: None,
                 },
                 Strategy::default(),
             )
@@ -1402,6 +1403,7 @@ mod tests {
                     name: tname("app.b"),
                     table: Box::default(),
                     beside_default: None,
+                    moves_at_most: None,
                 }),
             ],
         };
@@ -1511,6 +1513,7 @@ mod tests {
                     name: tname("app.t"),
                     table: Box::default(),
                     beside_default: None,
+                    moves_at_most: None,
                 }),
                 index("app.t"),
                 index("app.kept"),
@@ -1770,6 +1773,7 @@ mod tests {
                     name: tname("app.t"),
                     table: Box::default(),
                     beside_default: None,
+                    moves_at_most: None,
                 }),
                 tighten("app.t"),
             ],

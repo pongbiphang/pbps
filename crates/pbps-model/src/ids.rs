@@ -1,8 +1,8 @@
 //! The identity file (`schema.ids.json`).
 //!
 //! This file is committed to git and holds exactly what **cannot be derived from
-//! the declaration files**: the mapping from UID to name, plus tombstones for
-//! deleted objects (SPEC §5). Types, nullability and index definitions are never
+//! the declaration files**: the mapping from UID to name, tombstones for
+//! deleted objects, and the moves a human allowed (SPEC §5, §6). Types, nullability and index definitions are never
 //! stored here — the YAML already has them, and duplicating them would only
 //! create two sources of truth that can disagree.
 
@@ -38,6 +38,9 @@ pub enum IdsError {
 
     #[error("{uid} points at `{column}`, but no live table entry owns it")]
     OrphanColumn { uid: Uid, column: String },
+
+    #[error("a move is recorded for {uid}, but no live table entry has that uid")]
+    OrphanMove { uid: Uid },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -58,6 +61,13 @@ pub struct IdsFile {
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tombstones: BTreeMap<Uid, Tombstone>,
+
+    /// The moves a human allowed (#1788): by a new range partition's uid, the
+    /// DEFAULT partition's rows of its range the plan may move into it. A
+    /// compatible evolution under the same version, as `roles` is: a file
+    /// without the section allows no move.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub moves: BTreeMap<Uid, Move>,
 }
 
 impl Default for IdsFile {
@@ -68,8 +78,31 @@ impl Default for IdsFile {
             columns: BTreeMap::new(),
             roles: BTreeMap::new(),
             tombstones: BTreeMap::new(),
+            moves: BTreeMap::new(),
         }
     }
+}
+
+/// A move of a DEFAULT partition's rows into a new range partition, allowed by
+/// a human (`pbps move-rows`, #1788).
+///
+/// Moving rows is a delete and an insert, which whatever reads the database's
+/// changes sees: a logical slot decoding without a publication, an
+/// application holding a row's `xmin`. Whether an environment tolerates that,
+/// and whether the table is small enough to move in one transaction, is not
+/// in the declarations or the catalog, so it is recorded intent, as a drop's
+/// reason is (SPEC §6).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Move {
+    /// The most rows the move may take. A count seen when planning does not
+    /// bind the database the plan is applied to, so the moving statement
+    /// counts again, and refuses above this.
+    pub max_rows: u64,
+    /// `YYYY-MM-DD`
+    pub allowed_at: String,
+    pub reason: String,
+    pub operator: String,
 }
 
 /// The record left behind by an object that was physically deleted.
@@ -104,6 +137,8 @@ impl IdsFile {
         kept.tables.retain(|_, name| !tables.contains(name));
         kept.columns
             .retain(|_, column| !tables.contains(&column.table));
+        let live = kept.tables.clone();
+        kept.moves.retain(|uid, _| live.contains_key(uid));
         kept
     }
 
@@ -256,6 +291,13 @@ impl IdsFile {
                     uid: uid.clone(),
                     column: c.to_string(),
                 });
+            }
+        }
+        // A move belongs to a live table: a drop takes its move with it, so
+        // one left without its table was written by hand or a bad merge.
+        for uid in self.moves.keys() {
+            if !self.tables.contains_key(uid) {
+                return Err(IdsError::OrphanMove { uid: uid.clone() });
             }
         }
         Ok(())
@@ -606,6 +648,43 @@ mod tests {
         assert!(matches!(
             f.validate().unwrap_err(),
             IdsError::DuplicateName { .. }
+        ));
+    }
+
+    /// #1788: a move joins the file as roles did, under the same version: an
+    /// older file without the section allows no move and still reads, and
+    /// an empty section is not written. A move without its live table, and
+    /// one whose table a state leaves out, are refused and dropped.
+    #[test]
+    fn moves_join_the_file_and_belong_to_a_live_table() {
+        let allowed = Move {
+            max_rows: 1000,
+            allowed_at: "2026-10-11".into(),
+            reason: "no CDC on this table".into(),
+            operator: "leon".into(),
+        };
+        let mut f = sample();
+        f.moves.insert(uid("t_a9k2mq"), allowed.clone());
+        f.validate().unwrap();
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"moves\""), "{json}");
+        let back: IdsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, f);
+        let old: IdsFile =
+            serde_json::from_str(&serde_json::to_string(&sample()).unwrap()).unwrap();
+        assert!(old.moves.is_empty());
+        assert!(!serde_json::to_string(&sample()).unwrap().contains("moves"));
+        // A state for a database without the table keeps no move for it.
+        assert!(
+            f.without(&["dbo.customer".parse().unwrap()])
+                .moves
+                .is_empty()
+        );
+        // Negative: a move whose table has no live entry.
+        f.moves.insert(uid("t_bbbbbb"), allowed);
+        assert!(matches!(
+            f.validate().unwrap_err(),
+            IdsError::OrphanMove { .. }
         ));
     }
 

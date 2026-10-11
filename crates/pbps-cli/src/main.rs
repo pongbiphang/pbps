@@ -276,6 +276,20 @@ enum Command {
         reason: String,
     },
 
+    /// Allow a new range partition to take its rows from the DEFAULT partition
+    /// beside it (#1788)
+    MoveRows {
+        /// The new range partition, e.g. app.events_2030
+        table: String,
+        /// The most rows the move may take; above it, the apply refuses and
+        /// moves nothing
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        max_rows: u64,
+        /// Why moving the rows is acceptable here; required for audit
+        #[arg(long)]
+        reason: String,
+    },
+
     /// Render documentation and an ERD from the declarations
     Docs {
         /// markdown, html or erd
@@ -436,6 +450,7 @@ impl Command {
             | Command::DropTable { .. }
             | Command::RenameRole { .. }
             | Command::DropRole { .. }
+            | Command::MoveRows { .. }
             | Command::Docs { .. }
             | Command::Ui
             | Command::Pull { .. }
@@ -994,6 +1009,18 @@ fn run() -> anyhow::Result<()> {
         Command::DropRole { role, reason } => {
             cmd_intent(&project, Intent::DropRole { role, reason })
         }
+        Command::MoveRows {
+            table,
+            max_rows,
+            reason,
+        } => cmd_intent(
+            &project,
+            Intent::MoveRows {
+                table: table.parse::<TableName>()?,
+                max_rows,
+                reason,
+            },
+        ),
         Command::Pull {
             target,
             force,

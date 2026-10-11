@@ -3949,6 +3949,7 @@ fn partition_probes(
             name,
             table,
             beside_default: Some(default),
+            moves_at_most,
             ..
         } = &p.change
             && let Some(of) = &table.partition_of
@@ -3998,6 +3999,11 @@ fn partition_probes(
             // (#1763 review).
             let inserted = (!table.unlogged)
                 .then(|| default_insert_publication_probe(name, &parent, &stored, from, to));
+            // The rows a human did not allow to move (#1788), asked by
+            // their count alone: the questions above say what a move would
+            // set off, this one whether it may happen at all.
+            let unallowed =
+                default_move_bound_probe(name, &parent, &stored, from, to, *moves_at_most);
             for probe in [
                 default_hidden_referencers_probe(name, &parent, &stored, names, from, to),
                 default_trigger_probe(name, &parent, &stored, &gone, from, to),
@@ -4006,6 +4012,7 @@ fn partition_probes(
             ]
             .into_iter()
             .chain(inserted)
+            .chain(std::iter::once(unallowed))
             {
                 match probe {
                     Ok(probe) => out.push(probe),
@@ -4522,6 +4529,45 @@ fn default_rows_in_range(
     from: &[pbps_model::BoundDatum],
     to: &[pbps_model::BoundDatum],
 ) -> Result<String, DialectError> {
+    Ok(saturated_count(&default_rows_in_range_unclamped(
+        parent, default, from, to,
+    )?))
+}
+
+/// The rows a move out of `default` into the range would take, more than a
+/// human allowed (#1788): none without a move allowed, past its bound with
+/// one. Counted wide and clamped after the comparison, so a bound above the
+/// runner's i32 column is compared with the true count.
+fn default_move_bound_probe(
+    partition: &TableName,
+    parent: &TableName,
+    default: &TableName,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+    moves_at_most: Option<u64>,
+) -> Result<Probe, DialectError> {
+    let rows = default_rows_in_range_unclamped(parent, default, from, to)?;
+    Ok(Probe::new(
+        crate::emit::moving_beyond_its_intent(partition, parent, default, from, to, moves_at_most)?,
+        // Counted once: on a table worth bounding, a second count is a
+        // second scan of its range.
+        format!(
+            "SELECT {} FROM (SELECT {rows} AS n) AS m",
+            saturated_count(&format!(
+                "CASE WHEN m.n > {} THEN m.n ELSE 0 END",
+                moves_at_most.unwrap_or(0)
+            ))
+        ),
+    ))
+}
+
+/// [`default_rows_in_range`] before it is clamped to the runner's column.
+fn default_rows_in_range_unclamped(
+    parent: &TableName,
+    default: &TableName,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+) -> Result<String, DialectError> {
     let text = format!(
         "{} || {}",
         value_literal(&format!(
@@ -4530,13 +4576,13 @@ fn default_rows_in_range(
         )),
         range_predicate(from, to),
     );
-    Ok(saturated_count(&format!(
+    Ok(format!(
         "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()', \
          pg_catalog.query_to_xml({text}, false, true, '')))[1]::text::numeric \
          FROM pg_catalog.pg_partitioned_table pt \
          WHERE pt.partrelid = pg_catalog.to_regclass({})), 0)",
         value_literal(&qualified(parent)?)
-    )))
+    ))
 }
 
 /// The tables with a foreign key to `parent` or `default` whose rows this
@@ -5038,6 +5084,7 @@ mod tests {
                 ..Default::default()
             }),
             beside_default: None,
+            moves_at_most: None,
         };
         let range = B::Range {
             from: vec![pbps_model::BoundDatum::Value("1".into())],
@@ -5063,6 +5110,7 @@ mod tests {
                     name: "app.ev".parse().unwrap(),
                     table: Box::default(),
                     beside_default: None,
+                    moves_at_most: None,
                 }),
                 pbps_model::PlannedChange::new(partition(range)),
             ],
@@ -5165,6 +5213,7 @@ mod tests {
                 ..Default::default()
             }),
             beside_default: Some("app.ev_rest".parse().unwrap()),
+            moves_at_most: None,
         };
         let renamed = Change::RenameTable {
             uid: "t_cccccc".parse().unwrap(),
@@ -5182,7 +5231,37 @@ mod tests {
         for p in &asked {
             println!("-- {}\n{};", p.description, p.sql);
         }
-        assert_eq!(asked.len(), 6, "{asked:?}");
+        assert_eq!(asked.len(), 7, "{asked:?}");
+        // The rows nobody allowed to move (#1788), counted under the name
+        // the parent has before the rename, and refused at any row without a
+        // move allowed.
+        assert!(
+            asked[6]
+                .description
+                .contains("rows of app.ev_rest are inside the range of app.ev_1")
+                && asked[6].description.contains("no move of them was allowed")
+                && asked[6].sql.contains("ELSE 0 END")
+                && asked[6].sql.contains("CASE WHEN m.n > 0 THEN m.n")
+                && asked[6]
+                    .sql
+                    .contains("pt.partrelid = pg_catalog.to_regclass(E'\"app\".\"ev_old\"')"),
+            "{asked:?}"
+        );
+        let mut allowed = asked_plan.clone();
+        for p in &mut allowed.changes {
+            if let Change::CreateTable { moves_at_most, .. } = &mut p.change {
+                *moves_at_most = Some(3_000_000_000);
+            }
+        }
+        let allowed = probes(&allowed);
+        // Compared before the clamp to the runner's i32 column, so a bound
+        // above it is compared with the true count.
+        assert!(
+            allowed[6].description.contains("more than the 3000000000")
+                && allowed[6].sql.contains("> 3000000000 THEN")
+                && allowed[6].sql.starts_with("SELECT LEAST(CASE WHEN"),
+            "{allowed:?}"
+        );
         // An unlogged partition is in no publication: its inserts are not
         // asked about (#1763 review).
         let mut unlogged = asked_plan.clone();
@@ -5192,7 +5271,7 @@ mod tests {
             }
         }
         let unlogged = probes(&unlogged);
-        assert_eq!(unlogged.len(), 5, "{unlogged:?}");
+        assert_eq!(unlogged.len(), 6, "{unlogged:?}");
         assert!(
             unlogged.iter().all(|p| !p
                 .description
@@ -5402,6 +5481,7 @@ mod tests {
                 ..Default::default()
             }),
             beside_default: Some("app.ev_rest".parse().unwrap()),
+            moves_at_most: None,
         };
         let recomputed = Change::AlterColumnExpression {
             uid: "c_cccccc".parse().unwrap(),
@@ -5423,7 +5503,7 @@ mod tests {
             "{:?}",
             asked.probes
         );
-        assert_eq!(asked.probes.len(), 5, "{:?}", asked.probes);
+        assert_eq!(asked.probes.len(), 6, "{:?}", asked.probes);
         assert!(
             asked.unchecked.iter().any(|u| u
                 .reason
@@ -5958,6 +6038,7 @@ mod tests {
                     name: parent.clone(),
                     table: Box::new(table),
                     beside_default: None,
+                    moves_at_most: None,
                 },
                 Change::AddForeignKey {
                     table: child.clone(),

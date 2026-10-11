@@ -213,6 +213,12 @@ pub enum Change {
         /// `None` for any other table, which an older plan's creates all are.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         beside_default: Option<TableName>,
+        /// Beside a DEFAULT, the most of its rows the move may take, as a
+        /// human allowed it (`pbps move-rows`, #1788); `None` allows none, and
+        /// the moving statement refuses if it finds any. Ignored with no
+        /// `beside_default`, where nothing moves.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        moves_at_most: Option<u64>,
     },
     DropTable {
         uid: Uid,
@@ -2897,6 +2903,7 @@ mod tests {
             name: "app.ev_1".parse().unwrap(),
             table: Box::new(table.clone()),
             beside_default: beside.then(|| "app.ev_rest".parse().unwrap()),
+            moves_at_most: None,
         };
         assert!(create(&partition, true).intrinsic_risks().is_empty());
         partition.checks.insert(

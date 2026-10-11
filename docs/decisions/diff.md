@@ -4732,7 +4732,8 @@ found them:
   could take its insert. pbps does not manage publications (DEC-1444.1).
   This is a second writer, which SPEC 7.6 assumes away.
 
-What the catalog cannot answer is left to a human by #1788's move intent:
+What the catalog cannot answer is left to a human by #1788's move intent
+(DEC-1788.1):
 - a logical slot that decodes without a publication;
 - an application that reads a row's `xmin`;
 - a table too large to move in one transaction.
@@ -4745,3 +4746,91 @@ Pinned by `a_range_added_beside_a_standing_default_names_it`,
 moved rows against the engine's routing for two-column bounds, and on 18 a
 temporal key's count against the engine's refusal, and the CLI's
 `a_range_beside_a_default_takes_its_rows_through_the_cli`, on 18 and on 16.
+
+<a id="dec-1788-1"></a>
+
+**DEC-1788.1. A DEFAULT partition's rows move into a new range partition only
+as far as a human allowed: `pbps move-rows` records a bound and a reason in the
+identity file, and the apply refuses any row of a move nobody allowed, and more
+rows than the bound (#1788).**
+
+**Why intent.** A move is a delete from the DEFAULT and an insert into the new
+partition (DEC-1547.1). The catalog answers what that sets off inside the
+database, and the pre-flight refuses those. It cannot answer what reads the
+database's changes from outside: a logical slot decoding without a
+publication, an application holding a row's `xmin`. Nor can it say how many
+rows one transaction may move with the DEFAULT locked. Those are an
+environment's facts, so they are recorded as intent, as a drop's reason is
+(SPEC 6.5).
+
+**Where it lives.** The identity file gains `moves`, by the new partition's
+uid: `max_rows`, `allowed_at`, `reason`, `operator`. It is a compatible
+evolution under version 1, as `roles` was: a file without the section allows
+no move, and an empty one is not written. `validate` refuses a move whose uid
+has no live table. A table's drop removes its move, and a state recorded for a
+database without the table keeps none. A uid, not a name, so the move follows a
+rename of the partition or of its parent.
+
+**Why at apply, not at plan.** An offline plan cannot see the DEFAULT's rows,
+and the plan is the same whether any row moves (DEC-1547.1). So the change
+carries the bound, `CreateTable.moves_at_most`, and the apply checks it twice:
+- **The pre-flight** counts the rows of the range and refuses more than the
+  bound, `0` when no move was allowed. It counts once, and compares before
+  clamping to the runner's `int4`, so a bound above it is compared with the
+  true count.
+- **The moving statement** compares again, on the rows it has just counted
+  and locked `FOR UPDATE`, before any other question and before its delete. A
+  count seen by the pre-flight does not bind the rows the statement meets,
+  and the `plan --sql` script has no pre-flight at all.
+
+Both refusals give the same text. With no move allowed, it gives the command
+that allows one and the move written out to run by hand: lock, create, move,
+attach, in one transaction. Past a bound, it gives the same move, a batch at a
+time with the last batch and the attach together, or a larger bound. No row in
+the range needs nothing allowed. Plan version 35 carries the field, since an
+older build would read a bounded move as one without a bound.
+
+**The command.** `pbps move-rows <partition> --max-rows <N> --reason <why>`,
+with `N` at least 1. Identity resolution records it and refuses, by name, a
+table that is not a range partition whose parent declares a DEFAULT partition.
+It does not ask whether the partition is new: that is the database's to say,
+and an entry for one that exists is never consulted, since no plan creates it
+again. The same bound and reason allowed again keep the entry as it was, so
+the command converges; another replaces it, with the new operator and date.
+There is no annotation and no prompt: no offline plan knows there is a
+question to ask.
+
+**Publications and slots.**
+- A publication that would send the move's delete or the new partition's
+  insert is still refused, whatever was allowed: a subscriber is known to lose
+  the rows (DEC-1547.1).
+- A logical replication slot of this database is listed by `plan --db` as the
+  connected check `logical_slots`, with its plugin, and never refused. Its
+  consumer may take a delete and an insert in its stride; the operator
+  allowing the move is the one who knows. Measured on 16 and 18 with
+  `test_decoding`:
+  - the move decodes as the DEFAULT's delete and the new partition's insert;
+  - a physical slot, and a logical slot of another database, are not this
+    database's;
+  - a role without any privilege reads `pg_replication_slots`.
+
+**Rejected.**
+- **An apply flag such as `--allow-move`.** It would be decided at deploy
+  time and recorded nowhere in git, and it carries no bound. The risk gate
+  approves a kind of change, not a number of rows.
+- **Refusing the plan outright whenever the DEFAULT might hold rows.** Every
+  range beside a DEFAULT would then need intent, rows or not. DEC-1547.1 made
+  the plan independent of the data so that an offline plan and a connected one
+  agree. A refusal that only a connected plan could lift would break that.
+
+Pinned by `moves_join_the_file_and_belong_to_a_live_table`,
+`a_move_is_recorded_against_the_new_partition_and_converges`,
+`a_move_for_a_table_no_rows_can_move_into_is_refused`,
+`a_move_follows_its_partition_and_goes_with_its_drop`,
+`the_move_a_human_allowed_reaches_the_create_beside_the_default`,
+`a_move_is_bounded_by_the_rows_a_human_allowed`,
+`a_partition_beside_a_default_asks_what_its_move_would_fire`,
+`logical_slots_are_listed_not_refused`,
+`range_partitions_are_added_and_dropped_on_populated_trees` on 18 and 16, and
+the CLI's `a_range_beside_a_default_takes_its_rows_through_the_cli` on 18 and
+16.

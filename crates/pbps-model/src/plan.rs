@@ -219,7 +219,11 @@ use crate::schema::Schema;
 /// Bumped to 34 for a partition made beside its DEFAULT partition
 /// (DEC-1547.1): a `CreateTable`'s `beside_default`, which an older build
 /// cannot read.
-pub const CURRENT_VERSION: u32 = 34;
+///
+/// Bumped to 35 for the move a human allowed (DEC-1788.1): a `CreateTable`'s
+/// `moves_at_most`, which an older build cannot read and would apply as a
+/// move with no bound.
+pub const CURRENT_VERSION: u32 = 35;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -678,7 +682,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 34);
+        assert_eq!(CURRENT_VERSION, 35);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads
@@ -759,6 +763,7 @@ mod tests {
                             .unwrap(),
                     ),
                     beside_default: None,
+                    moves_at_most: None,
                 })],
             })
             .checksum()
@@ -929,6 +934,7 @@ mod tests {
                 name: TableName::new("dbo", "customer"),
                 table: Box::new(Table::default()),
                 beside_default: None,
+                moves_at_most: None,
             })],
         }))
         .unwrap();

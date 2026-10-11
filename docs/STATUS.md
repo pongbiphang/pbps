@@ -97,7 +97,7 @@ that differs from the database's default, and a collation change is a planned
 
 Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`),
 `validate` (`--since`), `fmt` (`--check`), `rename`, `rename-table`, `rename-role`, `drop`,
-`drop-table`, `drop-role`,
+`drop-table`, `drop-role`, `move-rows` (`--max-rows` / `--reason`),
 `docs` (`--format` / `--out` / `--title`), `explain` (`--plan`), `doctor`
 (`--env`), `schema` (`--kind declaration|config|envelope`), `completions`,
 `man`, `key generate` (`--out`). Every read-only command

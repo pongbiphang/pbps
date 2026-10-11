@@ -199,6 +199,7 @@ impl Reconstruction {
                             name: name.clone(),
                             table: Box::new(bare),
                             beside_default: None,
+                            moves_at_most: None,
                         },
                         relation(&name.schema, &name.name),
                         None,

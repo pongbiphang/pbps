@@ -2383,3 +2383,96 @@ fn a_parents_new_index_precedes_its_partitions_own_under_the_resolver() {
         .collect();
     assert_eq!(tables, [&parent, &partition]);
 }
+
+/// The plan a resolver orders carries the move a human allowed into the
+/// create it takes apart, as the ordinary plan does (#1788): the bound is
+/// the moving statement's only source.
+#[test]
+fn a_resolver_plan_keeps_the_move_a_human_allowed() {
+    use pbps_model::{BoundDatum, Hints, IdsFile, PartitionBound, PartitionBy, PartitionOf};
+    let mut base = pbps_model::Schema::default();
+    let mut parent = pbps_model::Table::default();
+    parent.columns.insert(
+        "ts".into(),
+        pbps_model::Column::new("date".parse().unwrap()).not_null(),
+    );
+    parent.partition_by = Some(PartitionBy {
+        columns: vec!["ts".into()],
+    });
+    base.tables.insert("app.ev".parse().unwrap(), parent);
+    let partition = |bound: PartitionBound| pbps_model::Table {
+        partition_of: Some(PartitionOf {
+            parent: "app.ev".parse().unwrap(),
+            bound,
+            columns: Default::default(),
+        }),
+        ..Default::default()
+    };
+    base.tables.insert(
+        "app.ev_rest".parse().unwrap(),
+        partition(PartitionBound::Default),
+    );
+    let mut desired = base.clone();
+    desired.tables.insert(
+        "app.ev_2025".parse().unwrap(),
+        partition(PartitionBound::Range {
+            from: vec![BoundDatum::Value("2025-01-01".into())],
+            to: vec![BoundDatum::Value("2026-01-01".into())],
+        }),
+    );
+    let old_ids = ids(&base, &IdsFile::default());
+    let bound = |intents: &[pbps_model::Intent]| {
+        let new_ids = crate::resolve(
+            &desired,
+            &old_ids,
+            intents,
+            &crate::Context {
+                operator: "1788".into(),
+                today: "2026-10-11".into(),
+            },
+        )
+        .unwrap()
+        .ids;
+        let ordered = plan(
+            crate::Side {
+                schema: &base,
+                ids: &old_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &new_ids,
+            },
+            &Hints::default(),
+            &[],
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        ordered
+            .changes
+            .changes
+            .iter()
+            .find_map(|p| {
+                if let Change::CreateTable {
+                    beside_default: Some(_),
+                    moves_at_most,
+                    ..
+                } = &p.change
+                {
+                    Some(*moves_at_most)
+                } else {
+                    None
+                }
+            })
+            .expect("a create beside the DEFAULT")
+    };
+    assert_eq!(
+        bound(&[pbps_model::Intent::MoveRows {
+            table: "app.ev_2025".parse().unwrap(),
+            max_rows: 7,
+            reason: "no CDC".into(),
+        }]),
+        Some(7)
+    );
+    // Negative: nothing allowed.
+    assert_eq!(bound(&[]), None);
+}

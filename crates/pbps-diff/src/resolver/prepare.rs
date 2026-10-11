@@ -207,6 +207,7 @@ pub(super) fn changes(
                 name,
                 table,
                 beside_default,
+                moves_at_most,
             } => {
                 let mut bare = (**table).clone();
                 let checks = std::mem::take(&mut bare.checks);
@@ -241,6 +242,7 @@ pub(super) fn changes(
                     name: name.clone(),
                     table: Box::new(bare),
                     beside_default: beside_default.clone(),
+                    moves_at_most: *moves_at_most,
                 }];
                 parts.extend(defaults);
                 parts.extend(

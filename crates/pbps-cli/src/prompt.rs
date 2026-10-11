@@ -196,7 +196,7 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
         // declaration), and there is no intent this prompt could record that
         // would let resolution proceed with a name pbps's own identity format
         // cannot carry.
-        Blocker::UnrepresentableName { .. } => {}
+        Blocker::UnrepresentableName { .. } | Blocker::MoveNotBesideDefault { .. } => {}
     }
     out
 }
@@ -359,6 +359,9 @@ fn question(b: &Blocker) -> String {
         Blocker::UnrepresentableName { what, part, table } => {
             let prefix = table.as_ref().map(|t| format!("{t}: ")).unwrap_or_default();
             format!("{prefix}{what} `{part}` contains a `.`")
+        }
+        Blocker::MoveNotBesideDefault { table } => {
+            format!("{table} is not a range partition beside a DEFAULT")
         }
     }
 }

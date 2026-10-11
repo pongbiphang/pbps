@@ -56,7 +56,7 @@ pub use data::{
 pub use declared::{Binding, Bindings, Declared, DeclaredExpressions};
 pub use drift::{DriftBaseline, DriftReport};
 pub use finding::{Finding, Severity};
-pub use ids::{IdsFile, Tombstone};
+pub use ids::{IdsFile, Move, Tombstone};
 pub use intent::Intent;
 pub use module::{
     Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ObjectName, PublicExecute,

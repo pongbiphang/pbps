@@ -4516,12 +4516,14 @@ async fn two_columns_whose_names_join_to_one_string_both_get_their_defaults() {
                 name: TableName::new("dbo", "a_b"),
                 table: Box::new(with_default("c")),
                 beside_default: None,
+                moves_at_most: None,
             }),
             pbps_model::PlannedChange::new(pbps_model::Change::CreateTable {
                 uid: "t_ab0002".parse().unwrap(),
                 name: TableName::new("dbo", "a"),
                 table: Box::new(with_default("b_c")),
                 beside_default: None,
+                moves_at_most: None,
             }),
         ],
     };
@@ -4574,6 +4576,7 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
             name: name.parse().unwrap(),
             table: Box::new(defaulted(columns)),
             beside_default: None,
+            moves_at_most: None,
         })
     };
     // A table renamed, and a new one under its old name, in one plan.
@@ -4773,6 +4776,7 @@ async fn a_default_whose_new_name_is_taken_frees_its_old_one() {
                     name: name.clone(),
                     table: Box::new(t),
                     beside_default: None,
+                    moves_at_most: None,
                 })],
             },
         )
@@ -14001,6 +14005,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                 name: TableName::new("dbo", "tier"),
                 table: Box::new(lookup),
                 beside_default: None,
+                moves_at_most: None,
             }),
             PlannedChange::new(Change::InsertRow {
                 table: TableName::new("dbo", "tier"),
@@ -14109,6 +14114,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                 name: TableName::new("dbo", "band"),
                 table: Box::new(bare),
                 beside_default: None,
+                moves_at_most: None,
             }),
             PlannedChange::new(Change::AddForeignKey {
                 table: TableName::new("dbo", "customer"),

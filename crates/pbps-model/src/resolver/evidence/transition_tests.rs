@@ -340,6 +340,7 @@ fn a_dropped_view_can_be_replaced_by_a_table_at_the_same_logical_address() {
             name: "app.v".parse().unwrap(),
             table: Box::new(table),
             beside_default: None,
+            moves_at_most: None,
         }));
     let desired = evidence.surfaces[0].current.clone().unwrap();
     evidence.surfaces.insert(
@@ -669,6 +670,7 @@ fn table_creation_requires_the_owner_even_with_a_child_transition() {
                 name: table.clone(),
                 table: Box::new(definition),
                 beside_default: None,
+                moves_at_most: None,
             },
             Surface::Table(table.clone()),
             child,
@@ -1297,6 +1299,7 @@ fn aggregate_table_creation_requires_all_owned_records() {
             name: table.clone(),
             table: Box::new(definition),
             beside_default: None,
+            moves_at_most: None,
         },
         Surface::Table(table.clone()),
         Surface::Default(table.column("n")),
@@ -1674,7 +1677,7 @@ fn mutations_of_created_or_removed_targets_use_the_planned_endpoint() {
     for creating in [false, true] {
         let change = if creating {
             Change::CreateTable { uid: "t_000000".parse().unwrap(), name: table.clone(),
-                table: Box::new(serde_json::from_value(serde_json::json!({"columns":{"n":{"type":"integer","nullable":true,"default":"7"}}})).unwrap()), beside_default: None }
+                table: Box::new(serde_json::from_value(serde_json::json!({"columns":{"n":{"type":"integer","nullable":true,"default":"7"}}})).unwrap()), beside_default: None, moves_at_most: None }
         } else {
             Change::DropTable {
                 uid: "t_000000".parse().unwrap(),
@@ -1909,6 +1912,7 @@ mod inline_binding_floor {
                 name: name.clone(),
                 table: Box::new(table),
                 beside_default: None,
+                moves_at_most: None,
             },
             Surface::Table(name.clone()),
             Surface::Column(name.column("n")),
@@ -2427,6 +2431,7 @@ mod column_vector_parent {
                     name: table.clone(),
                     table: Box::default(),
                     beside_default: None,
+                    moves_at_most: None,
                 }
             } else {
                 Change::DropTable {

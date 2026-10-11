@@ -703,6 +703,7 @@ mod tests {
                     name: table.clone(),
                     table: Box::new(base_only.tables[&table].clone()),
                     beside_default: None,
+                    moves_at_most: None,
                 }),
             ],
         };
