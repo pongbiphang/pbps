@@ -2883,6 +2883,9 @@ pub async fn account_for_module_dependents(
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     let partitions = crate::dependents::standing_partitions(declared, changes);
     let released = crate::dependents::released(changes, &found, &partitions);
+    // A create that moves rows out of a DEFAULT is not held with the rest
+    // (#1763 review).
+    crate::dependents::split_moving_defaults(changes, declared, dialect);
     let moved = crate::dependents::after_the_rebuilds(changes, &released, deps, declared)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     // Last of the reorderings: a partition's own default after its parent's,
@@ -3175,6 +3178,7 @@ mod tests {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: "dbo.t".parse().unwrap(),
                 table: Box::new(table),
+                beside_default: None,
             })],
         };
         let problems = pbps_mssql::temporal::refused_without_retention(&cs, &Default::default());

@@ -4444,3 +4444,304 @@ Pinned by `a_rename_moving_a_carried_names_holder_away_is_hoisted_ahead_of_the_m
 by `a_rename_that_moves_a_carried_names_holder_away_runs_first_on_both_servers`,
 on 16 and on 18, and by
 `a_hoisted_rename_stays_ahead_when_a_view_rebuild_plans_again`.
+
+<a id="dec-1547-1"></a>
+
+**DEC-1547.1. A range partition added beside a standing DEFAULT partition is
+made as a plain table of its parent's shape, filled with the DEFAULT's rows
+of its range, and attached, whether or not any row moves (#1547).**
+
+`CREATE TABLE ... PARTITION OF` refuses over a DEFAULT partition holding rows
+of the new range (DEC-1171.1). Three ways round it, each measured on 16.15
+and 18.6 with the locks read from `pg_locks` (the issue has the tables):
+
+- **Rows set aside in a temporary table** (B). The rows move twice, and the
+  parent is held at ACCESS EXCLUSIVE throughout, reads included.
+- **The DEFAULT detached and reattached** (A). It takes the strongest locks
+  for longest, and the reattach rescans the whole DEFAULT.
+- **A plain table, filled, then attached** (C). The parent is held at SHARE
+  UPDATE EXCLUSIVE, so its other partitions stay readable and writable. The
+  DEFAULT goes to ACCESS EXCLUSIVE only at the attach, which scans it.
+
+leon chose C (2026-10-10). Two further choices were made on the issue:
+
+- **Always, not only over rows.** The plan reads no rows (SPEC 7.2), so it
+  does not depend on whether any are there. An offline plan and a connected
+  one agree, and a row arriving after planning is moved rather than refused.
+  The attach's lock is also the lighter one even with nothing to move. This
+  amends the issue's line "with no such rows, the plan is #1171's plain
+  create".
+- **No index before the move.** Measured with 1,000,000 rows moved, the move
+  and the attach took:
+  - on 16, 1.6–2.2 s with no index on the plain table, against 2.6–3.9 s with
+    the parent's indexes made first;
+  - on 18, 3.4–4.6 s against 9.8–15 s.
+
+  The attach builds the clones over the loaded rows, under the new table's
+  own lock, which no other session can reach.
+
+**The statements**, in one change, `CreateTable` with `beside_default`
+naming the DEFAULT, and the first four in one `DO` block. Its declared name is the right one, because renames run
+in class 1, before every create. Only a DEFAULT the base and the
+declarations both hold under that parent counts. A DEFAULT the plan drops or
+detaches is gone in class 6, and a new one starts empty.
+
+1. `LOCK TABLE ONLY <default> IN SHARE MODE`, so no row of the range can
+   arrive in it between the move and the attach.
+2. `CREATE TABLE <new> (LIKE <parent> INCLUDING DEFAULTS INCLUDING GENERATED
+   INCLUDING CONSTRAINTS INCLUDING STORAGE INCLUDING COMPRESSION) USING heap`,
+   with the partition's own persistence and storage parameters.
+   - The attach refuses a table that lacks one of its parent's checks.
+   - Storage and compression are what `PARTITION OF` copies.
+   - Read back after the attach, the table is what `PARTITION OF` makes,
+     field for field: every check and NOT NULL is inherited (`conislocal`
+     false, `coninhcount` 1), every column is inherited with its parent's
+     default and generation, and the key and indexes are clones.
+3. A `DO` block that reads the parent's stored columns and its key from the
+   catalog when it runs, asks again what the delete would set off (below),
+   then moves the rows with one `DELETE ... RETURNING` into an `INSERT`.
+   - A column change earlier in the plan cannot leave the column list stale.
+   - A generated column is the engine's to compute, so it is not copied.
+     It is computed again in the new table, which can take another value:
+     measured on 16 and 18, a column of `tableoid` took the new
+     partition's. So, under a parent with a generated column, each moved
+     row's values are kept and compared with the inserted row's, as text,
+     and a changed one raises and undoes the move, which would otherwise
+     rewrite stored values no change of the plan names (#1763 review). A
+     DEFAULT attached with an expression of its own would compute another
+     too, but it leaves the whole tree out of the pull, measured on 18.
+   - The predicate is the one the #1171 probe counts with
+     (`range_predicate`), so the rows counted and the rows moved are one
+     set.
+   - It runs on the empty path. If a comparison picks other rows than the
+     range does (say, a key type whose operators live outside `pg_catalog`),
+     the attach refuses: it checks the new table against its range and the
+     DEFAULT against the rest. The result is the right rows or a rolled-back
+     plan.
+4. `ALTER TABLE <parent> ATTACH PARTITION <new> FOR VALUES ...`. Then, in
+   statements of their own, the partition's own defaults, NOT NULLs, checks
+   and indexes, as after #1171's create.
+
+**One statement.** The lock, the create, the move and the attach are one
+`DO` block. A `DO` block is one statement wherever it runs, and a failure
+anywhere in it undoes all of it (DECISIONS 328). Measured on 16 and 18:
+`LOCK` is accepted inside it outside any transaction, and a refused attach
+takes the table and the move back with it. So no apply can stop with the
+rows out of the DEFAULT and the table not yet attached. A staged apply is no
+exception, and `a_range_beside_a_default_takes_its_rows_through_the_cli`
+applies one staged.
+
+Two weaker shapes failed:
+- **Four statements.** Run one at a time outside a transaction, `LOCK`
+  failed (`LOCK TABLE can only be used in transaction blocks`), and a staged
+  run would have committed the moved rows outside the parent.
+- **One batch of four commands.** A driver sending it as one query runs it as
+  one implicit transaction. But a `plan --sql` script is read by `psql`
+  command by command (SPEC 7.3), where it is four statements again (#1763
+  review). The same test runs that script through psql.
+
+**What the move sets off.** A `DELETE` from the DEFAULT is a delete. Measured
+on 16 and 18:
+- A foreign key referencing the parent has a clone on every partition, the
+  DEFAULT among them. With `ON DELETE CASCADE` the move deleted the
+  referencing rows; with `NO ACTION` the move refused.
+- A key to a table above the parent reaches the DEFAULT the same way, down a
+  chain of clones. The last references the DEFAULT itself and owns the
+  delete trigger on it. With that trigger disabled, or `O` under
+  `session_replication_role = replica`, the delete left the referencing rows
+  alone.
+- A row trigger cloned from the parent ran once per moved row, and the
+  insert into the plain table fires nothing to answer it.
+- A statement trigger or rule on the DEFAULT itself ran even when no row
+  moved. The parent's own statement triggers did not run.
+- Measured on 18 with a subscriber, under a publication of the parent with
+  `publish_via_partition_root`: the delete reached the subscriber, and the
+  insert did not, into a table no publication named. Nor did the attach.
+  The subscriber lost the moved row while the publisher kept it (#1763
+  review).
+- A publication of every table, or of every table of the new table's
+  schema, takes the plain table in as soon as it is created. Measured on 16
+  and 18 with a subscriber holding the tree: under `FOR ALL TABLES` or
+  `TABLES IN SCHEMA` publishing inserts, with or without
+  `publish_via_partition_root`, the insert reached it under the new table's
+  name. Its apply stopped on "logical replication target relation … does
+  not exist", and the rows after it never arrived. `FOR TABLE` on the
+  parent, or a publication of updates only, left it replicating (#1763
+  review).
+
+So the apply's pre-flight asks six counts, under the names the catalog
+has before the plan runs:
+- **The rows referencing a moved row.** These are rows referencing the
+  DEFAULT's rows in the range, counted as #1171 counts the rows referencing
+  a dropped partition. A key is asked down its clones for the DEFAULT's own
+  delete trigger, firing in this session, rather than by the table it names.
+  `confrelid IN (parent, default)` missed a key to a grandparent and
+  counted one whose action is off (#1763 review). A key or a table the plan
+  removes first is left out, and so are the rows of a referencing table's
+  partitions the plan drops first, as for a detach. A key with nothing
+  pointing at a moved row fires nothing, so it does not refuse the plan.
+  Nor does a row of the tree that the same delete moves, through a key of
+  the tree to itself. Measured on 16 and 18, with both sides moved, the move
+  kept the reference under every action. With a referencing row outside the
+  range, `NO ACTION` and `RESTRICT` refused the move, and `CASCADE` and
+  `SET NULL` rewrote that row, so it is still counted (#1763 review).
+  Each column of the key is compared as the engine's referential check
+  compares it, under the referenced column's collation and through the
+  constraint's operator (DECISIONS 352). A bare `=` between columns
+  collated differently fails to compare, and inside the moving statement
+  that failure aborted a move the engine takes (#1763 review). With a
+  column retyped or a generated column recomputed in the same plan, the
+  count is unchecked rather than taken over the old values, as a deleted
+  row's is for a recomputation (DEC-1168.1). The new values may be written
+  before the move, and the moving statement asks the values it meets.
+- **The referencing tables the session cannot fully read.** These are
+  tables with such a key on which row-level security is active, or that
+  the session cannot read the key's columns of: `SELECT` on the table, or
+  on each of the key's columns, is enough, as for a deleted row (#1763
+  review). They are counted when there are rows to
+  move. The count above reads zero through either, which would mean "cannot
+  see" rather than "nothing there", and an unreadable table fails the count,
+  which the runner reports as unchecked and does not stop on. It is the
+  rule `hidden_children_probe` keeps for a deleted row (DECISIONS 333, 335),
+  asked by table (#1763 review).
+- **The rows moved under a delete row trigger.** These are the DEFAULT's
+  rows in the range, when a row trigger on the DEFAULT fires on delete.
+- **Statement triggers and rules.** These are the DEFAULT's statement
+  triggers and rules that fire on delete.
+- **Publications.** These are publications that publish deletes from the
+  DEFAULT, through itself or any table above it, counted when there are rows
+  to move. `pg_publication_tables` expands `FOR ALL TABLES`, a schema and a
+  partitioned table into what each one sends. A row filter sends only the
+  deletes of the rows it holds, so a publication whose filter holds none of
+  the moved rows is not counted. An unlogged DEFAULT publishes nothing,
+  through itself or a root above it, and is not asked about: measured on
+  16 and 18, its delete under a publication of the parent via the root
+  decoded to nothing, and was not held to a replica identity (#1763
+  review). pbps does not manage publications (DEC-1444.1); it reads them
+  so as not to break one silently.
+- **Publications of the new table.** These are publications that publish
+  inserts, of every table or of every table of the new table's schema,
+  counted when there are rows to move. A publication naming its tables
+  cannot name one the plan has not made yet. An unlogged new table is in no
+  publication and is not asked about: measured on 16 and 18, its
+  subscriber went on replicating.
+
+"Fires" is asked as `data_triggers` asks it:
+- `A` always fires; `O` fires outside, and `R` under,
+  `session_replication_role = replica`; `D` never fires.
+- A trigger the plan drops (class 0, before the move) is not asked about.
+  That covers a trigger on the DEFAULT, and one on the parent, whose clone
+  goes with it (#1763 review).
+
+Any of them refuses by name, with the remedy #1171 gave: repoint or delete
+the rows, or drop or disable the trigger, or move the rows, and plan again.
+
+**Asked again inside the statement** (#1763 review). A probe that cannot run
+is reported as unchecked and the apply goes on (SPEC 7.5): the engine
+enforces, inside the transaction, what the probe asked. Here the engine enforces nothing: a cascade
+is the engine doing what it was told. So the `DO` block asks the same six
+questions before its delete, from the catalog as the plan leaves it at that
+point, and raises over any of them. An answer it cannot get, such as a
+referencing table it has no `SELECT` on, is an error too. Either way the
+statement aborts, and the plan with it, before a row moves. The pre-flight
+stays: it refuses before any statement runs, and names the rows.
+
+The block counts the rows to move `FOR UPDATE` before it asks about their
+references, as the delete guard locks its row (DECISIONS 129, 326). A row
+referencing one of them, inserted by a session that has not committed,
+holds `FOR KEY SHARE` on it. The lock waits for that session, and the next
+statement of the block, under the apply's READ COMMITTED, sees what it
+committed. Unlocked, the question was asked before the insert was visible,
+and the delete then waited for the same session and cascaded into its row
+(#1763 review).
+
+The names matter. A parent renamed in the same plan (DEC-1690.1 refuses only
+attaches, detaches and drops beside a rename) is found under its old name.
+Under the new one the key is not found, the count reads zero, and a cascade
+deleted the referencing row. #1171's own count for a plain create had the
+same gap; the engine's refusal was its backstop, and it now reads the old
+name too.
+
+**The rest of the plan.**
+- **The DEFAULT's own tightenings follow the move.** A NOT NULL of the
+  DEFAULT's own that the plan tightens comes at (9, 6), after every create
+  that moves rows out of it. The create is at (7, 2), or at (9, 5) under a
+  parent whose columns change, where a tightening at (9, 1) or (9, 4)
+  counted, and the engine refused, the NULL the move takes away. Its own
+  checks, uniques and unique indexes are of class 13, after every create
+  already (#1763 review, leon's choice of one ordering rule).
+- **The create that moves is never held back.** A new partition's own
+  default calling a function the plan creates later holds its create
+  behind that function (#1578). Held so, a create that moves rows let
+  past it what must follow the move, and review found them one at a time:
+  the DEFAULT's tightenings, a foreign key into the tree, a trigger on the
+  DEFAULT, a row write before the move. So a create beside a DEFAULT keeps
+  its place, and its own default is split off into a `SetPartitionDefault`
+  right after the last function its text may call (`split_moving_defaults`
+  in `dependents.rs`; leon's choice, #1763 review). The move inserts every
+  column of the rows it takes, so it never evaluates the default. Nor is it
+  held with a column its parent adds behind a function the column's default
+  or expression calls: its own default and NOT NULL on that column are split
+  off too, into a `SetPartitionDefault` and a `SetPartitionNotNull` that the
+  reorder holds behind the column instead, the NOT NULL's risk with them. An
+  own index or check naming such a column cannot be split off, and that plan
+  is refused by name, with the remedy of adding the column first (#1763
+  review). The apply guard holds the created partition's own defaults and
+  NOT NULLs to the `CREATE` plus what the plan sets after it, as it holds a
+  created table's columns (DEC-942.1).
+- **Probes of the DEFAULT after the move.** A change the plan makes to the
+  DEFAULT after the create, such as a check of its own, would be counted
+  over rows the move has taken away by then. A check that only a moved row
+  breaks refused a plan the engine takes. Which rows stay is the catalog's
+  to say when the move runs, so such a change is reported unchecked
+  (SPEC 7.5), and the engine enforces its constraint inside the apply's
+  transaction. A change before the create is counted as before (#1763
+  review).
+- **Risk.** The partition's own checks and uniqueness are a `constraint`
+  risk, and its own NOT NULLs a `not_null` risk. An unlogged partition is a
+  `destructive` risk: it takes rows that were durable, as a switch to
+  unlogged does (DEC-1443.1). The change does not carry whether the DEFAULT
+  is unlogged too, so the gate asks even then (#1763 review). An empty partition faced
+  neither, and the moved rows face both. The parent's hold already, since
+  the rows come from a partition of the same parent.
+- **Estimate.** Made on the DEFAULT: ACCESS EXCLUSIVE, every row read.
+- **Plan version 34.** It carries the field.
+
+**What the move does not need to ask.** These were checked before review
+found them:
+- **A partition key with a collation or opclass of its own.** The range
+  predicate compares through the column's collation and default operators.
+  A held tree's key carries neither: the tree is held only while
+  `pg_get_partkeydef` reads `RANGE (` and the bare column names. Measured on
+  18, a key with `COLLATE` or an opclass of its own reads back with it. So
+  does a key whose collation differs from its column's. A key whose
+  collation matches its column's reads bare, and there the predicate's
+  collation is the key's.
+- **A DEFAULT that is partitioned, or a foreign table.** Every child of a
+  held tree is a plain table (`relkind = 'r'`), so such a tree is not held,
+  and no move is planned for it.
+- **A temporal foreign key.** The model leaves it out, so only the catalog
+  holds it, and it is counted with its own operators, `&&` for its `PERIOD`
+  part. Measured on 18, a key over a period accepts no `ON DELETE` action
+  but `NO ACTION`. Every referenced row of one `(key, partition key)` lies
+  in one partition, so a referencing row that overlaps a moved row has lost
+  all it was covered by. The count and the engine's check then refuse
+  together, and a referencing row with another key is counted by neither.
+- **A publication created during the apply.** `CREATE PUBLICATION` locks no
+  table, so one created by another session after the moving statement asked
+  could take its insert. pbps does not manage publications (DEC-1444.1).
+  This is a second writer, which SPEC 7.6 assumes away.
+
+What the catalog cannot answer is left to a human by #1788's move intent:
+- a logical slot that decodes without a publication;
+- an application that reads a row's `xmin`;
+- a table too large to move in one transaction.
+
+Pinned by `a_range_added_beside_a_standing_default_names_it`,
+`a_range_beside_a_default_is_filled_from_it_and_attached`,
+`a_partition_beside_a_default_asks_what_its_move_would_fire`,
+`a_partition_beside_a_default_risks_what_its_own_parts_ask_of_rows`,
+`range_partitions_are_added_and_dropped_on_populated_trees`, which checks the
+moved rows against the engine's routing for two-column bounds, and on 18 a
+temporal key's count against the engine's refusal, and the CLI's
+`a_range_beside_a_default_takes_its_rows_through_the_cli`, on 18 and on 16.

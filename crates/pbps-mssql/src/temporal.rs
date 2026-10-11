@@ -228,6 +228,7 @@ mod tests {
             uid: "t_aaaaaa".parse().unwrap(),
             name: tname(name),
             table: Box::new(table),
+            beside_default: None,
         })
     }
 

@@ -795,6 +795,29 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // DEFAULT partition, if it has one, for rows in the new range; the
         // detach that drops one locks the parent and checks each table with a
         // foreign key to it for rows that reference the partition.
+        // Beside a standing DEFAULT partition, the DEFAULT is what is held
+        // and read (#1547, DEC-1547.1): measured on 16 and 18, its rows in the
+        // range are moved out under SHARE, and the attach then holds it
+        // exclusively and scans what is left, while the parent takes a lock
+        // only other schema changes wait on.
+        Change::CreateTable {
+            name,
+            table,
+            beside_default: Some(default),
+            ..
+        } => table.partition_of.as_ref().and_then(|of| {
+            e(
+                format!(
+                    "creating the partition {name} of {} by moving the rows of its range out of \
+                     the DEFAULT partition {default} and attaching it",
+                    of.parent
+                ),
+                default,
+                Rewrite::No,
+                Reads::EveryRow,
+                Lock::AccessExclusive,
+            )
+        }),
         Change::CreateTable { name, table, .. } => table.partition_of.as_ref().and_then(|of| {
             e(
                 format!("creating the partition {name} of {}", of.parent),
@@ -1081,6 +1104,48 @@ mod tests {
         }
     }
 
+    /// A partition made beside a standing DEFAULT is measured on the DEFAULT,
+    /// which the move reads and the attach holds; one made without is
+    /// measured on its parent, which `PARTITION OF` holds (#1547).
+    #[test]
+    fn a_partition_beside_a_default_is_measured_on_the_default() {
+        let partition = pbps_model::Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: tname("app.ev"),
+                bound: pbps_model::PartitionBound::Range {
+                    from: vec![pbps_model::BoundDatum::Value("2025-01-01".into())],
+                    to: vec![pbps_model::BoundDatum::Value("2026-01-01".into())],
+                },
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let create = |beside_default| {
+            estimate(
+                &Change::CreateTable {
+                    uid: "t_000000".parse().unwrap(),
+                    name: tname("app.ev_2025"),
+                    table: Box::new(partition.clone()),
+                    beside_default,
+                },
+                Strategy::default(),
+            )
+            .unwrap()
+        };
+        let moved = create(Some(tname("app.ev_rest")));
+        assert_eq!(moved.table, tname("app.ev_rest"));
+        assert!(matches!(moved.reads, Reads::EveryRow));
+        assert!(matches!(moved.lock, Lock::AccessExclusive));
+        // Negative: without a DEFAULT beside it, the parent is the one held.
+        let plain = create(None);
+        assert_eq!(plain.table, tname("app.ev"));
+        assert!(
+            matches!(plain.reads, Reads::Unknown(_)),
+            "{:?}",
+            plain.reads
+        );
+    }
+
     /// An index's parameters change in place, reading nothing; a B-tree's
     /// take `ShareUpdateExclusiveLock`, a GIN index's `AccessExclusiveLock`
     /// (measured on 16 and 18, #1442).
@@ -1336,6 +1401,7 @@ mod tests {
                     uid: "t_eeeeee".parse().unwrap(),
                     name: tname("app.b"),
                     table: Box::default(),
+                    beside_default: None,
                 }),
             ],
         };
@@ -1444,6 +1510,7 @@ mod tests {
                     uid: "t_bbbbbb".parse().unwrap(),
                     name: tname("app.t"),
                     table: Box::default(),
+                    beside_default: None,
                 }),
                 index("app.t"),
                 index("app.kept"),
@@ -1702,6 +1769,7 @@ mod tests {
                     uid: "t_bbbbbb".parse().unwrap(),
                     name: tname("app.t"),
                     table: Box::default(),
+                    beside_default: None,
                 }),
                 tighten("app.t"),
             ],

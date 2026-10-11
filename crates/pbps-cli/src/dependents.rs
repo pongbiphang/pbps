@@ -1777,6 +1777,119 @@ pub(crate) fn after_the_rebuilds(
     Ok(count + after_their_functions(cs, deps, &Partitions::of(declared))?)
 }
 
+/// A create that moves rows out of a DEFAULT partition (#1547) is never held
+/// behind a function, as [`after_their_functions`] holds a create whose own
+/// default calls one the plan creates later: what must follow the move — a
+/// tightening of the DEFAULT, a key into the tree, a trigger on it, a row
+/// write — would be let past it, and each was found one at a time (#1763
+/// review). Its own default is set instead by a `SetPartitionDefault` after
+/// the last function the text may call. The move inserts every column of
+/// the rows it takes, so it never evaluates the default; only rows inserted
+/// after the plan do, and by then it is set.
+///
+/// Nor is it held with a column the parent adds behind a function (the
+/// column's own default or expression calls it): its own default and NOT
+/// NULL on that column are split off into changes that follow the column.
+/// An own index or check naming the column cannot be, and
+/// [`after_their_functions`] refuses that plan by name.
+///
+/// Run before [`after_the_rebuilds`], which holds what calls a function. The
+/// create and what is split off it carry the dialect's risks recomputed: a
+/// NOT NULL the create no longer sets is a risk of the change that does.
+pub(crate) fn split_moving_defaults(cs: &mut ChangeSet, declared: &Schema, dialect: &dyn Dialect) {
+    let functions = function_creates(cs);
+    let called_after = |text: &str, at: usize| {
+        functions
+            .iter()
+            .filter(|(f, created)| *created > at && pbps_pg::generated::may_call(text, f))
+            .map(|(_, created)| *created)
+            .max()
+    };
+    let late: BTreeSet<ColumnRef> = cs
+        .changes
+        .iter()
+        .enumerate()
+        .filter_map(|(j, p)| {
+            let Change::AddColumn {
+                table,
+                name,
+                column,
+                ..
+            } = &p.change
+            else {
+                return None;
+            };
+            column_expression(column)
+                .and_then(|text| called_after(text, j))
+                .map(|_| table.column(name))
+        })
+        .collect();
+    // Each split change, with the place it goes right after.
+    let mut sets: Vec<(usize, Change)> = Vec::new();
+    for (i, p) in cs.changes.iter_mut().enumerate() {
+        let Change::CreateTable {
+            uid,
+            name,
+            table,
+            beside_default: Some(_),
+        } = &mut p.change
+        else {
+            continue;
+        };
+        let Some(of) = table.partition_of.as_mut() else {
+            continue;
+        };
+        let parent = of.parent.clone();
+        let before = sets.len();
+        for (column, own) in &mut of.columns {
+            let added_late = late.contains(&parent.column(column));
+            let after = own
+                .default
+                .as_deref()
+                .and_then(|text| called_after(text, i));
+            if (after.is_some() || added_late)
+                && let Some(to) = own.default.take()
+            {
+                sets.push((
+                    after.unwrap_or(i),
+                    Change::SetPartitionDefault {
+                        uid: uid.clone(),
+                        table: name.clone(),
+                        parent: parent.clone(),
+                        column: column.clone(),
+                        from: None,
+                        to: Some(to),
+                        fallback: parent_default(declared, name, column),
+                    },
+                ));
+            }
+            if added_late && std::mem::take(&mut own.not_null) {
+                sets.push((
+                    i,
+                    Change::SetPartitionNotNull {
+                        uid: uid.clone(),
+                        table: name.clone(),
+                        column: column.clone(),
+                        not_null: true,
+                    },
+                ));
+            }
+        }
+        of.columns.retain(|_, c| c.default.is_some() || c.not_null);
+        if sets.len() > before {
+            p.risks = dialect.change_risks(&p.change);
+        }
+    }
+    // Each right after its place, inserted from the last place back so that
+    // the earlier places still hold; two after one place keep their order.
+    // One split off for a column the parent adds names that column, so the
+    // reorder holds it behind the column as it would have held the create.
+    sets.sort_by_key(|(after, _)| *after);
+    for (after, change) in sets.into_iter().rev() {
+        cs.changes.insert(after + 1, planned(change, dialect));
+    }
+}
+
 /// The literals in the plan's expressions that may name a relation this plan
 /// brings into being only after them (#1576, DEC-1576.1). PostgreSQL resolves
 /// `'app.ix'::regclass` when the expression is created, so a default, check,
@@ -2902,7 +3015,8 @@ fn after_their_functions(
         // its place in the column order is (DEC-1364.1), so the whole table
         // waits instead. So does a new partition's own default (#1578),
         // which has no column of its own to split into an
-        // `AlterColumnDefault`.
+        // `AlterColumnDefault`; one beside a DEFAULT, whose create moves
+        // rows, had its default split off already (`split_moving_defaults`).
         let texts: Vec<&str> = match &p.change {
             Change::AddColumn { column, .. } => column_expression(column).into_iter().collect(),
             Change::CreateTable { table, .. } => table
@@ -2951,6 +3065,30 @@ fn after_their_functions(
         {
             held.insert(i);
         }
+    }
+    // A create that moves rows is never held (`split_moving_defaults`):
+    // what must follow the move would be let past it. One still held names a
+    // column the parent adds behind a function in an own index or check,
+    // which cannot be split off.
+    if let Some(Change::CreateTable {
+        name,
+        beside_default: Some(default),
+        ..
+    }) = held.iter().map(|&i| window[i]).find(|c| {
+        matches!(
+            c,
+            Change::CreateTable {
+                beside_default: Some(_),
+                ..
+            }
+        )
+    }) {
+        return Err(format!(
+            "{name} is made beside the DEFAULT partition {default} and takes its rows, but an \
+             index or check of its own names a column this plan adds after a function the \
+             column calls, so the move would have to wait for that function and let past it \
+             what must follow the move. Add the column in one plan and the partition in the next."
+        ));
     }
     let mut preds: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
     let mut previous_free: Option<usize> = None;
@@ -3427,6 +3565,7 @@ mod tests {
     /// `after_the_rebuilds` with no `depends_on:` edges, for an order it
     /// finds.
     fn rebuilds(cs: &mut ChangeSet, released: &BTreeSet<ColumnRef>) -> usize {
+        split_moving_defaults(cs, &pbps_model::Schema::default(), pg().as_ref());
         after_the_rebuilds(
             cs,
             released,
@@ -3892,6 +4031,7 @@ mod tests {
             uid: Uid::derived(UidKind::Table, "app.n", 0),
             name: n.clone(),
             table: Box::new(t.clone()),
+            beside_default: None,
         };
         #[allow(clippy::wildcard_enum_match_arm)]
         let table_of = |cs: &ChangeSet| match &cs.changes[0].change {
@@ -3953,11 +4093,13 @@ mod tests {
                     uid: Uid::derived(UidKind::Table, "app.n", 0),
                     name: n.clone(),
                     table: Box::new(parent.clone()),
+                    beside_default: None,
                 },
                 Change::CreateTable {
                     uid: Uid::derived(UidKind::Table, "app.n_1", 0),
                     name: p1.clone(),
                     table: Box::new(partition(column)),
+                    beside_default: None,
                 },
                 alter(&s, "app.f(integer)"),
             ]);
@@ -4145,6 +4287,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.n", 0),
                 name: n,
                 table: Box::new(t),
+                beside_default: None,
             },
             alter(&s, "app.f(integer)"),
         ]);
@@ -4212,6 +4355,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, name, 0),
                 name: name.parse().unwrap(),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let mut cs = plan(vec![
@@ -4267,6 +4411,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, name, 0),
                 name: name.parse().unwrap(),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let mut parent = Table::default();
@@ -4281,6 +4426,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.ev", 0),
                 name: "app.ev".parse().unwrap(),
                 table: Box::new(parent),
+                beside_default: None,
             },
             partition("app.ev_new", "app.f(1)"),
             partition("app.ev_plain", "7"),
@@ -4298,6 +4444,262 @@ mod tests {
         assert!(function < table_at("app.ev_new"), "{order:?}");
         assert!(table_at("app.ev") < function, "{order:?}");
         assert!(table_at("app.ev_plain") < function, "{order:?}");
+    }
+
+    /// A partition made beside a DEFAULT, whose own default calls a function
+    /// the plan creates later, is not held behind it: its default is set by
+    /// a `SetPartitionDefault` after the function, and the create keeps its
+    /// place before what must follow the move — the DEFAULT's tightenings, a
+    /// key into the tree, a trigger on the DEFAULT, a row write (#1763
+    /// review). A plain partition's create is still held, as #1578 holds it.
+    #[test]
+    fn a_move_out_of_a_default_is_not_held_and_its_own_default_follows_the_function() {
+        let partition = |default: Option<&str>| Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: pbps_model::PartitionBound::Range {
+                    from: vec![pbps_model::BoundDatum::Value("1".into())],
+                    to: vec![pbps_model::BoundDatum::Value("2".into())],
+                },
+                columns: [
+                    (
+                        "v".to_owned(),
+                        pbps_model::PartitionColumn {
+                            default: Some("app.f(1)".to_owned()),
+                            not_null: false,
+                        },
+                    ),
+                    (
+                        "w".to_owned(),
+                        pbps_model::PartitionColumn {
+                            default: default.map(str::to_owned),
+                            not_null: true,
+                        },
+                    ),
+                ]
+                .into(),
+            }),
+            ..Table::default()
+        };
+        let fk_into = |table: &str| {
+            Box::new(pbps_model::ForeignKey {
+                columns: vec!["v".into()],
+                references_table: table.parse().unwrap(),
+                references_columns: vec!["v".into()],
+                on_delete: pbps_model::ReferentialAction::default(),
+                on_update: pbps_model::ReferentialAction::default(),
+            })
+        };
+        let trigger = Change::CreateModule {
+            id: ModuleId::Trigger {
+                on: pbps_model::ObjectName::new("app", "ev_rest"),
+                name: "audit".into(),
+            },
+            module: Box::new(module(
+                ModuleKind::Trigger,
+                "AFTER DELETE ON app.ev_rest FOR EACH STATEMENT EXECUTE FUNCTION app.note()",
+            )),
+        };
+        let mut cs = plan(vec![
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, "app.ev_1", 0),
+                name: "app.ev_1".parse().unwrap(),
+                table: Box::new(partition(Some("7"))),
+                beside_default: Some("app.ev_rest".parse().unwrap()),
+            },
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, "app.ev_plain", 0),
+                name: "app.ev_plain".parse().unwrap(),
+                table: Box::new(partition(None)),
+                beside_default: None,
+            },
+            Change::SetPartitionNotNull {
+                uid: Uid::derived(UidKind::Column, "app.ev_rest", 0),
+                table: "app.ev_rest".parse().unwrap(),
+                column: "v".into(),
+                not_null: true,
+            },
+            Change::AddForeignKey {
+                table: "app.child".parse().unwrap(),
+                name: "child_ev_fk".into(),
+                constraint: fk_into("app.ev"),
+            },
+            trigger,
+            routine("app.f(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        let order = names(&cs);
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let function =
+            at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
+        let create = |n: &str| {
+            at(&|c| matches!(c, Change::CreateTable { name, .. } if name.to_string() == n))
+        };
+        let set = at(&|c| matches!(c, Change::SetPartitionDefault { .. }));
+        assert_eq!(create("app.ev_1"), 0, "{order:?}");
+        assert!(function < set, "{order:?}");
+        let Change::SetPartitionDefault {
+            table,
+            column,
+            from,
+            to,
+            ..
+        } = &cs.changes[set].change
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (table.to_string(), column.as_str(), from, to.as_deref()),
+            ("app.ev_1".to_owned(), "v", &None, Some("app.f(1)")),
+        );
+        // The create no longer carries the default it hands over; a default
+        // calling nothing new, and a NOT NULL, stay in it.
+        let Change::CreateTable { table, .. } = &cs.changes[0].change else {
+            unreachable!()
+        };
+        let own = &table.partition_of.as_ref().unwrap().columns;
+        assert!(!own.contains_key("v"), "{own:?}");
+        assert_eq!(own["w"].default.as_deref(), Some("7"));
+        assert!(own["w"].not_null);
+        // What must follow the move keeps its place after it.
+        let trigger = at(
+            &|c| matches!(c, Change::CreateModule { module, .. } if module.kind == ModuleKind::Trigger),
+        );
+        let key = at(&|c| matches!(c, Change::AddForeignKey { .. }));
+        let tightened = at(&|c| matches!(c, Change::SetPartitionNotNull { .. }));
+        assert!(create("app.ev_1") < tightened, "{order:?}");
+        assert!(
+            tightened < key && key < trigger && trigger < function,
+            "{order:?}"
+        );
+        // Negative: a partition with no DEFAULT beside it moves nothing, and
+        // is held behind the function as before, its default in place.
+        assert!(function < create("app.ev_plain"), "{order:?}");
+        assert_eq!(
+            cs.changes
+                .iter()
+                .filter(|p| matches!(p.change, Change::SetPartitionDefault { .. }))
+                .count(),
+            1,
+            "{order:?}"
+        );
+    }
+
+    /// A partition made beside a DEFAULT, with its own default and NOT NULL on
+    /// a column the parent adds behind a function the column's default calls,
+    /// is not held with that column: both are split off and follow it, and
+    /// the DEFAULT's tightening keeps its place after the move (#1763
+    /// review). With an own index on that column instead, which cannot be
+    /// split off, the plan is refused by name.
+    #[test]
+    fn a_move_beside_a_column_added_behind_a_function_is_not_held_with_it() {
+        let make = |indexed: bool| {
+            let mut t = Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Range {
+                        from: vec![pbps_model::BoundDatum::Value("1".into())],
+                        to: vec![pbps_model::BoundDatum::Value("2".into())],
+                    },
+                    columns: [(
+                        "extra".to_owned(),
+                        pbps_model::PartitionColumn {
+                            default: Some("9".to_owned()),
+                            not_null: true,
+                        },
+                    )]
+                    .into(),
+                }),
+                ..Table::default()
+            };
+            if indexed {
+                t.indexes.insert(
+                    "ev_1_extra".into(),
+                    pbps_model::Index {
+                        columns: vec![pbps_model::IndexColumn {
+                            key: pbps_model::IndexKey::Column("extra".into()),
+                            descending: false,
+                            opclass: None,
+                        }],
+                        include: Vec::new(),
+                        unique: false,
+                        filter: None,
+                        method: Default::default(),
+                        storage_parameters: Default::default(),
+                    },
+                );
+            }
+            let mut extra = Column::new("integer".parse().unwrap());
+            extra.default = Some("app.f(1)".into());
+            plan(vec![
+                Change::AddColumn {
+                    uid: Uid::derived(UidKind::Column, "app.ev.extra", 0),
+                    table: "app.ev".parse().unwrap(),
+                    name: "extra".into(),
+                    column: Box::new(extra),
+                },
+                Change::CreateTable {
+                    uid: Uid::derived(UidKind::Table, "app.ev_1", 0),
+                    name: "app.ev_1".parse().unwrap(),
+                    table: Box::new(t),
+                    beside_default: Some("app.ev_rest".parse().unwrap()),
+                },
+                Change::SetPartitionNotNull {
+                    uid: Uid::derived(UidKind::Table, "app.ev_rest", 0),
+                    table: "app.ev_rest".parse().unwrap(),
+                    column: "v".into(),
+                    not_null: true,
+                },
+                routine("app.f(integer)", "SELECT 1"),
+            ])
+        };
+        let mut cs = make(false);
+        rebuilds(&mut cs, &BTreeSet::new());
+        let order = names(&cs);
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let function =
+            at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
+        let added = at(&|c| matches!(c, Change::AddColumn { .. }));
+        let create = at(&|c| matches!(c, Change::CreateTable { .. }));
+        let tightened = at(
+            &|c| matches!(c, Change::SetPartitionNotNull { table, .. } if table.name == "ev_rest"),
+        );
+        let own_default = at(&|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, to, .. }
+            if table.name == "ev_1" && column == "extra" && to.as_deref() == Some("9"))
+        });
+        let own_not_null = at(&|c| {
+            matches!(c, Change::SetPartitionNotNull { table, column, not_null: true, .. }
+            if table.name == "ev_1" && column == "extra")
+        });
+        assert!(create < tightened && tightened < function, "{order:?}");
+        assert!(function < added, "{order:?}");
+        assert!(added < own_default && added < own_not_null, "{order:?}");
+        let Change::CreateTable { table, .. } = &cs.changes[create].change else {
+            unreachable!()
+        };
+        assert!(
+            table.partition_of.as_ref().unwrap().columns.is_empty(),
+            "{order:?}"
+        );
+        // Negative: an own index on the column cannot be split off, and the
+        // plan is refused by name rather than letting the tightening past.
+        let mut indexed = make(true);
+        split_moving_defaults(&mut indexed, &pbps_model::Schema::default(), pg().as_ref());
+        let why = after_the_rebuilds(
+            &mut indexed,
+            &BTreeSet::new(),
+            &ModuleDeps::new(),
+            &pbps_model::Schema::default(),
+        )
+        .unwrap_err();
+        assert!(
+            why.contains("app.ev_1 is made beside the DEFAULT partition app.ev_rest")
+                && why.contains("Add the column in one plan and the partition in the next"),
+            "{why}"
+        );
     }
 
     /// A new partitioned parent held behind the function its generated column
@@ -4325,6 +4727,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, name, 0),
                 name: name.parse().unwrap(),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let partition = |name: &str, of: &str| Change::CreateTable {
@@ -4338,6 +4741,7 @@ mod tests {
                 }),
                 ..Table::default()
             }),
+            beside_default: None,
         };
         let mut cs = plan(vec![
             parent("app.ev", Some("app.f(k)")),
@@ -4386,6 +4790,7 @@ mod tests {
                 }),
                 ..Table::default()
             }),
+            beside_default: None,
         };
         let index_on = |column: &str| pbps_model::Index {
             columns: vec![pbps_model::IndexColumn {
@@ -4406,12 +4811,18 @@ mod tests {
                 uid,
                 name,
                 mut table,
+                ..
             } = partition(name, "v")
             else {
                 unreachable!("a partition is created");
             };
             table.indexes.insert(index.into(), index_on(column));
-            Change::CreateTable { uid, name, table }
+            Change::CreateTable {
+                uid,
+                name,
+                table,
+                beside_default: None,
+            }
         };
         // A standing partition's own changes on the column, and a default
         // on another parent's column of the same name.
@@ -4549,6 +4960,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, name, 0),
                 name: name.parse().unwrap(),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         // A later new table naming app.n only inside an OID-alias literal.
@@ -4561,6 +4973,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.literal", 0),
                 name: "app.literal".parse().unwrap(),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         // And a new partition naming it only in its own default (#1578).
@@ -4582,6 +4995,7 @@ mod tests {
                 }),
                 ..Table::default()
             }),
+            beside_default: None,
         };
         let mut cs = plan(vec![
             new_table("app.n", &[("id", None), ("g", Some("app.f(id)"))], None),
@@ -4650,6 +5064,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.other", 0),
                 name: "app.other".parse().unwrap(),
                 table: Box::new(other),
+                beside_default: None,
             },
             routine("app.f(integer)", "SELECT count(*)::integer FROM app.other"),
         ]);
@@ -6305,6 +6720,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.t", 1),
                 name: TableName::new("app", "t"),
                 table: Box::new(s.tables[&TableName::new("app", "t")].clone()),
+                beside_default: None,
             },
         ]);
         let found = BTreeMap::from([(
@@ -6831,6 +7247,7 @@ mod tests {
                 }),
                 ..Table::default()
             }),
+            beside_default: None,
         };
         let refused =
             refusal_of(&plan(vec![partition, add_index("ix_new", None)]), &*pg()).unwrap_err();
@@ -6873,6 +7290,7 @@ mod tests {
             uid: Uid::derived(UidKind::Table, "app.n", 0),
             name: TableName::new("app", "n"),
             table: Box::new(table),
+            beside_default: None,
         }
     }
 
@@ -7067,6 +7485,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, &format!("app.{table}"), 0),
                 name: TableName::new("app", table),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let cut = format!("{}_pkey", "t".repeat(58));
@@ -7110,6 +7529,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.n", 0),
                 name: TableName::new("app", "n"),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let row_of = |trigger: &str| {
@@ -7203,6 +7623,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, &format!("app.{table}"), 0),
                 name: TableName::new("app", table),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let holder = |name: &str, owner: Option<&str>, primary_key: bool| KeyNameHolder {
@@ -7380,6 +7801,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, &format!("app.{table}"), 0),
                 name: TableName::new("app", table),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let rename = |from: TableName, to: TableName| Change::RenameTable {
@@ -7505,6 +7927,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "s2.n", 0),
                 name: TableName::new("s2", "n"),
                 table: Box::new(in_s2),
+                beside_default: None,
             },
         ];
         let prefixes = key_name_prefixes(&plan(chain.clone()));
@@ -7562,6 +7985,7 @@ mod tests {
             uid: Uid::derived(UidKind::Table, "app.long", 0),
             name: TableName::new("app", &long),
             table: Box::new(t.clone()),
+            beside_default: None,
         }]));
         assert_eq!(prefixes, [("app".to_owned(), "t".repeat(49))]);
         for n in [0, 1, 10, 1000] {

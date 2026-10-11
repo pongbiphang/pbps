@@ -436,6 +436,40 @@ pub fn diff_partial(
     )
 }
 
+/// The DEFAULT partition a new range partition is made beside, under the
+/// name the plan leaves it (#1547, DEC-1547.1): one the base holds as the
+/// parent's DEFAULT and the declarations keep as that parent's. Its rows in
+/// the new range are moved into the partition before it is attached, so the
+/// plan is the same whether it holds any or not. A parent the plan creates
+/// has none, and neither has a DEFAULT the plan drops, detaches or makes:
+/// one leaving goes in class 6, before the partition is created, and a new
+/// one starts empty. The name is the declared one because renames run in
+/// class 1, before every create.
+fn standing_default(
+    base: Side<'_>,
+    declared: Side<'_>,
+    of: &pbps_model::PartitionOf,
+) -> Option<TableName> {
+    if !matches!(of.bound, pbps_model::PartitionBound::Range { .. }) {
+        return None;
+    }
+    let parent = base.ids.tables.get(declared.ids.table_uid(&of.parent)?)?;
+    let is_default_of = |side: Side<'_>, name: &TableName, parent: &TableName| {
+        side.schema
+            .tables
+            .get(name)
+            .and_then(|t| t.partition_of.as_ref())
+            .is_some_and(|o| {
+                &o.parent == parent && matches!(o.bound, pbps_model::PartitionBound::Default)
+            })
+    };
+    declared.ids.tables.iter().find_map(|(uid, name)| {
+        let was = base.ids.tables.get(uid)?;
+        (is_default_of(declared, name, &of.parent) && is_default_of(base, was, parent))
+            .then(|| name.clone())
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn diff_partial_rebuilding(
     base: Side<'_>,
@@ -525,10 +559,15 @@ fn diff_partial_rebuilding(
                 }),
                 (None, _) => {}
             }
+            let beside_default = table
+                .partition_of
+                .as_ref()
+                .and_then(|of| standing_default(base, declared, of));
             changes.push(Change::CreateTable {
                 uid: uid.clone(),
                 name: name.clone(),
                 table: Box::new(table),
+                beside_default,
             });
         }
     }
@@ -1431,6 +1470,21 @@ fn diff_partial_rebuilding(
         })
         .cloned()
         .collect();
+    // The DEFAULT partitions a create in this plan moves rows out of (#1547).
+    let moved_out_of: BTreeSet<TableName> = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::CreateTable {
+                beside_default: Some(default),
+                ..
+            } = &p.change
+            {
+                Some(default.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
     let follows_its_parent = |c: &Change| -> bool {
         let (Change::SetPartitionDefault { table, column, .. }
         | Change::SetPartitionNotNull { table, column, .. }) = c
@@ -1452,6 +1506,21 @@ fn diff_partial_rebuilding(
         }
         if follows_late_attach(c) {
             return (ROW_DELETIONS - 1, 2);
+        }
+        // A DEFAULT partition's own NOT NULL, tightened in a plan that moves
+        // rows out of it, comes after every create that moves them, whatever
+        // class the create lands in (7, or (9, 5) under a parent whose columns
+        // change): the rows the move takes may be the ones holding NULL there,
+        // and the engine scans what is left. Its own checks and uniques are of
+        // class 13, after every create already (#1763 review).
+        if let Change::SetPartitionNotNull {
+            table,
+            not_null: true,
+            ..
+        } = c
+            && moved_out_of.contains(table)
+        {
+            return (COLUMN_ALTERATIONS, 6);
         }
         if follows_its_parent(c) {
             return (COLUMN_ALTERATIONS, 4);
@@ -8400,6 +8469,263 @@ mod tests {
             kinds(&planned).contains(&"CreateTable".to_owned()),
             "{:?}",
             kinds(&planned)
+        );
+    }
+
+    /// A range partition added under a standing parent is made beside the
+    /// DEFAULT partition the base and the declarations both hold, which the
+    /// change names; without one standing on both sides there is none to
+    /// move rows out of (#1547, DEC-1547.1).
+    #[test]
+    fn a_range_added_beside_a_standing_default_names_it() {
+        use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionOf};
+        let mut parent = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("ts", Column::new(ty("date")).not_null()),
+        ]);
+        parent.partition_by = Some(PartitionBy {
+            columns: vec!["ts".into()],
+        });
+        let partition = |bound: PartitionBound| Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let range = |from: &str, to: &str| {
+            partition(PartitionBound::Range {
+                from: vec![BoundDatum::Value(from.into())],
+                to: vec![BoundDatum::Value(to.into())],
+            })
+        };
+        let bare = schema_of("app.ev", parent);
+        let mut tree = bare.clone();
+        tree.tables.insert(
+            "app.ev_rest".parse().unwrap(),
+            partition(PartitionBound::Default),
+        );
+        let with = |base: &Schema, added: &[(&str, Table)], removed: &[&str]| {
+            let mut declared = base.clone();
+            for (name, t) in added {
+                declared.tables.insert(name.parse().unwrap(), t.clone());
+            }
+            for name in removed {
+                declared.tables.remove(&name.parse::<TableName>().unwrap());
+            }
+            declared
+        };
+        let beside = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            let cs = diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .expect("planned");
+            cs.changes
+                .iter()
+                .filter_map(|p| match &p.change {
+                    Change::CreateTable {
+                        name,
+                        beside_default,
+                        ..
+                    } => Some((
+                        name.to_string(),
+                        beside_default.as_ref().map(ToString::to_string),
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let year = [("app.ev_2025", range("2025-01-01", "2026-01-01"))];
+        assert_eq!(
+            beside(&tree, &with(&tree, &year, &[]), &[]),
+            [("app.ev_2025".to_owned(), Some("app.ev_rest".to_owned()))]
+        );
+        // Negative: no DEFAULT beside it.
+        assert_eq!(
+            beside(&bare, &with(&bare, &year, &[]), &[]),
+            [("app.ev_2025".to_owned(), None)]
+        );
+        // Negative: a DEFAULT made in the same plan starts empty.
+        let both = with(
+            &bare,
+            &[
+                year[0].clone(),
+                ("app.ev_rest", partition(PartitionBound::Default)),
+            ],
+            &[],
+        );
+        assert!(
+            beside(&bare, &both, &[]).iter().all(|(_, d)| d.is_none()),
+            "{:?}",
+            beside(&bare, &both, &[])
+        );
+        // Negative: a DEFAULT the plan drops is gone before the partition is
+        // made.
+        let drop = [Intent::DropTable {
+            table: "app.ev_rest".parse().unwrap(),
+            reason: "gone".into(),
+        }];
+        assert_eq!(
+            beside(&tree, &with(&tree, &year, &["app.ev_rest"]), &drop),
+            [("app.ev_2025".to_owned(), None)]
+        );
+        // Negative: a whole new tree has nothing standing.
+        assert!(
+            beside(&Schema::default(), &with(&tree, &year, &[]), &[])
+                .iter()
+                .all(|(_, d)| d.is_none())
+        );
+    }
+
+    /// A DEFAULT partition's own NOT NULL, tightened in the plan that moves
+    /// rows out of it, follows the create that moves them: under a parent
+    /// whose columns change, that create comes at (9, 5), after the
+    /// partition alterations it would otherwise follow (#1763 review).
+    #[test]
+    fn a_default_tightened_in_a_moving_plan_follows_the_move() {
+        use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+        let mut parent = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("ts", Column::new(ty("date")).not_null()),
+            ("v", Column::new(ty("int"))),
+        ]);
+        parent.partition_by = Some(PartitionBy {
+            columns: vec!["ts".into()],
+        });
+        let partition = |bound: PartitionBound, not_null: bool| Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound,
+                columns: if not_null {
+                    [(
+                        "v".to_owned(),
+                        PartitionColumn {
+                            default: None,
+                            not_null: true,
+                        },
+                    )]
+                    .into_iter()
+                    .collect()
+                } else {
+                    Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+        let range = |from: &str, to: &str, not_null: bool| {
+            partition(
+                PartitionBound::Range {
+                    from: vec![BoundDatum::Value(from.into())],
+                    to: vec![BoundDatum::Value(to.into())],
+                },
+                not_null,
+            )
+        };
+        let mut base = schema_of("app.ev", parent.clone());
+        base.tables.insert(
+            "app.ev_rest".parse().unwrap(),
+            partition(PartitionBound::Default, false),
+        );
+        base.tables.insert(
+            "app.ev_2020".parse().unwrap(),
+            range("2020-01-01", "2021-01-01", false),
+        );
+        let order = |declared: &Schema| -> Vec<String> {
+            let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .expect("planned")
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::CreateTable { name, .. } = &p.change {
+                    Some(format!("create {name}"))
+                } else if let Change::SetPartitionNotNull {
+                    table, not_null, ..
+                } = &p.change
+                {
+                    Some(format!("not null {table} {not_null}"))
+                } else if let Change::AlterColumnDefault { column, .. } = &p.change {
+                    Some(format!("default {}", column.table))
+                } else {
+                    None
+                }
+            })
+            .collect()
+        };
+        let mut declared = base.clone();
+        declared
+            .tables
+            .get_mut(&"app.ev".parse::<TableName>().unwrap())
+            .unwrap()
+            .columns
+            .get_mut("v")
+            .unwrap()
+            .default = Some("1".into());
+        declared.tables.insert(
+            "app.ev_rest".parse().unwrap(),
+            partition(PartitionBound::Default, true),
+        );
+        declared.tables.insert(
+            "app.ev_2020".parse().unwrap(),
+            range("2020-01-01", "2021-01-01", true),
+        );
+        declared.tables.insert(
+            "app.ev_2030".parse().unwrap(),
+            range("2030-01-01", "2031-01-01", false),
+        );
+        assert_eq!(
+            order(&declared),
+            [
+                "default app.ev",
+                "not null app.ev_2020 true",
+                "create app.ev_2030",
+                "not null app.ev_rest true",
+            ]
+        );
+        // Negative: with no range added beside it, the DEFAULT's own NOT
+        // NULL keeps its place after its parent's change.
+        declared
+            .tables
+            .remove(&"app.ev_2030".parse::<TableName>().unwrap());
+        assert_eq!(
+            order(&declared),
+            [
+                "default app.ev",
+                "not null app.ev_2020 true",
+                "not null app.ev_rest true",
+            ]
         );
     }
 

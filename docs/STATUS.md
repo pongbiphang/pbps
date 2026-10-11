@@ -74,9 +74,10 @@ parameters (#1580, DEC-1580.1), and leaves any other tree out
 whole, by name. A
 tree is created whole, and a partition nobody declared is refused with the
 commands that adopt it (#1170, DEC-1170.1). A partition is then added under its
-standing parent, or dropped with drop intent; the apply's pre-flight refuses a
-range over DEFAULT-partition rows and the drop of a referenced partition
-(#1171, DEC-1171.1). A partition declared in a file of its own with its
+standing parent, or dropped with drop intent; the apply's pre-flight refuses
+the drop of a referenced partition (#1171, DEC-1171.1). A range added beside a
+standing DEFAULT partition takes the DEFAULT's rows of its range, made as a
+plain table, filled and attached (#1547, DEC-1547.1). A partition declared in a file of its own with its
 parent's shape is detached and kept, under its declared names (#1544,
 DEC-1544.1). A standing partition's own indexes, checks, defaults, NOT NULLs,
 storage parameters and persistence change on it alone (#1581, DEC-1581.1). An
@@ -87,8 +88,8 @@ rows, after a pre-flight count of the rows its range does not take (#1545,
 DEC-1545.1). A standing parent's columns change, recursed into every partition
 (#1687, DEC-1687.1), and its indexes (#1688, DEC-1688.1), keys, checks and
 foreign keys (#1689, DEC-1689.1) are added and dropped, and it is renamed
-(#1690, DEC-1690.1). Moving DEFAULT-partition rows (#1547) and attaching as the
-DEFAULT partition (#1639) stay refused by name.
+(#1690, DEC-1690.1). Attaching as the DEFAULT partition (#1639) stays refused
+by name.
 
 A SQL Server column may name its collation (`collation:`); `pull` declares one
 that differs from the database's default, and a collation change is a planned

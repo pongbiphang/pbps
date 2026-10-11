@@ -160,6 +160,7 @@ fn an_empty_new_table_has_an_answer_and_is_not_an_unchecked_key() {
         uid: "t_a1b2c3".parse().unwrap(),
         name: TableName::new("app", "items"),
         table: Box::new(table),
+        beside_default: None,
     };
     for dialect in [
         &pbps_mssql::Mssql as &dyn Dialect,

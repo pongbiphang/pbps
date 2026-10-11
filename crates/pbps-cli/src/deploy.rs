@@ -3675,6 +3675,11 @@ fn refuse_unplanned_movement(
     // after a function the plan rebuilds (#1027, DEC-942.1), so the payload
     // alone is not what the column will hold, as with its parts above.
     let mut set_defaults: BTreeMap<(&TableName, &str), Option<&String>> = BTreeMap::new();
+    // And a partition's own default and NOT NULL, which a partition made
+    // beside a DEFAULT has set after the function or the parent's column it
+    // waits for, not in its `CREATE` (#1763 review).
+    let mut set_partition_defaults: BTreeMap<(&TableName, &str), bool> = BTreeMap::new();
+    let mut set_partition_not_nulls: BTreeMap<(&TableName, &str), bool> = BTreeMap::new();
     // A freeing drop can now run before its owner's table rename. Its typed
     // address is the one that exists at execution; shape exclusions and net
     // postconditions must follow only the subsequent renames (DECISIONS 496).
@@ -3762,7 +3767,10 @@ fn refuse_unplanned_movement(
                 }
             }
         }
-        if let pbps_model::Change::CreateTable { uid, name, table } = &p.change {
+        if let pbps_model::Change::CreateTable {
+            uid, name, table, ..
+        } = &p.change
+        {
             created.insert(name, table.as_ref());
             created_uids.insert(name, uid);
         }
@@ -3832,6 +3840,21 @@ fn refuse_unplanned_movement(
         }
         if let pbps_model::Change::AlterColumnDefault { column, to, .. } = &p.change {
             set_defaults.insert((&column.table, column.name.as_str()), to.as_ref());
+        }
+        if let pbps_model::Change::SetPartitionDefault {
+            table, column, to, ..
+        } = &p.change
+        {
+            set_partition_defaults.insert((table, column.as_str()), to.is_some());
+        }
+        if let pbps_model::Change::SetPartitionNotNull {
+            table,
+            column,
+            not_null,
+            ..
+        } = &p.change
+        {
+            set_partition_not_nulls.insert((table, column.as_str()), *not_null);
         }
         if let pbps_model::Change::AddForeignKey {
             table,
@@ -4242,7 +4265,21 @@ fn refuse_unplanned_movement(
                     "{now_name} is not attached to the parent and range this plan declares"
                 ));
             }
-            if settled.whole() && own(declared) != own(now) {
+            // With the defaults this plan sets after the `CREATE`, as a
+            // column's above.
+            let mut finished = own(declared);
+            for ((t, c), has) in &set_partition_defaults {
+                if *t == now_name {
+                    finished.entry((*c).to_owned()).or_default().0 = *has;
+                }
+            }
+            for ((t, c), not_null) in &set_partition_not_nulls {
+                if *t == now_name {
+                    finished.entry((*c).to_owned()).or_default().1 = *not_null;
+                }
+            }
+            finished.retain(|_, held| *held != (false, false));
+            if settled.whole() && finished != own(now) {
                 moved.push(format!(
                     "{now_name}'s own column defaults or NOT NULLs are not the ones this plan's \
                      `CREATE TABLE` declares"
@@ -9757,6 +9794,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            beside_default: None,
         });
         let at = |name: &TableName| NameOccupant {
             wanted: name.clone(),
@@ -9813,6 +9851,7 @@ mod tests {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.x", 0),
                 name: x.clone(),
                 table: Box::default(),
+                beside_default: None,
             })
         };
         let occupant = |kind: &str, parent: Option<&TableName>| NameOccupant {
@@ -10047,6 +10086,7 @@ mod tests {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.n", 0),
                 name: name.clone(),
                 table: Box::default(),
+                beside_default: None,
             })
         };
         let rename_column = || {
@@ -10661,6 +10701,7 @@ mod tests {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.x", 0),
                 name: x.clone(),
                 table: Box::new(table),
+                beside_default: None,
             })])
         };
         assert_eq!(
@@ -10816,6 +10857,7 @@ mod tests {
                     unlogged,
                     ..Table::default()
                 }),
+                beside_default: None,
             })
         };
         let referencer = |of: &TableName| PermanentReferencer {
@@ -11062,6 +11104,7 @@ mod tests {
                 unlogged: true,
                 ..Table::default()
             }),
+            beside_default: None,
         });
         let rename_parent = PlannedChange::new(Change::RenameTable {
             uid: "t_dddddd".parse().unwrap(),
@@ -11150,6 +11193,7 @@ mod tests {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "archive.u", 0),
             name: TableName::new("archive", "u"),
             table: Box::new(declared),
+            beside_default: None,
         });
         assert!(
             refused(vec![created], &held).is_err(),
@@ -11662,6 +11706,7 @@ mod tests {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "archive.x", 0),
                 name: name.clone(),
                 table: Box::default(),
+                beside_default: None,
             })
         };
         let sequence = NameOccupant {
@@ -11809,6 +11854,7 @@ mod tests {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.x", 0),
                 name: x.clone(),
                 table: Box::default(),
+                beside_default: None,
             })
         };
         let view = || Module {
@@ -11992,6 +12038,7 @@ mod tests {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, name, 0),
                 name: TableName::new("app", name),
                 table: Box::default(),
+                beside_default: None,
             })
         };
         let unnamed_key_on = |table: &TableName| {
@@ -12122,6 +12169,7 @@ mod tests {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.x", 0),
                 name: x.clone(),
                 table: Box::default(),
+                beside_default: None,
             })],
         };
         let empty = pbps_diff::Scoped {
@@ -14501,6 +14549,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "dbo.new".parse().unwrap(),
                     table: Box::new(pbps_model::Table::default()),
+                    beside_default: None,
                 }),
                 pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
                     table: "dbo.new".parse().unwrap(),
@@ -14781,6 +14830,7 @@ mod tests {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(created.clone()),
+                beside_default: None,
             })],
         };
         let read = |edit: &dyn Fn(&mut Table)| {
@@ -14846,6 +14896,7 @@ mod tests {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(created.clone()),
+                beside_default: None,
             })],
         };
         let read = |edit: &dyn Fn(&mut std::collections::BTreeMap<String, PartitionColumn>)| {
@@ -14920,6 +14971,7 @@ mod tests {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(created.clone()),
+                beside_default: None,
             })],
         };
         let read = |edit: &dyn Fn(&mut Table)| {
@@ -15000,6 +15052,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: name.clone(),
                     table: Box::new(created.clone()),
+                    beside_default: None,
                 }),
                 PlannedChange::new(Change::AddIndex {
                     table: name.clone(),
@@ -15117,6 +15170,7 @@ mod tests {
                 uid: "t_000000".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(table(None, "80")),
+                beside_default: None,
             })],
         };
         let empty = Schema::default();
@@ -15731,6 +15785,7 @@ mod tests {
                 uid: "t_000000".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(declared),
+                beside_default: None,
             })],
         };
         let empty = Schema::default();
@@ -15838,6 +15893,7 @@ mod tests {
             uid: "t_000000".parse().unwrap(),
             name: name.clone(),
             table: Box::new(declared),
+            beside_default: None,
         }]);
         let empty = Schema::default();
         check(&creating, &empty, &schema(Some("6 months")), Settled::SoFar).expect("as created");
@@ -15931,6 +15987,7 @@ mod tests {
                 uid: "t_000000".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(declared),
+                beside_default: None,
             })],
         };
         let empty = Schema::default();
@@ -16045,6 +16102,7 @@ mod tests {
                 uid: "t_000000".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(declared),
+                beside_default: None,
             })],
         };
         let empty = Schema::default();
@@ -16083,6 +16141,7 @@ mod tests {
                     uid: "t_000000".parse().unwrap(),
                     name: name.clone(),
                     table: Box::new(bare),
+                    beside_default: None,
                 }),
                 PlannedChange::new(Change::SetReplicaIdentity {
                     uid: "t_000000".parse().unwrap(),
@@ -16370,6 +16429,7 @@ mod tests {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(created.clone()),
+                beside_default: None,
             })],
         };
         let read = |f: &dyn Fn(&mut Table)| {
@@ -16432,6 +16492,7 @@ mod tests {
             uid: "t_aaaaaa".parse().unwrap(),
             name: name.clone(),
             table: Box::new(created.clone()),
+            beside_default: None,
         });
         let set_default = PlannedChange::new(Change::AlterColumnDefault {
             uid: "c_bbbbbb".parse().unwrap(),
@@ -16528,6 +16589,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: name.clone(),
                     table: Box::new(declared.clone()),
+                    beside_default: None,
                 },
             )],
         };
@@ -16668,6 +16730,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "dbo.new".parse().unwrap(),
                     table: Box::new(declared()),
+                    beside_default: None,
                 },
             )],
         };
@@ -16699,6 +16762,7 @@ mod tests {
                         );
                         t
                     }),
+                    beside_default: None,
                 },
             )],
         };
@@ -16793,6 +16857,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "dbo.new".parse().unwrap(),
                     table: Box::new(declared()),
+                    beside_default: None,
                 }),
                 pbps_model::PlannedChange::new(pbps_model::Change::AddForeignKey {
                     table: "dbo.new".parse().unwrap(),
@@ -16830,6 +16895,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "dbo.new".parse().unwrap(),
                     table: Box::new(t),
+                    beside_default: None,
                 },
             )],
         };
@@ -16917,6 +16983,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "dbo.new".parse().unwrap(),
                     table: Box::new(t),
+                    beside_default: None,
                 },
             )],
         };
@@ -16992,6 +17059,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "dbo.new".parse().unwrap(),
                     table: Box::new(declared()),
+                    beside_default: None,
                 }),
                 pbps_model::PlannedChange::new(pbps_model::Change::AddForeignKey {
                     table: "dbo.new".parse().unwrap(),
@@ -17626,6 +17694,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "dbo.new".parse().unwrap(),
                     table: Box::new(pbps_model::Table::default()),
+                    beside_default: None,
                 },
             )],
         };
@@ -17683,6 +17752,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "dbo.new".parse().unwrap(),
                     table: Box::new(pbps_model::Table::default()),
+                    beside_default: None,
                 },
             )],
         };
