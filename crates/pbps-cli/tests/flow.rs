@@ -27,6 +27,14 @@ mod pty;
 #[path = "support/envelope_archives.rs"]
 mod envelope_archives;
 
+#[path = "support/fmt_scalars.rs"]
+mod fmt_scalars;
+
+#[test]
+fn formatting_preserves_multiline_data_and_refuses_malformed_yaml() {
+    fmt_scalars::check("mssql");
+}
+
 #[path = "support/resolver_selection.rs"]
 mod resolver_selection;
 
