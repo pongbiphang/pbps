@@ -198,6 +198,28 @@ test('master runs nightly rather than on push, and only master saves caches', ()
   }
 });
 
+test('release-windows starts on every non-PR event and conditions everything after its scope decision', () => {
+  const steps = job('release-windows').split(/^      - /m).slice(1);
+  const scope = steps.findIndex(step => /^        id: scope$/m.test(step));
+  assert.ok(scope > 0, 'the job decides its scope in a step with id `scope`');
+  const decide = steps[scope];
+  assert.match(decide, /^          python scripts\/ci_release_scope\.py$/m);
+  assert.match(decide, /^          EVENT: \$\{\{ github\.event_name \}\}$/m);
+  assert.match(decide, /^          BASE_SHA: \$\{\{ github\.event\.merge_group\.base_sha \}\}$/m);
+  assert.match(decide, /^          HEAD_SHA: \$\{\{ needs\.approve\.outputs\.checkout_sha \}\}$/m);
+  for (const step of steps.slice(0, scope)) {
+    assert.doesNotMatch(step, /^        if:/m, 'the steps the decision needs always run');
+  }
+  const later = steps.slice(scope + 1);
+  assert.ok(later.length > 0);
+  for (const step of later) {
+    const conditions = [...step.matchAll(/^        if: (.+)$/gm)].map(match => match[1]);
+    assert.equal(conditions.length, 1, `one condition on: ${step.split('\n')[0]}`);
+    assert.ok(conditions[0].includes("steps.scope.outputs.run == 'true'"),
+      `a step after the decision runs only when it says so: ${step.split('\n')[0]}`);
+  }
+});
+
 test('every job uses one validated intended-base checkout rather than an unverified event SHA', () => {
   const head = 'a'.repeat(40);
   const staleMerge = 'b'.repeat(40);

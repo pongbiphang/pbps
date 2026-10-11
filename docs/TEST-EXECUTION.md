@@ -256,6 +256,22 @@ inspection refuses redistributable C++ runtimes and database/TLS client DLLs.
 The required gate waits for both jobs. A compiler target alone is not runtime
 qualification.
 
+`release-linux` runs in full on every run. `release-windows` runs on the merge
+group, the nightly `master` run and dispatched runs, never on a pull request
+(DEC-1835.1). Its first step, `scripts/ci_release_scope.py`, decides whether
+the rest runs (DEC-1834.1). A merge group runs it in full only when the change
+touches an input of the qualification:
+- the workspace or any crate `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`
+  or `.cargo/config`;
+- `crates/pbps-db`, the only crate that builds a driver or TLS configuration;
+- the release scripts or `ci.yml`.
+
+Otherwise the job reports success without building, and says why in its step
+summary. The nightly and dispatched runs always run it in full. That backstop
+reports a regression from a change outside that set at most a day after it
+merged. A diff that cannot be read, or an event without a defined scope, runs
+in full.
+
 `scripts/qualify-release.py` accepts an already-built binary. It hashes that
 file, copies it into a generated staging directory and verifies its hash again
 inside a native consumer container. Only that staging directory is mounted:
