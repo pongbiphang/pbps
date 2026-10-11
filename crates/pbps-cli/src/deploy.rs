@@ -6148,7 +6148,11 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
 }
 
 /// `pbps baseline` — take the database as it stands as the new starting point.
-pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow::Result<()> {
+pub fn cmd_baseline(
+    project: &Project,
+    target: &Target,
+    reason: &pbps_model::Reason,
+) -> anyhow::Result<()> {
     let ids = crate::read_ids(project)?;
     let (declared_modules, declared_data, loaded) =
         declared_scope(project, crate::dialect(project)?.as_ref())?;
@@ -6180,7 +6184,7 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
                 StateSnapshot::new(StateKind::Baseline, scoped.schema, held, &operator),
             );
             snapshot.module_deps = loaded.hints.module_deps.clone();
-            snapshot.reason = Some(reason.to_owned());
+            snapshot.reason = Some(reason.to_string());
 
             let tables = snapshot.schema.tables.len();
             let id = crate::engine::record(&mut conn, &snapshot).await?;

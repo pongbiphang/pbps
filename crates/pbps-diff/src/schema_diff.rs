@@ -6147,7 +6147,7 @@ mod tests {
         };
         let drop_c = [Intent::DropColumn {
             column: "dbo.t.c".parse().unwrap(),
-            reason: "computed now".into(),
+            reason: "computed now".parse().unwrap(),
         }];
         assert_eq!(
             kinds(&run(
@@ -6855,7 +6855,7 @@ mod tests {
                 .filter(|t| !declared.tables.contains_key(*t))
                 .map(|t| Intent::DropTable {
                     table: t.clone(),
-                    reason: "gone".into(),
+                    reason: "gone".parse().unwrap(),
                 })
                 .collect();
             let declared_ids = crate::resolve(declared, &base_ids, &dropped, &ctx())
@@ -7226,7 +7226,7 @@ mod tests {
                 rename(&ev, &ev2),
                 Intent::DropTable {
                     table: "app.ev_2".parse().unwrap(),
-                    reason: "gone".into(),
+                    reason: "gone".parse().unwrap(),
                 },
             ],
         )
@@ -7371,7 +7371,7 @@ mod tests {
                 .filter(|t| !declared.tables.contains_key(*t))
                 .map(|t| Intent::DropTable {
                     table: t.clone(),
-                    reason: "gone".into(),
+                    reason: "gone".parse().unwrap(),
                 })
                 .collect();
             let declared_ids = crate::resolve(declared, &base_ids, &dropped, &ctx())
@@ -7658,7 +7658,7 @@ mod tests {
                 table: ev.clone(),
                 name: "m".into(),
             },
-            reason: "gone".into(),
+            reason: "gone".parse().unwrap(),
         }];
         let dropped = planned(
             &with(
@@ -7807,7 +7807,7 @@ mod tests {
                 table: ev.clone(),
                 name: "ts".into(),
             },
-            reason: "gone".into(),
+            reason: "gone".parse().unwrap(),
         }];
         let mut no_key = with(
             &|p| {
@@ -7938,7 +7938,7 @@ mod tests {
                             table: ev.clone(),
                             name: "n".into(),
                         },
-                        reason: "gone".into(),
+                        reason: "gone".parse().unwrap(),
                     }],
                 ),
                 (
@@ -8036,7 +8036,7 @@ mod tests {
                             table: ev.clone(),
                             name: "spare".into(),
                         },
-                        reason: "gone".into(),
+                        reason: "gone".parse().unwrap(),
                     }],
                 ),
                 (
@@ -8261,7 +8261,7 @@ mod tests {
             &dropped_b,
             &[Intent::DropTable {
                 table: "app.b".parse().unwrap(),
-                reason: "gone".into(),
+                reason: "gone".parse().unwrap(),
             }],
         );
         assert!(
@@ -8383,7 +8383,7 @@ mod tests {
             .remove(&"app.z_rest".parse::<TableName>().unwrap());
         let drop = [Intent::DropTable {
             table: "app.z_rest".parse().unwrap(),
-            reason: "gone".into(),
+            reason: "gone".parse().unwrap(),
         }];
         // A partition added under the standing parent is its creation.
         let added = outcome(&tree, &more, &[]).expect("a partition is added");
@@ -8424,15 +8424,15 @@ mod tests {
         let drop_all = [
             Intent::DropTable {
                 table: "app.ev".parse().unwrap(),
-                reason: "gone".into(),
+                reason: "gone".parse().unwrap(),
             },
             Intent::DropTable {
                 table: "app.a_old".parse().unwrap(),
-                reason: "gone".into(),
+                reason: "gone".parse().unwrap(),
             },
             Intent::DropTable {
                 table: "app.z_rest".parse().unwrap(),
-                reason: "gone".into(),
+                reason: "gone".parse().unwrap(),
             },
         ];
         // A parent's column is the parent's change, which the engine
@@ -8681,7 +8681,7 @@ mod tests {
         // made.
         let drop = [Intent::DropTable {
             table: "app.ev_rest".parse().unwrap(),
-            reason: "gone".into(),
+            reason: "gone".parse().unwrap(),
         }];
         assert_eq!(
             beside(&tree, &with(&tree, &year, &["app.ev_rest"]), &drop),
@@ -9923,7 +9923,7 @@ mod tests {
             &base_ids,
             &[Intent::DropTable {
                 table: "app.z_old".parse().unwrap(),
-                reason: "archived".into(),
+                reason: "archived".parse().unwrap(),
             }],
             &ctx(),
         )
@@ -10820,7 +10820,7 @@ mod tests {
             &base_ids,
             &[Intent::DropTable {
                 table: "app.t".parse().unwrap(),
-                reason: "replaced".into(),
+                reason: "replaced".parse().unwrap(),
             }],
             &ctx(),
         )
@@ -10856,7 +10856,7 @@ mod tests {
             &base_ids,
             &[Intent::DropTable {
                 table: "app.t".parse().unwrap(),
-                reason: "replaced".into(),
+                reason: "replaced".parse().unwrap(),
             }],
             &ctx(),
         )
@@ -10915,7 +10915,7 @@ mod tests {
                 &Schema::default(),
                 vec![Intent::DropTable {
                     table: "app.t".parse().unwrap(),
-                    reason: "retired".into(),
+                    reason: "retired".parse().unwrap(),
                 }],
             ),
             (
@@ -12657,7 +12657,7 @@ mod tests {
             },
             Intent::DropColumn {
                 column: "dbo.s.note".parse().unwrap(),
-                reason: "gone".to_owned(),
+                reason: "gone".parse().unwrap(),
             },
         ];
         let cs = run(&base, &declared, &intents);
@@ -12719,7 +12719,7 @@ mod tests {
             &base_ids,
             &[Intent::DropColumn {
                 column: "dbo.s.label".parse().unwrap(),
-                reason: "replace".into(),
+                reason: "replace".parse().unwrap(),
             }],
             &ctx(),
         )
@@ -12818,7 +12818,7 @@ mod tests {
         let drops: Vec<Intent> = (0..DROPPED)
             .map(|i| Intent::DropColumn {
                 column: format!("dbo.s.gone{i}").parse().unwrap(),
-                reason: "gone".into(),
+                reason: "gone".parse().unwrap(),
             })
             .collect();
         let declared_ids = crate::resolve(&declared, &base_ids, &drops, &ctx())
@@ -12892,7 +12892,7 @@ mod tests {
             &base_ids,
             &[Intent::DropColumn {
                 column: "dbo.s.note".parse().unwrap(),
-                reason: "gone".into(),
+                reason: "gone".parse().unwrap(),
             }],
             &ctx(),
         )
@@ -12991,7 +12991,7 @@ mod tests {
             &base_ids,
             &[Intent::DropColumn {
                 column: "dbo.s.note".parse().unwrap(),
-                reason: "gone".into(),
+                reason: "gone".parse().unwrap(),
             }],
             &ctx(),
         )
@@ -13086,7 +13086,7 @@ mod tests {
             &base_ids,
             &[Intent::DropColumn {
                 column: "dbo.s.note".parse().unwrap(),
-                reason: "gone".into(),
+                reason: "gone".parse().unwrap(),
             }],
             &ctx(),
         )
@@ -13166,7 +13166,7 @@ mod tests {
                 },
                 Intent::DropColumn {
                     column: "dbo.t.unrelated".parse().unwrap(),
-                    reason: "no longer in use".into(),
+                    reason: "no longer in use".parse().unwrap(),
                 },
             ],
         );
@@ -13198,11 +13198,11 @@ mod tests {
                 },
                 Intent::DropColumn {
                     column: "dbo.t.unrelated".parse().unwrap(),
-                    reason: "no longer in use".into(),
+                    reason: "no longer in use".parse().unwrap(),
                 },
                 Intent::DropColumn {
                     column: "dbo.other.gone".parse().unwrap(),
-                    reason: "no longer in use".into(),
+                    reason: "no longer in use".parse().unwrap(),
                 },
             ],
         );
@@ -13242,7 +13242,7 @@ mod tests {
             &[
                 Intent::DropColumn {
                     column: "dbo.s.note".parse().unwrap(),
-                    reason: "gone".into(),
+                    reason: "gone".parse().unwrap(),
                 },
                 Intent::RenameColumn {
                     table: "dbo.s".parse().unwrap(),
@@ -13273,7 +13273,7 @@ mod tests {
             &base_ids,
             &[Intent::DropTable {
                 table: "app.target".parse().unwrap(),
-                reason: "gone".into(),
+                reason: "gone".parse().unwrap(),
             }],
             &ctx(),
         )
@@ -13413,7 +13413,7 @@ mod tests {
                     tables(&[("app.old", "kept")]),
                     vec![Intent::DropTable {
                         table: "app.Target".parse().unwrap(),
-                        reason: "gone".into(),
+                        reason: "gone".parse().unwrap(),
                     }],
                 ),
                 (
@@ -13464,7 +13464,7 @@ mod tests {
                 },
                 Intent::DropTable {
                     table: "s2.c".parse().unwrap(),
-                    reason: "gone".into(),
+                    reason: "gone".parse().unwrap(),
                 },
             ],
         );
@@ -14023,11 +14023,11 @@ mod tests {
             &[
                 Intent::DropTable {
                     table: "app.target".parse().unwrap(),
-                    reason: "gone".into(),
+                    reason: "gone".parse().unwrap(),
                 },
                 Intent::DropTable {
                     table: "app.other".parse().unwrap(),
-                    reason: "gone".into(),
+                    reason: "gone".parse().unwrap(),
                 },
             ],
             &ctx(),
@@ -14421,7 +14421,7 @@ mod tests {
                     schema(&[("app.z", "zed"), ("app.y", "why")]),
                     vec![Intent::DropTable {
                         table: "app.a".parse().unwrap(),
-                        reason: "gone".into(),
+                        reason: "gone".parse().unwrap(),
                     }],
                 ),
                 (
@@ -14636,7 +14636,7 @@ mod tests {
             &[
                 Intent::DropTable {
                     table: "app.gone".parse().unwrap(),
-                    reason: "gone".into(),
+                    reason: "gone".parse().unwrap(),
                 },
                 Intent::RenameTable {
                     from: "app.old".parse().unwrap(),
@@ -14887,11 +14887,11 @@ mod tests {
         let intents = [
             Intent::DropTable {
                 table: "dbo.aaa".parse().unwrap(),
-                reason: "test".into(),
+                reason: "test".parse().unwrap(),
             },
             Intent::DropTable {
                 table: "dbo.zzz".parse().unwrap(),
-                reason: "test".into(),
+                reason: "test".parse().unwrap(),
             },
         ];
         let cs = run(&base, &Schema::default(), &intents);
@@ -14930,7 +14930,7 @@ mod tests {
             &base_ids,
             &[Intent::DropTable {
                 table: "dbo.t".parse().unwrap(),
-                reason: "replaced".into(),
+                reason: "replaced".parse().unwrap(),
             }],
             &ctx(),
         )
@@ -14957,7 +14957,7 @@ mod tests {
             &[
                 Intent::DropTable {
                     table: "dbo.t".parse().unwrap(),
-                    reason: "replaced".into(),
+                    reason: "replaced".parse().unwrap(),
                 },
                 Intent::RenameTable {
                     from: "dbo.a".parse().unwrap(),
@@ -15195,7 +15195,7 @@ mod tests {
                 // reason the change below must carry that name.
                 Intent::DropColumn {
                     column: "dbo.clients.doomed".parse().unwrap(),
-                    reason: "no longer used".into(),
+                    reason: "no longer used".parse().unwrap(),
                 },
             ],
         );
@@ -15377,7 +15377,7 @@ mod tests {
         let want = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
         let intents = vec![Intent::DropColumn {
             column: "dbo.t.b".parse().unwrap(),
-            reason: "no longer in use".into(),
+            reason: "no longer in use".parse().unwrap(),
         }];
         let cs = run(&base, &want, &intents);
 
@@ -16806,7 +16806,7 @@ mod tests {
                 },
                 Intent::DropTable {
                     table: "app.child".parse().unwrap(),
-                    reason: "gone".into(),
+                    reason: "gone".parse().unwrap(),
                 },
             ],
         );
@@ -17275,7 +17275,7 @@ mod tests {
             },
             Intent::DropColumn {
                 column: "dbo.t.doomed".parse().unwrap(),
-                reason: "no longer in use".into(),
+                reason: "no longer in use".parse().unwrap(),
             },
         ];
         let cs = run(
@@ -17430,7 +17430,7 @@ mod tests {
         let t: TableName = "app.t".parse().unwrap();
         let drops = ["a", "zz"].map(|c| pbps_model::Intent::DropColumn {
             column: t.column(c),
-            reason: "gone".into(),
+            reason: "gone".parse().unwrap(),
         });
         assert_eq!(order(&with("zz", "a"), &bare, &drops), ["-zz", "-a"]);
         // And when the same plan renames the table, so each `DropColumn`
@@ -17443,7 +17443,7 @@ mod tests {
         let u: TableName = "app.u".parse().unwrap();
         intents.extend(["a", "zz"].map(|c| pbps_model::Intent::DropColumn {
             column: u.column(c),
-            reason: "gone".into(),
+            reason: "gone".parse().unwrap(),
         }));
         assert_eq!(order(&with("zz", "a"), &renamed, &intents), ["-zz", "-a"]);
         // And when the same plan renames another column of the table, which

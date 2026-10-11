@@ -1205,21 +1205,21 @@ mod tests {
             (
                 Intent::DropTable {
                     table: "dbo.t".parse().unwrap(),
-                    reason: "retired".into(),
+                    reason: "retired".parse().unwrap(),
                 },
                 "drop table dbo.t (reason: retired)",
             ),
             (
                 Intent::DropColumn {
                     column: "dbo.t.old".parse().unwrap(),
-                    reason: "retired".into(),
+                    reason: "retired".parse().unwrap(),
                 },
                 "drop column dbo.t.old (reason: retired)",
             ),
             (
                 Intent::DropRole {
                     role: "old".into(),
-                    reason: "retired".into(),
+                    reason: "retired".parse().unwrap(),
                 },
                 "drop role old (reason: retired)",
             ),

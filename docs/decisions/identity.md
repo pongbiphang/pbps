@@ -815,3 +815,27 @@ Pinned by:
   name and the state keeps it, which fails when pruning skips the proof; a role
   dropped by hand is created by the next plan and verifies clean, which fails
   when the role is not pruned.
+
+<a id="dec-1796-1"></a>
+
+**DEC-1796.1. New drop and baseline reasons are nonblank values; historical
+reasons remain text.** `pbps_model::Reason` rejects a string whose `trim()` is
+empty, including Unicode whitespace, and otherwise preserves it verbatim.
+The three drop intents carry this type. Their CLI arguments and `baseline`'s
+argument parse it before project discovery, so a blank reason is a usage error
+(exit 2) and cannot change an identity file or ledger. The prompt constructs
+the same type after its existing line trimming; Compose reaches it through
+the ordinary CLI, without a second semantic validator in the UI.
+
+Checking only dispatch or the prompt leaves another input channel able to
+record unexplained intent. Conversely, changing `Tombstone.reason` or
+`StateSnapshot.reason` to the new type would refuse old audit history already
+written with a blank reason. Those persisted fields stay `String`; converting
+a validated new reason back to text does not rewrite their format. This is no
+reason-length policy and does not repair historical entries.
+
+Pinned by construction/serde refusals and legacy-record read-back, both-dialect
+CLI tests for unchanged identity bytes and verbatim nonblank reasons, prompt
+and Compose refusals, and baseline ledger preservation on real PostgreSQL and
+SQL Server. Missing-project and unreachable-target controls verify that the
+CLI refusal precedes I/O.

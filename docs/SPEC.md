@@ -729,6 +729,13 @@ pbps drop dbo.customer.national_id --reason "REG-2026-042 PII erasure request"
 
 Fully non-interactive, scriptable, and **needs no database connection**.
 
+`drop`, `drop-table` and `drop-role` require a reason containing at least one
+non-whitespace character. A blank `--reason` is a usage error (exit 2), refused
+before project discovery or file writes. Meaningful CLI reasons are recorded
+verbatim, including surrounding whitespace. The prompt and Compose use the
+same nonblank rule; the prompt still trims its input line. Historical blank
+reasons remain readable (DEC-1796.1).
+
 ### 6.2 Transient YAML annotations
 
 ```yaml
@@ -786,8 +793,8 @@ Four properties hold it to that:
   part-way abandons the answers already given. A partial answer written to the
   identity file would be a decision the user never made.
 - **A drop still needs a reason**, asked as a second question and never
-  defaulted. An empty one ends the prompt rather than writing a tombstone that
-  explains nothing.
+  defaulted. An empty or whitespace-only one ends the prompt rather than writing
+  a tombstone that explains nothing, under the same rule as the CLI and Compose.
 
 Identity is re-resolved after each round of answers. A column blocker derived
 under a contested table rename remains visible, but its report states the
@@ -1325,7 +1332,9 @@ or authorizing their modification.
 | Rebaseline: do not pursue the difference, take the current state as the new starting point | `pbps baseline --reason ... --operator ...` | A DBA has already dealt with it under a specific approval |
 
 `baseline` queries the database, writes a new `state_json`, and records the
-reason, operator and timestamp in the ledger.
+reason, operator and timestamp in the ledger. Its human `--reason` uses the
+same nonblank rule as the drop commands (§6.1): blank input is refused with
+exit 2 before project or connection I/O, and meaningful text is stored verbatim.
 
 A fourth situation looks similar and is not drift at all: **the change applied
 exactly as planned, and the change itself was wrong.** The database matches its

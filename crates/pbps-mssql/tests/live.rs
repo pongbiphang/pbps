@@ -1440,7 +1440,7 @@ async fn applying_a_planned_migration_converges_on_the_target() {
         },
         Intent::DropColumn {
             column: TableName::new("dbo", "customer").column("notes"),
-            reason: "merged into the CRM".into(),
+            reason: "merged into the CRM".parse().unwrap(),
         },
     ];
     let ids_b = mint_ids(&b, &ids_a, &intents);
@@ -17053,7 +17053,7 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
         &base_ids,
         &[Intent::DropColumn {
             column: named.column("note"),
-            reason: "gone".into(),
+            reason: "gone".parse().unwrap(),
         }],
     );
     let declared_ids = mint_ids(

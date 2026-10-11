@@ -1149,6 +1149,35 @@ fn changed_configuration_and_secret_bearing_destinations_do_not_seal() {
 }
 
 #[test]
+fn blank_drop_reasons_never_produce_a_compose_candidate() {
+    let repo = Repository::new("blank-reasons1796", "");
+    repo.table(&format!("{ORIGINAL}  old: {{type: int}}\n"));
+    checked(repo.cli(&["plan"]));
+    repo.commit();
+    repo.table(ORIGINAL);
+    let before = repo.preserved();
+    let mut store = repo.store();
+    for reason in ["", "   ", "\t", "\n\t ", "\u{3000}"] {
+        let mut action = request();
+        action.intent = Intent::Drop {
+            column: "dbo.t.old".into(),
+            reason: reason.into(),
+        };
+        let error = store.preview(action, SystemTime::now()).unwrap_err();
+        assert!(error.to_string().contains("The CLI refused"), "{error}");
+        assert_eq!(repo.preserved(), before);
+    }
+    let mut action = request();
+    action.intent = Intent::Drop {
+        column: "dbo.t.old".into(),
+        reason: "Approved retirement".into(),
+    };
+    let preview = store.preview(action, SystemTime::now()).unwrap();
+    assert!(preview.diff.contains("Approved retirement"));
+    assert_eq!(repo.preserved(), before);
+}
+
+#[test]
 fn ordinary_drop_and_strategy_intents_are_resolved_only_in_the_snapshot() {
     let repo = Repository::new("drop", "");
     repo.table(&format!("{ORIGINAL}  old: {{type: int}}\n"));

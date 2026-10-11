@@ -5174,7 +5174,7 @@ async fn dropping_a_table_with_toast_storage_closes_on_the_actual_catalog() {
         &base_ids,
         &[pbps_model::Intent::DropTable {
             table: dropped.clone(),
-            reason: "retired with its out-of-line storage".into(),
+            reason: "retired with its out-of-line storage".parse().unwrap(),
         }],
         &pbps_diff::Context {
             operator: "1274-test".into(),

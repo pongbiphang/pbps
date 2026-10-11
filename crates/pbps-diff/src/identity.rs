@@ -786,7 +786,7 @@ fn resolve_roles(
                 Tombstone {
                     was: role.clone(),
                     dropped_at: ctx.today.clone(),
-                    reason: reason.clone(),
+                    reason: reason.to_string(),
                     operator: ctx.operator.clone(),
                 },
             );
@@ -1113,7 +1113,7 @@ fn resolve_columns(
                     Tombstone {
                         was: column.to_string(),
                         dropped_at: ctx.today.clone(),
-                        reason: reason.clone(),
+                        reason: reason.to_string(),
                         operator: ctx.operator.clone(),
                     },
                 );
@@ -1335,11 +1335,17 @@ fn resolve_moves(
     }
 }
 
-fn drop_table_in_ids(ids: &mut IdsFile, uid: &Uid, table: &TableName, reason: &str, ctx: &Context) {
+fn drop_table_in_ids(
+    ids: &mut IdsFile,
+    uid: &Uid,
+    table: &TableName,
+    reason: &pbps_model::Reason,
+    ctx: &Context,
+) {
     let make = |was: String| Tombstone {
         was,
         dropped_at: ctx.today.clone(),
-        reason: reason.to_owned(),
+        reason: reason.to_string(),
         operator: ctx.operator.clone(),
     };
 

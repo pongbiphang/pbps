@@ -20,6 +20,7 @@
 //! desired state may have arrived via a rename or via a rebuild, so mixing it in
 //! would break that equality (see constraint 1 in CLAUDE.md).
 
+use crate::Reason;
 use crate::name::{ColumnRef, TableName};
 
 /// One piece of human-supplied intent.
@@ -42,12 +43,12 @@ pub enum Intent {
     /// Drop a table. `reason` is required for audit and cannot be omitted.
     DropTable {
         table: TableName,
-        reason: String,
+        reason: Reason,
     },
     /// Drop a column.
     DropColumn {
         column: ColumnRef,
-        reason: String,
+        reason: Reason,
     },
     /// A database role was renamed (ADR-0005). Membership follows the role
     /// through `ALTER ROLE ... WITH NAME`, which is why this is intent and not
@@ -59,7 +60,7 @@ pub enum Intent {
     /// Drop a role. "Why was this access removed" is an auditor's question.
     DropRole {
         role: String,
-        reason: String,
+        reason: Reason,
     },
     /// Allow the DEFAULT partition's rows inside a new range partition's
     /// range to move into it, at most `max_rows` of them (#1788).
@@ -104,6 +105,22 @@ mod tests {
     }
 
     #[test]
+    fn serialized_drop_intent_cannot_bypass_nonblank_reasons() {
+        for (kind, target, name) in [
+            ("drop_table", "table", "app.t"),
+            ("drop_column", "column", "app.t.old"),
+            ("drop_role", "role", "reader"),
+        ] {
+            for reason in ["", " ", "\t\n", "\u{3000}"] {
+                let value = serde_json::json!({"intent": kind, target: name, "reason": reason});
+                assert!(serde_json::from_value::<Intent>(value).is_err());
+            }
+            let valid = serde_json::json!({"intent": kind, target: name, "reason": "approved"});
+            assert!(serde_json::from_value::<Intent>(valid).is_ok());
+        }
+    }
+
+    #[test]
     fn round_trips_through_json() {
         let all = vec![
             Intent::RenameTable {
@@ -117,11 +134,11 @@ mod tests {
             },
             Intent::DropTable {
                 table: t("dbo.a"),
-                reason: "REG-1".into(),
+                reason: "REG-1".parse().unwrap(),
             },
             Intent::DropColumn {
                 column: "dbo.a.x".parse().unwrap(),
-                reason: "REG-2".into(),
+                reason: "REG-2".parse().unwrap(),
             },
             Intent::RenameRole {
                 from: "reader".into(),
@@ -129,7 +146,7 @@ mod tests {
             },
             Intent::DropRole {
                 role: "legacy".into(),
-                reason: "REG-3".into(),
+                reason: "REG-3".parse().unwrap(),
             },
             Intent::MoveRows {
                 table: t("dbo.ev_2030"),

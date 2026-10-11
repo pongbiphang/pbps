@@ -21,6 +21,27 @@ const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 #[path = "support/envelope_archives.rs"]
 mod envelope_archives;
 
+#[path = "support/audit_reasons.rs"]
+mod audit_reasons;
+
+#[test]
+fn blank_drop_reasons_preserve_identities_and_meaningful_reasons_remain_verbatim() {
+    audit_reasons::offline("postgres");
+}
+
+#[test]
+fn blank_audit_reasons_refuse_before_project_or_connection_io() {
+    audit_reasons::before_io("postgres");
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn blank_baseline_reasons_leave_the_live_ledger_unchanged() {
+    let own = OwnDatabase::new(&server(), "reasons1796");
+    on_server(own.connection(), "CREATE SCHEMA app");
+    audit_reasons::connected("postgres", own.connection());
+}
+
 #[path = "support/fmt_scalars.rs"]
 mod fmt_scalars;
 
