@@ -4842,11 +4842,16 @@ Measured on 17.0.4075.5: with `n = -1` and `m = 1`, dropping `n`, renaming
 `m` to `n`, and adding `CHECK (n > 0)` succeeds. The old probe read the
 outgoing `n` and counted one violation. Renaming `n` away and adding a new
 `n` with default `1`, or a persisted computed `n AS m`, has the same shape.
-The recorded vacated names include ordinary and computed columns; intersect
-those names with rename destinations and added columns. A CHECK on that
-table is unchecked, as in DEC-1699.1: arbitrary SQL is not rewritten to guess
-which column its text will bind to. An unrelated drop or rename leaves the
-ordinary CHECK count intact. Live tests compare each case with applying the
-emitted plan and retain the failing CHECKs as negative controls. Filtered
+The pure probe builder has no catalog collation: on a measured
+`Latin1_General_100_CI_AI` database, dropping `n` and renaming `m` to `N`
+or `ń` also passes its name to another column. Record the relinquishing
+owners by table, including computed columns without a uid. An added column
+or a rename by a different owner may take any relinquished name under that
+collation. A CHECK on that table is unchecked, as in DEC-1699.1: arbitrary
+SQL is not rewritten to guess which column its text will bind to. A lone
+drop or rename leaves the ordinary CHECK count intact; the uid proves that
+a case-only rename still reads the same column. Live tests compare each
+case with applying the emitted plan and retain the failing CHECKs as negative
+controls. Filtered
 indexes already refuse a projection across added or renamed columns, so they
 need no additional handoff rule.

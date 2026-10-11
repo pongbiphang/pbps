@@ -270,6 +270,13 @@ async fn a_known_null_decides_only_its_own_rows_foreign_key_tuple() {
 #[ignore = "needs live SQL Server"]
 async fn a_check_does_not_read_the_column_giving_up_its_name() {
     let mut db = TestDb::create("vacated_check1771").await;
+    db.conn
+        .execute(&format!(
+            "ALTER DATABASE [{}] COLLATE Latin1_General_100_CI_AI;",
+            db.name
+        ))
+        .await
+        .unwrap();
     let table = TableName::new("dbo", "t");
     let rename = |from: &str, to: &str| Change::RenameColumn {
         uid: Uid::generate(pbps_model::UidKind::Column),
@@ -286,11 +293,14 @@ async fn a_check_does_not_read_the_column_giving_up_its_name() {
     let mut observations = Vec::new();
     for case in [
         "drop rename",
+        "drop rename case",
+        "drop rename accent",
         "rename add",
         "rename computed",
         "drop computed rename",
         "alone",
         "unrelated rename",
+        "rename case",
         "unrelated drop",
     ] {
         db.conn
@@ -307,6 +317,8 @@ async fn a_check_does_not_read_the_column_giving_up_its_name() {
         };
         let mut steps = match case {
             "drop rename" => vec![drop("n"), rename("m", "n")],
+            "drop rename case" => vec![drop("n"), rename("m", "N")],
+            "drop rename accent" => vec![drop("n"), rename("m", "ń")],
             "rename add" => vec![
                 rename("n", "old_n"),
                 Change::AddColumn {
@@ -341,6 +353,7 @@ async fn a_check_does_not_read_the_column_giving_up_its_name() {
                 rename("m", "n"),
             ],
             "unrelated rename" => vec![rename("m", "m2")],
+            "rename case" => vec![rename("n", "N")],
             "unrelated drop" => vec![drop("m")],
             _ => vec![],
         };
@@ -348,7 +361,12 @@ async fn a_check_does_not_read_the_column_giving_up_its_name() {
             table: table.clone(),
             name: "positive".into(),
             constraint: pbps_model::CheckConstraint {
-                expression: "n > 0".into(),
+                expression: match case {
+                    "drop rename case" | "rename case" => "N > 0",
+                    "drop rename accent" => "[ń] > 0",
+                    _ => "n > 0",
+                }
+                .into(),
             },
         });
         let cs = changes(steps);
@@ -362,6 +380,8 @@ async fn a_check_does_not_read_the_column_giving_up_its_name() {
     for (case, counts, unchecked, applied) in observations {
         let handoff = [
             "drop rename",
+            "drop rename case",
+            "drop rename accent",
             "rename add",
             "rename computed",
             "drop computed rename",
@@ -379,6 +399,7 @@ async fn a_check_does_not_read_the_column_giving_up_its_name() {
                 "{case}: {unchecked:?}"
             );
         } else {
+            assert!(applied.unwrap_err().contains("CHECK constraint"), "{case}");
             assert_eq!(counts.len(), 1);
             assert_eq!(counts[0].1, 1, "{case}: {counts:?}");
             assert!(unchecked.is_empty());

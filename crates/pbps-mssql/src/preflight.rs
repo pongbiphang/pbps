@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{DialectError, Preflight, Probe, Unchecked};
 use pbps_model::{
-    Cell, Change, ChangeSet, ColumnRef, ColumnType, RowKey, TableName, TypeArg, Value,
+    Cell, Change, ChangeSet, ColumnRef, ColumnType, RowKey, TableName, TypeArg, Uid, Value,
 };
 
 use crate::emit::{qualified, verbatim};
@@ -94,11 +94,13 @@ enum Added {
 struct AsStored {
     /// New table name → the name it currently has.
     tables: BTreeMap<TableName, TableName>,
-    /// New column ref → the column name it currently has.
-    columns: BTreeMap<ColumnRef, String>,
-    /// Names relinquished by a drop or rename. Reusing one makes a raw
+    /// New column ref → its identity and the name it currently has.
+    columns: BTreeMap<ColumnRef, RenamedColumn>,
+    /// Owners relinquishing a name by a drop or rename. Reusing one makes a raw
     /// predicate read the outgoing column successfully, but incorrectly.
-    vacated: BTreeSet<ColumnRef>,
+    /// Computed columns have no uid; their relinquished names can still be
+    /// taken by an ordinary column's rename.
+    vacated: BTreeMap<TableName, BTreeSet<Option<Uid>>>,
     /// Tables this plan creates. They are empty, so nothing in them can violate
     /// anything, and probing them would only produce "invalid object name".
     created: BTreeSet<TableName>,
@@ -140,6 +142,12 @@ struct AsStored {
     /// through a constraint that will be gone refuses a delete the engine
     /// would have accepted (DECISIONS 128).
     removed: BTreeSet<Removed>,
+}
+
+#[derive(Debug)]
+struct RenamedColumn {
+    uid: Uid,
+    stored: String,
 }
 
 /// The rows of one table a plan writes, as the pre-delete probe has to see
@@ -442,16 +450,16 @@ impl AsStored {
                     this.tables.insert(to.clone(), from.clone());
                 }
                 Change::RenameColumn {
-                    table, from, to, ..
+                    uid, table, from, to, ..
                 } => {
-                    this.columns.insert(table.column(to), from.clone());
-                    this.vacated.insert(table.column(from));
+                    this.columns.insert(table.column(to), RenamedColumn { uid: uid.clone(), stored: from.clone() });
+                    this.vacated.entry(table.clone()).or_default().insert(Some(uid.clone()));
                 }
-                Change::DropColumn { column, .. } => {
-                    this.vacated.insert(column.clone());
+                Change::DropColumn { uid, column } => {
+                    this.vacated.entry(column.table.clone()).or_default().insert(Some(uid.clone()));
                 }
-                Change::DropComputedColumn { table, name, .. } => {
-                    this.vacated.insert(table.column(name));
+                Change::DropComputedColumn { table, .. } => {
+                    this.vacated.entry(table.clone()).or_default().insert(None);
                 }
                 Change::CreateTable { name, table, .. } => {
                     this.created.insert(name.clone());
@@ -672,10 +680,20 @@ impl AsStored {
     }
 
     fn passes_a_name(&self, table: &TableName) -> bool {
-        self.vacated
-            .iter()
-            .filter(|c| c.table == *table)
-            .any(|c| self.columns.contains_key(c) || self.added.contains_key(c))
+        // The pure probe builder has no catalog collation: different text
+        // can still name one column. Only a rename's own uid rules out a
+        // different holder; every other possible handoff is unchecked.
+        let Some(vacated) = self.vacated.get(table) else {
+            return false;
+        };
+        let added = self.added.keys().any(|c| c.table == *table);
+        vacated.iter().any(|owner| {
+            added
+                || self
+                    .columns
+                    .iter()
+                    .any(|(c, renamed)| c.table == *table && owner.as_ref() != Some(&renamed.uid))
+        })
     }
 
     /// `None` when the object does not exist yet, and so cannot be probed.
@@ -696,7 +714,7 @@ impl AsStored {
         let name = self
             .columns
             .get(column)
-            .cloned()
+            .map(|renamed| renamed.stored.clone())
             .unwrap_or_else(|| column.name.clone());
         Some(table.column(&name))
     }
