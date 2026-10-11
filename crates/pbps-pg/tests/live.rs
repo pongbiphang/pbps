@@ -4645,6 +4645,29 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             format!("{stopped:?}").contains("a publication publishes inserts into every table"),
             "{stopped:?}"
         );
+        // An unlogged partition is in no publication: the same move into
+        // one goes, and its pre-flight does not ask (#1763 review).
+        let mut unlogged_step = over_step.clone();
+        if let pbps_model::Change::CreateTable { table, .. } = &mut unlogged_step.changes[0].change
+        {
+            table.unlogged = true;
+        }
+        assert_eq!(
+            pg.preflight(&unlogged_step).probes.len(),
+            5,
+            "{unlogged_step:#?}"
+        );
+        let unlogged_moving = &unlogged_step.changes[0];
+        let unlogged_moving = pg
+            .emit(&unlogged_moving.change, unlogged_moving.strategy)
+            .expect("emit")
+            .remove(0)
+            .sql;
+        conn.execute(&format!(
+            "ROLLBACK TO SAVEPOINT schema_published; {unlogged_moving}"
+        ))
+        .await
+        .expect("the move into an unlogged partition");
         conn.execute(
             "ROLLBACK TO SAVEPOINT schema_published; \
              ALTER PUBLICATION pbps_pub_1547s SET (publish = 'update')",

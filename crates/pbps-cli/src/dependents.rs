@@ -2991,6 +2991,35 @@ fn after_their_functions(
     Ok(waits.len())
 }
 
+/// Whether `change` adds a rule the rows of `table` must meet: a `NOT NULL`,
+/// a check, or a key or unique index over them.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn tightens(change: &Change, table: &TableName) -> bool {
+    match change {
+        Change::SetPartitionNotNull {
+            table: t,
+            not_null: true,
+            ..
+        }
+        | Change::AddCheck { table: t, .. }
+        | Change::AddUnique { table: t, .. }
+        | Change::SetPrimaryKey {
+            table: t,
+            to: Some(_),
+            ..
+        } => t == table,
+        Change::AddIndex {
+            table: t, index, ..
+        } => t == table && index.unique,
+        Change::AlterColumnNullability {
+            column,
+            to_nullable: false,
+            ..
+        } => column.table == *table,
+        _ => false,
+    }
+}
+
 /// Why [`after_their_functions`] found no order: the first column it could
 /// not place, the functions it calls, and what may need the column.
 #[allow(clippy::wildcard_enum_match_arm)]
@@ -3070,9 +3099,19 @@ fn cycle(
 ///   of the same table or one referencing it.
 /// - A row write: everything after it. A trigger the plan creates must not
 ///   fire on a row the plan writes before the modules.
+/// - A partition made beside a DEFAULT: what tightens that DEFAULT, which
+///   judges the rows the move leaves it (DEC-1547.1).
 #[allow(clippy::wildcard_enum_match_arm)]
 fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps, partitions: &Partitions) -> bool {
     match earlier {
+        // The move takes the DEFAULT's rows of the new range out of it, and
+        // the differ ranks the DEFAULT's own tightenings after it (#1763
+        // review). Held back for a function, the create would otherwise let
+        // them past, and they would judge rows that are about to leave.
+        Change::CreateTable {
+            beside_default: Some(default),
+            ..
+        } if tightens(later, default) => true,
         Change::AddColumn { table, name, .. } => match later {
             Change::CreateModule { id, module } | Change::AlterModule { id, module } => partitions
                 .holding(table)
@@ -4305,6 +4344,76 @@ mod tests {
         assert!(function < table_at("app.ev_new"), "{order:?}");
         assert!(table_at("app.ev") < function, "{order:?}");
         assert!(table_at("app.ev_plain") < function, "{order:?}");
+    }
+
+    /// A partition made beside a DEFAULT, held behind the function its own
+    /// default calls, keeps the DEFAULT's own tightenings behind it: they
+    /// judge the rows the move leaves the DEFAULT (#1763 review). Another
+    /// table's keep their places.
+    #[test]
+    fn a_held_move_out_of_a_default_keeps_its_tightenings_behind_it() {
+        let mut t = Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: pbps_model::PartitionBound::Range {
+                    from: vec![pbps_model::BoundDatum::Value("1".into())],
+                    to: vec![pbps_model::BoundDatum::Value("2".into())],
+                },
+                columns: [(
+                    "v".to_owned(),
+                    pbps_model::PartitionColumn {
+                        default: Some("app.f(1)".to_owned()),
+                        not_null: false,
+                    },
+                )]
+                .into(),
+            }),
+            ..Table::default()
+        };
+        t.columns
+            .insert("v".into(), Column::new("integer".parse().unwrap()));
+        let not_null = |table: &str| Change::SetPartitionNotNull {
+            uid: Uid::derived(UidKind::Column, table, 0),
+            table: table.parse().unwrap(),
+            column: "v".into(),
+            not_null: true,
+        };
+        let mut cs = plan(vec![
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, "app.ev_1", 0),
+                name: "app.ev_1".parse().unwrap(),
+                table: Box::new(t),
+                beside_default: Some("app.ev_rest".parse().unwrap()),
+            },
+            not_null("app.ev_rest"),
+            not_null("app.other_rest"),
+            Change::AddCheck {
+                table: "app.ev_rest".parse().unwrap(),
+                name: "ev_rest_ck".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "v > 0".into(),
+                },
+            },
+            routine("app.f(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let order = names(&cs);
+        let function =
+            at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
+        let create = at(&|c| matches!(c, Change::CreateTable { .. }));
+        let tightened = |name: &str| {
+            at(
+                &|c| matches!(c, Change::SetPartitionNotNull { table, .. } if table.to_string() == name),
+            )
+        };
+        let check = at(&|c| matches!(c, Change::AddCheck { .. }));
+        assert!(function < create, "{order:?}");
+        assert!(create < tightened("app.ev_rest"), "{order:?}");
+        assert!(create < check, "{order:?}");
+        // Negative: another table's tightening is not held.
+        assert!(tightened("app.other_rest") < function, "{order:?}");
     }
 
     /// A new partitioned parent held behind the function its generated column

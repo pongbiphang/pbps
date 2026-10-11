@@ -4610,7 +4610,9 @@ has before the plan runs:
 - **Publications of the new table.** These are publications that publish
   inserts, of every table or of every table of the new table's schema,
   counted when there are rows to move. A publication naming its tables
-  cannot name one the plan has not made yet.
+  cannot name one the plan has not made yet. An unlogged new table is in no
+  publication and is not asked about: measured on 16 and 18, its
+  subscriber went on replicating.
 
 "Fires" is asked as `data_triggers` asks it:
 - `A` always fires; `O` fires outside, and `R` under,
@@ -4655,7 +4657,9 @@ name too.
   parent whose columns change, where a tightening at (9, 1) or (9, 4)
   counted, and the engine refused, the NULL the move takes away. Its own
   checks, uniques and unique indexes are of class 13, after every create
-  already (#1763 review, leon's choice of one ordering rule).
+  already (#1763 review, leon's choice of one ordering rule). A create held
+  back behind a function its own default calls keeps them behind it: the
+  reorder that holds it counts each of them as needing the create.
 - **Probes of the DEFAULT after the move.** A change the plan makes to the
   DEFAULT after the create, such as a check of its own, would be counted
   over rows the move has taken away by then. A check that only a moved row

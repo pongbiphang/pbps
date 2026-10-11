@@ -3993,13 +3993,20 @@ fn partition_probes(
                      its new values cannot be evaluated before apply",
                 ));
             }
+            // An unlogged table is in no publication, whatever it publishes:
+            // measured on 16 and 18, the subscriber went on replicating
+            // (#1763 review).
+            let inserted = (!table.unlogged)
+                .then(|| default_insert_publication_probe(name, &parent, &stored, from, to));
             for probe in [
                 default_hidden_referencers_probe(name, &parent, &stored, names, from, to),
                 default_trigger_probe(name, &parent, &stored, &gone, from, to),
                 default_statement_probe(name, &stored, &gone),
                 default_publication_probe(name, &parent, &stored, from, to),
-                default_insert_publication_probe(name, &parent, &stored, from, to),
-            ] {
+            ]
+            .into_iter()
+            .chain(inserted)
+            {
                 match probe {
                     Ok(probe) => out.push(probe),
                     Err(error) => {
@@ -5170,6 +5177,22 @@ mod tests {
             println!("-- {}\n{};", p.description, p.sql);
         }
         assert_eq!(asked.len(), 6, "{asked:?}");
+        // An unlogged partition is in no publication: its inserts are not
+        // asked about (#1763 review).
+        let mut unlogged = asked_plan.clone();
+        for p in &mut unlogged.changes {
+            if let Change::CreateTable { table, .. } = &mut p.change {
+                table.unlogged = true;
+            }
+        }
+        let unlogged = probes(&unlogged);
+        assert_eq!(unlogged.len(), 5, "{unlogged:?}");
+        assert!(
+            unlogged.iter().all(|p| !p
+                .description
+                .starts_with("publications that publish inserts")),
+            "{unlogged:?}"
+        );
         // The new table's inserts, published before it is attached by a
         // publication of every table or of its schema (#1763 review).
         assert!(

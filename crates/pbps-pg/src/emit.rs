@@ -3355,7 +3355,9 @@ fn beside_its_default(
          \x20               {published}\n\
          \x20           END IF;\n\
          \x20       END LOOP;\n\
-         \x20       IF EXISTS (SELECT 1 {inserting}) THEN\n\
+         \x20       IF (SELECT c.relpersistence FROM pg_catalog.pg_class c\n\
+         \x20           WHERE c.oid = {lq}::pg_catalog.regclass) = 'p'\n\
+         \x20          AND EXISTS (SELECT 1 {inserting}) THEN\n\
          \x20           {inserted}\n\
          \x20       END IF;\n\
          \x20       IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t\n\
@@ -3397,6 +3399,7 @@ fn beside_its_default(
         range = crate::preflight::range_predicate(from, to),
         lp = literal(&p),
         ld = literal(&d),
+        lq = literal(&q),
         trigger_fires = fires("t.tgenabled"),
         rule_fires = fires("w.ev_enabled"),
         matched = crate::preflight::moved_row_match(),
@@ -3407,6 +3410,9 @@ fn beside_its_default(
         )?,
         publications =
             crate::preflight::publications_of(&format!("{}::pg_catalog.regclass", literal(&d))),
+        // Of a logged table only: an unlogged one is in no publication, and
+        // measured on 16 and 18 its subscriber went on replicating (#1763
+        // review).
         inserting = crate::preflight::insert_publications(&literal(&name.schema)),
         inserted = refuse(format!(
             "a publication publishes inserts into every table, or every table of {}, so the rows \
