@@ -135,14 +135,15 @@ checksum-pinned, and state lives in the database itself.
   `ci-retest` label to that owned PR; if already present, remove only that label
   and add it again. Verify the unchanged reviewed head and intended base before
   and after the label event, then select its new PR-associated run. Every label
-  addition uses the approval/full-matrix route; label removal and title/body
-  edits do not trigger CI. Never approve merely because a label was added.
+  addition uses the approval route and the pull-request job set; label removal
+  and title/body edits do not trigger CI. Never approve merely because a label
+  was added.
   Verify approval bootstraps its immutable defining workflow and selects a
   merge SHA with the intended base and reviewed head as parents. Every job must
   use that pinned SHA, and its base parent must include the event base and
   belong to the intended base branch. Same-base advancement needs no rebase.
-  Require the complete approved matrix and actual required-check admission;
-  a retained green run alone is insufficient. Do not select a run merely
+  Require the complete approved pull-request job set (DEC-1835.1) and actual
+  required-check admission; a retained green run alone is insufficient. Do not select a run merely
   because it is newest or green in Actions.
 - Wait for `ci-gate` on the approved run and read the run, not `check-runs`,
   which lists only the jobs created so far. Retry a transient failure with
@@ -256,11 +257,12 @@ checksum-pinned, and state lives in the database itself.
   gates still apply to each dependent before enqueueing; refresh them after the
   base change (DEC-1228.1, DEC-1458.1).
 - A pull request must be green on its **own** head before it can be queued, so
-  a merge costs **two pre-merge runs** of `ci.yml` — one on the pull request,
-  one on the merge group — plus the post-merge run on `master`, which gates
-  nothing. That is the price of the queue and it is the cheap half of the trade:
-  what it buys is that none of them has to be repeated because somebody else
-  merged first.
+  a merge costs **two pre-merge runs** of `ci.yml`, plus the post-merge run on
+  `master`, which gates nothing. The pull-request run is a reduced set: it
+  omits `live`, `live-pg`, `resolver` and `release-windows`, which the
+  merge group then runs with every other job (DEC-1835.1). That is the price of
+  the queue and it is the cheap half of the trade: what it buys is that none of
+  them has to be repeated because somebody else merged first.
 - If the queue ejects the pull request, **read the failing job before
   re-queueing**, and say which of the two it was. A merge-group failure that
   reproduces, or that is a test failing on its merits, is a real interaction
@@ -270,7 +272,9 @@ checksum-pinned, and state lives in the database itself.
   crashes `ci.yml` and docs/PITFALLS.md both record — is transient, and
   re-queueing is the right move. What is never right is re-queueing without
   reading, which is how a real interaction gets merged on the second roll.
-  A conflict is the case above.
+  A conflict is the case above. A failure in `live`, `live-pg`, `resolver` or
+  `release-windows` is the first time that job ran on the change; read it the
+  same way.
 - Never bypass the ruleset. It requires green CI on the pull request head and
   green CI on the merge group.
 - Report at each merge: the draft and ready review counts, the qualifying route,

@@ -58,7 +58,7 @@ function outcome(github) {
     return [key, ['approve', 'gate', 'cancel'].includes(key) ? !falsy(result) : result.coerceString()];
   }));
 }
-function requiresFullCi(github, pr = true) {
+function requiresApprovedCi(github, pr = true) {
   const actual = outcome(github);
   assert.equal(actual.approve, true);
   assert.equal(actual.gate, true);
@@ -75,11 +75,11 @@ function admitted(github) {
   return github.event_name !== 'pull_request' || admittedTypes.includes(github.event.action);
 }
 
-test('opened, synchronize and reopened still require approved full CI', () => {
+test('opened, synchronize and reopened still require approved CI', () => {
   for (const action of ['opened', 'synchronize', 'reopened']) {
     const event = context('pull_request', action);
     assert.equal(admitted(event), true);
-    assert.equal(requiresFullCi(event).group, 'CI-1457');
+    assert.equal(requiresApprovedCi(event).group, 'CI-1457');
   }
   assert.deepEqual([...admittedTypes].sort(), ['labeled', 'opened', 'reopened', 'synchronize']);
 });
@@ -92,7 +92,7 @@ test('an explicit label requests associated CI on the unchanged head and intende
   assert.equal(labeled.event.pull_request.head.sha, 'unchanged-head');
   for (const existing of ['success', null]) {
     labeled.event.pull_request.checks = existing;
-    assert.equal(requiresFullCi(labeled).group, 'CI-1457');
+    assert.equal(requiresApprovedCi(labeled).group, 'CI-1457');
   }
 });
 
@@ -111,7 +111,7 @@ test('a base edit requires a fresh explicit retry rather than silently rerunning
   changed.event.action = 'labeled';
   changed.event.label = { name: 'ci-retest' };
   assert.equal(admitted(changed), true);
-  requiresFullCi(changed);
+  requiresApprovedCi(changed);
   assert.equal(admitted(context('pull_request', 'unlabeled')), false, 'removing a retry label cannot cancel CI');
 });
 
@@ -121,7 +121,7 @@ test('no admitted label can skip approval or manufacture a passing required cont
     const event = context('pull_request', 'labeled');
     event.event.label = { name };
     assert.equal(admitted(event), true);
-    requiresFullCi(event);
+    requiresApprovedCi(event);
   }
   assert.equal(policy.check, 'ci-gate');
 });
@@ -132,7 +132,7 @@ test('concurrency cancellation is boolean and never applies to non-PR events', (
   }
   for (const event of ['push', 'merge_group', 'workflow_dispatch']) {
     const github = { workflow: 'CI', event_name: event, event: {}, ref: 'refs/heads/master', run_id: 42 };
-    assert.equal(requiresFullCi(github, false).group, 'CI-refs/heads/master');
+    assert.equal(requiresApprovedCi(github, false).group, 'CI-refs/heads/master');
   }
 });
 
@@ -140,12 +140,42 @@ test('failure and cancellation cannot skip the required qualifying gate', () => 
   assert.match(policy.gate, /\balways\(\)/);
   assert.doesNotMatch(policy.gate, /cancelled\(/);
   for (const action of ['opened', 'labeled']) assert.equal(outcome(context('pull_request', action)).gate, true);
-  assert.match(job('gate'), /all\(\.\[\]; \.result == "success"\)/);
+  assert.match(job('gate'), /^        run: python3 scripts\/ci_gate_verdict\.py$/m);
   assert.match(job('gate'), /python3 scripts\/check_gate_needs\.py/);
   for (const [name, block] of [...workflow.split('jobs:\n')[1].matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/gm)].map(match => [match[1], match[2]])) {
     if (name === 'approve' || name === 'gate') continue;
     assert.match(block, /^    needs: (approve|\[approve, lint\])$/m, `${name} must remain behind approval`);
   }
+});
+
+test('a pull request omits exactly the declared jobs, and every other event runs every job', () => {
+  const declared = workflow.match(/^          PR_OMITTED: (.+)$/m);
+  assert.ok(declared, 'the gate declares the jobs a pull request omits');
+  const omitted = declared[1].trim().split(/\s+/);
+  assert.deepEqual([...omitted].sort(), ['live', 'live-pg', 'release-windows', 'resolver']);
+  const condition = "${{ github.event_name != 'pull_request' }}";
+  const blocks = [...workflow.split('jobs:\n')[1].matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/gm)];
+  const names = blocks.map(match => match[1]);
+  for (const name of omitted) assert.ok(names.includes(name), `${name} is a job`);
+  assert.ok(!omitted.includes('approve') && !omitted.includes('lint'), 'approval and lint always run');
+  for (const [, name, block] of blocks) {
+    if (name === 'gate') continue;
+    const conditions = [...block.matchAll(/^    if: (.+)$/gm)].map(match => match[1]);
+    if (!omitted.includes(name)) {
+      assert.deepEqual(conditions, [], `${name} has no job-level condition, so it runs on every event`);
+      continue;
+    }
+    assert.deepEqual(conditions, [condition], `${name} is skipped on pull requests and nowhere else`);
+    for (const event of ['merge_group', 'push', 'schedule', 'workflow_dispatch']) {
+      const github = { workflow: 'CI', event_name: event, event: {}, ref: 'refs/heads/master', run_id: 42 };
+      assert.equal(falsy(evaluate(condition, github)), false, `${name} runs on ${event}`);
+    }
+    assert.equal(falsy(evaluate(condition, context('pull_request', 'synchronize'))), true, `${name} is skipped on a pull request`);
+  }
+  const verdict = job('gate').match(/- name: every job succeeded\n        env:\n([\s\S]*?)\n        run: (.+)/);
+  assert.ok(verdict, 'the verdict step reads its inputs from the environment');
+  assert.match(verdict[1], /^          EVENT: \$\{\{ github\.event_name \}\}$/m);
+  assert.match(verdict[1], /^          NEEDS: \$\{\{ toJSON\(needs\) \}\}$/m);
 });
 
 test('every job uses one validated intended-base checkout rather than an unverified event SHA', () => {

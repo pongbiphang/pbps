@@ -1163,3 +1163,45 @@ at the ready mark, not on its own push, and may take another draft round. Once
 the pull-request CI run stops running the live suites (#1835), the full gate at
 the ready mark is their only run before the merge group, so it is the one run
 this decision cannot drop.
+
+<a id="dec-1835-1"></a>
+
+**DEC-1835.1. A pull request runs a reduced job set; the merge group runs every
+job.** Every merge ran the full matrix twice before it landed: once on the
+approved pull-request head, which the queue needs green before it admits the
+pull request, and once on the merge group. The pull-request run almost never
+decided anything. Its `live` and `live-pg` jobs repeat the suites the local
+full gate already ran on that head (DEC-1838.1), and the merge group runs the
+whole matrix again on the exact tree that merges.
+
+So the pull-request run omits `live`, `live-pg`, `resolver` and
+`release-windows`: the two suites the local gate covers, plus the two long jobs
+left. Everything else still runs on the pull request, including `windows`,
+`msrv` and `dev-rehearsal`, which DEC-1017.1 names as outside the local checks.
+The omitted jobs carry `if: ${{ github.event_name != 'pull_request' }}`, and
+the gate step names them once, in `PR_OMITTED`. `scripts/ci_gate_verdict.py`
+accepts `skipped` for exactly those jobs on a `pull_request` run. Anywhere else,
+a skip fails the gate, and so does a listed job that ran on a pull request.
+Every job must succeed on every other event. The CI policy test holds the list
+and the conditions together. `scripts/ignored_test_inventory.py` accepts that
+one condition, and no other, on a job that owns ignored tests, because the job
+still executes them on the merge group before every merge. The pull-request set stays a subset of the
+merge-group set, so no job can fail a pull request that the merge group would
+pass.
+
+This supersedes the paragraph of DEC-1017.1 that rejected "a `pull_request` run
+that skips the matrix and passes the gate". That rejection held while the
+pull-request gate was the last qualification before a merge. It no longer is:
+the merge queue is required (#636) and cannot be bypassed, so every change
+reaches `master` through a merge group whose gate demands `success` from every
+job, on the tree that merges. A reduced pull-request run therefore cannot
+qualify an untested merge, which is the hole DECISIONS 206 closed. For the same
+reason, DEC-1457.1's "the full matrix must pass" on a label-requested retest now
+means the pull-request job set. Approval itself is unchanged: one approved run,
+on the head the ready gate qualified.
+
+The cost is where a failure surfaces. A failure in an omitted job now first
+appears in the merge group, which ejects the pull request and rebuilds the
+groups queued behind it, instead of failing before enqueue. `live` and
+`live-pg` failures there mean the local gate missed something; `resolver` and
+`release-windows` failures are the ones no local check could have caught.

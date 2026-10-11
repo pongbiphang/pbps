@@ -130,8 +130,9 @@ review evidence (DEC-1457.1). When fresh CI is required, add `ci-retest` to the
 owned PR; remove only that label first if it is already present. Verify the
 head/base around the event, then select its new PR-associated run and approve
 only after the existing review gate qualifies. Every label addition enters
-approval and the full matrix; removing a label or editing title/body triggers
-nothing. Require the complete matrix and actual required-check admission, not
+approval and the pull-request job set (DEC-1835.1); removing a label or editing
+title/body triggers nothing. Require the complete pull-request job set and
+actual required-check admission, not
 just a retained green run. Verify the immutable defining-workflow bootstrap,
 intended-base/reviewed-head merge parents and every job's identical pinned SHA.
 The base parent includes the event base and belongs to the intended branch;
