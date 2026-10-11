@@ -140,6 +140,30 @@ class Ownership(unittest.TestCase):
                 with self.assertRaisesRegex(audit.InventoryError, "conditional owner job needs an explicit audit"):
                     self.check()
 
+    def test_continue_on_error_over_an_owner_is_refused(self):
+        # It runs the cases and keeps their failure out of the job's result,
+        # which `ci-gate` reads (#1380): on the step, on the job, and as a
+        # matrix expression on the job.
+        matrix = "    strategy:\n      matrix:\n        x: [a, b]\n"
+        for workflow in (WORKFLOW.replace("      - run:", "      - continue-on-error: true\n        run:"),
+                         WORKFLOW.replace("      - run:", "      - name: selected\n        continue-on-error: true\n        run:"),
+                         WORKFLOW.replace("    steps:", "    continue-on-error: true\n    steps:"),
+                         WORKFLOW.replace("    steps:", matrix + "    continue-on-error: ${{ matrix.x == 'a' }}\n    steps:")):
+            with self.subTest(workflow=workflow):
+                self.workflow.write_text(workflow)
+                with self.assertRaisesRegex(audit.InventoryError, "continue-on-error needs an explicit execution audit"):
+                    self.check()
+
+    def test_continue_on_error_that_hides_no_case_failure_is_accepted(self):
+        # A literal false keeps failures, and a step that runs no command an
+        # owner could be hides none.
+        for workflow in (WORKFLOW.replace("    steps:", "    continue-on-error: false\n    steps:"),
+                         WORKFLOW.replace("      - run:", "      - continue-on-error: ${{ false }}\n        run:"),
+                         WORKFLOW.replace("      - run:", "      - continue-on-error: true\n        run: echo warming up\n      - run:")):
+            with self.subTest(workflow=workflow):
+                self.workflow.write_text(workflow)
+                self.assertEqual(self.check(), 1)
+
     def test_matrix_condition_must_have_an_executed_variant(self):
         workflow = WORKFLOW.replace("    steps:", "    strategy:\n      matrix:\n        engine: [pg, mssql]\n    steps:")
         workflow = workflow.replace("      - run:", "      - name: selected\n        if: matrix.engine == 'pg'\n        run:")
