@@ -42,11 +42,20 @@ checksum-pinned, and state lives in the database itself.
 - Treat the issue as the specification: fix what it says, at the size it says.
 - Work in a git worktree, never in the main checkout. Remove it after merge.
 - One branch per issue, cut from `origin/master`, named `fix/issue-<n>-<slug>`.
-- Before every push, run locally what CI runs: `python3
+- The **full gate** is what CI runs: `python3
   scripts/check_decisions_test.py`, `python3 scripts/check-decisions.py`,
   `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`
   warning-free, `cargo test --workspace --all-targets`, `scripts/live-tests.sh`
-  and `scripts/live-tests-pg.sh`. All green, then push.
+  and `scripts/live-tests-pg.sh`. Run it on every head that can be queued:
+  before the first push of the branch, before marking the PR ready, before
+  every push in the ready phase, and before pushing a rebase. All green, then
+  push (DEC-1838.1).
+- Every other push (a draft-phase review round's fixes) runs the **round
+  gate**: the two decision checks, `fmt`, warning-free `clippy`, and the tests
+  that pin the round's fixes, live ones included when a fix is engine-facing.
+  A round fix that breaks something it did not touch is found by the full gate
+  before ready, not on its own push; that is the price.
+- A docs-only push runs only the two decision checks.
 - Push the issue branch without asking. Never push to `master` or to another
   issue's branch.
 - Open the PR as a **draft**, with `Closes #<n>` in the body. Taking the issue is
@@ -89,9 +98,11 @@ checksum-pinned, and state lives in the database itself.
   or P1, or as soon as a completed review reports no findings. A P0 or P1 resets
   the count. Count a review only if its `Reviewed commit:` is the pushed head.
   Never push a docs-only commit to move the count.
-- On stopping: kill the watch and post no further `@codex review`, then mark the
-  PR ready. Do **not** rebase merely because `master` moved — the queue handles
-  that, and rebasing would re-run the local checks and CI and create a new
+- On stopping: kill the watch and post no further `@codex review`, run the full
+  gate on the head, then mark the PR ready. A full-gate failure is fixed as a
+  draft round: the fix's head needs its own completed review before ready.
+  Do **not** rebase merely because `master` moved — the queue handles that,
+  and rebasing would re-run the local checks and CI and create a new
   review head for nothing (DECISIONS 502). Rebase only for the two cases that
   need the combined tree in your hands: a conflict, or an interaction the merge
   group confirmed;
@@ -153,7 +164,7 @@ checksum-pinned, and state lives in the database itself.
   a branch that predates it. A **conflict**, which the queue cannot resolve and
   ejects instead. And an **interaction the merge group confirmed** — `master`
   changed something this branch still calls — which a stale branch cannot even
-  compile, let alone test. Rebase, fix it, run the required local tests, push
+  compile, let alone test. Rebase, fix it, run the full gate, push
   with `git push --force-with-lease`, and obtain a completed code review whose
   `Reviewed commit:` is the resulting head. P0 is always fixed;
   P1–P3 follow the same three-case finding rules, and P2 may be deferred
