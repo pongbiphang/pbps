@@ -681,3 +681,32 @@ and `a_referential_action_is_spelled_only_when_it_is_not_the_default`
 (`crates/pbps-pg/tests/live.rs`), and the live
 `a_restrict_foreign_key_round_trips_and_its_actions_change_on_both_servers`
 (`crates/pbps-cli/tests/flow_pg.rs`), on 16 and 18.
+
+<a id="dec-1790-1"></a>
+
+**DEC-1790.1. A forced pull replaces declarations, never existing identity
+or recorded database history (#1790).** Resolving every pull against empty
+identities made an unchanged table a drop and create against the ledger;
+applying that destructive plan discarded its rows. Pull now validates the
+existing identity file before connecting and resolves against it, using exact
+names and no inferred intent. Missing files start a new adoption; malformed,
+unreadable or inconsistent files require repair. Tombstones remain history,
+not candidates for revival. An unchanged mapping keeps the file byte for byte.
+
+When names disappeared or disappeared and appeared together, the validated
+catalog declarations are still published, while the entire identity file is
+left untouched and the command exits 2 with the ordinary identity blockers.
+This leaves the same reviewable state as editing declarations manually and
+lets explicit rename/drop commands settle the ambiguity. Unrepresentable names
+and staging or policy failures still stop before publishing anything. No
+partial resolution is saved, and force never supplies a drop reason.
+
+Pull never baselines the database. A YAML-only rename with explicit intent can
+be planned against an unchanged database; a rename already performed outside
+pbps remains drift and connected planning refuses it even after identity
+intent is recorded. Accepting that database state requires a separate,
+deliberate baseline. Tests in `tests/support/pull_identity.rs` exercise both
+histories on PostgreSQL and SQL Server, populated no-op pulls with and without
+rows, byte-preserved IDs and tombstones, new names, and unchanged ledger
+history. `forced_pull_refuses_damaged_identity_history_before_connecting`
+pins the no-connection refusal for damaged files.

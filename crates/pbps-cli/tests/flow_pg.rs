@@ -22629,3 +22629,36 @@ mod compatibility;
 fn compatibility_core_contract() {
     compatibility::run(pbps_db::Driver::Postgres, "PBPS_TEST_PG_DB", "pg18");
 }
+
+#[path = "support/pull_identity.rs"]
+mod pull_identity;
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn unchanged_forced_pull_preserves_identities_rows_and_history() {
+    pull_identity::unchanged(&server(), true);
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn forced_pull_mints_only_added_objects() {
+    pull_identity::additions(&server(), true);
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn yaml_identity_changes_still_require_intent_and_risk_approval() {
+    pull_identity::intent_and_drift(&server(), true, false);
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn forced_pull_publishes_drift_without_accepting_it() {
+    pull_identity::intent_and_drift(&server(), true, true);
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn forced_pull_preserves_applied_column_rename_and_drop_history() {
+    pull_identity::column_history(&server(), true);
+}

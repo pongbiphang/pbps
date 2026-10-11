@@ -1097,8 +1097,8 @@ fn cmd_docs(
 ///
 /// `pull` designates one source-of-truth environment (SPEC §9.2): everything the
 /// database has and the model can express becomes YAML, everything it cannot
-/// express is printed as a warning, and a fresh identity file is minted so the
-/// next `plan` starts from "no changes".
+/// express is printed as a warning. Existing identities survive exact-name
+/// matches; a disappearance still needs the user's recorded intent.
 fn cmd_pull(
     project: &Project,
     target: &db::Target,
@@ -1116,6 +1116,13 @@ fn cmd_pull(
         .collect::<anyhow::Result<_>>()?;
 
     let dir = project.schema_dir();
+    // Force authorizes replacing declarations, not forgetting identity. Read
+    // before connecting so damaged history cannot become a fresh adoption
+    // (DEC-1790.1).
+    let existing_ids = read_ids_opt(project).context(
+        "pull cannot preserve identities; restore the identity file from git, or deliberately \
+         remove it only when starting a new adoption",
+    )?;
     if !force {
         // A listing that *failed* is not an empty directory. This guard is the
         // only thing standing between an unforced `pull` and the user's
@@ -1143,7 +1150,7 @@ fn cmd_pull(
         // `init` deliberately creates a versioned empty identity file. That is
         // still a pristine project, not user data for pull to overwrite. A
         // non-empty or malformed file remains a hard stop before connecting.
-        let identities_exist = read_ids_opt(project)?.is_some_and(|ids| {
+        let identities_exist = existing_ids.as_ref().is_some_and(|ids| {
             !ids.tables.is_empty()
                 || !ids.columns.is_empty()
                 || !ids.roles.is_empty()
@@ -1281,22 +1288,28 @@ fn cmd_pull(
         );
     }
 
-    // Mint fresh identity for everything pulled. resolve with an empty baseline
-    // and no intents leaves every *other* kind of blocker unreachable: they all
-    // need something to have disappeared, or a declared rename intent, and
-    // neither exists yet on a first pull. `UnrepresentableName` is the
-    // exception — it depends only on what the database handed back, not on any
-    // prior state, so a schema/table/column pbps's own `.`-joined identity
-    // format cannot carry is exactly the failure `pull` is expected to surface
-    // here (issue #108). Rendered in full, not just counted: the one case that
-    // can really happen is the one a bare count would hide the name of.
-    let res = pbps_diff::resolve(
-        &pulled.schema,
-        &IdsFile::default(),
-        &[],
-        &context(project.root()),
-    )
-    .map_err(|b| anyhow::anyhow!("pull could not mint identities:\n{}", report::blockers(&b)))?;
+    let ids = existing_ids.clone().unwrap_or_default();
+    let resolution = pbps_diff::resolve(&pulled.schema, &ids, &[], &context(project.root()));
+    if let Err(blockers) = &resolution {
+        // Only missing human intent permits publishing declarations. An
+        // unrepresentable name must still fail before writing anything (#108).
+        if !blockers.iter().all(|b| {
+            matches!(
+                b,
+                pbps_diff::Blocker::AmbiguousTables { .. }
+                    | pbps_diff::Blocker::AmbiguousColumns { .. }
+                    | pbps_diff::Blocker::AmbiguousRoles { .. }
+                    | pbps_diff::Blocker::DropTableNeedsReason { .. }
+                    | pbps_diff::Blocker::DropColumnNeedsReason { .. }
+                    | pbps_diff::Blocker::DropRoleNeedsReason { .. }
+            )
+        }) {
+            bail!(
+                "pull could not mint identities:\n{}",
+                report::blockers(blockers)
+            );
+        }
+    }
 
     // Staged first, outside the project, and loaded back through the checks
     // `validate` runs: an unforced pull into a fresh project and a forced one
@@ -1351,14 +1364,11 @@ fn cmd_pull(
         }
     }
 
-    write_ids(project, &res.ids)?;
-
     println!(
-        "Pulled {} table(s) and {} module(s) into `{}` and minted `{}`.",
+        "Pulled {} table(s) and {} module(s) into `{}`.",
         pulled.schema.tables.len(),
         pulled.schema.modules.len(),
-        dir.display(),
-        project.ids_file().display()
+        dir.display()
     );
     let left_out = pulled.warnings.len() + pulled.unexpressible.len();
     if left_out > 0 {
@@ -1366,7 +1376,30 @@ fn cmd_pull(
             "{left_out} thing(s) could not be expressed and were left out; see the warnings above."
         );
     }
-    println!("Next: commit these files, then `pbps plan` should report no changes.");
+    let res = match resolution {
+        Ok(res) => res,
+        Err(blockers) => {
+            eprintln!("{}", report::blockers(&blockers));
+            return Err(Found::new(format!(
+                "Declarations were updated, but `{}` is unchanged. Record explicit rename/drop \
+                 intent, then review and commit the files. Pull does not update database history \
+                 or accept drift.",
+                project.ids_file().display()
+            ))
+            .into());
+        }
+    };
+    // Leave even the original JSON formatting intact for an unchanged pull.
+    if existing_ids.is_none() || res.ids != ids {
+        write_ids(project, &res.ids)?;
+    }
+    let minted = res.created_tables.len() + res.added_columns.len() + res.created_roles.len();
+    let kept = ids.tables.len() + ids.columns.len() + ids.roles.len();
+    println!("Preserved {kept} existing identities; minted {minted} new identities.");
+    println!(
+        "Next: review and commit these files. Pull does not update database history or accept \
+         drift; use `pbps plan --db <connection>` to compare with the recorded state."
+    );
     Ok(())
 }
 
@@ -1767,7 +1800,10 @@ fn load_finding(e: &pbps_load::LoadError) -> output::Finding {
 /// and "empty" are the same thing.
 fn read_ids_opt(project: &Project) -> anyhow::Result<Option<IdsFile>> {
     let path = project.ids_file();
-    if !path.exists() {
+    if !path
+        .try_exists()
+        .with_context(|| format!("cannot inspect identity file `{}`", path.display()))?
+    {
         return Ok(None);
     }
     let text = std::fs::read_to_string(&path)

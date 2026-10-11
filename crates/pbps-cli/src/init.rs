@@ -452,8 +452,9 @@ fn yaml_string(value: &str) -> String {
 }
 
 fn mint_ids(schema: &Schema, root: &Path) -> anyhow::Result<IdsFile> {
-    // Same adoption path as `pbps pull`, and the same reason to render every
-    // blocker rather than count them: an empty baseline with no intents makes
+    // Like a first `pbps pull` into a project without identities: init only
+    // creates new projects. Render every blocker rather than count them; an
+    // empty baseline with no intents makes
     // every *other* blocker kind unreachable, but `UnrepresentableName`
     // depends only on what the database handed back, and `init --from` is
     // exactly the second place that can happen (issue #108).

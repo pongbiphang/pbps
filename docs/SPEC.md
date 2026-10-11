@@ -1366,6 +1366,14 @@ environment to lay the divergences out, deciding per environment whether to
 difference is right, fold it back into the declarations". Onboarding is done when
 every environment has been `snapshot`ted and drifts by nothing.
 
+A subsequent `pull --force` replaces declarations while preserving existing
+exact-name identities and tombstones. New names receive new identities. If a
+rename or drop needs human intent, pull publishes the validated declarations,
+keeps the identity file unchanged, reports the blockers and exits 2. Damaged
+identity files are refused before connecting. Pull never updates the database
+ledger or accepts drift; explicit identity intent does not waive the connected
+planning drift check (DEC-1790.1).
+
 ### 9.3 The dev database (optional)
 
 #### 9.3.1 Existing preview rehearsal
