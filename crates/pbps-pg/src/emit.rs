@@ -3320,6 +3320,7 @@ fn beside_its_default(
         "DECLARE\n\
          \x20   keep text;\n\
          \x20   cols text;\n\
+         \x20   gcols text;\n\
          \x20   n bigint;\n\
          \x20   hit boolean;\n\
          \x20   fk record;\n\
@@ -3335,6 +3336,11 @@ fn beside_its_default(
          \x20     FROM pg_catalog.pg_attribute a\n\
          \x20    WHERE a.attrelid = {lp}::pg_catalog.regclass AND a.attnum > 0\n\
          \x20      AND NOT a.attisdropped AND a.attgenerated = '';\n\
+         \x20   SELECT pg_catalog.string_agg(pg_catalog.quote_ident(a.attname), ', ' ORDER BY a.attnum)\n\
+         \x20     INTO gcols\n\
+         \x20     FROM pg_catalog.pg_attribute a\n\
+         \x20    WHERE a.attrelid = {lp}::pg_catalog.regclass AND a.attnum > 0\n\
+         \x20      AND NOT a.attisdropped AND a.attgenerated <> '';\n\
          \x20   IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t\n\
          \x20              WHERE t.tgrelid = {ld}::pg_catalog.regclass AND NOT t.tgisinternal\n\
          \x20                AND {trigger_fires} AND (t.tgtype::int & 9) = 8)\n\
@@ -3387,8 +3393,19 @@ fn beside_its_default(
          \x20           END IF;\n\
          \x20       END LOOP;\n\
          \x20   END IF;\n\
-         \x20   EXECUTE {delete} || keep || ' RETURNING ' || cols\n\
-         \x20       || {insert} || cols || ') SELECT * FROM moved';\n\
+         \x20   IF gcols IS NULL THEN\n\
+         \x20       EXECUTE {delete} || keep || ' RETURNING ' || cols\n\
+         \x20           || {insert} || cols || ') SELECT * FROM moved';\n\
+         \x20   ELSE\n\
+         \x20       EXECUTE {delete} || keep || ' RETURNING ' || cols || ', ' || gcols\n\
+         \x20           || {put} || cols || ') SELECT ' || cols || ' FROM moved RETURNING '\n\
+         \x20           || cols || ', ' || gcols || ') SELECT count(*) FROM (SELECT ROW('\n\
+         \x20           || cols || ', ' || gcols || ')::text FROM moved EXCEPT ALL SELECT ROW('\n\
+         \x20           || cols || ', ' || gcols || ')::text FROM put) AS changed' INTO n;\n\
+         \x20       IF n > 0 THEN\n\
+         \x20           {recomputed}\n\
+         \x20       END IF;\n\
+         \x20   END IF;\n\
          \x20   ALTER TABLE {p} ATTACH PARTITION {q} {bound};\n\
          END",
         create_sql = create.sql,
@@ -3460,6 +3477,22 @@ fn beside_its_default(
         )),
         delete = literal(&format!("WITH moved AS (DELETE FROM {d} AS r WHERE ")),
         insert = literal(&format!(") INSERT INTO {q} (")),
+        // The engine computes a generated column of each moved row again in
+        // the new table, under the new table's expression and `tableoid`.
+        // Measured on 16 and 18: a column of `tableoid` took the new
+        // partition's. (A DEFAULT attached with an expression of its own
+        // would compute another too, but it leaves its tree out of the pull.)
+        // So the values each row had are kept and compared, and a changed one
+        // undoes the move,
+        // which would otherwise rewrite stored values no change in the plan
+        // names (#1763 review). As text, as `EXCEPT` cannot compare a type
+        // without an equality operator.
+        put = literal(&format!("), put AS (INSERT INTO {q} (")),
+        recomputed = refuse(format!(
+            "moving its rows of the range of {name} out of {default} would change the value of a \
+             generated column, which the new partition computes otherwise (as one of its \
+             tableoid does); nothing was moved"
+        )),
     );
     let tag = dollar_tag(&body);
     Ok(vec![Statement::new(format!("DO {tag}\n{body}\n{tag};"))])

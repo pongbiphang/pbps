@@ -3675,6 +3675,9 @@ fn refuse_unplanned_movement(
     // after a function the plan rebuilds (#1027, DEC-942.1), so the payload
     // alone is not what the column will hold, as with its parts above.
     let mut set_defaults: BTreeMap<(&TableName, &str), Option<&String>> = BTreeMap::new();
+    // And a partition's own, which a partition made beside a DEFAULT has set
+    // after the function it calls, not in its `CREATE` (#1763 review).
+    let mut set_partition_defaults: BTreeMap<(&TableName, &str), bool> = BTreeMap::new();
     // A freeing drop can now run before its owner's table rename. Its typed
     // address is the one that exists at execution; shape exclusions and net
     // postconditions must follow only the subsequent renames (DECISIONS 496).
@@ -3835,6 +3838,12 @@ fn refuse_unplanned_movement(
         }
         if let pbps_model::Change::AlterColumnDefault { column, to, .. } = &p.change {
             set_defaults.insert((&column.table, column.name.as_str()), to.as_ref());
+        }
+        if let pbps_model::Change::SetPartitionDefault {
+            table, column, to, ..
+        } = &p.change
+        {
+            set_partition_defaults.insert((table, column.as_str()), to.is_some());
         }
         if let pbps_model::Change::AddForeignKey {
             table,
@@ -4245,7 +4254,16 @@ fn refuse_unplanned_movement(
                     "{now_name} is not attached to the parent and range this plan declares"
                 ));
             }
-            if settled.whole() && own(declared) != own(now) {
+            // With the defaults this plan sets after the `CREATE`, as a
+            // column's above.
+            let mut finished = own(declared);
+            for ((t, c), has) in &set_partition_defaults {
+                if *t == now_name {
+                    finished.entry((*c).to_owned()).or_default().0 = *has;
+                }
+            }
+            finished.retain(|_, held| *held != (false, false));
+            if settled.whole() && finished != own(now) {
                 moved.push(format!(
                     "{now_name}'s own column defaults or NOT NULLs are not the ones this plan's \
                      `CREATE TABLE` declares"

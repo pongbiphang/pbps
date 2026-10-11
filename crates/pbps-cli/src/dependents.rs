@@ -1774,7 +1774,70 @@ pub(crate) fn after_the_rebuilds(
     kept.extend(moved);
     kept.extend(tail);
     cs.changes = kept;
+    split_moving_defaults(cs, declared);
     Ok(count + after_their_functions(cs, deps, &Partitions::of(declared))?)
+}
+
+/// A create that moves rows out of a DEFAULT partition (#1547) is never held
+/// behind a function, as [`after_their_functions`] holds a create whose own
+/// default calls one the plan creates later: what must follow the move — a
+/// tightening of the DEFAULT, a key into the tree, a trigger on it, a row
+/// write — would be let past it, and each was found one at a time (#1763
+/// review). Its own default is set instead by a `SetPartitionDefault` after
+/// the last function the text may call. The move inserts every column of
+/// the rows it takes, so it never evaluates the default; only rows inserted
+/// after the plan do, and by then it is set.
+fn split_moving_defaults(cs: &mut ChangeSet, declared: &Schema) {
+    let functions = function_creates(cs);
+    let mut sets: Vec<(usize, Change)> = Vec::new();
+    for (i, p) in cs.changes.iter_mut().enumerate() {
+        let Change::CreateTable {
+            uid,
+            name,
+            table,
+            beside_default: Some(_),
+        } = &mut p.change
+        else {
+            continue;
+        };
+        let Some(of) = table.partition_of.as_mut() else {
+            continue;
+        };
+        let parent = of.parent.clone();
+        for (column, own) in &mut of.columns {
+            let Some(text) = own.default.as_deref() else {
+                continue;
+            };
+            let Some(after) = functions
+                .iter()
+                .filter(|(f, at)| *at > i && pbps_pg::generated::may_call(text, f))
+                .map(|(_, at)| *at)
+                .max()
+            else {
+                continue;
+            };
+            sets.push((
+                after,
+                Change::SetPartitionDefault {
+                    uid: uid.clone(),
+                    table: name.clone(),
+                    parent: parent.clone(),
+                    column: column.clone(),
+                    from: None,
+                    to: own.default.take(),
+                    fallback: parent_default(declared, name, column),
+                },
+            ));
+        }
+        of.columns.retain(|_, c| c.default.is_some() || c.not_null);
+    }
+    // Each right after its function, inserted from the last place back so
+    // that the earlier places still hold; two after one function keep their
+    // order.
+    sets.sort_by_key(|(after, _)| *after);
+    for (after, change) in sets.into_iter().rev() {
+        cs.changes.insert(after + 1, PlannedChange::new(change));
+    }
 }
 
 /// The literals in the plan's expressions that may name a relation this plan
@@ -2902,7 +2965,8 @@ fn after_their_functions(
         // its place in the column order is (DEC-1364.1), so the whole table
         // waits instead. So does a new partition's own default (#1578),
         // which has no column of its own to split into an
-        // `AlterColumnDefault`.
+        // `AlterColumnDefault`; one beside a DEFAULT, whose create moves
+        // rows, had its default split off already (`split_moving_defaults`).
         let texts: Vec<&str> = match &p.change {
             Change::AddColumn { column, .. } => column_expression(column).into_iter().collect(),
             Change::CreateTable { table, .. } => table
@@ -2991,49 +3055,6 @@ fn after_their_functions(
     Ok(waits.len())
 }
 
-/// Whether `change` adds a foreign key into the tree a move out of `default`
-/// changes: into its parent or the DEFAULT itself. Installed before the move,
-/// its action would fire on the moved rows' delete, and the moving statement
-/// refuses over it (#1763 review).
-fn references_the_tree(
-    change: &Change,
-    of: Option<&pbps_model::PartitionOf>,
-    default: &TableName,
-) -> bool {
-    matches!(change, Change::AddForeignKey { constraint, .. }
-        if constraint.references_table == *default
-            || of.is_some_and(|of| constraint.references_table == of.parent))
-}
-
-/// Whether `change` adds a rule the rows of `table` must meet: a `NOT NULL`,
-/// a check, or a key or unique index over them.
-#[allow(clippy::wildcard_enum_match_arm)]
-fn tightens(change: &Change, table: &TableName) -> bool {
-    match change {
-        Change::SetPartitionNotNull {
-            table: t,
-            not_null: true,
-            ..
-        }
-        | Change::AddCheck { table: t, .. }
-        | Change::AddUnique { table: t, .. }
-        | Change::SetPrimaryKey {
-            table: t,
-            to: Some(_),
-            ..
-        } => t == table,
-        Change::AddIndex {
-            table: t, index, ..
-        } => t == table && index.unique,
-        Change::AlterColumnNullability {
-            column,
-            to_nullable: false,
-            ..
-        } => column.table == *table,
-        _ => false,
-    }
-}
-
 /// Why [`after_their_functions`] found no order: the first column it could
 /// not place, the functions it calls, and what may need the column.
 #[allow(clippy::wildcard_enum_match_arm)]
@@ -3113,24 +3134,9 @@ fn cycle(
 ///   of the same table or one referencing it.
 /// - A row write: everything after it. A trigger the plan creates must not
 ///   fire on a row the plan writes before the modules.
-/// - A partition made beside a DEFAULT: what tightens that DEFAULT, which
-///   judges the rows the move leaves it (DEC-1547.1).
 #[allow(clippy::wildcard_enum_match_arm)]
 fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps, partitions: &Partitions) -> bool {
     match earlier {
-        // The move takes the DEFAULT's rows of the new range out of it, and
-        // the differ ranks the DEFAULT's own tightenings after it (#1763
-        // review). Held back for a function, the create would otherwise let
-        // them past, and they would judge rows that are about to leave.
-        Change::CreateTable {
-            beside_default: Some(default),
-            table,
-            ..
-        } if tightens(later, default)
-            || references_the_tree(later, table.partition_of.as_ref(), default) =>
-        {
-            true
-        }
         Change::AddColumn { table, name, .. } => match later {
             Change::CreateModule { id, module } | Change::AlterModule { id, module } => partitions
                 .holding(table)
@@ -4365,32 +4371,41 @@ mod tests {
         assert!(table_at("app.ev_plain") < function, "{order:?}");
     }
 
-    /// A partition made beside a DEFAULT, held behind the function its own
-    /// default calls, keeps the DEFAULT's own tightenings behind it: they
-    /// judge the rows the move leaves the DEFAULT (#1763 review). Another
-    /// table's keep their places.
+    /// A partition made beside a DEFAULT, whose own default calls a function
+    /// the plan creates later, is not held behind it: its default is set by
+    /// a `SetPartitionDefault` after the function, and the create keeps its
+    /// place before what must follow the move — the DEFAULT's tightenings, a
+    /// key into the tree, a trigger on the DEFAULT, a row write (#1763
+    /// review). A plain partition's create is still held, as #1578 holds it.
     #[test]
-    fn a_held_move_out_of_a_default_keeps_its_tightenings_behind_it() {
-        let mut t = Table {
+    fn a_move_out_of_a_default_is_not_held_and_its_own_default_follows_the_function() {
+        let partition = |default: Option<&str>| Table {
             partition_of: Some(pbps_model::PartitionOf {
                 parent: "app.ev".parse().unwrap(),
                 bound: pbps_model::PartitionBound::Range {
                     from: vec![pbps_model::BoundDatum::Value("1".into())],
                     to: vec![pbps_model::BoundDatum::Value("2".into())],
                 },
-                columns: [(
-                    "v".to_owned(),
-                    pbps_model::PartitionColumn {
-                        default: Some("app.f(1)".to_owned()),
-                        not_null: false,
-                    },
-                )]
+                columns: [
+                    (
+                        "v".to_owned(),
+                        pbps_model::PartitionColumn {
+                            default: Some("app.f(1)".to_owned()),
+                            not_null: false,
+                        },
+                    ),
+                    (
+                        "w".to_owned(),
+                        pbps_model::PartitionColumn {
+                            default: default.map(str::to_owned),
+                            not_null: true,
+                        },
+                    ),
+                ]
                 .into(),
             }),
             ..Table::default()
         };
-        t.columns
-            .insert("v".into(), Column::new("integer".parse().unwrap()));
         let fk_into = |table: &str| {
             Box::new(pbps_model::ForeignKey {
                 columns: vec!["v".into()],
@@ -4400,65 +4415,100 @@ mod tests {
                 on_update: pbps_model::ReferentialAction::default(),
             })
         };
-        let not_null = |table: &str| Change::SetPartitionNotNull {
-            uid: Uid::derived(UidKind::Column, table, 0),
-            table: table.parse().unwrap(),
-            column: "v".into(),
-            not_null: true,
+        let trigger = Change::CreateModule {
+            id: ModuleId::Trigger {
+                on: pbps_model::ObjectName::new("app", "ev_rest"),
+                name: "audit".into(),
+            },
+            module: Box::new(module(
+                ModuleKind::Trigger,
+                "AFTER DELETE ON app.ev_rest FOR EACH STATEMENT EXECUTE FUNCTION app.note()",
+            )),
         };
         let mut cs = plan(vec![
             Change::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.ev_1", 0),
                 name: "app.ev_1".parse().unwrap(),
-                table: Box::new(t),
+                table: Box::new(partition(Some("7"))),
                 beside_default: Some("app.ev_rest".parse().unwrap()),
             },
-            not_null("app.ev_rest"),
-            not_null("app.other_rest"),
-            Change::AddCheck {
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, "app.ev_plain", 0),
+                name: "app.ev_plain".parse().unwrap(),
+                table: Box::new(partition(None)),
+                beside_default: None,
+            },
+            Change::SetPartitionNotNull {
+                uid: Uid::derived(UidKind::Column, "app.ev_rest", 0),
                 table: "app.ev_rest".parse().unwrap(),
-                name: "ev_rest_ck".into(),
-                constraint: pbps_model::CheckConstraint {
-                    expression: "v > 0".into(),
-                },
+                column: "v".into(),
+                not_null: true,
             },
             Change::AddForeignKey {
                 table: "app.child".parse().unwrap(),
                 name: "child_ev_fk".into(),
                 constraint: fk_into("app.ev"),
             },
-            Change::AddForeignKey {
-                table: "app.other_child".parse().unwrap(),
-                name: "child_other_fk".into(),
-                constraint: fk_into("app.other"),
-            },
+            trigger,
             routine("app.f(integer)", "SELECT 1"),
         ]);
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        let order = names(&cs);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
-        let order = names(&cs);
-        let key =
-            |name: &str| at(&|c| matches!(c, Change::AddForeignKey { name: n, .. } if n == name));
         let function =
             at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
-        let create = at(&|c| matches!(c, Change::CreateTable { .. }));
-        let tightened = |name: &str| {
-            at(
-                &|c| matches!(c, Change::SetPartitionNotNull { table, .. } if table.to_string() == name),
-            )
+        let create = |n: &str| {
+            at(&|c| matches!(c, Change::CreateTable { name, .. } if name.to_string() == n))
         };
-        let check = at(&|c| matches!(c, Change::AddCheck { .. }));
-        assert!(function < create, "{order:?}");
-        assert!(create < tightened("app.ev_rest"), "{order:?}");
-        assert!(create < check, "{order:?}");
-        // A key into the tree is held behind the move too: installed first,
-        // its action would fire on the moved rows' delete.
-        assert!(create < key("child_ev_fk"), "{order:?}");
-        // Negative: another table's tightening, and a key into another
-        // table, are not held.
-        assert!(tightened("app.other_rest") < function, "{order:?}");
-        assert!(key("child_other_fk") < function, "{order:?}");
+        let set = at(&|c| matches!(c, Change::SetPartitionDefault { .. }));
+        assert_eq!(create("app.ev_1"), 0, "{order:?}");
+        assert!(function < set, "{order:?}");
+        let Change::SetPartitionDefault {
+            table,
+            column,
+            from,
+            to,
+            ..
+        } = &cs.changes[set].change
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (table.to_string(), column.as_str(), from, to.as_deref()),
+            ("app.ev_1".to_owned(), "v", &None, Some("app.f(1)")),
+        );
+        // The create no longer carries the default it hands over; a default
+        // calling nothing new, and a NOT NULL, stay in it.
+        let Change::CreateTable { table, .. } = &cs.changes[0].change else {
+            unreachable!()
+        };
+        let own = &table.partition_of.as_ref().unwrap().columns;
+        assert!(!own.contains_key("v"), "{own:?}");
+        assert_eq!(own["w"].default.as_deref(), Some("7"));
+        assert!(own["w"].not_null);
+        // What must follow the move keeps its place after it.
+        let trigger = at(
+            &|c| matches!(c, Change::CreateModule { module, .. } if module.kind == ModuleKind::Trigger),
+        );
+        let key = at(&|c| matches!(c, Change::AddForeignKey { .. }));
+        let tightened = at(&|c| matches!(c, Change::SetPartitionNotNull { .. }));
+        assert!(create("app.ev_1") < tightened, "{order:?}");
+        assert!(
+            tightened < key && key < trigger && trigger < function,
+            "{order:?}"
+        );
+        // Negative: a partition with no DEFAULT beside it moves nothing, and
+        // is held behind the function as before, its default in place.
+        assert!(function < create("app.ev_plain"), "{order:?}");
+        assert_eq!(
+            cs.changes
+                .iter()
+                .filter(|p| matches!(p.change, Change::SetPartitionDefault { .. }))
+                .count(),
+            1,
+            "{order:?}"
+        );
     }
 
     /// A new partitioned parent held behind the function its generated column

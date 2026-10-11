@@ -4502,6 +4502,14 @@ detaches is gone in class 6, and a new one starts empty.
    then moves the rows with one `DELETE ... RETURNING` into an `INSERT`.
    - A column change earlier in the plan cannot leave the column list stale.
    - A generated column is the engine's to compute, so it is not copied.
+     It is computed again in the new table, which can take another value:
+     measured on 16 and 18, a column of `tableoid` took the new
+     partition's. So, under a parent with a generated column, each moved
+     row's values are kept and compared with the inserted row's, as text,
+     and a changed one raises and undoes the move, which would otherwise
+     rewrite stored values no change of the plan names (#1763 review). A
+     DEFAULT attached with an expression of its own would compute another
+     too, but it leaves the whole tree out of the pull, measured on 18.
    - The predicate is the one the #1171 probe counts with
      (`range_predicate`), so the rows counted and the rows moved are one
      set.
@@ -4585,9 +4593,7 @@ has before the plan runs:
   column retyped or a generated column recomputed in the same plan, the
   count is unchecked rather than taken over the old values, as a deleted
   row's is for a recomputation (DEC-1168.1). The new values may be written
-  before the move, and the moving statement asks the values it meets. So is
-  it after a row the plan updates or deletes before the move, as a create
-  held behind a function follows the row writes (#1763 review).
+  before the move, and the moving statement asks the values it meets.
 - **The referencing tables the session cannot fully read.** These are
   tables with such a key on which row-level security is active, or that
   the session cannot read the key's columns of: `SELECT` on the table, or
@@ -4663,12 +4669,20 @@ name too.
   parent whose columns change, where a tightening at (9, 1) or (9, 4)
   counted, and the engine refused, the NULL the move takes away. Its own
   checks, uniques and unique indexes are of class 13, after every create
-  already (#1763 review, leon's choice of one ordering rule). A create held
-  back behind a function its own default calls keeps them behind it: the
-  reorder that holds it counts each of them as needing the create. So does
-  a foreign key the plan adds into the parent or the DEFAULT: installed
-  first, its action fires on the moved rows' delete, and the moving
-  statement refuses (#1763 review).
+  already (#1763 review, leon's choice of one ordering rule).
+- **The create that moves is never held back.** A new partition's own
+  default calling a function the plan creates later holds its create
+  behind that function (#1578). Held so, a create that moves rows let
+  past it what must follow the move, and review found them one at a time:
+  the DEFAULT's tightenings, a foreign key into the tree, a trigger on the
+  DEFAULT, a row write before the move. So a create beside a DEFAULT keeps
+  its place, and its own default is split off into a `SetPartitionDefault`
+  right after the last function its text may call (`split_moving_defaults`
+  in `dependents.rs`; leon's choice, #1763 review). The move inserts every
+  column of the rows it takes, so it never evaluates the default. The apply
+  guard holds the created partition's own defaults to the `CREATE` plus the
+  defaults the plan sets after it, as it holds a created table's columns
+  (DEC-942.1).
 - **Probes of the DEFAULT after the move.** A change the plan makes to the
   DEFAULT after the create, such as a check of its own, would be counted
   over rows the move has taken away by then. A check that only a moved row

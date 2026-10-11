@@ -4986,6 +4986,113 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         rollback(&mut conn).await;
         conn.execute(&format!("DROP TABLE {s}.ul")).await.unwrap();
 
+        // A generated column is computed again in the new table. One of
+        // `tableoid` takes another value there, and the move is undone; one
+        // the new table computes alike moves (#1763 review).
+        for (label, extra, refused) in [
+            ("alike", "", false),
+            (
+                "tableoid",
+                ", at bigint GENERATED ALWAYS AS (tableoid::bigint) STORED",
+                true,
+            ),
+            ("own", "", false),
+        ] {
+            let own = label == "own";
+            conn.execute(&format!(
+                "CREATE TABLE {s}.gx (id integer NOT NULL, ts date NOT NULL, \
+                     twice integer GENERATED ALWAYS AS (id * 2) STORED{extra}) \
+                     PARTITION BY RANGE (ts);
+                 {}
+                 INSERT INTO {s}.gx (id, ts) VALUES (1, '2030-01-01');",
+                if own {
+                    format!(
+                        "CREATE TABLE {s}.gx_rest (id integer NOT NULL, ts date NOT NULL, \
+                             twice integer GENERATED ALWAYS AS (id * 3) STORED);
+                         ALTER TABLE {s}.gx ATTACH PARTITION {s}.gx_rest DEFAULT;"
+                    )
+                } else {
+                    format!("CREATE TABLE {s}.gx_rest PARTITION OF {s}.gx DEFAULT;")
+                }
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{label}: the tree: {e}"));
+            let gx_base = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
+            // A DEFAULT with an expression of its own leaves the whole tree
+            // out of the pull, so no plan moves its rows.
+            if own {
+                assert!(!gx_base.tables.contains_key(&t("gx")), "{label}");
+                assert!(!gx_base.tables.contains_key(&t("gx_rest")), "{label}");
+                conn.execute(&format!("DROP TABLE {s}.gx")).await.unwrap();
+                continue;
+            }
+            let gx_ids = mint_ids(&gx_base, &added_ids, &[]);
+            let mut gx_split = gx_base.clone();
+            gx_split.tables.insert(
+                t("gx_2030"),
+                partition(
+                    "gx",
+                    range(vec![value("2030-01-01")], vec![value("2031-01-01")]),
+                ),
+            );
+            let gx_step = plan(
+                &gx_base,
+                &gx_ids,
+                &gx_split,
+                &mint_ids(&gx_split, &gx_ids, &[]),
+            );
+            let moving = &gx_step.changes[0];
+            let moving = pg
+                .emit(&moving.change, moving.strategy)
+                .expect("emit")
+                .remove(0)
+                .sql;
+            let before =
+                counted(&mut conn, &format!("SELECT twice FROM {s}.gx WHERE id = 1")).await;
+            match conn.execute(&moving).await {
+                Ok(_) => {
+                    assert!(!refused, "{label}: the move went");
+                    let after = counted(
+                        &mut conn,
+                        &format!("SELECT twice FROM ONLY {s}.gx_2030 WHERE id = 1"),
+                    )
+                    .await;
+                    assert_eq!(before, after, "{label}");
+                }
+                Err(e) => {
+                    assert!(refused, "{label}: {e}");
+                    let text = format!("{e:?}");
+                    assert!(
+                        text.contains("would change the value of a generated column"),
+                        "{label}: {text}"
+                    );
+                    // Nothing moved, and no table was left.
+                    assert_eq!(
+                        counted(
+                            &mut conn,
+                            &format!("SELECT count(*)::integer FROM ONLY {s}.gx_rest")
+                        )
+                        .await,
+                        1,
+                        "{label}"
+                    );
+                    assert_eq!(
+                        counted(
+                            &mut conn,
+                            &format!(
+                                "SELECT count(*)::integer FROM pg_catalog.pg_class \
+                                 WHERE oid = pg_catalog.to_regclass('{s}.gx_2030')"
+                            )
+                        )
+                        .await,
+                        0,
+                        "{label}"
+                    );
+                }
+            }
+            conn.execute(&format!("DROP TABLE {s}.gx")).await.unwrap();
+        }
+
         // A DEFAULT's own NOT NULL, tightened in the plan that moves its only
         // NULL out, under a parent whose column default changes too, which
         // puts the create among the column alterations: the tightening

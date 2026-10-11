@@ -6833,6 +6833,9 @@ fn partitions_are_added_and_dropped_through_the_cli() {
         "function: app.seven()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 7 $$\n",
     )
     .unwrap();
+    // The partition beside the DEFAULT moves rows (none here), so it is not
+    // held behind the function: its own default waits for it in a
+    // `SetPartitionDefault` (#1763 review).
     succeeds(d.run(&["plan"]));
     d.commit();
     let plan = d.dir.join("plan.json");
@@ -6842,6 +6845,11 @@ fn partitions_are_added_and_dropped_through_the_cli() {
             "+ create table app.ev_2026, a partition of app.ev for rows from (\"2026-01-01\") \
              to (\"2027-01-01\")"
         ),
+        "{}",
+        stdout(&o)
+    );
+    assert!(
+        stdout(&o).contains("~ id default -> app.seven()"),
         "{}",
         stdout(&o)
     );
