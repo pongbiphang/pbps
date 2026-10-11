@@ -2216,6 +2216,7 @@
         "resolver::server::vouched::live_tests::vouched_docker_refuses_a_missing_image_it_may_not_pull",
         "resolver::server::vouched::live_tests::vouched_docker_stages_its_baseline",
         "resolver::server::vouched::live_tests::vouched_baseline_outside_writes_allow_keeps_a_created_role",
+        "resolver::server::vouched::live_tests::vouched_supplied_baseline_outside_writes_allow_keeps_the_logins_own_default",
         "resolver::server::vouched::live_tests::vouched_compares_an_external_table_without_its_foreign_keys_and_triggers",
         "resolver::server::vouched::live_tests::vouched_refuses_a_baseline_that_differs_from_the_target",
         "resolver::server::vouched::live_tests::vouched_refuses_a_baseline_that_creates_a_managed_object",

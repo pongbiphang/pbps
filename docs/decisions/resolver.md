@@ -2371,7 +2371,11 @@ measured profiles while it does.
   default, is DEC-1673.1's rule. `allow` skips the before-and-after
   comparison of the shared state, and keeps what the baseline wrote there:
   a Docker scratch drops it with its container, and on a server scratch it
-  is the operator's to clean up. The choice is the user's and is sealed
+  is the operator's to clean up. In the supplied layout, the defaults the
+  baseline gave the login are the release's starting point, so the check
+  that the compile changed none still runs; `DROP OWNED` at release still
+  revokes a membership the login granted, which is cleanup the supplied
+  layout cannot skip. The choice is the user's and is sealed
   into the evidence, which `explain` shows. A role the target lacks is
   then not caught here; #1516's target-side checks catch it.
 - **Docker is the documented default.** The documentation and the example

@@ -150,7 +150,7 @@ impl Provenance {
     /// A supplied server, its baseline's outside writes refused.
     pub fn server() -> Self {
         Self {
-            scratch: VouchedScratch::Server,
+            scratch: VouchedScratch::Server {},
             outside_writes: OutsideWrites::Refused,
         }
     }
@@ -819,6 +819,16 @@ impl Run<'_> {
                     .execute("SET ROLE NONE")
                     .await
                     .map_err(db("the scratch session's role"))?;
+                // An allowed baseline may change the login's own defaults
+                // (#1674). Those are kept, so the release compares the
+                // compile's changes with what the baseline left.
+                if self.provenance.outside_writes == OutsideWrites::Allowed
+                    && let Created::Supplied { defaults, .. } = &mut self.created
+                {
+                    *defaults = sql::login_defaults(admin)
+                        .await
+                        .map_err(db("the scratch account's own defaults"))?;
+                }
                 pinned(admin, self.backend).await?;
                 baseline::created(&before, &inventory(admin).await?)
             }

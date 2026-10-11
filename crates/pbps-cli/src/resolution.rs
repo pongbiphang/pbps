@@ -348,7 +348,7 @@ mod producer {
             } => {
                 let scratch = scratch_connection(request, url_env)?;
                 let provenance = Provenance {
-                    scratch: pbps_model::resolver::VouchedScratch::Server,
+                    scratch: pbps_model::resolver::VouchedScratch::Server {},
                     outside_writes,
                 };
                 run(

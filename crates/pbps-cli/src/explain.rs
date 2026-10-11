@@ -605,7 +605,7 @@ fn resolver_runtime(runtime: &pbps_model::resolver::ResolverRuntime) -> String {
             outside_writes,
         } => {
             let scratch = match scratch {
-                VouchedScratch::Server => "a supplied server".to_owned(),
+                VouchedScratch::Server {} => "a supplied server".to_owned(),
                 VouchedScratch::Docker { image } => {
                     format!("a container of {image}, the image as configured and not verified")
                 }
@@ -790,7 +790,7 @@ mod tests {
         assert!(docker.contains("allowed, not checked"), "{docker}");
         // Negative: the default says nothing of outside writes.
         let server = resolver_runtime(&ResolverRuntime::Vouched {
-            scratch: VouchedScratch::Server,
+            scratch: VouchedScratch::Server {},
             outside_writes: OutsideWrites::Refused,
         });
         assert_eq!(

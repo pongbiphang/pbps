@@ -80,12 +80,17 @@ async fn bind_target(
 }
 
 /// The image is on the runner, or acquired where the policy allows it.
+/// Only the runtime saying the image is not there allows a pull: an
+/// inspection that timed out or was denied says nothing of it.
 async fn acquire(image: &str, pull: PullPolicy) -> Result<(), ProduceError> {
-    if docker(&["image", "inspect", "--format", "{{.Id}}", image])
-        .await
-        .is_ok()
-    {
-        return Ok(());
+    match docker(&["image", "inspect", "--format", "{{.Id}}", image]).await {
+        Ok(_) => return Ok(()),
+        Err(why) if no_such_image(&why) => {}
+        Err(why) => {
+            return Err(ProduceError::Acquire(format!(
+                "whether the image {image} is on this runner could not be read: {why}"
+            )));
+        }
     }
     match pull {
         PullPolicy::Never => Err(ProduceError::Acquire(format!(
@@ -118,23 +123,11 @@ impl Container {
             connection: String::new(),
             removed: false,
         };
-        // An omitted host port: Docker and Podman both pick a free one, on
-        // loopback only, so nothing off this host can reach the server.
-        let started = docker(&[
-            "run",
-            "--detach",
-            "--name",
-            &container.id,
-            "--label",
-            "pbps.resolver=scratch",
-            "--env",
-            &format!("POSTGRES_PASSWORD={password}"),
-            "--publish",
-            "127.0.0.1::5432",
-            image,
-        ])
-        .await
-        .map_err(|why| ProduceError::Acquire(format!("starting {image}: {why}")));
+        let args = run_args(&container.id, &password, image);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let started = docker(&args)
+            .await
+            .map_err(|why| ProduceError::Acquire(format!("starting {image}: {why}")));
         let port = match started {
             Ok(_) => docker(&["port", &container.id, "5432/tcp"])
                 .await
@@ -238,6 +231,39 @@ fn no_such_container(error: &str) -> bool {
     error.to_ascii_lowercase().contains("no such container")
 }
 
+/// And a missing image (measured on #1674: Docker's `No such image`,
+/// Podman's `image not known`).
+fn no_such_image(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("no such image") || error.contains("image not known")
+}
+
+/// The `docker run` that starts the scratch server.
+fn run_args(name: &str, password: &str, image: &str) -> Vec<String> {
+    [
+        "run",
+        "--detach",
+        // Any pull the policy allows was made by `acquire`; an image that
+        // went away since must not be fetched here instead.
+        "--pull",
+        "never",
+        "--name",
+        name,
+        "--label",
+        "pbps.resolver=scratch",
+        "--env",
+        &format!("POSTGRES_PASSWORD={password}"),
+        // An omitted host port: Docker and Podman both pick a free one, on
+        // loopback only, so nothing off this host can reach the server.
+        "--publish",
+        "127.0.0.1::5432",
+        image,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 /// Runs `docker` with `args`, and returns its standard output, or why it
 /// failed.
 async fn docker(args: &[&str]) -> Result<String, String> {
@@ -287,7 +313,47 @@ fn published_port(text: &str) -> Result<u16, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Container, no_such_container, published_port};
+    use super::{Container, no_such_container, no_such_image, published_port, run_args};
+
+    /// The launch never pulls: `pull: never` is enforced where an image can
+    /// be fetched, not only at the inspection before it.
+    #[test]
+    fn the_launch_never_pulls_and_publishes_on_loopback_only() {
+        let args = run_args("pbps-scratch-0", "secret", "postgres:18");
+        let after = |flag: &str| {
+            let at = args
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag}"));
+            args[at + 1].as_str()
+        };
+        assert_eq!(after("--pull"), "never");
+        assert_eq!(after("--publish"), "127.0.0.1::5432");
+        assert_eq!(after("--name"), "pbps-scratch-0");
+        assert_eq!(args.last().map(String::as_str), Some("postgres:18"));
+        // Negative: no other pull policy, and no second publish.
+        assert_eq!(args.iter().filter(|a| a.starts_with("--pull")).count(), 1);
+        assert_eq!(args.iter().filter(|a| *a == "--publish").count(), 1);
+    }
+
+    #[test]
+    fn only_the_runtime_saying_so_confirms_an_image_missing() {
+        for absent in [
+            "docker image failed (exit status: 1): Error response from daemon: failed to find image x: x: No such image",
+            "docker image failed (exit status: 125): Error: x: image not known",
+            "docker image failed (exit status: 1): Error: No such image: x",
+        ] {
+            assert!(no_such_image(absent), "{absent}");
+        }
+        // Negative: a timeout or a refused socket is no license to pull.
+        for unknown in [
+            "docker image did not finish in 120s",
+            "docker image failed (exit status: 1): permission denied while trying to connect to the Docker daemon socket",
+            "docker could not be run: No such file or directory (os error 2)",
+        ] {
+            assert!(!no_such_image(unknown), "{unknown}");
+        }
+    }
     use pbps_db::Driver;
     use std::time::Duration;
 

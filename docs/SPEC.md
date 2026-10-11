@@ -1852,7 +1852,11 @@ scratch compile (#1616).
     (DEC-1674.1). What the baseline changed outside the database, a role
     for instance, is kept, and pbps does not clean it up: a Docker scratch
     drops it with the container, and on a server scratch it is the
-    operator's. The choice is the user's, never inferred from the kind. The
+    operator's. In the supplied layout the login's own defaults the
+    baseline changed stay too: the release checks the compile's changes to
+    them against what the baseline left. The release's `DROP OWNED` still
+    revokes what reaches the login, a membership it granted included
+    (measured on 18), while a role it created stays. The choice is the user's, never inferred from the kind. The
     evidence records it, and `explain` shows it, so a reviewer sees a plan
     whose baseline ran with `allow`. A role the target lacks is not this
     check's to find: the target-side checks catch it (#1516).

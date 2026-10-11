@@ -55,8 +55,10 @@ pub enum ResolverRuntime {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum VouchedScratch {
-    /// A server the operator supplied.
-    Server,
+    /// A server the operator supplied. A struct variant, not a unit one:
+    /// serde's internally tagged unit variant drops fields it does not
+    /// know, where this one refuses them (#1843 review).
+    Server {},
     /// A container pbps started for the run and removed after it, from this
     /// image reference as configured. Unverified: no digest is claimed, and
     /// the content behind a tag can change (#1674).
@@ -227,7 +229,7 @@ impl ResolverEvidence {
                 !profile.is_empty() && hex(identity, 64)
             }
             ResolverRuntime::Vouched { scratch, .. } => match scratch {
-                VouchedScratch::Server => true,
+                VouchedScratch::Server {} => true,
                 VouchedScratch::Docker { image } => !image.is_empty(),
             },
         };
@@ -938,6 +940,18 @@ mod tests {
         // Negative: the pre-#1674 unit form names neither the scratch nor
         // the outside-write choice, and is not read as either.
         assert!(serde_json::from_value::<ResolverRuntime>(json!({"kind": "vouched"})).is_err());
+        // Negative: a server scratch carries nothing, and a field it does
+        // not have is refused rather than dropped.
+        assert!(
+            serde_json::from_value::<VouchedScratch>(
+                json!({"kind": "server", "image": "postgres:18"})
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::from_value::<VouchedScratch>(json!({"kind": "server"})).unwrap(),
+            VouchedScratch::Server {}
+        );
     }
 
     #[test]

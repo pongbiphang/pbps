@@ -252,7 +252,7 @@ fn vouched_refusal(result: Result<ResolvedPlan, ProduceError>) -> String {
 /// stays, and the resolved plan leaves it alone although ADR-0013's
 /// candidate test would rebuild it.
 fn assert_answers_the_overload(plan: &ResolvedPlan) {
-    assert_answers_the_overload_from(plan, pbps_model::resolver::VouchedScratch::Server);
+    assert_answers_the_overload_from(plan, pbps_model::resolver::VouchedScratch::Server {});
 }
 
 fn assert_answers_the_overload_from(
@@ -3791,7 +3791,7 @@ async fn vouched_baseline_outside_writes_allow_keeps_a_created_role() {
             &Standard::default(),
             Some(&baseline),
             &super::Provenance {
-                scratch: pbps_model::resolver::VouchedScratch::Server,
+                scratch: pbps_model::resolver::VouchedScratch::Server {},
                 outside_writes,
             },
         )
@@ -3817,6 +3817,53 @@ async fn vouched_baseline_outside_writes_allow_keeps_a_created_role() {
             "the role stays only under allow"
         );
         assert_outside_writes(result, outside_writes, &role);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_supplied_baseline_outside_writes_allow_keeps_the_logins_own_default() {
+    // A supplied account's allowed baseline changes the login's own
+    // default. It is kept, and the release compares the compile's changes
+    // with what the baseline left, not with what was there before it.
+    // Negative: under the default the same baseline refuses.
+    for outside_writes in [
+        pbps_model::resolver::OutsideWrites::Allowed,
+        pbps_model::resolver::OutsideWrites::Refused,
+    ] {
+        let mut fixture = Fixture::new("PBPS_TEST_PG_DB");
+        let target_db = staging_target(&mut fixture, &guarded_target()).await;
+        let (login, scratch_db) = fixture.confined().await;
+        let baseline = format!(
+            "{}ALTER ROLE CURRENT_USER SET work_mem = '5MB';\n",
+            plain_baseline("integer")
+        );
+        let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+        let key = ProjectKey::new(true);
+        let target_url = fixture.on(&target_db);
+        let identity = identity_of(&target_url).await;
+        let result = super::produce(
+            Driver::Postgres,
+            &fixture.as_login(&scratch_db, &login),
+            &target_url,
+            &identity,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+            &Standard::default(),
+            Some(&baseline),
+            &super::Provenance {
+                scratch: pbps_model::resolver::VouchedScratch::Server {},
+                outside_writes,
+            },
+        )
+        .await;
+        fixture.drop().await;
+        assert_outside_writes(result, outside_writes, &login.0);
     }
 }
 
