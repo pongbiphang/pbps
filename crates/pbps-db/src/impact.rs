@@ -11,10 +11,8 @@
 //! Table/column DROP RESTRICT has its own report: an engine carrying a rename
 //! into a dependent does not imply that it permits deleting the target.
 
-use std::collections::BTreeMap;
-
 use pbps_dialect::DialectError;
-use pbps_model::{Change, ChangeSet, ColumnRef, ModuleId, ModuleKind, ObjectName, TableName};
+use pbps_model::{Change, ColumnRef, ModuleId, ModuleKind, ObjectName, TableName};
 
 use crate::DbError;
 
@@ -100,25 +98,16 @@ impl std::fmt::Display for RenameTarget {
 /// plus a create, so its drop is another impact target. PostgreSQL leaves the
 /// drop side to its module reader, which already answers that question in full.
 #[must_use]
-pub fn rename_targets(changes: &ChangeSet, include_module_drops: bool) -> Vec<RenameTarget> {
-    // A RenameColumn carries the declared, post-rename table because its
-    // statement runs after RenameTable. Impact runs before either one, so
-    // translate through a map built over the whole plan rather than rely on
-    // the changes' current ordering (DECISIONS 407, 416).
-    let mut stored: BTreeMap<&TableName, &TableName> = BTreeMap::new();
-    for p in &changes.changes {
-        if let Change::RenameTable { from, to, .. } = &p.change {
-            stored.insert(to, from);
-        }
-    }
-    changes
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::RenameTable { from, .. } => Some(RenameTarget::Table(from.clone())),
-            Change::RenameColumn { table, from, .. } => {
-                let table = stored.get(table).map_or(table, |t| *t);
-                Some(RenameTarget::Column(table.column(from)))
+pub fn rename_targets(
+    names: &pbps_model::plan_names::PlanNames<'_>,
+    include_module_drops: bool,
+) -> Vec<RenameTarget> {
+    use pbps_model::plan_names::At;
+    names.changes().iter().filter_map(|p| match &p.change {
+            Change::RenameTable { uid, .. } => names.table_at(uid, At::Start).cloned().map(RenameTarget::Table),
+            Change::RenameColumn { uid, .. } => {
+                let (owner, column) = names.column_at(uid, At::Start)?;
+                Some(RenameTarget::Column(names.table_at(owner, At::Start)?.column(column)))
             }
             // A module rename reaches the plan as this drop plus a create,
             // so the drop side is where the catalog has to be asked what
@@ -243,6 +232,72 @@ mod tests {
 
     fn table(s: &str) -> TableName {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_temporary_table_name_is_never_queried_as_a_stored_impact_target() {
+        use pbps_model::{IdsFile, PlannedChange, Uid};
+        let uid: Uid = "t_aaaaaa".parse().unwrap();
+        let changes = [
+            PlannedChange::new(Change::RenameTable {
+                uid: uid.clone(),
+                from: table("app.a"),
+                to: table("app.tmp"),
+                defaults: vec![],
+            }),
+            PlannedChange::new(Change::RenameTable {
+                uid: uid.clone(),
+                from: table("app.tmp"),
+                to: table("app.b"),
+                defaults: vec![],
+            }),
+        ];
+        let after = IdsFile {
+            tables: [(uid, table("app.b"))].into(),
+            ..Default::default()
+        };
+        let names = pbps_model::plan_names::PlanNames::of(&changes, &after).unwrap();
+        assert_eq!(
+            rename_targets(&names, false),
+            vec![
+                RenameTarget::Table(table("app.a")),
+                RenameTarget::Table(table("app.a"))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_column_created_by_this_plan_has_no_stored_rename_impact() {
+        use pbps_model::{Column, IdsFile, PlannedChange, Table, Uid};
+        let owner: Uid = "t_aaaaaa".parse().unwrap();
+        let column: Uid = "c_aaaaaa".parse().unwrap();
+        let mut shape = Table::default();
+        shape
+            .columns
+            .insert("before".into(), Column::new("int".parse().unwrap()));
+        let changes = [
+            PlannedChange::new(Change::CreateTable {
+                uid: owner.clone(),
+                name: table("app.new"),
+                table: Box::new(shape),
+                beside_default: None,
+                moves_at_most: None,
+            }),
+            PlannedChange::new(Change::RenameColumn {
+                uid: column.clone(),
+                table: table("app.new"),
+                from: "before".into(),
+                to: "after".into(),
+                table_was: None,
+            }),
+        ];
+        let after = IdsFile {
+            tables: [(owner, table("app.new"))].into(),
+            columns: [(column, table("app.new").column("after"))].into(),
+            ..Default::default()
+        };
+        let names = pbps_model::plan_names::PlanNames::of(&changes, &after).unwrap();
+        assert!(rename_targets(&names, false).is_empty());
     }
 
     #[test]

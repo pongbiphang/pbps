@@ -8,7 +8,8 @@
 
 use pbps_diff::{Blocker, RenameSide};
 use pbps_model::change::DeleteCause;
-use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass, TableName};
+use pbps_model::plan_names::{At, Holder, PlanNames};
+use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass};
 
 /// One intent in the user's own vocabulary.
 ///
@@ -556,56 +557,34 @@ fn join<T: std::fmt::Display>(v: &[T]) -> String {
 /// values called a one-view plan "1 table". `module_name()` is what separates
 /// them, and it exists precisely because they are different kinds of object
 /// (ADR-0002).
-pub fn touched(cs: &ChangeSet) -> (usize, usize) {
-    let renames = renames(cs);
+pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
     let mut tables = std::collections::BTreeSet::new();
     let mut modules = std::collections::BTreeSet::new();
-    for p in &cs.changes {
+    for (i, p) in names.changes().iter().enumerate() {
         match (p.change.module_id(), p.change.table()) {
-            (Some(m), _) => modules.insert(m.to_string()),
-            (None, Some(t)) => tables.insert(renames.table(t).clone()),
-            // A role is neither; it is counted in its own line of the summary.
-            (None, None) => false,
-        };
+            (Some(m), _) => {
+                modules.insert(m.to_string());
+            }
+            (None, Some(table)) => {
+                let holder = match names.holder(table, At::Before(i)) {
+                    Holder::Vacant => names.holder(table, At::After(i)),
+                    other @ (Holder::Tracked(_) | Holder::Unmanaged) => other,
+                };
+                let named = match holder {
+                    Holder::Tracked(uid) => names.table_at(uid, At::End).unwrap_or(table),
+                    Holder::Unmanaged | Holder::Vacant => table,
+                };
+                tables.insert(named.clone());
+            }
+            // A role is neither; it is counted in its own summary line.
+            (None, None) => {}
+        }
     }
     (tables.len(), modules.len())
 }
 
-/// The new name of every object a change set renames, by its old name.
-///
-/// `RenameTable` and `RenameRole` answer for the old name, and every change
-/// that follows them in the same plan acts on the new one: the differ speaks
-/// in the declared schema's names once the rename is recorded. Counted as
-/// they come, the two spellings of one object made a renamed role whose
-/// grants also change "2 role(s)". Every name goes through [`Renames::table`]
-/// or [`Renames::role`] before it is counted, so both ends land on the same
-/// key.
-///
-/// One map per namespace, keyed by the typed name rather than by the rendered
-/// subject of [`Change::subject`]. That subject is a label (DECISIONS 56) and
-/// two namespaces share its spelling: the role `app.reader` and the table
-/// `[role app].reader` both render `role app.reader`, so one map keyed by it
-/// let a role rename rewrite a table's key and count two tables as one.
-struct Renames {
-    tables: std::collections::BTreeMap<TableName, TableName>,
-    roles: std::collections::BTreeMap<String, String>,
-}
-
-impl Renames {
-    /// The far end of `name`'s rename, or `name` where this plan renames no
-    /// such table.
-    fn table<'a>(&'a self, name: &'a TableName) -> &'a TableName {
-        self.tables.get(name).unwrap_or(name)
-    }
-
-    /// The same for a role, which is a principal and has no [`TableName`].
-    fn role<'a>(&'a self, name: &'a str) -> &'a str {
-        self.roles.get(name).map_or(name, String::as_str)
-    }
-}
-
 /// The role a change acts on, under the name the change itself carries — the
-/// *old* name for a rename, so [`Renames::role`] has something to resolve.
+/// *old* name for a rename, resolved at its own position in the name index.
 ///
 /// `Change::roles` answers with both ends of a rename, which is the right
 /// answer for "did this plan touch that role" and the wrong one for counting:
@@ -663,66 +642,6 @@ fn role_of(change: &Change) -> Option<&str> {
     }
 }
 
-fn renames(cs: &ChangeSet) -> Renames {
-    let mut tables = std::collections::BTreeMap::new();
-    let mut roles = std::collections::BTreeMap::new();
-    for p in &cs.changes {
-        // Exhaustive, for the reason `Change::objects` gives: a change added
-        // later that moves an object's name has to be named here, or the
-        // summary goes back to counting that object twice.
-        match &p.change {
-            Change::RenameTable { from, to, .. } => {
-                tables.insert(from.clone(), to.clone());
-            }
-            Change::RenameRole { from, to, .. } => {
-                roles.insert(from.clone(), to.clone());
-            }
-            Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => {}
-        }
-    }
-    Renames { tables, roles }
-}
-
 /// "3 table(s)", "2 module(s)", or both — never a count of one naming the
 /// other.
 pub fn objects(tables: usize, modules: usize, roles: usize) -> String {
@@ -740,25 +659,35 @@ pub fn objects(tables: usize, modules: usize, roles: usize) -> String {
 }
 
 /// How many distinct roles a change set touches (ADR-0005).
-pub fn touched_roles(cs: &ChangeSet) -> usize {
-    let renames = renames(cs);
-    cs.changes
+pub fn touched_roles(names: &PlanNames<'_>) -> usize {
+    names
+        .changes()
         .iter()
-        .filter_map(|p| role_of(&p.change))
-        .map(|name| renames.role(name))
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let name = role_of(&p.change)?;
+            let holder = match names.role_holder(name, At::Before(i)) {
+                Holder::Vacant => names.role_holder(name, At::After(i)),
+                other @ (Holder::Tracked(_) | Holder::Unmanaged) => other,
+            };
+            Some(match holder {
+                Holder::Tracked(uid) => names.role_at(uid, At::End).unwrap_or(name),
+                Holder::Unmanaged | Holder::Vacant => name,
+            })
+        })
         .collect::<std::collections::BTreeSet<_>>()
         .len()
 }
 
-pub fn summary(cs: &ChangeSet) -> String {
+pub fn summary(cs: &ChangeSet, names: &PlanNames<'_>) -> String {
     if cs.is_empty() {
         return String::new();
     }
-    let (tables, modules) = touched(cs);
+    let (tables, modules) = touched(names);
     let mut out = format!(
         "\n  {} change(s) across {}.\n",
         cs.changes.len(),
-        objects(tables, modules, touched_roles(cs))
+        objects(tables, modules, touched_roles(names))
     );
 
     let risks = cs.risks();
@@ -784,12 +713,12 @@ pub fn summary(cs: &ChangeSet) -> String {
     out
 }
 
-pub fn plan(cs: &ChangeSet) -> String {
+pub fn plan(cs: &ChangeSet, names: &PlanNames<'_>) -> String {
     if cs.is_empty() {
         return "No changes.\n".to_owned();
     }
 
-    let mut out = summary(cs);
+    let mut out = summary(cs, names);
     out.push_str(&changes(cs));
     // The advice names the *gated* classes only. A labelled-but-ungated one
     // (`grant-widen`, ADR-0005) is on every line it applies to above, and in
@@ -1579,8 +1508,17 @@ mod tests {
                 permissions: [Permission::Select].into_iter().collect(),
             },
         ]);
-        assert_eq!(touched_roles(&cs), 1);
-        assert!(summary(&cs).contains("1 role(s)"), "{}", summary(&cs));
+        let after = pbps_model::IdsFile {
+            roles: [(uid(UidKind::Role, "a"), "b".into())].into(),
+            ..Default::default()
+        };
+        let names = PlanNames::of(&cs.changes, &after).unwrap();
+        assert_eq!(touched_roles(&names), 1);
+        assert!(
+            summary(&cs, &names).contains("1 role(s)"),
+            "{}",
+            summary(&cs, &names)
+        );
     }
 
     /// The same shape one namespace over: `RenameTable` answers for the old
@@ -1601,8 +1539,22 @@ mod tests {
                 column: Box::new(pbps_model::Column::new("int".parse().unwrap())),
             },
         ]);
-        assert_eq!(touched(&cs), (1, 0));
-        assert!(summary(&cs).contains("1 table(s)"), "{}", summary(&cs));
+        let after = pbps_model::IdsFile {
+            tables: [(uid(UidKind::Table, "dbo.old"), "dbo.new".parse().unwrap())].into(),
+            columns: [(
+                uid(UidKind::Column, "dbo.new.extra"),
+                "dbo.new.extra".parse().unwrap(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let names = PlanNames::of(&cs.changes, &after).unwrap();
+        assert_eq!(touched(&names), (1, 0));
+        assert!(
+            summary(&cs, &names).contains("1 table(s)"),
+            "{}",
+            summary(&cs, &names)
+        );
     }
 
     /// Two roles that are not the two ends of one rename stay two: the
@@ -1621,8 +1573,17 @@ mod tests {
                 permissions: [Permission::Select].into_iter().collect(),
             },
         ]);
-        assert_eq!(touched_roles(&cs), 2);
-        assert!(summary(&cs).contains("2 role(s)"), "{}", summary(&cs));
+        let after = pbps_model::IdsFile {
+            roles: [(uid(UidKind::Role, "a"), "b".into())].into(),
+            ..Default::default()
+        };
+        let names = PlanNames::of(&cs.changes, &after).unwrap();
+        assert_eq!(touched_roles(&names), 2);
+        assert!(
+            summary(&cs, &names).contains("2 role(s)"),
+            "{}",
+            summary(&cs, &names)
+        );
     }
 
     /// A role and a table can render the same subject string: the role
@@ -1651,11 +1612,63 @@ mod tests {
                 column: Box::new(pbps_model::Column::new("int".parse().unwrap())),
             },
         ]);
-        assert_eq!(touched(&cs), (2, 0));
-        assert_eq!(touched_roles(&cs), 1);
-        let summary = summary(&cs);
+        let after = pbps_model::IdsFile {
+            roles: [(uid(UidKind::Role, "app.reader"), "new.role".into())].into(),
+            tables: ["role app.reader", "role new.role"]
+                .into_iter()
+                .map(|name| (uid(UidKind::Table, name), name.parse().unwrap()))
+                .collect(),
+            columns: ["role app.reader.extra", "role new.role.extra"]
+                .into_iter()
+                .map(|name| (uid(UidKind::Column, name), name.parse().unwrap()))
+                .collect(),
+            ..Default::default()
+        };
+        let names = PlanNames::of(&cs.changes, &after).unwrap();
+        assert_eq!(touched(&names), (2, 0));
+        assert_eq!(touched_roles(&names), 1);
+        let summary = summary(&cs, &names);
         assert!(summary.contains("2 table(s)"), "{summary}");
         assert!(summary.contains("1 role(s)"), "{summary}");
+    }
+
+    #[test]
+    fn a_table_and_role_renamed_twice_are_each_counted_once() {
+        let table = uid(UidKind::Table, "a");
+        let role = uid(UidKind::Role, "a");
+        let cs = set(vec![
+            Change::RenameTable {
+                uid: table.clone(),
+                from: "app.a".parse().unwrap(),
+                to: "app.tmp".parse().unwrap(),
+                defaults: vec![],
+            },
+            Change::RenameTable {
+                uid: table.clone(),
+                from: "app.tmp".parse().unwrap(),
+                to: "app.b".parse().unwrap(),
+                defaults: vec![],
+            },
+            Change::RenameRole {
+                uid: role.clone(),
+                from: "a".into(),
+                to: "tmp".into(),
+            },
+            Change::RenameRole {
+                uid: role.clone(),
+                from: "tmp".into(),
+                to: "b".into(),
+            },
+        ]);
+        let after = pbps_model::IdsFile {
+            tables: [(table, "app.b".parse().unwrap())].into(),
+            roles: [(role, "b".into())].into(),
+            ..Default::default()
+        };
+        let names = PlanNames::of(&cs.changes, &after).unwrap();
+        assert_eq!(touched(&names), (1, 0));
+        assert_eq!(touched_roles(&names), 1);
+        assert!(summary(&cs, &names).contains("1 table(s) and 1 role(s)"));
     }
 
     /// The placeholder is one literal argument in POSIX shells, PowerShell

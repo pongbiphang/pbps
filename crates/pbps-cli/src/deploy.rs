@@ -790,12 +790,34 @@ impl<'a> Occupant<'a> {
 }
 
 /// The partitions this plan creates `UNLOGGED`, each with its parent (#1595).
-pub(crate) fn unlogged_partitions_created(
-    cs: &pbps_model::ChangeSet,
-) -> Vec<(&TableName, &TableName)> {
-    cs.changes
+fn unlogged_partitions_created(
+    changes: &[pbps_model::PlannedChange],
+) -> Vec<(usize, &TableName, &TableName)> {
+    changes
         .iter()
-        .filter_map(|p| unlogged_partition(&p.change))
+        .enumerate()
+        .filter_map(|(at, p)| {
+            unlogged_partition(&p.change).map(|(partition, parent)| (at, partition, parent))
+        })
+        .collect()
+}
+
+/// The same statement-time parents the refusal compares, spelled for the
+/// catalog read that supplies its referencers.
+pub(crate) fn stored_unlogged_parents(
+    names: &pbps_model::plan_names::PlanNames<'_>,
+) -> Vec<TableName> {
+    use pbps_model::plan_names::{At, Holder};
+    unlogged_partitions_created(names.changes())
+        .into_iter()
+        .filter_map(
+            |(at, _, parent)| match names.holder(parent, At::Before(at)) {
+                Holder::Unmanaged => Some(parent.clone()),
+                Holder::Tracked(_) | Holder::Vacant => names.stored(parent, At::Before(at)),
+            },
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -834,10 +856,14 @@ fn unlogged_partition(change: &pbps_model::Change) -> Option<(&TableName, &Table
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn refuse_permanent_referencers(
     cs: &pbps_model::ChangeSet,
+    names: &pbps_model::plan_names::PlanNames<'_>,
     referencers: &[pbps_pg::catalog::PermanentReferencer],
     staged: bool,
 ) -> anyhow::Result<()> {
-    use pbps_model::Change;
+    use pbps_model::{
+        Change,
+        plan_names::{At, Holder},
+    };
     // The catalog names each referencing table as the database does now, and
     // the plan's changes on a table it also renames carry the new name, so
     // each is read back to the catalog's before it is compared: by uid where
@@ -845,15 +871,6 @@ pub(crate) fn refuse_permanent_referencers(
     // plan drops first, and that drop names the table that leaves (#1612
     // review). A key drop carries its execution address, which can precede
     // its owner's rename (DECISIONS 496); resolve it during the walk below.
-    let renamed: BTreeMap<&pbps_model::Uid, &TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::RenameTable { uid, from, .. } => Some((uid, from)),
-            _ => None,
-        })
-        .collect();
-    let mut renamed_from: BTreeMap<&TableName, &TableName> = BTreeMap::new();
     // Each removal with its place in the plan, and a whole table's with no
     // key. In a staged plan only one that runs before the partition's
     // `CREATE` counts: a staged apply commits between statements, and a
@@ -864,26 +881,30 @@ pub(crate) fn refuse_permanent_referencers(
     let mut removals: Vec<(usize, TableName, Option<&str>)> = Vec::new();
     for (at, p) in cs.changes.iter().enumerate() {
         match &p.change {
-            Change::RenameTable { from, to, .. } => {
-                renamed_from.insert(to, from);
+            Change::DropTable { uid, .. } => {
+                if let Some(table) = names.table_at(uid, At::Start) {
+                    removals.push((at, table.clone(), None));
+                }
             }
-            Change::DropTable { name, .. } => removals.push((at, name.clone(), None)),
             Change::SetTablePersistence {
                 uid,
-                table,
                 unlogged: true,
-            } => removals.push((
-                at,
-                renamed
-                    .get(uid)
-                    .map_or_else(|| table.clone(), |from| (*from).clone()),
-                None,
-            )),
+                ..
+            } => {
+                if let Some(table) = names.table_at(uid, At::Start) {
+                    removals.push((at, table.clone(), None));
+                }
+            }
             Change::DropForeignKey { table, name } => {
                 // Only earlier renames decide which stored table owns this
                 // removal; a later name handoff must not change it (DEC-1770.1).
-                let stored = (*renamed_from.get(table).unwrap_or(&table)).clone();
-                removals.push((at, stored, Some(name.as_str())));
+                let stored = match names.holder(table, At::Before(at)) {
+                    Holder::Unmanaged => Some(table.clone()),
+                    Holder::Tracked(_) | Holder::Vacant => names.stored(table, At::Before(at)),
+                };
+                if let Some(stored) = stored {
+                    removals.push((at, stored, Some(name.as_str())));
+                }
             }
             _ => {}
         }
@@ -894,7 +915,6 @@ pub(crate) fn refuse_permanent_referencers(
             .any(|(j, t, k)| (!staged || *j < at) && t == table && k.is_none_or(|k| k == key))
     };
     let mut lines = Vec::new();
-    let now = |t: &TableName| (*renamed_from.get(t).unwrap_or(&t)).clone();
     for (at, p) in cs.changes.iter().enumerate() {
         let Some((partition, parent)) = unlogged_partition(&p.change) else {
             continue;
@@ -902,7 +922,13 @@ pub(crate) fn refuse_permanent_referencers(
         // The parent too, which the plan can rename while it adds the
         // partition under the new name (#1613, #1690); the message names it
         // as declared.
-        let in_catalog = now(parent);
+        let in_catalog = match names.holder(parent, At::Before(at)) {
+            Holder::Unmanaged => Some(parent.clone()),
+            Holder::Tracked(_) | Holder::Vacant => names.stored(parent, At::Before(at)),
+        };
+        let Some(in_catalog) = in_catalog else {
+            continue;
+        };
         for r in referencers.iter().filter(|r| r.parent == in_catalog) {
             // A leaf's copy goes with the key its partitioned table declares,
             // which is the one a plan names.
@@ -1014,28 +1040,27 @@ fn module_object(id: &ModuleId) -> TableName {
 /// changes move or remove, by the catalog's names for them.
 // The complement is every change that moves or removes no object.
 #[allow(clippy::wildcard_enum_match_arm)]
-pub(crate) fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<TableName>) {
+pub(crate) fn object_reads(
+    cs: &pbps_model::ChangeSet,
+    index: &pbps_model::plan_names::PlanNames<'_>,
+) -> (Vec<TableName>, Vec<TableName>) {
     use pbps_model::Change;
     use pbps_mssql::emit::default_constraint_name as generated;
     use pbps_mssql::emit::fallback_default_constraint_name as fallback_name;
-    let renamed_from: BTreeMap<&TableName, &TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::RenameTable { from, to, .. } => Some((to, from)),
-            _ => None,
-        })
-        .collect();
-    let now = |t: &TableName| (*renamed_from.get(t).unwrap_or(&t)).clone();
     let in_schema = |t: &TableName, name: String| TableName::new(t.schema.clone(), name);
     let mut names = created_object_names(cs);
     let mut parents = Vec::new();
-    for p in &cs.changes {
+    for (at, p) in cs.changes.iter().enumerate() {
+        let now = |t: &TableName| {
+            index
+                .stored(t, pbps_model::plan_names::At::Before(at))
+                .unwrap_or_else(|| t.clone())
+        };
         match &p.change {
             Change::RenameTable {
                 from, to, defaults, ..
             } => {
-                parents.push(from.clone());
+                parents.push(now(from));
                 // The target itself, so the walk sees an object the project
                 // does not record holding it (DEC-981.2).
                 names.push(to.clone());
@@ -1054,7 +1079,7 @@ pub(crate) fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<T
                 names.push(in_schema(table, generated(table, to)));
                 names.push(in_schema(table, fallback_name(table, to)));
             }
-            Change::DropTable { name, .. } => parents.push(name.clone()),
+            Change::DropTable { name, .. } => parents.push(now(name)),
             Change::DropColumn { column, .. } => parents.push(now(&column.table)),
             Change::AlterColumnDefault { column, to, .. } => {
                 parents.push(now(&column.table));
@@ -6581,6 +6606,7 @@ pub fn cmd_bootstrap(
             crate::engine::owned_targets(
                 conn.driver(),
                 &cs,
+                &ids,
                 &existing.scoped.owners,
                 &existing.scoped.session_role,
             )?;
@@ -7262,7 +7288,13 @@ pub fn cmd_plan_db(
             let name_facts =
                 crate::engine::refuse_created_name_occupants(&mut conn, &mut cs, &target.label)
                     .await?;
-            crate::engine::refuse_unlogged_partition_referencers(&mut conn, &cs, staged).await?;
+            crate::engine::refuse_unlogged_partition_referencers(
+                &mut conn,
+                &cs,
+                &resolved.ids,
+                staged,
+            )
+            .await?;
             let rename_evidence = crate::engine::external_role_renames(
                 &mut conn,
                 &recorded_snapshot.ids,
@@ -7291,12 +7323,13 @@ pub fn cmd_plan_db(
             // after the plan's change to that expression which stops reading
             // it (DEC-1316.1): after the module passes, which may move that
             // change, and before the checks that read the order.
-            crate::engine::release_generated_inputs(&mut conn, &mut cs).await?;
+            crate::engine::release_generated_inputs(&mut conn, &mut cs, &resolved.ids).await?;
             // A computed column's function drops after it, by the catalog's
             // edges (DEC-1431.1): before the rename walk, which moves a
             // module drop only between the drops these edges order it
             // among (#1680).
-            let precedence = crate::engine::order_computed_by_edges(&mut conn, &mut cs).await?;
+            let precedence =
+                crate::engine::order_computed_by_edges(&mut conn, &mut cs, &resolved.ids).await?;
             // What an added computed column calls has no edge yet; its names
             // are compared under the collation instead (#1459).
             crate::engine::refuse_added_computed_calls(&mut conn, &cs, &declared).await?;
@@ -7305,6 +7338,7 @@ pub fn cmd_plan_db(
             crate::engine::order_created_object_names(
                 &mut conn,
                 &mut cs,
+                &resolved.ids,
                 &target.label,
                 &precedence,
             )
@@ -7317,7 +7351,7 @@ pub fn cmd_plan_db(
                 facts.order_and_refuse(&mut cs, &target.label)?;
             }
             let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
-            let drops = crate::engine::check_drop_blockers(&mut conn, &cs).await?;
+            let drops = crate::engine::check_drop_blockers(&mut conn, &cs, &resolved.ids).await?;
             let slots = crate::engine::logical_slots(&mut conn, &cs).await?;
             crate::engine::prepare_data_writes(&mut conn, &cs, &entry.snapshot, &resolved.ids)
                 .await?;
@@ -7436,17 +7470,27 @@ pub fn cmd_plan_db(
 
         findings.extend(policy);
         let permission_support = crate::engine::permission_support(&mut conn, &cs).await?;
-        let generation_support = crate::engine::generation_support(&mut conn, &cs).await?;
+        let generation_support =
+            crate::engine::generation_support(&mut conn, &cs, &resolved.ids).await?;
         // Asked of the read this plan was built from, not of the connection
         // again: the owners came out of the same statement snapshot as the
         // schema, so the two cannot disagree (DECISIONS 174).
-        let owned_targets =
-            crate::engine::owned_targets(conn.driver(), &cs, &scoped.owners, &scoped.session_role)?;
+        let owned_targets = crate::engine::owned_targets(
+            conn.driver(),
+            &cs,
+            &resolved.ids,
+            &scoped.owners,
+            &scoped.session_role,
+        )?;
         // The other half of the same read, and the other direction: a grant
         // this connection could see and could not take away is refused only
         // when the plan actually revokes it (#251).
-        let unrevocable_grants =
-            crate::engine::unrevocable_grants(conn.driver(), &cs, &managed.unrevocable)?;
+        let unrevocable_grants = crate::engine::unrevocable_grants(
+            conn.driver(),
+            &cs,
+            &resolved.ids,
+            &managed.unrevocable,
+        )?;
 
         // The edition is a connection-time fact, and it is the only place the
         // two edition-dependent questions of ADR-0003 can be answered
@@ -7579,7 +7623,13 @@ pub fn cmd_plan_db(
             }
             println!("Baseline: {baseline}");
             println!("Resolver profile: {name}; it answered the binding questions of {asked}.");
-            print!("{}", crate::report::plan(&changes));
+            print!(
+                "{}",
+                crate::report::plan(
+                    &changes,
+                    &pbps_model::plan_names::PlanNames::of(&changes.changes, &resolved.ids)?
+                )
+            );
             let report = crate::output::Report::plain("plan", vec![finding]);
             eprint!("{}", crate::output::human(&report.findings));
             return report.outcome();
@@ -7622,13 +7672,14 @@ pub fn cmd_plan_db(
         reject_non_transactional(&statements)?;
     }
 
-    let (tables, modules) = crate::report::touched(&cs);
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &resolved.ids)?;
+    let (tables, modules) = crate::report::touched(&names);
     let data = crate::PlanData {
         baseline: baseline_description.clone(),
         changes: cs.changes.len(),
         tables,
         modules,
-        roles: crate::report::touched_roles(&cs),
+        roles: crate::report::touched_roles(&names),
         risks: cs.risks().iter().map(|risk| risk.as_str()).collect(),
         connected_checks,
         cost: Some(cost),
@@ -7647,7 +7698,7 @@ pub fn cmd_plan_db(
                 selection.name, selection.source, assessment.unaffected, assessment.rebuilt,
             );
         }
-        print!("{}", crate::report::plan(&cs));
+        print!("{}", crate::report::plan(&cs, &names));
         for check in &data.connected_checks {
             println!("{}: {}", check.name, check.message);
         }
@@ -7980,7 +8031,8 @@ fn apply_identified(
     if !staged {
         reject_non_transactional(&statements)?;
     }
-    let targets = crate::engine::rename_targets(target.driver(), &plan.changes);
+    let names = pbps_model::plan_names::PlanNames::of(&plan.changes.changes, &plan.ids)?;
+    let targets = crate::engine::rename_targets(target.driver(), &names);
     let deployment = Deployment {
         project,
         target,
@@ -7998,7 +8050,7 @@ fn apply_identified(
         // This capability is constant for the connection and needs no ledger
         // lock. Check before any writes, including staged resumes.
         crate::engine::permission_support(&mut conn, &plan.changes).await?;
-        crate::engine::generation_support(&mut conn, &plan.changes).await?;
+        crate::engine::generation_support(&mut conn, &plan.changes, &plan.ids).await?;
 
         // The lock comes first, before the checks and not after them: a
         // pre-flight that passed while another pipeline was mid-apply would
@@ -8207,6 +8259,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     crate::engine::owned_targets(
         conn.driver(),
         &plan.changes,
+        &plan.ids,
         &scoped.owners,
         &scoped.session_role,
     )?;
@@ -8215,7 +8268,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     // made as the owner and applied as a least-privilege deployer otherwise
     // passes the baseline and fails at its `REVOKE`, after earlier statements
     // of a staged run are already committed.
-    crate::engine::unrevocable_grants(conn.driver(), &plan.changes, &unrevocable)?;
+    crate::engine::unrevocable_grants(conn.driver(), &plan.changes, &plan.ids, &unrevocable)?;
 
     // Before the probes, which run declared expressions and so the routines
     // they call (DEC-319.1). Every module the plan holds at any point of its
@@ -8238,9 +8291,10 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     let result = async {
         conn.begin(dialect.transaction_framing()).await?;
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
-        crate::engine::check_module_dependents(conn, &plan.changes, &scoped.schema).await?;
+        crate::engine::check_module_dependents(conn, &plan.changes, &scoped.schema, &plan.ids)
+            .await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, false).await?;
-        crate::engine::check_drop_blockers(conn, &plan.changes).await?;
+        crate::engine::check_drop_blockers(conn, &plan.changes, &plan.ids).await?;
         let data_guard =
             crate::engine::prepare_data_writes(conn, &plan.changes, &entry.snapshot, &plan.ids)
                 .await?;
@@ -8567,10 +8621,11 @@ async fn apply_staged_under_lock(
         crate::engine::owned_targets(
             conn.driver(),
             &plan.changes,
+            &plan.ids,
             &scoped.owners,
             &scoped.session_role,
         )?;
-        crate::engine::unrevocable_grants(conn.driver(), &plan.changes, &unrevocable)?;
+        crate::engine::unrevocable_grants(conn.driver(), &plan.changes, &plan.ids, &unrevocable)?;
         // The role a `DROP ROLE` will meet is the role as the plan left it:
         // the members whose `DROP MEMBER` has not run yet, and nothing
         // owned. Membership and ownership are outside the checksum on
@@ -8654,10 +8709,11 @@ async fn apply_staged_under_lock(
         crate::engine::owned_targets(
             conn.driver(),
             &plan.changes,
+            &plan.ids,
             &scoped.owners,
             &scoped.session_role,
         )?;
-        crate::engine::unrevocable_grants(conn.driver(), &plan.changes, &unrevocable)?;
+        crate::engine::unrevocable_grants(conn.driver(), &plan.changes, &plan.ids, &unrevocable)?;
         // Before the probes, as in the transactional apply (DEC-319.1).
         crate::pins::check(
             conn,
@@ -8691,7 +8747,7 @@ async fn apply_staged_under_lock(
     // Staged plans carry one logical change. A completed DROP has no catalog
     // target left; a closing-only resume must not ask for that old target.
     if start < total {
-        drop_preflight(conn, dialect, &plan.changes).await?;
+        drop_preflight(conn, dialect, &plan.changes, &plan.ids).await?;
     }
     // The names the catalog has right now. It starts at whatever the newest
     // entry recorded — the last ordinary state on a fresh run, the checkpoint
@@ -9350,9 +9406,10 @@ async fn drop_preflight(
     conn: &mut Conn,
     dialect: &dyn pbps_dialect::Dialect,
     changes: &pbps_model::ChangeSet,
+    ids: &IdsFile,
 ) -> anyhow::Result<()> {
     conn.begin(dialect.transaction_framing()).await?;
-    let result = crate::engine::check_drop_blockers(conn, changes).await;
+    let result = crate::engine::check_drop_blockers(conn, changes, ids).await;
     let rollback = conn.rollback(dialect.transaction_framing()).await;
     result?;
     rollback?;
@@ -9378,13 +9435,14 @@ async fn preflight(
     // caller that gets the old bug back, and this function is the one whose
     // answers depend on it.
     pin_session(conn, dialect).await?;
-    drop_preflight(conn, dialect, &plan.changes).await?;
+    drop_preflight(conn, dialect, &plan.changes, &plan.ids).await?;
     // Asked again, as the edition is below: a table outside the declarations
     // can gain a key to the parent between the plan and this apply, and the
     // engine takes the unlogged partition under it all the same (#1595).
     crate::engine::refuse_unlogged_partition_referencers(
         conn,
         &plan.changes,
+        &plan.ids,
         plan.mode.is_staged(),
     )
     .await?;
@@ -9458,9 +9516,11 @@ async fn preflight(
     run_probes(
         conn,
         dialect,
-        &plan.changes,
-        &pbps_model::Partitions::of(stored)
-            .renamed(crate::dependents::table_renames(&plan.changes)),
+        &pbps_model::plan_names::PlanNames::of(&plan.changes.changes, &plan.ids)?,
+        &pbps_model::Partitions::of(stored).renamed(&pbps_model::plan_names::PlanNames::of(
+            &plan.changes.changes,
+            &plan.ids,
+        )?),
     )
     .await
 }
@@ -9516,14 +9576,14 @@ fn impact_lines(report: &pbps_db::impact::ImpactReport, notes: &[String]) -> Vec
 async fn run_probes(
     conn: &mut Conn,
     dialect: &dyn pbps_dialect::Dialect,
-    changes: &pbps_model::ChangeSet,
+    names: &pbps_model::plan_names::PlanNames<'_>,
     partitions: &pbps_model::Partitions,
 ) -> anyhow::Result<()> {
     pin_session(conn, dialect).await?;
     let mut failures = Vec::new();
     let mut passed = 0usize;
     let mut unchecked = 0usize;
-    let report = dialect.preflight_with(changes, partitions);
+    let report = dialect.preflight_with(names, partitions);
     for skipped in &report.unchecked {
         unchecked += 1;
         eprintln!(
@@ -9595,8 +9655,11 @@ async fn run_probes(
     // "No probe" is not "no risk". Saying so keeps the operator's attention
     // where the approval already put it, rather than letting a clean pre-flight
     // read as a clean bill of health.
-    let unprobed: Vec<&str> = changes
-        .risks()
+    let unprobed: Vec<&str> = names
+        .changes()
+        .iter()
+        .flat_map(|change| change.risks.iter().copied())
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .filter(|r| {
             matches!(
@@ -9811,6 +9874,20 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+    fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<TableName>) {
+        let ids = crate::plan_fixture::ids(cs);
+        let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();
+        super::object_reads(cs, &names)
+    }
+    fn refuse_permanent_referencers(
+        cs: &pbps_model::ChangeSet,
+        referencers: &[pbps_pg::catalog::PermanentReferencer],
+        staged: bool,
+    ) -> anyhow::Result<()> {
+        let ids = crate::plan_fixture::ids(cs);
+        let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids)?;
+        super::refuse_permanent_referencers(cs, &names, referencers, staged)
+    }
 
     /// #1077: on SQL Server, any other object at a name the plan creates
     /// refuses it, with its kind and parent named. One the plan frees first
@@ -11060,12 +11137,10 @@ mod tests {
         );
         refused(vec![attach(false)], &parent).expect("a permanent attach");
         assert_eq!(
-            unlogged_partitions_created(&ChangeSet {
-                changes: vec![attach(true), attach(false), partition(true)],
-            }),
+            unlogged_partitions_created(&[attach(true), attach(false), partition(true)]),
             [
-                (&TableName::new("app", "t"), &parent),
-                (&TableName::new("app", "ev_u"), &parent)
+                (0, &TableName::new("app", "t"), &parent),
+                (2, &TableName::new("app", "ev_u"), &parent)
             ]
         );
         let renamed = TableName::new("ext", "r2");
@@ -12571,7 +12646,8 @@ mod tests {
             let probed = run_probes(
                 &mut conn,
                 &pbps_pg::Postgres::new(),
-                &changes,
+                &pbps_model::plan_names::PlanNames::of(&changes.changes, &IdsFile::default())
+                    .unwrap(),
                 &pbps_model::Partitions::default(),
             )
             .await;
@@ -12629,7 +12705,8 @@ mod tests {
             let probed = run_probes(
                 &mut conn,
                 &pbps_pg::Postgres::new(),
-                &changes,
+                &pbps_model::plan_names::PlanNames::of(&changes.changes, &IdsFile::default())
+                    .unwrap(),
                 &pbps_model::Partitions::default(),
             )
             .await;
@@ -12709,7 +12786,7 @@ mod tests {
         let probed = run_probes(
             &mut conn,
             &dialect,
-            &changes,
+            &pbps_model::plan_names::PlanNames::of(&changes.changes, &IdsFile::default()).unwrap(),
             &pbps_model::Partitions::default(),
         )
         .await;
@@ -19959,5 +20036,127 @@ mod tests {
             Settled::Closing,
         )
         .expect("inserted at its default, read back omitted");
+    }
+}
+
+#[cfg(test)]
+mod plan_name_tests {
+    use super::*;
+    use pbps_model::{Change, PlannedChange, plan_names::PlanNames};
+
+    #[test]
+    fn catalog_parent_reads_never_include_a_rename_chains_temporary_name() {
+        let (changes, ids) = crate::plan_fixture::chain();
+        let index = PlanNames::of(&changes.changes, &ids).unwrap();
+        let (_, parents) = object_reads(&changes, &index);
+        assert_eq!(parents, [TableName::new("app", "original_table")]);
+        assert!(!parents.contains(&TableName::new("app", "temporary_table")));
+    }
+
+    #[test]
+    fn a_referencing_key_is_removed_from_its_original_table_after_multiple_renames() {
+        let (mut changes, mut ids) = crate::plan_fixture::chain();
+        let parent = TableName::new("app", "parent");
+        let leaf = TableName::new("app", "leaf");
+        let leaf_uid: pbps_model::Uid = "t_bbbbbb".parse().unwrap();
+        ids.tables.insert(leaf_uid.clone(), leaf.clone());
+        changes
+            .changes
+            .push(PlannedChange::new(Change::DropForeignKey {
+                table: TableName::new("app", "final_table"),
+                name: "fk".into(),
+            }));
+        changes
+            .changes
+            .push(PlannedChange::new(Change::CreateTable {
+                uid: leaf_uid,
+                name: leaf,
+                table: Box::new(pbps_model::Table {
+                    unlogged: true,
+                    partition_of: Some(pbps_model::PartitionOf {
+                        parent: parent.clone(),
+                        bound: pbps_model::PartitionBound::Default,
+                        columns: Default::default(),
+                    }),
+                    ..pbps_model::Table::default()
+                }),
+                beside_default: None,
+                moves_at_most: None,
+            }));
+        let stored = TableName::new("app", "original_table");
+        let found = pbps_pg::catalog::PermanentReferencer {
+            parent,
+            table: stored.clone(),
+            key: "fk".into(),
+            root_table: stored,
+            root_key: "fk".into(),
+        };
+        let names = PlanNames::of(&changes.changes, &ids).unwrap();
+        assert!(
+            refuse_permanent_referencers(&changes, &names, std::slice::from_ref(&found), true)
+                .is_ok()
+        );
+        let another = pbps_pg::catalog::PermanentReferencer {
+            key: "other".into(),
+            root_key: "other".into(),
+            ..found
+        };
+        assert!(refuse_permanent_referencers(&changes, &names, &[another], true).is_err());
+    }
+
+    #[test]
+    fn unlogged_parent_reads_use_the_holder_at_creation_not_the_final_spelling() {
+        let (chain, mut ids) = crate::plan_fixture::chain();
+        let leaf = TableName::new("app", "leaf");
+        let leaf_uid: pbps_model::Uid = "t_bbbbbb".parse().unwrap();
+        ids.tables.insert(leaf_uid.clone(), leaf.clone());
+        let create_leaf = |parent: &str| {
+            PlannedChange::new(Change::CreateTable {
+                uid: leaf_uid.clone(),
+                name: leaf.clone(),
+                table: Box::new(pbps_model::Table {
+                    unlogged: true,
+                    partition_of: Some(pbps_model::PartitionOf {
+                        parent: TableName::new("app", parent),
+                        bound: pbps_model::PartitionBound::Default,
+                        columns: Default::default(),
+                    }),
+                    ..pbps_model::Table::default()
+                }),
+                beside_default: None,
+                moves_at_most: None,
+            })
+        };
+        let mut after_renames = chain.changes.clone();
+        after_renames.push(create_leaf("final_table"));
+        let mut before_renames = vec![create_leaf("original_table")];
+        before_renames.extend(chain.changes);
+        for changes in [&after_renames, &before_renames] {
+            let names = PlanNames::of(changes, &ids).unwrap();
+            assert_eq!(
+                stored_unlogged_parents(&names),
+                [TableName::new("app", "original_table")]
+            );
+        }
+        let mut shape = pbps_model::Table::default();
+        shape.columns.insert(
+            "original_column".into(),
+            pbps_model::Column::new("int".parse().unwrap()),
+        );
+        after_renames.insert(
+            0,
+            PlannedChange::new(Change::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: TableName::new("app", "original_table"),
+                table: Box::new(shape),
+                beside_default: None,
+                moves_at_most: None,
+            }),
+        );
+        let names = PlanNames::of(&after_renames, &ids).unwrap();
+        assert!(
+            stored_unlogged_parents(&names).is_empty(),
+            "a new parent has no stored referencers"
+        );
     }
 }

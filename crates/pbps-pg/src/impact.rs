@@ -90,8 +90,8 @@ pub use pbps_db::impact::{ImpactError, ImpactReport, Referrer, RenameTarget};
 
 /// Rename targets in the catalog's stored spelling. Module drops belong to
 /// this engine's module reader, so they are excluded here.
-pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
-    pbps_db::impact::rename_targets(changes, false)
+pub fn rename_targets(names: &pbps_model::plan_names::PlanNames<'_>) -> Vec<RenameTarget> {
+    pbps_db::impact::rename_targets(names, false)
 }
 
 /// Every routine in this database whose body the engine keeps as **text**,
@@ -661,8 +661,18 @@ mod tests {
                 }),
             ],
         };
+        let after = pbps_model::IdsFile {
+            tables: [("t_aaaaaa".parse().unwrap(), tname("app.customer"))].into(),
+            columns: [(
+                "c_aaaaaa".parse().unwrap(),
+                "app.customer.contact_email".parse().unwrap(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &after).unwrap();
         assert_eq!(
-            rename_targets(&cs),
+            rename_targets(&names),
             [
                 RenameTarget::Table(tname("app.client")),
                 RenameTarget::Column("app.client.email".parse().expect("a column")),
@@ -695,8 +705,22 @@ mod tests {
                 }),
             ],
         };
+        let after = pbps_model::IdsFile {
+            tables: [
+                ("t_aaaaaa".parse().unwrap(), tname("app.purchase")),
+                ("t_bbbbbb".parse().unwrap(), tname("app.customer")),
+            ]
+            .into(),
+            columns: [(
+                "c_aaaaaa".parse().unwrap(),
+                "app.customer.contact_email".parse().unwrap(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &after).unwrap();
         assert_eq!(
-            rename_targets(&cs),
+            rename_targets(&names),
             [
                 RenameTarget::Table(tname("app.order")),
                 RenameTarget::Column("app.customer.email".parse().expect("a column")),
@@ -716,7 +740,9 @@ mod tests {
                 kind: pbps_model::ModuleKind::View,
             })],
         };
-        assert!(rename_targets(&cs).is_empty(), "{cs:#?}");
+        let ids = pbps_model::IdsFile::default();
+        let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();
+        assert!(rename_targets(&names).is_empty(), "{cs:#?}");
     }
 
     #[test]

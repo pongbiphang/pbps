@@ -897,3 +897,35 @@ previews without Git, corrupted mappings and schemas, unchanged pending ids
 and existing outputs on refusal, and committed Git repair. A real PostgreSQL
 ledger export with a grantless role remains a no-op; removing that role from
 the exported schema is refused without changing the working ids or ledger.
+
+<a id="dec-1851-1"></a>
+
+**DEC-1851.1. Translate a plan address through its holder at an explicit
+boundary, using one borrowed identity index.** `PlanNames` derives table,
+column-owner and role histories from the ordered changes and the final ids
+file. Untouched table owners come from that file; touched owners come from
+UID-bearing changes. No catalog name or tombstone manufactures a UID.
+Construction refuses contradictory sources, simultaneous holders and an end
+state that disagrees with the supplied ids. A tracked holder, an unmanaged
+address and a vacated managed address are distinct answers. Vacancy does not
+prove that an engine's catalog namespace is free.
+
+A whole-plan `to -> from` map loses intermediate moves and changes ownership
+when another identity takes a vacated name. Final-name projections ask `End`;
+removals and catalog dependency reads ask `Before(i)`. In particular, collecting
+preflight removals must not call its final-name projection: in `drop a; rename
+b to a`, that records the drop against `b` (DEC-1770.1). Column histories keep
+the owning table UID, so table and column rename chains compose without a
+second name walk. Attach retires ordinary column identities; detach introduces
+the column identities supplied by its shape and the final mapping.
+
+The index borrows its change slice. A pass cannot mutate that slice and keep
+using the same index; a pass that changes order constructs another index for
+the resulting order. This derived view has no serialized representation and
+does not change saved-plan bytes, rename intent, engine SQL, namespace
+allocation or the apply guard's observation policy. The remaining dedicated
+step replays and apply-guard migration are separate slices of #1772.
+
+Pinned by the index's boundary, handoff, owner, lifetime and generated-sequence
+tests; a compile-fail example for stale use across mutation; consumer rename
+chain tests; and both engines' existing live removal-handoff regression.

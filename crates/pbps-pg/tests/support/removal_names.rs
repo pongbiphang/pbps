@@ -83,7 +83,7 @@ async fn a_removal_keeps_its_stored_table_when_names_change_hands() {
         let mut changes: Vec<_> = prefix.into_iter().map(PlannedChange::new).collect();
         changes.push(PlannedChange::new(deleting.clone()));
         let cs = ChangeSet { changes };
-        let report = dialect.preflight(&cs);
+        let report = dialect.fixture_preflight(&cs);
         assert!(report.unchecked.is_empty(), "{label}: {report:?}");
         let probes: Vec<_> = report
             .probes

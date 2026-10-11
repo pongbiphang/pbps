@@ -34,6 +34,7 @@ pub mod module;
 pub mod name;
 pub mod partitions;
 pub mod plan;
+pub mod plan_names;
 pub mod reason;
 pub mod rename;
 pub mod resolver;

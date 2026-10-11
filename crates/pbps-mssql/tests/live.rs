@@ -866,7 +866,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
                         PlannedChange::new(delete(deleted)),
                     ],
                 };
-                let probes = Mssql.preflight(&cs).probes;
+                let probes = Mssql.fixture_preflight(&cs).probes;
                 assert_eq!(probes.len(), 1);
                 let rows = db.conn.query(&probes[0].sql).await.unwrap();
                 assert_eq!(
@@ -904,7 +904,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
                         PlannedChange::new(delete(deleted)),
                     ],
                 };
-                let probes = Mssql.preflight(&cs).probes;
+                let probes = Mssql.fixture_preflight(&cs).probes;
                 assert_eq!(probes.len(), 1);
                 let rows = db.conn.query(&probes[0].sql).await.unwrap();
                 assert_eq!(
@@ -946,7 +946,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
                     }),
                 ],
             };
-            let probes = Mssql.preflight(&cs).probes;
+            let probes = Mssql.fixture_preflight(&cs).probes;
             let probe = probes
                 .iter()
                 .find(|p| p.sql.contains("NOT EXISTS"))
@@ -2512,7 +2512,7 @@ async fn a_layout_on_partitioned_rows_is_left_out_and_named() {
 /// Runs every probe of a plan and returns (description, count) pairs.
 async fn probe_counts(conn: &mut Conn, cs: &pbps_model::ChangeSet) -> Vec<(String, i32)> {
     let mut counts = Vec::new();
-    for probe in Mssql.preflight(cs).probes {
+    for probe in Mssql.fixture_preflight(cs).probes {
         let rows = conn
             .query(&probe.sql)
             .await
@@ -5405,7 +5405,17 @@ async fn a_column_rename_on_a_renamed_table_still_finds_its_blocker() {
             }),
         ],
     };
-    let target = pbps_mssql::impact::rename_targets(&changes)
+    let after = pbps_model::IdsFile {
+        tables: [("t_aaaaaa".parse().unwrap(), "dbo.customer".parse().unwrap())].into(),
+        columns: [(
+            "c_aaaaaa".parse().unwrap(),
+            "dbo.customer.contact_email".parse().unwrap(),
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &after).unwrap();
+    let target = pbps_mssql::impact::rename_targets(&names)
         .into_iter()
         .find(|target| matches!(target, RenameTarget::Column(_)))
         .expect("column rename target");
@@ -5534,7 +5544,6 @@ async fn a_table_name_needing_quoting_still_reports_what_blocks_its_rename() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn preflight_probes_count_what_the_engine_would_refuse() {
-    use pbps_dialect::Dialect;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut db = TestDb::create("probes").await;
@@ -5603,7 +5612,7 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
     };
 
     let mut counts = Vec::new();
-    for probe in Mssql.preflight(&cs).probes {
+    for probe in Mssql.fixture_preflight(&cs).probes {
         let rows = db
             .conn
             .query(&probe.sql)
@@ -5695,7 +5704,7 @@ async fn narrowing_to_sysname_probes_the_alias_real_capacity() {
             .unwrap_or_else(|e| panic!("{label}: insert: {e}"));
 
         let mut counts = Vec::new();
-        for probe in Mssql.preflight(&plan()).probes {
+        for probe in Mssql.fixture_preflight(&plan()).probes {
             let rows = db.conn.query(&probe.sql).await.unwrap_or_else(|e| {
                 panic!("{label}: the engine rejected a probe:\n{}\n{e}", probe.sql)
             });
@@ -5779,7 +5788,7 @@ async fn narrowing_a_varbinary_source_to_sysname_is_not_falsely_blocked() {
             to_collation: None,
         })],
     };
-    for probe in Mssql.preflight(&cs).probes {
+    for probe in Mssql.fixture_preflight(&cs).probes {
         let rows = db
             .conn
             .query(&probe.sql)
@@ -5835,7 +5844,7 @@ async fn unicode_capacity_verdict(
             to_collation: None,
         })],
     };
-    let preflight = Mssql.preflight(&changes);
+    let preflight = Mssql.fixture_preflight(&changes);
     assert_eq!(preflight.probes.len(), 1, "{from} -> {to}");
     let probe = &preflight.probes[0];
     let rows = db
@@ -6036,7 +6045,7 @@ async fn a_default_this_engine_fills_every_row_from_is_not_counted_as_missing() 
         let cs = plan(&base, &base_ids, &declared, &ids);
 
         let mut measured = Vec::new();
-        for probe in Mssql.preflight(&cs).probes {
+        for probe in Mssql.fixture_preflight(&cs).probes {
             let rows = db
                 .conn
                 .query(&probe.sql)
@@ -6098,7 +6107,7 @@ async fn unicode_to_varchar_probes_character_loss() {
     };
     async fn counts(conn: &mut Conn, plan: &ChangeSet) -> std::collections::BTreeMap<String, i32> {
         let mut counts = std::collections::BTreeMap::new();
-        for probe in Mssql.preflight(plan).probes {
+        for probe in Mssql.fixture_preflight(plan).probes {
             let rows = conn
                 .query(&probe.sql)
                 .await
@@ -6440,11 +6449,14 @@ async fn a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps
 
     // A plain index constrains nothing, so there is nothing to count.
     assert!(
-        Mssql.preflight(&one(index(false, None))).probes.is_empty(),
+        Mssql
+            .fixture_preflight(&one(index(false, None)))
+            .probes
+            .is_empty(),
         "a plain index is not probed"
     );
 
-    let probes = Mssql.preflight(&one(index(true, None))).probes;
+    let probes = Mssql.fixture_preflight(&one(index(true, None))).probes;
     assert_eq!(probes.len(), 1, "{probes:?}");
     let rows = db
         .conn
@@ -6456,7 +6468,7 @@ async fn a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps
     assert_eq!(n, 2, "{}", probes[0].sql);
 
     let filtered = Mssql
-        .preflight(&one(index(true, Some("[deleted_at] IS NULL"))))
+        .fixture_preflight(&one(index(true, Some("[deleted_at] IS NULL"))))
         .probes;
     assert_eq!(filtered.len(), 1, "{filtered:?}");
     let rows = db
@@ -6556,7 +6568,7 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
     // column of the table: the count it could produce here is 2, and 2 refuses
     // the plan the engine just accepted.
     let probes = Mssql
-        .preflight(&ChangeSet {
+        .fixture_preflight(&ChangeSet {
             changes: vec![
                 PlannedChange::new(Change::AlterColumnType {
                     uid: "c_bbbbbb".parse().unwrap(),
@@ -6609,7 +6621,6 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_key_probe_counts_the_rows_the_plan_will_leave() {
-    use pbps_dialect::Dialect;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut db = TestDb::create("keyafter").await;
@@ -6645,7 +6656,7 @@ async fn a_key_probe_counts_the_rows_the_plan_will_leave() {
     let count = |changes: Vec<PlannedChange>| {
         let cs = ChangeSet { changes };
         Mssql
-            .preflight(&cs)
+            .fixture_preflight(&cs)
             .probes
             .into_iter()
             .find(|p| p.description.contains("collide"))
@@ -6685,7 +6696,6 @@ async fn a_key_probe_counts_the_rows_the_plan_will_leave() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn probes_over_a_column_this_plan_adds_run_and_count_what_the_engine_refuses() {
-    use pbps_dialect::Dialect;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut db = TestDb::create("addedcol").await;
@@ -6748,7 +6758,7 @@ async fn probes_over_a_column_this_plan_adds_run_and_count_what_the_engine_refus
         // The same, pointing at a parent row that is not there.
         ("orphaned", vec![add(false, Some("'us'")), unique, fk]),
     ] {
-        for probe in Mssql.preflight(&ChangeSet { changes }).probes {
+        for probe in Mssql.fixture_preflight(&ChangeSet { changes }).probes {
             let rows = db.conn.query(&probe.sql).await.unwrap_or_else(|e| {
                 panic!("the engine rejected a probe ({label}):\n{}\n{e}", probe.sql)
             });
@@ -9009,7 +9019,7 @@ async fn a_declaration_that_removes_rows_is_told_which_policy_catalog_read_its_c
         key_type: None,
     };
     let probe_sql = Mssql
-        .preflight(&ChangeSet {
+        .fixture_preflight(&ChangeSet {
             changes: vec![PlannedChange::new(deletion.clone())],
         })
         .probes
@@ -9431,7 +9441,7 @@ async fn referenced_column_subsets_match_the_foreign_key_and_its_probe() {
     let object_select = holds_at_object_scope(&mut lp, "shared.parent", "SELECT").await;
     let unrelated = lp.query("SELECT label FROM shared.parent").await;
     let ready = named_gaps(&referenced_permissions(&mut lp, &referenced).await);
-    let probes = Mssql.preflight(&changes).probes;
+    let probes = Mssql.fixture_preflight(&changes).probes;
     let mut counts = Vec::new();
     for probe in &probes {
         let rows = lp.query(&probe.sql).await.unwrap();
@@ -10630,7 +10640,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     // kind 7 first is not.
     let probe_for = |cs: &pbps_model::ChangeSet| {
         Mssql
-            .preflight(cs)
+            .fixture_preflight(cs)
             .probes
             .into_iter()
             .find(|p| p.description.contains("row `old`"))
@@ -10931,7 +10941,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     // column no key spans is nobody's business.
     let refusal_for = |cs: &pbps_model::ChangeSet| {
         Mssql
-            .preflight(cs)
+            .fixture_preflight(cs)
             .probes
             .into_iter()
             .find(|p| p.description.contains("cannot evaluate"))
@@ -11339,7 +11349,7 @@ async fn a_disabled_foreign_key_neither_cascades_nor_blocks_a_delete() {
     // The probe counts nothing: the child is there, but nothing enforces the
     // constraint that would take it.
     let probe = Mssql
-        .preflight(&cs)
+        .fixture_preflight(&cs)
         .probes
         .into_iter()
         .find(|p| p.description.contains("row `old`"))
@@ -11526,7 +11536,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
 
     // The probe, run where `apply` runs it: nothing references the row.
     let probe = Mssql
-        .preflight(&cs)
+        .fixture_preflight(&cs)
         .probes
         .into_iter()
         .find(|p| p.description.contains("row `old`"))
@@ -12316,7 +12326,7 @@ async fn a_grant_on_a_schema_the_database_does_not_have_is_counted_before_it_run
     ] {
         let cs = grant(schema);
         let probe = Mssql
-            .preflight(&cs)
+            .fixture_preflight(&cs)
             .probes
             .into_iter()
             .find(|p| p.description.contains(schema))
@@ -12343,7 +12353,7 @@ async fn a_grant_on_a_schema_the_database_does_not_have_is_counted_before_it_run
         })],
     };
     assert!(
-        Mssql.preflight(&object).probes.is_empty(),
+        Mssql.fixture_preflight(&object).probes.is_empty(),
         "an object target carries no probe"
     );
 
@@ -13872,7 +13882,6 @@ async fn a_row_write_across_a_retyped_column_still_holds_the_recorded_row() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
-    use pbps_dialect::Dialect;
     use pbps_model::{Cell, Change, ChangeSet, PlannedChange, RowKey, Value};
 
     let mut db = TestDb::create("fkprobe").await;
@@ -13945,7 +13954,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
     ];
 
     async fn count(conn: &mut Conn, cs: &ChangeSet) -> i32 {
-        let probes = Mssql.preflight(cs).probes;
+        let probes = Mssql.fixture_preflight(cs).probes;
         let probe = probes
             .iter()
             .find(|p| p.description.contains("parent"))
@@ -15926,10 +15935,9 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         ("ordinary_index", false),
         ("filtered_index", false),
     ] {
-        let reports =
-            pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_index(name)]))
-                .await
-                .unwrap();
+        let reports = fixture_key_drop_blockers(&mut conn, &plan(vec![drop_index(name)]))
+            .await
+            .unwrap();
         assert_eq!(
             reports.iter().any(|r| !r.blocking.is_empty()),
             blocked,
@@ -15944,29 +15952,27 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         drop_index("standalone_key"),
     ]);
     assert!(
-        pbps_mssql::impact::key_drop_blockers(&mut conn, &removed)
+        fixture_key_drop_blockers(&mut conn, &removed)
             .await
             .unwrap()
             .iter()
             .all(|r| r.blocking.is_empty())
     );
     assert!(
-        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_index("missing")]))
+        fixture_key_drop_blockers(&mut conn, &plan(vec![drop_index("missing")]))
             .await
             .is_err()
     );
-    let reports =
-        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("other_key")]))
-            .await
-            .unwrap();
+    let reports = fixture_key_drop_blockers(&mut conn, &plan(vec![drop_key("other_key")]))
+        .await
+        .unwrap();
     assert!(
         reports.iter().all(|r| r.blocking.is_empty()),
         "the other key has the same columns but no binding: {reports:?}"
     );
-    let reports =
-        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
-            .await
-            .unwrap();
+    let reports = fixture_key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
+        .await
+        .unwrap();
     assert_eq!(reports.len(), 1);
     assert!(
         reports[0].blocking.iter().any(|b| b.contains("child_fk")),
@@ -15976,17 +15982,14 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         table: child.clone(),
         name: "child_fk".into(),
     };
-    let reports = pbps_mssql::impact::key_drop_blockers(
-        &mut conn,
-        &plan(vec![fk.clone(), drop_key("old_key")]),
-    )
-    .await
-    .unwrap();
-    assert!(reports.iter().all(|r| r.blocking.is_empty()), "{reports:?}");
     let reports =
-        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key"), fk]))
+        fixture_key_drop_blockers(&mut conn, &plan(vec![fk.clone(), drop_key("old_key")]))
             .await
             .unwrap();
+    assert!(reports.iter().all(|r| r.blocking.is_empty()), "{reports:?}");
+    let reports = fixture_key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key"), fk]))
+        .await
+        .unwrap();
     assert!(
         !reports[0].blocking.is_empty(),
         "a later FK removal does not clear an earlier key drop"
@@ -16016,28 +16019,28 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         },
     ]);
     assert!(
-        pbps_mssql::impact::key_drop_blockers(&mut conn, &renamed)
+        fixture_key_drop_blockers(&mut conn, &renamed)
             .await
             .unwrap()
             .iter()
             .all(|r| r.blocking.is_empty())
     );
     assert!(
-        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("missing")]))
+        fixture_key_drop_blockers(&mut conn, &plan(vec![drop_key("missing")]))
             .await
             .is_err(),
         "an absent existing key is not a successful dependency read"
     );
     conn.execute("CREATE USER key_guard177_reader WITHOUT LOGIN; GRANT VIEW DEFINITION, ALTER ON OBJECT::dbo.parent TO key_guard177_reader; GRANT VIEW DEFINITION, ALTER ON OBJECT::dbo.indexed TO key_guard177_reader; EXECUTE AS USER='key_guard177_reader';").await.unwrap();
     assert!(
-        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_index("ordinary_index")]))
+        fixture_key_drop_blockers(&mut conn, &plan(vec![drop_index("ordinary_index")]))
             .await
             .unwrap()
             .is_empty(),
         "an ordinary index drop does not need database metadata grants"
     );
     assert!(
-        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_index("filtered_index")]))
+        fixture_key_drop_blockers(&mut conn, &plan(vec![drop_index("filtered_index")]))
             .await
             .expect(
                 "a filtered unique index cannot back an FK and needs no database metadata grant"
@@ -16048,13 +16051,13 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         .await
         .expect("the deployment account can replace the filtered index with parent-only grants");
     assert!(
-        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_index("standalone_key")]))
+        fixture_key_drop_blockers(&mut conn, &plan(vec![drop_index("standalone_key")]))
             .await
             .unwrap_err()
             .to_string()
             .contains("database VIEW DEFINITION")
     );
-    let hidden = pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
+    let hidden = fixture_key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
         .await
         .unwrap_err();
     assert!(
@@ -16062,19 +16065,17 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         "{hidden}"
     );
     conn.execute("REVERT; GRANT VIEW DEFINITION TO key_guard177_reader; EXECUTE AS USER='key_guard177_reader';").await.unwrap();
-    let visible =
-        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
-            .await
-            .unwrap();
+    let visible = fixture_key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
+        .await
+        .unwrap();
     assert!(!visible[0].blocking.is_empty());
     conn.execute("REVERT").await.unwrap();
     conn.execute("CREATE ROLE key_guard177_denied; ALTER ROLE key_guard177_denied ADD MEMBER key_guard177_reader;").await.unwrap();
     for principal in ["key_guard177_reader", "key_guard177_denied"] {
         conn.execute(&format!("DENY VIEW DEFINITION ON OBJECT::dbo.child TO {principal}; EXECUTE AS USER='key_guard177_reader';")).await.unwrap();
-        let denied =
-            pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
-                .await
-                .unwrap_err();
+        let denied = fixture_key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
+            .await
+            .unwrap_err();
         assert!(denied.to_string().contains("metadata DENY"), "{denied}");
         conn.execute(&format!(
             "REVERT; REVOKE VIEW DEFINITION ON OBJECT::dbo.child FROM {principal};"
@@ -16085,7 +16086,7 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
     conn.execute("DENY VIEW DEFINITION ON OBJECT::dbo.child TO public")
         .await
         .unwrap();
-    let owner = pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
+    let owner = fixture_key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
         .await
         .unwrap();
     assert!(
@@ -16178,7 +16179,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
             Some("5074"),
             "{refused}"
         );
-        let reports = pbps_mssql::impact::key_drop_blockers(
+        let reports = fixture_key_drop_blockers(
             &mut conn,
             &plan(vec![widen(
                 &format!("dbo.p_{family}"),
@@ -16200,7 +16201,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
         );
         // The child side of the same key refuses the same way, so it is
         // reported the same way.
-        let child = pbps_mssql::impact::key_drop_blockers(
+        let child = fixture_key_drop_blockers(
             &mut conn,
             &plan(vec![widen(
                 &format!("ext.c_{family}"),
@@ -16221,7 +16222,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
         // really does widen; and a plan that takes the key away first — which
         // is what the differ writes for a key it declares — is not reported
         // either.
-        let solo = pbps_mssql::impact::key_drop_blockers(
+        let solo = fixture_key_drop_blockers(
             &mut conn,
             &plan(vec![widen(
                 &format!("dbo.solo_{family}"),
@@ -16241,7 +16242,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
         ))
         .await
         .expect("the control widens, so the refusal above is the key's doing");
-        let dropped = pbps_mssql::impact::key_drop_blockers(
+        let dropped = fixture_key_drop_blockers(
             &mut conn,
             &plan(vec![
                 Change::DropForeignKey {
@@ -16288,7 +16289,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
             to_collation: None,
         },
     ]);
-    let reports = pbps_mssql::impact::key_drop_blockers(&mut conn, &renamed)
+    let reports = fixture_key_drop_blockers(&mut conn, &renamed)
         .await
         .unwrap();
     assert_eq!(
@@ -16302,7 +16303,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
     );
     // A column the catalog does not have is a failed read, not a report of no
     // dependencies — the same rule the key side already follows.
-    let absent = pbps_mssql::impact::key_drop_blockers(
+    let absent = fixture_key_drop_blockers(
         &mut conn,
         &plan(vec![widen(
             "dbo.p_varchar",
@@ -16329,7 +16330,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
     )
     .await
     .unwrap();
-    let hidden = pbps_mssql::impact::key_drop_blockers(
+    let hidden = fixture_key_drop_blockers(
         &mut conn,
         &plan(vec![widen(
             "dbo.p_varchar",
@@ -16938,7 +16939,7 @@ async fn a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delet
     // Negative control: a child this plan leaves on the parent still blocks it.
     let blocked = plan(&before, &ids, &after, &ids);
     let blocked_probe = Mssql
-        .preflight(&blocked)
+        .fixture_preflight(&blocked)
         .probes
         .into_iter()
         .find(|p| p.description.contains("row `old`"))
@@ -16963,7 +16964,7 @@ async fn a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delet
             )
         }));
     let changes = plan(&before, &ids, &after, &ids);
-    let probes = Mssql.preflight(&changes).probes;
+    let probes = Mssql.fixture_preflight(&changes).probes;
     let mut counts = Vec::new();
     for probe in &probes {
         counts.push((
@@ -17598,4 +17599,21 @@ async fn tightening_nullability_is_refused_by_what_indexes_the_column() {
         .expect_err("relaxing under a filter");
     assert!(e.to_string().contains("5074"), "{e}");
     db.drop().await;
+}
+
+mod plan_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-dialect/tests/support/preflight.rs"
+    ));
+}
+use plan_fixture::FixturePreflight as _;
+
+async fn fixture_key_drop_blockers(
+    conn: &mut pbps_db::Conn,
+    changes: &pbps_model::ChangeSet,
+) -> Result<Vec<pbps_db::impact::DropReport>, pbps_db::impact::ImpactError> {
+    let ids = plan_fixture::ids(changes);
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
+    pbps_mssql::impact::key_drop_blockers(conn, &names).await
 }

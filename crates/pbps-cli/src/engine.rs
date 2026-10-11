@@ -775,6 +775,7 @@ impl NameFacts {
 pub async fn refuse_unlogged_partition_referencers(
     conn: &mut Conn,
     cs: &ChangeSet,
+    ids: &pbps_model::IdsFile,
     staged: bool,
 ) -> anyhow::Result<()> {
     if conn.driver() != Driver::Postgres {
@@ -782,23 +783,8 @@ pub async fn refuse_unlogged_partition_referencers(
     }
     // Each parent under the name the catalog has it by: the partition names
     // it as declared, after a rename this plan may run first (#1613, #1690).
-    let renamed_from: BTreeMap<&TableName, &TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| {
-            if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
-                Some((to, from))
-            } else {
-                None
-            }
-        })
-        .collect();
-    let parents: Vec<TableName> = crate::deploy::unlogged_partitions_created(cs)
-        .into_iter()
-        .map(|(_, parent)| (*renamed_from.get(parent).unwrap_or(&parent)).clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, ids)?;
+    let parents = crate::deploy::stored_unlogged_parents(&names);
     if parents.is_empty() {
         return Ok(());
     }
@@ -810,7 +796,20 @@ pub async fn refuse_unlogged_partition_referencers(
                  partition to",
             )
         })?;
-    crate::deploy::refuse_permanent_referencers(cs, &referencers, staged)
+    crate::deploy::refuse_permanent_referencers(cs, &names, &referencers, staged)
+}
+
+/// Catalog reads precede the plan, while the caller names an object at its
+/// statement boundary. Keep that translation identical for the edge query,
+/// its visibility proof, and the preliminary computed-column presence read.
+fn computed_catalog_table(
+    names: &pbps_model::plan_names::PlanNames<'_>,
+    table: &TableName,
+    at: usize,
+) -> TableName {
+    names
+        .stored(table, pbps_model::plan_names::At::Before(at))
+        .unwrap_or_else(|| table.clone())
 }
 
 /// Orders a SQL Server plan's function drops after the computed columns that
@@ -829,28 +828,24 @@ pub async fn refuse_unlogged_partition_referencers(
 pub async fn order_computed_by_edges(
     conn: &mut Conn,
     cs: &mut ChangeSet,
+    ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<Vec<(pbps_model::Change, pbps_model::Change)>> {
     if conn.driver() != Driver::Mssql {
         return Ok(Vec::new());
     }
-    let mut renamed: BTreeMap<pbps_model::TableName, pbps_model::TableName> = BTreeMap::new();
-    for p in &cs.changes {
-        if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
-            renamed.insert(to.clone(), from.clone());
-        }
-    }
-    let catalog = |t: &pbps_model::TableName| renamed.get(t).cloned().unwrap_or_else(|| t.clone());
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, ids)?;
+    let catalog = |at, table: &TableName| computed_catalog_table(&names, table, at);
     let mut objects: Vec<pbps_model::TableName> = Vec::new();
-    for p in &cs.changes {
+    for (at, p) in cs.changes.iter().enumerate() {
         let touched = match &p.change {
             pbps_model::Change::AddComputedColumn { table, .. }
             | pbps_model::Change::DropComputedColumn { table, .. }
-            | pbps_model::Change::RenameColumn { table, .. } => Some(catalog(table)),
+            | pbps_model::Change::RenameColumn { table, .. } => Some(catalog(at, table)),
             pbps_model::Change::DropTable { name, .. } => Some(name.clone()),
             pbps_model::Change::DropColumn { column, .. }
             | pbps_model::Change::AlterColumnType { column, .. }
             | pbps_model::Change::AlterColumnNullability { column, .. } => {
-                Some(catalog(&column.table))
+                Some(catalog(at, &column.table))
             }
             pbps_model::Change::AlterModule { id, .. }
             | pbps_model::Change::DropModule { id, .. } => Some(id.object_name()),
@@ -874,13 +869,13 @@ pub async fn order_computed_by_edges(
     let mut inputs: Vec<pbps_model::TableName> = Vec::new();
     let mut drops = 0;
     let mut decides = false;
-    for p in &cs.changes {
+    for (at, p) in cs.changes.iter().enumerate() {
         match &p.change {
-            pbps_model::Change::RenameColumn { table, .. } => inputs.push(catalog(table)),
+            pbps_model::Change::RenameColumn { table, .. } => inputs.push(catalog(at, table)),
             pbps_model::Change::DropColumn { column, .. }
             | pbps_model::Change::AlterColumnType { column, .. }
             | pbps_model::Change::AlterColumnNullability { column, .. } => {
-                inputs.push(catalog(&column.table));
+                inputs.push(catalog(at, &column.table));
             }
             pbps_model::Change::DropComputedColumn { .. } => decides = true,
             pbps_model::Change::AlterModule { module, .. } => {
@@ -913,7 +908,7 @@ pub async fn order_computed_by_edges(
     // An empty read is "no edge" only where no referrer the pass decides by
     // can be hidden (#1462).
     let mut targets = pbps_mssql::catalog::ReferrerTargets::default();
-    for p in &cs.changes {
+    for (at, p) in cs.changes.iter().enumerate() {
         match &p.change {
             pbps_model::Change::AlterModule { id, module }
                 if module.kind == pbps_model::ModuleKind::Function =>
@@ -927,7 +922,7 @@ pub async fn order_computed_by_edges(
             pbps_model::Change::DropComputedColumn { table, name, .. } => {
                 targets
                     .computed_columns
-                    .push((catalog(table), name.clone()));
+                    .push((catalog(at, table), name.clone()));
             }
             _ => {}
         }
@@ -955,9 +950,12 @@ pub async fn order_computed_by_edges(
             .into_iter()
             .map(|(a, b)| (spellings[a].clone(), spellings[b].clone())),
     );
-    crate::computed_order::order_by_edges(cs, &edges, &alike)
+    crate::computed_order::order_by_edges(cs, ids, &edges, &alike)
         .map_err(|why| anyhow::anyhow!("computed_dependencies (SQL Server): {why}"))?;
-    Ok(crate::computed_order::drop_precedence(cs, &edges, &alike))
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, ids)?;
+    Ok(crate::computed_order::drop_precedence(
+        cs, &names, &edges, &alike,
+    ))
 }
 
 /// Refuses a SQL Server computed column this plan adds, new or again, whose
@@ -1002,6 +1000,7 @@ pub async fn refuse_added_computed_calls(
 pub async fn order_created_object_names(
     conn: &mut Conn,
     cs: &mut ChangeSet,
+    ids: &pbps_model::IdsFile,
     label: &str,
     precedence: &[(pbps_model::Change, pbps_model::Change)],
 ) -> anyhow::Result<()> {
@@ -1027,7 +1026,8 @@ pub async fn order_created_object_names(
             .collect();
         crate::object_order::order_column_renames(cs, &alike, label)?;
     }
-    let (mut names, parents) = crate::deploy::object_reads(cs);
+    let index = pbps_model::plan_names::PlanNames::of(&cs.changes, ids)?;
+    let (mut names, parents) = crate::deploy::object_reads(cs, &index);
     let mut occupants = pbps_mssql::catalog::object_name_occupants(conn, &names, &parents).await?;
     // Where a transfer carries each child of a moved table: a name the
     // first read could not know to ask until it found the child (#1366).
@@ -1313,10 +1313,12 @@ pub struct ConnectedCheck {
 pub async fn check_drop_blockers(
     conn: &mut Conn,
     changes: &ChangeSet,
+    ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<ConnectedCheck> {
     match conn.driver() {
         Driver::Mssql => {
-            let reports = pbps_mssql::impact::key_drop_blockers(conn, changes).await?;
+            let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+            let reports = pbps_mssql::impact::key_drop_blockers(conn, &names).await?;
             refuse_drop_reports("SQL Server", &reports)?;
             // Two kinds of question now, and the count says which: a key this
             // plan drops, and a column it retypes while a key stands on it
@@ -1410,6 +1412,7 @@ fn refuse_drop_reports(
 pub fn owned_targets(
     driver: Driver,
     changes: &ChangeSet,
+    ids: &pbps_model::IdsFile,
     owners: &std::collections::BTreeMap<pbps_model::GrantTarget, String>,
     session_role: &str,
 ) -> anyhow::Result<ConnectedCheck> {
@@ -1467,18 +1470,7 @@ pub fn owned_targets(
     // Only tables: a module is replaced rather than renamed, and a role this
     // dialect does not manage is renamed in the cluster before the plan is
     // built, so the read already knows it under its new name (DECISIONS 377).
-    let renamed: std::collections::BTreeMap<pbps_model::GrantTarget, pbps_model::GrantTarget> =
-        changes
-            .changes
-            .iter()
-            .filter_map(|planned| match &planned.change {
-                pbps_model::Change::RenameTable { from, to, .. } => Some((
-                    pbps_model::GrantTarget::Object(to.clone()),
-                    pbps_model::GrantTarget::Object(from.clone()),
-                )),
-                _ => None,
-            })
-            .collect();
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
 
     let mut impossible = Vec::new();
     for planned in &changes.changes {
@@ -1497,7 +1489,7 @@ pub fn owned_targets(
             (!session_role.is_empty()).then_some(session_role)
         } else {
             owners
-                .get(renamed.get(target).unwrap_or(target))
+                .get(&stored_grant_target(&names, target))
                 .map(String::as_str)
         };
         if owner == Some(role.as_str()) {
@@ -1553,6 +1545,7 @@ pub fn owned_targets(
 pub fn unrevocable_grants(
     driver: Driver,
     changes: &ChangeSet,
+    ids: &pbps_model::IdsFile,
     unrevocable: &[pbps_db::catalog::Unrevocable],
 ) -> anyhow::Result<ConnectedCheck> {
     if driver != Driver::Postgres {
@@ -1575,18 +1568,7 @@ pub fn unrevocable_grants(
     //
     // Only tables, again: a module is replaced rather than renamed, and a
     // schema this dialect does not rename cannot move under a grant.
-    let renamed: std::collections::BTreeMap<pbps_model::GrantTarget, pbps_model::GrantTarget> =
-        changes
-            .changes
-            .iter()
-            .filter_map(|planned| match &planned.change {
-                pbps_model::Change::RenameTable { from, to, .. } => Some((
-                    pbps_model::GrantTarget::Object(to.clone()),
-                    pbps_model::GrantTarget::Object(from.clone()),
-                )),
-                _ => None,
-            })
-            .collect();
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
 
     let mut impossible = Vec::new();
     for planned in &changes.changes {
@@ -1598,10 +1580,10 @@ pub fn unrevocable_grants(
         else {
             continue;
         };
-        let read_as = renamed.get(target).unwrap_or(target);
+        let read_as = stored_grant_target(&names, target);
         for found in unrevocable {
             if &found.role == role
-                && &found.target == read_as
+                && found.target == read_as
                 && permissions.contains(&found.permission)
             {
                 impossible.push(format!("role {role}: {}", found.why));
@@ -1621,73 +1603,51 @@ pub fn unrevocable_grants(
     })
 }
 
-/// The catalog's names for what a plan names by its declared names: a rename
-/// in the plan runs before most of its changes, so the declared name is not
-/// yet the catalog's when the plan is read against it.
-struct LiveNames {
-    tables: BTreeMap<TableName, TableName>,
-    columns: BTreeMap<(TableName, String), String>,
+/// Grants on modules and schemas retain their catalog identity; only an
+/// object tracked as a table participates in the plan's table renames.
+fn stored_grant_target(
+    names: &pbps_model::plan_names::PlanNames<'_>,
+    target: &pbps_model::GrantTarget,
+) -> pbps_model::GrantTarget {
+    if let pbps_model::GrantTarget::Object(table) = target
+        && let Some(stored) = names.stored(table, pbps_model::plan_names::At::End)
+    {
+        return pbps_model::GrantTarget::Object(stored);
+    }
+    target.clone()
 }
 
-impl LiveNames {
-    fn of(changes: &ChangeSet) -> Self {
-        let mut tables = BTreeMap::new();
-        let mut columns = BTreeMap::new();
-        for p in &changes.changes {
-            if let pbps_model::Change::RenameColumn {
-                table, from, to, ..
-            } = &p.change
-            {
-                columns.insert((table.clone(), to.clone()), from.clone());
-            } else if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
-                tables.insert(to.clone(), from.clone());
-            }
-        }
-        Self { tables, columns }
-    }
+/// Catalog addresses of changed columns come from identity, including a
+/// source-named drop whose address is handed to another column later.
+fn changed_column<'c>(
+    names: &pbps_model::plan_names::PlanNames<'_>,
+    change: &'c pbps_model::Change,
+) -> Option<(TableName, String, &'c pbps_model::ColumnRef, &'static str)> {
+    use pbps_model::{Change, plan_names::At};
+    let (uid, column, what) = if let Change::AlterColumnType { uid, column, .. } = change {
+        (uid, column, "retyped")
+    } else if let Change::DropColumn { uid, column } = change {
+        (uid, column, "dropped")
+    } else {
+        return None;
+    };
+    let (owner, name) = names.column_at(uid, At::Start)?;
+    Some((
+        names.table_at(owner, At::Start)?.clone(),
+        name.into(),
+        column,
+        what,
+    ))
+}
 
-    fn table(&self, table: &TableName) -> TableName {
-        self.tables.get(table).unwrap_or(table).clone()
-    }
-
-    /// The catalog's table and column for a column a retype or drop changes,
-    /// with the column as the change names it and what it does. A retype names
-    /// the column as declared, after the plan's renames; a drop names it by
-    /// the catalog's own name, so only its table is reversed. A rename into
-    /// the freed name belongs to another column.
-    fn changed<'c>(
-        &self,
-        change: &'c pbps_model::Change,
-    ) -> Option<(TableName, String, &'c pbps_model::ColumnRef, &'static str)> {
-        if let pbps_model::Change::AlterColumnType { column, .. } = change {
-            let (table, live) = self.column(column);
-            Some((table, live, column, "retyped"))
-        } else if let pbps_model::Change::DropColumn { column, .. } = change {
-            Some((
-                self.table(&column.table),
-                column.name.clone(),
-                column,
-                "dropped",
-            ))
-        } else {
-            None
-        }
-    }
-
-    /// The catalog's table and column for a column the plan names.
-    fn column(&self, column: &pbps_model::ColumnRef) -> (TableName, String) {
-        let table = self
-            .tables
-            .get(&column.table)
-            .unwrap_or(&column.table)
-            .clone();
-        let name = self
-            .columns
-            .get(&(column.table.clone(), column.name.clone()))
-            .unwrap_or(&column.name)
-            .clone();
-        (table, name)
-    }
+fn stored_column(
+    names: &pbps_model::plan_names::PlanNames<'_>,
+    column: &pbps_model::ColumnRef,
+) -> (TableName, String) {
+    let stored = names
+        .stored_column(column, pbps_model::plan_names::At::End)
+        .unwrap_or_else(|| column.clone());
+    (stored.table, stored.name)
 }
 
 /// Where the plan changes the expression of the generated column `generated`
@@ -1701,7 +1661,7 @@ impl LiveNames {
 /// column.
 fn release_of(
     changes: &ChangeSet,
-    names: &LiveNames,
+    names: &pbps_model::plan_names::PlanNames<'_>,
     table: &TableName,
     generated: &str,
     base: &str,
@@ -1717,7 +1677,7 @@ fn release_of(
         );
     changes.changes.iter().position(|p| {
         matches!(&p.change, pbps_model::Change::AlterColumnExpression { column, to, .. }
-            if names.column(column) == (table.clone(), generated.to_owned())
+            if stored_column(names, column) == (table.clone(), generated.to_owned())
                 && (base_is_another || !pbps_pg::generated::may_read(to, base))
                 && !pbps_pg::generated::may_read(to, &named.name))
     })
@@ -1751,17 +1711,19 @@ fn release_of(
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn order_after_releases(
     changes: &mut ChangeSet,
+    ids: &pbps_model::IdsFile,
     dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
 ) -> Result<usize, String> {
     use pbps_model::Change;
     use pbps_pg::generated::may_read;
-    let names = LiveNames::of(changes);
+    let names =
+        pbps_model::plan_names::PlanNames::of(&changes.changes, ids).map_err(|e| e.to_string())?;
     let n = changes.changes.len();
     // What each change waits for, by position.
     let mut waits: Vec<std::collections::BTreeSet<usize>> =
         vec![std::collections::BTreeSet::new(); n];
     for (i, p) in changes.changes.iter().enumerate() {
-        let Some((table, live, column, _)) = names.changed(&p.change) else {
+        let Some((table, live, column, _)) = changed_column(&names, &p.change) else {
             continue;
         };
         let readers: Vec<&str> = dependences
@@ -1809,7 +1771,7 @@ pub(crate) fn order_after_releases(
                 },
                 _ => continue,
             };
-            let (at, generated) = names.column(&c);
+            let (at, generated) = stored_column(&names, &c);
             if at != table
                 || (!added && readers.contains(&generated.as_str()))
                 || !((!live_is_another && may_read(to, &live)) || may_read(to, &column.name))
@@ -1868,7 +1830,7 @@ pub(crate) fn order_after_releases(
         }
     }
     if let Some(&(first, _)) = held.first() {
-        let column = names.changed(&changes.changes[first].change).map_or_else(
+        let column = changed_column(&names, &changes.changes[first].change).map_or_else(
             || changes.changes[first].change.subject(),
             |c| c.2.to_string(),
         );
@@ -1912,12 +1874,12 @@ fn reused(changes: &ChangeSet, column: &pbps_model::ColumnRef) -> bool {
 /// since it was held, where one of them needs what it holds back.
 fn passes(
     changes: &ChangeSet,
-    names: &LiveNames,
+    names: &pbps_model::plan_names::PlanNames<'_>,
     held: usize,
     passed: &[usize],
 ) -> Result<(), String> {
     let change = &changes.changes[held].change;
-    let Some((_, _, column, _)) = names.changed(change) else {
+    let Some((_, _, column, _)) = changed_column(names, change) else {
         return Ok(());
     };
     // A drop holds its name until it runs: a change taking the name needs it
@@ -1992,21 +1954,22 @@ fn after_the_alterations(change: &pbps_model::Change) -> bool {
 pub async fn release_generated_inputs(
     conn: &mut Conn,
     changes: &mut ChangeSet,
+    ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<usize> {
     if conn.driver() != Driver::Postgres {
         return Ok(0);
     }
-    let names = LiveNames::of(changes);
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
     let mut dependences = BTreeMap::new();
     for p in &changes.changes {
-        if let Some((table, ..)) = names.changed(&p.change)
+        if let Some((table, ..)) = changed_column(&names, &p.change)
             && let std::collections::btree_map::Entry::Vacant(e) = dependences.entry(table)
         {
             let found = pbps_pg::generated::dependences(conn, e.key()).await?;
             e.insert(found);
         }
     }
-    order_after_releases(changes, &dependences)
+    order_after_releases(changes, ids, &dependences)
         .map_err(|why| anyhow::anyhow!("generation_support (PostgreSQL): {why}"))
 }
 
@@ -2016,17 +1979,17 @@ pub async fn release_generated_inputs(
 /// (DEC-1168.1, DEC-1316.1). `dependences` is each table's live edges.
 fn unreleased(
     changes: &ChangeSet,
+    names: &pbps_model::plan_names::PlanNames<'_>,
     dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
 ) -> Vec<String> {
-    let names = LiveNames::of(changes);
     // A drop names its column by the catalog's name already: only its table
     // is reversed. A rename into the freed name is another column's.
     let dropped: std::collections::BTreeSet<(TableName, String)> = changes
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::DropColumn { column, .. } = &p.change {
-                Some((names.table(&column.table), column.name.clone()))
+            if let pbps_model::Change::DropColumn { .. } = &p.change {
+                changed_column(names, &p.change).map(|(table, name, ..)| (table, name))
             } else {
                 None
             }
@@ -2034,14 +1997,14 @@ fn unreleased(
         .collect();
     let mut problems = Vec::new();
     for (i, p) in changes.changes.iter().enumerate() {
-        let Some((table, live, column, what)) = names.changed(&p.change) else {
+        let Some((table, live, column, what)) = changed_column(names, &p.change) else {
             continue;
         };
         for d in dependences.get(&table).into_iter().flatten() {
             if d.base != live || dropped.contains(&(table.clone(), d.generated.clone())) {
                 continue;
             }
-            if release_of(changes, &names, &table, &d.generated, &live, column)
+            if release_of(changes, names, &table, &d.generated, &live, column)
                 .is_some_and(|r| r < i)
             {
                 continue;
@@ -2147,6 +2110,7 @@ fn slots_listed(moving: &[String], slots: &[(String, String)]) -> ConnectedCheck
 pub async fn generation_support(
     conn: &mut Conn,
     changes: &ChangeSet,
+    ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<ConnectedCheck> {
     if conn.driver() == Driver::Mssql {
         return Ok(ConnectedCheck {
@@ -2177,17 +2141,17 @@ pub async fn generation_support(
             ));
         }
     }
-    let names = LiveNames::of(changes);
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
     let mut dependences = BTreeMap::new();
     for p in &changes.changes {
-        if let Some((table, ..)) = names.changed(&p.change)
+        if let Some((table, ..)) = changed_column(&names, &p.change)
             && let std::collections::btree_map::Entry::Vacant(e) = dependences.entry(table)
         {
             let found = pbps_pg::generated::dependences(conn, e.key()).await?;
             e.insert(found);
         }
     }
-    problems.extend(unreleased(changes, &dependences));
+    problems.extend(unreleased(changes, &names, &dependences));
     if !problems.is_empty() {
         anyhow::bail!("generation_support (PostgreSQL): {}", problems.join("\n"));
     }
@@ -2592,10 +2556,13 @@ pub fn impact_notes(driver: Driver, report: &ImpactReport) -> Vec<String> {
 /// the catalog still knows them by. Which changes count is each engine's
 /// question: a module rename is a drop plus a create, and only SQL Server asks
 /// the drop side through the rename-impact query.
-pub fn rename_targets(driver: Driver, changes: &ChangeSet) -> Vec<RenameTarget> {
+pub fn rename_targets(
+    driver: Driver,
+    names: &pbps_model::plan_names::PlanNames<'_>,
+) -> Vec<RenameTarget> {
     match driver {
-        Driver::Mssql => pbps_mssql::impact::rename_targets(changes),
-        Driver::Postgres => pbps_pg::impact::rename_targets(changes),
+        Driver::Mssql => pbps_mssql::impact::rename_targets(names),
+        Driver::Postgres => pbps_pg::impact::rename_targets(names),
     }
 }
 
@@ -3060,13 +3027,14 @@ pub async fn check_module_dependents(
     conn: &mut Conn,
     changes: &ChangeSet,
     stored: &pbps_model::Schema,
+    ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<()> {
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
     let found = module_dependents(conn, changes).await?;
     // Under the plan's names, as the declarations the planner matched by are:
     // a parent's column change names it as declared, and the baseline holds
     // its partitions under its name before a rename (#1751 review).
-    let partitions = crate::dependents::standing_partitions(stored, changes)
-        .renamed(crate::dependents::table_renames(changes));
+    let partitions = crate::dependents::standing_partitions(stored, changes).renamed(&names);
     let left = crate::dependents::unaccounted(changes, &found, &partitions);
     if !left.is_empty() {
         anyhow::bail!(
@@ -3239,6 +3207,22 @@ pub fn validate_plan_analysis(plan: &pbps_model::SavedPlan) -> anyhow::Result<()
 
 #[cfg(test)]
 mod tests {
+    fn order_after_releases(
+        changes: &mut ChangeSet,
+        dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
+    ) -> Result<usize, String> {
+        let ids = crate::plan_fixture::ids(changes);
+        super::order_after_releases(changes, &ids, dependences)
+    }
+    fn unreleased(
+        changes: &ChangeSet,
+        dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
+    ) -> Vec<String> {
+        let ids = crate::plan_fixture::ids(changes);
+        let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
+        super::unreleased(changes, &names, dependences)
+    }
+
     use super::*;
 
     /// #1630: what a server without history retention refuses is an
@@ -3357,7 +3341,11 @@ mod tests {
             column: col(name),
         };
         let retype = |name: &str| Change::AlterColumnType {
-            uid: uid("c_bbbbbb"),
+            uid: uid(if matches!(name, "a" | "x") {
+                "c_bbbbbb"
+            } else {
+                "c_ffffff"
+            }),
             column: col(name),
             from: "integer".parse().unwrap(),
             to: "bigint".parse().unwrap(),
@@ -3436,7 +3424,7 @@ mod tests {
         // The input renamed to `x` in the same plan, and the new text naming
         // `x`: it still reads the column, whatever the catalog calls it.
         let rename = |from: &str, to: &str| Change::RenameColumn {
-            uid: uid("c_cccccc"),
+            uid: uid(if from == "a" { "c_bbbbbb" } else { "c_cccccc" }),
             table: t.clone(),
             from: from.into(),
             to: to.into(),
@@ -4271,5 +4259,110 @@ mod tests {
             "{}",
             none.message
         );
+    }
+}
+
+#[cfg(test)]
+mod plan_name_tests {
+    use super::*;
+    use pbps_model::{Change, GrantTarget, Permission, PlannedChange};
+
+    #[test]
+    fn computed_catalog_reads_use_the_original_holder_at_each_statement() {
+        let (changes, ids) = crate::plan_fixture::chain();
+        let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
+        let original = TableName::new("app", "original_table");
+        for (at, name) in [
+            (0, "original_table"),
+            (1, "temporary_table"),
+            (2, "final_table"),
+        ] {
+            assert_eq!(
+                computed_catalog_table(&names, &TableName::new("app", name), at),
+                original
+            );
+        }
+        let unmanaged = TableName::new("app", "external_table");
+        assert_eq!(computed_catalog_table(&names, &unmanaged, 2), unmanaged);
+    }
+
+    #[test]
+    fn a_generated_readers_release_survives_table_and_column_rename_chains() {
+        let (mut changes, mut ids) = crate::plan_fixture::chain();
+        let table = TableName::new("app", "final_table");
+        let generated: pbps_model::Uid = "c_bbbbbb".parse().unwrap();
+        ids.columns.insert(generated.clone(), table.column("g"));
+        changes.changes.extend([
+            PlannedChange::new(Change::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: table.column("final_column"),
+                from: "integer".parse().unwrap(),
+                to: "bigint".parse().unwrap(),
+                from_nullable: true,
+                to_nullable: true,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: None,
+            }),
+            PlannedChange::new(Change::AlterColumnExpression {
+                uid: generated,
+                column: table.column("g"),
+                from: "final_column * 2".into(),
+                to: "0".into(),
+            }),
+        ]);
+        let reads = BTreeMap::from([(
+            TableName::new("app", "original_table"),
+            vec![pbps_pg::generated::Dependence {
+                base: "original_column".into(),
+                generated: "g".into(),
+            }],
+        )]);
+        assert_eq!(
+            order_after_releases(&mut changes.clone(), &ids, &BTreeMap::new()),
+            Ok(0)
+        );
+        assert_eq!(order_after_releases(&mut changes, &ids, &reads), Ok(1));
+        assert!(matches!(
+            changes.changes[4].change,
+            Change::AlterColumnExpression { .. }
+        ));
+    }
+
+    #[test]
+    fn grant_checks_keep_catalog_ownership_and_grantors_through_a_rename_chain() {
+        let (mut changes, ids) = crate::plan_fixture::chain();
+        let target = GrantTarget::Object(TableName::new("app", "final_table"));
+        let stored = GrantTarget::Object(TableName::new("app", "original_table"));
+        changes.changes.push(PlannedChange::new(Change::Grant {
+            role: "owner".into(),
+            target: target.clone(),
+            permissions: [Permission::Select].into(),
+        }));
+        let owners = [(stored.clone(), "owner".into())].into();
+        assert!(owned_targets(Driver::Postgres, &changes, &ids, &owners, "deployer").is_err());
+        assert!(
+            owned_targets(
+                Driver::Postgres,
+                &changes,
+                &ids,
+                &BTreeMap::new(),
+                "deployer"
+            )
+            .is_ok()
+        );
+        changes.changes.push(PlannedChange::new(Change::Revoke {
+            role: "reader".into(),
+            target,
+            permissions: [Permission::Select].into(),
+        }));
+        let found = pbps_db::catalog::Unrevocable {
+            role: "reader".into(),
+            target: stored,
+            permission: Permission::Select,
+            why: "the session cannot revoke the stored grant".into(),
+        };
+        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found]).is_err());
+        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[]).is_ok());
     }
 }

@@ -1059,7 +1059,12 @@ async fn temporal_modifiers_keep_the_engine_bounds_and_do_not_shorten_the_calend
         let changes = pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(change)],
         };
-        assert!(Postgres::new().preflight(&changes).probes.is_empty());
+        assert!(
+            Postgres::new()
+                .fixture_preflight(&changes)
+                .probes
+                .is_empty()
+        );
         conn.execute(&format!("ALTER TABLE {table} ALTER COLUMN c TYPE {to}"))
             .await
             .unwrap();
@@ -4197,7 +4202,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         );
         let added_ids = mint_moving(&added, &ids);
         let step = plan(&base, &ids, &added, &added_ids);
-        for probe in pg.preflight(&step).probes {
+        for probe in pg.fixture_preflight(&step).probes {
             assert_eq!(
                 counted(&mut conn, &probe.sql).await,
                 0,
@@ -4247,7 +4252,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         // Nobody allowed the move (#1788): its one row is counted by the
         // pre-flight and refused by the moving statement, before its delete.
         let unallowed = plan(&added, &added_ids, &over, &mint_ids(&over, &added_ids, &[]));
-        let unallowed_probes = pg.preflight(&unallowed).probes;
+        let unallowed_probes = pg.fixture_preflight(&unallowed).probes;
         assert_eq!(unallowed_probes.len(), 7, "{unallowed_probes:#?}");
         let bound = unallowed_probes
             .iter()
@@ -4286,7 +4291,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 }],
             ),
         );
-        let probes = pg.preflight(&over_step).probes;
+        let probes = pg.fixture_preflight(&over_step).probes;
         assert_eq!(probes.len(), 7, "{probes:#?}");
         // The moving statement, which asks the same questions again before
         // its delete (#1763 review).
@@ -4695,7 +4700,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             table.unlogged = true;
         }
         assert_eq!(
-            pg.preflight(&unlogged_step).probes.len(),
+            pg.fixture_preflight(&unlogged_step).probes.len(),
             6,
             "{unlogged_step:#?}"
         );
@@ -4825,7 +4830,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             })
             .collect();
         assert_eq!(order, ["create", "check"], "{checked_step:#?}");
-        let checked_preflight = pg.preflight(&checked_step);
+        let checked_preflight = pg.fixture_preflight(&checked_step);
         assert_eq!(
             checked_preflight.probes.len(),
             7,
@@ -4864,7 +4869,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 },
             );
         let alone_probes = pg
-            .preflight(&plan(
+            .fixture_preflight(&plan(
                 &added,
                 &added_ids,
                 &alone_checked,
@@ -4907,7 +4912,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &sr_split,
             &mint_moving(&sr_split, &sr_ids),
         );
-        let sr_probes = pg.preflight(&sr_step).probes;
+        let sr_probes = pg.fixture_preflight(&sr_step).probes;
         for probe in &sr_probes {
             assert_eq!(
                 counted(&mut conn, &probe.sql).await,
@@ -4984,7 +4989,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &mint_moving(&ul_split, &ul_ids),
         );
         let ul_published = pg
-            .preflight(&ul_step)
+            .fixture_preflight(&ul_step)
             .probes
             .into_iter()
             .find(|p| {
@@ -5188,7 +5193,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             plan(&nn_base, &nn_ids, &wanted, &mint_moving(&wanted, &nn_ids))
         };
         let nn_step = tightened(true);
-        let nn_preflight = pg.preflight(&nn_step);
+        let nn_preflight = pg.fixture_preflight(&nn_step);
         for probe in &nn_preflight.probes {
             assert_eq!(
                 counted(&mut conn, &probe.sql).await,
@@ -5216,7 +5221,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         rollback(&mut conn).await;
         // Negative: with no range added, the tightening is counted over the
         // NULL that stays.
-        let kept = pg.preflight(&tightened(false)).probes;
+        let kept = pg.fixture_preflight(&tightened(false)).probes;
         let mut nulls = 0;
         for probe in &kept {
             nulls += counted(&mut conn, &probe.sql).await;
@@ -5252,7 +5257,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &collated_split,
             &mint_moving(&collated_split, &collated_ids),
         );
-        let collated_probes = pg.preflight(&collated_step).probes;
+        let collated_probes = pg.fixture_preflight(&collated_step).probes;
         assert_eq!(collated_probes.len(), 7, "{collated_probes:#?}");
         in_a_transaction(&mut conn).await;
         apply(&mut conn, &pg, &collated_step).await;
@@ -5298,7 +5303,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         }];
         let fewer_ids = mint_ids(&fewer, &added_ids, &archive);
         let drop_step = plan(&added, &added_ids, &fewer, &fewer_ids);
-        let probes = pg.preflight(&drop_step).probes;
+        let probes = pg.fixture_preflight(&drop_step).probes;
         assert_eq!(probes.len(), 1, "{probes:#?}");
         assert_eq!(counted(&mut conn, &probes[0].sql).await, 1);
         in_a_transaction(&mut conn).await;
@@ -5320,7 +5325,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             .foreign_keys
             .clear();
         let unkeyed_step = plan(&added, &added_ids, &unkeyed, &fewer_ids);
-        let unkeyed_probes = pg.preflight(&unkeyed_step).probes;
+        let unkeyed_probes = pg.fixture_preflight(&unkeyed_step).probes;
         assert_eq!(unkeyed_probes.len(), 1, "{unkeyed_probes:#?}");
         assert_eq!(counted(&mut conn, &unkeyed_probes[0].sql).await, 0);
         in_a_transaction(&mut conn).await;
@@ -5377,7 +5382,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             })
             .collect();
         assert_eq!(order, ["aref_1", "ev_2025"]);
-        for probe in pg.preflight(&both_step).probes {
+        for probe in pg.fixture_preflight(&both_step).probes {
             assert_eq!(
                 counted(&mut conn, &probe.sql).await,
                 0,
@@ -5397,7 +5402,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &alone,
             &mint_moving_and(&alone, &aref_ids, &archive),
         );
-        let alone_probes = pg.preflight(&alone_step).probes;
+        let alone_probes = pg.fixture_preflight(&alone_step).probes;
         assert_eq!(alone_probes.len(), 1, "{alone_probes:#?}");
         assert_eq!(counted(&mut conn, &alone_probes[0].sql).await, 1);
         // The same for a move out of the DEFAULT: a row referencing a moved
@@ -5428,7 +5433,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             plan(&with_aref, &aref_ids, &wanted, &wanted_ids)
         };
         let reference_count = |step: &pbps_model::ChangeSet| {
-            pg.preflight(step)
+            pg.fixture_preflight(step)
                 .probes
                 .into_iter()
                 .find(|p| p.description.starts_with("rows that reference rows of"))
@@ -5466,7 +5471,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &split,
             &mint_ids(&split, &added_ids, &archive),
         );
-        let split_probes = pg.preflight(&split_step).probes;
+        let split_probes = pg.fixture_preflight(&split_step).probes;
         assert_eq!(split_probes.len(), 15, "{split_probes:#?}");
         for probe in &split_probes {
             assert_eq!(
@@ -5543,7 +5548,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 &tp_split,
                 &mint_moving(&tp_split, &tp_ids),
             );
-            let tp_probes = pg.preflight(&tp_step).probes;
+            let tp_probes = pg.fixture_preflight(&tp_step).probes;
             let tp_moving = &tp_step.changes[0];
             let tp_moving = pg
                 .emit(&tp_moving.change, tp_moving.strategy)
@@ -5729,7 +5734,7 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
             })
             .collect();
         assert_eq!(kinds, ["DetachPartition"], "{:?}", step.changes);
-        for probe in pg.preflight(&step).probes {
+        for probe in pg.fixture_preflight(&step).probes {
             assert_eq!(
                 counted(&mut conn, &probe.sql).await,
                 0,
@@ -5894,7 +5899,7 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
                 format!("DELETE FROM {s}.u WHERE a IS DISTINCT FROM 7"),
             ),
         ] {
-            let probes = pg.preflight(&step).probes;
+            let probes = pg.fixture_preflight(&step).probes;
             assert_eq!(probes.len(), 4, "{probes:?}");
             assert!(
                 probes[0].description.contains("outside the range"),
@@ -17375,7 +17380,7 @@ async fn the_pre_delete_probe_counts_a_foreign_key_this_engine_never_stopped_enf
     );
 
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     // The count, and beside it the refusal that says whether this session
     // could complete it at all (DECISIONS 333); nothing here has a policy, so
     // that one counts nothing.
@@ -17946,7 +17951,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     // Nothing references the row when the human approves the plan.
     assert_eq!(counted(&mut conn, &probes[0].sql).await, 0);
 
@@ -18159,7 +18164,7 @@ async fn a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delet
 
     let base = connected_base(&mut conn, &before, &s).await;
     let cs = plan(&base, &ids0, &after, &ids1);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert_eq!(probes.len(), 2, "{probes:#?}");
     assert_eq!(
         counted(&mut conn, &probes[0].sql).await,
@@ -18274,7 +18279,7 @@ async fn a_referencing_row_the_session_cannot_see_refuses_the_delete() {
     // …so preflight says so before the first statement of the plan runs,
     // which is the only place a refusal can still stop a staged apply from
     // committing everything ahead of the delete.
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert_eq!(probes.len(), 2, "{probes:#?}");
     assert_eq!(
         counted(&mut deployer, &probes[0].sql).await,
@@ -18506,7 +18511,7 @@ async fn a_row_that_references_only_itself_can_be_deleted() {
     let pg = Postgres::new();
     // The probe already leaves the doomed row out on its own table, so the
     // plan is offered at all…
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert_eq!(probes.len(), 2, "{probes:#?}");
     assert_eq!(counted(&mut conn, &probes[0].sql).await, 0);
     assert_eq!(counted(&mut conn, &probes[1].sql).await, 0);
@@ -18648,7 +18653,7 @@ async fn a_write_to_a_default_no_probe_can_evaluate_is_refused_where_a_key_spans
     );
 
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     // The count, the refusal about whether it could be complete, then one
     // refusal per table this plan writes to such a default: the keyed child
     // and the loose one.
@@ -18973,7 +18978,7 @@ async fn a_referencing_relation_is_counted_only_where_its_key_reaches() {
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     // The row lives in the inheritance child, which no key covers.
     assert_eq!(
         counted(&mut conn, &probes[0].sql).await,
@@ -19019,7 +19024,7 @@ async fn a_referencing_relation_is_counted_only_where_its_key_reaches() {
             matches!(&c.change, pbps_model::Change::DeleteRow { key, .. } if key.as_str() == "keep")
         })
         .expect("the plan deletes `keep`");
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let count = probes
         .iter()
         .find(|p| p.description.contains("row `keep`"))
@@ -19151,7 +19156,7 @@ async fn an_unprobeable_default_beside_a_null_in_the_same_key_refuses_nothing() 
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
         .find(|p| p.description.contains("cannot evaluate"))
@@ -19237,7 +19242,7 @@ async fn a_referencing_table_the_session_cannot_read_refuses_the_delete() {
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert_eq!(probes.len(), 2, "{probes:#?}");
 
     let mut deployer = Conn::connect(Driver::Postgres, &conn_str_as(&role, "x", &conn.name))
@@ -19355,7 +19360,7 @@ async fn a_child_left_to_a_null_default_is_not_counted_against_its_parents_delet
         "the child goes back to its default: {cs:#?}"
     );
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert_eq!(
         counted(&mut conn, &probes[0].sql).await,
         0,
@@ -19474,7 +19479,7 @@ async fn a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_br
     );
 
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     // The catalog's count sees no key — it is not there yet — and the
     // planned key is asked about from the plan (DECISIONS 345).
     assert_eq!(counted(&mut conn, &probes[0].sql).await, 0);
@@ -19514,7 +19519,7 @@ async fn a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_br
     );
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let count = probes
         .iter()
         .find(|p| {
@@ -19697,7 +19702,7 @@ async fn narrowed_integer_key(from: &str, to: &str, overflow: i64) {
     );
 
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     // The key this plan adds still has its own probe, carrying a plain
     // `CAST`: the row `cannot_become` names is excluded from this probe's
     // own count with an `AND NOT (...)`, not attempted and not blanked to
@@ -19866,7 +19871,7 @@ async fn a_narrowed_parent_column_is_probed_without_raising_on_either_alias() {
         "the referenced column is what narrows: {cs:#?}"
     );
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     for alias in ["p", "q"] {
         assert!(
             probes
@@ -20040,7 +20045,7 @@ async fn a_foreign_key_this_plan_adds_on_a_narrowing_pair_still_counts_a_row_who
     );
 
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let has_its_own_probe = "the key cannot be added once the row is gone";
     let mut named = Vec::new();
     for p in &probes {
@@ -20183,7 +20188,7 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
             narrowing_projection_change("public.t.v", "numeric(5,2)", to),
             constraint,
         ]);
-        let report = Postgres::new().preflight(&cs);
+        let report = Postgres::new().fixture_preflight(&cs);
         let mut counts = Vec::new();
         for p in &report.probes {
             counts.push((p.description.clone(), counted(&mut db, &p.sql).await));
@@ -20287,7 +20292,7 @@ async fn narrowing_projection_keeps_added_foreign_key_checks_for_fitting_rows() 
             }),
         });
         let cs = narrowing_projection_plan(changes);
-        let report = Postgres::new().preflight(&cs);
+        let report = Postgres::new().fixture_preflight(&cs);
         let mut counts = Vec::new();
         for p in &report.probes {
             counts.push((p.description.clone(), counted(&mut db, &p.sql).await));
@@ -20364,7 +20369,7 @@ async fn narrowing_projection_keeps_inserted_and_updated_rows_in_composite_keys(
                 clustered: false,
             },
         ]);
-        let report = Postgres::new().preflight(&cs);
+        let report = Postgres::new().fixture_preflight(&cs);
         let mut counts = Vec::new();
         for p in &report.probes {
             counts.push((p.description.clone(), counted(&mut db, &p.sql).await));
@@ -20495,7 +20500,7 @@ async fn a_key_this_plan_adds_on_a_column_it_adds_counts_the_backfilled_rows() {
         matches!(cs.changes[0].change, pbps_model::Change::AddColumn { .. }),
         "the column comes first: {cs:#?}"
     );
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert_eq!(
         counted(&mut conn, &planned_count(&probes)).await,
         2,
@@ -20521,7 +20526,7 @@ async fn a_key_this_plan_adds_on_a_column_it_adds_counts_the_backfilled_rows() {
     };
     set_default(&mut declared, Some("'keep'"));
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert_eq!(
         counted(&mut conn, &planned_count(&probes)).await,
         0,
@@ -20531,7 +20536,7 @@ async fn a_key_this_plan_adds_on_a_column_it_adds_counts_the_backfilled_rows() {
     // references nothing.
     set_default(&mut declared, None);
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert_eq!(
         counted(&mut conn, &planned_count(&probes)).await,
         0,
@@ -20558,7 +20563,7 @@ async fn a_key_this_plan_adds_on_a_column_it_adds_counts_the_backfilled_rows() {
     let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
         .find(|p| p.description.contains("cannot evaluate"))
@@ -20686,7 +20691,7 @@ async fn a_row_updated_to_a_null_beside_an_unprobeable_default_leaves_the_count(
     );
 
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let count = probes
         .iter()
         .find(|p| {
@@ -20807,7 +20812,7 @@ async fn a_key_into_a_column_this_plan_adds_to_the_parent_counts_against_its_bac
     let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned: Vec<_> = probes
         .iter()
         .filter(|p| p.description.contains("on a column it also adds"))
@@ -20831,7 +20836,7 @@ async fn a_key_into_a_column_this_plan_adds_to_the_parent_counts_against_its_bac
     );
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned: Vec<_> = probes
         .iter()
         .filter(|p| p.description.contains("on a column it also adds"))
@@ -20935,7 +20940,7 @@ async fn an_omitted_cell_with_no_default_is_a_null_the_probe_knows() {
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
         .find(|p| p.description.contains("cannot evaluate"))
@@ -21037,7 +21042,7 @@ async fn a_typed_null_backfill_is_a_null_beside_an_unprobeable_one() {
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert!(
         !probes
             .iter()
@@ -21159,7 +21164,7 @@ async fn a_surviving_parent_row_is_the_row_this_plan_leaves_there() {
             .any(|c| matches!(c.change, pbps_model::Change::UpdateRow { .. })),
         "the survivor is updated: {cs:#?}"
     );
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned = probes
         .iter()
         .find(|p| p.description.contains("on a column it also adds"))
@@ -21209,7 +21214,7 @@ async fn a_surviving_parent_row_is_the_row_this_plan_leaves_there() {
         );
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned = probes
         .iter()
         .find(|p| p.description.contains("on a column it also adds"))
@@ -21315,7 +21320,7 @@ async fn a_backfilled_literal_is_compared_through_its_columns_type() {
     let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned = probes
         .iter()
         .find(|p| p.description.contains("on a column it also adds"))
@@ -21336,7 +21341,7 @@ async fn a_backfilled_literal_is_compared_through_its_columns_type() {
         .expect("the column")
         .default = Some("'2026-01-03'".into());
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned = probes
         .iter()
         .find(|p| p.description.contains("on a column it also adds"))
@@ -21451,7 +21456,7 @@ async fn an_identity_column_this_plan_adds_is_a_backfill_no_probe_can_evaluate()
             .any(|c| matches!(c.change, pbps_model::Change::AddColumn { .. })),
         "the identity column is added: {cs:#?}"
     );
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
         .find(|p| p.description.contains("cannot evaluate"))
@@ -21581,7 +21586,7 @@ async fn a_key_this_plan_adds_on_a_column_it_retypes_compares_the_converted_valu
         2,
         "both columns are retyped: {cs:#?}"
     );
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned = probes
         .iter()
         .find(|p| p.description.contains("on a column it also adds"))
@@ -21666,7 +21671,7 @@ async fn a_column_grant_that_covers_the_count_is_enough_to_count() {
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert_eq!(probes.len(), 2, "{probes:#?}");
     let mut deployer = Conn::connect(Driver::Postgres, &conn_str_as(&role, "x", &conn.name))
         .await
@@ -21783,7 +21788,7 @@ async fn a_retyped_survivor_that_holds_the_converted_value_is_a_survivor() {
     let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned = probes
         .iter()
         .find(|p| p.description.contains("on a column it also adds"))
@@ -21801,7 +21806,7 @@ async fn a_retyped_survivor_that_holds_the_converted_value_is_a_survivor() {
         &[],
     );
     let cs_none = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs_none).probes;
+    let probes = pg.fixture_preflight(&cs_none).probes;
     let refused: Vec<_> = probes
         .iter()
         .filter(|p| p.description.contains("on a column it also adds"))
@@ -21928,7 +21933,7 @@ async fn an_inserted_survivor_and_an_arriving_child_meet_through_the_columns_typ
     let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned = probes
         .iter()
         .find(|p| p.description.contains("on a column it also adds"))
@@ -22016,7 +22021,7 @@ async fn a_referencing_table_in_a_schema_the_session_cannot_use_refuses_the_dele
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert_eq!(probes.len(), 2, "{probes:#?}");
     let mut deployer = Conn::connect(Driver::Postgres, &conn_str_as(&role, "x", &conn.name))
         .await
@@ -22151,7 +22156,7 @@ async fn a_child_this_plan_creates_arrives_on_the_parent_before_its_key_exists()
             .any(|c| matches!(c.change, pbps_model::Change::AddForeignKey { .. })),
         "the key is its own change, after the delete: {cs:#?}"
     );
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned = probes
         .iter()
         .find(|p| p.description.contains("on a column it also adds"))
@@ -22169,7 +22174,7 @@ async fn a_child_this_plan_creates_arrives_on_the_parent_before_its_key_exists()
         &[("c1", row(&[("parent", Value::Text("keep".into()))]))],
     );
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned = probes
         .iter()
         .find(|p| p.description.contains("on a column it also adds"))
@@ -22292,7 +22297,7 @@ async fn an_insert_leaving_a_key_column_to_an_identity_is_refused() {
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
         .find(|p| p.description.contains("cannot evaluate"))
@@ -22332,7 +22337,7 @@ async fn an_insert_leaving_a_key_column_to_an_identity_is_refused() {
         &[("c1", row(&[("x", Value::Null)]))],
     );
     let cs = plan(&base, &ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
         .find(|p| p.description.contains("cannot evaluate"))
@@ -22410,7 +22415,7 @@ async fn a_key_whose_delete_action_is_switched_off_is_not_counted() {
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert_eq!(
         counted(&mut conn, &probes[0].sql).await,
         0,
@@ -22527,7 +22532,7 @@ async fn a_planned_key_on_unchanged_columns_sees_the_survivor_too() {
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned = probes
         .iter()
         .find(|p| p.description.contains("on a column it also adds"))
@@ -22547,7 +22552,7 @@ async fn a_planned_key_on_unchanged_columns_sees_the_survivor_too() {
         &[],
     );
     let cs_none = plan(&base, &ids, &declared, &ids);
-    let probes = pg.preflight(&cs_none).probes;
+    let probes = pg.fixture_preflight(&cs_none).probes;
     let mut total = 0;
     for p in probes
         .iter()
@@ -22656,7 +22661,7 @@ async fn a_row_arriving_against_an_unprobeable_parent_backfill_is_refused() {
     let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
         .find(|p| p.description.contains("cannot evaluate"))
@@ -22682,7 +22687,7 @@ async fn a_row_arriving_against_an_unprobeable_parent_backfill_is_refused() {
         &[("c1", row(&[("ref", Value::Null)]))],
     );
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
         .find(|p| p.description.contains("cannot evaluate"))
@@ -22762,7 +22767,7 @@ async fn a_policy_on_a_partition_does_not_refuse_a_delete_counted_through_its_pa
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert_eq!(probes.len(), 2, "{probes:#?}");
     let mut deployer = Conn::connect(Driver::Postgres, &conn_str_as(&role, "x", &conn.name))
         .await
@@ -22898,7 +22903,7 @@ async fn a_row_spelling_a_value_over_a_null_backfill_is_refused_on_its_own_tuple
     let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
         .find(|p| p.description.contains("cannot evaluate"))
@@ -22921,7 +22926,7 @@ async fn a_row_spelling_a_value_over_a_null_backfill_is_refused_on_its_own_tuple
         &[("c0", row(&[])), ("c1", row(&[]))],
     );
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     for p in probes
         .iter()
         .filter(|p| p.description.contains("cannot evaluate"))
@@ -23036,7 +23041,7 @@ async fn a_stored_row_holding_null_in_the_key_is_not_refused_for_a_backfill_it_n
     let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusals: Vec<_> = probes
         .iter()
         .filter(|p| p.description.contains("cannot evaluate"))
@@ -23081,7 +23086,7 @@ async fn a_stored_row_holding_null_in_the_key_is_not_refused_for_a_backfill_it_n
     .expect("the fixture");
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &base_ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
         .find(|p| p.description.contains("cannot evaluate"))
@@ -23203,7 +23208,7 @@ async fn a_null_an_update_leaves_alone_is_a_null_of_the_tuple_it_writes() {
     );
 
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusals: Vec<_> = probes
         .iter()
         .filter(|p| p.description.contains("cannot evaluate"))
@@ -23241,7 +23246,7 @@ async fn a_null_an_update_leaves_alone_is_a_null_of_the_tuple_it_writes() {
     );
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
         .find(|p| p.description.contains("cannot evaluate"))
@@ -23354,7 +23359,7 @@ async fn a_null_an_update_leaves_alone_decides_for_a_key_this_plan_adds_too() {
         "the key is this plan's to add: {cs:#?}"
     );
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned: Vec<_> = probes
         .iter()
         .filter(|p| {
@@ -23390,7 +23395,7 @@ async fn a_null_an_update_leaves_alone_decides_for_a_key_this_plan_adds_too() {
     );
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
         .find(|p| {
@@ -23499,7 +23504,7 @@ async fn a_default_cast_from_null_is_the_null_the_row_is_left_to() {
     );
 
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     for p in probes
         .iter()
         .filter(|p| p.description.contains("cannot evaluate"))
@@ -23551,7 +23556,7 @@ async fn a_default_cast_from_null_is_the_null_the_row_is_left_to() {
         .default = Some("CAST(lower('ZZ') AS text)".into());
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
         .find(|p| p.description.contains("cannot evaluate"))
@@ -23788,7 +23793,7 @@ async fn a_child_collated_differently_from_its_parent_is_still_counted() {
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let count = probes
         .iter()
         .find(|p| {
@@ -23918,7 +23923,7 @@ async fn an_inserted_survivor_meets_an_arriving_child_under_the_referenced_colla
                 .any(|c| matches!(c.change, pbps_model::Change::AddForeignKey { .. })),
             "the key is this plan's to add: {cs:#?}"
         );
-        let probes = pg.preflight(&cs).probes;
+        let probes = pg.fixture_preflight(&cs).probes;
         let planned = probes
             .iter()
             .find(|p| p.description.contains("on a column it also adds"))
@@ -24043,7 +24048,7 @@ async fn a_planned_key_across_collations_is_counted_under_the_referenced_collati
         "the key is this plan's to add: {cs:#?}"
     );
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned = probes
         .iter()
         .find(|p| p.description.contains("on a column it also adds"))
@@ -24067,7 +24072,7 @@ async fn a_planned_key_across_collations_is_counted_under_the_referenced_collati
         .expect("move the child");
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let planned = probes
         .iter()
         .find(|p| p.description.contains("on a column it also adds"))
@@ -24123,7 +24128,7 @@ async fn planned_key_collation_guards_match_the_engine_for_every_collation_pair(
                     }),
                 })],
             };
-            let report = Postgres::new().preflight(&cs);
+            let report = Postgres::new().fixture_preflight(&cs);
             let probe = report
                 .probes
                 .iter()
@@ -24258,7 +24263,7 @@ async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_colu
             let cs = ChangeSet {
                 changes: changes.into_iter().map(PlannedChange::new).collect(),
             };
-            let report = Postgres::new().preflight(&cs);
+            let report = Postgres::new().fixture_preflight(&cs);
             if mode == "add_default" {
                 assert!(
                     report
@@ -24376,7 +24381,7 @@ async fn a_parent_whose_referenced_columns_the_session_cannot_read_refuses_the_d
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     let count = probes
         .iter()
         .find(|p| {
@@ -24533,7 +24538,7 @@ async fn a_default_spelled_as_an_escape_string_is_the_literal_it_is() {
                     if matches!(columns.get("ref"), Some((_, pbps_model::Cell::Default(d))) if d == default))),
             "{default}: the row is left to the declared spelling: {cs:#?}"
         );
-        let probes = pg.preflight(&cs).probes;
+        let probes = pg.fixture_preflight(&cs).probes;
         for p in probes
             .iter()
             .filter(|p| p.description.contains("cannot evaluate"))
@@ -24583,7 +24588,7 @@ async fn a_default_spelled_as_an_escape_string_is_the_literal_it_is() {
     let ids = mint_ids(&declared, &IdsFile::default(), &[]);
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert!(
         !probes
             .iter()
@@ -24704,7 +24709,7 @@ async fn a_default_spelled_as_a_number_in_any_base_is_the_constant_it_is() {
         let ids = mint_ids(&declared, &IdsFile::default(), &[]);
         let base = connected_base(&mut conn, &declared, &s).await;
         let cs = plan(&base, &ids, &declared, &ids);
-        let probes = pg.preflight(&cs).probes;
+        let probes = pg.fixture_preflight(&cs).probes;
         assert!(
             !probes
                 .iter()
@@ -24746,7 +24751,7 @@ async fn a_default_spelled_as_a_number_in_any_base_is_the_constant_it_is() {
     let ids = mint_ids(&declared, &IdsFile::default(), &[]);
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
-    let probes = pg.preflight(&cs).probes;
+    let probes = pg.fixture_preflight(&cs).probes;
     assert!(
         !probes
             .iter()
@@ -26314,7 +26319,7 @@ fn probe_schema_9(test: &str) -> String {
 async fn counts(conn: &mut Conn, cs: &pbps_model::ChangeSet) -> Vec<(String, i64)> {
     let pg = Postgres::new();
     let mut out = Vec::new();
-    for probe in pg.preflight(cs).probes {
+    for probe in pg.fixture_preflight(cs).probes {
         let n = counted(conn, &probe.sql).await;
         out.push((probe.description, n));
     }
@@ -26555,7 +26560,7 @@ async fn a_key_into_a_created_empty_parent_counts_every_reference_the_child_hold
     // the *collation* probe is that — so a reader of a future regression would
     // be shown an unreadable count where the fact is that the orphan probe was
     // never built at all.
-    let report = Postgres::new().preflight(&cs);
+    let report = Postgres::new().fixture_preflight(&cs);
     assert!(
         report
             .probes
@@ -29696,7 +29701,7 @@ async fn a_length_probe_is_measured_in_the_session_the_statement_will_run_in() {
             alter(&format!("{s}.n.v"), "integer", "varchar(6)"),
         ],
     };
-    let probes = Postgres::new().preflight(&cs).probes;
+    let probes = Postgres::new().fixture_preflight(&cs).probes;
     let lengths = probes
         .iter()
         .filter(|p| p.sql.contains("length(rtrim"))
@@ -30109,7 +30114,7 @@ async fn a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_pl
 
     // So the probe must not be there to say otherwise.
     let asked = Postgres::new()
-        .preflight(&ChangeSet {
+        .fixture_preflight(&ChangeSet {
             changes: vec![
                 PlannedChange::new(retype),
                 PlannedChange::new(check.clone()),
@@ -30124,7 +30129,7 @@ async fn a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_pl
     // The check alone, on a table nothing retypes, is still probed — and
     // against the same rows, now converted, it counts nothing.
     let alone = Postgres::new()
-        .preflight(&ChangeSet {
+        .fixture_preflight(&ChangeSet {
             changes: vec![PlannedChange::new(check)],
         })
         .probes;
@@ -34448,3 +34453,11 @@ async fn a_date_or_time_literal_read_two_ways_is_found_on_both_versions() {
         assert!(found.misspelt.is_empty(), "{connection}: {found:#?}");
     }
 }
+
+mod plan_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-dialect/tests/support/preflight.rs"
+    ));
+}
+use plan_fixture::FixturePreflight as _;
