@@ -1159,7 +1159,10 @@ For the same reason, a probe that would read a column the plan recomputes is
 reported unchecked rather than run over the old expression's values: its
 tightening, a key over it, and any check or filtered index of its table. A
 reference row's delete is counted against keys the catalog names at run
-time, so any recomputation in the plan leaves it unchecked too.
+time, so any recomputation in the plan leaves it unchecked too. The
+recomputation itself is listed unchecked as well, whatever reads the column:
+a NOT NULL, check or unique index the plan does not name can refuse its new
+values, and a change missing from the report would read as checked (#1318).
 
 Its declared text is recorded, advanced and overlaid as a default's is
 (`DeclaredExpressions::generated`), and compared by presence (SPEC §7.6),
