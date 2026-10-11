@@ -21,6 +21,35 @@ const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 #[path = "support/envelope_archives.rs"]
 mod envelope_archives;
 
+#[path = "support/batch_intent.rs"]
+mod batch_intent;
+
+#[test]
+#[ignore = "needs live postgres"]
+fn forced_pull_with_multiple_decisions_provides_a_complete_batch_remedy() {
+    pull_identity::batch_after_forced_pull(&server(), true);
+}
+
+#[test]
+fn identity_batches_record_complete_decisions_and_retain_unrecorded_remedies() {
+    batch_intent::complete("postgres");
+}
+
+#[test]
+fn identity_batches_refuse_partial_conflicting_or_malformed_answers_without_writes() {
+    batch_intent::atomic_refusals("postgres");
+}
+
+#[test]
+fn identity_batches_rename_and_drop_tables_and_roles_together() {
+    batch_intent::tables_and_roles("postgres");
+}
+
+#[test]
+fn identity_batches_keep_annotation_provenance_and_single_edit_workflows() {
+    batch_intent::annotations_and_single_edits("postgres");
+}
+
 #[path = "support/audit_reasons.rs"]
 mod audit_reasons;
 

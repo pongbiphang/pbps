@@ -839,3 +839,33 @@ CLI tests for unchanged identity bytes and verbatim nonblank reasons, prompt
 and Compose refusals, and baseline ledger preservation on real PostgreSQL and
 SQL Server. Missing-project and unreachable-target controls verify that the
 CLI refusal precedes I/O.
+
+<a id="dec-1791-1"></a>
+
+**DEC-1791.1. Several explicit identity decisions resolve as one batch, never
+as persisted partial answers.** A normal edit can remove or rename several
+objects. The single-intent commands resolve the complete declarations, so each
+was refused by the other unanswered decisions and neither recorded anything.
+`pbps intent` takes repeatable two-value rename/drop options, requires at least
+one, and validates qualified name shapes and nonblank `Reason` values before discovery.
+CLI keeps a nonempty `IntentBatch`; existing commands construct a singleton.
+Loaded annotations precede the supplied decisions in one ordinary resolution,
+and only a complete success writes the ids file. No differ, identity format,
+SQL, or prompt semantics change. Persisting partial answers would contradict
+SPEC §6.3 and create a second artifact capable of replaying stale decisions.
+
+Human and JSON reports share one complete batch remedy. It keeps supplied
+valid-but-unrecorded decisions, gives each drop its own reason placeholder,
+and lists rename alternatives without selecting them. Provisional table-derived
+choices remain conditional. Existing cross-shell quoting and safe placeholders
+apply to names and reasons; the report never turns a value into shell syntax.
+The JSON note is emitted once, not copied into every blocker. MoveRows and
+Compose's batch UI remain separate surfaces.
+
+Pinned by both-dialect CLI flows for multiple drops, renames and mixed choices,
+table/role identities, repeated drops and stale explicit-rename refusals,
+unchanged bytes on partial/conflicting/unused
+answers, before-I/O malformed-input refusals, and shared human/JSON remedies.
+Unit cases cover ambiguous and provisional choices and shell-sensitive values.
+Real SQL Server and PostgreSQL forced-pull cases require the complete batch
+remedy and verify both drop reasons while preserving the ledger history (#1821).

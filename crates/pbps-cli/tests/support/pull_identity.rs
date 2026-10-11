@@ -327,6 +327,69 @@ pub fn intent_and_drift(server: &str, pg: bool, drift: bool) {
     }
 }
 
+pub fn batch_after_forced_pull(server: &str, pg: bool) {
+    let own = OwnDatabase::new(server, "pull_identity_batch1791");
+    let connection = own.connection();
+    prepare(connection, pg);
+    let table = format!("{}.country", schema(pg));
+    for column in ["legacy_email", "legacy_phone"] {
+        on_server(
+            connection,
+            &format!("ALTER TABLE {table} ADD {column} int NULL"),
+        );
+    }
+    let d = Demo::new("pull-identity-batch1791");
+    ok(d.run(&["pull", "--db", connection]));
+    d.commit();
+    ok(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let before = history(&d, connection);
+    let path = d.dir.join("schema.ids.json");
+    let ids = std::fs::read(&path).unwrap();
+    for column in ["legacy_email", "legacy_phone"] {
+        on_server(
+            connection,
+            &format!("ALTER TABLE {table} DROP COLUMN {column}"),
+        );
+    }
+    let out = d.run(&["pull", "--db", connection, "--force"]);
+    assert_eq!(code(&out), 2, "{}{}", stdout(&out), stderr(&out));
+    let email = format!("{table}.legacy_email");
+    let phone = format!("{table}.legacy_phone");
+    assert!(
+        stderr(&out).contains(&format!(
+            "pbps intent --drop {email} \"<why>\" --drop {phone} \"<why>\""
+        )),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), ids);
+    ok(d.run(&[
+        "intent",
+        "--drop",
+        &email,
+        "email retired",
+        "--drop",
+        &phone,
+        "phone retired",
+    ]));
+    let recorded: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        recorded
+            .tombstones
+            .values()
+            .any(|t| t.was == email && t.reason == "email retired")
+    );
+    assert!(
+        recorded
+            .tombstones
+            .values()
+            .any(|t| t.was == phone && t.reason == "phone retired")
+    );
+    ok(d.run(&["plan", "--check"]));
+    assert_eq!(history(&d, connection), before);
+}
+
 pub fn column_history(server: &str, pg: bool) {
     let own = OwnDatabase::new(server, "pull_identity_column_history");
     let connection = own.connection();

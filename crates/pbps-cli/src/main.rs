@@ -15,6 +15,7 @@ mod explain;
 mod hooks;
 mod init;
 mod integration;
+mod intent_batch;
 mod key;
 mod object_order;
 mod output;
@@ -65,7 +66,8 @@ const EXIT_FINDING: i32 = 2;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory as _, Parser, Subcommand};
+use intent_batch::IntentBatch;
 
 use pbps_config::{DialectName, Project};
 use pbps_dialect::Dialect;
@@ -98,6 +100,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Record several explicit rename/drop decisions together, or none
+    Intent(intent_batch::BatchArgs),
+
     /// Browse local read views of environments, drift, saved plans and history
     Ui,
 
@@ -446,6 +451,7 @@ impl Command {
             // undiscoverable project reported as an unresolved *target* rather
             // than as a failure of the whole command.
             Command::Explain { .. }
+            | Command::Intent(_)
             | Command::Init(_)
             | Command::Schema { .. }
             | Command::Completions { .. }
@@ -597,6 +603,20 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // Validate the heterogeneous option pairs before even discovering a
+    // project. A blank reason in the last pair must not admit an earlier one.
+    let batch = if let Command::Intent(args) = &cli.command {
+        Some(args.parse().unwrap_or_else(|error| {
+            Cli::command()
+                .error(
+                    clap::error::ErrorKind::ValueValidation,
+                    format!("{error:#}"),
+                )
+                .exit()
+        }))
+    } else {
+        None
+    };
     let start = match &cli.project {
         Some(p) => p.clone(),
         None => std::env::current_dir()?,
@@ -979,6 +999,7 @@ fn run() -> anyhow::Result<()> {
         }
         Command::Validate { format, since } => cmd_validate(&project, format, since.as_deref()),
         Command::Fmt { check, format } => cmd_fmt(&project, check, format),
+        Command::Intent(_) => cmd_intent(&project, batch.expect("validated before discovery")),
         Command::Rename { from, to } => {
             let col: ColumnRef = from.parse()?;
             cmd_intent(
@@ -987,7 +1008,8 @@ fn run() -> anyhow::Result<()> {
                     table: col.table.clone(),
                     from: col.name,
                     to,
-                },
+                }
+                .into(),
             )
         }
         Command::RenameTable { from, to } => cmd_intent(
@@ -995,25 +1017,30 @@ fn run() -> anyhow::Result<()> {
             Intent::RenameTable {
                 from: from.parse()?,
                 to: to.parse()?,
-            },
+            }
+            .into(),
         ),
         Command::Drop { column, reason } => cmd_intent(
             &project,
             Intent::DropColumn {
                 column: column.parse()?,
                 reason,
-            },
+            }
+            .into(),
         ),
         Command::DropTable { table, reason } => cmd_intent(
             &project,
             Intent::DropTable {
                 table: table.parse::<TableName>()?,
                 reason,
-            },
+            }
+            .into(),
         ),
-        Command::RenameRole { from, to } => cmd_intent(&project, Intent::RenameRole { from, to }),
+        Command::RenameRole { from, to } => {
+            cmd_intent(&project, Intent::RenameRole { from, to }.into())
+        }
         Command::DropRole { role, reason } => {
-            cmd_intent(&project, Intent::DropRole { role, reason })
+            cmd_intent(&project, Intent::DropRole { role, reason }.into())
         }
         Command::MoveRows {
             table,
@@ -1025,7 +1052,8 @@ fn run() -> anyhow::Result<()> {
                 table: table.parse::<TableName>()?,
                 max_rows,
                 reason,
-            },
+            }
+            .into(),
         ),
         Command::Pull {
             target,
@@ -2379,14 +2407,14 @@ pub struct FmtData {
     mode: &'static str,
 }
 
-/// Records one intent: re-resolves identity with it, then writes the identity
-/// file back.
-fn cmd_intent(project: &Project, intent: Intent) -> anyhow::Result<()> {
+/// Resolves every supplied decision together; only a complete answer is written.
+fn cmd_intent(project: &Project, batch: IntentBatch) -> anyhow::Result<()> {
     let loaded = load(project, dialect(project)?.as_ref())?;
     let ids = read_ids(project)?;
     let annotation_count = loaded.intents.len();
     let mut intents = loaded.intents;
-    intents.push(intent);
+    let supplied = batch.into_vec();
+    intents.extend(supplied.iter().cloned());
 
     match pbps_diff::resolve_with_annotations(
         &loaded.schema,
@@ -2398,7 +2426,7 @@ fn cmd_intent(project: &Project, intent: Intent) -> anyhow::Result<()> {
         Ok(res) => {
             if res.ids == ids {
                 println!(
-                    "The identity file is unchanged; this intent may have taken effect already."
+                    "The identity file is unchanged; these intents may have taken effect already."
                 );
                 return Ok(());
             }
@@ -2407,7 +2435,7 @@ fn cmd_intent(project: &Project, intent: Intent) -> anyhow::Result<()> {
             Ok(())
         }
         Err(blockers) => {
-            eprintln!("{}", report::blockers(&blockers));
+            eprintln!("{}", report::blockers_with_intents(&blockers, &supplied));
             Err(Found::new("identity could not be resolved").into())
         }
     }
@@ -2663,7 +2691,7 @@ fn cmd_plan(
             if json {
                 let report = output::Report::new(
                     "plan",
-                    blockers.iter().map(report::blocker_finding).collect(),
+                    report::blocker_findings(&blockers),
                     None::<PlanData>,
                 );
                 return report.emit_json();
