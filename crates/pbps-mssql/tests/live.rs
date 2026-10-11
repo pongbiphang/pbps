@@ -41,6 +41,9 @@ mod resolver_tests;
 #[path = "support/removal_names.rs"]
 mod removal_names_tests;
 
+#[path = "support/null_predelete.rs"]
+mod null_predelete_tests;
+
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn an_authorized_migration_connection_failure_does_not_claim_missing_rights() {

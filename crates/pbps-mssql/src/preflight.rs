@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{DialectError, Preflight, Probe, Unchecked};
 use pbps_model::{
-    Cell, Change, ChangeSet, ColumnRef, ColumnType, RowKey, TableName, TypeArg, Value,
+    Cell, Change, ChangeSet, ColumnRef, ColumnType, RowKey, TableName, TypeArg, Uid, Value,
 };
 
 use crate::emit::{qualified, verbatim};
@@ -94,8 +94,13 @@ enum Added {
 struct AsStored {
     /// New table name → the name it currently has.
     tables: BTreeMap<TableName, TableName>,
-    /// New column ref → the column name it currently has.
-    columns: BTreeMap<ColumnRef, String>,
+    /// New column ref → its identity and the name it currently has.
+    columns: BTreeMap<ColumnRef, RenamedColumn>,
+    /// Owners relinquishing a name by a drop or rename. Reusing one makes a raw
+    /// predicate read the outgoing column successfully, but incorrectly.
+    /// Computed columns have no uid; their relinquished names can still be
+    /// taken by an ordinary column's rename.
+    vacated: BTreeMap<TableName, BTreeSet<Option<Uid>>>,
     /// Tables this plan creates. They are empty, so nothing in them can violate
     /// anything, and probing them would only produce "invalid object name".
     created: BTreeSet<TableName>,
@@ -139,6 +144,12 @@ struct AsStored {
     removed: BTreeSet<Removed>,
 }
 
+#[derive(Debug)]
+struct RenamedColumn {
+    uid: Uid,
+    stored: String,
+}
+
 /// The rows of one table a plan writes, as the pre-delete probe has to see
 /// them: which are deleted outright, and what each update or insert leaves
 /// in each column it touches.
@@ -169,8 +180,8 @@ struct Moved {
     updated: BTreeMap<RowKey, BTreeMap<String, Option<String>>>,
     /// Inserted row -> column -> the value it arrives with, as the SQL the
     /// engine compares: spelled by the row, or the literal default of a
-    /// column it omits. A column set to NULL, or left to a default that is
-    /// not a literal, is absent.
+    /// column it omits. NULL stays explicit; a default that is not a literal
+    /// is absent.
     ///
     /// `COUNT(*)` over the child sees only what is stored, and a row
     /// arriving on the parent is either not in the table yet (an insert) or
@@ -215,6 +226,41 @@ struct Moved {
     /// Defaults in legacy plans without destination type metadata. The live
     /// FK supplies that missing assignment type in the delete probe.
     untyped_defaults: BTreeMap<RowKey, BTreeSet<String>>,
+    /// Unchanged NULL cells still decide their row's foreign-key tuple,
+    /// including beside an unevaluable default (DEC-1771.1).
+    held_null: BTreeMap<RowKey, BTreeSet<String>>,
+}
+
+impl Moved {
+    fn nulls_of(
+        &self,
+        row: &RowKey,
+        stored_name: &impl Fn(&str) -> Option<String>,
+    ) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        if let Some(columns) = self.updated.get(row) {
+            for (column, sql) in columns {
+                if sql.as_deref().is_some_and(is_null_default)
+                    && let Some(name) = stored_name(column)
+                {
+                    out.insert(name);
+                }
+            }
+        }
+        if let Some(columns) = self.inserted.get(row) {
+            for (column, sql) in columns {
+                if is_null_default(sql)
+                    && let Some(name) = stored_name(column)
+                {
+                    out.insert(name);
+                }
+            }
+        }
+        if let Some(columns) = self.held_null.get(row) {
+            out.extend(columns.iter().filter_map(|c| stored_name(c)));
+        }
+        out
+    }
 }
 
 /// A foreign key this plan removes before its deletes run: the constraint,
@@ -242,10 +288,10 @@ fn written(value: &Value) -> Option<String> {
 }
 
 /// A default the engine can compare without running anything: a literal
-/// (the line 80 drew), and not `NULL`, which references no row.
+/// (the line 80 drew), including `NULL`, which references no row.
 fn constant_default(default: &str) -> Option<&str> {
     let d = unwrapped(default);
-    (crate::rows::is_constant(d) && !is_null_default(d)).then_some(d)
+    crate::rows::is_constant(d).then_some(d)
 }
 
 /// A constant default as the column it is assigned to stores it.
@@ -265,6 +311,11 @@ fn assigned_default(
     ty: Option<&ColumnType>,
     collation: Option<&pbps_model::Collation>,
 ) -> Option<String> {
+    // Assignment preserves NULL under every destination type and collation.
+    // Keep that fact visible without parsing the CONVERT generated below.
+    if is_null_default(default) {
+        return Some("NULL".into());
+    }
     let default = verbatim(default);
     let Some(ty) = ty else {
         return Some(format!("({default})"));
@@ -399,9 +450,16 @@ impl AsStored {
                     this.tables.insert(to.clone(), from.clone());
                 }
                 Change::RenameColumn {
-                    table, from, to, ..
+                    uid, table, from, to, ..
                 } => {
-                    this.columns.insert(table.column(to), from.clone());
+                    this.columns.insert(table.column(to), RenamedColumn { uid: uid.clone(), stored: from.clone() });
+                    this.vacated.entry(table.clone()).or_default().insert(Some(uid.clone()));
+                }
+                Change::DropColumn { uid, column } => {
+                    this.vacated.entry(column.table.clone()).or_default().insert(Some(uid.clone()));
+                }
+                Change::DropComputedColumn { table, .. } => {
+                    this.vacated.entry(table.clone()).or_default().insert(None);
                 }
                 Change::CreateTable { name, table, .. } => {
                     this.created.insert(name.clone());
@@ -462,19 +520,29 @@ impl AsStored {
                     key_column,
                     key,
                     columns,
+                    unchanged,
                     types,
                     after_types,
                     ..
                 } => {
                     let moved = this.moved.entry(table.clone()).or_default();
                     moved.key_column = key_column.clone();
+                    for (column, cell) in unchanged {
+                        let null = match cell {
+                            Cell::Value(value) => matches!(value, Value::Null),
+                            Cell::Default(default) => is_null_default(default),
+                        };
+                        if null {
+                            moved.held_null.entry(key.clone()).or_default().insert(column.clone());
+                        }
+                    }
                     let updated = moved.updated.entry(key.clone()).or_default();
                     for (column, (_, after)) in columns {
                         let sql = match after {
                             Cell::Value(v) => written(v),
                             Cell::Default(d) => {
                                 let constant = constant_default(d);
-                                if constant.is_none() && !is_null_default(d) {
+                                if constant.is_none() {
                                     moved
                                         .unprobeable
                                         .entry(column.clone())
@@ -543,7 +611,7 @@ impl AsStored {
                                         .insert(key.clone());
                                 }
                             }
-                        } else if !is_null_default(default) {
+                        } else {
                             moved
                                 .unprobeable
                                 .entry(column.clone())
@@ -570,8 +638,7 @@ impl AsStored {
                 // Exhaustive rather than `_`: a change added later that moves a
                 // name has to be reflected here, or every probe downstream of
                 // it would quietly query the wrong object.
-                Change::DropColumn { .. }
-                | Change::AlterColumnNullability { .. }
+                Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
                 | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
@@ -582,7 +649,6 @@ impl AsStored {
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
-                | Change::DropComputedColumn { .. }
                 | Change::DropIndex { .. }
                 // A module carries no data and no identity, so nothing here
                 // applies to one.
@@ -613,6 +679,23 @@ impl AsStored {
         this
     }
 
+    fn passes_a_name(&self, table: &TableName) -> bool {
+        // The pure probe builder has no catalog collation: different text
+        // can still name one column. Only a rename's own uid rules out a
+        // different holder; every other possible handoff is unchecked.
+        let Some(vacated) = self.vacated.get(table) else {
+            return false;
+        };
+        let added = self.added.keys().any(|c| c.table == *table);
+        vacated.iter().any(|owner| {
+            added
+                || self
+                    .columns
+                    .iter()
+                    .any(|(c, renamed)| c.table == *table && owner.as_ref() != Some(&renamed.uid))
+        })
+    }
+
     /// `None` when the object does not exist yet, and so cannot be probed.
     fn table(&self, name: &TableName) -> Option<TableName> {
         if self.created.contains(name) {
@@ -631,7 +714,7 @@ impl AsStored {
         let name = self
             .columns
             .get(column)
-            .cloned()
+            .map(|renamed| renamed.stored.clone())
             .unwrap_or_else(|| column.name.clone());
         Some(table.column(&name))
     }
@@ -790,6 +873,9 @@ fn build(
             let Some(stored) = names.table(table) else {
                 return Ok(skip(change, "the table does not exist before apply", unchecked));
             };
+            if names.passes_a_name(table) {
+                return Ok(skip(change, "a column name in the check's table changes owner before apply", unchecked));
+            }
             // The rows the statement will meet, not the rows standing now.
             // `order_key` runs every row change (11, 12) before every
             // constraint this plan adds (13), which is what makes the two
@@ -1625,6 +1711,19 @@ fn guarded(
     fragment: &str,
 ) -> String {
     let mut arms = String::new();
+    // SQL Server exempts a tuple with any NULL from its foreign key. This
+    // decides the tuple even when another cell cannot be evaluated yet.
+    let nulls: Vec<&String> = comparable
+        .iter()
+        .filter(|(_, sql)| is_null_default(sql))
+        .map(|(column, _)| column)
+        .collect();
+    if !nulls.is_empty() {
+        arms.push_str(&format!(
+            "WHEN {} THEN {fragment} ",
+            touches(nulls.into_iter())
+        ));
+    }
     if !uncomparable.is_empty() {
         arms.push_str(&format!("WHEN {} THEN N'' ", touches(uncomparable.iter())));
     }
@@ -1663,23 +1762,42 @@ fn unprobeable_probe(
         Removal::Table => return Ok(None),
         Removal::Keys(keys) => keys,
     };
-    let mut columns = Vec::new();
+    let stored_name = |column: &str| names.column(&child.column(column)).map(|r| r.name);
+    let mut rows: BTreeMap<&RowKey, BTreeSet<String>> = BTreeMap::new();
     let mut described = Vec::new();
-    for (column, rows) in &moved.unprobeable {
-        let Some(stored_column) = names.column(&child.column(column)) else {
+    for (column, keys) in &moved.unprobeable {
+        let Some(name) = stored_name(column) else {
             continue;
         };
-        columns.push(literal(&stored_column.name));
-        let rows: Vec<String> = rows.iter().map(|r| format!("`{r}`")).collect();
+        for key in keys {
+            rows.entry(key).or_default().insert(name.clone());
+        }
+        let listed: Vec<String> = keys.iter().map(|r| format!("`{r}`")).collect();
         described.push(format!(
             "{column} (row{} {})",
-            if rows.len() == 1 { "" } else { "s" },
-            rows.join(", ")
+            if listed.len() == 1 { "" } else { "s" },
+            listed.join(", ")
         ));
     }
-    if columns.is_empty() {
+    if rows.is_empty() {
         return Ok(None);
     }
+    // NULL exempts only this row's tuple in this foreign key. Combining
+    // columns across rows or keys would hide a different unknown arrival.
+    let arms: Vec<String> = rows
+        .iter()
+        .map(|(row, columns)| {
+            format!(
+                "(c.name IN ({}) AND NOT {})",
+                columns
+                    .iter()
+                    .map(|c| literal(c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                touches(moved.nulls_of(row, &stored_name).iter())
+            )
+        })
+        .collect();
     Ok(Some(Probe::new(
         format!(
             "foreign-key column(s) of {child} that reference {table} and that this plan writes to \
@@ -1695,10 +1813,10 @@ fn unprobeable_probe(
               WHERE fk.referenced_object_id = OBJECT_ID({})\n   \
                 AND fk.parent_object_id = OBJECT_ID({})\n   \
                 AND fk.is_disabled = 0\n   \
-                AND c.name IN ({}){};",
+                AND ({}){};",
             literal(&qualified(&stored.table)?),
             literal(&qualified(&stored_child)?),
-            columns.join(", "),
+            arms.join(" OR "),
             if removed.is_empty() {
                 String::new()
             } else {
@@ -4346,14 +4464,10 @@ mod tests {
             );
             assert!(p[0].sql.contains("N'status_code'"), "{default}: {p:?}");
         }
-        // Not a literal: nothing to compare before it runs. NULL: no row.
+        // Not a literal: nothing to compare before it runs.
         // The key is still written, so a key spanning it is asked about,
         // and one spanning `status_code` is not.
-        for default in [
-            "(NEXT VALUE FOR [dbo].[s])",
-            "(CONVERT(int, 'abc'))",
-            "(NULL)",
-        ] {
+        for default in ["(NEXT VALUE FOR [dbo].[s])", "(CONVERT(int, 'abc'))"] {
             let sql = sql_of(&plan(vec![insert(default), delete.clone()]));
             assert!(!sql.contains("N'status_code'"), "{default}: {sql}");
             assert!(
@@ -4392,6 +4506,8 @@ mod tests {
             probes(&plan(vec![insert("(NULL)"), delete.clone()])).len(),
             1
         );
+        let null = sql_of(&plan(vec![insert("(NULL)"), delete.clone()]));
+        assert!(null.contains("N', NULL)'"), "{null}");
 
         // An update to DEFAULT, the same way.
         let update = Change::UpdateRow {

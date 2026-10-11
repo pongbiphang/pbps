@@ -1017,3 +1017,29 @@ removals at their steps for the same reason, while its parent lookup still
 uses the complete map. Live tests on both engines compare counts with the
 engine's delete verdict, including a planned child arrival, an ordinary drop,
 a drop after its owner's rename, and a freeing FK drop before name reuse.
+
+<a id="dec-1771-1"></a>
+
+**DEC-1771.1. SQL Server's future foreign-key tuple retains every known NULL.**
+Measured on 17.0.4075.5: updating a reference to `DEFAULT` under `DEFAULT NULL`
+and then deleting its parent succeeds, but the preflight count was one.
+`constant_default` now retains NULL, and assignment preserves it as the literal
+`NULL`, since converting it to a destination type or collation cannot change
+its value. This also keeps the tuple's NULL visible without parsing generated
+`CONVERT` expressions. Old plans without destination types use the same rule.
+
+A NULL in any column exempts that row's whole foreign-key tuple, including
+when another column is left to an unevaluable default. Apply this fact before
+giving up on unknown cells in the delete count, and per row and per catalog
+key in the refusal for unknown defaults. Unchanged declared NULL cells and
+unchanged NULL defaults participate too (DECISIONS 334, 336 and 349). Derive
+written NULLs from the final recorded assignments, so an explicit non-NULL
+insert value overrides an omitted-column NULL default. A NULL in another row
+or another key exempts neither; live negative cases pin both boundaries.
+
+The companion planned-key case needs no SQL Server change: `AddForeignKey`
+already probes the projected child and parent after the plan's row changes
+(DECISIONS 151). Measured without a standing key, deleting the parent leaves
+one orphan counted by that probe; deleting the child or setting its reference
+to NULL leaves none. Applying those three plans agrees. The pre-delete count
+need not duplicate that planned-key check.
