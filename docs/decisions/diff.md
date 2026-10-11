@@ -1331,11 +1331,17 @@ any of them may need the new type: a row may write a value only that type
 accepts, and a function body may be checked against it. The retype cannot both
 follow its release and precede them. A drop of another input, moved after its
 own release, needs nothing of this column's type and does not hold it back.
+A drop moved past a row the plan inserts into its table is refused the same
+way when the input is `NOT NULL` with no default and no identity, which the
+catalog reads beside the generated column's edges: the row cannot write a
+column the declaration drops, and the column refuses it while it stands. A
+nullable or defaulted input lets the row in, and that plan applies (#1397).
 
 Pinned by `a_released_input_is_retyped_or_dropped_after_its_release`
 (`crates/pbps-cli/src/engine.rs`), `a_replaced_internal_member_keeps_its_owner`
 (`crates/pbps-pg/src/drop_impact.rs`), and the live
-`an_expression_change_releases_its_old_input_in_the_same_plan`
+`an_expression_change_releases_its_old_input_in_the_same_plan` and
+`a_released_input_dropped_past_an_inserted_row_is_refused_only_when_required`
 (`crates/pbps-cli/tests/flow_pg.rs`).
 
 <a id="dec-1363-1"></a>

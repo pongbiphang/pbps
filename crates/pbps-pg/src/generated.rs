@@ -21,6 +21,9 @@ pub struct Dependence {
     pub base: String,
     /// The generated column computed from it.
     pub generated: String,
+    /// The input is `NOT NULL` with no default and no identity: while it
+    /// stands, a row inserted without it is refused (#1397).
+    pub base_required: bool,
 }
 
 /// Every column of `table` that a generated column of the same table is
@@ -39,7 +42,9 @@ pub struct Dependence {
 /// is the same answer here: nothing live depends on anything.
 pub async fn dependences(conn: &mut Conn, table: &TableName) -> Result<Vec<Dependence>, DbError> {
     let sql = format!(
-        "SELECT base.attname AS base, gen.attname AS generated
+        "SELECT base.attname AS base, gen.attname AS generated,
+                base.attnotnull AND NOT base.atthasdef AND base.attidentity = ''
+                  AS base_required
            FROM pg_catalog.pg_attrdef ad
            JOIN pg_catalog.pg_attribute gen
              ON gen.attrelid = ad.adrelid AND gen.attnum = ad.adnum AND gen.attgenerated <> ''
@@ -67,6 +72,9 @@ pub async fn dependences(conn: &mut Conn, table: &TableName) -> Result<Vec<Depen
         out.push(Dependence {
             base: text("base")?,
             generated: text("generated")?,
+            base_required: row.try_get::<bool>("base_required")?.ok_or_else(|| {
+                DbError::BadRow("catalog column `base_required` is null".to_owned())
+            })?,
         });
     }
     Ok(out)

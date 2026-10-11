@@ -2929,7 +2929,35 @@ async fn a_generated_columns_inputs_leave_out_its_own_column() {
         [Dependence {
             base: "a".into(),
             generated: "b".into(),
+            base_required: false,
         }]
+    );
+    // Which inputs a row cannot be inserted without (#1397): `NOT NULL` with
+    // no default only. A default or an identity fills the column, and a
+    // nullable one takes NULL.
+    db.execute(&format!(
+        "CREATE TABLE {s}.r (id integer PRIMARY KEY, req integer NOT NULL,
+                             dflt integer NOT NULL DEFAULT 0,
+                             ident integer NOT NULL GENERATED ALWAYS AS IDENTITY,
+                             opt integer,
+                             g bigint GENERATED ALWAYS AS (req + dflt + ident + opt) STORED);"
+    ))
+    .await
+    .expect("the table");
+    let found = dependences(&mut db.conn, &TableName::new(&s, "r"))
+        .await
+        .expect("the catalog answers");
+    assert_eq!(
+        found
+            .iter()
+            .map(|d| (d.base.as_str(), d.base_required))
+            .collect::<Vec<_>>(),
+        [
+            ("dflt", false),
+            ("ident", false),
+            ("opt", false),
+            ("req", true)
+        ]
     );
     db.execute(&format!("ALTER TABLE {s}.t ALTER COLUMN b TYPE bigint;"))
         .await

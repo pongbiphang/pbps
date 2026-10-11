@@ -1703,6 +1703,8 @@ fn release_of(
 /// - a change the moved one passes needs what it holds back: a column's name
 ///   taken before its drop runs, or a row, key or module that may need its
 ///   new type before its retype runs;
+/// - a drop of a `NOT NULL` input with no default, moved past a row the plan
+///   inserts into its table, which the column refuses while it stands (#1397);
 /// - a drop of a column another generated column's new text may read, which
 ///   no order performs (#1391);
 /// - changes that wait on one another, as two generated columns trading
@@ -1718,6 +1720,16 @@ pub(crate) fn order_after_releases(
     use pbps_pg::generated::may_read;
     let names =
         pbps_model::plan_names::PlanNames::of(&changes.changes, ids).map_err(|e| e.to_string())?;
+    // Inputs a row cannot be inserted without while they stand, by their
+    // live table and name (#1397).
+    let required: std::collections::BTreeSet<(TableName, String)> = dependences
+        .iter()
+        .flat_map(|(table, ds)| {
+            ds.iter()
+                .filter(|d| d.base_required)
+                .map(move |d| (table.clone(), d.base.clone()))
+        })
+        .collect();
     let n = changes.changes.len();
     // What each change waits for, by position.
     let mut waits: Vec<std::collections::BTreeSet<usize>> =
@@ -1824,7 +1836,7 @@ pub(crate) fn order_after_releases(
             .position(|(h, _)| waits[*h].iter().all(|w| done[*w]))
         {
             let (h, from) = held.remove(k);
-            passes(changes, &names, h, &order[from..])?;
+            passes(changes, &names, &required, h, &order[from..])?;
             order.push(h);
             done[h] = true;
         }
@@ -1875,13 +1887,33 @@ fn reused(changes: &ChangeSet, column: &pbps_model::ColumnRef) -> bool {
 fn passes(
     changes: &ChangeSet,
     names: &pbps_model::plan_names::PlanNames<'_>,
+    required: &std::collections::BTreeSet<(TableName, String)>,
     held: usize,
     passed: &[usize],
 ) -> Result<(), String> {
     let change = &changes.changes[held].change;
-    let Some((_, _, column, _)) = changed_column(names, change) else {
+    let Some((table, live, column, _)) = changed_column(names, change) else {
         return Ok(());
     };
+    // A drop holds its column until it runs, and an input that is `NOT NULL`
+    // with no default refuses a row inserted without it, as every row of its
+    // table the plan inserts is once the declaration drops it. The drop
+    // cannot both follow the release and precede the insert (#1397). A
+    // nullable or defaulted input lets the row in, and that plan applies.
+    if matches!(change, pbps_model::Change::DropColumn { .. })
+        && required.contains(&(table, live))
+        && let Some(insert) = passed.iter().map(|i| &changes.changes[*i].change).find(
+            |c| matches!(c, pbps_model::Change::InsertRow { table, .. } if *table == column.table),
+        )
+    {
+        return Err(format!(
+            "{column} is dropped after the expression change that releases it, which \
+             follows `{}`: the column is NOT NULL with no default, so that row, which does \
+             not write it, is refused while the column stands. Apply the expression change \
+             in a plan of its own first, then this one.",
+            insert.subject()
+        ));
+    }
     // A drop holds its name until it runs: a change taking the name needs it
     // free, and the release needs the column still there.
     if let Some(taker) = passed
@@ -3369,6 +3401,7 @@ mod tests {
             vec![pbps_pg::generated::Dependence {
                 base: "a".into(),
                 generated: "g".into(),
+                base_required: false,
             }],
         )]);
         let kinds = |cs: &ChangeSet| -> Vec<&'static str> {
@@ -3470,10 +3503,12 @@ mod tests {
                 pbps_pg::generated::Dependence {
                     generated: "g".into(),
                     base: "a".into(),
+                    base_required: false,
                 },
                 pbps_pg::generated::Dependence {
                     generated: "h".into(),
                     base: "b".into(),
+                    base_required: false,
                 },
             ],
         )]);
@@ -3520,6 +3555,45 @@ mod tests {
         let mut cs = plan(vec![retype("a"), update("a"), recompute("b * 2")]);
         let refusal = order_after_releases(&mut cs, &reads_a).unwrap_err();
         assert!(refusal.contains("may need the new type"), "{refusal}");
+        // A drop moved past a row inserted into its table, as it is when the
+        // release follows a function create: a `NOT NULL` input with no
+        // default refuses the row, which cannot write it, so the plan is
+        // refused by name (#1397).
+        let insert = |table: &TableName| Change::InsertRow {
+            table: table.clone(),
+            key_column: "id".into(),
+            identity_key: false,
+            key: pbps_model::RowKey::from("1"),
+            row: pbps_model::Row::default(),
+            defaults: BTreeMap::new(),
+            types: BTreeMap::new(),
+        };
+        let requires_a = BTreeMap::from([(
+            t.clone(),
+            vec![pbps_pg::generated::Dependence {
+                base: "a".into(),
+                generated: "g".into(),
+                base_required: true,
+            }],
+        )]);
+        let mut cs = plan(vec![drop("a"), insert(&t), recompute("b * 2")]);
+        let refusal = order_after_releases(&mut cs, &requires_a).unwrap_err();
+        assert!(
+            refusal.contains("app.t.a is dropped after the expression change")
+                && refusal.contains("NOT NULL with no default")
+                && refusal.contains("in a plan of its own first"),
+            "{refusal}"
+        );
+        // Negatives: a nullable or defaulted input lets the row in, a row of
+        // another table is no concern of the column, and an insert after the
+        // release is never passed.
+        let mut cs = plan(vec![drop("a"), insert(&t), recompute("b * 2")]);
+        assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(1));
+        let other: TableName = "app.other".parse().unwrap();
+        let mut cs = plan(vec![drop("a"), insert(&other), recompute("b * 2")]);
+        assert_eq!(order_after_releases(&mut cs, &requires_a), Ok(1));
+        let mut cs = plan(vec![drop("a"), recompute("b * 2"), insert(&t)]);
+        assert_eq!(order_after_releases(&mut cs, &requires_a), Ok(1));
         // So does any row in between, of another column as much, and a
         // module; a moved drop of another input does not hold it back.
         let mut cs = plan(vec![retype("a"), update("b"), recompute("b * 2")]);
@@ -3640,10 +3714,12 @@ mod tests {
                 pbps_pg::generated::Dependence {
                     generated: "g".into(),
                     base: "a".into(),
+                    base_required: false,
                 },
                 pbps_pg::generated::Dependence {
                     generated: "h".into(),
                     base: "b".into(),
+                    base_required: false,
                 },
             ],
         )]);
@@ -4316,6 +4392,7 @@ mod plan_name_tests {
             vec![pbps_pg::generated::Dependence {
                 base: "original_column".into(),
                 generated: "g".into(),
+                base_required: false,
             }],
         )]);
         assert_eq!(

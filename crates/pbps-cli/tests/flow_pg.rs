@@ -8626,6 +8626,139 @@ fn an_expression_change_releases_a_generated_column_from_a_dropped_function() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+/// A generated column's new expression calls a function the same plan
+/// creates, so its release of `a` runs after the plan's rows, and `a`'s drop
+/// waits behind it, past a row inserted into the table (#1397). A nullable
+/// input lets that row in, and the plan applies end to end. A `NOT NULL`
+/// input with no default would refuse the row inside the apply, so the plan
+/// is refused by name at `plan --db`, before anything runs.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_released_input_dropped_past_an_inserted_row_is_refused_only_when_required() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "released-drop-insert");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.opt (id integer PRIMARY KEY, a integer, b integer, \
+                               g integer GENERATED ALWAYS AS (a * 2) STORED); \
+         CREATE TABLE app.req (id integer PRIMARY KEY, a integer NOT NULL, b integer, \
+                               g integer GENERATED ALWAYS AS (a * 2) STORED)",
+    );
+    let d = Demo::new("released-drop-insert");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    // One revision of a table: `a` gone, `g` computed by `function` from
+    // `b`, which the same revision creates, and a row inserted without `a`.
+    let revise = |table: &str, function: &str| {
+        std::fs::write(
+            d.dir
+                .join(format!("schema/app.{function}%28integer%29.function.yml")),
+            format!(
+                "function: app.{function}(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+                 (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 3 $$\n"
+            ),
+        )
+        .unwrap();
+        let path = d.dir.join(format!("schema/app.{table}.yml"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut in_a = false;
+        let edited: String = text
+            .lines()
+            .filter_map(|l| {
+                if !l.starts_with("   ") {
+                    in_a = l == "  a:";
+                }
+                if in_a {
+                    None
+                } else if l.trim_start().starts_with("generated:") {
+                    Some(format!(
+                        "    generated: {{expression: 'app.{function}(b)', stored: true}}"
+                    ))
+                } else {
+                    Some(l.to_owned())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\ndata:\n  mode: exact\n  rows:\n    1: {b: 3}\n";
+        assert!(!edited.contains("  a:\n"), "{edited}");
+        std::fs::write(&path, edited).unwrap();
+        succeeds(d.run(&[
+            "drop",
+            &format!("app.{table}.a"),
+            "--reason",
+            "computed from b now",
+        ]));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+    };
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    revise("opt", "f");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    // The row before the release, the drop after it.
+    assert!(
+        at("INSERT INTO \"app\".\"opt\"")
+            < at("ALTER TABLE \"app\".\"opt\" ALTER COLUMN \"g\" SET EXPRESSION")
+            && at("ALTER TABLE \"app\".\"opt\" ALTER COLUMN \"g\" SET EXPRESSION")
+                < at("ALTER TABLE \"app\".\"opt\" DROP COLUMN \"a\""),
+        "{script}"
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "narrowing", "--allow", "destructive"],
+    ));
+    assert_eq!(
+        scalar(&connection, "SELECT g::int8 FROM app.opt WHERE id = 1"),
+        9
+    );
+    succeeds(d.run(&["verify", "--db", &connection]));
+
+    revise("req", "h");
+    let refused = d.run(&["plan", "--db", &connection]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("app.req.a is dropped after the expression change")
+            && stderr(&refused).contains("NOT NULL with no default"),
+        "{}",
+        stderr(&refused)
+    );
+    // Nothing ran: `a` and its generated column stand as they were.
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_attribute \
+             WHERE attrelid = 'app.req'::regclass AND attname = 'a' AND NOT attisdropped"
+        ),
+        1
+    );
+}
+
 /// One revision changes a generated column's expression to stop reading `a`
 /// and drops or retypes `a`: the expression change runs first, releasing `a`,
 /// and the plan applies (DEC-1316.1). A view over the generated column stays:
