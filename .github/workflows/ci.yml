@@ -32,6 +32,16 @@ name: CI
 # with its reviewer set before this file names it: a workflow that names a
 # missing environment creates it with no protection at all.
 #
+# The approved pull-request run is a reduced set; the merge group runs every
+# job (DEC-1835.1). `live` and `live-pg` repeat the suites the local full gate
+# already ran on that head, and `resolver` and `release-windows` are the long
+# jobs left. They carry `if: ${{ github.event_name != 'pull_request' }}` and
+# are named in the gate's PR_OMITTED. That cannot qualify an untested merge:
+# the merge queue is required and cannot be bypassed, so every change reaches
+# `master` through a merge group whose gate demands `success` from every job.
+# The pull-request set stays a subset of the merge-group set, so no job can
+# fail a pull request that the merge group would pass.
+#
 # Do not add `paths` or `paths-ignore` here. `ci-gate` is a required check, and
 # a required check that never reports leaves a pull request blocked with
 # nothing that can clear it.
@@ -117,6 +127,7 @@ jobs:
       - run: python3 scripts/check-decisions.py
       # The checker `ci-gate` runs on its own `needs` (#637).
       - run: python3 scripts/check_gate_needs_test.py
+      - run: python3 scripts/ci_gate_verdict_test.py
       # The dedicated-server fixture's retry decision runs only in the resolver
       # job, as root; this is the one place its logic is tested (DEC-958.1).
       - run: python3 scripts/live_resolver_server_test.py
@@ -196,6 +207,7 @@ jobs:
   # Linux docker host.
   live:
     needs: [approve, lint]
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     services:
       mssql:
@@ -403,6 +415,7 @@ jobs:
   # dropping tests.
   live-pg:
     needs: [approve, lint]
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -583,6 +596,7 @@ jobs:
   # what they share is the test binary, which each half builds for itself.
   resolver:
     needs: [approve, lint]
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -685,6 +699,7 @@ jobs:
 
   release-windows:
     needs: [approve, lint]
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: windows-2025
     timeout-minutes: 60
     env:
@@ -785,9 +800,10 @@ jobs:
   # job named `ci-gate` would count as passing and hide missing CI. The name
   # and admission condition below keep those runs out of qualification.
   # For the same reason `skipped` and `cancelled` are failures below and not
-  # passes. Nothing here is meant to be skipped; if something ever is, the gate
-  # should shut rather than open, and a `paths` filter added later cannot
-  # quietly qualify a pull request that nothing ran on.
+  # passes. The one exception is named: on a pull request, and only for the
+  # jobs in PR_OMITTED, `skipped` is the expected result (DEC-1835.1).
+  # Anything else skipped shuts the gate rather than opening it, so a `paths`
+  # filter added later cannot quietly qualify a pull request nothing ran on.
   compatibility:
     name: compatibility (${{ matrix.cell }})
     needs: [approve, lint]
@@ -824,16 +840,15 @@ jobs:
       - run: python3 scripts/check_gate_needs.py
       # Through the environment, not `${{ }}` inside `run:`: interpolation
       # would splice the value into the program text.
+      #
+      # A pull request runs a reduced set (DEC-1835.1): the jobs in
+      # PR_OMITTED carry `if: ${{ github.event_name != 'pull_request' }}`,
+      # and only there, only for them, is `skipped` accepted. Every job must
+      # succeed on every other event. The CI policy test keeps this list and
+      # those conditions in step.
       - name: every job succeeded
         env:
           NEEDS: ${{ toJSON(needs) }}
-        run: |
-          echo "$NEEDS"
-          # `jq -e` exits non-zero when the result is false, so the verdict is
-          # the exit status and needs no test of its own.
-          if jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" >/dev/null; then
-            exit 0
-          fi
-          jq -r 'to_entries[] | select(.value.result != "success")
-                 | "::error::\(.key): \(.value.result)"' <<<"$NEEDS"
-          exit 1
+          EVENT: ${{ github.event_name }}
+          PR_OMITTED: live live-pg resolver release-windows
+        run: python3 scripts/ci_gate_verdict.py

@@ -2320,7 +2320,11 @@ Three traps sat inside the fix, and each of them is a measurement:
   This is also why `ci-gate` counts `skipped` as a failure rather than passing
   it through, and why `ci.yml` carries no `paths` filter: the reverse of this
   trap is a required check that never reports at all, which blocks the pull
-  request with nothing that can clear it.
+  request with nothing that can clear it. The one exception is declared, not
+  inferred: on a `pull_request` run, and only for the jobs the gate names in
+  `PR_OMITTED`, `skipped` is the expected result (DEC-1835.1). Those jobs carry
+  `if: ${{ github.event_name != 'pull_request' }}`, the merge group still runs
+  them before every merge, and any other skip still shuts the gate.
 - **The gate job's own `if:` can skip the gate, and a skipped gate passes.**
   The aggregating job was first written with `if: ${{ !cancelled() }}`, so
   cancelling the run skipped it — and a skipped required check is a passing

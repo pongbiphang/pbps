@@ -124,6 +124,22 @@ class Ownership(unittest.TestCase):
                 with self.assertRaises(audit.InventoryError):
                     self.check()
 
+    def test_a_job_omitted_only_from_pull_requests_still_owns_its_cases(self):
+        self.workflow.write_text(WORKFLOW.replace(
+            "    steps:", "    if: ${{ github.event_name != 'pull_request' }}\n    steps:"))
+        self.assertEqual(self.check(), 1)
+
+    def test_any_other_job_condition_is_refused(self):
+        for condition in ("${{ github.event_name == 'pull_request' }}",
+                          "${{ github.event_name != 'merge_group' }}",
+                          "github.event_name != 'pull_request'",
+                          "${{ github.event_name != 'pull_request' && false }}",
+                          "${{ always() }}"):
+            with self.subTest(condition=condition):
+                self.workflow.write_text(WORKFLOW.replace("    steps:", f"    if: {condition}\n    steps:"))
+                with self.assertRaisesRegex(audit.InventoryError, "conditional owner job needs an explicit audit"):
+                    self.check()
+
     def test_matrix_condition_must_have_an_executed_variant(self):
         workflow = WORKFLOW.replace("    steps:", "    strategy:\n      matrix:\n        engine: [pg, mssql]\n    steps:")
         workflow = workflow.replace("      - run:", "      - name: selected\n        if: matrix.engine == 'pg'\n        run:")

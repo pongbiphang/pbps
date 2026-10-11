@@ -565,6 +565,12 @@ def check_witness(root, witness, fixtures=None):
 # string; GitHub's parser is not pinned to either, so both sets are refused.
 YAML_NON_STRINGS = {"true", "false", "yes", "no", "on", "off", "y", "n", "null"}
 
+# The one job-level condition an owner may carry. A job with it is skipped on a
+# pull request only; the merge group, `master` and dispatched runs execute it,
+# so its cases still run on the exact tree before every merge (DEC-1835.1).
+# Any other condition, or a spelling of this one, still needs an audit.
+PULL_REQUEST_OMISSION = "${{ github.event_name != 'pull_request' }}"
+
 
 def workflow_runs(source, job, platform=None):
     """Read the repository's run scalar/block subset; ambiguous owners fail."""
@@ -577,8 +583,9 @@ def workflow_runs(source, job, platform=None):
         runner = re.search(r"^    runs-on: ([\w-]+)\s*$", body, re.M)
         prefix = {"linux": "ubuntu-", "win32": "windows-", "darwin": "macos-"}[platform]
         require(runner is not None and runner[1].startswith(prefix), f"owner platform differs from CI runner: {job}")
-    job_conditions = re.findall(r"^    if: (.+)$", body, re.M)
-    require(not job_conditions, f"conditional owner job needs an explicit audit: {job}")
+    job_conditions = [c.strip() for c in re.findall(r"^    if: (.+)$", body, re.M)]
+    require(job_conditions in ([], [PULL_REQUEST_OMISSION]),
+            f"conditional owner job needs an explicit audit: {job}")
     steps = re.split(r"^      - ", body, flags=re.M)[1:]
     require(not re.search(r"^        (include|exclude):", body, re.M),
             f"matrix include/exclude needs an explicit execution audit: {job}")

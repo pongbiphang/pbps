@@ -119,8 +119,8 @@ and merge order.
   required, add `ci-retest` to the owned PR; if already present, remove only
   that label and add it again. Verify OPEN/base/unchanged head/diff around the
   label event and select its new associated run. Label additions require
-  approval and the full matrix; title/body edits and label removal trigger
-  nothing (DEC-1457.1). Verify the immutable defining-workflow bootstrap and
+  approval and the pull-request job set (DEC-1835.1); title/body edits and
+  label removal trigger nothing (DEC-1457.1). Verify the immutable defining-workflow bootstrap and
   the approval-selected merge SHA's intended-base/reviewed-head parents. Every
   job must use it; its base parent includes the event base and belongs to the
   intended branch. Require complete CI and actual required-check admission,
