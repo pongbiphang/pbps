@@ -1248,9 +1248,10 @@ async fn inventory(conn: &mut Conn) -> Result<baseline::Inventory, Error> {
 /// with the session, or reach the compile.
 /// Runs the baseline inside one `REPEATABLE READ` transaction pbps opens,
 /// and refuses it, rolled back so it leaves nothing, when it changed the
-/// cluster outside the scratch database or ended that transaction itself
-/// (#1783). One snapshot serves both reads of the shared state, so another
-/// session's writes during the script are in neither.
+/// cluster outside the scratch database (#1783). One snapshot serves both
+/// reads of the shared state, so another session's writes during the
+/// script are in neither. The script cannot end the transaction itself:
+/// [`baseline::run`] refuses transaction control before it runs.
 async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
     let read =
         |what: &'static str| move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"));
@@ -1259,14 +1260,24 @@ async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
         .await
         .map_err(read("the baseline's transaction"))?;
     let outcome = async {
-        let began = baseline::transaction_began(session)
+        // Under an empty path, here and after the script, whose `SET`s
+        // last until `DISCARD ALL`: a type it creates may be named `text`.
+        let pinned = "SELECT pg_catalog.set_config('search_path', '', true)";
+        session
+            .execute(pinned)
             .await
-            .map_err(read("the baseline's transaction"))?;
+            .map_err(read("the baseline session's path"))?;
         let before = baseline::shared_state(session)
             .await
             .map_err(read("the cluster's shared state"))?;
         if let Err(failed) = baseline::run(session, sql).await {
             let mut finding = format!("the engine refused it: {}", failed.error);
+            if failed.unsupported() {
+                finding.push_str(
+                    "; if it controls its transaction, leave out BEGIN, COMMIT and ROLLBACK: \
+                     pbps runs the whole baseline as one transaction",
+                );
+            }
             if failed.names_something_missing() {
                 finding.push_str(
                     "; the baseline runs before any managed object, so a statement that names \
@@ -1276,16 +1287,10 @@ async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
             }
             return Err(Error::Baseline(vec![finding]));
         }
-        let still = baseline::transaction_began(session)
+        session
+            .execute(pinned)
             .await
-            .map_err(read("the baseline's transaction"))?;
-        if still != began {
-            return Err(Error::Baseline(vec![
-                "it ends the transaction it runs in; leave out COMMIT and ROLLBACK, since pbps \
-                 runs the whole baseline as one transaction"
-                    .into(),
-            ]));
-        }
+            .map_err(read("the baseline session's path"))?;
         let after = baseline::shared_state(session)
             .await
             .map_err(read("the cluster's shared state"))?;

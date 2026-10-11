@@ -22,6 +22,12 @@ pub struct Failed {
 }
 
 impl Failed {
+    /// Whether the engine refused a feature: transaction control among
+    /// them, which the script may not use.
+    pub fn unsupported(&self) -> bool {
+        self.error.server_error_code().as_deref() == Some("0A000")
+    }
+
     /// Whether the engine named something that does not exist. A baseline
     /// runs before any managed object, so such a name may be a managed
     /// object it may not refer to.
@@ -33,36 +39,43 @@ impl Failed {
     }
 }
 
-/// Runs the baseline as one script, in one simple query, so the engine
-/// decides where each statement ends (#1769). Not split here: where a
-/// statement ends depends on the server's own lexer and grammar, and a
-/// client-side copy of them kept refusing valid files on ever narrower
-/// inputs (review of #1754: a `begin` name, a continued `E''` string, a
-/// qualified `ext.end()` in a `BEGIN ATOMIC` body).
+/// Runs the baseline as one script the engine splits (#1769), through a
+/// `DO` block's `EXECUTE`, inside the transaction the caller opened. Not
+/// split here: where a statement ends depends on the server's own lexer and
+/// grammar, and a client-side copy of them kept refusing valid files on ever
+/// narrower inputs (review of #1754: a `begin` name, a continued `E''`
+/// string, a qualified `ext.end()` in a `BEGIN ATOMIC` body).
 ///
 /// What that costs, by decision on #1769:
-/// - the script is one implicit transaction, so a statement that cannot run
+/// - the script runs inside one transaction, so a statement that cannot run
 ///   in a transaction block (`CREATE INDEX CONCURRENTLY`, `VACUUM`) is
 ///   refused by the engine, and a refused script leaves nothing behind;
 /// - the whole text is read under the session's settings when it starts, so
 ///   a setting the script changes (`standard_conforming_strings`) does not
 ///   change how the rest of it is read.
 ///
+/// Through `EXECUTE` rather than as a simple query, because a simple query
+/// may `COMMIT` the caller's transaction part-way, and what it committed,
+/// a role included, would outlast the refusal that followed (#1783 review).
+/// `EXECUTE` refuses transaction control before it runs (measured on 16 and
+/// 18: "EXECUTE of transaction commands is not implemented").
+///
 /// What a misread creates is still compared with the target afterwards.
 pub async fn run(conn: &mut impl ExecuteConnection, sql: &str) -> Result<(), Failed> {
-    conn.execute(sql).await.map_err(|error| Failed { error })
+    let body = dollar_quoted(sql, "pbps_baseline");
+    let block = dollar_quoted(&format!("BEGIN EXECUTE {body}; END"), "pbps_block");
+    conn.execute(&format!("DO {block}"))
+        .await
+        .map_err(|error| Failed { error })
 }
 
-/// When the session's transaction began. The baseline runs inside one
-/// transaction pbps opens; a different answer after it means the script
-/// ended that transaction itself.
-pub async fn transaction_began(conn: &mut impl QueryConnection) -> Result<String, DbError> {
-    let rows = conn
-        .query("SELECT pg_catalog.transaction_timestamp()::text AS began")
-        .await?;
-    rows.first()
-        .map(|row| text(row, "began"))
-        .unwrap_or_else(|| Err(DbError::BadRow("no transaction start".into())))
+/// `text` dollar-quoted under a tag it does not contain.
+fn dollar_quoted(text: &str, stem: &str) -> String {
+    let tag = (0..)
+        .map(|n| format!("${stem}_{n}$"))
+        .find(|tag| !text.contains(tag.as_str()))
+        .expect("an unbounded sequence holds a tag the text lacks");
+    format!("{tag}{text}{tag}")
 }
 
 /// The cluster state outside the scratch database that a transaction can
@@ -82,14 +95,14 @@ pub async fn shared_state(
     let rows = conn
         .query(
             "SELECT 'role ' || pg_catalog.quote_ident(r.rolname) AS name, \
-                    pg_catalog.row_to_json(r)::text AS detail \
+                    pg_catalog.row_to_json(r)::pg_catalog.text AS detail \
                FROM pg_catalog.pg_roles r \
              UNION ALL \
              SELECT 'the membership of role ' \
                       || pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(m.member)) \
                       || ' in role ' \
                       || pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(m.roleid)), \
-                    pg_catalog.row_to_json(m)::text \
+                    pg_catalog.row_to_json(m)::pg_catalog.text \
                FROM pg_catalog.pg_auth_members m \
              UNION ALL \
              SELECT 'the settings of ' \
@@ -98,14 +111,14 @@ pub async fn shared_state(
                       || ' in ' \
                       || CASE WHEN s.setdatabase = 0 THEN 'every database' ELSE 'database ' \
                          || pg_catalog.quote_ident(d.datname) END, \
-                    pg_catalog.row_to_json(s)::text \
+                    pg_catalog.row_to_json(s)::pg_catalog.text \
                FROM pg_catalog.pg_db_role_setting s \
                LEFT JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase \
               WHERE d.datname IS DISTINCT FROM pg_catalog.current_database() \
              UNION ALL \
              SELECT 'the comment on ' || COALESCE( \
                       pg_catalog.pg_describe_object(c.classoid, c.objoid, 0), 'a shared object'), \
-                    pg_catalog.row_to_json(c)::text \
+                    pg_catalog.row_to_json(c)::pg_catalog.text \
                FROM pg_catalog.pg_shdescription c \
               WHERE NOT (c.classoid = 'pg_catalog.pg_database'::pg_catalog.regclass \
                      AND c.objoid = (SELECT o.oid FROM pg_catalog.pg_database o \
@@ -113,20 +126,20 @@ pub async fn shared_state(
              UNION ALL \
              SELECT 'the security label on ' || COALESCE( \
                       pg_catalog.pg_describe_object(l.classoid, l.objoid, 0), 'a shared object'), \
-                    pg_catalog.row_to_json(l)::text \
+                    pg_catalog.row_to_json(l)::pg_catalog.text \
                FROM pg_catalog.pg_shseclabel l \
               WHERE NOT (l.classoid = 'pg_catalog.pg_database'::pg_catalog.regclass \
                      AND l.objoid = (SELECT o.oid FROM pg_catalog.pg_database o \
                                       WHERE o.datname = pg_catalog.current_database())) \
              UNION ALL \
              SELECT 'tablespace ' || pg_catalog.quote_ident(t.spcname), \
-                    pg_catalog.row_to_json(t)::text \
+                    pg_catalog.row_to_json(t)::pg_catalog.text \
                FROM pg_catalog.pg_tablespace t \
              UNION ALL \
              SELECT 'database ' || pg_catalog.quote_ident(d.datname), \
                     pg_catalog.json_build_array(d.datname, d.datdba, d.encoding, \
                       d.datistemplate, d.datallowconn, d.datconnlimit, d.dattablespace, \
-                      d.datacl)::text \
+                      d.datacl)::pg_catalog.text \
                FROM pg_catalog.pg_database d \
               WHERE d.datname <> pg_catalog.current_database()",
         )
@@ -591,6 +604,14 @@ mod tests {
         assert_eq!(created.schemas, BTreeSet::from([16390, 16402]));
         // Negative: nothing new, nothing created.
         assert_eq!(created_none(&after), Created::default());
+    }
+
+    #[test]
+    fn a_dollar_quote_takes_a_tag_the_text_does_not_hold() {
+        assert_eq!(dollar_quoted("SELECT 1", "t"), "$t_0$SELECT 1$t_0$");
+        // Negative: a text holding the first tags never closes early.
+        let text = "SELECT $t_0$a$t_0$, $t_1$b$t_1$";
+        assert_eq!(dollar_quoted(text, "t"), format!("$t_2${text}$t_2$"));
     }
 
     #[test]

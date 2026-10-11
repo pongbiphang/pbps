@@ -1678,8 +1678,8 @@ scratch compile (#1616).
   EXISTS`. It runs as the setup role: in the run-owned layout in a session
   of its own, in the supplied one on the checked connection, which `DISCARD
   ALL` then resets. It runs inside one `REPEATABLE READ` transaction pbps
-  opens and commits; a file that ends it (`COMMIT`, `ROLLBACK`) refuses the
-  run.
+  opens and commits. Transaction control in it (`BEGIN`, `COMMIT`,
+  `ROLLBACK`) is refused by the engine before anything it did can commit.
   - **It runs as one script**: pbps sends the file whole and the engine
     splits it (#1769). It is one transaction, so a statement that
     cannot run in a transaction block, such as `CREATE INDEX CONCURRENTLY`,

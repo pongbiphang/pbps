@@ -2453,9 +2453,11 @@ async fn vouched_refuses_a_baseline_that_writes_outside_the_scratch_database() {
                 .to_owned(),
             vec!["the comment on role".to_owned()],
         ),
+        // Transaction control would commit the role before any check:
+        // refused before it runs, and the role is never created.
         (
-            "COMMIT;".to_owned(),
-            vec!["it ends the transaction it runs in".to_owned()],
+            format!("CREATE ROLE {role};\nCOMMIT;"),
+            vec!["leave out BEGIN, COMMIT and ROLLBACK".to_owned()],
         ),
     ];
     for (statements, named) in &cases {
@@ -2518,6 +2520,35 @@ async fn vouched_refuses_a_baseline_that_writes_outside_the_scratch_database() {
         );
         assert_eq!(left, 0, "{server}: the setting is rolled back");
     }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_checks_a_baseline_whose_path_shadows_a_built_in_type() {
+    // The baseline's `SET`s last on its session until `DISCARD ALL`, and the
+    // checks after it run there: a type it names `text`, first on its path,
+    // must not change what they read.
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let mut setup = guarded_target();
+    setup.push(format!("CREATE TYPE {EXTERNAL}.text AS ENUM ('a')"));
+    let target_db = staging_target(&mut target, &setup).await;
+    let baseline = format!(
+        "{}CREATE TYPE {EXTERNAL}.text AS ENUM ('a');\nSET search_path = {EXTERNAL}, pg_catalog;\n",
+        plain_baseline("integer")
+    );
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &baseline,
+    )
+    .await;
+    target.drop().await;
+    assert_staged(result, "t", "a path that shadows text");
 }
 
 #[tokio::test]

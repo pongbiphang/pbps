@@ -2191,11 +2191,14 @@ target whose recreated `public` has none, the difference #688 removed.
   scratch superuser. The supplied one runs it on the checked connection,
   where every write goes, then `DISCARD ALL`, so its `SET`s do not reach
   the compile on that session. Both run it inside one `REPEATABLE READ`
-  transaction pbps opens and commits; a file that ends that transaction
-  itself (`COMMIT`, `ROLLBACK`) is refused, rolled back as far as it can be.
+  transaction pbps opens and commits.
 - **One script** (decided with the maintainer on #1769). The file is sent
-  whole, as one simple query, and the engine decides where each statement
-  ends. So it is one transaction: a statement that cannot run in a
+  whole, through a `DO` block's `EXECUTE`, and the engine decides where each
+  statement ends. `EXECUTE` refuses transaction control (`BEGIN`, `COMMIT`,
+  `ROLLBACK`) before it runs (measured on 16 and 18), so the file cannot
+  commit part of itself ahead of the checks after it; a simple query could,
+  and what it committed, a role included, would outlast the refusal. So it
+  is one transaction: a statement that cannot run in a
   transaction block (`CREATE INDEX CONCURRENTLY`, `VACUUM`) is refused by
   the engine, and a refused file leaves nothing. And it is read whole under
   the session's settings when it starts: a setting it changes, such as
@@ -2260,6 +2263,8 @@ a binding verdict and stays unresolved.
 - **Take an extension's version for its members.** A member the target
   altered in place, or one the baseline adds with `ALTER EXTENSION ... ADD`,
   leaves the version as it was (#1754's review, #1766).
+- **Detect afterwards that the file ended its transaction.** What it
+  committed before ending it is already in the cluster (#1754's review).
 - **Compare the shared state across separate transactions.** Other runs on
   a shared scratch cluster create and drop their own roles meanwhile, so it
   would refuse at random.
