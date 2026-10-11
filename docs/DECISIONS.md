@@ -647,3 +647,4 @@ other numbers before landing. Some records still mention them as proposals.
 | DEC-1720.1 | [connection](decisions/connection.md#dec-1720-1) | A target connection reaches one cluster for its whole life; a proxy that hands its transactions to different clusters is unsupported. |
 | DEC-1133.1 | [process](decisions/process.md#dec-1133-1) | Release qualification executes the hashed artifact in a native, source-free consumer. |
 | DEC-1767.1 | [diff](decisions/diff.md#dec-1767-1) | A connected PostgreSQL plan hoists the one later table rename that moves a carried name's holder away ahead of the move carrying an object onto it; a holder one hoist does not clear is still refused. |
+| DEC-1770.1 | [data/pre-delete](decisions/data/pre-delete.md#dec-1770-1) | Preflight removals retain the stored table name resolved through earlier renames at their own step, so later name reuse cannot move a removal onto another table. |

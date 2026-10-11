@@ -28,6 +28,9 @@ use pbps_pg::Postgres;
 #[path = "support/resolver.rs"]
 mod resolver_tests;
 
+#[path = "support/removal_names.rs"]
+mod removal_names_tests;
+
 #[path = "support/rename_order.rs"]
 mod rename_order_tests;
 

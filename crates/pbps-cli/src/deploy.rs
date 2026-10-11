@@ -828,8 +828,8 @@ pub(crate) fn refuse_permanent_referencers(
     // each is read back to the catalog's before it is compared: by uid where
     // the change has one, since a rename's destination can be a name the
     // plan drops first, and that drop names the table that leaves (#1612
-    // review). A key is dropped from a table that stays, under the name the
-    // rename leaves it.
+    // review). A key drop carries its execution address, which can precede
+    // its owner's rename (DECISIONS 496); resolve it during the walk below.
     let renamed: BTreeMap<&pbps_model::Uid, &TableName> = cs
         .changes
         .iter()
@@ -838,15 +838,7 @@ pub(crate) fn refuse_permanent_referencers(
             _ => None,
         })
         .collect();
-    let renamed_from: BTreeMap<&TableName, &TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::RenameTable { from, to, .. } => Some((to, from)),
-            _ => None,
-        })
-        .collect();
-    let now = |t: &TableName| (*renamed_from.get(t).unwrap_or(&t)).clone();
+    let mut renamed_from: BTreeMap<&TableName, &TableName> = BTreeMap::new();
     // Each removal with its place in the plan, and a whole table's with no
     // key. In a staged plan only one that runs before the partition's
     // `CREATE` counts: a staged apply commits between statements, and a
@@ -857,6 +849,9 @@ pub(crate) fn refuse_permanent_referencers(
     let mut removals: Vec<(usize, TableName, Option<&str>)> = Vec::new();
     for (at, p) in cs.changes.iter().enumerate() {
         match &p.change {
+            Change::RenameTable { from, to, .. } => {
+                renamed_from.insert(to, from);
+            }
             Change::DropTable { name, .. } => removals.push((at, name.clone(), None)),
             Change::SetTablePersistence {
                 uid,
@@ -870,7 +865,10 @@ pub(crate) fn refuse_permanent_referencers(
                 None,
             )),
             Change::DropForeignKey { table, name } => {
-                removals.push((at, now(table), Some(name.as_str())));
+                // Only earlier renames decide which stored table owns this
+                // removal; a later name handoff must not change it (DEC-1770.1).
+                let stored = (*renamed_from.get(table).unwrap_or(&table)).clone();
+                removals.push((at, stored, Some(name.as_str())));
             }
             _ => {}
         }
@@ -881,6 +879,7 @@ pub(crate) fn refuse_permanent_referencers(
             .any(|(j, t, k)| (!staged || *j < at) && t == table && k.is_none_or(|k| k == key))
     };
     let mut lines = Vec::new();
+    let now = |t: &TableName| (*renamed_from.get(t).unwrap_or(&t)).clone();
     for (at, p) in cs.changes.iter().enumerate() {
         let Some((partition, parent)) = unlogged_partition(&p.change) else {
             continue;
@@ -10965,6 +10964,40 @@ mod tests {
             &parent,
         )
         .expect("the referencing table dropped before its name is taken");
+        // A freeing FK drop may precede its owner's rename (DECISIONS 496).
+        // The old name's next holder must not receive that removal (#1770).
+        for (key_table, before_renames, allowed) in
+            [("r", true, true), ("r2", false, true), ("r", false, false)]
+        {
+            let drop_key = PlannedChange::new(Change::DropForeignKey {
+                table: TableName::new("ext", key_table),
+                name: "r_ev_fkey".into(),
+            });
+            let mut changes = vec![
+                PlannedChange::new(Change::RenameTable {
+                    uid: "t_bbbbbb".parse().unwrap(),
+                    from: TableName::new("ext", "r"),
+                    to: renamed.clone(),
+                    defaults: Vec::new(),
+                }),
+                PlannedChange::new(Change::RenameTable {
+                    uid: "t_cccccc".parse().unwrap(),
+                    from: TableName::new("ext", "other"),
+                    to: TableName::new("ext", "r"),
+                    defaults: Vec::new(),
+                }),
+            ];
+            changes.insert(if before_renames { 0 } else { 2 }, drop_key);
+            changes.push(partition(true));
+            for staged in [false, true] {
+                let result = refused_as(changes.clone(), &parent, staged);
+                assert_eq!(
+                    result.is_ok(),
+                    allowed,
+                    "drop on {key_table}, before renames: {before_renames}, staged: {staged}: {result:?}"
+                );
+            }
+        }
         // Negative: the newcomer made unlogged is not the referencer.
         let e = refused(
             vec![
