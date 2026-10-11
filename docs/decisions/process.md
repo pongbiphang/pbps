@@ -1205,3 +1205,34 @@ appears in the merge group, which ejects the pull request and rebuilds the
 groups queued behind it, instead of failing before enqueue. `live` and
 `live-pg` failures there mean the local gate missed something; `resolver` and
 `release-windows` failures are the ones no local check could have caught.
+
+<a id="dec-1836-1"></a>
+
+**DEC-1836.1. `master` runs CI nightly, not on push, and only `master` saves
+caches.** With the merge queue required, a push to `master` is the merge
+group's own commit: the five most recent `master` push runs before this change
+each had the head SHA of a merge group that had already passed. The push run
+re-tested that tree with every job after every merge, and it competed for the
+free plan's concurrent runners with the next merge group. Its one red run in
+ten days was a fault in the run on a tree its merge group had passed, and it
+still had to be read.
+
+It could not simply be removed. Every pull request and merge group restores
+its Rust caches from `refs/heads/master`, and the push run was what refreshed
+them. A nightly `schedule` run keeps that, because a scheduled run executes on
+the default branch. It also runs every job unconditionally, so a job that
+another rule narrows for a change still gets a backstop, and it catches drift
+in runner images and pinned engines on days nothing merges. Its tree is
+`master` at that hour, which may span several merges; a red one is read by
+the procedure AGENTS.md gives for an ejection.
+
+Caches are saved only where they can be restored: every `rust-cache` step
+carries `save-if: github.ref == 'refs/heads/master'`. A cache saved under a
+merge group's temporary `gh-readonly-queue/...` ref, or under a pull request's
+merge ref, can be restored only by a run on that same ref, which never comes.
+Those caches held about 2.7 GB of the repository's 10 GB budget and pushed out
+the `master` entries every run depends on. The `master` caches hold
+dependencies only, since workspace crates are not cached, so a nightly refresh
+goes stale only after a merge that changes `Cargo.lock` or the toolchain. Until
+the next night those runs restore the previous dependency cache and compile
+only what changed.
