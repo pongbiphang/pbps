@@ -1663,6 +1663,7 @@
         "non_schema_bound_functions_defer_missing_table_resolution",
         "null_predelete_tests::a_check_does_not_read_the_column_giving_up_its_name",
         "null_predelete_tests::a_known_null_decides_only_its_own_rows_foreign_key_tuple",
+        "null_predelete_tests::a_legacy_null_default_needs_no_catalog_assignment_type",
         "null_predelete_tests::a_null_default_moves_a_reference_off_the_deleted_parent",
         "null_predelete_tests::a_planned_foreign_key_counts_references_after_parent_deletion",
         "numeric_capacity_requires_approval_for_overflow_and_changed_values",

@@ -461,3 +461,88 @@ async fn a_planned_foreign_key_counts_references_after_parent_deletion() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_legacy_null_default_needs_no_catalog_assignment_type() {
+    let mut db = TestDb::create("null_clr1828").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.p (id int PRIMARY KEY, h hierarchyid UNIQUE);
+        INSERT dbo.p VALUES (1, hierarchyid::Parse('/1/'));
+        CREATE TABLE dbo.c (id int PRIMARY KEY, h hierarchyid NULL DEFAULT NULL,
+            CONSTRAINT fk_c FOREIGN KEY (h) REFERENCES dbo.p(h));
+        INSERT dbo.c VALUES (1, hierarchyid::Parse('/1/'));",
+        )
+        .await
+        .unwrap();
+    let mut observations = Vec::new();
+    for remaining in [false, true] {
+        if remaining {
+            db.conn
+                .execute("INSERT dbo.c VALUES (2, hierarchyid::Parse('/1/'));")
+                .await
+                .unwrap();
+        }
+        for legacy in [false, true] {
+            for clear in [false, true] {
+                let value = Cell::Value(Value::Text("/1/".into()));
+                let cs = changes(vec![
+                    Change::UpdateRow {
+                        table: TableName::new("dbo", "c"),
+                        key_column: "id".into(),
+                        key: "1".into(),
+                        columns: [(
+                            "h".into(),
+                            (
+                                value.clone(),
+                                if clear {
+                                    Cell::Default("NULL".into())
+                                } else {
+                                    value
+                                },
+                            ),
+                        )]
+                        .into(),
+                        unchanged: Default::default(),
+                        types: if legacy {
+                            Default::default()
+                        } else {
+                            [("h".into(), ty("hierarchyid"))].into()
+                        },
+                        after_types: Default::default(),
+                        key_type: None,
+                    },
+                    delete_parent(),
+                ]);
+                observations.push((
+                    remaining,
+                    legacy,
+                    clear,
+                    probe_counts(&mut db.conn, &cs).await,
+                    rolled_back(&mut db.conn, &cs).await,
+                ));
+            }
+        }
+    }
+    db.drop().await;
+    for (remaining, legacy, clear, counts, applied) in observations {
+        let expected = i32::from(!clear) + i32::from(remaining);
+        assert_eq!(
+            applied.is_ok(),
+            expected == 0,
+            "remaining={remaining}, legacy={legacy}, clear={clear}: {applied:?}"
+        );
+        let count = counts
+            .iter()
+            .find(|(description, _)| {
+                description.starts_with("rows in other tables that still reference")
+            })
+            .unwrap()
+            .1;
+        assert_eq!(
+            count, expected,
+            "remaining={remaining}, legacy={legacy}, clear={clear}: {counts:?}"
+        );
+    }
+}
