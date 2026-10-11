@@ -2248,9 +2248,11 @@ target whose recreated `public` has none, the difference #688 removed.
 **How it is compared.** Both sides are read with the capture's owned
 snapshot, so the identities are those the sealed manifest uses, and the
 comparison is a projection of the manifest's properties.
-- A root the capture has no identity for (a text search object, a large
-  object, a subscription, a default privilege) or a foreign table is
-  refused as uncompared.
+- A root the capture has no identity for (a conversion, a large object, a
+  subscription, a default privilege) or a foreign table is refused as
+  uncompared. Text search objects have identities since #1786: a parser,
+  template, dictionary or configuration by namespace and name, and a
+  configuration's mapping row by configuration, token type and order.
 - A root with a managed relation's or row type's name is refused as
   managed. A routine is not matched by name, since an unmanaged overload
   may share one; a baseline routine with a declared signature fails the
@@ -2271,8 +2273,8 @@ comparison is a projection of the manifest's properties.
   collation or operator family is named in its own right: the types its
   signature names do not hold it, so a routine over a compared type is not
   a part of the type. Each extension member is
-  compared on its own, with the roots' projection. A member the capture has no identity for (a text
-  search dictionary, as `unaccent` brings) refuses, naming it: a plan that
+  compared on its own, with the roots' projection. A member the capture has no identity for (a
+  foreign-data wrapper, as `postgres_fdw` brings) refuses, naming it: a plan that
   reads an extension seals all its members, and the capture refuses one it
   cannot read rather than leave it out. An operator family's operators and support
   routines are compared with it, by strategy and support number. A

@@ -54,6 +54,11 @@ pub(super) const CLASSES: &[&str] = &[
     "pg_parameter_acl",
     "pg_tablespace",
     "pg_inherits",
+    "pg_ts_parser",
+    "pg_ts_template",
+    "pg_ts_dict",
+    "pg_ts_config",
+    "pg_ts_config_map",
     "pg_depend",
 ];
 
@@ -205,6 +210,8 @@ pub(super) fn field(class: &str, name: &str, kind: &str) -> Result<Field> {
                 | ("pg_extension", "extowner")
                 | ("pg_opclass", "opcowner")
                 | ("pg_opfamily", "opfowner")
+                | ("pg_ts_dict", "dictowner")
+                | ("pg_ts_config", "cfgowner")
                 | ("pg_tablespace", "spcowner")
                 | ("pg_database", "datdba")
         )
@@ -228,7 +235,11 @@ pub(super) fn field(class: &str, name: &str, kind: &str) -> Result<Field> {
         | ("pg_extension", "extnamespace")
         | ("pg_constraint", "connamespace")
         | ("pg_opclass", "opcnamespace")
-        | ("pg_opfamily", "opfnamespace") => Some("pg_namespace"),
+        | ("pg_opfamily", "opfnamespace")
+        | ("pg_ts_parser", "prsnamespace")
+        | ("pg_ts_template", "tmplnamespace")
+        | ("pg_ts_dict", "dictnamespace")
+        | ("pg_ts_config", "cfgnamespace") => Some("pg_namespace"),
         ("pg_class", "reltype" | "reloftype")
         | ("pg_attribute", "atttypid")
         | ("pg_type", "typelem" | "typarray" | "typbasetype")
@@ -271,6 +282,8 @@ pub(super) fn field(class: &str, name: &str, kind: &str) -> Result<Field> {
         )
         | ("pg_am", "amhandler")
         | ("pg_amproc", "amproc")
+        | ("pg_ts_parser", "prsstart" | "prstoken" | "prsend" | "prsheadline" | "prslextype")
+        | ("pg_ts_template", "tmplinit" | "tmpllexize")
         | ("pg_trigger", "tgfoid") => Some("pg_proc"),
         ("pg_operator", "oprcom" | "oprnegate")
         | ("pg_aggregate", "aggsortop")
@@ -287,6 +300,10 @@ pub(super) fn field(class: &str, name: &str, kind: &str) -> Result<Field> {
         | ("pg_amproc", "amprocfamily")
         | ("pg_opclass", "opcfamily") => Some("pg_opfamily"),
         ("pg_range", "rngsubopc") => Some("pg_opclass"),
+        ("pg_ts_dict", "dicttemplate") => Some("pg_ts_template"),
+        ("pg_ts_config", "cfgparser") => Some("pg_ts_parser"),
+        ("pg_ts_config_map", "mapcfg") => Some("pg_ts_config"),
+        ("pg_ts_config_map", "mapdict") => Some("pg_ts_dict"),
         ("pg_constraint", "conparentid") | ("pg_trigger", "tgconstraint") => Some("pg_constraint"),
         ("pg_trigger", "tgparentid") => Some("pg_trigger"),
         ("pg_db_role_setting", "setdatabase") => Some("pg_database"),

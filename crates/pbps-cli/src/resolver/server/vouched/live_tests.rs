@@ -1911,13 +1911,14 @@ async fn vouched_refuses_a_baseline_object_left_uncompared() {
     let scratch = Fixture::new(SCRATCH_SERVER);
     let mut setup = guarded_target();
     setup.push(format!(
-        "CREATE TEXT SEARCH CONFIGURATION {EXTERNAL}.words (COPY = pg_catalog.english)"
+        "CREATE CONVERSION {EXTERNAL}.words FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8"
     ));
     let target_db = staging_target(&mut target, &setup).await;
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
     let baseline = format!(
-        "{}CREATE TEXT SEARCH CONFIGURATION {EXTERNAL}.words (COPY = pg_catalog.english);",
+        "{}CREATE CONVERSION {EXTERNAL}.words FOR 'LATIN1' TO 'UTF8' \
+         FROM pg_catalog.iso8859_1_to_utf8;",
         plain_baseline("integer")
     );
     let refused = baseline_refusal(
@@ -1933,7 +1934,7 @@ async fn vouched_refuses_a_baseline_object_left_uncompared() {
     target.drop().await;
     assert!(
         refused.contains(&format!(
-            "the baseline created text search configuration {EXTERNAL}.words, which the \
+            "the baseline created conversion {EXTERNAL}.words, which the \
              comparison with the target does not cover"
         )),
         "{refused}"
@@ -2331,9 +2332,45 @@ async fn vouched_compares_each_extension_member_with_the_target() {
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_refuses_an_extension_with_a_member_no_capture_identifies() {
-    // `unaccent` brings a text search dictionary and template, classes the
-    // capture has no identity for. Sealing a plan that reads the extension
-    // would need them, so the comparison names them first.
+    // `postgres_fdw` brings a foreign-data wrapper, a class the capture has
+    // no identity for. Sealing a plan that reads the extension would need
+    // it, so the comparison names it first.
+    let call = format!("SELECT {EXTERNAL}.postgres_fdw_disconnect_all() AS r");
+    let baseline =
+        format!("CREATE SCHEMA {EXTERNAL};\nCREATE EXTENSION postgres_fdw SCHEMA {EXTERNAL};");
+    let setup = vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!("CREATE EXTENSION postgres_fdw SCHEMA {EXTERNAL}"),
+        format!("CREATE VIEW {MANAGED}.a AS {call}"),
+    ];
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let inputs = staging_inputs(&call, &call, &[]);
+    let key = ProjectKey::new(true);
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &baseline,
+    )
+    .await;
+    target.drop().await;
+    let refused = baseline_refusal(result);
+    assert!(
+        refused.contains("foreign-data wrapper postgres_fdw")
+            && refused.contains("no plan can seal its extension"),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_stages_an_extension_that_brings_text_search_objects() {
+    // `unaccent` brings a text search dictionary and template, which the
+    // capture identifies and the comparison reads like any member (#1786).
     let call = format!("SELECT {EXTERNAL}.unaccent('pbps') AS r");
     let baseline =
         format!("CREATE SCHEMA {EXTERNAL};\nCREATE EXTENSION unaccent SCHEMA {EXTERNAL};");
@@ -2357,12 +2394,60 @@ async fn vouched_refuses_an_extension_with_a_member_no_capture_identifies() {
     )
     .await;
     target.drop().await;
-    let refused = baseline_refusal(result);
-    assert!(
-        refused.contains(&format!("text search dictionary {EXTERNAL}.unaccent"))
-            && refused.contains("no plan can seal its extension"),
-        "{refused}"
-    );
+    let plan = result.unwrap_or_else(|error| panic!("unaccent: {error}"));
+    plan.evidence.validate(&plan.changes).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_compares_a_text_search_dictionary_with_the_target() {
+    // A dictionary's options are its shape; one that differs refuses,
+    // naming it, and one that matches stages (#1786).
+    // With a configuration mapped to it, whose mapping rows are its parts.
+    let dictionary = |options: &str| {
+        format!(
+            "CREATE TEXT SEARCH DICTIONARY {EXTERNAL}.words \
+             (TEMPLATE = pg_catalog.simple{options}); \
+             CREATE TEXT SEARCH CONFIGURATION {EXTERNAL}.cfg (PARSER = pg_catalog.\"default\"); \
+             ALTER TEXT SEARCH CONFIGURATION {EXTERNAL}.cfg \
+             ADD MAPPING FOR asciiword WITH {EXTERNAL}.words"
+        )
+    };
+    let call = format!("SELECT {EXTERNAL}.t.id FROM {EXTERNAL}.t");
+    for staged_options in [", STOPWORDS = english", ""] {
+        let mut setup = guarded_target();
+        setup.push(dictionary(", STOPWORDS = english"));
+        let mut target = Fixture::new("PBPS_TEST_PG_DB");
+        let scratch = Fixture::new(SCRATCH_SERVER);
+        let target_db = staging_target(&mut target, &setup).await;
+        let inputs = staging_inputs(&reading("id", "t"), &call, &[]);
+        let key = ProjectKey::new(true);
+        let baseline = format!(
+            "{}{};\n",
+            plain_baseline("integer"),
+            dictionary(staged_options)
+        );
+        let result = produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &baseline,
+        )
+        .await;
+        target.drop().await;
+        if staged_options.is_empty() {
+            let refused = baseline_refusal(result);
+            assert!(
+                refused.contains(&format!("text search dictionary {EXTERNAL}.words"))
+                    && refused.contains("dictinitoption"),
+                "{refused}"
+            );
+        } else {
+            // Negative: the same dictionary stages.
+            assert_staged(result, "t", "an identical dictionary");
+        }
+    }
 }
 
 #[tokio::test]

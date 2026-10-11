@@ -320,6 +320,7 @@ impl Builder<'_> {
             ],
             "pg_proc" => &[("pg_aggregate", "aggfnoid")],
             "pg_opfamily" => &[("pg_amop", "amopfamily"), ("pg_amproc", "amprocfamily")],
+            "pg_ts_config" => &[("pg_ts_config_map", "mapcfg")],
             _ => &[],
         };
         for &(child, field) in children {

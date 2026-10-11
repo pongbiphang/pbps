@@ -1783,7 +1783,9 @@ scratch compile (#1616).
     question is answered. A mismatch, an object the target does not have,
     or a baseline object in the managed set refuses, and the finding names
     the object. So does an object the comparison cannot read, such as a
-    text search configuration or a foreign table.
+    conversion or a foreign table. Text search parsers, templates,
+    dictionaries and configurations, with a configuration's mapping, are
+    read like any other object (#1786).
   - An extension's members are each compared like an object it creates:
     an extension's version says nothing of a member altered in place, or
     one the baseline adds to an extension (#1783). A member the comparison

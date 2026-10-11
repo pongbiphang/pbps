@@ -199,6 +199,18 @@ impl Catalog {
                     .push(self.object("pg_am", number(row, method)?)?);
                 id
             }
+            "pg_ts_parser" => self.named(class, row, "prsname", Some("prsnamespace"))?,
+            "pg_ts_template" => self.named(class, row, "tmplname", Some("tmplnamespace"))?,
+            "pg_ts_dict" => self.named(class, row, "dictname", Some("dictnamespace"))?,
+            "pg_ts_config" => self.named(class, row, "cfgname", Some("cfgnamespace"))?,
+            // A configuration's mapping: which dictionaries, in order, serve
+            // each token type.
+            "pg_ts_config_map" => self.related(
+                class,
+                row,
+                &[("mapcfg", "pg_ts_config")],
+                &["maptokentype", "mapseqno"],
+            )?,
             "pg_cast" => self.related(
                 class,
                 row,

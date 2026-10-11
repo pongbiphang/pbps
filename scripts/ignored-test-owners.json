@@ -2211,6 +2211,8 @@
         "resolver::server::vouched::live_tests::vouched_stages_a_cast_and_an_operator_over_external_types_in_the_baseline",
         "resolver::server::vouched::live_tests::vouched_compares_each_extension_member_with_the_target",
         "resolver::server::vouched::live_tests::vouched_refuses_an_extension_with_a_member_no_capture_identifies",
+        "resolver::server::vouched::live_tests::vouched_stages_an_extension_that_brings_text_search_objects",
+        "resolver::server::vouched::live_tests::vouched_compares_a_text_search_dictionary_with_the_target",
         "resolver::server::vouched::live_tests::vouched_compares_an_operator_familys_members_with_the_target",
         "resolver::server::vouched::live_tests::vouched_takes_a_routine_over_a_staged_type_as_no_part_of_it",
         "resolver::server::vouched::live_tests::vouched_compares_a_sequence_its_table_owns",
