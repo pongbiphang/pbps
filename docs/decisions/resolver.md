@@ -2330,3 +2330,68 @@ a binding verdict and stays unresolved.
 Recorded in SPEC §9.3.2 and ADR-0016's amendment. Pinned by the
 `vouched_` baseline live tests in `resolver::server::vouched`, and by the
 tests in `resolver::baseline` and `resolver::capture::staged`.
+
+<a id="dec-1674-1"></a>
+
+**DEC-1674.1. A Docker entry is the operator-vouched resolver on a
+container pbps starts for the run; either kind's baseline may be allowed to
+write outside the scratch database (#1674).** A `kind: docker` entry ran the
+frozen measured profile `linux-amd64-v1`, and #1636 cannot remove the
+measured profiles while it does.
+
+- **What the container is.** A PostgreSQL server started from the entry's
+  `image` through the runner's own `docker` command, which may be Docker,
+  rootless Docker or Podman. Its port is published on loopback only and
+  its superuser password is generated, so the run is DEC-1672.1's
+  run-owned layout. Every check a server entry gets still runs: the
+  container is a separate cluster by construction, but a check skipped
+  because it "cannot fail" is one nobody re-reads when that stops being
+  true.
+- **The operator vouches for the image and the runtime**, as for a server
+  (DEC-1528.1): containment, isolation, log handling, channels. The
+  evidence records the image reference as configured and claims no
+  digest. A digest pbps read from the runtime would be one more unverified
+  claim, and pinning or verifying images is outside this entry.
+- **The target is bound for a Docker entry too** (DEC-1685.1). The measured
+  profile bound it by process observation, so the planning read recorded
+  no `system_identifier` for a Docker entry; now it does, and the run
+  checks it before starting anything.
+- **The container is removed whatever the outcome.** `kill`, then
+  `rm --force`, then a read that confirms it gone; a removal that cannot be
+  confirmed fails the run naming the container, as any unconfirmed cleanup
+  does. `kill` first, because `rm --force` waits out the runtime's stop
+  grace, measured at ten seconds under Podman. A run that ends otherwise,
+  by a panic or a cancelled future, still removes it from a drop guard,
+  best effort.
+- **`outside_writes: refuse | allow`, on both kinds.** `refuse`, the
+  default, is DEC-1673.1's rule. `allow` skips the before-and-after
+  comparison of the shared state, and keeps what the baseline wrote there:
+  a Docker scratch drops it with its container, and on a server scratch it
+  is the operator's to clean up. The choice is the user's and is sealed
+  into the evidence, which `explain` shows. A role the target lacks is
+  then not caught here; #1516's target-side checks catch it.
+- **Docker is the documented default.** The documentation and the example
+  configuration lead with a Docker entry; a server entry is for a managed
+  target no community image matches, a CI without a container runtime, or
+  an engine with no Linux image. `kind` stays required.
+
+**Why not the alternatives.**
+- **Keep the measured profile for Docker.** It brings admission,
+  containment and observation the one resolver does not claim, and blocks
+  #1636.
+- **Let the kind decide the outside-write check**, off for Docker because
+  the container goes away. The kind says where the scratch is, not whether
+  the user meant the baseline to create a role; a missing role would then
+  show only on one kind. The switch says it, for both.
+- **Clean up a server scratch's outside writes.** pbps cannot tell a role
+  the baseline created from one another run created meanwhile on a shared
+  cluster without the comparison `allow` skips.
+- **Derive the image from the target's version, and pull by default.**
+  Left for after this issue: the image is the operator's to vouch for, and
+  a guessed one is a claim nobody made.
+
+Recorded in SPEC §9.3.2. Pinned by the `vouched_docker_` live tests and
+`vouched_baseline_outside_writes_allow_keeps_a_created_role` in
+`resolver::server::vouched`, and by
+`either_kind_takes_a_baseline_and_an_outside_write_choice` in
+`pbps-config`.

@@ -259,7 +259,10 @@ and [delivery tracking](RESOLVER-DELIVERY.md).
 operator-vouched resolver for managed declarations (#1672, DEC-1672.1); its
 answer is still refused as `resolver.publication-unavailable` until #1516.
 A server entry's `baseline` stages external objects, compared with the
-target (#1673, DEC-1673.1). The vouched Docker scratch (#1674) follows.
+target (#1673, DEC-1673.1). A Docker entry is the same resolver on a
+container pbps starts from the entry's image and removes after the run, and
+either kind's baseline may be allowed to write outside the scratch database
+(#1674, DEC-1674.1).
 Selecting a resolver will give the operator-vouched resolver. It keeps two
 separation checks plus the shared compatibility qualification, and stages
 external objects from a reviewed baseline compared with the target. The
