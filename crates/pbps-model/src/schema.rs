@@ -503,6 +503,14 @@ pub struct Table {
 pub struct PartitionBy {
     /// The key's columns, in order.
     pub columns: Vec<String>,
+    /// Its partitions are another tool's to create and drop: pg_partman, a
+    /// scheduled job (#1533, DEC-1533.1). pbps manages the parent alone,
+    /// declares no partition, and holds each it finds only as the parent
+    /// makes it. Declared as `partitions: external`; the catalog cannot say
+    /// it, so a live read leaves it `false` and the managed scope sets it
+    /// from what is compared against.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub external: bool,
 }
 
 /// A partition's parent and the rows it takes (#1170).

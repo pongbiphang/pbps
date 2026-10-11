@@ -1052,6 +1052,7 @@ async fn temporal_modifiers_keep_the_engine_bounds_and_do_not_shorten_the_calend
             to: to.clone(),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         };
@@ -7482,6 +7483,7 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
                 to: ty("integer"),
                 from_nullable: false,
                 to_nullable: false,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             },
@@ -7501,6 +7503,7 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
                 to: ty("varchar(20)"),
                 from_nullable: false,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             },
@@ -8717,6 +8720,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
                 to: ty("timestamptz"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             },
@@ -8767,6 +8771,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
                     to: ty("time"),
                     from_nullable: true,
                     to_nullable: true,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 },
@@ -8788,6 +8793,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
                 to: ty("timetz"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             },
@@ -8967,6 +8973,7 @@ async fn a_conversion_to_text_renders_under_the_framings_settings_and_not_the_op
         to: ty("text"),
         from_nullable: true,
         to_nullable: true,
+        through_external_partitions: false,
         from_collation: None,
         to_collation: None,
     };
@@ -20073,6 +20080,7 @@ fn narrowing_projection_change(column: &str, from: &str, to: &str) -> pbps_model
         to: ty(to),
         from_nullable: true,
         to_nullable: true,
+        through_external_partitions: false,
         from_collation: None,
         to_collation: None,
     }
@@ -24234,6 +24242,7 @@ async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_colu
                     to: ty("varchar(20)"),
                     from_nullable: true,
                     to_nullable: true,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 }),
@@ -26370,6 +26379,7 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
             column: table.column("email"),
             ty: ty("text"),
             to_nullable: false,
+            through_external_partitions: false,
             collation: None,
         },
         Change::AddCheck {
@@ -26406,6 +26416,7 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
             to: ty("varchar(5)"),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         },
@@ -26713,6 +26724,7 @@ async fn integer_narrowing_conversion_probes_match_both_engine_boundaries() {
                 to: ty(to),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             })],
@@ -26804,6 +26816,7 @@ async fn a_value_a_cast_would_truncate_is_one_the_alter_refuses() {
         to: ty(to),
         from_nullable: true,
         to_nullable: true,
+        through_external_partitions: false,
         from_collation: None,
         to_collation: None,
     };
@@ -28339,6 +28352,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
             to: ty(dst),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         };
@@ -28412,6 +28426,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
         to: ty("timestamptz"),
         from_nullable: true,
         to_nullable: true,
+        through_external_partitions: false,
         from_collation: None,
         to_collation: None,
     };
@@ -28612,6 +28627,7 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
             to: ty(dst),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         };
@@ -28665,6 +28681,7 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
             to: ty(to),
             from_nullable: false,
             to_nullable: false,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         };
@@ -28722,6 +28739,7 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
         column: column.column("v"),
         ty: ty("integer"),
         to_nullable: false,
+        through_external_partitions: false,
         collation: None,
     };
     let widen = Change::AlterColumnType {
@@ -28731,6 +28749,7 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
         to: ty("varchar(20)"),
         from_nullable: true,
         to_nullable: true,
+        through_external_partitions: false,
         from_collation: None,
         to_collation: None,
     };
@@ -28742,6 +28761,7 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
         to: ty("varchar(20)"),
         from_nullable: true,
         to_nullable: false,
+        through_external_partitions: false,
         from_collation: None,
         to_collation: None,
     };
@@ -28855,6 +28875,7 @@ async fn a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unk
             column: table.column(column),
             ty: ty("integer"),
             to_nullable,
+            through_external_partitions: false,
             collation: None,
         };
         let mut ours =
@@ -28944,6 +28965,7 @@ async fn nullability_folded_into_widening_keeps_unparsed_check_uncertainty() {
         to: ty("varchar(20)"),
         from_nullable: true,
         to_nullable: false,
+        through_external_partitions: false,
         from_collation: None,
         to_collation: None,
     };
@@ -29189,6 +29211,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                 to: ty("bigint"),
                 from_nullable: false,
                 to_nullable: false,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             },
@@ -29326,6 +29349,7 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
         to: ty("bigint"),
         from_nullable: true,
         to_nullable: true,
+        through_external_partitions: false,
         from_collation: None,
         to_collation: None,
     };
@@ -29423,6 +29447,7 @@ async fn index_expressions_and_predicates_keep_unmeasured_costs_unknown() {
                 to: ty("bigint"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             };
@@ -29659,6 +29684,7 @@ async fn a_length_probe_is_measured_in_the_session_the_statement_will_run_in() {
             to: ty(to),
             from_nullable: false,
             to_nullable: false,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         })
@@ -29767,6 +29793,7 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
                 to: ty("bigint"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             }),
@@ -29775,6 +29802,7 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
                 column: new.column("required"),
                 ty: ty("integer"),
                 to_nullable: false,
+                through_external_partitions: false,
                 collation: None,
             }),
             PlannedChange::new(Change::AlterColumnType {
@@ -29784,6 +29812,7 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
                 to: ty("bigint"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             }),
@@ -29978,6 +30007,7 @@ async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists
                 to: ty("bigint"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             }),
@@ -30047,6 +30077,7 @@ async fn a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_pl
         to: ty("numeric(10,0)"),
         from_nullable: true,
         to_nullable: true,
+        through_external_partitions: false,
         from_collation: None,
         to_collation: None,
     };
@@ -30152,6 +30183,7 @@ async fn a_date_the_engine_carries_across_is_not_counted_out_of_range() {
                 to: ty("timestamp without time zone"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             })],
@@ -30245,6 +30277,7 @@ async fn a_float_on_the_boundary_is_judged_as_the_engine_judges_it() {
                 to: ty(to),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             })],
@@ -30525,6 +30558,7 @@ async fn a_length_probe_agrees_with_the_engine_for_every_rendering_the_pins_deci
                     to: ty(&to),
                     from_nullable: true,
                     to_nullable: true,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 })],
@@ -32580,7 +32614,12 @@ async fn doctor_adopted_acl_scope_matches_the_differ_and_keeps_recorded_targets(
         pbps_model::Uid::generate(pbps_model::UidKind::Role),
         recipient.clone(),
     );
-    let scoped = pbps_diff::scope(&pulled.schema, &ids, &grants.managed_modules);
+    let scoped = pbps_diff::scope(
+        &pulled.schema,
+        &ids,
+        &grants.managed_modules,
+        &Default::default(),
+    );
     let scoped_targets: Vec<_> = scoped.schema.roles[&recipient]
         .grants
         .keys()

@@ -314,6 +314,7 @@ mod tests {
             to: ty.parse().unwrap(),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: Some(pbps_model::Collation::new(
                 "Latin1_General_100_CI_AS_SC_UTF8",

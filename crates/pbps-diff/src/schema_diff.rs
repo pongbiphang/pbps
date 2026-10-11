@@ -838,6 +838,7 @@ fn diff_partial_rebuilding(
     }
 
     split_tightenings_from_retypes(&mut changes);
+    clear_external_partitions_after_loosening(declared.schema, &mut changes);
     recreate_retyped_dependents(base, declared, &renames, dialect, &mut changes);
     recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
     rebind_foreign_keys_to_a_new_occupant(base, declared, &mut changes);
@@ -1794,6 +1795,7 @@ fn diff_columns(
                 to: to_ty.clone(),
                 from_nullable: base_col.nullable,
                 to_nullable: col.nullable || tightened_after,
+                through_external_partitions: false,
                 from_collation: base_col.collation.clone(),
                 to_collation: col.collation.clone(),
             });
@@ -1803,6 +1805,7 @@ fn diff_columns(
                     column: declared_ref.clone(),
                     ty: to_ty,
                     to_nullable: false,
+                    through_external_partitions: false,
                     collation: col.collation.clone(),
                 });
             }
@@ -1812,6 +1815,7 @@ fn diff_columns(
                 column: declared_ref.clone(),
                 ty: to_ty,
                 to_nullable: col.nullable,
+                through_external_partitions: false,
                 collation: col.collation.clone(),
             });
         }
@@ -2130,6 +2134,39 @@ fn row_table(change: &Change) -> Option<&TableName> {
 /// fills or removes its NULLs (#1367). The same split DEC-1168.1 makes for a
 /// recomputed column, for the same reason: the check has to meet the values
 /// the plan leaves, not the ones it found.
+/// A NOT NULL a parent with external partitions drops (#1533) reaches every
+/// partition, but on 18 one a partition set of its own outlives it
+/// (DEC-1687.1). A declared partition is brought back by its own change after
+/// the parent's; an external one is listed nowhere, so the parent's change
+/// carries the clearing itself (DEC-1533.1, #1833 review).
+fn clear_external_partitions_after_loosening(declared: &Schema, changes: &mut [Change]) {
+    let external = |table: &TableName| {
+        declared
+            .tables
+            .get(table)
+            .and_then(|t| t.partition_by.as_ref())
+            .is_some_and(|by| by.external)
+    };
+    for change in changes {
+        if let Change::AlterColumnNullability {
+            column,
+            to_nullable: true,
+            through_external_partitions,
+            ..
+        }
+        | Change::AlterColumnType {
+            column,
+            from_nullable: false,
+            to_nullable: true,
+            through_external_partitions,
+            ..
+        } = change
+        {
+            *through_external_partitions = external(&column.table);
+        }
+    }
+}
+
 fn split_tightenings_from_retypes(changes: &mut Vec<Change>) {
     let rows = tables_with_row_changes(changes);
     let mut split = Vec::new();
@@ -2152,6 +2189,7 @@ fn split_tightenings_from_retypes(changes: &mut Vec<Change>) {
                 column: column.clone(),
                 ty: to.clone(),
                 to_nullable: false,
+                through_external_partitions: false,
                 collation: to_collation.clone(),
             });
         }
@@ -3318,9 +3356,58 @@ fn refuse_partition_changes(
             };
             // A key column renamed is the same key: the engine renames it in
             // the key as it does in the table (measured on 16 and 18, #1687).
+            // Another tool's partitions on one side and pbps's on the other
+            // (#1533). No statement makes the switch, and a plan records only
+            // what its changes do, so the setting is recorded as an adoption
+            // is (#1170): by a baseline once the declarations say so. A
+            // partition pbps holds is dropped or detached first, since
+            // handing it over would leave the declarations nothing to say
+            // about it.
+            let external = |t: &Table| t.partition_by.as_ref().map(|by| by.external);
+            if let (Some(was), Some(is)) = (external(b), external(d))
+                && was != is
+            {
+                let held: Vec<String> = base
+                    .schema
+                    .tables
+                    .iter()
+                    .filter(|(_, t)| {
+                        t.partition_of
+                            .as_ref()
+                            .is_some_and(|of| &of.parent == base_name)
+                    })
+                    .map(|(n, _)| n.to_string())
+                    .collect();
+                if !is {
+                    refuse(
+                        declared_name,
+                        "declare its external partitions; adopt them as partitions made by hand \
+                         are, with `pbps pull` and `pbps baseline --reason …`"
+                            .to_owned(),
+                    );
+                } else if !held.is_empty() {
+                    refuse(
+                        declared_name,
+                        format!(
+                            "make its partitions external while pbps holds {}; drop or detach \
+                             them in a plan of their own first",
+                            held.join(", ")
+                        ),
+                    );
+                } else {
+                    refuse(
+                        declared_name,
+                        "make its partitions external, which no statement does; record it with \
+                         `pbps baseline --reason …` once the declarations say so"
+                            .to_owned(),
+                    );
+                }
+                continue;
+            }
             let renamed = |by: &pbps_model::PartitionBy| {
                 let names = renamed_columns(base.ids, base_name, declared.ids, declared_name);
                 pbps_model::PartitionBy {
+                    external: by.external,
                     columns: by
                         .columns
                         .iter()
@@ -6801,6 +6888,7 @@ mod tests {
                 ("n", Column::new(ty("int"))),
             ]);
             parent.partition_by = Some(PartitionBy {
+                external: false,
                 columns: vec!["ts".into()],
             });
             for (name, ix) in parent_indexes {
@@ -7124,6 +7212,120 @@ mod tests {
             );
         }
     }
+    /// #1533: a parent whose partitions are external is changed as any
+    /// standing parent is. Switching it between declared and external
+    /// partitions is never a plan, which records only what its changes do:
+    /// the switch is refused with the way to make it. Negatives: a switch to
+    /// external with no partition held, one while pbps holds a partition,
+    /// and the reverse. A held partition under an external parent never reaches
+    /// the differ: `scope` refuses it.
+    #[test]
+    fn a_parent_with_external_partitions_hands_nothing_over() {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+        let ev: TableName = "app.ev".parse().unwrap();
+        let tree = |external: bool, extra: bool, partitions: &[&str]| {
+            let mut s = Schema::default();
+            let mut columns = vec![
+                ("id", Column::new(ty("int")).not_null()),
+                ("ts", Column::new(ty("date")).not_null()),
+            ];
+            if extra {
+                columns.push(("n", Column::new(ty("int"))));
+            }
+            let mut parent = table(&columns);
+            parent.partition_by = Some(PartitionBy {
+                external,
+                columns: vec!["ts".into()],
+            });
+            s.tables.insert(ev.clone(), parent);
+            for name in partitions {
+                s.tables.insert(
+                    name.parse().unwrap(),
+                    Table {
+                        partition_of: Some(PartitionOf {
+                            parent: ev.clone(),
+                            bound: PartitionBound::Default,
+                            columns: Default::default(),
+                        }),
+                        ..Default::default()
+                    },
+                );
+            }
+            s
+        };
+        let outcome = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .map(|cs| kinds(&cs))
+            .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        // A column on an external parent: its own change.
+        assert_eq!(
+            outcome(&tree(true, false, &[]), &tree(true, true, &[]), &[]).unwrap(),
+            ["AddColumn"]
+        );
+        // Negative: a parent pbps holds no partition of becomes external by a
+        // baseline, which records it, not by a plan, which would not.
+        let errors =
+            outcome(&tree(false, false, &[]), &tree(true, false, &[]), &[]).expect_err("refused");
+        assert!(
+            errors.iter().any(|e| e.contains(
+                "make its partitions external, which no statement does; record it with `pbps \
+                 baseline --reason …`"
+            )),
+            "{errors:?}"
+        );
+        let drop = Intent::DropTable {
+            table: "app.ev_d".parse().unwrap(),
+            reason: "handed over".parse().unwrap(),
+        };
+        // Negative: external while pbps holds a partition, dropped with intent,
+        // said once, not again for the drop.
+        let errors = outcome(
+            &tree(false, false, &["app.ev_d"]),
+            &tree(true, false, &[]),
+            std::slice::from_ref(&drop),
+        )
+        .expect_err("refused");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(
+            errors[0]
+                .matches("make its partitions external while pbps holds app.ev_d")
+                .count(),
+            1,
+            "{errors:?}"
+        );
+        // Negative: external partitions declared by a plan.
+        let errors = outcome(
+            &tree(true, false, &[]),
+            &tree(false, false, &["app.ev_d"]),
+            &[],
+        )
+        .expect_err("refused");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("declare its external partitions")),
+            "{errors:?}"
+        );
+    }
+
     /// #1690: a standing parent's rename is planned, a plain `RENAME` its
     /// partitions follow, so their `partition_of.parent` naming the new name
     /// is no change of their partitioning, and the parent's own changes in
@@ -7142,6 +7344,7 @@ mod tests {
                 ("ts", Column::new(ty("date")).not_null()),
             ]);
             parent.partition_by = Some(PartitionBy {
+                external: false,
                 columns: vec!["ts".into()],
             });
             s.tables.insert(parent_name.clone(), parent);
@@ -7330,6 +7533,7 @@ mod tests {
                 ("r", Column::new(ty("int"))),
             ]);
             parent.partition_by = Some(PartitionBy {
+                external: false,
                 columns: vec!["ts".into()],
             });
             let mut partition = Table {
@@ -7534,6 +7738,7 @@ mod tests {
                 ("m", Column::new(ty("int"))),
             ]);
             t.partition_by = Some(PartitionBy {
+                external: false,
                 columns: vec!["ts".into()],
             });
             t
@@ -7700,6 +7905,7 @@ mod tests {
                         })
                         .collect();
                     p.partition_by = Some(PartitionBy {
+                        external: false,
                         columns: vec!["at".into()],
                     });
                 },
@@ -7817,6 +8023,7 @@ mod tests {
             &keep_b,
         );
         no_key.tables.get_mut(&ev).unwrap().partition_by = Some(PartitionBy {
+            external: false,
             columns: vec!["ts".into()],
         });
         let e = refused(&no_key, &drop_ts);
@@ -8019,6 +8226,7 @@ mod tests {
                     .map(|(c, col)| (if c == "ts" { "spare".to_owned() } else { c }, col))
                     .collect();
                 p.partition_by = Some(PartitionBy {
+                    external: false,
                     columns: vec!["spare".into()],
                 });
             },
@@ -8063,6 +8271,7 @@ mod tests {
                 p.columns.insert("spare".into(), Column::new(ty("int")));
                 rename(p, "ts", "k");
                 p.partition_by = Some(PartitionBy {
+                    external: false,
                     columns: vec!["k".into()],
                 });
             },
@@ -8076,6 +8285,7 @@ mod tests {
                 rename(p, "spare", "ts");
                 p.columns.get_mut("ts").unwrap().ty = ty("bigint");
                 p.partition_by = Some(PartitionBy {
+                    external: false,
                     columns: vec!["k".into()],
                 });
             },
@@ -8290,6 +8500,7 @@ mod tests {
             ("ts", Column::new(ty("date")).not_null()),
         ]);
         parent.partition_by = Some(PartitionBy {
+            external: false,
             columns: vec!["ts".into()],
         });
         let partition = |bound: PartitionBound| Table {
@@ -8488,6 +8699,7 @@ mod tests {
         use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionOf};
         let mut parent = table(&[("ts", Column::new(ty("date")).not_null())]);
         parent.partition_by = Some(PartitionBy {
+            external: false,
             columns: vec!["ts".into()],
         });
         let partition = |bound: PartitionBound| Table {
@@ -8586,6 +8798,7 @@ mod tests {
             ("ts", Column::new(ty("date")).not_null()),
         ]);
         parent.partition_by = Some(PartitionBy {
+            external: false,
             columns: vec!["ts".into()],
         });
         let partition = |bound: PartitionBound| Table {
@@ -8708,6 +8921,7 @@ mod tests {
             ("v", Column::new(ty("int"))),
         ]);
         parent.partition_by = Some(PartitionBy {
+            external: false,
             columns: vec!["ts".into()],
         });
         let partition = |bound: PartitionBound, not_null: bool| Table {
@@ -8892,6 +9106,7 @@ mod tests {
         };
         parent.unique.insert("ev_u".into(), unique(None));
         parent.partition_by = Some(PartitionBy {
+            external: false,
             columns: vec!["ts".into()],
         });
         let range = |from: &str, to: &str| PartitionBound::Range {
@@ -9276,6 +9491,7 @@ mod tests {
                 .get_mut(&"app.r".parse::<TableName>().unwrap())
                 .unwrap()
                 .partition_by = Some(PartitionBy {
+                external: false,
                 columns: vec!["id".into()],
             });
             schema
@@ -9816,6 +10032,7 @@ mod tests {
             },
         );
         parent.partition_by = Some(PartitionBy {
+            external: false,
             columns: vec!["ts".into()],
         });
         let mut tree = schema_of("app.ev", parent.clone());
@@ -10126,6 +10343,7 @@ mod tests {
             ("n", Column::new(ty("int"))),
         ]);
         parent.partition_by = Some(PartitionBy {
+            external: false,
             columns: vec!["ts".into()],
         });
         let own = |default: &str| Table {
@@ -10360,6 +10578,7 @@ mod tests {
         ]);
         parent.indexes.insert("ev_n".into(), index("n"));
         parent.partition_by = Some(PartitionBy {
+            external: false,
             columns: vec!["ts".into()],
         });
         let mut own = Table {
@@ -10539,6 +10758,7 @@ mod tests {
         use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
         let mut parent = table(&[("ts", Column::new(ty("date")).not_null())]);
         parent.partition_by = Some(PartitionBy {
+            external: false,
             columns: vec!["ts".into()],
         });
         let own = Table {
@@ -15022,6 +15242,7 @@ mod tests {
                     },
                     ty: ty("int"),
                     to_nullable: true,
+                    through_external_partitions: false,
                     collation: None,
                 }),
             ],

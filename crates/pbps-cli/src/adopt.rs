@@ -24,6 +24,138 @@ use pbps_model::{ModuleId, ModuleKind, Role, Schema};
 
 use crate::declaration_file;
 
+/// Declares `partitions: external` (#1533) on the parents another tool
+/// creates partitions of, and leaves those partitions out of what is written.
+///
+/// The catalog cannot say who made a partition, so the parents come from
+/// two places (DEC-1533.1): pg_partman's own catalog, read here, and the
+/// ones the operator names (`pull --partitions-external`). pg_partman's
+/// template tables go too: it makes them beside its catalog and outside the
+/// extension, and they are its own. Run before the other leave-outs, so a
+/// role's grants are narrowed to the tables actually written.
+///
+/// A partition with parts of its own is refused by name, as `plan` would
+/// refuse it: pbps holds an external partition only as its parent makes it.
+/// pg_partman installed with its catalog unreadable is an error, not "no
+/// parent is pg_partman's".
+pub(crate) async fn hand_over_external_partitions(
+    conn: &mut pbps_db::Conn,
+    pulled: &mut Pulled,
+    named: &[pbps_model::TableName],
+) -> anyhow::Result<()> {
+    use std::collections::BTreeMap;
+
+    // No engine branch here: SQL Server has no partitioned table in this
+    // model, so a named parent is refused below as one pull does not keep,
+    // and the engine seam answers that no pg_partman is installed.
+    let parent = |schema: &Schema, name: &pbps_model::TableName| {
+        schema
+            .tables
+            .get(name)
+            .is_some_and(|t| t.partition_by.is_some() && t.partition_of.is_none())
+    };
+    // By parent, why it is external.
+    let mut external: BTreeMap<pbps_model::TableName, String> = BTreeMap::new();
+    for name in named {
+        if !parent(&pulled.schema, name) {
+            anyhow::bail!(
+                "--partitions-external {name}: this database has no range-partitioned parent by \
+                 that name that pull keeps"
+            );
+        }
+        external.insert(name.clone(), "named with --partitions-external".to_owned());
+    }
+    if let Some(schema) = crate::engine::partman_schema(conn).await? {
+        let maintained = crate::engine::partman_maintained(conn, &schema)
+            .await
+            .with_context(|| {
+                format!(
+                    "pg_partman is installed in schema `{schema}`, and its `part_config` cannot \
+                     be read as this role, so pull cannot tell which parents' partitions it \
+                     makes; grant USAGE on schema `{schema}` and SELECT on \
+                     `{schema}.part_config`, then pull again"
+                )
+            })?;
+        for m in maintained {
+            if let Some(template) = &m.template
+                && pulled.schema.tables.remove(template).is_some()
+            {
+                pulled.onboarding_notices.push(format!(
+                    "table `{template}` was left out: it is pg_partman's template for `{}`",
+                    m.parent
+                ));
+            }
+            if parent(&pulled.schema, &m.parent) {
+                external
+                    .entry(m.parent.clone())
+                    .or_insert_with(|| "pg_partman maintains it".to_owned());
+            } else {
+                pulled.warnings.push(format!(
+                    "pg_partman maintains `{}`, which this pull does not keep as a \
+                     range-partitioned parent; its partitions are not declared external",
+                    m.parent
+                ));
+            }
+        }
+    }
+    let mut refused = Vec::new();
+    for (name, why) in &external {
+        let partitions: Vec<pbps_model::TableName> = pulled
+            .schema
+            .tables
+            .iter()
+            .filter(|(_, t)| t.partition_of.as_ref().is_some_and(|of| &of.parent == name))
+            .map(|(n, _)| n.clone())
+            .collect();
+        for partition in &partitions {
+            let own = pbps_diff::own_parts(&pulled.schema.tables[partition]);
+            if !own.is_empty() {
+                refused.push(format!(
+                    "  {partition}, a partition of {name}, holds {} of its own",
+                    own.join(", ")
+                ));
+            }
+            // What the read could not take in is a part of its own the list
+            // above cannot see: a hash index, say (#1833 review).
+            for limitation in &pulled.limitations {
+                if matches!(&limitation.target,
+                    LimitationTarget::Relation(t) if t == partition)
+                {
+                    refused.push(format!(
+                        "  {partition}, a partition of {name}: {}",
+                        limitation.detail
+                    ));
+                }
+            }
+        }
+        for partition in &partitions {
+            pulled.schema.tables.remove(partition);
+        }
+        if let Some(by) = pulled
+            .schema
+            .tables
+            .get_mut(name)
+            .and_then(|t| t.partition_by.as_mut())
+        {
+            by.external = true;
+        }
+        pulled.onboarding_notices.push(format!(
+            "table `{name}`: its partitions are external ({why}), so its {} partition(s) are not \
+             declared",
+            partitions.len()
+        ));
+    }
+    if !refused.is_empty() {
+        anyhow::bail!(
+            "these partitions of parents whose partitions are external hold parts of their own, \
+             which pbps would neither compare nor keep; drop them from the partitions, or pull \
+             without declaring the parent's partitions external:\n{}",
+            refused.join("\n")
+        );
+    }
+    Ok(())
+}
+
 /// Takes out of `pulled.schema` every object the dialect's validation
 /// refuses, and records each one where the adoption already reports what it
 /// left behind: a table in `warnings`, a module in `unmanaged_modules`, a
@@ -551,6 +683,7 @@ mod tests {
         let s = &mut pulled.schema;
         let mut parent = table("integer", None);
         parent.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
             columns: vec!["id".into()],
         });
         s.tables
@@ -590,6 +723,7 @@ mod tests {
         let s = &mut pulled.schema;
         let mut parent = table("integer", None);
         parent.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
             columns: vec!["id".into()],
         });
         s.tables

@@ -309,6 +309,7 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                     to,
                     from_nullable,
                     to_nullable,
+                    through_external_partitions: _,
                     from_collation,
                     to_collation,
                 } => {

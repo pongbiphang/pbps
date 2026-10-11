@@ -296,7 +296,12 @@ async fn rehearse_in(
         .await
         .context("cannot read the dev database back")?;
     let modules: std::collections::BTreeSet<_> = declared.modules.keys().cloned().collect();
-    let scoped = pbps_diff::scope(&built.schema, declared_ids, &modules);
+    let scoped = pbps_diff::scope(
+        &built.schema,
+        declared_ids,
+        &modules,
+        &pbps_diff::external_parents(declared),
+    );
 
     // The engine side is identified by what the engine actually holds, not by
     // the identity file the declarations carry. Handing both sides the same

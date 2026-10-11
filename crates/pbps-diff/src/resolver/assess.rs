@@ -569,6 +569,7 @@ mod tests {
                 .columns
                 .insert("id".into(), Column::new("int".parse().unwrap()));
             parent.partition_by = Some(pbps_model::PartitionBy {
+                external: false,
                 columns: vec!["id".into()],
             });
             schema.tables.insert("app.ev".parse().unwrap(), parent);

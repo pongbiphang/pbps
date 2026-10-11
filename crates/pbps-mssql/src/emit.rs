@@ -2600,6 +2600,7 @@ mod tests {
             to: ty("varchar(20)"),
             from_nullable: false,
             to_nullable: false,
+            through_external_partitions: false,
             from_collation: cs.clone(),
             to_collation: cs.clone(),
         });
@@ -2614,6 +2615,7 @@ mod tests {
             column: cref("dbo.t.code"),
             ty: ty("varchar(10)"),
             to_nullable: true,
+            through_external_partitions: false,
             collation: cs,
         });
         assert_eq!(
@@ -2629,6 +2631,7 @@ mod tests {
             column: cref("dbo.t.code"),
             ty: ty("varchar(10)"),
             to_nullable: true,
+            through_external_partitions: false,
             collation: None,
         });
         assert_eq!(
@@ -2710,6 +2713,7 @@ mod tests {
             to: ty("bigint"),
             from_nullable: false,
             to_nullable: false,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         });
@@ -2724,6 +2728,7 @@ mod tests {
             column: cref("dbo.t.email"),
             ty: ty("nvarchar(255)"),
             to_nullable: false,
+            through_external_partitions: false,
             collation: None,
         });
         assert_eq!(
@@ -2740,6 +2745,7 @@ mod tests {
                 column: cref("dbo.t.version"),
                 ty: ty(spelling),
                 to_nullable: true,
+                through_external_partitions: false,
                 collation: None,
             };
             let msg = emit(&change, Strategy::default()).unwrap_err().to_string();
@@ -2757,6 +2763,7 @@ mod tests {
                 column: cref("dbo.t.version"),
                 ty: ty("varbinary(8)"),
                 to_nullable: false,
+                through_external_partitions: false,
                 collation: None,
             }),
             ["ALTER TABLE [dbo].[t] ALTER COLUMN [version] varbinary(8) NOT NULL;"]
@@ -3562,6 +3569,7 @@ mod tests {
                 column: cref("dbo.order_line.note"),
                 ty: ty("nvarchar(100)"),
                 to_nullable: false,
+                through_external_partitions: false,
                 collation: None,
             }),
             [

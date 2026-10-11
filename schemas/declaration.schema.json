@@ -142,11 +142,8 @@
           "default": null
         },
         "partitions": {
-          "description": "The parent's partitions, by name (qualified when in another schema):\n`{from: ['2025-01-01'], to: ['2026-01-01']}`, `MINVALUE`/`MAXVALUE`\nfor an unbounded end, or `default`.",
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/$defs/PartitionDto"
-          }
+          "description": "The parent's partitions, by name (qualified when in another schema):\n`{from: ['2025-01-01'], to: ['2026-01-01']}`, `MINVALUE`/`MAXVALUE`\nfor an unbounded end, or `default`. Or `external`: another tool, such\nas pg_partman, creates and drops them, and pbps manages the parent\nalone.",
+          "$ref": "#/$defs/PartitionsDto"
         },
         "system_time": {
           "description": "SQL Server `PERIOD FOR SYSTEM_TIME` and system versioning:\n`{period: [valid_from, valid_to], hidden: true, versioning: {history:\ndbo.orders_history, retention: 6 months}}`. Absent is an ordinary\ntable.",
@@ -631,6 +628,21 @@
             "index"
           ],
           "additionalProperties": false
+        }
+      ]
+    },
+    "PartitionsDto": {
+      "description": "A parent's `partitions:`: its partitions by name, or `external` (#1533).",
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/PartitionDto"
+          }
+        },
+        {
+          "description": "`external`: any other word is refused by the loader, by name, as a\npartition's `default` is.",
+          "const": "external"
         }
       ]
     },
@@ -1129,6 +1141,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 37,
+  "x-pbps-schema-version": 38,
   "x-pbps-tool-version": "0.0.0"
 }

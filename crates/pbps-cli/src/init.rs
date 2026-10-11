@@ -183,7 +183,13 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                 let mut pulled = db::runtime()?.block_on(async {
                     let mut conn =
                         pbps_db::Conn::connect(db::driver_for(config.dialect), &connection).await?;
-                    crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await
+                    let mut pulled =
+                        crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await?;
+                    // As `pull` does without its flag: pg_partman's parents
+                    // are declared with external partitions (#1533).
+                    crate::adopt::hand_over_external_partitions(&mut conn, &mut pulled, &[])
+                        .await?;
+                    Ok::<_, anyhow::Error>(pulled)
                 })?;
                 // As `pull` does, and before identities are minted for it:
                 // what `validate` would refuse is left out and named, rather

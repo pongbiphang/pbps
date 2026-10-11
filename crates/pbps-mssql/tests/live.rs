@@ -5569,6 +5569,7 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
                 column: "dbo.customer.email".parse().unwrap(),
                 ty: ty("nvarchar(255)"),
                 to_nullable: false,
+                through_external_partitions: false,
                 collation: None,
             }),
             PlannedChange::new(Change::AddCheck {
@@ -5655,6 +5656,7 @@ async fn narrowing_to_sysname_probes_the_alias_real_capacity() {
             to: ty("sysname"),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         })],
@@ -5772,6 +5774,7 @@ async fn narrowing_a_varbinary_source_to_sysname_is_not_falsely_blocked() {
             to: ty("sysname"),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         })],
@@ -5827,6 +5830,7 @@ async fn unicode_capacity_verdict(
             to: ty(to),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         })],
@@ -6087,6 +6091,7 @@ async fn unicode_to_varchar_probes_character_loss() {
             to: ty(to),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         })],
@@ -6560,6 +6565,7 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
                     to: ColumnType::new("varchar", vec![pbps_model::TypeArg::Int(2)]),
                     from_nullable: true,
                     to_nullable: true,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 }),
@@ -13025,7 +13031,12 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
     assert_eq!(pulled.warnings, Vec::<String>::new());
     assert_eq!(pulled.schema.roles.get("app_reader"), Some(&reader));
     // Scoped by the ids file, the live state is the declaration.
-    let scoped = pbps_diff::scope(&pulled.schema, &ids, &Default::default());
+    let scoped = pbps_diff::scope(
+        &pulled.schema,
+        &ids,
+        &Default::default(),
+        &Default::default(),
+    );
     assert_eq!(scoped.schema.roles, declared.roles);
     assert!(
         scoped.unmanaged_roles.is_empty(),
@@ -13086,7 +13097,13 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
             .is_some_and(|g| g.contains(&Permission::Update)),
         "the widened grant must not read as the plain one"
     );
-    let live = pbps_diff::scope(&again.schema, &ids, &Default::default()).schema;
+    let live = pbps_diff::scope(
+        &again.schema,
+        &ids,
+        &Default::default(),
+        &Default::default(),
+    )
+    .schema;
     let drift = pbps_diff::diff_partial(
         pbps_diff::Side {
             schema: &scoped.schema,
@@ -14065,6 +14082,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                 to: ty("varchar(10)"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             }),
@@ -16136,6 +16154,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
         to: ty(wider),
         from_nullable: false,
         to_nullable: false,
+        through_external_partitions: false,
         from_collation: None,
         to_collation: None,
     };
@@ -16264,6 +16283,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
             to: ty("varchar(20)"),
             from_nullable: false,
             to_nullable: false,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         },

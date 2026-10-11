@@ -1338,6 +1338,7 @@ mod tests {
             .insert("a".into(), Column::new("int".parse().unwrap()));
         assert!(found(&parent).is_empty());
         parent.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
             columns: vec!["a".into()],
         });
         let partition = Table {

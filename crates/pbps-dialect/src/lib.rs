@@ -4138,6 +4138,7 @@ mod tests {
         use pbps_model::{BoundDatum as D, PartitionBound as B};
         let partitioned = |key: &[&str]| Table {
             partition_by: Some(pbps_model::PartitionBy {
+                external: false,
                 columns: key.iter().map(|k| (*k).to_owned()).collect(),
             }),
             ..Default::default()
@@ -4184,6 +4185,7 @@ mod tests {
         let mut nested = ok.clone();
         let mut middle = of("app.p", one("5"));
         middle.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
             columns: vec!["a".into()],
         });
         nested.tables.insert("app.p3".parse().unwrap(), middle);

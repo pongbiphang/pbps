@@ -6570,6 +6570,525 @@ fn an_array_column_widens_through_the_cli() {
     );
 }
 
+/// A parent whose partitions pg_partman makes goes through the CLI with
+/// `partitions: external` (#1533): `pull` finds it in pg_partman's catalog and
+/// writes the parent alone, without pg_partman's template table; a baseline
+/// leaves nothing to plan; a column added to the parent through a plan, which
+/// says it recurses into every partition under its lock, reaches every one;
+/// and a partition made later, by any tool, stays out of the plan.
+/// Negatives: a partition with an index of its own is refused by `plan` and
+/// by `pull`, naming it, and a role that cannot read pg_partman's catalog is
+/// refused by `pull` with the grant that lets it. On 16 and 18.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18 with pg_partman; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn pg_partman_parents_are_pulled_with_external_partitions() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        pg_partman_parent_is_pulled_with_external_partitions(server, k);
+    }
+}
+
+fn pg_partman_parent_is_pulled_with_external_partitions(server: &str, k: usize) {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let db = OwnDatabase::new(server, "partman-1533");
+    let connection = db.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; CREATE SCHEMA partman; \
+         CREATE EXTENSION pg_partman SCHEMA partman; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts timestamptz NOT NULL) \
+             PARTITION BY RANGE (ts); \
+         SELECT partman.create_parent(p_parent_table := 'app.ev', p_control := 'ts', \
+             p_interval := '1 month')",
+    );
+    let partitions = || {
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_inherits WHERE inhparent = 'app.ev'::regclass",
+        )
+    };
+    assert!(partitions() > 1, "pg_partman made no partitions");
+
+    let d = Demo::new(&format!("partman-1533-{k}"));
+    let o = succeeds(d.run(&["pull", "--db", &connection]));
+    assert!(
+        stderr(&o)
+            .contains("table `app.ev`: its partitions are external (pg_partman maintains it)")
+            && stderr(&o).contains(
+                "table `partman.template_app_ev` was left out: it is pg_partman's template"
+            ),
+        "{}",
+        stderr(&o)
+    );
+    let text = std::fs::read_to_string(d.dir.join("schema/app.ev.yml")).unwrap();
+    assert!(
+        text.ends_with("\npartition_by: [ts]\n\npartitions: external\n"),
+        "{text}"
+    );
+    let files: Vec<String> = std::fs::read_dir(d.dir.join("schema"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !files.iter().any(|f| f.starts_with("partman.")),
+        "{files:?}"
+    );
+    succeeds(d.run(&["fmt", "--check"]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // A column on the parent reaches every partition, and the plan says so.
+    let path = d.dir.join("schema/app.ev.yml");
+    std::fs::write(
+        &path,
+        text.replace(
+            "\npartition_by:",
+            "  note:\n    type: text\n\npartition_by:",
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["fmt"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    let every = partitions();
+    assert!(
+        stdout(&o).contains("+ add column note text")
+            && stdout(&o).contains(&format!(
+                "the statement recurses into its {every} partition(s) and takes \
+                 AccessExclusiveLock on each"
+            )),
+        "{}",
+        stdout(&o)
+    );
+    succeeds(approved_apply(&d, &connection, &plan, &[]));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_inherits i JOIN pg_attribute a \
+             ON a.attrelid = i.inhrelid AND a.attname = 'note' AND NOT a.attisdropped \
+             WHERE i.inhparent = 'app.ev'::regclass"
+        ),
+        every
+    );
+    // A partition made later, by pg_partman or anyone, is its parent's alone.
+    on_server(
+        &connection,
+        "CREATE TABLE app.ev_p20400101 PARTITION OF app.ev \
+             FOR VALUES FROM ('2040-01-01') TO ('2040-02-01')",
+    );
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // Negative: a partition with an index of its own, refused by name.
+    on_server(&connection, "CREATE INDEX ev_own ON app.ev_default (note)");
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains(
+            "app.ev_default is a partition of the managed table app.ev, whose partitions are \
+             external, and holds indexes of its own"
+        ),
+        "{}",
+        stderr(&o)
+    );
+    let o = d.run(&["pull", "--force", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("app.ev_default, a partition of app.ev, holds indexes of its own"),
+        "{}",
+        stderr(&o)
+    );
+    on_server(&connection, "DROP INDEX app.ev_own");
+    // Negative: one the catalog read cannot take in, which it leaves out and
+    // names, so that no part list could see it (#1833 review).
+    on_server(
+        &connection,
+        "CREATE INDEX ev_hash ON app.ev_default USING hash (id)",
+    );
+    for args in [
+        &["plan", "--db", &connection][..],
+        &["verify", "--db", &connection][..],
+        &["pull", "--force", "--db", &connection][..],
+    ] {
+        let o = d.run(args);
+        assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
+        assert!(
+            format!("{}{}", stdout(&o), stderr(&o))
+                .contains("index `ev_hash` on `app.ev_default` uses the `hash` method"),
+            "{args:?}: {}{}",
+            stdout(&o),
+            stderr(&o)
+        );
+    }
+    on_server(&connection, "DROP INDEX app.ev_hash");
+
+    // Negative: pg_partman's catalog unreadable is not "no parent is its".
+    let role = Role(
+        server.to_owned(),
+        format!("pbps_partman_{k}_{}", std::process::id()),
+    );
+    // PUBLIC's default CONNECT is its way in, so it holds no grant of its
+    // own that would keep the role from being dropped.
+    on_server(
+        &connection,
+        &format!(
+            "DROP ROLE IF EXISTS {0}; CREATE ROLE {0} LOGIN PASSWORD 'trigger-test'",
+            role.1
+        ),
+    );
+    let reader = Demo::new(&format!("partman-1533-reader-{k}"));
+    let o = reader.run(&["pull", "--db", &as_role(&connection, &role.1)]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains(
+            "pg_partman is installed in schema `partman`, and its `part_config` cannot be read \
+             as this role"
+        ) && stderr(&o).contains("grant USAGE on schema `partman`"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!reader.dir.join("schema/app.ev.yml").exists());
+}
+
+/// `pull --partitions-external` declares a parent's partitions external
+/// where no catalog says so (#1533): a parent whose partitions an application
+/// makes is written alone, and a baseline leaves nothing to plan. Without the
+/// flag the same parent is written with its partitions, as #1170 pulls it.
+/// Negatives: a name that is no partitioned parent, and a parent's partition
+/// with a check of its own. On 16 and 18.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn pull_declares_a_named_parents_partitions_external() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        pull_declares_a_named_parents_partitions_external_on(server, k);
+    }
+}
+
+fn pull_declares_a_named_parents_partitions_external_on(server: &str, k: usize) {
+    let db = OwnDatabase::new(server, "external-1533");
+    let connection = db.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL) PARTITION BY RANGE (ts); \
+         CREATE TABLE app.ev_2025 PARTITION OF app.ev \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
+         CREATE TABLE app.ev_rest PARTITION OF app.ev DEFAULT; \
+         CREATE TABLE app.plain (id integer); \
+         CREATE TABLE app.dc (id integer NOT NULL, ts date NOT NULL) PARTITION BY RANGE (ts); \
+         CREATE TABLE app.dc_1 PARTITION OF app.dc \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+    );
+    // Without the flag, the partitions are declared.
+    let d = Demo::new(&format!("external-1533-declared-{k}"));
+    succeeds(d.run(&["pull", "--db", &connection]));
+    let text = std::fs::read_to_string(d.dir.join("schema/app.ev.yml")).unwrap();
+    assert!(text.contains("\npartitions:\n  ev_2025:"), "{text}");
+    // Negative: declared external while pbps holds the partitions, a
+    // baseline would record two owners for each; it is refused, naming the
+    // way, and the recorded state stays as it was (#1833 review).
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let held = text.find("\npartitions:\n").unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.ev.yml"),
+        format!("{}\npartitions: external\n", &text[..held]),
+    )
+    .unwrap();
+    d.commit();
+    let o = d.run(&["baseline", "--db", &connection, "--reason", "hand over"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains(
+            "app.ev_2025 is a partition pbps holds of the managed table app.ev, whose partitions \
+             are external"
+        ),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        scalar(&connection, "SELECT count(*) FROM public.__pbps_state"),
+        1,
+        "the refused baseline recorded an entry"
+    );
+
+    let d = Demo::new(&format!("external-1533-{k}"));
+    let o = succeeds(d.run(&[
+        "pull",
+        "--db",
+        &connection,
+        "--partitions-external",
+        "app.ev",
+    ]));
+    assert!(
+        stderr(&o).contains(
+            "table `app.ev`: its partitions are external (named with --partitions-external), so \
+             its 2 partition(s) are not declared"
+        ),
+        "{}",
+        stderr(&o)
+    );
+    let text = std::fs::read_to_string(d.dir.join("schema/app.ev.yml")).unwrap();
+    assert!(
+        text.ends_with("\npartition_by: [ts]\n\npartitions: external\n"),
+        "{text}"
+    );
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // A column of the parent renamed and its name taken by a new one: the
+    // apply's closing read compares the parent under its brought-forward key
+    // as external still, and the plan applies (#1833 review).
+    let path = d.dir.join("schema/app.ev.yml");
+    let declared = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        declared.contains("  id:\n    type: integer\n    nullable: false\n"),
+        "{declared}"
+    );
+    // The rename first, as its intent is recorded; then the name taken.
+    let renamed = declared.replacen("  id:\n", "  id2:\n", 1);
+    std::fs::write(&path, &renamed).unwrap();
+    succeeds(d.run(&["rename", "app.ev.id", "id2"]));
+    std::fs::write(
+        &path,
+        renamed.replacen(
+            "    nullable: false\n  ts:",
+            "    nullable: false\n  id:\n    type: integer\n  ts:",
+            1,
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["fmt"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&o).contains("+ add column id integer") && stdout(&o).contains("id -> id2"),
+        "{}",
+        stdout(&o)
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "rename"],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // Negative: names that are no partitioned parent.
+    for name in ["app.plain", "app.nope", "app.ev_2025"] {
+        let o = d.run(&[
+            "pull",
+            "--force",
+            "--db",
+            &connection,
+            "--partitions-external",
+            name,
+        ]);
+        assert_ne!(code(&o), 0, "{name}: {}", stdout(&o));
+        assert!(
+            stderr(&o).contains(&format!(
+                "--partitions-external {name}: this database has no range-partitioned parent"
+            )),
+            "{name}: {}",
+            stderr(&o)
+        );
+    }
+    // Negative: a partition with a check of its own.
+    on_server(
+        &connection,
+        "ALTER TABLE app.ev_2025 ADD CONSTRAINT ev_2025_ck CHECK (id > 0)",
+    );
+    let o = d.run(&[
+        "pull",
+        "--force",
+        "--db",
+        &connection,
+        "--partitions-external",
+        "app.ev",
+    ]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("app.ev_2025, a partition of app.ev, holds checks of its own"),
+        "{}",
+        stderr(&o)
+    );
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o)
+            .contains("app.ev_2025 is a partition of the managed table app.ev, whose partitions"),
+        "{}",
+        stderr(&o)
+    );
+    on_server(
+        &connection,
+        "ALTER TABLE app.ev_2025 DROP CONSTRAINT ev_2025_ck",
+    );
+
+    // A rename chain handing a declared parent's name to the external one:
+    // each read of the apply names the external parent by its identity, so
+    // the declared `app.dc` is not read as external before its own rename
+    // runs (#1833 review).
+    let schema = d.dir.join("schema");
+    let dc = std::fs::read_to_string(schema.join("app.dc.yml")).unwrap();
+    assert!(dc.contains("\npartitions:\n  dc_1:"), "{dc}");
+    std::fs::remove_file(schema.join("app.dc.yml")).unwrap();
+    std::fs::write(
+        schema.join("app.dc2.yml"),
+        dc.replacen("table: app.dc\n", "table: app.dc2\n", 1),
+    )
+    .unwrap();
+    succeeds(d.run(&["rename-table", "app.dc", "app.dc2"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let ev = std::fs::read_to_string(schema.join("app.ev.yml")).unwrap();
+    std::fs::remove_file(schema.join("app.ev.yml")).unwrap();
+    std::fs::write(
+        schema.join("app.dc.yml"),
+        ev.replacen("table: app.ev\n", "table: app.dc\n", 1),
+    )
+    .unwrap();
+    succeeds(d.run(&["rename-table", "app.ev", "app.dc"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&o).contains("app.dc -> app.dc2") && stdout(&o).contains("app.ev -> app.dc"),
+        "{}",
+        stdout(&o)
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "rename"],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_inherits WHERE inhparent = 'app.dc'::regclass"
+        ),
+        2,
+        "the external parent took the name with its partitions"
+    );
+
+    // A NOT NULL a partition sets of its own beside its parent's is local on
+    // 18 and outlives the parent's `DROP NOT NULL` (DEC-1687.1). The parent's
+    // change clears it from every partition after, which no declaration
+    // lists, and the apply's closing read finds them its own (#1833 review).
+    // Its clearing is pbps's own SQL, on the empty path: the operators a user
+    // of the parent's schema could add are not called (DEC-1564.1).
+    on_server(
+        &connection,
+        "ALTER TABLE app.ev_2025 ALTER COLUMN id2 SET NOT NULL",
+    );
+    on_server(&connection, &trap_operators("app"));
+    let path = schema.join("app.dc.yml");
+    let declared = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        declared.contains("  id2:\n    type: integer\n    nullable: false\n"),
+        "{declared}"
+    );
+    std::fs::write(
+        &path,
+        declared.replacen(
+            "  id2:\n    type: integer\n    nullable: false\n",
+            "  id2:\n    type: integer\n",
+            1,
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    assert!(stdout(&o).contains("id2"), "{}", stdout(&o));
+    // A staged run stopped at the clearing, the one place 18 runs an
+    // `ALTER TABLE` on the partition, leaves no checkpoint between the
+    // parent's change and the clearing: they are one statement, so it rolls
+    // back whole and the plan runs again from its start. Split in two, the
+    // parent's change committed and the checkpoint read the kept NOT NULL as
+    // the partition's own, so the run could not be resumed (#1833 review).
+    // On 16 nothing is kept and the clearing alters nothing.
+    on_server(
+        &connection,
+        "CREATE SCHEMA witness; \
+         CREATE FUNCTION witness.stop_at_clearing() RETURNS event_trigger \
+             LANGUAGE plpgsql SET search_path = pg_catalog AS $$ \
+         BEGIN \
+           IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() c \
+                       WHERE c.objid = 'app.ev_2025'::regclass::oid) THEN \
+             RAISE EXCEPTION 'stop at the clearing'; \
+           END IF; \
+         END $$; \
+         CREATE EVENT TRIGGER stop_at_clearing ON ddl_command_end \
+             WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.stop_at_clearing()",
+    );
+    let stopped = approved_apply(&d, &connection, &plan, &["--staged"]);
+    if scalar(
+        &connection,
+        "SELECT current_setting('server_version_num')::bigint / 10000",
+    ) >= 18
+    {
+        assert_eq!(
+            code(&stopped),
+            1,
+            "{}{}",
+            stdout(&stopped),
+            stderr(&stopped)
+        );
+        assert!(
+            stderr(&stopped).contains("stop at the clearing"),
+            "{}",
+            stderr(&stopped)
+        );
+        assert!(latest_snapshot(&connection).staged.is_none());
+        on_server(&connection, "DROP EVENT TRIGGER stop_at_clearing");
+        succeeds(approved_apply(&d, &connection, &plan, &["--staged"]));
+    } else {
+        succeeds(stopped);
+        on_server(&connection, "DROP EVENT TRIGGER stop_at_clearing");
+    }
+    succeeds(d.run(&["verify", "--db", &connection]));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_inherits i JOIN pg_attribute a \
+             ON a.attrelid = i.inhrelid AND a.attname = 'id2' AND a.attnotnull \
+             WHERE i.inhparent = 'app.dc'::regclass"
+        ),
+        0,
+        "a partition kept a NOT NULL of its own"
+    );
+}
+
 /// A RANGE partition tree goes the whole way through the CLI (#1170): pulled
 /// into one file, its parent's, which bootstraps an empty database into the
 /// same tree, verifies and leaves nothing to plan. A bound the engine spells

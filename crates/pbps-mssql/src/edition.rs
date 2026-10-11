@@ -203,6 +203,7 @@ mod tests {
             column: "dbo.customer.score".parse().unwrap(),
             ty: "int".parse().unwrap(),
             to_nullable: true,
+            through_external_partitions: false,
             collation: None,
         })
     }

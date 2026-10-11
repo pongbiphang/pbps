@@ -31,6 +31,12 @@ pub struct Scoped {
     /// untouched — pbps will neither change nor drop them.
     pub unmanaged: Vec<TableName>,
 
+    /// Partitions of a managed parent whose partitions are external (#1533):
+    /// another tool's to create and drop, held as the parent makes them and
+    /// compared not at all. Kept apart from [`Scoped::unmanaged`], whose
+    /// policy is about tables nobody declared a reason to leave alone.
+    pub external: Vec<TableName>,
+
     /// Tables the identity file names that the database does not have.
     ///
     /// Reported rather than quietly treated as "nothing to compare": against a
@@ -87,31 +93,85 @@ pub struct Scoped {
 /// since pbps last recorded it"), while `plan --db` passes those plus the
 /// declared ones ("what would it take to get there"). A module in neither is
 /// somebody else's, and pbps neither changes nor drops it.
-pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ModuleId>) -> Scoped {
+///
+/// # Why the external parents are supplied
+///
+/// Which parents' partitions are another tool's (#1533) is declared, and the
+/// catalog cannot say it, so the caller supplies the parents, as it supplies
+/// the modules: those of the state it compares against and those declared.
+/// A managed parent among them is marked so, as declared, and each of its
+/// partitions pbps holds no uid for is left out, so long as it is only what
+/// the parent makes it. One with parts of its own is refused by name: pbps
+/// would neither compare nor keep them.
+pub fn scope(
+    schema: &Schema,
+    ids: &IdsFile,
+    managed_modules: &BTreeSet<ModuleId>,
+    external_parents: &BTreeSet<TableName>,
+) -> Scoped {
     let managed: BTreeSet<&TableName> = ids.tables.values().collect();
 
     let mut scoped = Schema::default();
     let mut unmanaged = Vec::new();
+    let mut external = Vec::new();
     let mut unexpressible = Vec::new();
     for (name, table) in &schema.tables {
+        // A partition pbps holds under a parent whose partitions are
+        // external (#1533) is two owners for one table: recorded so, the
+        // ledger would say pbps keeps what the declarations hand to another
+        // tool, and no later plan could take it back (#1833 review). Refused
+        // wherever a read is scoped, the baseline that would record it first.
+        if managed.contains(name)
+            && let Some(of) = &table.partition_of
+            && managed.contains(&of.parent)
+            && external_parents.contains(&of.parent)
+        {
+            unexpressible.push(format!(
+                "{name} is a partition pbps holds of the managed table {}, whose partitions are \
+                 external; drop or detach it in a plan of its own while the parent's partitions \
+                 are declared, then make them external",
+                of.parent
+            ));
+            continue;
+        }
         if managed.contains(name) {
-            scoped.tables.insert(name.clone(), table.clone());
-        } else {
-            // A partition nobody declared under a parent pbps manages is not
-            // somebody else's table the way an unmanaged one is: the managed
-            // parent routes its rows into it (#1170).
-            if let Some(of) = &table.partition_of
-                && managed.contains(&of.parent)
+            let mut table = table.clone();
+            if external_parents.contains(name)
+                && let Some(by) = table.partition_by.as_mut()
             {
+                by.external = true;
+            }
+            scoped.tables.insert(name.clone(), table);
+            continue;
+        }
+        // A partition nobody declared under a parent pbps manages is not
+        // somebody else's table the way an unmanaged one is: the managed
+        // parent routes its rows into it (#1170).
+        if let Some(of) = &table.partition_of
+            && managed.contains(&of.parent)
+        {
+            if !external_parents.contains(&of.parent) {
                 unexpressible.push(format!(
                     "{name} is a partition of the managed table {} and is not declared; declare \
                      it with `pbps pull` and record it with `pbps baseline --reason …`, or detach \
                      it by hand",
                     of.parent
                 ));
+            } else if let parts @ [_, ..] = own_parts(table).as_slice() {
+                unexpressible.push(format!(
+                    "{name} is a partition of the managed table {}, whose partitions are \
+                     external, and holds {} of its own; pbps holds an external partition only \
+                     as its parent makes it, so drop them from {name}, or declare the \
+                     partitions",
+                    of.parent,
+                    parts.join(", ")
+                ));
+            } else {
+                external.push(name.clone());
+                continue;
             }
-            unmanaged.push(name.clone());
         }
+        unmanaged.push(name.clone());
     }
 
     let missing = managed
@@ -185,6 +245,7 @@ pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ModuleId
     Scoped {
         schema: scoped,
         unmanaged,
+        external,
         missing,
         unmanaged_modules,
         unmanaged_roles,
@@ -194,6 +255,72 @@ pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ModuleId
         owners: BTreeMap::new(),
         session_role: String::new(),
     }
+}
+
+/// The parents whose partitions are external (#1533) in `schema`: what
+/// [`scope`] is handed. A command comparing against the ledger takes them
+/// from the recorded state, as `verify` does, and one recording the
+/// declarations from those (DEC-1533.1).
+pub fn external_parents(schema: &Schema) -> BTreeSet<TableName> {
+    schema
+        .tables
+        .iter()
+        .filter(|(_, t)| t.partition_by.as_ref().is_some_and(|by| by.external))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// What a partition holds of its own beside what its parent makes it, by
+/// kind: none for a partition the parent alone makes (#1170, #1533).
+///
+/// Every part a table can hold is asked, not only those a declared
+/// partition can carry, so a part this list forgets is not one it waves
+/// through: a destructure, so a new part of a table fails to compile here.
+pub fn own_parts(table: &pbps_model::Table) -> Vec<&'static str> {
+    let pbps_model::Table {
+        description,
+        columns,
+        computed,
+        primary_key,
+        unique,
+        foreign_keys,
+        checks,
+        indexes,
+        clustered,
+        replica_identity,
+        storage_parameters,
+        unlogged,
+        partition_by,
+        partition_of,
+        system_time,
+        data,
+    } = table;
+    [
+        (description.is_some(), "a comment"),
+        (!columns.is_empty(), "columns"),
+        (!computed.is_empty(), "computed columns"),
+        (primary_key.is_some(), "a primary key"),
+        (!unique.is_empty(), "unique constraints"),
+        (!foreign_keys.is_empty(), "foreign keys"),
+        (!checks.is_empty(), "checks"),
+        (!indexes.is_empty(), "indexes"),
+        (clustered.is_some(), "a clustered index"),
+        (replica_identity.is_some(), "a replica identity"),
+        (!storage_parameters.is_empty(), "storage parameters"),
+        (*unlogged, "unlogged persistence"),
+        (partition_by.is_some(), "partitions"),
+        (
+            partition_of
+                .as_ref()
+                .is_some_and(|of| !of.columns.is_empty()),
+            "column defaults or NOT NULLs",
+        ),
+        (system_time.is_some(), "system versioning"),
+        (data.is_some(), "rows"),
+    ]
+    .into_iter()
+    .filter_map(|(held, part)| held.then_some(part))
+    .collect()
 }
 
 /// The identity of a database **as observed**, for comparing a live schema
@@ -324,6 +451,7 @@ mod tests {
             &schema(&["dbo.customer", "dbo.order", "dbo.legacy_audit"]),
             &ids(&[("t_aaaaaa", "dbo.customer"), ("t_bbbbbb", "dbo.order")]),
             &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             scoped.schema.tables.keys().collect::<Vec<_>>(),
@@ -351,7 +479,12 @@ mod tests {
         live.tables.insert(t("app.ev_rest"), partition_of("app.ev"));
         live.tables
             .insert(t("app.other_rest"), partition_of("app.other"));
-        let scoped = scope(&live, &ids(&[("t_aaaaaa", "app.ev")]), &BTreeSet::new());
+        let scoped = scope(
+            &live,
+            &ids(&[("t_aaaaaa", "app.ev")]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
         assert_eq!(scoped.unexpressible.len(), 1, "{:?}", scoped.unexpressible);
         assert!(
             scoped.unexpressible[0]
@@ -367,6 +500,7 @@ mod tests {
             &live,
             &ids(&[("t_aaaaaa", "app.ev"), ("t_bbbbbb", "app.ev_rest")]),
             &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert!(
             scoped.unexpressible.is_empty(),
@@ -376,16 +510,128 @@ mod tests {
         assert!(scoped.schema.tables.contains_key(&t("app.ev_rest")));
     }
 
+    /// A managed parent whose partitions are external (#1533) is marked so,
+    /// and a partition of it pbps holds no uid for is left out, neither
+    /// unmanaged nor refused, while it is only what the parent makes it. One
+    /// with parts of its own is refused, naming them; one pbps holds a uid for
+    /// is refused too; and a parent not named external still refuses its
+    /// undeclared partitions (#1170).
+    #[test]
+    fn an_external_parents_partitions_are_left_out_while_they_are_its_own() {
+        let partition_of = |parent: &str| Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: t(parent),
+                bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let mut live = schema(&["app.ev"]);
+        live.tables.get_mut(&t("app.ev")).unwrap().partition_by = Some(pbps_model::PartitionBy {
+            columns: vec!["id".into()],
+            external: false,
+        });
+        live.tables.insert(t("app.ev_p1"), partition_of("app.ev"));
+        live.tables.insert(t("app.ev_p2"), partition_of("app.ev"));
+        let parents = BTreeSet::from([t("app.ev")]);
+        let managed = ids(&[("t_aaaaaa", "app.ev")]);
+        let scoped = scope(&live, &managed, &BTreeSet::new(), &parents);
+        assert!(
+            scoped.unexpressible.is_empty(),
+            "{:?}",
+            scoped.unexpressible
+        );
+        assert_eq!(scoped.external, [t("app.ev_p1"), t("app.ev_p2")]);
+        assert!(scoped.unmanaged.is_empty(), "{:?}", scoped.unmanaged);
+        assert_eq!(scoped.schema.tables.len(), 1);
+        assert!(
+            scoped.schema.tables[&t("app.ev")]
+                .partition_by
+                .as_ref()
+                .is_some_and(|by| by.external)
+        );
+
+        // Negative: a partition with an index and a storage parameter of its
+        // own is refused, by name and by part.
+        let mut extra = live.clone();
+        let p2 = extra.tables.get_mut(&t("app.ev_p2")).unwrap();
+        p2.indexes.insert(
+            "ev_p2_i".into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Column("id".to_owned()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            },
+        );
+        p2.storage_parameters
+            .insert("fillfactor".into(), "70".into());
+        let scoped = scope(&extra, &managed, &BTreeSet::new(), &parents);
+        assert_eq!(scoped.unexpressible.len(), 1, "{:?}", scoped.unexpressible);
+        assert!(
+            scoped.unexpressible[0].contains(
+                "app.ev_p2 is a partition of the managed table app.ev, whose partitions are \
+                 external, and holds indexes, storage parameters of its own"
+            ),
+            "{:?}",
+            scoped.unexpressible
+        );
+        assert_eq!(scoped.external, [t("app.ev_p1")]);
+
+        // Negative: a partition pbps holds a uid for is two owners for one
+        // table, refused rather than kept or handed over (#1833 review).
+        let scoped = scope(
+            &live,
+            &ids(&[("t_aaaaaa", "app.ev"), ("t_bbbbbb", "app.ev_p1")]),
+            &BTreeSet::new(),
+            &parents,
+        );
+        assert!(!scoped.schema.tables.contains_key(&t("app.ev_p1")));
+        assert!(
+            scoped.unexpressible.iter().any(|u| u.contains(
+                "app.ev_p1 is a partition pbps holds of the managed table app.ev, whose \
+                 partitions are external"
+            )),
+            "{:?}",
+            scoped.unexpressible
+        );
+        assert_eq!(scoped.external, [t("app.ev_p2")]);
+
+        // Negative: not named external, the undeclared partitions are refused.
+        let scoped = scope(&live, &managed, &BTreeSet::new(), &BTreeSet::new());
+        assert_eq!(scoped.unexpressible.len(), 2, "{:?}", scoped.unexpressible);
+        assert!(scoped.external.is_empty());
+        assert!(
+            scoped.schema.tables[&t("app.ev")]
+                .partition_by
+                .as_ref()
+                .is_some_and(|by| !by.external)
+        );
+    }
+
     /// Somebody else's table is not drift. Without this the check would fire on
     /// the first run in every database that has any history.
     #[test]
     fn an_unmanaged_table_does_not_change_the_managed_state() {
         let ids = ids(&[("t_aaaaaa", "dbo.customer")]);
         assert_eq!(
-            scope(&schema(&["dbo.customer"]), &ids, &BTreeSet::new()).schema,
+            scope(
+                &schema(&["dbo.customer"]),
+                &ids,
+                &BTreeSet::new(),
+                &BTreeSet::new()
+            )
+            .schema,
             scope(
                 &schema(&["dbo.customer", "dbo.other_tool"]),
                 &ids,
+                &BTreeSet::new(),
                 &BTreeSet::new()
             )
             .schema,
@@ -401,6 +647,7 @@ mod tests {
             &schema(&["dbo.customer"]),
             &ids(&[("t_aaaaaa", "dbo.customer"), ("t_bbbbbb", "dbo.order")]),
             &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(scoped.missing, vec![t("dbo.order")]);
         assert!(scoped.unmanaged.is_empty());
@@ -411,6 +658,7 @@ mod tests {
         let scoped = scope(
             &schema(&["dbo.customer"]),
             &IdsFile::default(),
+            &BTreeSet::new(),
             &BTreeSet::new(),
         );
         assert!(scoped.schema.tables.is_empty());
@@ -562,7 +810,12 @@ mod tests {
             "dbo.v_theirs",
         );
         let managed = BTreeSet::from(["dbo.v_mine".parse::<ModuleId>().unwrap()]);
-        let scoped = scope(&live, &ids(&[("t_aaaaaa", "dbo.customer")]), &managed);
+        let scoped = scope(
+            &live,
+            &ids(&[("t_aaaaaa", "dbo.customer")]),
+            &managed,
+            &BTreeSet::new(),
+        );
 
         assert_eq!(scoped.schema.modules.len(), 1);
         assert!(
@@ -605,7 +858,7 @@ mod tests {
             .roles
             .insert("r_bbbbbb".parse().unwrap(), "gone".into());
 
-        let scoped = scope(&live, &recorded, &BTreeSet::new());
+        let scoped = scope(&live, &recorded, &BTreeSet::new(), &BTreeSet::new());
         assert_eq!(scoped.unmanaged_roles, vec!["someone_elses".to_string()]);
         assert_eq!(scoped.missing_roles, vec!["gone".to_string()]);
         let kept: Vec<String> = scoped.schema.roles["app_reader"]
@@ -642,7 +895,7 @@ mod tests {
             .insert("r_aaaaaa".parse().unwrap(), "app_reader".into());
         let managed = BTreeSet::from(["app.f(integer)".parse::<ModuleId>().unwrap()]);
 
-        let scoped = scope(&live, &recorded, &managed);
+        let scoped = scope(&live, &recorded, &managed, &BTreeSet::new());
         let kept: Vec<String> = scoped.schema.roles["app_reader"]
             .grants
             .keys()

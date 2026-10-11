@@ -98,10 +98,12 @@ fn rows_to_read(scopes: &DataScopes) -> BTreeMap<TableName, RowScope> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn managed_state(
     conn: &mut Conn,
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
+    external: &BTreeSet<TableName>,
     unmanaged: pbps_config::Unmanaged,
     scopes: &DataScopes,
     reference: &Schema,
@@ -110,6 +112,7 @@ async fn managed_state(
     let request = ManagedRead {
         ids,
         modules,
+        external,
         unmanaged,
         scopes,
         reference,
@@ -121,6 +124,7 @@ async fn managed_state(
 struct ManagedRead<'a> {
     ids: &'a IdsFile,
     modules: &'a BTreeSet<ModuleId>,
+    external: &'a BTreeSet<TableName>,
     unmanaged: pbps_config::Unmanaged,
     scopes: &'a DataScopes,
     reference: &'a Schema,
@@ -133,6 +137,7 @@ impl ManagedRead<'_> {
             conn,
             self.ids,
             self.modules,
+            self.external,
             self.unmanaged,
             self.scopes,
             self.reference,
@@ -173,17 +178,27 @@ where
     Ok(captured)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn managed_state_once(
     conn: &mut Conn,
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
+    external: &BTreeSet<TableName>,
     unmanaged: pbps_config::Unmanaged,
     scopes: &DataScopes,
     reference: &Schema,
     read: crate::engine::Read,
 ) -> anyhow::Result<pbps_diff::Scoped> {
-    let managed =
-        managed_state_full(conn, ids, modules, unmanaged, &rows_to_read(scopes), read).await?;
+    let managed = managed_state_full(
+        conn,
+        ids,
+        modules,
+        external,
+        unmanaged,
+        &rows_to_read(scopes),
+        read,
+    )
+    .await?;
     refuse_managed_limitations(&managed.limitations)?;
     let mut scoped = managed.scoped;
     // Definition projection must not manufacture absence. Keep the same
@@ -1878,10 +1893,12 @@ fn refuse_managed_limitations(limitations: &[String]) -> anyhow::Result<()> {
 /// One read and two projections, never two reads: two reads would ask the
 /// engine the same thing twice and could get two answers, which is the very
 /// thing the comparison exists to detect.
+#[allow(clippy::too_many_arguments)]
 async fn baseline_state(
     conn: &mut Conn,
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
+    external: &BTreeSet<TableName>,
     unmanaged: pbps_config::Unmanaged,
     scopes: &DataScopes,
     recorded: &Schema,
@@ -1897,6 +1914,7 @@ async fn baseline_state(
         conn,
         ids,
         modules,
+        external,
         unmanaged,
         &rows_to_read(scopes),
         crate::engine::Read::Snapshot,
@@ -1938,6 +1956,7 @@ async fn staged_baseline(
     ids: &IdsFile,
     checked: &BTreeSet<ModuleId>,
     watched: &BTreeSet<ModuleId>,
+    external: &BTreeSet<TableName>,
     unmanaged: pbps_config::Unmanaged,
     checked_scopes: &DataScopes,
     recorded: &Schema,
@@ -1955,9 +1974,9 @@ async fn staged_baseline(
     // replaces each refused over their own set, so refusing over the union is
     // what keeps that (491edd9, DECISIONS 174).
     debug_assert!(checked.is_subset(watched));
-    refuse_managed_limitations(&managed_limitations(&pulled, ids, watched))?;
+    refuse_managed_limitations(&managed_limitations(&pulled, ids, watched, external))?;
 
-    let mut scoped = cut(&pulled, ids, checked, &unreadable, unmanaged)?;
+    let mut scoped = cut(&pulled, ids, checked, external, &unreadable, unmanaged)?;
     // The watch cut is the one the row read is taken against, because it is
     // the wider of the two: a module the plan creates is in it and not in the
     // checksum's, and no table is in either alone. `Unmanaged::Ignore`
@@ -1967,6 +1986,7 @@ async fn staged_baseline(
         &pulled,
         ids,
         watched,
+        external,
         &unreadable,
         pbps_config::Unmanaged::Ignore,
     )?;
@@ -2008,13 +2028,14 @@ async fn managed_state_full(
     conn: &mut Conn,
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
+    external: &BTreeSet<TableName>,
     unmanaged: pbps_config::Unmanaged,
     rows: &BTreeMap<TableName, RowScope>,
     read: crate::engine::Read,
 ) -> anyhow::Result<Managed> {
     let pulled = pull(conn, read).await?;
     let unreadable = unreadable_modules(&pulled.unmanaged_modules);
-    let limitations = managed_limitations(&pulled, ids, modules);
+    let limitations = managed_limitations(&pulled, ids, modules, external);
     let unmanaged_relations = pulled
         .limitations
         .iter()
@@ -2031,7 +2052,7 @@ async fn managed_state_full(
             | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => None,
         })
         .collect();
-    let scoped = cut(&pulled, ids, modules, &unreadable, unmanaged)?;
+    let scoped = cut(&pulled, ids, modules, external, &unreadable, unmanaged)?;
     let rows = crate::engine::read_rows(conn, &scoped.schema, rows, read)
         .await
         .context("cannot read the declared rows back")?;
@@ -2114,10 +2135,11 @@ fn cut(
     pulled: &pbps_db::catalog::Pulled,
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
+    external: &BTreeSet<TableName>,
     unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
     unmanaged: pbps_config::Unmanaged,
 ) -> anyhow::Result<pbps_diff::Scoped> {
-    let mut scoped = pbps_diff::scope(&pulled.schema, ids, modules);
+    let mut scoped = pbps_diff::scope(&pulled.schema, ids, modules, external);
     // A managed role's grant WITH GRANT OPTION is wider than the plain grant
     // the declarations can spell, and was left out of the role's set rather
     // than folded in. Carried beside the comparison so `verify` reports it
@@ -2842,8 +2864,18 @@ pub(crate) fn managed_limitations(
     pulled: &pbps_db::catalog::Pulled,
     ids: &IdsFile,
     modules: &std::collections::BTreeSet<ModuleId>,
+    external: &BTreeSet<TableName>,
 ) -> Vec<String> {
-    let managed_tables: std::collections::BTreeSet<_> = ids.tables.values().collect();
+    let mut managed_tables: std::collections::BTreeSet<_> = ids.tables.values().collect();
+    // A partition of a managed parent whose partitions are external (#1533)
+    // is held only as its parent makes it: what the catalog read could not
+    // take in, a hash index of its own say, is a part of its own the scope
+    // cannot see, and is refused as one (#1833 review).
+    managed_tables.extend(pulled.schema.tables.iter().filter_map(|(name, table)| {
+        let of = table.partition_of.as_ref()?;
+        (external.contains(&of.parent) && ids.tables.values().any(|t| t == &of.parent))
+            .then_some(name)
+    }));
     pulled
         .limitations
         .iter()
@@ -2947,6 +2979,45 @@ pub(crate) fn permissions_the_managed_set_keeps<'a>(
             Some(pbps_model::GrantTarget::Schema(_)) | None => true,
         })
         .map(|u| u.what.as_str())
+        .collect()
+}
+
+/// The tables whose partitions are external (#1533), by identity: the
+/// recorded state's and each the plan creates so. Built as
+/// [`modules_after`] is, from the state and the plan alone. A uid's setting
+/// cannot change within a plan (the differ refuses the switch), so the one
+/// set holds for every read the apply takes. Each read names them through
+/// the ids it scopes with, by [`externals_under`]: by name, a rename chain
+/// that hands a declared parent's name to an external one would mark the
+/// declared parent external before its rename ran (#1833 review).
+fn external_uids(
+    recorded: &pbps_model::StateSnapshot,
+    changes: &pbps_model::ChangeSet,
+) -> BTreeSet<pbps_model::Uid> {
+    let names = pbps_diff::external_parents(&recorded.schema);
+    let mut set: BTreeSet<_> = recorded
+        .ids
+        .tables
+        .iter()
+        .filter(|(_, name)| names.contains(*name))
+        .map(|(uid, _)| uid.clone())
+        .collect();
+    for p in &changes.changes {
+        if let pbps_model::Change::CreateTable { uid, table, .. } = &p.change
+            && table.partition_by.as_ref().is_some_and(|by| by.external)
+        {
+            set.insert(uid.clone());
+        }
+    }
+    set
+}
+
+/// The names `ids` gives the tables of [`external_uids`].
+fn externals_under(uids: &BTreeSet<pbps_model::Uid>, ids: &IdsFile) -> BTreeSet<TableName> {
+    ids.tables
+        .iter()
+        .filter(|(uid, _)| uids.contains(*uid))
+        .map(|(_, name)| name.clone())
         .collect()
 }
 
@@ -4778,6 +4849,7 @@ fn refuse_unplanned_movement(
                             .map_or(c, |(now, _)| now.clone())
                     };
                     let by = by.map(|by| pbps_model::PartitionBy {
+                        external: by.external,
                         columns: by.columns.into_iter().map(forward).collect(),
                     });
                     ((of, by), place(after.tables.get(now_name).unwrap_or(now)))
@@ -5839,6 +5911,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             &mut conn,
             &recorded_ids,
             &recorded_modules,
+            &pbps_diff::external_parents(&baseline.snapshot.schema),
             // The unmanaged policy is applied below instead, beside the
             // finished report, so that neither verdict can erase the other.
             pbps_config::Unmanaged::Ignore,
@@ -6074,6 +6147,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
                 &mut conn,
                 &ids,
                 &declared_modules,
+                &pbps_diff::external_parents(&loaded.schema),
                 project.config.unmanaged,
                 &declared_data,
                 &loaded.schema,
@@ -6166,6 +6240,7 @@ pub fn cmd_baseline(
                 &mut conn,
                 &ids,
                 &declared_modules,
+                &pbps_diff::external_parents(&loaded.schema),
                 project.config.unmanaged,
                 &declared_data,
                 &loaded.schema,
@@ -6480,6 +6555,7 @@ pub fn cmd_bootstrap(
                 &mut conn,
                 &ids,
                 &declared_modules,
+                &pbps_diff::external_parents(&loaded.schema),
                 project.config.unmanaged,
                 &BTreeMap::new(),
                 crate::engine::Read::Snapshot,
@@ -6604,6 +6680,7 @@ pub fn cmd_bootstrap(
                 &mut conn,
                 &ids,
                 &declared_modules,
+                &pbps_diff::external_parents(&loaded.schema),
                 project.config.unmanaged,
                 &loaded.schema.data_scopes(),
                 &loaded.schema,
@@ -6907,6 +6984,10 @@ pub fn cmd_plan_db(
             &mut conn,
             &recorded_ids,
             &recorded_modules,
+            // The recorded setting, as `verify` reads it: the live side is
+            // what the ledger says pbps holds, and a declared switch is the
+            // differ's to refuse (DEC-1533.1).
+            &pbps_diff::external_parents(&entry.snapshot.schema),
             pbps_config::Unmanaged::Ignore,
             &pbps_model::data::read_scopes(&recorded_data, &declared_data),
             crate::engine::Read::Snapshot,
@@ -8079,6 +8160,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         return Ok(None);
     }
     rename_snapshot_roles(&mut entry.snapshot, &role_renames);
+    let externals = external_uids(&entry.snapshot, &plan.changes);
     let recorded_ids = role_scope(&entry.snapshot.ids, &plan.ids, dialect);
     let recorded_modules = managed_modules(Some(&entry.snapshot), None);
     // The scopes the closing read-back will use, expressed in the names the
@@ -8089,6 +8171,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         conn,
         &recorded_ids,
         &recorded_modules,
+        &externals_under(&externals, &recorded_ids),
         project.config.unmanaged,
         &pinned_scopes(&entry.snapshot.schema.data_scopes(), &planned_scopes),
         &entry.snapshot.schema,
@@ -8200,6 +8283,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
             conn,
             &plan.ids,
             &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
+            &externals_under(&externals, &plan.ids),
             project.config.unmanaged,
             &plan.data,
             &Schema::default(),
@@ -8215,6 +8299,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
                 conn,
                 &plan.ids,
                 &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
+                &externals_under(&externals, &plan.ids),
                 project.config.unmanaged,
                 &plan.data,
                 &Schema::default(),
@@ -8394,6 +8479,7 @@ async fn apply_staged_under_lock(
         .await?
         .renames;
     rename_snapshot_roles(&mut entry.snapshot, &role_renames);
+    let externals = external_uids(&entry.snapshot, &plan.changes);
 
     // Both branches read once and hand back what they validated: the
     // statement to start at, and the state the checkpoints are measured
@@ -8442,6 +8528,7 @@ async fn apply_staged_under_lock(
             at_checkpoint,
             &after_modules,
             &after_modules,
+            &externals_under(&externals, at_checkpoint),
             project.config.unmanaged,
             &entry.snapshot.schema.data_scopes(),
             &entry.snapshot.schema,
@@ -8539,6 +8626,7 @@ async fn apply_staged_under_lock(
             &recorded_ids,
             &recorded_modules,
             &modules_after(&entry.snapshot, &plan.changes, Settled::SoFar),
+            &externals_under(&externals, &recorded_ids),
             project.config.unmanaged,
             &pinned_scopes(
                 &entry.snapshot.schema.data_scopes(),
@@ -8753,6 +8841,7 @@ async fn apply_staged_under_lock(
             conn,
             &live_ids,
             &modules_after(&entry.snapshot, &plan.changes, Settled::SoFar),
+            &externals_under(&externals, &live_ids),
             pbps_config::Unmanaged::Ignore,
             &scopes_at(plan, &live_ids),
             &Schema::default(),
@@ -8838,6 +8927,7 @@ async fn apply_staged_under_lock(
         conn,
         &plan.ids,
         &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
+        &externals_under(&externals, &plan.ids),
         project.config.unmanaged,
         &plan.data,
         &Schema::default(),
@@ -10811,6 +10901,7 @@ mod tests {
         let parent = Table {
             columns: [("id".to_owned(), column())].into_iter().collect(),
             partition_by: Some(PartitionBy {
+                external: false,
                 columns: vec!["id".into()],
             }),
             ..Table::default()
@@ -12196,6 +12287,7 @@ mod tests {
         let empty = pbps_diff::Scoped {
             schema: Schema::default(),
             unmanaged: Vec::new(),
+            external: Vec::new(),
             missing: Vec::new(),
             unmanaged_modules: Vec::new(),
             unmanaged_roles: Vec::new(),
@@ -12251,6 +12343,7 @@ mod tests {
         let empty = pbps_diff::Scoped {
             schema: Schema::default(),
             unmanaged: Vec::new(),
+            external: Vec::new(),
             missing: Vec::new(),
             unmanaged_modules: Vec::new(),
             unmanaged_roles: Vec::new(),
@@ -12321,6 +12414,7 @@ mod tests {
             let mut scoped = pbps_diff::scope(
                 &pbps_model::Schema::default(),
                 &pbps_model::IdsFile::default(),
+                &Default::default(),
                 &Default::default(),
             );
             if open {
@@ -12750,6 +12844,7 @@ mod tests {
         let request = ManagedRead {
             ids: &ids,
             modules: &modules,
+            external: &BTreeSet::new(),
             unmanaged: pbps_config::Unmanaged::Ignore,
             scopes: &scopes,
             reference: &reference,
@@ -13187,7 +13282,14 @@ mod tests {
     fn a_state_that_cannot_be_expressed_is_not_recorded_by_any_command() {
         // The real constructor, so the empty case is the one a clean
         // database actually produces.
-        let empty = || pbps_diff::scope(&Schema::default(), &IdsFile::default(), &BTreeSet::new());
+        let empty = || {
+            pbps_diff::scope(
+                &Schema::default(),
+                &IdsFile::default(),
+                &BTreeSet::new(),
+                &Default::default(),
+            )
+        };
         for then in ["plan again", "snapshot again", "baseline again"] {
             refuse_unexpressible(&empty(), "prod", then).expect("nothing to refuse");
         }
@@ -13285,6 +13387,7 @@ mod tests {
             to: "bigint".parse().unwrap(),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         }]);
@@ -14297,6 +14400,7 @@ mod tests {
                     to: "nvarchar(100)".parse().unwrap(),
                     from_nullable: true,
                     to_nullable: true,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 },
@@ -14828,6 +14932,7 @@ mod tests {
                     column: "dbo.t.note".parse().unwrap(),
                     ty: "nvarchar(50)".parse().unwrap(),
                     to_nullable: false,
+                    through_external_partitions: false,
                     collation: None,
                 },
             )],
@@ -15457,6 +15562,7 @@ mod tests {
                     .insert(c.into(), Column::new("integer".parse().unwrap()));
             }
             p.partition_by = Some(PartitionBy {
+                external: false,
                 columns: vec!["v".into()],
             });
             let t = Table {
@@ -15651,6 +15757,7 @@ mod tests {
             column: pbps_model::ColumnRef::new(parent.clone(), "w"),
             ty: "integer".parse().unwrap(),
             to_nullable: false,
+            through_external_partitions: false,
             collation: None,
         }]);
         check(
@@ -15779,6 +15886,7 @@ mod tests {
             .into_iter()
             .collect();
             p.partition_by = Some(PartitionBy {
+                external: false,
                 columns: vec![key.into()],
             });
             s
@@ -17351,6 +17459,7 @@ mod tests {
                     to: "nvarchar(100)".parse().unwrap(),
                     from_nullable: true,
                     to_nullable: true,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 },
@@ -17406,6 +17515,7 @@ mod tests {
                     to: "nvarchar(100)".parse().unwrap(),
                     from_nullable: true,
                     to_nullable: false,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 },
@@ -17475,6 +17585,7 @@ mod tests {
                     column: "dbo.t.note".parse().unwrap(),
                     ty: "int".parse().unwrap(),
                     to_nullable: false,
+                    through_external_partitions: false,
                     collation: None,
                 },
             )],
@@ -18332,6 +18443,7 @@ mod tests {
                 to: ColumnType::from_str("varchar(10)").unwrap(),
                 from_nullable: false,
                 to_nullable: false,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             })
@@ -18421,6 +18533,7 @@ mod tests {
                 to: ColumnType::from_str("varchar(10)").unwrap(),
                 from_nullable: false,
                 to_nullable: false,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             })],
@@ -18690,7 +18803,7 @@ mod tests {
     #[test]
     fn a_module_in_the_managed_set_that_cannot_be_read_back_is_a_limitation() {
         let modules = std::iter::once("dbo.declared_secret".parse().unwrap()).collect();
-        let found = managed_limitations(&pulled(), &ids(), &modules);
+        let found = managed_limitations(&pulled(), &ids(), &modules, &BTreeSet::new());
         assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(found[0], "dbo.managed has a computed column");
         assert!(
@@ -18705,10 +18818,15 @@ mod tests {
     /// limitation — and a limitation on somebody else's table is neither.
     #[test]
     fn objects_outside_the_managed_set_are_not_limitations() {
-        let found = managed_limitations(&pulled(), &ids(), &Default::default());
+        let found = managed_limitations(&pulled(), &ids(), &Default::default(), &BTreeSet::new());
         assert_eq!(found, ["dbo.managed has a computed column"]);
 
-        let found = managed_limitations(&pulled(), &IdsFile::default(), &Default::default());
+        let found = managed_limitations(
+            &pulled(),
+            &IdsFile::default(),
+            &Default::default(),
+            &BTreeSet::new(),
+        );
         assert!(found.is_empty(), "{found:?}");
     }
 
@@ -18719,10 +18837,15 @@ mod tests {
     fn every_unreadable_module_is_either_a_limitation_or_unmanaged() {
         let pulled = pulled();
         let modules = std::iter::once("dbo.declared_secret".parse().unwrap()).collect();
-        let scoped = pbps_diff::scope(&pulled.schema, &IdsFile::default(), &modules);
+        let scoped = pbps_diff::scope(
+            &pulled.schema,
+            &IdsFile::default(),
+            &modules,
+            &Default::default(),
+        );
         let unreadable = unreadable_modules(&pulled.unmanaged_modules);
 
-        let limited = managed_limitations(&pulled, &IdsFile::default(), &modules);
+        let limited = managed_limitations(&pulled, &IdsFile::default(), &modules, &BTreeSet::new());
         let unmanaged = unmanaged_objects(&scoped, &unreadable, &IdsFile::default(), &modules);
         assert!(limited.iter().any(|l| l.contains("dbo.declared_secret")));
         assert!(!limited.iter().any(|l| l.contains("dbo.stray_secret")));
@@ -18760,7 +18883,7 @@ mod tests {
             });
         }
         let before = pulled.unmanaged_modules.clone();
-        let facts = managed_limitations(&pulled, &IdsFile::default(), &modules);
+        let facts = managed_limitations(&pulled, &IdsFile::default(), &modules, &BTreeSet::new());
         assert_eq!(facts.len(), 4, "{facts:?}");
         assert_eq!(facts[0], "omitted aggregate");
         assert_eq!(facts[1], "another unsupported property");
@@ -18768,7 +18891,15 @@ mod tests {
         assert!(facts[3].contains("app.f(bigint)") && facts[3].contains("omitted aggregate"));
         assert_eq!(pulled.unmanaged_modules, before);
         assert_eq!(pulled.limitations.len(), 2);
-        assert!(managed_limitations(&pulled, &IdsFile::default(), &BTreeSet::new()).is_empty());
+        assert!(
+            managed_limitations(
+                &pulled,
+                &IdsFile::default(),
+                &BTreeSet::new(),
+                &BTreeSet::new()
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -18800,7 +18931,7 @@ mod tests {
         }
         let modules = BTreeSet::new();
         // The identity remains authoritative even though no table was pulled.
-        let scoped = pbps_diff::scope(&pulled.schema, &ids, &modules);
+        let scoped = pbps_diff::scope(&pulled.schema, &ids, &modules, &Default::default());
         assert!(scoped.schema.tables.is_empty());
         let unreadable = unreadable_modules(&pulled.unmanaged_modules);
         let outside = unmanaged_objects(&scoped, &unreadable, &ids, &modules);
@@ -18817,23 +18948,23 @@ mod tests {
                 .any(|fact| fact.contains(&pulled.limitations[0].detail))
         );
         assert_eq!(
-            managed_limitations(&pulled, &ids, &modules),
+            managed_limitations(&pulled, &ids, &modules, &BTreeSet::new()),
             [pulled.limitations[0].detail.clone()]
         );
 
         // Inventory-only fallback has the same membership even without a
         // typed limitation; SQL Server's shared-module fallback is tested above.
         pulled.limitations.clear();
-        let facts = managed_limitations(&pulled, &ids, &modules);
+        let facts = managed_limitations(&pulled, &ids, &modules, &BTreeSet::new());
         assert_eq!(facts.len(), 1, "{facts:?}");
         assert!(facts[0].contains("dbo.managed is in the managed set"));
         let empty = IdsFile::default();
-        let unscoped = pbps_diff::scope(&pulled.schema, &empty, &modules);
+        let unscoped = pbps_diff::scope(&pulled.schema, &empty, &modules, &Default::default());
         assert_eq!(
             unmanaged_objects(&unscoped, &unreadable, &empty, &modules).len(),
             5
         );
-        assert!(managed_limitations(&pulled, &empty, &modules).is_empty());
+        assert!(managed_limitations(&pulled, &empty, &modules, &BTreeSet::new()).is_empty());
     }
 
     #[test]
@@ -18870,14 +19001,19 @@ mod tests {
                 why: "cannot be represented".into(),
             })
             .collect();
-        let scoped = pbps_diff::scope(&pulled.schema, &IdsFile::default(), &held);
+        let scoped = pbps_diff::scope(
+            &pulled.schema,
+            &IdsFile::default(),
+            &held,
+            &Default::default(),
+        );
         let unreadable = unreadable_modules(&pulled.unmanaged_modules);
         let unmanaged = unmanaged_objects(&scoped, &unreadable, &IdsFile::default(), &held);
         assert_eq!(unmanaged.len(), 3, "{unmanaged:?}");
         assert!(unmanaged.iter().any(|s| s.contains("app.f(bigint)")));
         assert!(unmanaged.iter().any(|s| s.contains("app.other.audit")));
         assert!(unmanaged.iter().any(|s| s.contains("module app.f (")));
-        let limited = managed_limitations(&pulled, &IdsFile::default(), &held);
+        let limited = managed_limitations(&pulled, &IdsFile::default(), &held, &BTreeSet::new());
         assert_eq!(limited.len(), 2, "{limited:?}");
         assert!(limited.iter().any(|s| s.contains("app.f(integer)")));
         assert!(limited.iter().any(|s| s.contains("app.t.audit")));
@@ -18957,6 +19093,7 @@ mod tests {
             to: "bigint".parse().unwrap(),
             from_nullable: false,
             to_nullable: false,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         });
@@ -18997,6 +19134,7 @@ mod tests {
             column: dbo_t.column("kept"),
             ty: "int".parse().unwrap(),
             to_nullable: true,
+            through_external_partitions: false,
             collation: None,
         });
         let e = refuse_unplanned_movement(
@@ -19159,6 +19297,7 @@ mod tests {
                     to: "bigint".parse().unwrap(),
                     from_nullable: false,
                     to_nullable: false,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 }),
@@ -19216,6 +19355,7 @@ mod tests {
                     column: dbo_t.column("c"),
                     ty: "varchar(10)".parse().unwrap(),
                     to_nullable: false,
+                    through_external_partitions: false,
                     collation: Some(Collation::new("Latin1_General_CS_AS")),
                 },
             )],
@@ -19244,6 +19384,7 @@ mod tests {
                     column: dbo_t.column("n"),
                     ty: "int".parse().unwrap(),
                     to_nullable: true,
+                    through_external_partitions: false,
                     collation: None,
                 },
             )],

@@ -2492,6 +2492,7 @@ mod tests {
             column: cref("dbo.customer.email"),
             ty: ty("nvarchar(255)"),
             to_nullable: false,
+            through_external_partitions: false,
             collation: None,
         });
         assert_eq!(
@@ -2663,6 +2664,7 @@ mod tests {
                 column: cref("dbo.customer.email"),
                 ty: ty("nvarchar(255)"),
                 to_nullable: true,
+                through_external_partitions: false,
                 collation: None,
             })
             .is_empty()
@@ -2681,6 +2683,7 @@ mod tests {
             to: ty("nvarchar(50)"),
             from_nullable: true,
             to_nullable: false,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         });
@@ -2706,6 +2709,7 @@ mod tests {
             to: ty(ty_),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: to.map(pbps_model::Collation::new),
         };
@@ -2836,6 +2840,7 @@ mod tests {
                 to: ty("varchar(10)"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: Some(pbps_model::Collation::new("Latin1_General_CS_AS")),
             })
@@ -2888,6 +2893,7 @@ mod tests {
                     to: ty("nvarchar(255)"),
                     from_nullable: false,
                     to_nullable: false,
+                    through_external_partitions: false,
                     from_collation: Some(pbps_model::Collation::new("Latin1_General_CS_AS")),
                     to_collation: Some(pbps_model::Collation::new("Latin1_General_CI_AS")),
                 }),
@@ -2931,6 +2937,7 @@ mod tests {
             to: ty("nvarchar(50)"),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         });
@@ -2961,6 +2968,7 @@ mod tests {
             to: ty("sysname"),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         });
@@ -2990,6 +2998,7 @@ mod tests {
                 to: ty("sysname"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             })
@@ -3009,6 +3018,7 @@ mod tests {
             to: ty("sysname"),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         });
@@ -3043,6 +3053,7 @@ mod tests {
                 to: target,
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             });
@@ -3085,6 +3096,7 @@ mod tests {
                 to: target,
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             });
@@ -3111,6 +3123,7 @@ mod tests {
                 to: ty(to),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             });
@@ -3135,6 +3148,7 @@ mod tests {
                 to: ty(to),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             });
@@ -3155,6 +3169,7 @@ mod tests {
             to: ty("int"),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         });
@@ -3195,6 +3210,7 @@ mod tests {
                     to: ty(to),
                     from_nullable: false,
                     to_nullable: false,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 })
@@ -3209,6 +3225,7 @@ mod tests {
             to: ty("varbinary(8)"),
             from_nullable: false,
             to_nullable: false,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         });
@@ -3228,6 +3245,7 @@ mod tests {
                 to: ty("bigint"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             })
@@ -3515,6 +3533,7 @@ mod tests {
                 to: ty("varchar(10)"),
                 from_nullable: true,
                 to_nullable: true,
+                through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
             },
@@ -3879,6 +3898,7 @@ mod tests {
             to: ty("varchar(2)"),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         };
@@ -3902,6 +3922,7 @@ mod tests {
                     to: ty("varchar(2)"),
                     from_nullable: true,
                     to_nullable: true,
+                    through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
                 },
@@ -4913,6 +4934,7 @@ mod tests {
                 column: cref("dbo.customer.email"),
                 ty: ty("nvarchar(255)"),
                 to_nullable: false,
+                through_external_partitions: false,
                 collation: None,
             },
             Change::AddCheck {
@@ -4960,6 +4982,7 @@ mod tests {
                 column: cref("dbo.customer.contact_email"),
                 ty: ty("nvarchar(255)"),
                 to_nullable: false,
+                through_external_partitions: false,
                 collation: None,
             },
         ]);

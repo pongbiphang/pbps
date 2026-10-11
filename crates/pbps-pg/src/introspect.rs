@@ -891,7 +891,10 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             partition_by: raw_table
                 .partition_key
                 .clone()
-                .map(|columns| pbps_model::PartitionBy { columns }),
+                .map(|columns| pbps_model::PartitionBy {
+                    external: false,
+                    columns,
+                }),
             ..Table::default()
         };
 

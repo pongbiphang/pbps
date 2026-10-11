@@ -417,11 +417,39 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
         })
     });
 
+    // `partitions: external` (#1533): the parent alone, with no partition
+    // declared; any other word is not a setting.
+    let (external, declared) = match dto.partitions {
+        crate::dto::PartitionsDto::Declared(declared) => (false, declared),
+        crate::dto::PartitionsDto::External(word) if word == "external" => {
+            (true, indexmap::IndexMap::new())
+        }
+        crate::dto::PartitionsDto::External(word) => {
+            errs.push(LoadError::semantic(
+                src,
+                to_span(&dto.table.defined),
+                format!(
+                    "`partitions:` is `{word}`: write `external`, or a mapping of partitions by \
+                     name"
+                ),
+                "not a partitions setting",
+            ));
+            (false, indexmap::IndexMap::new())
+        }
+    };
     let partition_by = dto
         .partition_by
-        .map(|columns| pbps_model::PartitionBy { columns });
+        .map(|columns| pbps_model::PartitionBy { columns, external });
     let mut partitions = Vec::new();
-    if partition_by.is_none() && !dto.partitions.is_empty() {
+    if partition_by.is_none() && external {
+        errs.push(LoadError::semantic(
+            src,
+            to_span(&dto.table.defined),
+            "`partitions: external` is declared without `partition_by:`",
+            "external partitions need their parent's key",
+        ));
+    }
+    if partition_by.is_none() && !declared.is_empty() {
         errs.push(LoadError::semantic(
             src,
             to_span(&dto.table.defined),
@@ -430,7 +458,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
         ));
     }
     if let Some(parent) = &name {
-        for (child, partition) in dto.partitions {
+        for (child, partition) in declared {
             let child_name = if child.contains('.') {
                 match TableName::from_str(&child) {
                     Ok(n) => n,

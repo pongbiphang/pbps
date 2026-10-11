@@ -167,8 +167,17 @@ elif command[0] != 'sleep':
         self.assertEqual(result.returncode, 0, result.stderr)
         first_client = next(i for i, c in enumerate(calls) if c[0] == "cargo")
         for name in ("pbps-test-pg", "pbps-test-pg16", "pbps-test-pg-scratch"):
-            probes = [c for c in calls[:first_client] if c[:3] == ["docker", "exec", name]]
+            probes = [c for c in calls[:first_client]
+                      if c[:4] == ["docker", "exec", name, "pg_isready"]]
             self.assertEqual(len(probes), 3)
+        # pg_partman (#1533) goes onto the two servers the flow cases use,
+        # once each is ready and before any client runs; never the scratch.
+        last_probe = max(i for i, c in enumerate(calls) if c[3:4] == ["pg_isready"])
+        installs = [(i, c[2]) for i, c in enumerate(calls)
+                    if c[:2] == ["docker", "exec"] and "partman" in " ".join(c)]
+        # In either order: the two run at once.
+        self.assertCountEqual([name for _, name in installs], ["pbps-test-pg", "pbps-test-pg16"])
+        self.assertTrue(all(last_probe < i < first_client for i, _ in installs), installs)
         self.assertEqual([c for c in calls if c[0] in ("cargo", "python3")], [
             ["python3", "scripts/check-live-fixture.py", "--cell", "pg18", "--container", "pbps-test-pg", "--port", "54320"],
             ["python3", "scripts/check-live-fixture.py", "--cell", "pg16", "--container", "pbps-test-pg16", "--port", "54321"],

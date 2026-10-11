@@ -459,6 +459,27 @@ pub async fn database_collation(conn: &mut Conn) -> Result<Option<String>, DbErr
     }
 }
 
+/// The schema pg_partman is installed in, if it is (#1533). SQL Server has
+/// no such tool, and no partitioned table in this model.
+pub async fn partman_schema(conn: &mut Conn) -> Result<Option<String>, DbError> {
+    match conn.driver() {
+        Driver::Mssql => Ok(None),
+        Driver::Postgres => pbps_pg::partman::schema(conn).await,
+    }
+}
+
+/// The parents pg_partman's catalog in `schema` names (#1533). Reached only
+/// through [`partman_schema`], which answers `None` on SQL Server.
+pub async fn partman_maintained(
+    conn: &mut Conn,
+    schema: &str,
+) -> Result<Vec<pbps_pg::partman::Maintained>, DbError> {
+    match conn.driver() {
+        Driver::Mssql => Ok(Vec::new()),
+        Driver::Postgres => pbps_pg::partman::maintained(conn, schema).await,
+    }
+}
+
 /// Refuses a declared column collation the target does not have (#1175), by
 /// name and before any statement runs. PostgreSQL declares none: `validate`
 /// refuses the field there.
@@ -3342,6 +3363,7 @@ mod tests {
             to: "bigint".parse().unwrap(),
             from_nullable: true,
             to_nullable: true,
+            through_external_partitions: false,
             from_collation: None,
             to_collation: None,
         };
@@ -4195,6 +4217,7 @@ mod tests {
                         to: "bigint".parse().unwrap(),
                         from_nullable: true,
                         to_nullable: true,
+                        through_external_partitions: false,
                         from_collation: None,
                         to_collation: None,
                     },

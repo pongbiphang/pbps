@@ -127,6 +127,7 @@ fn nullability_mutations_preserve_unchanged_default_fingerprints() {
                 column: table().column("n"),
                 ty: "integer".parse().unwrap(),
                 to_nullable,
+                through_external_partitions: false,
                 collation: None,
             },
             "column",
