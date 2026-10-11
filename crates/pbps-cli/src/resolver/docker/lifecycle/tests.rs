@@ -775,6 +775,8 @@ async fn fixed_launch_survives_bootstrap_and_explicit_close_removes_the_live_can
         .acquire(&pbps_config::resolver::ResolverProfile::Docker {
             image,
             pull: pbps_config::resolver::PullPolicy::Never,
+            baseline: None,
+            outside_writes: Default::default(),
         })
         .await
         .unwrap();

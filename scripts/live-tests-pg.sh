@@ -124,8 +124,11 @@ python3 scripts/live-transport.py pg
 # it asks anything (DECISIONS 415). Run here rather than left to
 # `cargo test --workspace`, which does not pass `--ignored`.
 cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1 "$@"
-# The operator-vouched resolver end to end (#1672), with no root or Docker of
-# its own: the three servers above are its targets and scratch servers.
+# The operator-vouched resolver end to end (#1672), with no root: the three
+# servers above are its targets and scratch servers, and a Docker scratch
+# (#1674) starts from their images, already here.
+PBPS_TEST_PG_SCRATCH_IMAGE=${PBPS_TEST_PG_SCRATCH_IMAGE:-$IMAGE} \
+PBPS_TEST_PG_OLD_SCRATCH_IMAGE=${PBPS_TEST_PG_OLD_SCRATCH_IMAGE:-$OLD_IMAGE} \
 cargo test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::vouched::live_tests "$@"
 # The CLI end to end on this engine, serially: each test creates and drops a
 # database of its own, and two of those racing is a race the engine can lose.

@@ -123,7 +123,7 @@ pub fn validate_runtime(runtime: &ResolverRuntime) -> Result<(), &'static str> {
         }
         // Nothing to enforce: the operator vouches for it, and the evidence
         // says so (DEC-1528.1).
-        ResolverRuntime::Vouched => Ok(()),
+        ResolverRuntime::Vouched { .. } => Ok(()),
         ResolverRuntime::Container { .. } | ResolverRuntime::Supplied { .. } => {
             Err("this build cannot enforce the recorded resolver runtime profile")
         }

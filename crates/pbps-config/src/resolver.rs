@@ -26,6 +26,37 @@ pub enum PullPolicy {
     IfMissing,
 }
 
+/// What a baseline may change outside the scratch database (#1674).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OutsideWrites {
+    /// A baseline that changes catalog state outside the scratch database
+    /// (a role, another database's settings) is rolled back and refused
+    /// (DEC-1673.1).
+    #[default]
+    Refuse,
+    /// Such changes are kept and not checked. pbps does not clean them up: a
+    /// Docker scratch drops them with its container, and on a server scratch
+    /// they are the operator's. The evidence records the choice.
+    Allow,
+}
+
+impl OutsideWrites {
+    fn is_refuse(&self) -> bool {
+        *self == OutsideWrites::Refuse
+    }
+}
+
 /// Only a configured source can be selected; an image suggestion is not an
 /// acquisition instruction. Neither variant can represent two backends.
 #[derive(
@@ -43,6 +74,17 @@ pub enum ResolverProfile {
         image: String,
         #[serde(default)]
         pull: PullPolicy,
+        /// As a server entry's: the SQL file that stages the objects outside
+        /// the managed set (#1673).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "baseline_path"
+        )]
+        #[schemars(length(min = 1))]
+        baseline: Option<std::path::PathBuf>,
+        #[serde(default, skip_serializing_if = "OutsideWrites::is_refuse")]
+        outside_writes: OutsideWrites,
     },
     Server {
         /// Separate scratch credentials, read only when resolution is needed.
@@ -66,6 +108,8 @@ pub enum ResolverProfile {
         )]
         #[schemars(length(min = 1))]
         baseline: Option<std::path::PathBuf>,
+        #[serde(default, skip_serializing_if = "OutsideWrites::is_refuse")]
+        outside_writes: OutsideWrites,
     },
 }
 
@@ -435,6 +479,8 @@ mod tests {
             ResolverProfile::Docker {
                 image: "postgres:18".into(),
                 pull: PullPolicy::Never,
+                baseline: None,
+                outside_writes: OutsideWrites::Refuse,
             }
         );
         assert!(config("").select_resolver(None, None).unwrap().is_none());
@@ -460,7 +506,7 @@ mod tests {
             "{kind: unknown}",
             "{kind: docker, image: postgres:18, standard: {comment: c}}",
             // Docker stays the measured profile until #1674.
-            "{kind: docker, image: postgres:18, baseline: baseline.sql}",
+            "{kind: docker, image: postgres:18, outside_writes: sometimes}",
             "{kind: server, url_env: S, baseline: ''}",
         ] {
             assert!(
@@ -472,6 +518,43 @@ mod tests {
                 "{profile}"
             );
         }
+    }
+
+    #[test]
+    fn either_kind_takes_a_baseline_and_an_outside_write_choice() {
+        let config = Config::parse(
+            "dialect: postgres\nresolvers:\n  \
+             d: {kind: docker, image: postgres:18, baseline: db/b.sql, outside_writes: allow}\n  \
+             s: {kind: server, url_env: S, outside_writes: allow}\n  \
+             plain: {kind: server, url_env: S}\n",
+            Path::new("pbps.yml"),
+        )
+        .unwrap();
+        let ResolverProfile::Docker {
+            baseline,
+            outside_writes,
+            ..
+        } = &config.resolvers["d"]
+        else {
+            panic!("a docker entry");
+        };
+        assert_eq!(baseline.as_deref(), Some(Path::new("db/b.sql")));
+        assert_eq!(*outside_writes, OutsideWrites::Allow);
+        assert!(matches!(
+            config.resolvers["s"],
+            ResolverProfile::Server {
+                outside_writes: OutsideWrites::Allow,
+                ..
+            }
+        ));
+        // Negative: omitted, a baseline's outside writes are refused.
+        assert!(matches!(
+            config.resolvers["plain"],
+            ResolverProfile::Server {
+                outside_writes: OutsideWrites::Refuse,
+                ..
+            }
+        ));
     }
 
     #[test]

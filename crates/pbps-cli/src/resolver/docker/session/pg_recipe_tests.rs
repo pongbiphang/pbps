@@ -294,6 +294,8 @@ async fn the_public_factory_runs_the_pinned_engine_on_bounded_private_storage() 
         .acquire(&ResolverProfile::Docker {
             image: image_ref.into(),
             pull: PullPolicy::Never,
+            baseline: None,
+            outside_writes: Default::default(),
         })
         .await
         .unwrap();

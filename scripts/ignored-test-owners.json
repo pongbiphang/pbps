@@ -606,7 +606,7 @@
         "engine::tests::a_module_handed_to_the_postgres_rename_impact_is_refused_not_empty",
         "engine::tests::the_postgres_arms_answer_engine_only_questions_by_name",
         "engine::tests::the_role_questions_refuse_on_postgres_rather_than_answer_none",
-        "resolution::tests::only_a_supplied_server_demands_the_cluster_identity_grant"
+        "resolution::tests::every_resolver_kind_demands_the_cluster_identity_grant"
       ]
     },
     {
@@ -2207,6 +2207,14 @@
         "resolver::server::vouched::live_tests::vouched_refuses_a_declared_setting_the_scratch_account_may_not_set_before_writing",
         "resolver::server::vouched::live_tests::vouched_refuses_a_declared_value_the_engine_rejects_before_writing",
         "resolver::server::vouched::live_tests::vouched_compiles_a_managed_view_over_a_baseline_table",
+        "resolver::server::vouched::live_tests::vouched_docker_starts_and_removes_its_container_without_root",
+        "resolver::server::vouched::live_tests::vouched_docker_removes_its_container_when_the_run_fails",
+        "resolver::server::vouched::live_tests::vouched_docker_answers_a_managed_question",
+        "resolver::server::vouched::live_tests::vouched_docker_records_the_image_as_configured_and_unverified",
+        "resolver::server::vouched::live_tests::vouched_docker_binds_the_target_by_its_cluster_identity",
+        "resolver::server::vouched::live_tests::vouched_docker_refuses_a_missing_image_it_may_not_pull",
+        "resolver::server::vouched::live_tests::vouched_docker_stages_its_baseline",
+        "resolver::server::vouched::live_tests::vouched_baseline_outside_writes_allow_keeps_a_created_role",
         "resolver::server::vouched::live_tests::vouched_compares_an_external_table_without_its_foreign_keys_and_triggers",
         "resolver::server::vouched::live_tests::vouched_refuses_a_baseline_that_differs_from_the_target",
         "resolver::server::vouched::live_tests::vouched_refuses_a_baseline_that_creates_a_managed_object",

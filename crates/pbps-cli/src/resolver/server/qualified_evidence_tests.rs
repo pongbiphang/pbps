@@ -453,6 +453,8 @@ async fn open(profile: Profile, target: &mut NativeTarget) -> ScratchRun {
                 .acquire(&ResolverProfile::Docker {
                     image,
                     pull: PullPolicy::Never,
+                    baseline: None,
+                    outside_writes: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -514,6 +516,8 @@ async fn produced(
                 ResolverProfile::Docker {
                     image: std::env::var("PBPS_RESOLVER_TEST_IMAGE").unwrap(),
                     pull: PullPolicy::Never,
+                    baseline: None,
+                    outside_writes: Default::default(),
                 },
             )
         }
@@ -525,6 +529,7 @@ async fn produced(
                     url_env: "PBPS_SERVER_ENDPOINT".into(),
                     standard: None,
                     baseline: None,
+                    outside_writes: Default::default(),
                 },
             )
         }
@@ -590,6 +595,7 @@ async fn the_production_run_connects_with_the_callers_driver() {
             url_env: "PBPS_1514_UNSET".into(),
             standard: None,
             baseline: None,
+            outside_writes: Default::default(),
         },
         "Server=localhost,1;User Id=sa;Password=x;Encrypt=false",
         &inputs.binding(),
