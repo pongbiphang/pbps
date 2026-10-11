@@ -571,6 +571,13 @@ YAML_NON_STRINGS = {"true", "false", "yes", "no", "on", "off", "y", "n", "null"}
 # Any other condition, or a spelling of this one, still needs an audit.
 PULL_REQUEST_OMISSION = "${{ github.event_name != 'pull_request' }}"
 
+# `continue-on-error` runs the cases but keeps their failure out of the job's
+# result, which is what `ci-gate` reads, so an owner under it could never block
+# a merge (#1380). Only a literal false leaves the result alone. The key is
+# found whatever follows its colon, so a value on the next line, which YAML
+# reads as `true` as readily, is read as empty and refused.
+KEEPS_FAILURES = ("false", "${{ false }}")
+
 
 def workflow_runs(source, job, platform=None):
     """Read the repository's run scalar/block subset; ambiguous owners fail."""
@@ -586,6 +593,8 @@ def workflow_runs(source, job, platform=None):
     job_conditions = [c.strip() for c in re.findall(r"^    if: (.+)$", body, re.M)]
     require(job_conditions in ([], [PULL_REQUEST_OMISSION]),
             f"conditional owner job needs an explicit audit: {job}")
+    require(all(v.strip() in KEEPS_FAILURES for v in re.findall(r"^    continue-on-error:(.*)$", body, re.M)),
+            f"continue-on-error needs an explicit execution audit: {job}")
     steps = re.split(r"^      - ", body, flags=re.M)[1:]
     require(not re.search(r"^        (include|exclude):", body, re.M),
             f"matrix include/exclude needs an explicit execution audit: {job}")
@@ -638,12 +647,18 @@ def workflow_runs(source, job, platform=None):
                 if not line.strip(): continue
                 if not line.startswith("          "): break
                 lines.append(line[10:])
-            yield "\n".join(lines)
+            script = "\n".join(lines)
         elif scalar.startswith(('"', "'")):
             raise InventoryError(f"quoted run scalar needs an explicit audit: {job}")
         else:
             require(not scalar.startswith((">", "&", "*")), f"unsupported run scalar: {scalar}")
-            yield scalar
+            script = scalar
+        # On the step, only where it carries a command an owner could be: a
+        # step that runs no case cannot hide a case's failure.
+        tolerated = re.search(r"(?:^|\n)(?:        )?continue-on-error:(.*)", step)
+        require(not tolerated or tolerated[1].strip() in KEEPS_FAILURES or not any(True for _ in shell_commands(script)),
+                f"continue-on-error needs an explicit execution audit: {job}")
+        yield script
 
 
 def shell_commands(script):
