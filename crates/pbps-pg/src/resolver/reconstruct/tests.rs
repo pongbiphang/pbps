@@ -474,6 +474,7 @@ fn a_partitions_own_default_is_set_after_its_parents_and_its_functions() {
     v.default = Some("0".into());
     parent.columns.insert("v".into(), v);
     parent.partition_by = Some(PartitionBy {
+        external: false,
         columns: vec!["v".into()],
     });
     schema.tables.insert(TableName::new("app", "ev"), parent);

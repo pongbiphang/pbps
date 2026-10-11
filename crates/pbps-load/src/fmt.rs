@@ -232,7 +232,12 @@ pub fn render_partitioned(
     }
     if let Some(by) = &table.partition_by {
         let _ = writeln!(s, "\npartition_by: {}", seq(&by.columns));
-        if !partitions.is_empty() {
+        // Another tool's partitions are not listed (#1533): a caller handing
+        // some over with the setting has two sources of truth, and the
+        // setting wins, as the loader reads it.
+        if by.external {
+            s.push_str("\npartitions: external\n");
+        } else if !partitions.is_empty() {
             s.push_str("\npartitions:\n");
             let mut sorted: Vec<&(&TableName, &Table)> = partitions.iter().collect();
             sorted.sort_by(|a, b| a.0.cmp(b.0));
@@ -1775,6 +1780,7 @@ indexes:
             };
             let parent = pbps_model::Table {
                 partition_by: Some(pbps_model::PartitionBy {
+                    external: false,
                     columns: vec!["a".to_owned()],
                 }),
                 ..crate::load_table_str(
@@ -1821,6 +1827,53 @@ indexes:
         .unwrap();
         assert!(t.partitions.is_empty() && t.table.partition_by.is_none());
         assert!(!render(&t.name, &t.table, &[], None).contains("partition"));
+    }
+
+    /// `partitions: external` (#1533) declares the parent alone: no
+    /// partition is loaded, the key says so, and it renders back as written.
+    /// Any other word, and the setting without a key, are refused by name.
+    #[test]
+    fn external_partitions_are_a_setting_on_the_parent_alone() {
+        let yaml = "table: app.ev\ncolumns:\n  ts: {type: date, nullable: false}\n\npartition_by: \
+                    [ts]\n\npartitions: external\n";
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        assert!(t.partitions.is_empty());
+        assert_eq!(
+            t.table.partition_by,
+            Some(pbps_model::PartitionBy {
+                columns: vec!["ts".into()],
+                external: true,
+            })
+        );
+        let out = render(&t.name, &t.table, &[], None);
+        assert!(
+            out.ends_with("\npartition_by: [ts]\n\npartitions: external\n"),
+            "{out}"
+        );
+        let back = crate::load_table_str(Path::new("t.yml"), &out).unwrap();
+        assert_eq!(back.table, t.table, "{out}");
+        assert!(back.partitions.is_empty());
+        // Negative: a word that is not the setting.
+        let errs = crate::load_table_str(Path::new("t.yml"), &yaml.replace("external", "externl"))
+            .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e
+                .to_string()
+                .contains("`partitions:` is `externl`: write `external`")),
+            "{errs:?}"
+        );
+        // Negative: the setting without a key.
+        let errs = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: app.ev\ncolumns:\n  ts: {type: date}\npartitions: external\n",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e
+                .to_string()
+                .contains("`partitions: external` is declared without `partition_by:`")),
+            "{errs:?}"
+        );
     }
 
     /// A partition block the loader cannot read is a load error, never an

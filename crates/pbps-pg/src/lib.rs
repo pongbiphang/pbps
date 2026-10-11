@@ -64,6 +64,7 @@ pub mod generated;
 pub mod impact;
 pub mod introspect;
 pub mod modules;
+pub mod partman;
 pub mod pins;
 mod preflight;
 pub mod roles;
@@ -1473,6 +1474,7 @@ mod tests {
             table.columns.insert((*c).into(), column);
         }
         table.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
             columns: key.iter().map(|c| (*c).to_owned()).collect(),
         });
         table
@@ -1536,6 +1538,7 @@ mod tests {
         cases.push(("declares only its own checks, indexes", own));
         let mut nested = partition.clone();
         nested.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
             columns: vec!["x".into()],
         });
         cases.push(("declares only its own checks, indexes", nested));

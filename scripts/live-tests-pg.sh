@@ -78,6 +78,17 @@ for name in "$NAME" "$OLD_NAME" "$SCRATCH_NAME"; do
     fi
 done
 
+# pg_partman for `partitions: external` (#1533), as ci.yml installs it: the
+# cases create the extension in a database of their own.
+# Both at once, each waited on so either failing stops the run.
+partman_pids=()
+for fixture in "$NAME:18" "$OLD_NAME:16"; do
+    docker exec "${fixture%%:*}" sh -c "dpkg -s postgresql-${fixture##*:}-partman >/dev/null 2>&1 || \
+        { apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-${fixture##*:}-partman; }" >/dev/null &
+    partman_pids+=($!)
+done
+for pid in "${partman_pids[@]}"; do wait "$pid"; done
+
 python3 scripts/check-live-fixture.py --cell pg18 --container "$NAME" --port "$PORT"
 python3 scripts/check-live-fixture.py --cell pg16 --container "$OLD_NAME" --port "$OLD_PORT"
 python3 scripts/check-live-fixture.py --cell pg18 --container "$SCRATCH_NAME" --port "$SCRATCH_PORT"

@@ -4953,6 +4953,7 @@ mod tests {
             pbps_model::Column::new("date".parse().unwrap()),
         );
         parent.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
             columns: vec!["ts".into()],
         });
         let create = |name: &str, table: &pbps_model::Table| {

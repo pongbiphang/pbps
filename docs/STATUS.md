@@ -89,7 +89,10 @@ DEC-1545.1). A standing parent's columns change, recursed into every partition
 (#1687, DEC-1687.1), and its indexes (#1688, DEC-1688.1), keys, checks and
 foreign keys (#1689, DEC-1689.1) are added and dropped, and it is renamed
 (#1690, DEC-1690.1). Attaching as the DEFAULT partition (#1639) stays refused
-by name.
+by name. `partitions: external` hands a parent's partitions to another tool:
+pbps manages the parent alone, refuses a partition holding anything of its
+own, and `pull` declares it on pg_partman's parents and on each
+`--partitions-external` (#1533, DEC-1533.1).
 
 A SQL Server column may name its collation (`collation:`); `pull` declares one
 that differs from the database's default, and a collation change is a planned
@@ -107,7 +110,7 @@ commands emit has a published schema of its own (`schema --kind envelope`,
 output against it.
 
 Connected (each takes `--db <connection string>` or `--env <name>`): `pull`
-(`--force` / `--data`), `plan --db` (`--staged` / `--resolve-with`), `apply` (`--plan` /
+(`--force` / `--data` / `--partitions-external`), `plan --db` (`--staged` / `--resolve-with`), `apply` (`--plan` /
 `--checksum` / `--allow` / `--staged` /
 `--resume`), `verify` (`--format json`), `snapshot` (`--force`), `baseline`
 (`--reason`), `bootstrap` (`--sql`), `state list` (`--limit` / `--format json`),

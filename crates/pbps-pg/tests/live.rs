@@ -32580,7 +32580,12 @@ async fn doctor_adopted_acl_scope_matches_the_differ_and_keeps_recorded_targets(
         pbps_model::Uid::generate(pbps_model::UidKind::Role),
         recipient.clone(),
     );
-    let scoped = pbps_diff::scope(&pulled.schema, &ids, &grants.managed_modules);
+    let scoped = pbps_diff::scope(
+        &pulled.schema,
+        &ids,
+        &grants.managed_modules,
+        &Default::default(),
+    );
     let scoped_targets: Vec<_> = scoped.schema.roles[&recipient]
         .grants
         .keys()

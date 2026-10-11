@@ -531,6 +531,25 @@ jobs:
         env:
           PBPS_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
           PBPS_TEST_PG_OLD_CONTAINER: ${{ job.services.postgres-old.id }}
+      # pg_partman for `partitions: external` (#1533, DEC-1533.1), which
+      # `pull` reads from pg_partman's own catalog: the cases install the
+      # extension in a database of their own, and the package must be on both
+      # servers. From the PGDG repository the image is built with, which keeps
+      # only the current release; its catalog is what the cases read, and a
+      # new one that changed it would fail them, which is the point.
+      # Both at once, each `wait`ed on by its own pid so either failing
+      # fails the step: the two downloads, not the work, are the cost.
+      - name: Install pg_partman on both servers
+        if: matrix.suite == 'flow-rest'
+        run: |
+          set -euo pipefail
+          pids=()
+          for c in ${{ job.services.postgres.id }}:18 ${{ job.services.postgres-old.id }}:16; do
+            docker exec "${c%%:*}" sh -c "apt-get update -qq && \
+              apt-get install -y -qq --no-install-recommends postgresql-${c##*:}-partman" &
+            pids+=($!)
+          done
+          for pid in "${pids[@]}"; do wait "$pid"; done
       - run: cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1 --skip trigger --skip routine --skip function --skip grant
         if: matrix.suite == 'flow-rest'
         env:

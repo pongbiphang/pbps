@@ -298,7 +298,14 @@ indexes:
   (DEC-1595.1). A bound value is written as the engine prints it, and a connected
   command refuses any other spelling with the engine's. A tree is created
   whole, parent first. A partition the database has and the declarations do not is refused with the
-  commands that adopt it. `data:` beside a tree, and partitioning on SQL Server,
+  commands that adopt it. `partitions: external` in place of the list hands a
+  parent's partitions to another tool, such as pg_partman: pbps manages the
+  parent alone and neither records, compares, creates nor drops them, and a
+  parent change reaches each through the engine. One holding anything of its
+  own is refused by name. `pull` declares the setting on the parents
+  pg_partman's catalog names and on each `--partitions-external <parent>`.
+  A plan never switches the setting; a baseline records it, after any
+  partition pbps holds is dropped or detached (DEC-1533.1). `data:` beside a tree, and partitioning on SQL Server,
   are refused (DEC-1170.1). Under a standing parent a partition is added, or
   dropped with drop intent, which detaches it first and is `destructive`. A
   range added beside a standing DEFAULT partition takes the DEFAULT's rows of
@@ -1403,7 +1410,7 @@ full state.
 
 | Command | Purpose |
 |---|---|
-| `pbps pull` | Reverse-generate YAML declarations from an existing database (a new user's first step). `--data <table>` also declares that table's rows as `exact` reference data |
+| `pbps pull` | Reverse-generate YAML declarations from an existing database (a new user's first step). `--data <table>` also declares that table's rows as `exact` reference data; `--partitions-external <parent>` declares that parent's partitions `external`, which pg_partman's parents are without it (DEC-1533.1) |
 | `pbps plan --db` | Compute an applyable plan against the target environment as queried (the deployment layer, see 7.3). `--staged` produces a staged plan for one logical change (ADR-0003) |
 | `pbps verify` | The drift check: the live database against `__pbps_state`. `--format json` emits the typed drift diff, and found drift fires the `on_drift` hook (see 9.4) |
 | `pbps apply --plan plan.json --checksum ... --allow ...` | Apply exactly the plan checksum approved at the deployment gate. `--staged` runs a staged plan statement by statement outside a transaction, recording each completion; `--staged --resume` continues one that stopped |

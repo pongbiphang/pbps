@@ -2308,6 +2308,7 @@ fn a_parents_new_index_precedes_its_partitions_own_under_the_resolver() {
         parent.clone(),
         Table {
             partition_by: Some(PartitionBy {
+                external: false,
                 columns: vec!["ts".into()],
             }),
             ..Default::default()
@@ -2397,6 +2398,7 @@ fn a_resolver_plan_keeps_the_move_a_human_allowed() {
         pbps_model::Column::new("date".parse().unwrap()).not_null(),
     );
     parent.partition_by = Some(PartitionBy {
+        external: false,
         columns: vec!["ts".into()],
     });
     base.tables.insert("app.ev".parse().unwrap(), parent);

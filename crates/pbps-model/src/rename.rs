@@ -217,6 +217,7 @@ mod tests {
         r.rename_column(ColumnRef::new(t("app.other"), "n"), "n2");
         let parent = Table {
             partition_by: Some(crate::PartitionBy {
+                external: false,
                 columns: vec!["ts".into()],
             }),
             ..Default::default()

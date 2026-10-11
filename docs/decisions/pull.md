@@ -710,3 +710,70 @@ histories on PostgreSQL and SQL Server, populated no-op pulls with and without
 rows, byte-preserved IDs and tombstones, new names, and unchanged ledger
 history. `forced_pull_refuses_damaged_identity_history_before_connecting`
 pins the no-connection refusal for damaged files.
+
+<a id="dec-1533-1"></a>
+
+**DEC-1533.1. A parent's `partitions: external` hands its partitions to
+another tool, and `pull` learns it from pg_partman's catalog or from
+`--partitions-external` (#1533).** A parent whose partitions pg_partman,
+pg_cron or the application makes gains one every month. Declaring each would
+make every one a plan, and leaving them undeclared refused the parent
+(DEC-1170.1). With the setting pbps manages the parent's shape alone: it
+neither records nor compares, creates nor drops the partitions, and a change
+to the parent reaches every one of them through the engine's recursion. The
+connected plan's cost estimate already says that, with the count and the lock
+each one takes (DEC-1687.1). Scoping a live read leaves a partition of such a
+parent out of the managed and unmanaged sets alike, while it is only what its
+parent makes it. One holding anything of its own (an index, a check, a column
+default, storage parameters) is refused by name. pbps would neither compare
+nor keep that part, and dropping it silently is the wrong thing done quietly.
+A command that compares against the ledger (`plan --db`, `verify`,
+`status`) takes the external parents from the recorded state. `apply` takes
+them from the recorded state plus the parents its plan creates. The commands
+that record the declarations (`baseline`, `snapshot`, `bootstrap`) take them
+from the declarations.
+
+The catalog cannot say who made a partition. So `pull` takes the set from two
+places. The first is pg_partman's own `part_config`, in the schema
+`pg_extension` names. That is measured on 18 with pg_partman 5.5.0, whose
+`create_parent` also makes a DEFAULT partition and a template table
+`partman.template_<schema>_<table>`. pg_partman was looked at first because
+it is the common tool: about 2,800 stars and contributions growing yearly
+since 2019, and it is offered on RDS, Aurora, Azure Flexible Server and
+Supabase. The template table is left out with a note, since it is pg_partman's
+own and lives outside the extension. The second place is the repeatable
+`pull --partitions-external <parent>`, for every other tool, whose catalog
+pbps does not read. Detection alone would miss those tools; the flag alone
+would make every pg_partman user say what the database already says.
+pg_partman installed with its `part_config` unreadable to the pulling role is
+an error naming the grants. It is never read as "no parent is pg_partman's".
+
+A switch between declared and external partitions is never a plan. No
+statement makes it, and a plan records only what its changes do. A plan that
+switched would leave the ledger on the old setting, and `verify` would refuse
+the next partition pg_partman makes. So the switch is refused by name with
+the way to make it, as an adoption is (#1170):
+
+- A parent pbps holds no partition of becomes external through a baseline,
+  once the declarations say so.
+- One whose partitions pbps holds drops or detaches them in a plan of their
+  own first, since handing them over would take their rows. That is refused
+  in the offline plan, where the setting differs, and in the connected one,
+  where the ledger already reads the parent as external and a drop is what
+  is left.
+- External partitions become declared through `pull` and a baseline. The
+setting is PostgreSQL's alone, as partitioning is, and SQL Server refuses
+the flag. Plan version 36 and state version 23 carry the setting, which an
+older build cannot read.
+
+Tests: `external_partitions_are_a_setting_on_the_parent_alone`
+(`crates/pbps-load/src/fmt.rs`),
+`declaration_schema_and_loader_agree_on_external_partitions`
+(`crates/pbps-cli/src/integration.rs`),
+`an_external_parents_partitions_are_left_out_while_they_are_its_own`
+(`crates/pbps-diff/src/managed.rs`),
+`a_parent_with_external_partitions_hands_nothing_over`
+(`crates/pbps-diff/src/schema_diff.rs`), and the live
+`pg_partman_parents_are_pulled_with_external_partitions` and
+`pull_declares_a_named_parents_partitions_external`
+(`crates/pbps-cli/tests/flow_pg.rs`), on 16 and 18.

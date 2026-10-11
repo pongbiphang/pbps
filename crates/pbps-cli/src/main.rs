@@ -318,6 +318,12 @@ enum Command {
         /// repeatable
         #[arg(long = "data", value_name = "TABLE")]
         data: Vec<String>,
+
+        /// Declare this range-partitioned parent's partitions external: another
+        /// tool creates and drops them, and pbps manages the parent alone;
+        /// repeatable. pg_partman's parents are found without it
+        #[arg(long = "partitions-external", value_name = "TABLE")]
+        partitions_external: Vec<String>,
     },
 
     /// Run a saved plan against the environment it was computed for
@@ -1025,9 +1031,10 @@ fn run() -> anyhow::Result<()> {
             target,
             force,
             data,
+            partitions_external,
         } => {
             let target = target.resolve(&project)?;
-            cmd_pull(&project, &target, force, &data)
+            cmd_pull(&project, &target, force, &data, &partitions_external)
         }
         Command::Docs { format, out, title } => cmd_docs(&project, format, out.as_deref(), &title),
         Command::Verify { target, format } => {
@@ -1131,6 +1138,7 @@ fn cmd_pull(
     target: &db::Target,
     force: bool,
     data: &[String],
+    partitions_external: &[String],
 ) -> anyhow::Result<()> {
     // Parsed before anything connects: a misspelt table name is a fact about
     // the command line, and it should not cost a round trip to find out.
@@ -1139,6 +1147,13 @@ fn cmd_pull(
         .map(|raw| {
             raw.parse::<TableName>()
                 .map_err(|e| anyhow::anyhow!("--data {raw}: {e}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let partitions_external: Vec<TableName> = partitions_external
+        .iter()
+        .map(|raw| {
+            raw.parse::<TableName>()
+                .map_err(|e| anyhow::anyhow!("--partitions-external {raw}: {e}"))
         })
         .collect::<anyhow::Result<_>>()?;
 
@@ -1203,6 +1218,10 @@ fn cmd_pull(
         // out and named like any other object (DEC-902.1), whether or not
         // `--data` asked for its rows — so the rows of a table that will not
         // be declared are neither read nor able to stop the pull (DEC-921.1).
+        // First: what is written of a parent whose partitions another tool
+        // makes is the parent alone, and the leave-outs below then judge what
+        // is written (#1533).
+        adopt::hand_over_external_partitions(&mut conn, &mut pulled, &partitions_external).await?;
         let read_before: std::collections::BTreeSet<TableName> =
             pulled.schema.tables.keys().cloned().collect();
         adopt::leave_out_what_validate_refuses(&mut pulled, dialect.as_ref());

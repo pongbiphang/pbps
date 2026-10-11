@@ -323,7 +323,12 @@ async fn one(
     // that disagreed about which objects are managed would disagree about
     // whether an environment has drifted.
     let recorded_modules = recorded_modules(&entry);
-    let scoped = pbps_diff::scope(&pulled.schema, &recorded_ids, &recorded_modules);
+    let scoped = pbps_diff::scope(
+        &pulled.schema,
+        &recorded_ids,
+        &recorded_modules,
+        &pbps_diff::external_parents(&entry.snapshot.schema),
+    );
     // The rows too, under the recorded scope, as `verify` reads them. Only the
     // read happens here; what it means is decided beside every other catalog
     // fact, below, so that a read which failed cannot hide any of them.
@@ -1039,6 +1044,7 @@ mod tests {
             &pulled.schema,
             &entry.snapshot.ids,
             &recorded_modules(&entry),
+            &Default::default(),
         );
         (entry, pulled, scoped)
     }

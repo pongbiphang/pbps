@@ -13025,7 +13025,12 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
     assert_eq!(pulled.warnings, Vec::<String>::new());
     assert_eq!(pulled.schema.roles.get("app_reader"), Some(&reader));
     // Scoped by the ids file, the live state is the declaration.
-    let scoped = pbps_diff::scope(&pulled.schema, &ids, &Default::default());
+    let scoped = pbps_diff::scope(
+        &pulled.schema,
+        &ids,
+        &Default::default(),
+        &Default::default(),
+    );
     assert_eq!(scoped.schema.roles, declared.roles);
     assert!(
         scoped.unmanaged_roles.is_empty(),
@@ -13086,7 +13091,13 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
             .is_some_and(|g| g.contains(&Permission::Update)),
         "the widened grant must not read as the plain one"
     );
-    let live = pbps_diff::scope(&again.schema, &ids, &Default::default()).schema;
+    let live = pbps_diff::scope(
+        &again.schema,
+        &ids,
+        &Default::default(),
+        &Default::default(),
+    )
+    .schema;
     let drift = pbps_diff::diff_partial(
         pbps_diff::Side {
             schema: &scoped.schema,

@@ -6963,6 +6963,7 @@ fn a_partitions_own_default_needs_its_catalog_record() {
             pbps_model::Column::new("integer".parse().unwrap()),
         );
         parent.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
             columns: vec!["id".into()],
         });
         schema.tables.insert("app.ev".parse().unwrap(), parent);

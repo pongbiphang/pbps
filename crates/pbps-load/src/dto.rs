@@ -390,9 +390,11 @@ pub struct TableDto {
 
     /// The parent's partitions, by name (qualified when in another schema):
     /// `{from: ['2025-01-01'], to: ['2026-01-01']}`, `MINVALUE`/`MAXVALUE`
-    /// for an unbounded end, or `default`.
+    /// for an unbounded end, or `default`. Or `external`: another tool, such
+    /// as pg_partman, creates and drops them, and pbps manages the parent
+    /// alone.
     #[serde(default)]
-    pub partitions: IndexMap<String, PartitionDto>,
+    pub partitions: PartitionsDto,
 
     /// SQL Server `PERIOD FOR SYSTEM_TIME` and system versioning:
     /// `{period: [valid_from, valid_to], hidden: true, versioning: {history:
@@ -675,6 +677,57 @@ pub struct PartitionColumnDto {
     #[serde(default)]
     #[schemars(extend("enum" = [false, null]))]
     pub nullable: Option<bool>,
+}
+
+/// A parent's `partitions:`: its partitions by name, or `external` (#1533).
+#[derive(Debug, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum PartitionsDto {
+    Declared(IndexMap<String, PartitionDto>),
+    /// `external`: any other word is refused by the loader, by name, as a
+    /// partition's `default` is.
+    #[schemars(schema_with = "external_schema")]
+    External(String),
+}
+
+impl Default for PartitionsDto {
+    fn default() -> Self {
+        Self::Declared(IndexMap::new())
+    }
+}
+
+fn external_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "const": "external",
+        "description": "Another tool, such as pg_partman, creates and drops this parent's \
+                        partitions; pbps manages the parent alone."
+    })
+}
+
+impl<'de> serde::Deserialize<'de> for PartitionsDto {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // A word or a mapping, told apart by what the document holds, as
+        // `PartitionDto` is: an untagged derive would report a misspelt
+        // mapping as "matches no variant", not by its own error.
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = PartitionsDto;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a mapping of partitions by name, or `external`")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PartitionsDto, E> {
+                Ok(PartitionsDto::External(v.to_owned()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<PartitionsDto, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(PartitionsDto::Declared)
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 impl<'de> serde::Deserialize<'de> for PartitionDto {
