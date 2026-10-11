@@ -1660,7 +1660,9 @@ fn side(values: &BTreeMap<String, String>, untyped_defaults: &BTreeSet<String>) 
     let whens: Vec<String> = values
         .iter()
         .map(|(name, sql)| {
-            let value = if !untyped_defaults.contains(name) {
+            // NULL needs no assignment type. A CLR column's unnamed system
+            // type must not erase the tuple SQL through NULL concatenation.
+            let value = if !untyped_defaults.contains(name) || is_null_default(sql) {
                 literal(sql)
             } else {
                 // The catalog supplies the destination type for old plans
@@ -4507,7 +4509,7 @@ mod tests {
             1
         );
         let null = sql_of(&plan(vec![insert("(NULL)"), delete.clone()]));
-        assert!(null.contains("N', NULL)'"), "{null}");
+        assert!(null.contains("WHEN N'status_code' THEN N'NULL'"), "{null}");
 
         // An update to DEFAULT, the same way.
         let update = Change::UpdateRow {
