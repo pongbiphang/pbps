@@ -226,6 +226,15 @@ jobs:
     needs: [approve, lint]
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
+    # Two suites, each with its own SQL Server (#1837): the dialect targets
+    # and the single-threaded CLI flow ran one after the other on one host,
+    # which made this the second-longest job in the merge group. Every
+    # ignored case still runs in exactly one suite; the inventory in `quick`
+    # refuses a split that drops one.
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [dialect, flow]
     services:
       mssql:
         # Pinned by digest: SQL Server 2025 RTM, 17.0.4075.5, image built
@@ -255,6 +264,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
+          key: ${{ matrix.suite }}
       # The service has no health check hook here; the loop stands in for one.
       #
       # Found by the published port, not by `ancestor=<image>`: that filter
@@ -290,8 +300,10 @@ jobs:
       # it crashed this job the first time it was tried (#611). Skipped by
       # name here; unset, its variable makes the test fail rather than pass.
       - run: cargo test -p pbps-mssql --test live -- --ignored --skip a_real_express_target_is_an_edition_limitation
+        if: matrix.suite == 'dialect'
       # Driver error conversion is a separate test target, ignored by quick.
       - run: cargo test -p pbps-db --test live_mssql -- --ignored
+        if: matrix.suite == 'dialect'
       # Phase 3.1's onboarding path and the optional dev rehearsal both cross
       # the CLI/database boundary, so the dialect-only suite cannot exercise
       # them. Keep these ignored in ordinary jobs and run them here against the
@@ -302,6 +314,7 @@ jobs:
       # test schedule.
       # Except the one that needs a second edition, which `live-editions` runs.
       - run: cargo test -p pbps-cli --test flow -- --ignored --test-threads=1 --skip connected_plan_json_reports_unsupported_online_edition_as_a_finding
+        if: matrix.suite == 'flow'
       # A session killed mid-run (error 596, #669) leaves nothing in the job
       # log about why: the test sees only "the session is in the kill state".
       # The server's own errorlog is where a kill, a severe error or memory
@@ -641,10 +654,10 @@ jobs:
   # away from the shared live services: the full factory owns both a target
   # and scratch instance, and its root inspector reads their actual processes.
   #
-  # Each engine's fixtures are split across two hosts, in their original
-  # order, where the time halves (DEC-1370.1). Every script owns and removes
-  # its own containers and scratch root, so none relies on one before it;
-  # what they share is the test binary, which each half builds for itself.
+  # Each engine's fixtures are split across three hosts (DEC-1370.1, #1837).
+  # Every script owns and removes its own containers and scratch root, so none
+  # relies on one before it; what they share is the test binary, which each
+  # shard builds for itself.
   resolver:
     needs: [approve, lint]
     if: ${{ github.event_name != 'pull_request' }}
@@ -653,14 +666,14 @@ jobs:
       fail-fast: false
       matrix:
         engine: [pg, mssql]
-        half: [first, second]
+        half: [first, second, third]
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@stable
       # Keyed by half: the first also builds the test profile its container
-      # fixtures run under, and the second does not.
+      # fixtures run under, and the second and third do not.
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -696,18 +709,23 @@ jobs:
         run: sudo python3 scripts/live-resolver-target.py "$FIXTURE_ENGINE" --native-host --test-binary "$PBPS_FIXTURE_BINARY"
         env:
           FIXTURE_ENGINE: ${{ matrix.engine }}
+      # SQL Server runs this in its second shard, which the dedicated scratch
+      # server's move to the third left otherwise empty (#1837).
       - name: Verified launch privileges before engine initialization
-        if: matrix.half == 'first'
-        run: sudo python3 scripts/live-resolver-launch.py "$FIXTURE_ENGINE" --test-binary "$PBPS_FIXTURE_BINARY"
-        env:
-          FIXTURE_ENGINE: ${{ matrix.engine }}
+        if: matrix.engine == 'pg' && matrix.half == 'first'
+        run: sudo python3 scripts/live-resolver-launch.py pg --test-binary "$PBPS_FIXTURE_BINARY"
+      - name: Verified launch privileges before engine initialization (SQL Server)
+        if: matrix.engine == 'mssql' && matrix.half == 'second'
+        run: sudo python3 scripts/live-resolver-launch.py mssql --test-binary "$PBPS_FIXTURE_BINARY"
       - name: PG16 complete factory on the disposable native host
         if: matrix.engine == 'pg' && matrix.half == 'second'
         run: sudo python3 scripts/live-resolver-target.py pg --pg-major 16 --native-host --test-binary "$PBPS_FIXTURE_BINARY"
       # A supplied server pbps did not provision. It runs a target and a
-      # dedicated server at once, so it keeps the same disposable host.
+      # dedicated server at once, so it keeps the same disposable host: a third
+      # one, because beside the PG16 factory it made the second PostgreSQL
+      # shard the longest job in the merge group (#1837).
       - name: Dedicated scratch server lifecycle and exclusivity
-        if: matrix.half == 'second'
+        if: matrix.half == 'third'
         run: sudo python3 scripts/live-resolver-server.py "$FIXTURE_ENGINE" --test-binary "$PBPS_FIXTURE_BINARY"
         env:
           FIXTURE_ENGINE: ${{ matrix.engine }}
