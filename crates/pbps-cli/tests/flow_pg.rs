@@ -10054,6 +10054,93 @@ fn a_rename_that_moves_a_carried_names_holder_away_runs_first_on_both_servers() 
     }
 }
 
+/// #1767 review: a view the plan changes, with a dependent view the
+/// declarations leave alone, makes the module passes plan the revision again
+/// in the differ's order (`rediff`), which undid the hoist. The plan
+/// written still runs `s2.b`'s move first, and applies.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_hoisted_rename_stays_ahead_when_a_view_rebuild_plans_again() {
+    let own = OwnDatabase::new(&server(), "rediff1767");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA s1; CREATE SCHEMA s2; CREATE SCHEMA s3; CREATE SCHEMA app; \
+         CREATE TABLE s1.a (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY); \
+         CREATE TABLE s2.a (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY); \
+         ALTER TABLE s2.a RENAME TO b; ALTER INDEX s2.a_pkey RENAME TO b_pkey; \
+         CREATE VIEW app.v1 AS SELECT 1 AS x; \
+         CREATE VIEW app.v2 AS SELECT x FROM app.v1",
+    );
+    let d = Demo::new("rediff1767");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let view = std::fs::read_dir(d.dir.join("schema"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("app.v1.")
+        })
+        .expect("the pull writes `app.v1`");
+    let text = std::fs::read_to_string(&view).unwrap();
+    assert!(text.contains("1 AS x"), "{text}");
+    std::fs::write(&view, text.replace("1 AS x", "2 AS x")).unwrap();
+    let moved = |from: &str, to: &str| {
+        let path = d.dir.join(format!("schema/{from}.yml"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(
+            d.dir.join(format!("schema/{to}.yml")),
+            text.replace(&format!("table: {from}"), &format!("table: {to}")),
+        )
+        .unwrap();
+        succeeds(d.run(&["rename-table", from, to]));
+    };
+    moved("s2.b", "s3.b");
+    moved("s1.a", "s2.a");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("DROP VIEW") < at("CREATE VIEW"),
+        "the views are rebuilt:\n{script}"
+    );
+    assert!(
+        at("ALTER TABLE \"s2\".\"b\" SET SCHEMA \"s3\"")
+            < at("ALTER TABLE \"s1\".\"a\" SET SCHEMA \"s2\""),
+        "{script}"
+    );
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename", "--allow", "destructive"],
+    ));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 /// #1633: a foreign key's `RESTRICT` is pulled as `restrict` on delete and
 /// on update, bootstrapped into an empty database, and pulled back the same,
 /// with nothing left to plan. Changing an action between `restrict` and

@@ -681,13 +681,14 @@ fn roles_are_the_clusters(question: &str) -> anyhow::Error {
 /// `sys.objects` walk also orders the plan, so it runs after every pass that
 /// changes the plan: [`order_created_object_names`]. On PostgreSQL it first
 /// hoists a table rename that moves a carried object's holder away, where
-/// that clears the plan (#1767, DEC-1767.1); the passes after it move no
-/// table rename.
+/// that clears the plan (#1767, DEC-1767.1). What it read is returned, for
+/// [`NameFacts::order_and_refuse`] again once the module passes, which may
+/// plan the revision afresh in the differ's order, have run.
 pub async fn refuse_created_name_occupants(
     conn: &mut Conn,
     cs: &mut ChangeSet,
     label: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<NameFacts>> {
     match conn.driver() {
         Driver::Postgres => {
             let mut occupants = pbps_pg::catalog::relation_name_occupants(
@@ -710,13 +711,32 @@ pub async fn refuse_created_name_occupants(
                     occupants.push(found);
                 }
             }
-            let relations = pbps_pg::catalog::relations_at(conn, &carried).await?;
-            // A holder a later rename moves away is cleared by hoisting that
-            // rename, where one hoist does it (#1767, DEC-1767.1).
-            crate::deploy::order_carried_moves(cs, &occupants, &relations);
-            crate::deploy::refuse_uninventoried_occupants(cs, &occupants, &relations, label)
+            let facts = NameFacts {
+                relations: pbps_pg::catalog::relations_at(conn, &carried).await?,
+                occupants,
+            };
+            facts.order_and_refuse(cs, label)?;
+            Ok(Some(facts))
         }
-        Driver::Mssql => Ok(()),
+        Driver::Mssql => Ok(None),
+    }
+}
+
+/// What [`refuse_created_name_occupants`] read of a PostgreSQL target: the
+/// name occupants the plan's names and moves meet, and the tables and views
+/// at the carried names.
+pub struct NameFacts {
+    occupants: Vec<pbps_pg::catalog::NameOccupant>,
+    relations: Vec<(TableName, &'static str)>,
+}
+
+impl NameFacts {
+    /// Hoists a table rename that moves a carried object's holder away, where
+    /// one hoist clears the plan (#1767, DEC-1767.1), then refuses what is
+    /// left (#951, #1749, #1765).
+    pub fn order_and_refuse(&self, cs: &mut ChangeSet, label: &str) -> anyhow::Result<()> {
+        crate::deploy::order_carried_moves(cs, &self.occupants, &self.relations);
+        crate::deploy::refuse_uninventoried_occupants(cs, &self.occupants, &self.relations, label)
     }
 }
 

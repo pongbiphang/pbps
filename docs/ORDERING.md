@@ -79,13 +79,17 @@ Then, in this order:
   keeps the first one it clears (`object_order`, DEC-1366.1). A name only a
   later class frees is refused with that change named (DEC-1366.2).
 - **On a connected PostgreSQL plan, `order_carried_moves`** (in
-  `crates/pbps-cli/src/deploy.rs`, called from `refuse_created_name_occupants`
-  before the module passes, none of which moves a table rename) replays the
-  catalog's name occupants and the tables and views at the carried names
-  through the plan. Where a cross-schema rename carries an index or owned
-  sequence onto a name that a later table rename moves away, it hoists that
-  rename ahead of the move. It moves one rename at a time, and only across
-  other table renames that do not free its target (DEC-1767.1).
+  `crates/pbps-cli/src/deploy.rs`) replays the catalog's name occupants and
+  the tables and views at the carried names through the plan. Where a
+  cross-schema rename carries an index or owned sequence onto a name that a
+  later table rename moves away, it hoists that rename ahead of the move. It
+  moves one rename at a time, and only across other table renames: none of
+  them may free a name the hoisted rename takes on its way, which is its
+  target or the name `SET SCHEMA` lands it on first, and none may take its
+  target on theirs. `refuse_created_name_occupants` calls it before the
+  module passes. It runs again, over the same catalog reads, after the last
+  pass that reorders, because a module pass may plan the revision again in
+  the differ's order (DEC-1767.1).
 - **On a connected plan, `order_role_drops`** (called from `deploy.rs`, once
   `plan --db` has read the dropped roles' members) ranks the role drops by
   membership again. The differ saw no members when it sorted (DECISIONS 127,

@@ -430,9 +430,10 @@ pub(crate) fn refuse_uninventoried_occupants(
 /// move [`name_clashes`] finds landing on a held name, each later table rename
 /// is tried just before it, and the first that leaves the whole plan with
 /// fewer clashes is kept; then the next clash. A rename is only hoisted
-/// across other table renames, none of which frees its target: anything else
-/// between them, or a rename waiting on one of them, keeps the order and the
-/// refusal. One rename moves at a time: a holder that needs a chain of moves
+/// across other table renames, none of which frees a name it takes on its
+/// way (its target, or the name `SET SCHEMA` lands it on first) or takes its
+/// target on theirs: anything else between them, or a rename waiting on one
+/// of them, keeps the order and the refusal. One rename moves at a time: a holder that needs a chain of moves
 /// to clear stays refused, as before.
 // The complement is every change that is not a table rename.
 #[allow(clippy::wildcard_enum_match_arm)]
@@ -442,11 +443,31 @@ pub(crate) fn order_carried_moves(
     relations: &[(TableName, &'static str)],
 ) {
     use pbps_model::Change;
+    // The names a rename takes as it runs: its target and, on its way across
+    // schemas under a new name, its old name in the target schema, which
+    // `SET SCHEMA` lands it on before `RENAME TO` (as `rename_order` claims).
+    let claims = |from: &TableName, to: &TableName| {
+        let mut out = vec![to.clone()];
+        if from.schema != to.schema && from.name != to.name {
+            out.push(TableName::new(&to.schema, &from.name));
+        }
+        out
+    };
     let hoistable =
         |changes: &[pbps_model::PlannedChange], at: usize, r: usize| match &changes[r].change {
-            Change::RenameTable { to: target, .. } => changes[at..r]
-                .iter()
-                .all(|p| matches!(&p.change, Change::RenameTable { from, .. } if from != target)),
+            Change::RenameTable { from, to, .. } => {
+                let taken = claims(from, to);
+                changes[at..r].iter().all(|p| match &p.change {
+                    // Nothing it takes is freed by one it would pass, and
+                    // nothing that one takes on its way is its target.
+                    Change::RenameTable {
+                        from: other_from,
+                        to: other_to,
+                        ..
+                    } => !taken.contains(other_from) && !claims(other_from, other_to).contains(to),
+                    _ => false,
+                })
+            }
             _ => false,
         };
     let renames = cs
@@ -7003,7 +7024,9 @@ pub fn cmd_plan_db(
             // the names this plan creates, asked of PostgreSQL's whole
             // relation namespace, not only of what the inventory reports
             // (#951). SQL Server's is asked after the passes below (#1077).
-            crate::engine::refuse_created_name_occupants(&mut conn, &mut cs, &target.label).await?;
+            let name_facts =
+                crate::engine::refuse_created_name_occupants(&mut conn, &mut cs, &target.label)
+                    .await?;
             crate::engine::refuse_unlogged_partition_referencers(&mut conn, &cs, staged).await?;
             let rename_evidence = crate::engine::external_role_renames(
                 &mut conn,
@@ -7051,6 +7074,13 @@ pub fn cmd_plan_db(
                 &precedence,
             )
             .await?;
+            // The module passes may plan the revision again in the differ's
+            // order (`rediff`), undoing a hoist: the carried moves are ordered
+            // and checked again, over the same reads, as the plan now stands
+            // (#1767 review).
+            if let Some(facts) = &name_facts {
+                facts.order_and_refuse(&mut cs, &target.label)?;
+            }
             let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
             let drops = crate::engine::check_drop_blockers(&mut conn, &cs).await?;
             crate::engine::prepare_data_writes(&mut conn, &cs, &entry.snapshot, &resolved.ids)
@@ -11328,8 +11358,9 @@ mod tests {
     /// this plan moves away runs after that rename, which is hoisted ahead of
     /// it (DEC-1767.1). Negatives keep the order and the refusal: a plan that
     /// clears as it is, two moves that each wait for the other, a change other
-    /// than a table rename between them, and a rename whose own target an
-    /// earlier rename frees.
+    /// than a table rename between them, a rename whose own target or way
+    /// across an earlier rename frees, and one between passing through its
+    /// target.
     #[test]
     fn a_rename_moving_a_carried_names_holder_away_is_hoisted_ahead_of_the_move() {
         use pbps_model::{Change, ChangeSet, PlannedChange};
@@ -11405,6 +11436,21 @@ mod tests {
         let (changes, refused) = ordered(vec![a_in(), frees(), b_waits()]);
         assert_eq!(changes, vec![a_in(), frees(), b_waits()]);
         refused.expect_err("the rename waits on one between");
+
+        // `s2.b -> s3.c` passes through `s3.b` (`SET SCHEMA` first), which
+        // only the rename after `s1.a`'s move frees (review of #1785).
+        let b_across = || rename(t("s2", "b"), t("s3", "c"));
+        let frees_on_the_way = || rename(t("s3", "b"), t("s4", "b"));
+        let (changes, refused) = ordered(vec![a_in(), frees_on_the_way(), b_across()]);
+        assert_eq!(changes, vec![a_in(), frees_on_the_way(), b_across()]);
+        refused.expect_err("the rename waits on one between, for its way across");
+
+        // `s5.c -> s3.e` passes through `s3.c`, the hoisted rename's target:
+        // hoisted, `s2.b` would hold it when `s5.c` needs it.
+        let passes_through = || rename(t("s5", "c"), t("s3", "e"));
+        let (changes, refused) = ordered(vec![a_in(), passes_through(), b_waits()]);
+        assert_eq!(changes, vec![a_in(), passes_through(), b_waits()]);
+        refused.expect_err("one between passes through its target");
     }
 
     /// #1749: what the cross-schema renames carry, by the name each lands
