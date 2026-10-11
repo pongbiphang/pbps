@@ -230,11 +230,12 @@ fn shared_read(catalog: &str) -> Shared {
                     pg_catalog.row_to_json(t)::pg_catalog.text \
                FROM pg_catalog.pg_tablespace t",
         ),
+        // Every column but the horizons VACUUM updates in place, past any
+        // snapshot; listing the columns kept missed a refreshed collation
+        // version.
         "pg_database" => Some(
             "SELECT 'database:' || d.oid, 'database ' || pg_catalog.quote_ident(d.datname), \
-                    pg_catalog.json_build_array(d.datname, d.datdba, d.encoding, \
-                      d.datistemplate, d.datallowconn, d.datconnlimit, d.dattablespace, \
-                      d.datacl)::pg_catalog.text \
+                    (pg_catalog.to_jsonb(d) - 'datfrozenxid' - 'datminmxid')::pg_catalog.text \
                FROM pg_catalog.pg_database d \
               WHERE d.datname <> pg_catalog.current_database()",
         ),

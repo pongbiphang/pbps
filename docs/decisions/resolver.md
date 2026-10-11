@@ -2214,8 +2214,10 @@ target whose recreated `public` has none, the difference #688 removed.
   catalogs, so one no rule names is read whole; left out are `pg_shdepend`
   (derived from database objects) and `pg_subscription` (created in the
   current database only, where the inventory finds it), and `pg_authid` is
-  read through `pg_roles`, which a supplied account may read. All are read
-  under the transaction's one snapshot, so another session's writes
+  read through `pg_roles`, which a supplied account may read. Another
+  database is compared by its whole row except `datfrozenxid` and
+  `datminmxid`, which VACUUM updates in place, past any snapshot. All are
+  read under the transaction's one snapshot, so another session's writes
   meanwhile are in neither read (measured on 16 and 18). The second read
   runs after `RESET ALL`, so the file's own `SET`s (a time zone that renders
   a role's expiry with another offset, a timeout) do not make it differ from

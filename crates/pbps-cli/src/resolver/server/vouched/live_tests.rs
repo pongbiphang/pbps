@@ -2748,6 +2748,57 @@ async fn vouched_checks_a_baseline_whose_path_shadows_a_built_in_type() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_compares_every_attribute_of_another_database() {
+    // A collation version no list of columns named: refreshing another
+    // database's is a write outside the scratch database like any other.
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    for stale in [true, false] {
+        let mut target = Fixture::new("PBPS_TEST_PG_DB");
+        let mut scratch = Fixture::new(SCRATCH_SERVER);
+        let target_db = staging_target(&mut target, &guarded_target()).await;
+        let other = format!("pbps_v1783_other_{}", scratch.token);
+        let mut admin = scratch.admin().await;
+        admin
+            .execute(&format!("CREATE DATABASE {other}"))
+            .await
+            .unwrap();
+        scratch.databases.push(other.clone());
+        if stale {
+            admin
+                .execute(&format!(
+                    "UPDATE pg_catalog.pg_database SET datcollversion = '0' \
+                      WHERE datname = '{other}'"
+                ))
+                .await
+                .unwrap();
+        }
+        let baseline = format!(
+            "{}ALTER DATABASE {other} REFRESH COLLATION VERSION;\n",
+            plain_baseline("integer")
+        );
+        let result = produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &baseline,
+        )
+        .await;
+        target.drop().await;
+        scratch.drop().await;
+        if stale {
+            let refused = baseline_refusal(result);
+            assert!(refused.contains(&format!("database {other}")), "{refused}");
+        } else {
+            // Negative: a refresh that changes nothing is no change.
+            assert_staged(result, "t", "a refresh that changes nothing");
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_reads_the_shared_state_under_its_own_settings_not_the_baselines() {
     // A baseline's `SET TimeZone` renders a role's expiry with another
     // offset; read under it, the second read of the shared state would

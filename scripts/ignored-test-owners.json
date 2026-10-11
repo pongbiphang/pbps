@@ -2192,6 +2192,7 @@
         "resolver::server::vouched::live_tests::vouched_refuses_a_baseline_that_writes_outside_the_scratch_database",
         "resolver::server::vouched::live_tests::vouched_runs_the_baseline_on_the_empty_path_every_session_pins",
         "resolver::server::vouched::live_tests::vouched_checks_a_baseline_whose_path_shadows_a_built_in_type",
+        "resolver::server::vouched::live_tests::vouched_compares_every_attribute_of_another_database",
         "resolver::server::vouched::live_tests::vouched_reads_the_shared_state_under_its_own_settings_not_the_baselines",
         "resolver::server::vouched::live_tests::vouched_ignores_another_sessions_cluster_writes_during_the_baseline",
         "resolver::server::vouched::live_tests::vouched_compares_an_extension_member_in_a_system_schema_in_full",
