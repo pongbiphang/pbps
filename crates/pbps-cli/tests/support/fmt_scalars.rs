@@ -19,6 +19,92 @@ fn inserted_rows(d: &Demo, filename: &str) -> Vec<(RowKey, Row)> {
         .collect()
 }
 
+pub fn check_numeric(dialect: &str) {
+    let d = Demo::new("fmtnumeric1801");
+    let schema = if dialect == "postgres" { "app" } else { "dbo" };
+    let boolean = if dialect == "postgres" {
+        "boolean"
+    } else {
+        "bit"
+    };
+    let values = [
+        "0x1f",
+        "0X1F",
+        "-0x1f",
+        "+0X1F",
+        "0o17",
+        "0O17",
+        "-0o17",
+        "+0O17",
+        "0b101",
+        "0B101",
+        "-0b101",
+        "+0b1",
+        "1_000",
+        "-1_0",
+        "+1_000",
+        "-0X1F",
+        "+0x1f",
+        "-0O17",
+        "+0o17",
+        "-0B101",
+        "+0B101",
+        "+.INF",
+        "-.INF",
+        ".NAN",
+        "+.nan",
+        "-.nan",
+        "+.NaN",
+        "-.NaN",
+        ".inf",
+        ".INF",
+        "+.inf",
+        "-.inf",
+        ".nan",
+        ".NaN",
+        "001",
+        "1e3",
+        "2026-10-11",
+        "12:30:00",
+        "yes",
+        "null",
+        "~",
+    ];
+    let mut yaml = format!(
+        "table: {schema}.t\ncolumns:\n  id: {{type: bigint, nullable: false}}\n  label: {{type: varchar(100)}}\n  amount: {{type: int}}\n  enabled: {{type: {boolean}}}\n  absent: {{type: varchar(100)}}\nprimary_key: [id]\ndata:\n  mode: exact\n  rows:\n"
+    );
+    for (i, value) in values.iter().enumerate() {
+        yaml.push_str(&format!(
+            "    '{}': {{label: {}, amount: 31, enabled: true, absent: null}}\n",
+            i + 1,
+            serde_json::to_string(value).unwrap()
+        ));
+    }
+    d.table(&yaml);
+    let before = inserted_rows(&d, "before.json");
+    assert_eq!(before.len(), values.len());
+    for (i, value) in values.iter().enumerate() {
+        let (_, row) = before
+            .iter()
+            .find(|(key, _)| key.0 == (i + 1).to_string())
+            .unwrap();
+        assert_eq!(row.get("label"), Some(&Value::Text((*value).into())));
+        assert_eq!(row.get("amount"), Some(&Value::Int(31)));
+        assert_eq!(row.get("enabled"), Some(&Value::Bool(true)));
+        assert_eq!(row.get("absent"), Some(&Value::Null));
+    }
+    for args in [
+        &["validate"][..],
+        &["fmt"],
+        &["validate"],
+        &["fmt", "--check"],
+    ] {
+        let out = d.run(args);
+        assert_eq!(code(&out), 0, "{args:?}: {}{}", stdout(&out), stderr(&out));
+    }
+    assert_eq!(inserted_rows(&d, "after.json"), before);
+}
+
 pub fn check(dialect: &str) {
     let d = Demo::new("fmtscalars1795");
     let schema = if dialect == "postgres" { "app" } else { "dbo" };

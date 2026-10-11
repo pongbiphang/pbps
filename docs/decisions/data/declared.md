@@ -651,3 +651,23 @@ to add an entry here.
      keeps a future engine that pads differently from failing every read of
      an extreme value. The rendering read back is unchanged, so no recorded
      state moves.
+
+<a id="dec-1801-1"></a>
+
+**DEC-1801.1. The YAML loader decides whether a string can remain bare.**
+The formatter retains its conservative quoting rules, then parses an otherwise
+bare scalar as a flow-sequence item using the loader's untagged `ValueDto`.
+Only one text item with exactly the original contents permits bare output;
+an error, a different type or changed text requires quotes. This covers the
+strictest contexts the shared scalar writer serves, including reference-data
+cells and keys. Existing quotes are never removed by this additional check.
+
+Rust's integer and float parsers are not YAML's grammar: they miss radix
+integers, digit separators and non-finite spellings. Extending that list would
+leave a second grammar to drift when the loader changes. The same round-trip
+principle as decisions 255 and 258 makes the loader the authority, at the cost
+of one small parse for each otherwise-bare scalar. Actual integer, boolean and
+null cells keep their typed writer; partition bounds remain always quoted and
+canonical storage tokens remain intentionally bare. Whole-declaration and
+both-dialect typed-plan tests pin string contents, type identity, numeric
+variants and unchanged non-text values, with a second format producing no diff.

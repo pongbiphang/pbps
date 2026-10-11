@@ -217,6 +217,8 @@ indexes:
 
 - **Formatting preserves scalar text exactly**, including line breaks and
   control characters, using double-quoted YAML escapes wherever needed.
+  A bare string is emitted only when the YAML loader reads it back as the
+  same text, including its type (DEC-1801.1).
 - **`columns` is a map, not a list**, and the key is the column name. One less
   level of nesting, and duplicate names become impossible to express.
 - **`nullable` defaults to `true`** and is written only when needed. The field
@@ -540,7 +542,8 @@ can imply.
   converts it — the same "keep it verbatim, never parse it" the defaults and
   check expressions get.
 - **Boolean-ish and number-shaped row keys are real** (`no` is a status code,
-  `1` is a key), so `fmt` quotes them, under the same rule as §4.3.
+  `1`, `0x1f` and `1_000` are keys), so `fmt` quotes them, under the same rule
+  as §4.3. The rule also preserves text cells that resemble YAML numbers.
 
 | Mode | Meaning | DELETE emitted? |
 |---|---|---|
