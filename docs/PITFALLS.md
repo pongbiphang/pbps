@@ -1009,6 +1009,10 @@ It survived because **every `--dev` test passed a connection string**: the
 docker path had no automated coverage at all. Reading found it; running could
 not have.
 
+`-p 0:1433` also hid a runtime difference: Podman's CLI rejects host port zero,
+while Docker accepts it and publishes on all interfaces. Use `127.0.0.1::1433`
+for a host-chosen loopback port, then verify the reported mapping (#1809).
+
 ## A guard written as a `for` over a `Result`
 
 A read that must return exactly one row grew a guard for the case where it

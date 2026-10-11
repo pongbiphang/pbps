@@ -499,9 +499,9 @@ impl Container {
             .args(["run", "-d", "-e", "ACCEPT_EULA=Y"])
             .arg("-e")
             .arg(format!("MSSQL_SA_PASSWORD={password}"))
-            // Port 0 lets the host pick, so a rehearsal never collides with the
-            // SQL Server a developer already has running.
-            .args(["-p", "0:1433", image])
+            // An omitted host port lets both Docker and Podman avoid an
+            // existing SQL Server. Only this host needs the scratch server.
+            .args(["-p", "127.0.0.1::1433", image])
             .output()
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -549,11 +549,15 @@ impl Container {
             .output()
             .map_err(|e| anyhow::anyhow!("cannot ask docker for the published port: {e}"))?;
         let text = String::from_utf8_lossy(&out.stdout);
-        // `0.0.0.0:49154` — and on a dual-stack host, one line per family.
-        text.lines()
-            .filter_map(|l| l.rsplit(':').next())
-            .find_map(|p| p.trim().parse::<u16>().ok())
-            .ok_or_else(|| anyhow::anyhow!("docker published no port for 1433: {}", text.trim()))
+        if !out.status.success() {
+            bail!(
+                "docker could not report the published port for 1433 ({}):\n{}\n{}",
+                out.status,
+                text.trim(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        parse_published_port(&text)
     }
 
     /// Polls until the server answers, because a container is "running" long
@@ -581,6 +585,22 @@ impl Container {
     }
 }
 
+fn parse_published_port(text: &str) -> anyhow::Result<u16> {
+    // Accept exactly the requested mapping. Picking one line or just its
+    // suffix would hide an additional public bind or a malformed address.
+    text.trim()
+        .strip_prefix("127.0.0.1:")
+        .filter(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "docker did not publish exactly one loopback port for 1433: {}",
+                text.trim()
+            )
+        })
+}
+
 impl Drop for Container {
     fn drop(&mut self) {
         if self.id.is_empty() {
@@ -595,6 +615,36 @@ impl Drop for Container {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_single_nonzero_ipv4_loopback_mapping_is_accepted() {
+        for (text, port) in [
+            ("127.0.0.1:1", 1),
+            ("127.0.0.1:41417\n", 41417),
+            ("127.0.0.1:65535\r\n", 65535),
+        ] {
+            assert_eq!(parse_published_port(text).unwrap(), port);
+        }
+        for text in [
+            "0.0.0.0:49154",
+            "invalid IP:45887",
+            "[::]:49154",
+            "[::1]:49154",
+            "127.0.0.1:0",
+            "127.0.0.1:65536",
+            "127.0.0.1:+1",
+            "127.0.0.1:-1",
+            "127.0.0.1:",
+            "",
+            "garbage",
+            "0.0.0.0:49154\n[::]:49154\n",
+            "127.0.0.1:41417\n0.0.0.0:41417\n",
+            "127.0.0.1:41417\n127.0.0.1:41418\n",
+        ] {
+            let error = parse_published_port(text).unwrap_err().to_string();
+            assert!(error.contains(text.trim()), "{error}");
+        }
+    }
 
     fn planned(c: Change) -> pbps_model::PlannedChange {
         pbps_model::PlannedChange::new(c)
@@ -715,17 +765,5 @@ mod tests {
             parse("Server=localhost,1433;User Id=sa;Password=x"),
             Spec::Connection("Server=localhost,1433;User Id=sa;Password=x".into())
         );
-    }
-
-    #[test]
-    fn the_published_port_is_read_from_dockers_output() {
-        // Not a docker call: the parsing is what can be wrong, and a
-        // dual-stack host prints two lines.
-        let text = "0.0.0.0:49154\n[::]:49154\n";
-        let port = text
-            .lines()
-            .filter_map(|l| l.rsplit(':').next())
-            .find_map(|p| p.trim().parse::<u16>().ok());
-        assert_eq!(port, Some(49154));
     }
 }

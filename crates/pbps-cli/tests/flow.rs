@@ -11388,6 +11388,88 @@ fn an_unreadable_plan_at_a_non_utf8_path_still_produces_an_envelope() {
 
 // ---- Thirty-third review round ----
 
+#[cfg(unix)]
+#[test]
+fn an_unusable_dev_mapping_refuses_rehearsal_and_removes_only_its_container() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let d = Demo::new("devmapping");
+    d.table(ONE_COLUMN);
+    let bin = d.dir.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let docker = bin.join("docker");
+    std::fs::write(
+        &docker,
+        r#"#!/bin/sh
+case "$1" in
+  run)
+    shift
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -p ]; then printf 'publish %s\n' "$2" >> "$PBPS_DEV_LOG"; fi
+      shift
+    done
+    printf 'owned-dev-container\n';;
+  port)
+    printf '%s\n' "$*" >> "$PBPS_DEV_LOG"
+    printf '%s\n' "$PBPS_DEV_MAPPING"
+    if [ "$PBPS_DEV_PORT_STATUS" != 0 ]; then printf 'mapping lookup failed\n' >&2; fi
+    exit "$PBPS_DEV_PORT_STATUS";;
+  rm) printf '%s\n' "$*" >> "$PBPS_DEV_LOG";;
+  *) exit 99;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let path = std::env::join_paths(paths).unwrap();
+    let log = d.dir.join("docker.log");
+    for (mapping, status, diagnostic) in [
+        ("0.0.0.0:49154", "0", "exactly one loopback port"),
+        ("lookup unavailable", "17", "mapping lookup failed"),
+        ("127.0.0.1:49154", "17", "mapping lookup failed"),
+    ] {
+        std::fs::write(&log, "").unwrap();
+        let mut command = Command::new(BIN);
+        command
+            .arg("--project")
+            .arg(&d.dir)
+            .args(["plan", "--dev", "docker://stand-in", "--format", "json"])
+            .env("PATH", &path)
+            .env("PBPS_DEV_LOG", &log)
+            .env("PBPS_DEV_MAPPING", mapping)
+            .env("PBPS_DEV_PORT_STATUS", status);
+        // Another test's fork can briefly retain the just-written script's
+        // descriptor. Retry only before the stand-in has done any work.
+        let mut o = command.output().unwrap();
+        for _ in 0..200 {
+            if !stdout(&o).contains("Text file busy")
+                || !std::fs::read_to_string(&log).unwrap().is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            o = command.output().unwrap();
+        }
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        assert!(
+            v["findings"].as_array().unwrap().iter().any(|f| {
+                f["id"] == "rehearsal.unavailable"
+                    && f.to_string().contains(diagnostic)
+                    && f.to_string().contains(mapping)
+            }),
+            "{v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "publish 127.0.0.1::1433\nport owned-dev-container 1433/tcp\nrm -f owned-dev-container\n"
+        );
+    }
+}
+
 /// `plan --dev docker://<image>` end to end, which is the one path through
 /// `dev.rs` that had **no automated coverage at all** — every other `--dev`
 /// test passes a connection string, so `Container::start` was never run.

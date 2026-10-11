@@ -1386,9 +1386,9 @@ pbps plan --dev "Server=...;User Id=...;Password=..."   # a server already runni
 # or `dev: { docker: ... }` / `dev: { url_env: ... }` in pbps.yml
 ```
 
-A container is started with a per-run password on a host-chosen port and removed
-on every path out; against a server that is already running, pbps creates one
-scratch database and drops it. `--dev` and `--db` are refused together: a
+A container is started with a per-run password on a host-chosen loopback port
+and removed on every path out; against a server that is already running, pbps
+creates one scratch database and drops it. `--dev` and `--db` are refused together: a
 rehearsal answers a preview's question, and combining the two would invite a
 dev-verified plan to be read as a target-verified one.
 

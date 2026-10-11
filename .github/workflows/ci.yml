@@ -560,6 +560,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: plan --dev docker://
         run: |
+          # Record the server, not just the client: Docker CLI can also use Podman.
+          docker version
           # The name filter is asserted, not trusted: a rename would otherwise
           # leave this job green while running nothing, which is the shape
           # docs/PITFALLS.md calls "tests that pass for the wrong reason".
