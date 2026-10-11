@@ -1000,3 +1000,20 @@ the [decision record](../../DECISIONS.md), which says how to add an entry here.
      cannot see produces no row and the report is silent about it: that is the
      boundary of a read-only check, not a gap it could print a `GRANT` for, and
      the count's own `VIEW DEFINITION` demands (505) report the visibility half.
+
+<a id="dec-1770-1"></a>
+
+**DEC-1770.1. A preflight removal keeps the stored table name resolved at its
+own step.** The whole-plan reverse rename map answers for final addresses.
+Using it for `DropTable` or a freeing `DropForeignKey` instead attributes
+`drop a; rename b to a` to `b`: the surviving child's references disappear
+from the count and the dropped child's references remain. Both engines
+reproduced three rows counted from `a` where only one row from `b` survives.
+Resolve each removal while walking the plan, through only earlier renames,
+and retain that stored address in `Removed::stored_table`. Catalog filters
+and projected-row checks use it directly; changes addressed by final names
+keep the whole-plan map. The permanent-referencer guard resolves its FK
+removals at their steps for the same reason, while its parent lookup still
+uses the complete map. Live tests on both engines compare counts with the
+engine's delete verdict, including a planned child arrival, an ordinary drop,
+a drop after its owner's rename, and a freeing FK drop before name reuse.

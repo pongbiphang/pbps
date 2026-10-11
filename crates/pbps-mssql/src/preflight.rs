@@ -222,7 +222,9 @@ struct Moved {
 /// a dropped constraint is one the base side read from the catalog.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Removed {
-    table: TableName,
+    /// Resolved when the removal is visited, before a later rename can give
+    /// this address to another table (DEC-1770.1).
+    stored_table: TableName,
     constraint: Option<String>,
 }
 
@@ -444,13 +446,13 @@ impl AsStored {
                 // either would refuse a delete that will be valid by then.
                 Change::DropForeignKey { table, name } => {
                     this.removed.insert(Removed {
-                        table: table.clone(),
+                        stored_table: this.table(table).unwrap_or_else(|| table.clone()),
                         constraint: Some(name.clone()),
                     });
                 }
                 Change::DropTable { name, .. } => {
                     this.removed.insert(Removed {
-                        table: name.clone(),
+                        stored_table: this.table(name).unwrap_or_else(|| name.clone()),
                         // Every key the table holds goes with it.
                         constraint: None,
                     });
@@ -1134,10 +1136,7 @@ impl AsStored {
     fn removed_from(&self, stored_child: &TableName) -> Removal {
         let mut keys = Vec::new();
         for removed in &self.removed {
-            let table = self
-                .table(&removed.table)
-                .unwrap_or_else(|| removed.table.clone());
-            if &table != stored_child {
+            if &removed.stored_table != stored_child {
                 continue;
             }
             match &removed.constraint {
@@ -1369,7 +1368,7 @@ fn delete_probe(
     // of the same name (DECISIONS 128).
     let mut gone = Vec::new();
     for removed in &names.removed {
-        let table = names.table(&removed.table).unwrap_or(removed.table.clone());
+        let table = &removed.stored_table;
         let of_table = format!(
             "s.name = {} AND t.name = {}",
             literal(&table.schema),
