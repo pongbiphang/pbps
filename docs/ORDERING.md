@@ -235,8 +235,10 @@ namespace, and on PostgreSQL views, tables and indexes share the relation
 namespace. A rename *into* a name (classes 1 and 3) is held to the same rule
 by class: `RenameRole` (1) takes a name `DropRole` (0) freed with no pass.
 The exception is a rename whose freeing drop sits in a higher class than its
-own: `DropColumn` (5) before `RenameColumn` (3), and `DropTable` (6) before
-`RenameTable` (1). `frees_a_renamed_column` and `rename_order` order those.
+own: `DropColumn` (5) before `RenameColumn` (3), and before `RenameTable` (1)
+a `DropTable` (6) or the drop of an index (P) or named constraint (S) holding
+the name (2). `frees_a_renamed_column` and `rename_order` order those; the
+rows below list each.
 
 | Pair | Kind | Order now | Verdict |
 |---|---|---|---|
