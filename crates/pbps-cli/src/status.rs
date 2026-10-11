@@ -439,7 +439,12 @@ fn record_catalog_findings(
     // The same inventory `verify` reports as unexpressible drift, including a
     // recorded module the catalog can no longer read back: one screen must not
     // call an environment clean where the other calls it drifted.
-    let limitations = crate::deploy::managed_limitations(pulled, recorded_ids, &recorded_modules);
+    let limitations = crate::deploy::managed_limitations(
+        pulled,
+        recorded_ids,
+        &recorded_modules,
+        &pbps_diff::external_parents(&entry.snapshot.schema),
+    );
     if !limitations.is_empty() {
         record_status_issue(
             row,

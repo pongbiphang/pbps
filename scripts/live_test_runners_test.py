@@ -175,7 +175,8 @@ elif command[0] != 'sleep':
         last_probe = max(i for i, c in enumerate(calls) if c[3:4] == ["pg_isready"])
         installs = [(i, c[2]) for i, c in enumerate(calls)
                     if c[:2] == ["docker", "exec"] and "partman" in " ".join(c)]
-        self.assertEqual([name for _, name in installs], ["pbps-test-pg", "pbps-test-pg16"])
+        # In either order: the two run at once.
+        self.assertCountEqual([name for _, name in installs], ["pbps-test-pg", "pbps-test-pg16"])
         self.assertTrue(all(last_probe < i < first_client for i, _ in installs), installs)
         self.assertEqual([c for c in calls if c[0] in ("cargo", "python3")], [
             ["python3", "scripts/check-live-fixture.py", "--cell", "pg18", "--container", "pbps-test-pg", "--port", "54320"],

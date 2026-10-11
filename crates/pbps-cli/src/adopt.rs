@@ -120,6 +120,18 @@ pub(crate) async fn hand_over_external_partitions(
                     own.join(", ")
                 ));
             }
+            // What the read could not take in is a part of its own the list
+            // above cannot see: a hash index, say (#1833 review).
+            for limitation in &pulled.limitations {
+                if matches!(&limitation.target,
+                    LimitationTarget::Relation(t) if t == partition)
+                {
+                    refused.push(format!(
+                        "  {partition}, a partition of {name}: {}",
+                        limitation.detail
+                    ));
+                }
+            }
         }
         for partition in &partitions {
             pulled.schema.tables.remove(partition);

@@ -6710,6 +6710,28 @@ fn pg_partman_parent_is_pulled_with_external_partitions(server: &str, k: usize) 
         stderr(&o)
     );
     on_server(&connection, "DROP INDEX app.ev_own");
+    // Negative: one the catalog read cannot take in, which it leaves out and
+    // names, so that no part list could see it (#1833 review).
+    on_server(
+        &connection,
+        "CREATE INDEX ev_hash ON app.ev_default USING hash (id)",
+    );
+    for args in [
+        &["plan", "--db", &connection][..],
+        &["verify", "--db", &connection][..],
+        &["pull", "--force", "--db", &connection][..],
+    ] {
+        let o = d.run(args);
+        assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
+        assert!(
+            format!("{}{}", stdout(&o), stderr(&o))
+                .contains("index `ev_hash` on `app.ev_default` uses the `hash` method"),
+            "{args:?}: {}{}",
+            stdout(&o),
+            stderr(&o)
+        );
+    }
+    on_server(&connection, "DROP INDEX app.ev_hash");
 
     // Negative: pg_partman's catalog unreadable is not "no parent is its".
     let role = Role(
@@ -6764,7 +6786,10 @@ fn pull_declares_a_named_parents_partitions_external_on(server: &str, k: usize) 
          CREATE TABLE app.ev_2025 PARTITION OF app.ev \
              FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
          CREATE TABLE app.ev_rest PARTITION OF app.ev DEFAULT; \
-         CREATE TABLE app.plain (id integer)",
+         CREATE TABLE app.plain (id integer); \
+         CREATE TABLE app.dc (id integer NOT NULL, ts date NOT NULL) PARTITION BY RANGE (ts); \
+         CREATE TABLE app.dc_1 PARTITION OF app.dc \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
     );
     // Without the flag, the partitions are declared.
     let d = Demo::new(&format!("external-1533-declared-{k}"));
@@ -6795,6 +6820,48 @@ fn pull_declares_a_named_parents_partitions_external_on(server: &str, k: usize) 
     );
     d.commit();
     succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // A column of the parent renamed and its name taken by a new one: the
+    // apply's closing read compares the parent under its brought-forward key
+    // as external still, and the plan applies (#1833 review).
+    let path = d.dir.join("schema/app.ev.yml");
+    let declared = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        declared.contains("  id:\n    type: integer\n    nullable: false\n"),
+        "{declared}"
+    );
+    // The rename first, as its intent is recorded; then the name taken.
+    let renamed = declared.replacen("  id:\n", "  id2:\n", 1);
+    std::fs::write(&path, &renamed).unwrap();
+    succeeds(d.run(&["rename", "app.ev.id", "id2"]));
+    std::fs::write(
+        &path,
+        renamed.replacen(
+            "    nullable: false\n  ts:",
+            "    nullable: false\n  id:\n    type: integer\n  ts:",
+            1,
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["fmt"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&o).contains("+ add column id integer") && stdout(&o).contains("id -> id2"),
+        "{}",
+        stdout(&o)
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "rename"],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
     let next = succeeds(d.run(&["plan", "--db", &connection]));
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 
@@ -6843,6 +6910,60 @@ fn pull_declares_a_named_parents_partitions_external_on(server: &str, k: usize) 
             .contains("app.ev_2025 is a partition of the managed table app.ev, whose partitions"),
         "{}",
         stderr(&o)
+    );
+    on_server(
+        &connection,
+        "ALTER TABLE app.ev_2025 DROP CONSTRAINT ev_2025_ck",
+    );
+
+    // A rename chain handing a declared parent's name to the external one:
+    // each read of the apply names the external parent by its identity, so
+    // the declared `app.dc` is not read as external before its own rename
+    // runs (#1833 review).
+    let schema = d.dir.join("schema");
+    let dc = std::fs::read_to_string(schema.join("app.dc.yml")).unwrap();
+    assert!(dc.contains("\npartitions:\n  dc_1:"), "{dc}");
+    std::fs::remove_file(schema.join("app.dc.yml")).unwrap();
+    std::fs::write(
+        schema.join("app.dc2.yml"),
+        dc.replacen("table: app.dc\n", "table: app.dc2\n", 1),
+    )
+    .unwrap();
+    succeeds(d.run(&["rename-table", "app.dc", "app.dc2"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let ev = std::fs::read_to_string(schema.join("app.ev.yml")).unwrap();
+    std::fs::remove_file(schema.join("app.ev.yml")).unwrap();
+    std::fs::write(
+        schema.join("app.dc.yml"),
+        ev.replacen("table: app.ev\n", "table: app.dc\n", 1),
+    )
+    .unwrap();
+    succeeds(d.run(&["rename-table", "app.ev", "app.dc"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&o).contains("app.dc -> app.dc2") && stdout(&o).contains("app.ev -> app.dc"),
+        "{}",
+        stdout(&o)
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "rename"],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_inherits WHERE inhparent = 'app.dc'::regclass"
+        ),
+        2,
+        "the external parent took the name with its partitions"
     );
 }
 

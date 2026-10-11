@@ -725,11 +725,16 @@ connected plan's cost estimate already says that, with the count and the lock
 each one takes (DEC-1687.1). Scoping a live read leaves a partition of such a
 parent out of the managed and unmanaged sets alike, while it is only what its
 parent makes it. One holding anything of its own (an index, a check, a column
-default, storage parameters) is refused by name. pbps would neither compare
+default, storage parameters) is refused by name. So is one holding what the
+catalog read could not take in, such as a hash index: the read names it as a
+limitation instead of dropping it, and a part list alone would not see it. pbps would neither compare
 nor keep that part, and dropping it silently is the wrong thing done quietly.
 A command that compares against the ledger (`plan --db`, `verify`,
 `status`) takes the external parents from the recorded state. `apply` takes
-them from the recorded state plus the parents its plan creates. The commands
+them by identity, from the recorded parents' uids plus the parents its plan
+creates. Each read names them through the ids it scopes with. By name alone,
+a rename chain that hands a declared parent's name to an external one would
+read the declared parent as external before its own rename ran. The commands
 that record the declarations (`baseline`, `snapshot`, `bootstrap`) take them
 from the declarations.
 
