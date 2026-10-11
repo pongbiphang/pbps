@@ -4245,7 +4245,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         );
         let over_step = plan(&added, &added_ids, &over, &mint_ids(&over, &added_ids, &[]));
         let probes = pg.preflight(&over_step).probes;
-        assert_eq!(probes.len(), 5, "{probes:#?}");
+        assert_eq!(probes.len(), 6, "{probes:#?}");
         // The moving statement, which asks the same questions again before
         // its delete (#1763 review).
         assert_eq!(over_step.changes.len(), 1, "{over_step:#?}");
@@ -4601,9 +4601,65 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             "{}",
             probes[4].description
         );
+        // A publication naming the parent cannot name the new table: its
+        // inserts are not counted.
+        assert_eq!(
+            counted(&mut conn, &probes[5].sql).await,
+            0,
+            "{}",
+            probes[5].description
+        );
         conn.execute(&moving)
             .await
             .expect("the move, with no delete published");
+        rollback(&mut conn).await;
+        // A publication of every table of the schema takes in the new table
+        // as soon as it is created, and publishes the rows moved into it
+        // before the attach under its own name: counted, and the move stops.
+        // One publishing updates only is not (#1763 review). A schema, not
+        // `FOR ALL TABLES`, which would reach every other test's tables.
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!(
+            "CREATE PUBLICATION pbps_pub_1547s FOR TABLES IN SCHEMA {s} \
+                 WITH (publish = 'insert'); SAVEPOINT schema_published"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[4].sql).await,
+            0,
+            "{}",
+            probes[4].description
+        );
+        assert_eq!(
+            counted(&mut conn, &probes[5].sql).await,
+            1,
+            "{}",
+            probes[5].description
+        );
+        let stopped = conn
+            .execute(&moving)
+            .await
+            .expect_err("the move stops over the schema publication");
+        assert!(
+            format!("{stopped:?}").contains("a publication publishes inserts into every table"),
+            "{stopped:?}"
+        );
+        conn.execute(
+            "ROLLBACK TO SAVEPOINT schema_published; \
+             ALTER PUBLICATION pbps_pub_1547s SET (publish = 'update')",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &probes[5].sql).await,
+            0,
+            "{}",
+            probes[5].description
+        );
+        conn.execute(&moving)
+            .await
+            .expect("the move, with no insert published");
         rollback(&mut conn).await;
 
         // Two key columns, with unbounded ends: the engine refuses
@@ -4707,7 +4763,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         let checked_preflight = pg.preflight(&checked_step);
         assert_eq!(
             checked_preflight.probes.len(),
-            5,
+            6,
             "{:#?}",
             checked_preflight.probes
         );
@@ -4954,7 +5010,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &mint_ids(&collated_split, &collated_ids, &[]),
         );
         let collated_probes = pg.preflight(&collated_step).probes;
-        assert_eq!(collated_probes.len(), 5, "{collated_probes:#?}");
+        assert_eq!(collated_probes.len(), 6, "{collated_probes:#?}");
         in_a_transaction(&mut conn).await;
         apply(&mut conn, &pg, &collated_step).await;
         assert_eq!(
@@ -5167,7 +5223,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             &mint_ids(&split, &added_ids, &archive),
         );
         let split_probes = pg.preflight(&split_step).probes;
-        assert_eq!(split_probes.len(), 11, "{split_probes:#?}");
+        assert_eq!(split_probes.len(), 13, "{split_probes:#?}");
         for probe in &split_probes {
             assert_eq!(
                 counted(&mut conn, &probe.sql).await,

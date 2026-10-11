@@ -3998,6 +3998,7 @@ fn partition_probes(
                 default_trigger_probe(name, &parent, &stored, &gone, from, to),
                 default_statement_probe(name, &stored, &gone),
                 default_publication_probe(name, &parent, &stored, from, to),
+                default_insert_publication_probe(name, &parent, &stored, from, to),
             ] {
                 match probe {
                     Ok(probe) => out.push(probe),
@@ -4345,6 +4346,58 @@ pub(crate) fn publications_of(default: &str) -> String {
          JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
          WHERE p.pubdelete AND pubt.schemaname = pn.nspname AND pubt.tablename = pc.relname"
     )
+}
+
+/// The publications that publish inserts into the new partition while it is
+/// still a plain table, as SQL text from `FROM` on, with `schema` a SQL text
+/// expression of its schema's name (#1763 review). The move inserts the rows
+/// into it before the attach, and a publication of every table, or of every
+/// table of its schema, takes the table in as soon as it is created; one
+/// naming tables cannot name it yet. Measured on 16 and 18 with a subscriber
+/// holding the published tree: under `FOR ALL TABLES` or `TABLES IN SCHEMA`
+/// publishing inserts, with or without `publish_via_partition_root`, the
+/// insert reached it under the new table's own name, and its apply stopped
+/// on "logical replication target relation … does not exist", the rows
+/// after it never arriving. `FOR TABLE` on the parent, or a publication of
+/// updates only, left it replicating.
+pub(crate) fn insert_publications(schema: &str) -> String {
+    format!(
+        "FROM pg_catalog.pg_publication p \
+         WHERE p.pubinsert AND (p.puballtables OR EXISTS (SELECT 1 \
+         FROM pg_catalog.pg_publication_namespace pns \
+         JOIN pg_catalog.pg_namespace n ON n.oid = pns.pnnspid \
+         WHERE pns.pnpubid = p.oid AND n.nspname = {schema}))"
+    )
+}
+
+/// The publications that would publish the rows moved into `partition`
+/// before it is attached, when the DEFAULT has rows to move
+/// ([`insert_publications`]).
+fn default_insert_publication_probe(
+    partition: &TableName,
+    parent: &TableName,
+    default: &TableName,
+    from: &[pbps_model::BoundDatum],
+    to: &[pbps_model::BoundDatum],
+) -> Result<Probe, DialectError> {
+    Ok(Probe::new(
+        format!(
+            "publications that publish inserts into every table, or every table of {}: moving \
+             the rows of {default} inside the range of {partition} inserts them into it before \
+             it is attached, and a subscriber receives them as rows of a table it does not \
+             have, which stops its replication; move the rows by hand, or take the inserts \
+             out of the publication for the move, then plan again",
+            partition.schema
+        ),
+        format!(
+            "SELECT CASE WHEN {} > 0 THEN {} ELSE 0 END",
+            default_rows_in_range(parent, default, from, to)?,
+            saturated_count(&format!(
+                "(SELECT count(*) {})",
+                insert_publications(&value_literal(&partition.schema))
+            ))
+        ),
+    ))
 }
 
 /// The publications that would send the move's delete and not its insert,
@@ -5116,7 +5169,18 @@ mod tests {
         for p in &asked {
             println!("-- {}\n{};", p.description, p.sql);
         }
-        assert_eq!(asked.len(), 5, "{asked:?}");
+        assert_eq!(asked.len(), 6, "{asked:?}");
+        // The new table's inserts, published before it is attached by a
+        // publication of every table or of its schema (#1763 review).
+        assert!(
+            asked[5].description.starts_with(
+                "publications that publish inserts into every table, or every table of app:"
+            ) && asked[5].sql.contains(
+                "WHERE p.pubinsert AND (p.puballtables OR EXISTS (SELECT 1 FROM \
+                 pg_catalog.pg_publication_namespace pns"
+            ) && asked[5].sql.contains("n.nspname = E'app'"),
+            "{asked:?}"
+        );
         // The publications that would send the move's delete and not its
         // insert, asked only over rows to move (#1763 review).
         assert!(
@@ -5330,7 +5394,7 @@ mod tests {
             "{:?}",
             asked.probes
         );
-        assert_eq!(asked.probes.len(), 4, "{:?}", asked.probes);
+        assert_eq!(asked.probes.len(), 5, "{:?}", asked.probes);
         assert!(
             asked.unchecked.iter().any(|u| u
                 .reason

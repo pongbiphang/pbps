@@ -3355,6 +3355,9 @@ fn beside_its_default(
          \x20               {published}\n\
          \x20           END IF;\n\
          \x20       END LOOP;\n\
+         \x20       IF EXISTS (SELECT 1 {inserting}) THEN\n\
+         \x20           {inserted}\n\
+         \x20       END IF;\n\
          \x20       IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t\n\
          \x20                  WHERE t.tgrelid = {ld}::pg_catalog.regclass AND NOT t.tgisinternal\n\
          \x20                    AND {trigger_fires} AND (t.tgtype::int & 9) = 9) THEN\n\
@@ -3404,6 +3407,13 @@ fn beside_its_default(
         )?,
         publications =
             crate::preflight::publications_of(&format!("{}::pg_catalog.regclass", literal(&d))),
+        inserting = crate::preflight::insert_publications(&literal(&name.schema)),
+        inserted = refuse(format!(
+            "a publication publishes inserts into every table, or every table of {}, so the rows \
+             moved into {name} before it is attached would reach subscribers as rows of a table \
+             they do not have; nothing was moved",
+            name.schema
+        )),
         published = refuse(format!(
             "a publication publishes deletes from {default}, so moving its rows of the range of \
              {name} would send subscribers their delete and not their insert; nothing was moved"
@@ -4698,6 +4708,7 @@ mod tests {
             "is under row-level security",
             "would fire the action of their foreign key; nothing was moved",
             "a publication publishes deletes from app.ev_rest",
+            "a publication publishes inserts into every table, or every table of app",
         ] {
             let at = at(refusal);
             assert!(block < at && at < delete, "{refusal}: {one}");

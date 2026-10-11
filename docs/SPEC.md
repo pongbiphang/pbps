@@ -300,7 +300,7 @@ indexes:
   its range: it is made as a plain table, filled from the DEFAULT and attached,
   in one statement; the apply's pre-flight refuses the move while a row
   references a moved row, a delete trigger or rule on the DEFAULT would fire
-  for it, or a publication would send its delete (DEC-1547.1). The pre-flight refuses the drop of a partition rows
+  for it, or a publication would send its delete or the insert into the new table (DEC-1547.1). The pre-flight refuses the drop of a partition rows
   still reference (DEC-1171.1). A
   partition moved out of `partitions:` into a file of its own, declared with its
   parent's columns, keys, constraints and indexes under any names, is detached
