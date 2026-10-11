@@ -1236,3 +1236,36 @@ dependencies only, since workspace crates are not cached, so a nightly refresh
 goes stale only after a merge that changes `Cargo.lock` or the toolchain. Until
 the next night those runs restore the previous dependency cache and compile
 only what changed.
+
+<a id="dec-1834-1"></a>
+
+**DEC-1834.1. The Windows release qualification runs in full only when its
+inputs change, and always nightly.** DEC-1133.1's checks need the locked MSVC
+build with a static CRT, its import table, and the hashed binary run in a clean
+Server Core consumer against owned native PostgreSQL and SQL Server Express
+fixtures. That made `release-windows` the longest job in `ci.yml`, at about 28
+minutes, while the qualification itself took under a minute. In its first day
+it caught no product defect: its failures were its own development and two
+merge groups whose Windows runner never started Docker.
+
+Those checks can change only with their inputs: the dependency graph and build
+configuration (manifests, `Cargo.lock`, the toolchain, `.cargo/config`), the
+driver and TLS code in `crates/pbps-db`, and the qualification's own scripts
+and workflow. Of the 577 pull requests merged in the month before, 90 touched
+any of them. So a merge group runs it in full when
+`merge_group.base_sha..checkout` touches that set, which covers this pull
+request and everything queued ahead of it. The nightly run (DEC-1836.1) and a
+dispatched run always run it in full, so a regression from outside the set is
+reported at most a day after it merged. A pull request never runs the job at
+all (DEC-1835.1).
+
+The job always starts, and every step after `scripts/ci_release_scope.py` is
+conditioned on its `run` output. A job-level condition or a `paths` filter
+would report `skipped`, which `ci-gate` reads as a failure (DECISIONS 206).
+Unknown is not unaffected: a missing base, an unreadable diff or an event
+without a defined scope runs in full. The script compares both sides of each
+rename, because a file moved out of the set is still a change to it. It writes
+its output as bytes, because text mode on the Windows runner would end the line
+with `\r` and the value would never equal `true`. A crate that starts building
+a driver or TLS configuration belongs in the script's trigger set. The release
+workflow (#1158) must still qualify the exact tagged artifact unconditionally.
