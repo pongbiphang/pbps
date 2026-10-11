@@ -27,13 +27,23 @@ use std::collections::{BTreeMap, BTreeSet};
 /// join the sealed capture, and the assessment takes them, and their parts,
 /// as reconstructed. Nothing is in it for being a member of something
 /// compared (#1783).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Staged {
     compared: BTreeSet<ObjectIdentity>,
     /// The target's shapes the comparison accepted, which the opening
     /// capture must still hold (#1755).
     accepted: BTreeMap<ObjectIdentity, BTreeMap<String, Value>>,
     described: BTreeMap<ObjectIdentity, String>,
+}
+
+/// The compared identities only: the accepted shapes are canonical catalog
+/// properties, which have no ordinary `Debug` path (DEC-612.3).
+impl std::fmt::Debug for Staged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Staged")
+            .field("compared", &self.compared)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Staged {
@@ -731,6 +741,24 @@ mod tests {
         assert!(!shaped.contains_key(&total));
         // Negative: what the identity names as its holder is a part.
         assert!(shaped.contains_key(&label));
+    }
+
+    #[test]
+    fn staged_debug_names_identities_not_the_accepted_properties() {
+        let f = id("pg_proc", &["ext", "f"], vec![]);
+        let staged = Staged {
+            compared: BTreeSet::from([f.clone()]),
+            accepted: BTreeMap::from([(
+                f.clone(),
+                BTreeMap::from([("proargdefaults".to_owned(), json!("'s3cret'::text"))]),
+            )]),
+            described: BTreeMap::from([(f, "function ext.f()".to_owned())]),
+        };
+        let shown = format!("{staged:?}");
+        assert!(shown.contains("compared"), "{shown}");
+        // Negative: no canonical property reaches the output.
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(!shown.contains("proargdefaults"), "{shown}");
     }
 
     #[test]
