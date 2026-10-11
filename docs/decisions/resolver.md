@@ -2216,13 +2216,16 @@ target whose recreated `public` has none, the difference #688 removed.
   current database only, where the inventory finds it), and `pg_authid` is
   read through `pg_roles`, which a supplied account may read. All are read
   under the transaction's one snapshot, so another session's writes
-  meanwhile are in neither read (measured on 16 and 18). Each is compared by
-  a key of OIDs and its row, never by a rendered name, which reads past the
-  snapshot. A difference rolls the transaction back and refuses, naming each
-  object, so nothing is left to clean up. The scratch database's own
-  settings, attributes and comment are its own and go with it; the
-  compatibility qualification reads its settings. A role's password is not
-  in the views a supplied account reads, and is not compared.
+  meanwhile are in neither read (measured on 16 and 18). The second read
+  runs after `RESET ALL`, so the file's own `SET`s (a time zone that renders
+  a role's expiry with another offset, a timeout) do not make it differ from
+  the first. Each is compared by a key of OIDs and its row, never by a
+  rendered name, which reads past the snapshot. A difference rolls the
+  transaction back and refuses, naming each object, so nothing is left to
+  clean up. The scratch database's own settings, attributes and comment are
+  its own and go with it; the compatibility qualification reads its
+  settings. A role's password is not in the views a supplied account reads,
+  and is not compared.
 - **Chains are one hop**, read from the target's `pg_depend` before
   compiling, as §9.3.2 words them. A chain refuses when the compile fails,
   and the refusal names it: the target's dependencies are the current

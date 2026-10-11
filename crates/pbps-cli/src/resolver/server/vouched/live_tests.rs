@@ -2748,6 +2748,44 @@ async fn vouched_checks_a_baseline_whose_path_shadows_a_built_in_type() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_reads_the_shared_state_under_its_own_settings_not_the_baselines() {
+    // A baseline's `SET TimeZone` renders a role's expiry with another
+    // offset; read under it, the second read of the shared state would
+    // differ from the first and refuse a baseline that changed nothing.
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let mut scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &guarded_target()).await;
+    let expiring = format!("pbps_v1783_expiring_{}", scratch.token);
+    scratch
+        .admin()
+        .await
+        .execute(&format!(
+            "CREATE ROLE {expiring} NOLOGIN VALID UNTIL '2100-01-01 00:00:00+00'"
+        ))
+        .await
+        .unwrap();
+    scratch.roles.push(expiring);
+    let baseline = format!(
+        "{}SET TimeZone = 'Pacific/Kiritimati';\nSET statement_timeout = '1ms';\n",
+        plain_baseline("integer")
+    );
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &baseline,
+    )
+    .await;
+    target.drop().await;
+    scratch.drop().await;
+    assert_staged(result, "t", "a baseline that sets its own time zone");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_ignores_another_sessions_cluster_writes_during_the_baseline() {
     // Other runs share the scratch cluster: a role one creates while this
     // baseline runs is in neither of its reads, so nothing is refused.

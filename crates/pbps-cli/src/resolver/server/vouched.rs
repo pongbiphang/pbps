@@ -1243,10 +1243,7 @@ async fn inventory(conn: &mut Conn) -> Result<baseline::Inventory, Error> {
 }
 
 /// Runs the baseline on `session` as one script (#1769), and refuses with
-/// the engine's error when the engine refuses it. A transaction it leaves
-/// open is rolled back and refused: its work would otherwise vanish unseen
-/// with the session, or reach the compile.
-/// Runs the baseline inside one `REPEATABLE READ` transaction pbps opens,
+/// the engine's error when the engine refuses it. Runs the baseline inside one `REPEATABLE READ` transaction pbps opens,
 /// and refuses it, rolled back so it leaves nothing, when it changed the
 /// cluster outside the scratch database (#1783). One snapshot serves both
 /// reads of the shared state, so another session's writes during the
@@ -1286,10 +1283,17 @@ async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
             }
             return Err(Error::Baseline(vec![finding]));
         }
-        // Under an empty path: the script's `SET`s last on this session
-        // until `DISCARD ALL`, and a type it creates may be named `text`.
-        // Not before it: the file runs on the session's own path, and
-        // nothing it could shadow exists yet.
+        // Under the settings the first read had, not the script's: its
+        // `SET`s last on this session until `DISCARD ALL`, and a time zone
+        // renders a role's expiry differently, a timeout can cancel the
+        // read. Every setting is reset rather than the ones known to matter,
+        // so one no one listed cannot refuse a valid baseline. The path is
+        // pinned again, empty as every pbps session's (DEC-1564.1), since a
+        // type the script creates may be named `text`.
+        session
+            .execute("RESET ALL")
+            .await
+            .map_err(read("the baseline session's settings"))?;
         session
             .execute("SELECT pg_catalog.set_config('search_path', '', true)")
             .await
