@@ -2991,6 +2991,20 @@ fn after_their_functions(
     Ok(waits.len())
 }
 
+/// Whether `change` adds a foreign key into the tree a move out of `default`
+/// changes: into its parent or the DEFAULT itself. Installed before the move,
+/// its action would fire on the moved rows' delete, and the moving statement
+/// refuses over it (#1763 review).
+fn references_the_tree(
+    change: &Change,
+    of: Option<&pbps_model::PartitionOf>,
+    default: &TableName,
+) -> bool {
+    matches!(change, Change::AddForeignKey { constraint, .. }
+        if constraint.references_table == *default
+            || of.is_some_and(|of| constraint.references_table == of.parent))
+}
+
 /// Whether `change` adds a rule the rows of `table` must meet: a `NOT NULL`,
 /// a check, or a key or unique index over them.
 #[allow(clippy::wildcard_enum_match_arm)]
@@ -3110,8 +3124,13 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps, partitions: &Parti
         // them past, and they would judge rows that are about to leave.
         Change::CreateTable {
             beside_default: Some(default),
+            table,
             ..
-        } if tightens(later, default) => true,
+        } if tightens(later, default)
+            || references_the_tree(later, table.partition_of.as_ref(), default) =>
+        {
+            true
+        }
         Change::AddColumn { table, name, .. } => match later {
             Change::CreateModule { id, module } | Change::AlterModule { id, module } => partitions
                 .holding(table)
@@ -4372,6 +4391,15 @@ mod tests {
         };
         t.columns
             .insert("v".into(), Column::new("integer".parse().unwrap()));
+        let fk_into = |table: &str| {
+            Box::new(pbps_model::ForeignKey {
+                columns: vec!["v".into()],
+                references_table: table.parse().unwrap(),
+                references_columns: vec!["v".into()],
+                on_delete: pbps_model::ReferentialAction::default(),
+                on_update: pbps_model::ReferentialAction::default(),
+            })
+        };
         let not_null = |table: &str| Change::SetPartitionNotNull {
             uid: Uid::derived(UidKind::Column, table, 0),
             table: table.parse().unwrap(),
@@ -4394,12 +4422,24 @@ mod tests {
                     expression: "v > 0".into(),
                 },
             },
+            Change::AddForeignKey {
+                table: "app.child".parse().unwrap(),
+                name: "child_ev_fk".into(),
+                constraint: fk_into("app.ev"),
+            },
+            Change::AddForeignKey {
+                table: "app.other_child".parse().unwrap(),
+                name: "child_other_fk".into(),
+                constraint: fk_into("app.other"),
+            },
             routine("app.f(integer)", "SELECT 1"),
         ]);
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let order = names(&cs);
+        let key =
+            |name: &str| at(&|c| matches!(c, Change::AddForeignKey { name: n, .. } if n == name));
         let function =
             at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
         let create = at(&|c| matches!(c, Change::CreateTable { .. }));
@@ -4412,8 +4452,13 @@ mod tests {
         assert!(function < create, "{order:?}");
         assert!(create < tightened("app.ev_rest"), "{order:?}");
         assert!(create < check, "{order:?}");
-        // Negative: another table's tightening is not held.
+        // A key into the tree is held behind the move too: installed first,
+        // its action would fire on the moved rows' delete.
+        assert!(create < key("child_ev_fk"), "{order:?}");
+        // Negative: another table's tightening, and a key into another
+        // table, are not held.
         assert!(tightened("app.other_rest") < function, "{order:?}");
+        assert!(key("child_other_fk") < function, "{order:?}");
     }
 
     /// A new partitioned parent held behind the function its generated column

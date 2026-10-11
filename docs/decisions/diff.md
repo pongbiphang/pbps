@@ -4585,7 +4585,9 @@ has before the plan runs:
   column retyped or a generated column recomputed in the same plan, the
   count is unchecked rather than taken over the old values, as a deleted
   row's is for a recomputation (DEC-1168.1). The new values may be written
-  before the move, and the moving statement asks the values it meets.
+  before the move, and the moving statement asks the values it meets. So is
+  it after a row the plan updates or deletes before the move, as a create
+  held behind a function follows the row writes (#1763 review).
 - **The referencing tables the session cannot fully read.** These are
   tables with such a key on which row-level security is active, or that
   the session cannot read the key's columns of: `SELECT` on the table, or
@@ -4659,7 +4661,10 @@ name too.
   checks, uniques and unique indexes are of class 13, after every create
   already (#1763 review, leon's choice of one ordering rule). A create held
   back behind a function its own default calls keeps them behind it: the
-  reorder that holds it counts each of them as needing the create.
+  reorder that holds it counts each of them as needing the create. So does
+  a foreign key the plan adds into the parent or the DEFAULT: installed
+  first, its action fires on the moved rows' delete, and the moving
+  statement refuses (#1763 review).
 - **Probes of the DEFAULT after the move.** A change the plan makes to the
   DEFAULT after the create, such as a check of its own, would be counted
   over rows the move has taken away by then. A check that only a moved row

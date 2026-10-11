@@ -3944,7 +3944,18 @@ fn partition_probes(
     // Partitions dropped so far, in plan order: by a partition's own drop,
     // their rows are gone, and so are their references.
     let mut dropped_before: Vec<&TableName> = Vec::new();
+    // Whether a row this plan updates or deletes is written before, in plan
+    // order: a create held behind a function follows the row writes of
+    // class 12, which may remove or repoint what references the moved rows.
+    let mut rows_written_before = false;
     for p in &changes.changes {
+        if matches!(
+            p.change,
+            Change::UpdateRow { .. } | Change::DeleteRow { .. }
+        ) {
+            rows_written_before = true;
+            continue;
+        }
         let probe = if let Change::CreateTable {
             name,
             table,
@@ -3971,7 +3982,9 @@ fn partition_probes(
             // for a recomputation (DEC-1168.1). Which keys read the column is
             // the catalog's to say when the move runs, and the moving
             // statement asks the values it meets there (#1763 review).
-            if names.recomputed.is_empty() && names.retyped.is_empty() {
+            // So may a row update or delete the plan writes before the move,
+            // which the count would judge over the old rows (#1763 review).
+            if names.recomputed.is_empty() && names.retyped.is_empty() && !rows_written_before {
                 match default_reference_probe(
                     name,
                     &parent,
@@ -3989,8 +4002,9 @@ fn partition_probes(
             } else {
                 unchecked.push(Unchecked::for_change(
                     &p.change,
-                    "a column this plan retypes or recomputes may reference the moved rows, and \
-                     its new values cannot be evaluated before apply",
+                    "a column this plan retypes or recomputes, or a row it writes before the move, \
+                     may reference the moved rows, and its new values cannot be evaluated before \
+                     apply",
                 ));
             }
             // An unlogged table is in no publication, whatever it publishes:
@@ -5455,6 +5469,44 @@ mod tests {
                 .contains("a column this plan retypes or recomputes")),
             "{:?}",
             retyped.unchecked
+        );
+        // A row the plan deletes before the move, as a create held behind a
+        // function follows the row writes: the count is unchecked. Deleted
+        // after the move, it is not, and the count is asked (#1763 review).
+        let written = |delete_first: bool| {
+            let mut changes = vec![
+                pbps_model::PlannedChange::new(deleting("ext.child", "old")),
+                pbps_model::PlannedChange::new(create.clone()),
+            ];
+            if !delete_first {
+                changes.reverse();
+            }
+            preflight(&ChangeSet { changes })
+        };
+        let before = written(true);
+        assert!(
+            before
+                .probes
+                .iter()
+                .all(|p| !p.description.starts_with("rows that reference rows of")),
+            "{:?}",
+            before.probes
+        );
+        assert!(
+            before
+                .unchecked
+                .iter()
+                .any(|u| u.reason.contains("or a row it writes before the move")),
+            "{:?}",
+            before.unchecked
+        );
+        let after = written(false);
+        assert!(
+            after.probes.iter().any(|p| p
+                .description
+                .starts_with("rows that reference rows of app.ev_rest")),
+            "{:?}",
+            after.probes
         );
         // Negative: with no recomputation, the count is asked.
         let plain = preflight(&ChangeSet {
