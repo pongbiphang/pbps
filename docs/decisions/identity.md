@@ -869,3 +869,31 @@ answers, before-I/O malformed-input refusals, and shared human/JSON remedies.
 Unit cases cover ambiguous and provisional choices and shell-sensitive values.
 Real SQL Server and PostgreSQL forced-pull cases require the complete batch
 remedy and verify both drop reasons while preserving the ledger history (#1821).
+
+<a id="dec-1797-1"></a>
+
+**DEC-1797.1. Every offline baseline carries validated identities; a file
+snapshot also proves each live identity is held by its schema.** Parsing a
+snapshot checked its outer version, not its nested ids. A corrupt nested
+version or duplicate mapping was accepted, and an empty schema retaining live
+uids could report a false no-op. `ValidIds` is constructed only through
+`IdsFile::validated`, exposes no mutable access or deserializer, and is the
+identity field of `Baseline`. The ordinary validation rules therefore govern
+both file and Git sources. File admission additionally calls `check_held_by`:
+each live table, column and role must exist under its mapped name. Tombstones
+need no live object, and untracked schema objects need no uid.
+
+The membership check stays file-only. A Git commit can retain identities
+beside deleted declarations awaiting explicit intent. Git's internal mappings
+must still be valid; repairing only the working file does not repair the
+historical evidence, so the user commits that repair or selects another
+revision. Git read failures being mistaken for absence remain #1814's scope.
+`StateSnapshot` and connected recording retain their existing representation
+and DEC-1600.1's boundary; no ledger format, differ or SQL semantics change.
+
+Pinned by unit membership/validated-admission cases and both-dialect CLI
+cases covering every supported snapshot version, no-op/addition/rename
+previews without Git, corrupted mappings and schemas, unchanged pending ids
+and existing outputs on refusal, and committed Git repair. A real PostgreSQL
+ledger export with a grantless role remains a no-op; removing that role from
+the exported schema is refused without changing the working ids or ledger.

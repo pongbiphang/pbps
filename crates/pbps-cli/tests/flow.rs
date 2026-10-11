@@ -27,6 +27,24 @@ mod pty;
 #[path = "support/envelope_archives.rs"]
 mod envelope_archives;
 
+#[path = "support/baseline_ids.rs"]
+mod baseline_ids;
+
+#[test]
+fn supported_file_baselines_keep_noops_additions_and_renames_without_git() {
+    baseline_ids::supported_files("mssql");
+}
+
+#[test]
+fn corrupt_file_baselines_refuse_before_any_identity_or_output_write() {
+    baseline_ids::corrupt_files("mssql");
+}
+
+#[test]
+fn git_baselines_require_committing_repairs_to_corrupt_identity_mappings() {
+    baseline_ids::corrupt_git("mssql");
+}
+
 #[path = "support/batch_intent.rs"]
 mod batch_intent;
 
