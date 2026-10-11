@@ -148,7 +148,10 @@ class Ownership(unittest.TestCase):
         for workflow in (WORKFLOW.replace("      - run:", "      - continue-on-error: true\n        run:"),
                          WORKFLOW.replace("      - run:", "      - name: selected\n        continue-on-error: true\n        run:"),
                          WORKFLOW.replace("    steps:", "    continue-on-error: true\n    steps:"),
-                         WORKFLOW.replace("    steps:", matrix + "    continue-on-error: ${{ matrix.x == 'a' }}\n    steps:")):
+                         WORKFLOW.replace("    steps:", matrix + "    continue-on-error: ${{ matrix.x == 'a' }}\n    steps:"),
+                         # The value on the next line, which YAML reads as `true` too.
+                         WORKFLOW.replace("    steps:", "    continue-on-error:\n      true\n    steps:"),
+                         WORKFLOW.replace("      - run:", "      - continue-on-error:\n          true\n        run:")):
             with self.subTest(workflow=workflow):
                 self.workflow.write_text(workflow)
                 with self.assertRaisesRegex(audit.InventoryError, "continue-on-error needs an explicit execution audit"):
