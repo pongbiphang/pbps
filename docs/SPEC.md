@@ -91,8 +91,9 @@ machinery and never appear in the ids file (see 4.5).
 
 1. **The declarations contain only the desired state** — the columns you want, and
    that is all. No UIDs, no rename annotations, no tombstones.
-2. **Only what cannot be derived needs a human** — rename and drop intent is the
-   whole of that category; everything else is decided automatically.
+2. **Only what cannot be derived needs a human** — rename and drop intent, and
+   the permission to move a DEFAULT partition's rows (6.5), are the whole of
+   that category; everything else is decided automatically.
 3. **Intent is stated once and recorded permanently** — in the identity file in
    version control, decoupled from each environment's deployment progress.
 4. **Human judgement happens at authoring time, not deployment time** — by the
@@ -300,7 +301,8 @@ indexes:
   its range: it is made as a plain table, filled from the DEFAULT and attached,
   in one statement; the apply's pre-flight refuses the move while a row
   references a moved row, a delete trigger or rule on the DEFAULT would fire
-  for it, or a publication would send its delete or the insert into the new table (DEC-1547.1). The pre-flight refuses the drop of a partition rows
+  for it, or a publication would send its delete or the insert into the new table (DEC-1547.1). It also refuses any row to move unless a human allowed the
+  move, and more rows than the move allowed (6.5, DEC-1788.1). The pre-flight refuses the drop of a partition rows
   still reference (DEC-1171.1). A
   partition moved out of `partitions:` into a file of its own, declared with its
   parent's columns, keys, constraints and indexes under any names, is detached
@@ -647,12 +649,20 @@ grants:
       "reason": "REG-2026-042 PII erasure request",
       "operator": "leon"
     }
+  },
+  "moves": {
+    "t_q4w8rz": {
+      "max_rows": 50000,
+      "allowed_at": "2026-10-11",
+      "reason": "no CDC reads app.events",
+      "operator": "leon"
+    }
   }
 }
 ```
 
-It stores only **what cannot be derived from the YAML**: the identity mapping and
-the tombstones. Types, nullability and index definitions are never stored — the
+It stores only **what cannot be derived from the YAML**: the identity mapping,
+the tombstones, and the moves a human allowed (6.5). Types, nullability and index definitions are never stored — the
 YAML already has them.
 
 A 200-column project is 200 lines of `uid: name`, and a rename's diff is:
@@ -697,8 +707,10 @@ one uid**. On violation it fails and asks a human to decide which uid survives.
 
 ## 6. Expressing intent
 
-Only two kinds of change need human intent: **rename** and **drop** (when one
-table both loses and gains a column, the two cannot be told apart automatically).
+Only two kinds of change need human intent to be planned: **rename** and
+**drop** (when one table both loses and gains a column, the two cannot be told
+apart automatically). A third is needed to apply one: **moving a DEFAULT
+partition's rows** into a new range partition (6.5).
 
 There are three equivalent inputs, all of which converge on the ids file.
 
@@ -800,6 +812,50 @@ confirmation (14.3). Whichever channel supplies it, the artifact is the same: on
 entry in the ids file, in git, reviewed in the merge request. That is what still
 exists when prod deploys the rename five versions later.
 
+### 6.5 Moving DEFAULT-partition rows
+
+A range partition added beside a standing DEFAULT partition takes the
+DEFAULT's rows of its range (4.3, DEC-1547.1). Moving a row is a delete from
+the DEFAULT and an insert into the new partition, and whatever reads the
+database's changes sees exactly that: a logical replication slot decodes both,
+an application holding a row's `xmin` finds it gone. Whether an environment
+tolerates that, and how many rows one transaction may move with the DEFAULT
+locked, is in no file and no catalog. So it is intent:
+
+```bash
+pbps move-rows app.events_2030 --max-rows 50000 --reason "no CDC reads app.events"
+```
+
+The command records one entry in the ids file's `moves`, against the new
+partition's uid, with the bound, the reason, who allowed it and when. Like the
+other commands of 6.1 it needs no database connection, and allowing the same
+bound and reason again changes nothing. It is refused for a table that is not a
+range partition whose parent declares a DEFAULT partition, where no row can
+move. The entry follows the partition through a rename and goes with its drop.
+
+- **Without a move allowed**, any row of the DEFAULT inside the range refuses
+  the apply by name, before its first statement, with the command that allows
+  the move and the move written out to run by hand: lock the DEFAULT, create
+  the table, move the rows, attach it, in one transaction. A DEFAULT with no
+  such row needs nothing allowed, and the plan is the same either way.
+- **With one**, the rows move, unless there are more than its bound: the apply
+  refuses then, nothing moved, and the message sends the operator to move the
+  rows by hand in batches. The bound is checked twice — by the pre-flight, and
+  again by the moving statement itself on the rows it has locked — because a
+  count seen when planning does not bind the database the plan reaches.
+- **A publication is refused anyway.** A subscriber is known to lose the moved
+  rows (DEC-1547.1); no intent makes that acceptable.
+- **A logical slot is listed, not refused.** `plan --db` names each logical
+  replication slot of the database, with its plugin, as one that will decode
+  the move; whether its consumer takes a delete and an insert in its stride is
+  what the operator allowing the move answers.
+
+There is no prompt for it and no annotation: an offline `plan` cannot see
+whether the DEFAULT holds any row of the range, so it cannot know there is a
+question to ask. The plan report says, for each such partition, how many rows
+it may take or that it may take none. An entry for a partition that already
+exists is never consulted, since no plan creates it again.
+
 ---
 
 ## 7. Change classification and the risk gate
@@ -813,6 +869,7 @@ exists when prod deploys the rename five versions later.
 | Narrowing, adding NOT NULL, adding a constraint | No | The intent is clear, but the class is dangerous |
 | A pure deletion with no additions in the same table | **Yes** (a reason) | Unambiguous as an operation, but the tombstone has to answer an audit's "why", which no algorithm can produce |
 | **A disappearance and an addition in the same table** | **Yes** | Rename or drop+add; indistinguishable |
+| A range partition beside a DEFAULT that holds rows of its range | **Yes** (to apply: a bound and a reason) | Moving the rows is a delete and an insert, and whether the environment tolerates that is not in the catalog (6.5) |
 
 ### 7.2 Risk classes
 
@@ -1285,7 +1342,7 @@ back is structure: a column that was dropped returns empty (14.3).
 | `pbps plan --base <file>` | Use a state snapshot file as the baseline instead (for environments without git) |
 | `pbps plan --check` | CI mode: fail only when intent is missing, never prompt, and never connect |
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
-| `pbps rename` / `rename-table` / `rename-role` / `drop` / `drop-table` / `drop-role` | Record intent into the ids file |
+| `pbps rename` / `rename-table` / `rename-role` / `drop` / `drop-table` / `drop-role` / `move-rows` | Record intent into the ids file |
 | `pbps validate` | Static checks: type validity, FK targets exist, identity consistency (one name may not map to more than one uid, see 5.3), module shape and namespace collisions (4.5), grant targets (4.7), and the declaration rules of the `policies:` block ([ADR-0008](ADR-0008-policies.md)); `--since <rev>` evaluates the rules only for objects whose identity changed since that revision |
 | `pbps docs` | Render documentation and an ERD from the declarations (see 9.4) |
 | `pbps explain --plan <file>` | The deployment gate's view of a saved plan: what, why, how it runs, and the exact approval command (see 9.6) |

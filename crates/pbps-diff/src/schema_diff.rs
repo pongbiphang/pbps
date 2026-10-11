@@ -563,11 +563,18 @@ fn diff_partial_rebuilding(
                 .partition_of
                 .as_ref()
                 .and_then(|of| standing_default(base, declared, of));
+            // What a human allowed it to take (#1788): read from the
+            // declared side, where `pbps move-rows` writes it.
+            let moves_at_most = beside_default
+                .as_ref()
+                .and_then(|_| declared.ids.moves.get(uid))
+                .map(|m| m.max_rows);
             changes.push(Change::CreateTable {
                 uid: uid.clone(),
                 name: name.clone(),
                 table: Box::new(table),
                 beside_default,
+                moves_at_most,
             });
         }
     }
@@ -8470,6 +8477,101 @@ mod tests {
             "{:?}",
             kinds(&planned)
         );
+    }
+
+    /// The move a human allowed reaches the create that moves (#1788): its
+    /// bound, read from the declared side's identity file by the
+    /// partition's uid. Nothing allowed is `None`, and a create that moves
+    /// nothing carries no bound, whatever the file holds.
+    #[test]
+    fn the_move_a_human_allowed_reaches_the_create_beside_the_default() {
+        use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionOf};
+        let mut parent = table(&[("ts", Column::new(ty("date")).not_null())]);
+        parent.partition_by = Some(PartitionBy {
+            columns: vec!["ts".into()],
+        });
+        let partition = |bound: PartitionBound| Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let mut base = schema_of("app.ev", parent);
+        let mut declared = base.clone();
+        declared.tables.insert(
+            "app.ev_2025".parse().unwrap(),
+            partition(PartitionBound::Range {
+                from: vec![BoundDatum::Value("2025-01-01".into())],
+                to: vec![BoundDatum::Value("2026-01-01".into())],
+            }),
+        );
+        let bounds = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                .map(|r| r.ids)
+                .unwrap_or_else(|_| {
+                    // The intent is refused for a parent without a DEFAULT;
+                    // write the move by hand to see the differ ignore it.
+                    let mut ids = crate::resolve(declared, &base_ids, &[], &ctx())
+                        .unwrap()
+                        .ids;
+                    let uid = ids
+                        .table_uid(&"app.ev_2025".parse().unwrap())
+                        .unwrap()
+                        .clone();
+                    ids.moves.insert(
+                        uid,
+                        pbps_model::Move {
+                            max_rows: 10,
+                            allowed_at: "2026-10-11".into(),
+                            reason: "by hand".into(),
+                            operator: "leon".into(),
+                        },
+                    );
+                    ids
+                });
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .expect("planned")
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::CreateTable { moves_at_most, .. } => Some(*moves_at_most),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+        };
+        let allowed = [Intent::MoveRows {
+            table: "app.ev_2025".parse().unwrap(),
+            max_rows: 10,
+            reason: "no CDC".into(),
+        }];
+        // Negative: no DEFAULT beside it, so nothing moves and no bound is
+        // carried, though the file holds one.
+        assert_eq!(bounds(&base, &declared, &allowed), [None]);
+        for tree in [&mut base, &mut declared] {
+            tree.tables.insert(
+                "app.ev_rest".parse().unwrap(),
+                partition(PartitionBound::Default),
+            );
+        }
+        assert_eq!(bounds(&base, &declared, &allowed), [Some(10)]);
+        // Negative: nothing allowed.
+        assert_eq!(bounds(&base, &declared, &[]), [None]);
     }
 
     /// A range partition added under a standing parent is made beside the

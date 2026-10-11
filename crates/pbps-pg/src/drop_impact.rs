@@ -873,6 +873,7 @@ mod tests {
                     name: t.clone(),
                     table: Box::default(),
                     beside_default: None,
+                    moves_at_most: None,
                 }),
             ],
         };

@@ -1832,6 +1832,7 @@ pub(crate) fn split_moving_defaults(cs: &mut ChangeSet, declared: &Schema, diale
             name,
             table,
             beside_default: Some(_),
+            moves_at_most: _,
         } = &mut p.change
         else {
             continue;
@@ -4032,6 +4033,7 @@ mod tests {
             name: n.clone(),
             table: Box::new(t.clone()),
             beside_default: None,
+            moves_at_most: None,
         };
         #[allow(clippy::wildcard_enum_match_arm)]
         let table_of = |cs: &ChangeSet| match &cs.changes[0].change {
@@ -4094,12 +4096,14 @@ mod tests {
                     name: n.clone(),
                     table: Box::new(parent.clone()),
                     beside_default: None,
+                    moves_at_most: None,
                 },
                 Change::CreateTable {
                     uid: Uid::derived(UidKind::Table, "app.n_1", 0),
                     name: p1.clone(),
                     table: Box::new(partition(column)),
                     beside_default: None,
+                    moves_at_most: None,
                 },
                 alter(&s, "app.f(integer)"),
             ]);
@@ -4288,6 +4292,7 @@ mod tests {
                 name: n,
                 table: Box::new(t),
                 beside_default: None,
+                moves_at_most: None,
             },
             alter(&s, "app.f(integer)"),
         ]);
@@ -4356,6 +4361,7 @@ mod tests {
                 name: name.parse().unwrap(),
                 table: Box::new(t),
                 beside_default: None,
+                moves_at_most: None,
             }
         };
         let mut cs = plan(vec![
@@ -4412,6 +4418,7 @@ mod tests {
                 name: name.parse().unwrap(),
                 table: Box::new(t),
                 beside_default: None,
+                moves_at_most: None,
             }
         };
         let mut parent = Table::default();
@@ -4427,6 +4434,7 @@ mod tests {
                 name: "app.ev".parse().unwrap(),
                 table: Box::new(parent),
                 beside_default: None,
+                moves_at_most: None,
             },
             partition("app.ev_new", "app.f(1)"),
             partition("app.ev_plain", "7"),
@@ -4506,12 +4514,14 @@ mod tests {
                 name: "app.ev_1".parse().unwrap(),
                 table: Box::new(partition(Some("7"))),
                 beside_default: Some("app.ev_rest".parse().unwrap()),
+                moves_at_most: None,
             },
             Change::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.ev_plain", 0),
                 name: "app.ev_plain".parse().unwrap(),
                 table: Box::new(partition(None)),
                 beside_default: None,
+                moves_at_most: None,
             },
             Change::SetPartitionNotNull {
                 uid: Uid::derived(UidKind::Column, "app.ev_rest", 0),
@@ -4644,6 +4654,7 @@ mod tests {
                     name: "app.ev_1".parse().unwrap(),
                     table: Box::new(t),
                     beside_default: Some("app.ev_rest".parse().unwrap()),
+                    moves_at_most: None,
                 },
                 Change::SetPartitionNotNull {
                     uid: Uid::derived(UidKind::Table, "app.ev_rest", 0),
@@ -4728,6 +4739,7 @@ mod tests {
                 name: name.parse().unwrap(),
                 table: Box::new(t),
                 beside_default: None,
+                moves_at_most: None,
             }
         };
         let partition = |name: &str, of: &str| Change::CreateTable {
@@ -4742,6 +4754,7 @@ mod tests {
                 ..Table::default()
             }),
             beside_default: None,
+            moves_at_most: None,
         };
         let mut cs = plan(vec![
             parent("app.ev", Some("app.f(k)")),
@@ -4791,6 +4804,7 @@ mod tests {
                 ..Table::default()
             }),
             beside_default: None,
+            moves_at_most: None,
         };
         let index_on = |column: &str| pbps_model::Index {
             columns: vec![pbps_model::IndexColumn {
@@ -4822,6 +4836,7 @@ mod tests {
                 name,
                 table,
                 beside_default: None,
+                moves_at_most: None,
             }
         };
         // A standing partition's own changes on the column, and a default
@@ -4961,6 +4976,7 @@ mod tests {
                 name: name.parse().unwrap(),
                 table: Box::new(t),
                 beside_default: None,
+                moves_at_most: None,
             }
         };
         // A later new table naming app.n only inside an OID-alias literal.
@@ -4974,6 +4990,7 @@ mod tests {
                 name: "app.literal".parse().unwrap(),
                 table: Box::new(t),
                 beside_default: None,
+                moves_at_most: None,
             }
         };
         // And a new partition naming it only in its own default (#1578).
@@ -4996,6 +5013,7 @@ mod tests {
                 ..Table::default()
             }),
             beside_default: None,
+            moves_at_most: None,
         };
         let mut cs = plan(vec![
             new_table("app.n", &[("id", None), ("g", Some("app.f(id)"))], None),
@@ -5065,6 +5083,7 @@ mod tests {
                 name: "app.other".parse().unwrap(),
                 table: Box::new(other),
                 beside_default: None,
+                moves_at_most: None,
             },
             routine("app.f(integer)", "SELECT count(*)::integer FROM app.other"),
         ]);
@@ -6721,6 +6740,7 @@ mod tests {
                 name: TableName::new("app", "t"),
                 table: Box::new(s.tables[&TableName::new("app", "t")].clone()),
                 beside_default: None,
+                moves_at_most: None,
             },
         ]);
         let found = BTreeMap::from([(
@@ -7248,6 +7268,7 @@ mod tests {
                 ..Table::default()
             }),
             beside_default: None,
+            moves_at_most: None,
         };
         let refused =
             refusal_of(&plan(vec![partition, add_index("ix_new", None)]), &*pg()).unwrap_err();
@@ -7291,6 +7312,7 @@ mod tests {
             name: TableName::new("app", "n"),
             table: Box::new(table),
             beside_default: None,
+            moves_at_most: None,
         }
     }
 
@@ -7486,6 +7508,7 @@ mod tests {
                 name: TableName::new("app", table),
                 table: Box::new(t),
                 beside_default: None,
+                moves_at_most: None,
             }
         };
         let cut = format!("{}_pkey", "t".repeat(58));
@@ -7530,6 +7553,7 @@ mod tests {
                 name: TableName::new("app", "n"),
                 table: Box::new(t),
                 beside_default: None,
+                moves_at_most: None,
             }
         };
         let row_of = |trigger: &str| {
@@ -7624,6 +7648,7 @@ mod tests {
                 name: TableName::new("app", table),
                 table: Box::new(t),
                 beside_default: None,
+                moves_at_most: None,
             }
         };
         let holder = |name: &str, owner: Option<&str>, primary_key: bool| KeyNameHolder {
@@ -7802,6 +7827,7 @@ mod tests {
                 name: TableName::new("app", table),
                 table: Box::new(t),
                 beside_default: None,
+                moves_at_most: None,
             }
         };
         let rename = |from: TableName, to: TableName| Change::RenameTable {
@@ -7928,6 +7954,7 @@ mod tests {
                 name: TableName::new("s2", "n"),
                 table: Box::new(in_s2),
                 beside_default: None,
+                moves_at_most: None,
             },
         ];
         let prefixes = key_name_prefixes(&plan(chain.clone()));
@@ -7986,6 +8013,7 @@ mod tests {
             name: TableName::new("app", &long),
             table: Box::new(t.clone()),
             beside_default: None,
+            moves_at_most: None,
         }]));
         assert_eq!(prefixes, [("app".to_owned(), "t".repeat(49))]);
         for n in [0, 1, 10, 1000] {

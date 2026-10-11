@@ -6874,6 +6874,14 @@ fn partitions_are_added_and_dropped_through_the_cli() {
     let p2030 = "  ev_2030: {from: [\"2030-01-01\"], to: [\"2031-01-01\"]}\n";
     tree(&format!("{p2025}{p2026}{p2030}{rest}"));
     succeeds(d.run(&["plan"]));
+    succeeds(d.run(&[
+        "move-rows",
+        "app.ev_2030",
+        "--max-rows",
+        "1",
+        "--reason",
+        "nothing reads app.ev's changes",
+    ]));
     d.commit();
     succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
     on_server(
@@ -6975,6 +6983,14 @@ fn partitions_are_added_and_dropped_through_the_cli() {
     )
     .unwrap();
     succeeds(d.run(&["plan"]));
+    succeeds(d.run(&[
+        "move-rows",
+        "app.ev_2031",
+        "--max-rows",
+        "1",
+        "--reason",
+        "nothing reads app.ev's changes",
+    ]));
     d.commit();
     succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
     // The partition's own NOT NULL is a risk of the change that sets it, as
@@ -20561,6 +20577,157 @@ fn default_move_flow(server: &str, slug: &str, container: &str) {
         d.commit();
         connected(d)
     };
+    let kept = |why: &str| {
+        assert_eq!(
+            holds("SELECT count(*) FROM pg_class WHERE relname = 'ev_2025'"),
+            0,
+            "{why}: no partition"
+        );
+        assert_eq!(ids_in("ONLY app.ev_rest"), "2,3,4,5", "{why}: no row moved");
+    };
+
+    // #1788: nobody allowed the move, so its rows are refused by name before
+    // any statement runs, with the command that allows it and the move
+    // written out to run by hand. `plan --db` lists the logical slots that
+    // would decode the move: none, a physical slot being none of them.
+    let physical = format!("pbps_{}", slug.replace('-', "_"));
+    let drop_slot = format!(
+        "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+         WHERE slot_name = '{physical}'"
+    );
+    on_server(&conn, &drop_slot);
+    on_server(
+        &conn,
+        &format!("SELECT pg_create_physical_replication_slot('{physical}')"),
+    );
+    with("  ev_2025:\n    from: [\"2025-01-01\"]\n    to: [\"2026-01-01\"]\n");
+    let shown = planned(&d);
+    on_server(&conn, &drop_slot);
+    assert!(
+        shown.contains("app.ev_rest, none allowed: the apply refuses any it holds"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(
+            "logical_slots: no logical replication slot on this database would decode the rows \
+             moved from app.ev_rest into app.ev_2025"
+        ),
+        "{shown}"
+    );
+    let o = approved_apply(&d, &conn, &plan, &[]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let refused = stderr(&o);
+    for said in [
+        "the data will not accept this plan",
+        "2 rows of app.ev_rest are inside the range of app.ev_2025",
+        "no move of them was allowed",
+        "pbps move-rows app.ev_2025 --max-rows <N> --reason <why>",
+        "LOCK TABLE ONLY \"app\".\"ev_rest\" IN SHARE MODE;",
+    ] {
+        assert!(refused.contains(said), "{said}: {refused}");
+    }
+    kept("refused before the apply");
+    // The moving statement refuses too, run where no pre-flight asks: the
+    // `plan --sql` script, read by psql.
+    let script = d.dir.join("unallowed.sql");
+    succeeds(d.run(&["plan", "--db", &conn, "--sql", script.to_str().unwrap()]));
+    let o = psql_script_in(container, &db, &std::fs::read_to_string(&script).unwrap());
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("2 rows of app.ev_rest are inside the range of app.ev_2025")
+            && stderr(&o).contains("no move of them was allowed"),
+        "{}",
+        stderr(&o)
+    );
+    kept("refused by the moving statement");
+
+    // Negative: a move for a table no rows can move into is refused, and
+    // records nothing; and a bound must allow a row.
+    let ids_file = d.dir.join("schema.ids.json");
+    let before = std::fs::read_to_string(&ids_file).unwrap();
+    let o = d.run(&["move-rows", "app.ev", "--max-rows", "5", "--reason", "x"]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        format!("{}{}", stdout(&o), stderr(&o))
+            .contains("app.ev is not a range partition whose parent declares a DEFAULT partition"),
+        "{}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    let o = d.run(&[
+        "move-rows",
+        "app.ev_2025",
+        "--max-rows",
+        "0",
+        "--reason",
+        "x",
+    ]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(std::fs::read_to_string(&ids_file).unwrap(), before);
+
+    // Allowed, but for fewer rows than the range holds: refused, by the
+    // pre-flight and by the moving statement alike, with nothing moved.
+    succeeds(d.run(&[
+        "move-rows",
+        "app.ev_2025",
+        "--max-rows",
+        "1",
+        "--reason",
+        "no CDC reads app.ev",
+    ]));
+    planned(&d);
+    let o = approved_apply(&d, &conn, &plan, &[]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("2 rows of app.ev_rest are inside the range of app.ev_2025, more than the 1 its allowed move may take")
+            && stderr(&o).contains("a batch at a time"),
+        "{}",
+        stderr(&o)
+    );
+    kept("past the bound allowed");
+    succeeds(d.run(&["plan", "--db", &conn, "--sql", script.to_str().unwrap()]));
+    let o = psql_script_in(container, &db, &std::fs::read_to_string(&script).unwrap());
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("more than the 1 its allowed move may take"),
+        "{}",
+        stderr(&o)
+    );
+    kept("past the bound, by the moving statement");
+
+    // Allowed for as many rows as it holds: the rows move below. Allowing
+    // the same again changes nothing, `plan --check` finds the identity file
+    // current, and the plan carries the bound.
+    succeeds(d.run(&[
+        "move-rows",
+        "app.ev_2025",
+        "--max-rows",
+        "2",
+        "--reason",
+        "no CDC reads app.ev",
+    ]));
+    d.commit();
+    let again = succeeds(d.run(&[
+        "move-rows",
+        "app.ev_2025",
+        "--max-rows",
+        "2",
+        "--reason",
+        "no CDC reads app.ev",
+    ]));
+    assert!(
+        stdout(&again).contains("The identity file is unchanged"),
+        "{}",
+        stdout(&again)
+    );
+    succeeds(d.run(&["plan", "--check"]));
+    let shown = connected(&d);
+    assert!(
+        shown.contains(
+            "moving those rows out of the default partition app.ev_rest, at most 2 as allowed"
+        ),
+        "{shown}"
+    );
 
     // Its own check refuses row 3, moved in before the check is added: the
     // whole plan rolls back.
@@ -20669,6 +20836,14 @@ fn default_move_flow(server: &str, slug: &str, container: &str) {
         ),
     )
     .unwrap();
+    succeeds(d.run(&[
+        "move-rows",
+        "app.ev_2026",
+        "--max-rows",
+        "1",
+        "--reason",
+        "no CDC reads app.ev",
+    ]));
     planned(&d);
     let o = approved_apply(&d, &conn, &plan, &[]);
     assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));

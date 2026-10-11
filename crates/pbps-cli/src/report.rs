@@ -24,6 +24,13 @@ pub fn intent(i: &Intent) -> String {
         Intent::DropColumn { column, reason } => format!("drop column {column} (reason: {reason})"),
         Intent::RenameRole { from, to } => format!("rename role {from} -> {to}"),
         Intent::DropRole { role, reason } => format!("drop role {role} (reason: {reason})"),
+        Intent::MoveRows {
+            table,
+            max_rows,
+            reason,
+        } => format!(
+            "move at most {max_rows} DEFAULT-partition rows into {table} (reason: {reason})"
+        ),
     }
 }
 
@@ -60,6 +67,7 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
             Blocker::ConflictingRenameIntents { .. } => "identity.conflicting-rename-intents",
             Blocker::RenameTargetExists { .. } => "identity.rename-target-exists",
             Blocker::UnrepresentableName { .. } => "identity.unrepresentable-name",
+            Blocker::MoveNotBesideDefault { .. } => "identity.move-not-beside-default",
         }
     }
     let text = one_blocker(b);
@@ -229,6 +237,11 @@ fn one_blocker(b: &Blocker) -> String {
                  the {what} so it no longer contains a `.`, then declare it (or pull) again\n"
             )
         }
+        Blocker::MoveNotBesideDefault { table } => format!(
+            "  {table} is not a range partition whose parent declares a DEFAULT partition, so \
+             no rows can move into it\n\n    declare {table} as a range partition beside the \
+             DEFAULT, or drop the `move-rows` request\n"
+        ),
     }
 }
 
@@ -672,6 +685,7 @@ pub fn describe(c: &Change) -> String {
             name,
             table,
             beside_default,
+            moves_at_most,
             ..
         } => match &table.partition_of {
             Some(of) => match &of.bound {
@@ -699,12 +713,18 @@ pub fn describe(c: &Change) -> String {
                         list(to)
                     );
                     // The rows it takes from the DEFAULT are the change's to
-                    // say, since they leave that partition (#1547).
-                    match beside_default {
-                        Some(default) => format!(
-                            "{made}, moving those rows out of the default partition {default}"
+                    // say, since they leave that partition (#1547), and so
+                    // is how many a human allowed it to take (#1788).
+                    match (beside_default, moves_at_most) {
+                        (Some(default), Some(most)) => format!(
+                            "{made}, moving those rows out of the default partition {default}, \
+                             at most {most} as allowed"
                         ),
-                        None => made,
+                        (Some(default), None) => format!(
+                            "{made}, moving those rows out of the default partition {default}, \
+                             none allowed: the apply refuses any it holds"
+                        ),
+                        (None, _) => made,
                     }
                 }
             },
@@ -1049,6 +1069,7 @@ mod tests {
                 ..Default::default()
             }),
             beside_default: None,
+            moves_at_most: None,
         };
         assert_eq!(
             super::describe(&create(Some(B::Range {
@@ -1079,9 +1100,32 @@ mod tests {
                 name,
                 table,
                 beside_default: Some("app.ev_rest".parse().unwrap()),
+                moves_at_most: None,
             }),
             "+ create table app.p1, a partition of app.ev for rows from (\"1\") to (\"2\"), \
-             moving those rows out of the default partition app.ev_rest"
+             moving those rows out of the default partition app.ev_rest, none allowed: the \
+             apply refuses any it holds"
+        );
+        // And how many a human allowed it to take (#1788).
+        let Change::CreateTable {
+            uid, name, table, ..
+        } = create(Some(B::Range {
+            from: vec![D::Value("1".into())],
+            to: vec![D::Value("2".into())],
+        }))
+        else {
+            unreachable!("a create");
+        };
+        assert_eq!(
+            super::describe(&Change::CreateTable {
+                uid,
+                name,
+                table,
+                beside_default: Some("app.ev_rest".parse().unwrap()),
+                moves_at_most: Some(500),
+            }),
+            "+ create table app.p1, a partition of app.ev for rows from (\"1\") to (\"2\"), \
+             moving those rows out of the default partition app.ev_rest, at most 500 as allowed"
         );
         assert_eq!(
             super::describe(&create(None)),

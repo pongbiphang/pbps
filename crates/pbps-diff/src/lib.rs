@@ -1924,4 +1924,172 @@ mod tests {
         assert_eq!(r.created_roles.len(), 1);
         r.ids.validate().unwrap();
     }
+
+    // ---- move intent (#1788) ----
+
+    /// A parent `app.ev` with a DEFAULT `app.ev_rest` and range partitions,
+    /// as the declarations write them.
+    fn partitioned(ranges: &[&str], default: bool) -> Schema {
+        let mut names = vec!["app.ev"];
+        names.extend_from_slice(ranges);
+        if default {
+            names.push("app.ev_rest");
+        }
+        let spec: Vec<(&str, &[&str])> = names.iter().map(|n| (*n, &["id"][..])).collect();
+        let mut s = schema(&spec);
+        for name in ranges {
+            s.tables.get_mut(&t(name)).unwrap().partition_of = Some(pbps_model::PartitionOf {
+                parent: t("app.ev"),
+                bound: pbps_model::PartitionBound::Range {
+                    from: vec![pbps_model::BoundDatum::Value("1".into())],
+                    to: vec![pbps_model::BoundDatum::Value("2".into())],
+                },
+                columns: Default::default(),
+            });
+        }
+        if default {
+            s.tables.get_mut(&t("app.ev_rest")).unwrap().partition_of =
+                Some(pbps_model::PartitionOf {
+                    parent: t("app.ev"),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                });
+        }
+        s
+    }
+
+    fn move_rows(table: &str, max_rows: u64, reason: &str) -> Intent {
+        Intent::MoveRows {
+            table: t(table),
+            max_rows,
+            reason: reason.into(),
+        }
+    }
+
+    /// A move is recorded against the new partition's uid, minted in the
+    /// same run, with who allowed it and when; allowing the same bound again
+    /// changes nothing, so the command converges, and another bound
+    /// replaces it.
+    #[test]
+    fn a_move_is_recorded_against_the_new_partition_and_converges() {
+        let ids = resolve(&partitioned(&[], true), &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared = partitioned(&["app.ev_1"], true);
+        let r = resolve(
+            &declared,
+            &ids,
+            &[move_rows("app.ev_1", 500, "no CDC")],
+            &ctx(),
+        )
+        .unwrap();
+        let uid = r.ids.table_uid(&t("app.ev_1")).unwrap().clone();
+        assert_eq!(
+            r.ids.moves.get(&uid),
+            Some(&pbps_model::Move {
+                max_rows: 500,
+                allowed_at: "2026-08-30".into(),
+                reason: "no CDC".into(),
+                operator: "leon".into(),
+            })
+        );
+        r.ids.validate().unwrap();
+
+        let later = Context {
+            operator: "someone else".into(),
+            today: "2026-09-01".into(),
+        };
+        let again = resolve(
+            &declared,
+            &r.ids,
+            &[move_rows("app.ev_1", 500, "no CDC")],
+            &later,
+        )
+        .unwrap();
+        assert_eq!(
+            again.ids, r.ids,
+            "the same move allowed again is kept as it was"
+        );
+
+        let more = resolve(
+            &declared,
+            &r.ids,
+            &[move_rows("app.ev_1", 900, "no CDC")],
+            &later,
+        )
+        .unwrap();
+        assert_eq!(more.ids.moves[&uid].max_rows, 900);
+        assert_eq!(more.ids.moves[&uid].operator, "someone else");
+    }
+
+    /// Only a range partition whose parent declares a DEFAULT can take rows
+    /// from it: a move for anything else is refused by name, not recorded
+    /// and never consulted.
+    #[test]
+    fn a_move_for_a_table_no_rows_can_move_into_is_refused() {
+        let declared = partitioned(&["app.ev_1"], true);
+        let ids = resolve(&declared, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        for table in ["app.ev", "app.ev_rest", "app.nowhere"] {
+            let errs = resolve(&declared, &ids, &[move_rows(table, 1, "x")], &ctx()).unwrap_err();
+            assert_eq!(
+                errs,
+                vec![Blocker::MoveNotBesideDefault { table: t(table) }],
+                "{table}"
+            );
+        }
+        // A range partition whose parent has no DEFAULT.
+        let bare = partitioned(&["app.ev_1"], false);
+        let ids = resolve(&bare, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let errs = resolve(&bare, &ids, &[move_rows("app.ev_1", 1, "x")], &ctx()).unwrap_err();
+        assert_eq!(
+            errs,
+            vec![Blocker::MoveNotBesideDefault {
+                table: t("app.ev_1")
+            }]
+        );
+    }
+
+    /// A move follows its partition by uid through a rename, and goes with
+    /// it when it is dropped: the file never holds a move without its table.
+    #[test]
+    fn a_move_follows_its_partition_and_goes_with_its_drop() {
+        let declared = partitioned(&["app.ev_1"], true);
+        let ids = resolve(
+            &declared,
+            &IdsFile::default(),
+            &[move_rows("app.ev_1", 5, "x")],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let uid = ids.table_uid(&t("app.ev_1")).unwrap().clone();
+        let renamed = partitioned(&["app.ev_one"], true);
+        let r = resolve(
+            &renamed,
+            &ids,
+            &[Intent::RenameTable {
+                from: t("app.ev_1"),
+                to: t("app.ev_one"),
+            }],
+            &ctx(),
+        )
+        .unwrap();
+        assert!(r.ids.moves.contains_key(&uid));
+        let r = resolve(
+            &partitioned(&[], true),
+            &ids,
+            &[Intent::DropTable {
+                table: t("app.ev_1"),
+                reason: "gone".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap();
+        assert!(r.ids.moves.is_empty(), "{:?}", r.ids.moves);
+        r.ids.validate().unwrap();
+    }
 }

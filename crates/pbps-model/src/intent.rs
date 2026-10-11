@@ -3,13 +3,17 @@
 //! # Why intent is a separate concept
 //!
 //! Almost every change can be derived automatically from what the declaration
-//! files currently say. Only two things cannot, because the information simply
+//! files currently say. Three things cannot, because the information simply
 //! is not in the files — it is only in the author's head (SPEC §6):
 //!
 //! - **Rename, or drop plus add**: when a table loses one column and gains
 //!   another in the same revision, the two are structurally indistinguishable.
 //! - **Why something was dropped**: the question an audit asks, and one no
 //!   algorithm can answer.
+//! - **Whether a DEFAULT partition's rows may move** into a new range
+//!   partition (#1788): a move is a delete and an insert, and whether the
+//!   environment tolerates that, and how many rows it may take, is in no
+//!   file and no catalog.
 //!
 //! Intent does not go into [`crate::Schema`]. `Schema` must satisfy "two
 //! semantically identical schemas are equal", and intent is one-shot: the same
@@ -57,6 +61,13 @@ pub enum Intent {
         role: String,
         reason: String,
     },
+    /// Allow the DEFAULT partition's rows inside a new range partition's
+    /// range to move into it, at most `max_rows` of them (#1788).
+    MoveRows {
+        table: TableName,
+        max_rows: u64,
+        reason: String,
+    },
 }
 
 impl Intent {
@@ -64,7 +75,9 @@ impl Intent {
     pub fn concerns_table(&self, t: &TableName) -> bool {
         match self {
             Intent::RenameTable { from, to } => from == t || to == t,
-            Intent::RenameColumn { table, .. } | Intent::DropTable { table, .. } => table == t,
+            Intent::RenameColumn { table, .. }
+            | Intent::DropTable { table, .. }
+            | Intent::MoveRows { table, .. } => table == t,
             Intent::DropColumn { column, .. } => &column.table == t,
             Intent::RenameRole { .. } | Intent::DropRole { .. } => false,
         }
@@ -117,6 +130,11 @@ mod tests {
             Intent::DropRole {
                 role: "legacy".into(),
                 reason: "REG-3".into(),
+            },
+            Intent::MoveRows {
+                table: t("dbo.ev_2030"),
+                max_rows: 5000,
+                reason: "REG-4".into(),
             },
         ];
         let back: Vec<Intent> =

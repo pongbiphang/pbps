@@ -606,6 +606,34 @@ pub fn notes(report: &ImpactReport) -> Vec<String> {
     out
 }
 
+/// The logical replication slots on this database, by name with their
+/// output plugin (#1788): each decodes a move of DEFAULT-partition rows as a
+/// delete and an insert, which the plan lists rather than refuses, since a
+/// slot read by its own consumer may take that in its stride.
+///
+/// A slot with no database is physical, and one on another database decodes
+/// nothing of this one.
+pub async fn logical_slots(conn: &mut Conn) -> Result<Vec<(String, String)>, DbError> {
+    let mut out = Vec::new();
+    for row in conn
+        .query(
+            "SELECT slot_name::text AS slot, plugin::text AS plugin \
+             FROM pg_catalog.pg_replication_slots \
+             WHERE slot_type = 'logical' AND database = pg_catalog.current_database() \
+             ORDER BY slot_name",
+        )
+        .await?
+    {
+        let named = |column: &str| -> Result<String, DbError> {
+            row.try_get::<&str>(column)?
+                .map(str::to_owned)
+                .ok_or_else(|| DbError::BadRow(format!("catalog column `{column}` is null")))
+        };
+        out.push((named("slot")?, named("plugin")?));
+    }
+    Ok(out)
+}
+
 fn text(row: &Row, column: &str) -> Result<String, DbError> {
     Ok(row.try_get::<&str>(column)?.unwrap_or_default().to_owned())
 }
