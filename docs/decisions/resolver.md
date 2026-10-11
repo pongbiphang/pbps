@@ -2364,9 +2364,17 @@ measured profiles while it does.
   unconfirmed cleanup does. `kill` first, because `rm --force` waits out
   the runtime's stop grace; `--volumes`, because the image declares its
   data directory a volume, which `rm` alone leaves behind (both measured
-  under Podman). A run that ends otherwise, by a panic or a cancelled
-  future, still asks for the removal from a drop guard, which does not
-  wait on the runtime.
+  under Podman). The release reads the volumes first and confirms each
+  gone too: Docker deletes the container's record before its volumes and
+  only logs a volume it could not delete. A `docker run` that did not
+  finish is never a clean release, because the daemon may still complete
+  the create; the container is named, to be removed if it appears. A run
+  that ends otherwise, by a panic or a cancelled future, still asks for
+  the removal from a drop guard, which does not wait on the runtime. That
+  is best effort: a create still in flight when it runs can land after
+  it. Every scratch container carries the label `pbps.resolver=scratch`,
+  so such a leftover is found with `docker ps --all --filter
+  label=pbps.resolver=scratch`.
 - **`outside_writes: refuse | allow`, on both kinds.** `refuse`, the
   default, is DEC-1673.1's rule. `allow` skips the before-and-after
   comparison of the shared state, and keeps what the baseline wrote there:

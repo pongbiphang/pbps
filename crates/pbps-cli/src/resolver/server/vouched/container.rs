@@ -125,9 +125,15 @@ impl Container {
         };
         let args = run_args(&container.id, &password, image);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let started = docker(&args)
-            .await
-            .map_err(|why| ProduceError::Acquire(format!("starting {image}: {why}")));
+        let started = match run_to_end(&args).await {
+            Ok(started) => {
+                started.map_err(|why| ProduceError::Acquire(format!("starting {image}: {why}")))
+            }
+            Err(why) => {
+                let name = container.id.clone();
+                return Err(unfinished_start(&name, &why, container.remove().await));
+            }
+        };
         let port = match started {
             Ok(_) => docker(&["port", &container.id, "5432/tcp"])
                 .await
@@ -188,21 +194,58 @@ impl Container {
     /// `--volumes` because the image declares its data directory a volume,
     /// which `rm` alone leaves behind, a whole cluster per run (both
     /// measured on #1674).
+    ///
+    /// The volumes are read first and confirmed gone one by one: Docker
+    /// deletes the container's record before its volumes, and only logs a
+    /// volume it failed to delete, so a container gone proves nothing of
+    /// them (#1843 review).
     async fn remove(mut self) -> Result<(), Vec<String>> {
+        let volumes = docker(&[
+            "container",
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{.Name}} {{end}}",
+            &self.id,
+        ])
+        .await
+        .map(|names| {
+            names
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
         let _ = docker(&["kill", &self.id]).await;
         let _ = docker(&["rm", "--force", "--volumes", &self.id]).await;
+        let mut left = Vec::new();
         // Only the runtime saying there is no such container is absence. An
         // unreachable daemon or a timeout says nothing, and the container
         // may still run.
         match docker(&["container", "inspect", "--format", "{{.Id}}", &self.id]).await {
-            Err(why) if no_such_container(&why) => {
-                self.removed = true;
-                Ok(())
+            Err(why) if no_such_container(&why) => {}
+            _ => left.push(format!("the docker container {} and its volumes", self.id)),
+        }
+        match volumes {
+            Ok(volumes) => {
+                for volume in volumes {
+                    match docker(&["volume", "inspect", "--format", "{{.Name}}", &volume]).await {
+                        Err(why) if no_such_volume(&why) => {}
+                        _ => left.push(format!("the docker volume {volume}")),
+                    }
+                }
             }
-            _ => Err(vec![format!(
-                "the docker container {} and its volumes",
+            // Never created, or created and never named: nothing to read.
+            Err(why) if no_such_container(&why) => {}
+            Err(_) if left.is_empty() => left.push(format!(
+                "the volumes of the docker container {}, which could not be read",
                 self.id
-            )]),
+            )),
+            Err(_) => {}
+        }
+        if left.is_empty() {
+            self.removed = true;
+            Ok(())
+        } else {
+            Err(left)
         }
     }
 }
@@ -229,6 +272,11 @@ impl Drop for Container {
 /// socket `... found: no such container`, Docker's `No such container:`).
 fn no_such_container(error: &str) -> bool {
     error.to_ascii_lowercase().contains("no such container")
+}
+
+/// And a missing volume (measured on #1674: `no such volume` on both).
+fn no_such_volume(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("no such volume")
 }
 
 /// And a missing image (measured on #1674: Docker's `No such image`,
@@ -264,9 +312,28 @@ fn run_args(name: &str, password: &str, image: &str) -> Vec<String> {
     .collect()
 }
 
+/// A `docker run` that did not finish leaves the daemon's create request
+/// unknown: it may complete after the removal read "no such container", and
+/// the container appear afterwards. So the release is never reported clean;
+/// the container is named, to be removed if it appears (#1843 review).
+fn unfinished_start(name: &str, why: &str, removal: Result<(), Vec<String>>) -> ProduceError {
+    let mut names = removal.err().unwrap_or_default();
+    names.push(format!(
+        "the docker container {name} and its volumes, if it appears: its start did not \
+         finish ({why})"
+    ));
+    ProduceError::Cleanup(names)
+}
+
 /// Runs `docker` with `args`, and returns its standard output, or why it
 /// failed.
 async fn docker(args: &[&str]) -> Result<String, String> {
+    run_to_end(args).await.and_then(|finished| finished)
+}
+
+/// As [`docker`], telling a command that ran to its end, successfully or
+/// not, from one that did not finish or could not be run (the outer `Err`).
+async fn run_to_end(args: &[&str]) -> Result<Result<String, String>, String> {
     let output = tokio::time::timeout(
         COMMAND,
         Command::new("docker")
@@ -283,7 +350,7 @@ async fn docker(args: &[&str]) -> Result<String, String> {
         )
     })?
     .map_err(|error| format!("docker could not be run: {error}"))?;
-    if output.status.success() {
+    Ok(if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
         Err(format!(
@@ -292,7 +359,7 @@ async fn docker(args: &[&str]) -> Result<String, String> {
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         ))
-    }
+    })
 }
 
 /// Exactly the one loopback mapping asked for. Accepting any line, or any
@@ -313,7 +380,55 @@ fn published_port(text: &str) -> Result<u16, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Container, no_such_container, no_such_image, published_port, run_args};
+    use super::{
+        Container, no_such_container, no_such_image, no_such_volume, published_port, run_args,
+        unfinished_start,
+    };
+
+    /// A start that did not finish is never a clean release, even when the
+    /// removal then found no container: the create may still land.
+    #[test]
+    fn an_unfinished_start_names_its_container_even_when_none_was_found() {
+        let named = |error| {
+            let super::ProduceError::Cleanup(names) = error else {
+                panic!("not a cleanup failure: {error}");
+            };
+            names
+        };
+        let names = named(unfinished_start(
+            "pbps-scratch-1",
+            "docker run did not finish",
+            Ok(()),
+        ));
+        assert_eq!(names.len(), 1);
+        assert!(names[0].contains("pbps-scratch-1") && names[0].contains("if it appears"));
+        // A removal that itself failed keeps what it named.
+        let names = named(unfinished_start(
+            "pbps-scratch-1",
+            "docker run did not finish",
+            Err(vec!["the docker volume v".into()]),
+        ));
+        assert_eq!(names.len(), 2, "{names:?}");
+    }
+
+    #[test]
+    fn only_the_runtime_saying_so_confirms_a_volume_gone() {
+        for absent in [
+            "docker volume failed (exit status: 1): Error response from daemon: no such volume",
+            "docker volume failed (exit status: 125): Error: no such volume x",
+            "docker volume failed (exit status: 1): Error: No such volume: x",
+        ] {
+            assert!(no_such_volume(absent), "{absent}");
+        }
+        // Negative: a refused socket or a timeout leaves it unknown.
+        for unknown in [
+            "docker volume did not finish in 120s",
+            "docker volume failed (exit status: 1): permission denied while trying to connect to the Docker daemon socket",
+            "docker volume failed (exit status: 1): Error: no such container x",
+        ] {
+            assert!(!no_such_volume(unknown), "{unknown}");
+        }
+    }
 
     /// The launch never pulls: `pull: never` is enforced where an image can
     /// be fetched, not only at the inspection before it.

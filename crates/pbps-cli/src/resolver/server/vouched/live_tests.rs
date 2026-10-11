@@ -3571,6 +3571,71 @@ async fn vouched_docker_removes_its_container_when_the_run_is_cancelled() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn vouched_docker_names_a_volume_its_removal_left() {
+    // A second container holding the scratch's data volume: `rm --volumes`
+    // succeeds and the container is gone, but the volume stays (measured
+    // under Podman; Docker only logs it). The run names the volume rather
+    // than reporting a clean release.
+    let target = setting("PBPS_TEST_PG_DB");
+    let image = setting("PBPS_TEST_PG_SCRATCH_IMAGE");
+    let identity = identity_of(&target).await;
+    let before = scratch_containers();
+    let holder = format!("pbps-v1674-holder-{:016x}", rand::random::<u64>());
+    let mut volumes = Vec::new();
+    let result = super::container::with_container(
+        Driver::Postgres,
+        &target,
+        &identity,
+        &image,
+        Default::default(),
+        async |_: &str| {
+            volumes = new_container_volumes(&before);
+            let scratch: Vec<String> = scratch_containers().difference(&before).cloned().collect();
+            let held = std::process::Command::new("docker")
+                .args([
+                    "create",
+                    "--name",
+                    &holder,
+                    "--volumes-from",
+                    &scratch[0],
+                    &image,
+                ])
+                .output()
+                .unwrap();
+            assert!(held.status.success(), "docker create: {held:?}");
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "--force", "--volumes", &holder])
+        .output();
+    for volume in &volumes {
+        let _ = std::process::Command::new("docker")
+            .args(["volume", "rm", volume])
+            .output();
+    }
+    assert_eq!(
+        before,
+        scratch_containers(),
+        "the scratch container itself is gone"
+    );
+    match result {
+        Err(ProduceError::Cleanup(names)) => {
+            assert!(!volumes.is_empty());
+            for volume in &volumes {
+                assert!(
+                    names.contains(&format!("the docker volume {volume}")),
+                    "{names:?}"
+                );
+            }
+        }
+        other => panic!("a release that left a volume reported {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
 async fn vouched_docker_answers_a_managed_question() {
     // The question a server scratch answers, answered the same way on a
     // container started for the run.

@@ -2210,6 +2210,7 @@
         "resolver::server::vouched::live_tests::vouched_docker_starts_and_removes_its_container_without_root",
         "resolver::server::vouched::live_tests::vouched_docker_removes_its_container_when_the_run_fails",
         "resolver::server::vouched::live_tests::vouched_docker_removes_its_container_when_the_run_is_cancelled",
+        "resolver::server::vouched::live_tests::vouched_docker_names_a_volume_its_removal_left",
         "resolver::server::vouched::live_tests::vouched_docker_answers_a_managed_question",
         "resolver::server::vouched::live_tests::vouched_docker_records_the_image_as_configured_and_unverified",
         "resolver::server::vouched::live_tests::vouched_docker_binds_the_target_by_its_cluster_identity",
