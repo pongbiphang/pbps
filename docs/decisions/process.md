@@ -1133,3 +1133,33 @@ Python effect interpreter. This does not relax protected bindings, selector
 reads or reflective spellings in otherwise inert annotations. Actual Python
 controls distinguish eager and deferred evaluation; full-owner controls and
 removed-projection counterfactuals pin the scheduling boundary.
+
+<a id="dec-1838-1"></a>
+
+**DEC-1838.1. The full local gate runs on the heads that can be queued; a
+review round runs a round gate.** The full gate (the decision checks, `fmt`,
+`clippy`, the workspace tests and both live suites) took about thirty minutes
+and ran before every push. A pull request usually takes several draft review
+rounds, and each round's head is reviewed and fixed again before the head that
+merges exists, so most of that time qualified heads nobody would queue.
+
+The heads that can reach the queue are the first push of the branch, the head
+marked ready, a ready-phase push and a rebase made for a conflict or a
+confirmed merge-group interaction. The full gate runs before each of those.
+Before ready rather than just before enqueueing: if nothing is pushed after the
+ready mark, that head is the one queued, so the run is the same, and a failure
+found there is fixed while the pull request is still a draft instead of
+resetting the ready-phase review count. A full-gate failure is fixed as a draft
+round, and its head needs its own completed review before ready.
+
+Every other push runs the round gate: the two decision checks, `fmt`,
+warning-free `clippy`, and the tests that pin the round's fixes, live ones
+included when a fix is engine-facing. Those tests already run, since each fixed
+thread names its pinning test and the fix is reverted to watch that test fail.
+A docs-only push runs only the decision checks.
+
+The cost is that a round fix which breaks something it did not touch is found
+at the ready mark, not on its own push, and may take another draft round. Once
+the pull-request CI run stops running the live suites (#1835), the full gate at
+the ready mark is their only run before the merge group, so it is the one run
+this decision cannot drop.

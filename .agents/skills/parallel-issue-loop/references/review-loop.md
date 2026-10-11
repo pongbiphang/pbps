@@ -14,7 +14,10 @@ them before advancing a PR.
    production fix and observe the new regression test fail for the expected
    reason before restoring the fix.
 4. Sweep every analogous site for the same bug shape before pushing.
-5. Before every push, run and observe all commands required by `AGENTS.md`:
+5. Run and observe the **full gate** on every head that can be queued: before
+   the first push of the branch, before marking the PR ready, before every
+   push in the ready phase, and before pushing a rebase (`AGENTS.md`,
+   DEC-1838.1):
 
    ```bash
    python3 scripts/check_decisions_test.py
@@ -25,6 +28,12 @@ them before advancing a PR.
    scripts/live-tests.sh
    scripts/live-tests-pg.sh
    ```
+
+   Every other push (a draft-phase review round's fixes) runs the **round
+   gate**: the two decision checks, `cargo fmt --all --check`, warning-free
+   `cargo clippy --workspace --all-targets`, and the tests that pin the round's
+   fixes, live ones included when a fix is engine-facing. A docs-only push runs
+   only the two decision checks.
 
    Run `cargo deny check` when dependencies change. If a required command cannot
    run or does not pass, report the command, failure output, and reason, then
@@ -72,7 +81,9 @@ finding still needs the disposition above. Count a review only when its
 move the count.
 
 When either route qualifies, kill the watch and post no further draft
-`@codex review`, then mark the PR ready. Do **not** rebase merely because
+`@codex review`, run the full gate on the head, then mark the PR ready. A
+full-gate failure is fixed as a draft round whose head needs its own completed
+review before ready. Do **not** rebase merely because
 `master` moved: the merge queue builds the PR against current `master`, so a
 branch that is only behind needs nothing (DECISIONS 502). Rebase only to
 resolve a conflict; that rebase does not repeat the qualified draft gate, but
@@ -132,8 +143,8 @@ close/reopen, head rewrites, dispatch or a bypass.
 `master` moving before merge needs no action: the queue rebuilds the PR against
 current `master` when it is enqueued.
 
-- If the queue ejects the PR for a conflict, resolve it, run the required local
-  tests, push with `git push --force-with-lease`, and obtain a completed code
+- If the queue ejects the PR for a conflict, resolve it, run the full gate,
+  push with `git push --force-with-lease`, and obtain a completed code
   review whose `Reviewed commit:` is the conflict-resolution head.
 - P0 from the conflict-resolution review is always fixed. P1–P3 use the same
   three-case finding rules above; a P2 may be deferred directly to a linked
@@ -152,7 +163,7 @@ Before merge, the primary agent—not an issue worker—must independently confi
 - the issue is still open and the PR closes the intended issue;
 - the final diff is a complete solution limited to the issue;
 - architecture and product guardrails are preserved;
-- all required local tests actually ran and passed;
+- the full gate actually ran and passed on the head being queued;
 - the qualifying draft and ready reviews belong to the recorded pushed heads;
 - every finding has the required fix or linked deferred issue;
 - no review thread is unresolved;

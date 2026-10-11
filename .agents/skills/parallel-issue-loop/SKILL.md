@@ -129,7 +129,7 @@ and merge order.
   need you, and both begin by rebasing onto current `master`, because neither
   reproduces on a branch that predates it: a conflict, which ejects the PR from
   the queue, and an interaction the merge group confirmed, which a stale branch
-  cannot compile. Rebase, fix, rerun required tests, and follow the
+  cannot compile. Rebase, fix, run the full gate, and follow the
   resulting-head code-review gate in the review reference. Do not automatically
   repeat the earlier draft/ready streak.
 - Do not merge a downstream PR while its required upstream issue remains

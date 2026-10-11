@@ -133,8 +133,8 @@ unclaimed, and not already carried by a PR. You own the DAG and the merge order.
   because neither reproduces on a branch that predates it: a **conflict**,
   which ejects the PR from the queue, and an **interaction the merge group
   confirmed** — `master` changed something the branch still calls — which a
-  stale branch cannot even compile. Rebase, fix it, push with
-  `--force-with-lease`, rerun the required tests, and follow the resulting-head
+  stale branch cannot even compile. Rebase, fix it, run the
+  full gate, push with `--force-with-lease`, and follow the resulting-head
   code-review gate in the review reference. Do not automatically repeat the
   draft or ready streak.
 - Never merge a downstream PR while its required upstream issue is unmerged.
@@ -154,7 +154,9 @@ review reference.
 
 ## Local verification and the live suites
 
-Workers run, before every push:
+Workers run the **full gate** on every head that can be queued: before the
+first push of the branch, before the PR is marked ready, before every push in
+the ready phase, and before pushing a rebase (AGENTS.md, DEC-1838.1):
 
 ```bash
 python3 scripts/check_decisions_test.py
@@ -165,6 +167,12 @@ cargo test --workspace --all-targets
 scripts/live-tests.sh
 scripts/live-tests-pg.sh
 ```
+
+Every other push (a draft-phase review round's fixes) runs the **round gate**:
+the two decision checks, `cargo fmt --all --check`, warning-free `cargo clippy
+--workspace --all-targets`, and the tests that pin the round's fixes, live ones
+included when a fix is engine-facing. A docs-only push runs only the two
+decision checks.
 
 The live suites need a database container, and concurrent workers sharing one
 container make each other fail. Serialize them through you: hold a single live
