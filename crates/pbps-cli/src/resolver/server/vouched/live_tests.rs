@@ -2428,6 +2428,52 @@ async fn vouched_compares_an_operator_familys_members_with_the_target() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_compares_a_sequence_its_table_owns() {
+    // An identity column's sequence is a part of its table by a dependency
+    // that no list names; it is compared all the same (#1783).
+    let table = [
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!(
+            "CREATE TABLE {EXTERNAL}.t (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+             name text UNIQUE)"
+        ),
+    ];
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    for altered in [true, false] {
+        let mut setup = vec![format!("CREATE SCHEMA {MANAGED}")];
+        setup.extend(table.iter().cloned());
+        if altered {
+            setup.push(format!(
+                "ALTER TABLE {EXTERNAL}.t ALTER COLUMN id SET INCREMENT BY 5"
+            ));
+        }
+        setup.push(format!("CREATE VIEW {MANAGED}.a AS {}", reading("id", "t")));
+        let mut target = Fixture::new("PBPS_TEST_PG_DB");
+        let scratch = Fixture::new(SCRATCH_SERVER);
+        let target_db = staging_target(&mut target, &setup).await;
+        let key = ProjectKey::new(true);
+        let baseline = table.iter().map(|s| format!("{s};\n")).collect::<String>();
+        let result = produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &baseline,
+        )
+        .await;
+        target.drop().await;
+        if altered {
+            let refused = baseline_refusal(result);
+            assert!(refused.contains("seqincrement"), "{refused}");
+        } else {
+            // Negative: the same sequence is staged.
+            assert_staged(result, "t", "an unaltered sequence");
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_compares_an_operator_class_with_its_family() {
     // The class lives on its family automatically; whether it is its type's
     // default is in its own header, compared with the family (#1783).

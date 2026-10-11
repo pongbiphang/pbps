@@ -1,18 +1,17 @@
 //! What a resolver baseline staged on scratch, compared with the target
 //! (SPEC §9.3.2; #1673).
 //!
-//! Each object the baseline created is compared by what a creation-time
-//! binding can read: its own class properties, of a relation its columns,
-//! primary-key and unique constraints and indexes, and parents, and of an
-//! operator family its operators and support routines. An extension's
+//! Each object the baseline created is compared with everything that hangs
+//! off it, a part of a part too, except what a binding does not read:
+//! foreign keys, CHECKs and constraint triggers, defaults, triggers,
+//! policies, rules, non-unique indexes and the source of a routine's body or
+//! a view's query. A binding reads an object's shape, not how it computes or
+//! guards it, so a baseline may omit those, and a view may be staged as a
+//! shape view. What is left out is listed, not what is compared, so a kind
+//! of part no one thought of refuses when it differs (#1783). An extension's
 //! members are compared each on its own: nothing is accepted for belonging
-//! to something compared (#1783).
-//! Foreign keys, CHECKs, defaults, triggers, policies, rules, non-unique
-//! indexes and the source of a routine's body or a view's query are not
-//! compared: a binding reads an object's shape, not how it computes or
-//! guards it, so a baseline may omit them, and a view may be staged as a
-//! shape view. The target's complete fingerprints are still sealed and
-//! rechecked; only this comparison is narrower.
+//! to something compared. The target's complete fingerprints are still
+//! sealed and rechecked; only this comparison is narrower.
 
 use super::logical::Catalog;
 use super::manifest::Input;
@@ -244,63 +243,76 @@ fn shapes(
         }
     }
     let first = |object: &ObjectIdentity, at: usize| object.signature.get(at).cloned();
+    // What each object was made by, internally or automatically: the same
+    // dependencies `assess::carries` follows to accept a part as
+    // reconstructed, so whatever it accepts on a compared object's account
+    // was compared here (#1783).
+    let mut makers: BTreeMap<&ObjectIdentity, Vec<&ObjectIdentity>> = BTreeMap::new();
+    for dependency in inputs.keys() {
+        if let ("pg_depend", [kind], [made, maker]) = (
+            dependency.class.as_str(),
+            dependency.name.as_slice(),
+            dependency.signature.as_slice(),
+        ) && matches!(kind.as_str(), "i" | "a")
+        {
+            makers.entry(made).or_default().push(maker);
+        }
+    }
+    // A non-unique index's relation, and so its columns, are left out with
+    // it, though the relation depends on its table automatically.
+    let unindexed: BTreeSet<ObjectIdentity> = inputs
+        .iter()
+        .filter(|(object, input)| {
+            object.class == "pg_index"
+                && input.properties.get("indisunique") != Some(&Value::Bool(true))
+        })
+        .filter_map(|(object, _)| first(object, 0))
+        .collect();
     let mut ranked: BTreeMap<ObjectIdentity, Vec<(f64, ObjectIdentity)>> = BTreeMap::new();
-    for (object, input) in inputs {
-        let properties = &input.properties;
-        let owner = match object.class.as_str() {
-            "pg_constraint" => first(object, 1).filter(|_| {
-                matches!(
-                    properties.get("contype").and_then(Value::as_str),
-                    Some("p" | "u")
-                )
-            }),
-            "pg_index" => reference(properties, "indrelid")
-                .filter(|_| properties.get("indisunique") == Some(&Value::Bool(true))),
-            // An operator class lives on its family, automatically, and is
-            // no root; its header (default or not, input and storage type)
-            // decides which class an index or ORDER BY picks, so it is
-            // compared with the family, not taken as covered by it.
-            "pg_opclass" => reference(properties, "opcfamily"),
-            // An operator family's members: which operator serves each
-            // strategy and which routine each support number, which an
-            // index, an ORDER BY and a row comparison bind by (#1783).
-            "pg_inherits"
-            | "pg_partitioned_table"
-            | "pg_sequence"
-            | "pg_range"
-            | "pg_aggregate"
-            | "pg_amop"
-            | "pg_amproc" => first(object, 0),
-            "pg_enum" => {
+    let mut compared: BTreeSet<ObjectIdentity> = roots.union(&relations).cloned().collect();
+    // Every part of a compared object is compared, except what DEC-1673.1
+    // leaves out; a part of a part too, so this runs until nothing joins.
+    loop {
+        let mut joined = Vec::new();
+        for (object, input) in inputs {
+            if compared.contains(object) || unindexed.contains(object) {
+                continue;
+            }
+            let properties = &input.properties;
+            let Some(owners) = part_of(object, properties, &makers) else {
+                continue;
+            };
+            if !owners.iter().any(|owner| compared.contains(owner)) {
+                continue;
+            }
+            if object.class == "pg_enum" {
                 if let (Some(owner), Some(order)) = (
                     first(object, 0),
                     properties.get("enumsortorder").and_then(Value::as_f64),
-                ) && roots.contains(&owner)
-                {
+                ) {
                     ranked
                         .entry(owner)
                         .or_default()
                         .push((order, object.clone()));
                 }
-                continue;
+            } else {
+                shapes.insert(object.clone(), projected(object, properties));
             }
-            _ => continue,
-        };
-        let Some(owner) = owner else {
-            continue;
-        };
-        if !roots.contains(&owner) && !relations.contains(&owner) {
-            continue;
-        }
-        shapes.insert(object.clone(), projected(object, properties));
-        if object.class == "pg_index"
-            && let Some(index) = first(object, 0)
-        {
-            if let Some(input) = inputs.get(&index) {
+            // A unique index's relation, which its identity names, joins with
+            // it, and its columns after it.
+            if object.class == "pg_index"
+                && let Some(index) = first(object, 0)
+                && let Some(input) = inputs.get(&index)
+            {
                 shapes.insert(index.clone(), projected(&index, &input.properties));
+                joined.push(index);
             }
-            relations.insert(index);
+            joined.push(object.clone());
         }
+        if joined.is_empty() {
+            break;
+        }
+        compared.extend(joined);
     }
     // An enum's labels by their place, not the engine's sort keys, which
     // differ with the order labels were added in.
@@ -312,17 +324,53 @@ fn shapes(
             shapes.insert(label.clone(), properties);
         }
     }
-    for (object, input) in inputs {
-        if object.class == "column"
-            && object
-                .signature
-                .first()
-                .is_some_and(|relation| relations.contains(relation))
-        {
-            shapes.insert(object.clone(), projected(object, &input.properties));
-        }
-    }
     shapes
+}
+
+/// The objects `object` is a part of, or `None` when DEC-1673.1 leaves it
+/// out of the comparison. A part hangs off its owner by its identity (a
+/// column, an enum label, an operator family's member), by a reference (an
+/// index's relation, an operator class's family), or by an internal or
+/// automatic dependency (a row type, an owned sequence). Left out, because a
+/// binding reads an object's shape and not how it computes or guards it:
+/// foreign keys, CHECKs and constraint triggers, column defaults, triggers,
+/// policies, rules (a view's query among them), non-unique indexes, and the
+/// dependency rows themselves, which differ between a shape view and the
+/// view it stands for. Anything else is compared: a kind of part no one
+/// listed is refused when it differs, not accepted unseen.
+fn part_of(
+    object: &ObjectIdentity,
+    properties: &BTreeMap<String, Value>,
+    makers: &BTreeMap<&ObjectIdentity, Vec<&ObjectIdentity>>,
+) -> Option<Vec<ObjectIdentity>> {
+    let mut owners: Vec<ObjectIdentity> = match object.class.as_str() {
+        "pg_attrdef" | "pg_trigger" | "pg_policy" | "pg_rewrite" | "pg_depend" => return None,
+        "pg_constraint" => {
+            if matches!(
+                properties.get("contype").and_then(Value::as_str),
+                Some("f" | "c" | "t")
+            ) {
+                return None;
+            }
+            object.signature.get(1).cloned().into_iter().collect()
+        }
+        "pg_index" => {
+            if properties.get("indisunique") != Some(&Value::Bool(true)) {
+                return None;
+            }
+            reference(properties, "indrelid").into_iter().collect()
+        }
+        "pg_opclass" => reference(properties, "opcfamily").into_iter().collect(),
+        _ => object.signature.first().cloned().into_iter().collect(),
+    };
+    owners.extend(
+        makers
+            .get(object)
+            .into_iter()
+            .flatten()
+            .map(|maker| (*maker).clone()),
+    );
+    Some(owners)
 }
 
 /// An object's properties without what the comparison skips, and without
@@ -565,6 +613,41 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn a_part_no_list_names_is_compared_through_its_dependency() {
+        // An owned sequence hangs off its column only by an automatic
+        // dependency: no class list names it, and it is compared all the
+        // same, so what `carries` accepts was compared (#1783).
+        let t = table();
+        let column = id("column", &["a"], vec![t.clone()]);
+        let sequence = id("pg_class", &["ext", "t_a_seq"], vec![]);
+        let roots = BTreeSet::from([t.clone()]);
+        let owned = |increment: i64, policy: &str| {
+            BTreeMap::from([
+                (t.clone(), input(json!({"relkind": "r"}))),
+                (column.clone(), input(json!({"atttypid": "int4"}))),
+                (sequence.clone(), input(json!({"relkind": "S"}))),
+                (
+                    id("pg_depend", &["a"], vec![sequence.clone(), column.clone()]),
+                    input(json!({})),
+                ),
+                (
+                    id("pg_sequence", &[], vec![sequence.clone()]),
+                    input(json!({"seqincrement": increment})),
+                ),
+                (
+                    id("pg_policy", &["p"], vec![t.clone()]),
+                    input(json!({"polqual": policy})),
+                ),
+            ])
+        };
+        let shaped = shapes(&owned(1, "true"), &roots);
+        assert!(shaped.contains_key(&id("pg_sequence", &[], vec![sequence.clone()])));
+        // Negative: a part DEC-1673.1 leaves out stays out, listed or not.
+        assert_eq!(shaped, shapes(&owned(1, "false"), &roots));
+        assert_ne!(shaped, shapes(&owned(5, "true"), &roots));
     }
 
     #[test]

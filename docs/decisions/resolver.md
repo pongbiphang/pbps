@@ -2210,15 +2210,19 @@ target whose recreated `public` has none, the difference #688 removed.
   #1783). Roles, role memberships, role settings and other databases'
   settings, shared comments and security labels, tablespaces, other
   databases, parameter privileges and replication origins are read before
-  and after the file, under the transaction's one
-  snapshot, so another session's writes meanwhile are in neither read
-  (measured on 16 and 18). Each is compared by a key of OIDs and its row,
-  never by a rendered name, which reads past the snapshot. A difference
-  rolls the transaction back and
-  refuses, naming each object, so nothing is left to clean up. The scratch
-  database's own settings, attributes and comment are its own and go with
-  it; the compatibility qualification reads its settings. A role's password
-  is not in the views a supplied account reads, and is not compared.
+  and after the file. The catalogs are the engine's own list of shared
+  catalogs, so one no rule names is read whole; left out are `pg_shdepend`
+  (derived from database objects) and `pg_subscription` (created in the
+  current database only, where the inventory finds it), and `pg_authid` is
+  read through `pg_roles`, which a supplied account may read. All are read
+  under the transaction's one snapshot, so another session's writes
+  meanwhile are in neither read (measured on 16 and 18). Each is compared by
+  a key of OIDs and its row, never by a rendered name, which reads past the
+  snapshot. A difference rolls the transaction back and refuses, naming each
+  object, so nothing is left to clean up. The scratch database's own
+  settings, attributes and comment are its own and go with it; the
+  compatibility qualification reads its settings. A role's password is not
+  in the views a supplied account reads, and is not compared.
 - **Chains are one hop**, read from the target's `pg_depend` before
   compiling, as §9.3.2 words them. A chain refuses when the compile fails,
   and the refusal names it: the target's dependencies are the current
@@ -2243,10 +2247,15 @@ comparison is a projection of the manifest's properties.
 - **Accepted means compared** (#1783). An object counts as reconstructed
   in the assessment when it was compared itself, or is a part of one that
   was: its row and array types, indexes, owned sequences. Extension
-  membership is no such part, and neither is an operator class, which lives
-  on its family automatically: its header (default or not, input and
-  storage type) is compared with the family. Each member is compared on its
-  own, with the roots' projection. A member the capture has no identity for (a text
+  membership is no such part. **Every part of a compared object is compared
+  except what this entry leaves out** (foreign keys, CHECKs and constraint
+  triggers, column defaults, triggers, policies, rules, non-unique indexes,
+  bodies), however it hangs off the object: by its identity, a reference,
+  or the same internal or automatic dependency `carries` follows, so
+  whatever the assessment accepts on an object's account was compared. An
+  operator class's header, an identity column's sequence and an operator
+  family's members are parts like any other. Each extension member is
+  compared on its own, with the roots' projection. A member the capture has no identity for (a text
   search dictionary, as `unaccent` brings) refuses, naming it: a plan that
   reads an extension seals all its members, and the capture refuses one it
   cannot read rather than leave it out. An operator family's operators and support
@@ -2270,6 +2279,10 @@ a binding verdict and stays unresolved.
 - **Take an extension's version for its members.** A member the target
   altered in place, or one the baseline adds with `ALTER EXTENSION ... ADD`,
   leaves the version as it was (#1754's review, #1766).
+- **List what to compare, or which shared catalogs to read.** Whatever a
+  list missed passed unseen: an operator family's members, an operator
+  class, an owned sequence, parameter privileges (#1754's review, rounds 9
+  to 17). Listing what is left out instead makes a miss refuse.
 - **Detect afterwards that the file ended its transaction.** What it
   committed before ending it is already in the cluster (#1754's review).
 - **Compare the shared state across separate transactions.** Other runs on

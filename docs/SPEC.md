@@ -1718,20 +1718,26 @@ scratch compile (#1616).
     cannot read refuses, naming it, as a root would.
   - It changes nothing outside the scratch database. Roles, role
     memberships, role and other databases' settings, shared comments and
-    security labels, tablespaces, other databases, parameter privileges and
-    replication origins are read before and after it, in its own transaction's snapshot, so another session's writes
+    security labels, tablespaces, other databases, parameter privileges,
+    replication origins, and any other shared catalog the engine lists, are
+    read before and after it, in its own transaction's snapshot, so another session's writes
     meanwhile do not count. A change refuses, naming each object, and is
     rolled back.
   - The shared compatibility qualification reads scratch after the
     baseline, so a setting the baseline changed must match the target too:
     the scratch database's own settings are its to change.
-- **What is compared is what a creation-time binding can read:**
-  - an object's own class-specific properties, as the evidence manifest
-    fingerprints them;
-  - of a relation's children, its columns, the primary-key and unique
-    constraints and indexes that a `GROUP BY` functional dependency or an
-    `ON CONFLICT` inference relies on, and its inheritance and partition
-    parents, which a row-type coercion such as `c::ext.parent` relies on;
+- **Everything is compared except what is listed as not compared** (#1783):
+  each object's own class-specific properties, as the evidence manifest
+  fingerprints them, and every part of it, however the part hangs off it
+  (by its identity, a reference, or an internal or automatic dependency), a
+  part of a part too. A kind of part no list names is compared, so it
+  refuses when it differs instead of passing unseen. Among the parts a
+  binding reads:
+  - of a relation, its columns, the primary-key and unique constraints and
+    indexes that a `GROUP BY` functional dependency or an `ON CONFLICT`
+    inference relies on, its inheritance and partition parents, which a
+    row-type coercion such as `c::ext.parent` relies on, and an identity
+    column's sequence;
   - of an operator family, which operator serves each strategy and which
     routine each support number, and each of its operator classes' headers,
     which an index, an `ORDER BY` and a row comparison bind by.

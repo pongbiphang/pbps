@@ -97,22 +97,103 @@ fn dollar_quoted(text: &str, stem: &str) -> String {
 /// only what a statement changes: VACUUM rewrites its frozen-transaction
 /// horizons in place, past any snapshot.
 pub async fn shared_state(conn: &mut impl QueryConnection) -> Result<SharedState, DbError> {
+    // Every shared catalog the engine has, read from the engine, so one no
+    // list here names is read too: a change to it refuses rather than
+    // passes unseen (#1783).
     let rows = conn
         .query(
+            "SELECT c.relname::pg_catalog.text AS catalog, \
+                    EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a \
+                             WHERE a.attrelid = c.oid AND a.attname = 'oid' \
+                               AND NOT a.attisdropped)::pg_catalog.text AS keyed \
+               FROM pg_catalog.pg_class c \
+              WHERE c.relisshared AND c.relkind = 'r' \
+                AND c.relnamespace = 'pg_catalog'::pg_catalog.regnamespace \
+              ORDER BY 1",
+        )
+        .await?;
+    let catalogs = rows
+        .iter()
+        .map(|row| Ok((text(row, "catalog")?, text(row, "keyed")? == "true")))
+        .collect::<Result<Vec<_>, DbError>>()?;
+    let rows = conn.query(&shared_query(&catalogs)).await?;
+    rows.iter()
+        .map(|row| {
+            Ok((
+                text(row, "key")?,
+                (text(row, "detail")?, text(row, "name")?),
+            ))
+        })
+        .collect()
+}
+
+/// One read of every shared catalog in `catalogs` (each with whether it has
+/// an `oid` column), as rows of key, name and detail.
+fn shared_query(catalogs: &[(String, bool)]) -> String {
+    catalogs
+        .iter()
+        .filter_map(|(catalog, keyed)| match shared_read(catalog) {
+            Shared::Read(sql) => Some(sql.to_owned()),
+            Shared::Left => None,
+            Shared::Unnamed => {
+                // A catalog no rule here knows: every row, keyed by its OID
+                // or, without one, by the row itself.
+                let key = if *keyed {
+                    "x.oid::pg_catalog.text".to_owned()
+                } else {
+                    "pg_catalog.row_to_json(x)::pg_catalog.text".to_owned()
+                };
+                Some(format!(
+                    "SELECT '{catalog}:' || {key} AS key, \
+                            'a row of pg_catalog.{catalog}' AS name, \
+                            pg_catalog.row_to_json(x)::pg_catalog.text AS detail \
+                       FROM pg_catalog.{catalog} x"
+                ))
+            }
+        })
+        // Named columns whichever read comes first.
+        .map(|sql| format!("SELECT f.key, f.name, f.detail FROM ({sql}) AS f (key, name, detail)"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
+/// How a shared catalog is read.
+enum Shared {
+    /// By this query, which names its rows readably.
+    Read(&'static str),
+    /// Not read, for the reason at its rule.
+    Left,
+    /// By the generic read: no rule here knows it.
+    Unnamed,
+}
+
+fn shared_read(catalog: &str) -> Shared {
+    let read = match catalog {
+        // Derived: each row is a database object's dependency on a role or
+        // tablespace, which creating objects in the scratch database adds.
+        "pg_shdepend" => return Shared::Left,
+        // A subscription is created in the current database only, where the
+        // inventory finds it; its connection string is unreadable to a
+        // supplied account.
+        "pg_subscription" => return Shared::Left,
+        // Through `pg_roles`: a supplied account may not read passwords.
+        "pg_authid" => Some(
             "SELECT 'role:' || r.oid AS key, \
                     'role ' || pg_catalog.quote_ident(r.rolname) AS name, \
                     pg_catalog.row_to_json(r)::pg_catalog.text AS detail \
-               FROM pg_catalog.pg_roles r \
-             UNION ALL \
-             SELECT 'membership:' || m.oid, \
+               FROM pg_catalog.pg_roles r",
+        ),
+        "pg_auth_members" => Some(
+            "SELECT 'membership:' || m.oid, \
                     'the membership of role ' \
                       || pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(m.member)) \
                       || ' in role ' \
                       || pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(m.roleid)), \
                     pg_catalog.row_to_json(m)::pg_catalog.text \
-               FROM pg_catalog.pg_auth_members m \
-             UNION ALL \
-             SELECT 'setting:' || s.setdatabase || ':' || s.setrole, \
+               FROM pg_catalog.pg_auth_members m",
+        ),
+        "pg_db_role_setting" => Some(
+            "SELECT 'setting:' || s.setdatabase || ':' || s.setrole, \
                     'the settings of ' \
                       || CASE WHEN s.setrole = 0 THEN 'every role' ELSE 'role ' \
                          || pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(s.setrole)) END \
@@ -122,56 +203,56 @@ pub async fn shared_state(conn: &mut impl QueryConnection) -> Result<SharedState
                     pg_catalog.row_to_json(s)::pg_catalog.text \
                FROM pg_catalog.pg_db_role_setting s \
                LEFT JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase \
-              WHERE d.datname IS DISTINCT FROM pg_catalog.current_database() \
-             UNION ALL \
-             SELECT 'comment:' || c.classoid || ':' || c.objoid, \
+              WHERE d.datname IS DISTINCT FROM pg_catalog.current_database()",
+        ),
+        "pg_shdescription" => Some(
+            "SELECT 'comment:' || c.classoid || ':' || c.objoid, \
                     'the comment on ' || COALESCE( \
                       pg_catalog.pg_describe_object(c.classoid, c.objoid, 0), 'a shared object'), \
                     pg_catalog.row_to_json(c)::pg_catalog.text \
                FROM pg_catalog.pg_shdescription c \
               WHERE NOT (c.classoid = 'pg_catalog.pg_database'::pg_catalog.regclass \
                      AND c.objoid = (SELECT o.oid FROM pg_catalog.pg_database o \
-                                      WHERE o.datname = pg_catalog.current_database())) \
-             UNION ALL \
-             SELECT 'label:' || l.classoid || ':' || l.objoid || ':' || l.provider, \
+                                      WHERE o.datname = pg_catalog.current_database()))",
+        ),
+        "pg_shseclabel" => Some(
+            "SELECT 'label:' || l.classoid || ':' || l.objoid || ':' || l.provider, \
                     'the security label on ' || COALESCE( \
                       pg_catalog.pg_describe_object(l.classoid, l.objoid, 0), 'a shared object'), \
                     pg_catalog.row_to_json(l)::pg_catalog.text \
                FROM pg_catalog.pg_shseclabel l \
               WHERE NOT (l.classoid = 'pg_catalog.pg_database'::pg_catalog.regclass \
                      AND l.objoid = (SELECT o.oid FROM pg_catalog.pg_database o \
-                                      WHERE o.datname = pg_catalog.current_database())) \
-             UNION ALL \
-             SELECT 'tablespace:' || t.oid, 'tablespace ' || pg_catalog.quote_ident(t.spcname), \
+                                      WHERE o.datname = pg_catalog.current_database()))",
+        ),
+        "pg_tablespace" => Some(
+            "SELECT 'tablespace:' || t.oid, 'tablespace ' || pg_catalog.quote_ident(t.spcname), \
                     pg_catalog.row_to_json(t)::pg_catalog.text \
-               FROM pg_catalog.pg_tablespace t \
-             UNION ALL \
-             SELECT 'database:' || d.oid, 'database ' || pg_catalog.quote_ident(d.datname), \
+               FROM pg_catalog.pg_tablespace t",
+        ),
+        "pg_database" => Some(
+            "SELECT 'database:' || d.oid, 'database ' || pg_catalog.quote_ident(d.datname), \
                     pg_catalog.json_build_array(d.datname, d.datdba, d.encoding, \
                       d.datistemplate, d.datallowconn, d.datconnlimit, d.dattablespace, \
                       d.datacl)::pg_catalog.text \
                FROM pg_catalog.pg_database d \
-              WHERE d.datname <> pg_catalog.current_database() \
-             UNION ALL \
-             SELECT 'parameter:' || p.oid, \
+              WHERE d.datname <> pg_catalog.current_database()",
+        ),
+        "pg_parameter_acl" => Some(
+            "SELECT 'parameter:' || p.oid, \
                     'the privileges on parameter ' || pg_catalog.quote_ident(p.parname), \
                     pg_catalog.row_to_json(p)::pg_catalog.text \
-               FROM pg_catalog.pg_parameter_acl p \
-             UNION ALL \
-             SELECT 'origin:' || o.roident, \
+               FROM pg_catalog.pg_parameter_acl p",
+        ),
+        "pg_replication_origin" => Some(
+            "SELECT 'origin:' || o.roident, \
                     'replication origin ' || pg_catalog.quote_ident(o.roname), \
                     pg_catalog.row_to_json(o)::pg_catalog.text \
                FROM pg_catalog.pg_replication_origin o",
-        )
-        .await?;
-    rows.iter()
-        .map(|row| {
-            Ok((
-                text(row, "key")?,
-                (text(row, "detail")?, text(row, "name")?),
-            ))
-        })
-        .collect()
+        ),
+        _ => None,
+    };
+    read.map_or(Shared::Unnamed, Shared::Read)
 }
 
 /// Each shared object, by a key of OIDs, with its row and its name. Only
@@ -646,6 +727,27 @@ mod tests {
         // Negative: a text holding the first tags never closes early.
         let text = "SELECT $t_0$a$t_0$, $t_1$b$t_1$";
         assert_eq!(dollar_quoted(text, "t"), format!("$t_2${text}$t_2$"));
+    }
+
+    #[test]
+    fn every_shared_catalog_is_read_unless_a_rule_leaves_it_out() {
+        let catalogs = [
+            ("pg_authid".to_owned(), true),
+            ("pg_shdepend".to_owned(), false),
+            ("pg_future_keyed".to_owned(), true),
+            ("pg_future_rows".to_owned(), false),
+        ];
+        let sql = shared_query(&catalogs);
+        // A known catalog is read by its own rule, named readably.
+        assert!(sql.contains("FROM pg_catalog.pg_roles r"), "{sql}");
+        // One no rule knows is read whole, keyed by its OID or its row.
+        assert!(sql.contains("'pg_future_keyed:' || x.oid"), "{sql}");
+        assert!(
+            sql.contains("'pg_future_rows:' || pg_catalog.row_to_json(x)"),
+            "{sql}"
+        );
+        // Negative: a catalog a rule leaves out is not read.
+        assert!(!sql.contains("pg_shdepend"), "{sql}");
     }
 
     #[test]
