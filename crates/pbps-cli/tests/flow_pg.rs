@@ -7021,9 +7021,61 @@ fn pull_declares_a_named_parents_partitions_external_on(server: &str, k: usize) 
     .unwrap();
     succeeds(d.run(&["plan"]));
     d.commit();
-    let o = succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    let o = succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
     assert!(stdout(&o).contains("id2"), "{}", stdout(&o));
-    succeeds(approved_apply(&d, &connection, &plan, &[]));
+    // A staged run stopped at the clearing, the one place 18 runs an
+    // `ALTER TABLE` on the partition, leaves no checkpoint between the
+    // parent's change and the clearing: they are one statement, so it rolls
+    // back whole and the plan runs again from its start. Split in two, the
+    // parent's change committed and the checkpoint read the kept NOT NULL as
+    // the partition's own, so the run could not be resumed (#1833 review).
+    // On 16 nothing is kept and the clearing alters nothing.
+    on_server(
+        &connection,
+        "CREATE SCHEMA witness; \
+         CREATE FUNCTION witness.stop_at_clearing() RETURNS event_trigger \
+             LANGUAGE plpgsql SET search_path = pg_catalog AS $$ \
+         BEGIN \
+           IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() c \
+                       WHERE c.objid = 'app.ev_2025'::regclass::oid) THEN \
+             RAISE EXCEPTION 'stop at the clearing'; \
+           END IF; \
+         END $$; \
+         CREATE EVENT TRIGGER stop_at_clearing ON ddl_command_end \
+             WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.stop_at_clearing()",
+    );
+    let stopped = approved_apply(&d, &connection, &plan, &["--staged"]);
+    if scalar(
+        &connection,
+        "SELECT current_setting('server_version_num')::bigint / 10000",
+    ) >= 18
+    {
+        assert_eq!(
+            code(&stopped),
+            1,
+            "{}{}",
+            stdout(&stopped),
+            stderr(&stopped)
+        );
+        assert!(
+            stderr(&stopped).contains("stop at the clearing"),
+            "{}",
+            stderr(&stopped)
+        );
+        assert!(latest_snapshot(&connection).staged.is_none());
+        on_server(&connection, "DROP EVENT TRIGGER stop_at_clearing");
+        succeeds(approved_apply(&d, &connection, &plan, &["--staged"]));
+    } else {
+        succeeds(stopped);
+        on_server(&connection, "DROP EVENT TRIGGER stop_at_clearing");
+    }
     succeeds(d.run(&["verify", "--db", &connection]));
     assert_eq!(
         scalar(

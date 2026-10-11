@@ -726,9 +726,9 @@ each one takes (DEC-1687.1). One thing the recursion does not carry: on 18, a NO
 NULL a partition set of its own beside its parent's outlives the parent's
 `DROP NOT NULL` (DEC-1687.1). A declared partition is brought back by its own
 change, but an external one is listed nowhere. So the parent's change carries
-the clearing itself. After its own statement, it drops the NOT NULL every
-partition still holds on the column, found at apply time through
-`pg_inherits`. An external partition holds no NOT NULL of its own, so none
+the clearing itself. In the same statement, so that no staged checkpoint
+falls between the two, it drops the NOT NULL every partition still holds on
+the column, found at apply time through `pg_inherits`, on the empty path. An external partition holds no NOT NULL of its own, so none
 is lost. Scoping a live read leaves a partition of such a
 parent out of the managed and unmanaged sets alike, while it is only what its
 parent makes it. One holding anything of its own (an index, a check, a column

@@ -1403,7 +1403,11 @@ fn one(pg: &Postgres, table: &TableName, body: String) -> Sql {
 ///
 /// pbps's own text, so on the empty path where nothing the parent's schema
 /// defines, an `=` operator say, can stand in for the catalog's (DEC-1564.1),
-/// and under a tag the names in it cannot close (#1833 review).
+/// and under a tag the names in it cannot close (#1833 review). Appended to
+/// the parent's own statement, after its closing `SET search_path = ''`, and
+/// not a statement of its own: a staged apply checkpoints between statements,
+/// and a checkpoint between the two reads the kept NOT NULL as the
+/// partition's own and refuses to resume (#1833 review).
 fn clear_external_partitions(table: &TableName, column: &str, mut sql: Vec<Statement>) -> Sql {
     let body = format!(
         "DECLARE\n  p pg_catalog.regclass;\nBEGIN\n  FOR p IN\n    SELECT \
@@ -1415,7 +1419,9 @@ fn clear_external_partitions(table: &TableName, column: &str, mut sql: Vec<State
         name = literal(column),
         parent = literal(&qualified(table)?),
     );
-    sql.push(Statement::new(atomically(&body)));
+    let parents = sql.last_mut().expect("the parent's statement comes first");
+    parents.sql.push('\n');
+    parents.sql.push_str(&atomically(&body));
     Ok(sql)
 }
 
@@ -5229,21 +5235,25 @@ mod tests {
         };
         for change in [nullability(true, true), retype(false, true)] {
             let sql = sql_of(&pg, &change);
-            assert_eq!(sql.len(), 2, "{sql:?}");
-            assert!(sql[0].contains("DROP NOT NULL"), "{sql:?}");
-            // pbps's own, on the session's empty path (DEC-1564.1).
+            // One statement, so no staged checkpoint falls between the
+            // parent's and the clearing (#1833 review).
+            assert_eq!(sql.len(), 1, "{sql:?}");
+            // The clearing is pbps's own, after the parent's statement has
+            // put the session back on the empty path (DEC-1564.1).
+            let (parents, clearing) = sql[0]
+                .split_once("\nSET search_path = '';\n")
+                .expect("the parent's statement, then the clearing");
+            assert!(parents.contains("DROP NOT NULL"), "{parents}");
             assert!(
-                sql[1].starts_with("DO $pbps$\n") && !sql[1].contains("search_path"),
-                "{}",
-                sql[1]
+                clearing.starts_with("DO $pbps$\n") && !clearing.contains("search_path"),
+                "{clearing}"
             );
             assert!(
-                sql[1].contains("i.inhparent = '\"app\".\"ev\"'::pg_catalog.regclass")
-                    && sql[1].contains("a.attname = 'it''s'")
-                    && sql[1]
+                clearing.contains("i.inhparent = '\"app\".\"ev\"'::pg_catalog.regclass")
+                    && clearing.contains("a.attname = 'it''s'")
+                    && clearing
                         .contains("ALTER TABLE %s ALTER COLUMN %I DROP NOT NULL', p, 'it''s')"),
-                "{}",
-                sql[1]
+                "{clearing}"
             );
         }
         // A name holding the block's usual tag takes another (#1833 review).
@@ -5257,9 +5267,9 @@ mod tests {
         };
         let sql = sql_of(&pg, &tagged);
         assert!(
-            sql[1].starts_with("DO $pbps1$\n") && sql[1].ends_with("\n$pbps1$;"),
+            sql[0].contains("\nDO $pbps1$\n") && sql[0].ends_with("\n$pbps1$;"),
             "{}",
-            sql[1]
+            sql[0]
         );
         // Negative: a tightening, a retype that stays nullable, and a parent
         // whose partitions are declared.
