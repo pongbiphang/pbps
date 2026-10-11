@@ -34,6 +34,7 @@ pub mod module;
 pub mod name;
 pub mod partitions;
 pub mod plan;
+pub mod reason;
 pub mod rename;
 pub mod resolver;
 pub mod role;
@@ -68,6 +69,7 @@ pub use plan::{
     PlanBaseline, PlanMode, PlanOrigin, RoutinePins, SavedPlan, SchemaPin, plan_checksum,
     state_checksum,
 };
+pub use reason::{Reason, ReasonError};
 pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};
 pub use schema::{

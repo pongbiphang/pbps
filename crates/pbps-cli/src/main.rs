@@ -255,14 +255,14 @@ enum Command {
         column: String,
         /// Why it is being dropped; required for audit
         #[arg(long)]
-        reason: String,
+        reason: pbps_model::Reason,
     },
 
     /// Record a table drop
     DropTable {
         table: String,
         #[arg(long)]
-        reason: String,
+        reason: pbps_model::Reason,
     },
 
     /// Record a database role rename (ADR-0005)
@@ -273,7 +273,7 @@ enum Command {
         role: String,
         /// Why it is being dropped; required for audit
         #[arg(long)]
-        reason: String,
+        reason: pbps_model::Reason,
     },
 
     /// Allow a new range partition to take its rows from the DEFAULT partition
@@ -379,7 +379,7 @@ enum Command {
 
         /// Why the difference is not being pursued; required for audit
         #[arg(long)]
-        reason: String,
+        reason: pbps_model::Reason,
     },
 
     /// Build the whole schema from the declarations, into an empty database

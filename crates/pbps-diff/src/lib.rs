@@ -412,7 +412,7 @@ mod tests {
         let s = schema(&[("dbo.customer", &["id"])]);
         let intent = Intent::DropColumn {
             column: "dbo.customer.national_id".parse().unwrap(),
-            reason: "REG-2026-042 PII erasure request".into(),
+            reason: "REG-2026-042 PII erasure request".parse().unwrap(),
         };
         let r = resolve(&s, &ids, &[intent], &ctx()).unwrap();
 
@@ -434,7 +434,7 @@ mod tests {
         let s = schema(&[("dbo.customer", &["id"])]);
         let intent = Intent::DropColumn {
             column: "dbo.customer.national_id".parse().unwrap(),
-            reason: "REG-1".into(),
+            reason: "REG-1".parse().unwrap(),
         };
         let after = resolve(&s, &ids, &[intent], &ctx()).unwrap().ids;
 
@@ -557,7 +557,7 @@ mod tests {
         let s = Schema::default();
         let intent = Intent::DropTable {
             table: t("dbo.customer"),
-            reason: "no longer in use".into(),
+            reason: "no longer in use".parse().unwrap(),
         };
         let r = resolve(&s, &ids, &[intent], &ctx()).unwrap();
 
@@ -616,7 +616,7 @@ mod tests {
         };
         let drop = Intent::DropTable {
             table: t("dbo.old"),
-            reason: "retired".into(),
+            reason: "retired".parse().unwrap(),
         };
         let errs = resolve(&s, &ids, &[rename, drop], &ctx()).unwrap_err();
 
@@ -650,7 +650,7 @@ mod tests {
         };
         let drop = Intent::DropColumn {
             column: "dbo.t.old".parse().unwrap(),
-            reason: "retired".into(),
+            reason: "retired".parse().unwrap(),
         };
         let errs = resolve(&s, &ids, &[rename, drop], &ctx()).unwrap_err();
 
@@ -683,7 +683,7 @@ mod tests {
         };
         let drop = Intent::DropRole {
             role: "old".into(),
-            reason: "retired".into(),
+            reason: "retired".parse().unwrap(),
         };
         let errs = resolve(&s, &ids, &[rename, drop], &ctx()).unwrap_err();
 
@@ -712,7 +712,7 @@ mod tests {
             },
             Intent::DropTable {
                 table: t("dbo.old"),
-                reason: "retired".into(),
+                reason: "retired".parse().unwrap(),
             },
         ];
 
@@ -738,7 +738,7 @@ mod tests {
             },
             Intent::DropColumn {
                 column: "dbo.t.old".parse().unwrap(),
-                reason: "retired".into(),
+                reason: "retired".parse().unwrap(),
             },
         ];
 
@@ -770,7 +770,7 @@ mod tests {
             },
             Intent::DropRole {
                 role: "old".into(),
-                reason: "retired".into(),
+                reason: "retired".parse().unwrap(),
             },
         ];
 
@@ -795,7 +795,7 @@ mod tests {
             },
             Intent::DropTable {
                 table: t("dbo.old"),
-                reason: "retired".into(),
+                reason: "retired".parse().unwrap(),
             },
         ];
 
@@ -899,7 +899,7 @@ mod tests {
         };
         let drop = Intent::DropTable {
             table: t("dbo.old"),
-            reason: "retired".into(),
+            reason: "retired".parse().unwrap(),
         };
         let errs = resolve(&s, &ids, &[rename, drop], &ctx()).unwrap_err();
 
@@ -1025,7 +1025,7 @@ mod tests {
         let s = schema(&[("dbo.customer", &["id"])]);
         let intent = Intent::DropColumn {
             column: "dbo.customer.gone".parse().unwrap(),
-            reason: "REG-1".into(),
+            reason: "REG-1".parse().unwrap(),
         };
         let after = resolve(&s, &ids, std::slice::from_ref(&intent), &ctx())
             .unwrap()
@@ -1712,7 +1712,7 @@ mod tests {
                 },
                 Intent::DropTable {
                     table: t("dbo.gone"),
-                    reason: "superseded".into(),
+                    reason: "superseded".parse().unwrap(),
                 },
             ],
             &ctx(),
@@ -1894,7 +1894,7 @@ mod tests {
             &ids,
             &[Intent::DropRole {
                 role: "legacy".into(),
-                reason: "SEC-7: retired".into(),
+                reason: "SEC-7: retired".parse().unwrap(),
             }],
             &ctx(),
         )
@@ -1906,7 +1906,7 @@ mod tests {
         // And a stale annotation for it is absorbed, not a blocker.
         let stale = Intent::DropRole {
             role: "legacy".into(),
-            reason: "x".into(),
+            reason: "x".parse().unwrap(),
         };
         assert!(intent_is_absorbed(
             &stale,
@@ -2084,7 +2084,7 @@ mod tests {
             &ids,
             &[Intent::DropTable {
                 table: t("app.ev_1"),
-                reason: "gone".into(),
+                reason: "gone".parse().unwrap(),
             }],
             &ctx(),
         )

@@ -5293,7 +5293,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         fewer.tables.remove(&t("ev_2025"));
         let archive = [Intent::DropTable {
             table: t("ev_2025"),
-            reason: "archived".into(),
+            reason: "archived".parse().unwrap(),
         }];
         let fewer_ids = mint_ids(&fewer, &added_ids, &archive);
         let drop_step = plan(&added, &added_ids, &fewer, &fewer_ids);
@@ -5351,11 +5351,11 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         let both_intents = [
             Intent::DropTable {
                 table: t("aref_1"),
-                reason: "gone".into(),
+                reason: "gone".parse().unwrap(),
             },
             Intent::DropTable {
                 table: t("ev_2025"),
-                reason: "gone".into(),
+                reason: "gone".parse().unwrap(),
             },
         ];
         let both_step = plan(
@@ -5421,7 +5421,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             );
             let intents = [Intent::DropTable {
                 table: t("aref_1"),
-                reason: "gone".into(),
+                reason: "gone".parse().unwrap(),
             }];
             let wanted_ids = mint_moving_and(&wanted, &aref_ids, if kept { &[] } else { &intents });
             plan(&with_aref, &aref_ids, &wanted, &wanted_ids)
@@ -8455,7 +8455,7 @@ async fn a_migration_that_renames_widens_retypes_and_drops_converges() {
         },
         Intent::DropColumn {
             column: TableName::new(&s, "t").column("notes"),
-            reason: "merged elsewhere".into(),
+            reason: "merged elsewhere".parse().unwrap(),
         },
     ];
     let ids_b = mint_ids(&b, &ids_a, &intents);
@@ -9127,7 +9127,7 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
         &base_ids,
         &[Intent::DropColumn {
             column: named.column("note"),
-            reason: "gone".into(),
+            reason: "gone".parse().unwrap(),
         }],
     );
     let declared_ids = mint_ids(

@@ -298,12 +298,15 @@ pub fn ask_from<R: std::io::BufRead>(blockers: &[Blocker], reader: R) -> Option<
 /// The reason is what the tombstone shows an audit (SPEC §6.1). An empty one
 /// would be the answer everyone gives, so a blank line ends the prompt rather
 /// than recording a drop nobody explained.
-fn reason<R: std::io::BufRead>(lines: &mut std::io::Lines<R>, what: &str) -> Option<String> {
+fn reason<R: std::io::BufRead>(
+    lines: &mut std::io::Lines<R>,
+    what: &str,
+) -> Option<pbps_model::Reason> {
     eprint!("  Why is {what} being dropped? (an audit reads this) ");
     let _ = std::io::stderr().flush();
     let answer = lines.next()?.ok()?;
     let answer = answer.trim();
-    (!answer.is_empty()).then(|| answer.to_owned())
+    pbps_model::Reason::new(answer).ok()
 }
 
 fn question(b: &Blocker) -> String {
@@ -742,21 +745,23 @@ mod tests {
         );
     }
 
-    /// A drop asks a second question, and the answer goes into the tombstone
-    /// verbatim. Nothing here may default it.
+    /// A drop asks a second question and keeps the trimmed answer. Nothing
+    /// here may default it; CLI arguments keep their own verbatim contract.
     #[test]
     fn choosing_a_drop_asks_why_and_keeps_the_answer() {
         let b = Blocker::DropColumnNeedsReason {
             column: "dbo.customer.pii".parse().unwrap(),
         };
-        let got = ask_from(std::slice::from_ref(&b), answers("1\nREG-2026-042\n")).unwrap();
-        assert_eq!(
-            got,
-            vec![Intent::DropColumn {
-                column: "dbo.customer.pii".parse().unwrap(),
-                reason: "REG-2026-042".into(),
-            }]
-        );
+        for input in ["1\nREG-2026-042\n", "1\n \tREG-2026-042\u{3000}\n"] {
+            let got = ask_from(std::slice::from_ref(&b), answers(input)).unwrap();
+            assert_eq!(
+                got,
+                vec![Intent::DropColumn {
+                    column: "dbo.customer.pii".parse().unwrap(),
+                    reason: "REG-2026-042".parse().unwrap(),
+                }]
+            );
+        }
     }
 
     /// The negative cases, and the important ones: every way of not answering
@@ -788,6 +793,8 @@ mod tests {
         // nothing.
         assert!(ask_from(std::slice::from_ref(&drop), answers("1\n\n")).is_none());
         assert!(ask_from(std::slice::from_ref(&drop), answers("1\n   \n")).is_none());
+        assert!(ask_from(std::slice::from_ref(&drop), answers("1\n\t\n")).is_none());
+        assert!(ask_from(std::slice::from_ref(&drop), answers("1\n\u{3000}\n")).is_none());
     }
 
     /// Stopping half way through several questions abandons the answers already
