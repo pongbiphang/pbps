@@ -4,16 +4,17 @@
 //! plan is about to change — and so is the shape of the answer. How the
 //! catalog is asked is each engine's: `pbps_mssql::impact` reads
 //! `sys.sql_expression_dependencies`, `pbps_pg::impact` reads `pg_depend` and
-//! the bodies `pg_proc` keeps as text. Which changes in a plan *are* renames
-//! is each engine's too, because a module rename is a drop plus a create
-//! (ADR-0002) and only one engine asks the drop side here (the other answers
-//! it in `pbps_pg::modules`), so the builder stays with the engine and only
-//! the target it builds lives here (DECISIONS 417).
+//! the bodies `pg_proc` keeps as text. The target builder shares the plan
+//! traversal and stored-name translation. Each engine chooses whether it also
+//! asks the drop side of a module rename here: SQL Server does, while
+//! PostgreSQL answers it in `pbps_pg::modules` (ADR-0002, DECISIONS 417).
 //! Table/column DROP RESTRICT has its own report: an engine carrying a rename
 //! into a dependent does not imply that it permits deleting the target.
 
+use std::collections::BTreeMap;
+
 use pbps_dialect::DialectError;
-use pbps_model::{ColumnRef, ModuleId, ModuleKind, ObjectName, TableName};
+use pbps_model::{Change, ChangeSet, ColumnRef, ModuleId, ModuleKind, ObjectName, TableName};
 
 use crate::DbError;
 
@@ -86,6 +87,92 @@ impl std::fmt::Display for RenameTarget {
             RenameTarget::Module(m) => write!(f, "module {m}"),
         }
     }
+}
+
+/// Impact targets in plan order, named as the catalog knows them before execution.
+///
+/// Both halves of a renamed column's address must use the stored spelling:
+/// its change carries the declared table name, which may itself be renamed.
+/// Querying that future address either refuses a valid plan or silently misses
+/// dependencies (DECISIONS 407, 416).
+///
+/// `include_module_drops` is SQL Server's policy: a module rename is a drop
+/// plus a create, so its drop is another impact target. PostgreSQL leaves the
+/// drop side to its module reader, which already answers that question in full.
+#[must_use]
+pub fn rename_targets(changes: &ChangeSet, include_module_drops: bool) -> Vec<RenameTarget> {
+    // A RenameColumn carries the declared, post-rename table because its
+    // statement runs after RenameTable. Impact runs before either one, so
+    // translate through a map built over the whole plan rather than rely on
+    // the changes' current ordering (DECISIONS 407, 416).
+    let mut stored: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+    for p in &changes.changes {
+        if let Change::RenameTable { from, to, .. } = &p.change {
+            stored.insert(to, from);
+        }
+    }
+    changes
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameTable { from, .. } => Some(RenameTarget::Table(from.clone())),
+            Change::RenameColumn { table, from, .. } => {
+                let table = stored.get(table).map_or(table, |t| *t);
+                Some(RenameTarget::Column(table.column(from)))
+            }
+            // A module rename reaches the plan as this drop plus a create,
+            // so the drop side is where the catalog has to be asked what
+            // still points at the old name.
+            Change::DropModule { id, .. } => {
+                include_module_drops.then(|| RenameTarget::Module(id.object_name()))
+            }
+            // Exhaustive rather than `_`: a change added later that also
+            // moves a name must be considered here, and a catch-all would
+            // let it through silently.
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
+            | Change::SetStorageParameters { .. }
+            | Change::SetReplicaIdentity { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
+            | Change::DropIndex { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            // Row changes move no name: a row's identity is its key, and a
+            // changed key is a delete plus an insert, not a rename.
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. }
+            | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
+            | Change::PublicExecution { .. } => None,
+        })
+        .collect()
 }
 
 /// One object that refers to the thing being renamed.

@@ -240,7 +240,7 @@ here.
     What stayed with the engine is what only the engine can spell: `Held`,
     `Gap` and `Securable` (a gap's securable is rendered in that engine's
     `GRANT` spelling, `OBJECT::[dbo].[t]` against `TABLE "app"."t"`, so the
-    seam hands the CLI the rendered text), the rename-target builder (only
+    seam hands the CLI the rendered text), the rename-target policy (only
     SQL Server asks the drop side of a module rename through the impact query;
     PostgreSQL answers it in `modules`), `truncate_reason` (UTF-16 units on
     one, characters on the other), and PostgreSQL's `key_collations`, which

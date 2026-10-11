@@ -72,11 +72,11 @@
 //! says so rather than implying the list is exact; §7.4 puts a checklist in
 //! front of a human for exactly that reason.
 
-use std::collections::BTreeMap;
-
 use pbps_db::{Conn, DbError, Row};
 use pbps_dialect::DialectError;
-use pbps_model::{ModuleId, ModuleKind, ObjectName, TableName};
+#[cfg(test)]
+use pbps_model::TableName;
+use pbps_model::{ModuleId, ModuleKind, ObjectName};
 
 use crate::emit::qualified;
 
@@ -88,92 +88,10 @@ use crate::emit::qualified;
 pub use crate::drop_impact::drop_blockers;
 pub use pbps_db::impact::{ImpactError, ImpactReport, Referrer, RenameTarget};
 
-/// Every rename in a plan, as the objects they are renamed **from** — the
-/// name the catalog still knows them by. Taking the new name would query
-/// something that does not exist yet and report no impact at all, which is
-/// the most dangerous possible answer.
-///
-/// **Both halves of a column's name** have to be taken back, not just the
-/// column's own. A `RenameColumn` carries the *declared*, post-rename table
-/// (`pbps_diff::schema_diff::order_key` class 3 says why: the statement it
-/// becomes names the table, and it runs after the table rename), so a plan
-/// that renames `app.client` to `app.customer` and its `email` to
-/// `contact_email` describes the column as `app.customer.email` — a table
-/// the catalog will not have until a statement this report runs *before*
-/// has executed. Read literally that is `ImpactError::Name` on a plan the
-/// engine would accept, which is the refusal
-/// `preflight::AsStored` exists to prevent one rank further on
-/// (DECISIONS 407).
+/// Rename targets in the catalog's stored spelling. Module drops belong to
+/// this engine's module reader, so they are excluded here.
 pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
-    use pbps_model::Change;
-    // The plan's name for a table, to the catalog's. Built first and over
-    // the whole plan, because the ordering that puts a table rename before
-    // its column renames is `order_key`'s and not this list's to assume.
-    let mut stored: BTreeMap<&TableName, &TableName> = BTreeMap::new();
-    for p in &changes.changes {
-        if let Change::RenameTable { from, to, .. } = &p.change {
-            stored.insert(to, from);
-        }
-    }
-    changes
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::RenameTable { from, .. } => Some(RenameTarget::Table(from.clone())),
-            Change::RenameColumn { table, from, .. } => {
-                let table = stored.get(table).map_or(table, |t| *t);
-                Some(RenameTarget::Column(table.column(from)))
-            }
-            // A module rename reaches the plan as a drop plus a create, and
-            // what points at the old name is `crate::modules`' question.
-            // Exhaustive rather than `_`: a change added later that moves a
-            // name has to be considered here, and a catch-all would let it
-            // through in silence.
-            Change::DropModule { .. }
-            | Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            // A row's identity is its key, and a changed key is a delete
-            // plus an insert rather than a rename.
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
-        })
-        .collect()
+    pbps_db::impact::rename_targets(changes, false)
 }
 
 /// Every routine in this database whose body the engine keeps as **text**,

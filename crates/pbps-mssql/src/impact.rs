@@ -23,8 +23,6 @@
 //! report says so rather than implying the list is complete; §7.4 puts a
 //! checklist in front of a human for exactly that reason.
 
-use std::collections::BTreeMap;
-
 use pbps_db::{Conn, DbError};
 use pbps_dialect::DialectError;
 use pbps_model::{Change, TableName};
@@ -447,76 +445,7 @@ pub async fn key_drop_blockers(
 /// Every rename in a plan, as the objects they are renamed *from* — which is
 /// the name the catalog still knows them by.
 pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
-    // A RenameColumn carries the declared, post-rename table because its
-    // statement runs after RenameTable. Impact runs before either one, so
-    // translate through a map built over the whole plan rather than rely on
-    // the changes' current ordering (DECISIONS 416).
-    let mut stored: BTreeMap<&TableName, &TableName> = BTreeMap::new();
-    for p in &changes.changes {
-        if let Change::RenameTable { from, to, .. } = &p.change {
-            stored.insert(to, from);
-        }
-    }
-    changes
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::RenameTable { from, .. } => Some(RenameTarget::Table(from.clone())),
-            Change::RenameColumn { table, from, .. } => {
-                let table = stored.get(table).map_or(table, |t| *t);
-                Some(RenameTarget::Column(table.column(from)))
-            }
-            // A module rename reaches the plan as this drop plus a create,
-            // so the drop side is where the catalog has to be asked what
-            // still points at the old name.
-            Change::DropModule { id, .. } => Some(RenameTarget::Module(id.object_name())),
-            // Exhaustive rather than `_`: a change added later that also
-            // moves a name must be considered here, and a catch-all would
-            // let it through silently.
-            Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            // Row changes move no name: a row's identity is its key, and a
-            // changed key is a delete plus an insert, not a rename.
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::PublicExecution { .. } => None,
-        })
-        .collect()
+    pbps_db::impact::rename_targets(changes, true)
 }
 
 /// What refers to the object, asked of `sys.dm_sql_referencing_entities`

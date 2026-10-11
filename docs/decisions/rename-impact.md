@@ -368,7 +368,7 @@ the [decision record](../DECISIONS.md), which says how to add an entry here.
     `email` to `contact_email` describes the column as `app.customer.email`,
     and `impact::rename_impact`, which runs before any statement, looked up a
     table the catalog does not have yet and answered `ImpactError::Name` — a
-    refusal of a plan the engine would accept. `RenameTarget::from_changes`
+    refusal of a plan the engine would accept. `pbps_db::impact::rename_targets`
     therefore builds the table map over the whole plan first and translates the
     column's table through it, the same translation `preflight::AsStored` makes
     one rank further on. Built over the whole plan rather than as it walks,
@@ -399,8 +399,8 @@ the [decision record](../DECISIONS.md), which says how to add an entry here.
     table, every dependency query joined against NULL, and even a
     SCHEMABINDING view that blocks the rename came back as an empty report.
 
-    `RenameTarget::from_changes` builds the complete table-rename map first and
-    translates a column target through it. It does not rely on change order:
+    `pbps_db::impact::rename_targets` builds the complete table-rename map first
+    and translates a column target through it. It does not rely on change order:
     putting table renames before column renames is the emitter's concern, while
     this code's concern is the catalog state before the plan begins. This is
     the SQL Server instance of DECISIONS 407; unlike PostgreSQL's loud missing-
