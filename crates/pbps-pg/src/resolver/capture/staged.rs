@@ -141,8 +141,8 @@ pub async fn compare(
         }
         // An extension's members are one closure: a plan that reads the
         // extension seals every member, and the capture refuses a member it
-        // has no identity for rather than leave it out (a text search
-        // dictionary `unaccent` brings). Named here, where the remedy is
+        // has no identity for rather than leave it out (the foreign-data
+        // wrapper `postgres_fdw` brings). Named here, where the remedy is
         // known, rather than as a capture failure later.
         for object in &created.members {
             match comparable(catalog, object) {
@@ -253,8 +253,8 @@ async fn read(
 }
 
 /// The identity of a created object the comparison can read, or `None`: a
-/// class the capture has no identity for (a text search configuration, a
-/// large object, a subscription, a default privilege), or a foreign table,
+/// class the capture has no identity for (a conversion, a large object, a
+/// subscription, a default privilege), or a foreign table,
 /// whose properties are not qualified.
 fn comparable(catalog: &Catalog, object: &Object) -> Option<ObjectIdentity> {
     let identity = catalog.object(&object.catalog, object.oid).ok()?;
