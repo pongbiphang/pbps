@@ -6794,10 +6794,7 @@ pub fn cmd_plan_db(
             if json {
                 return crate::output::Report::plain(
                     "plan",
-                    blockers
-                        .iter()
-                        .map(crate::report::blocker_finding)
-                        .collect(),
+                    crate::report::blocker_findings(&blockers),
                 )
                 .emit_json();
             }

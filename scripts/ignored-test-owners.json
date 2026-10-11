@@ -1136,7 +1136,8 @@
         "verify_and_status_reject_an_unreadable_unmanaged_module",
         "verify_calls_an_unexpressible_live_difference_drift_not_unreachable",
         "verify_keeps_the_expressible_drift_beside_an_unexpressible_one",
-        "blank_baseline_reasons_leave_the_live_ledger_unchanged"
+        "blank_baseline_reasons_leave_the_live_ledger_unchanged",
+        "forced_pull_with_multiple_decisions_provides_a_complete_batch_remedy"
       ]
     },
     {
@@ -1420,7 +1421,8 @@
         "an_unasked_partition_default_stays_in_the_envelope_when_a_later_step_fails",
         "an_unlogged_partition_under_an_undeclared_permanent_key_is_refused",
         "an_ambiguous_date_or_time_literal_is_refused_with_both_readings",
-        "blank_baseline_reasons_leave_the_live_ledger_unchanged"
+        "blank_baseline_reasons_leave_the_live_ledger_unchanged",
+        "forced_pull_with_multiple_decisions_provides_a_complete_batch_remedy"
       ]
     },
     {

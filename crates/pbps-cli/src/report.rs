@@ -35,6 +35,10 @@ pub fn intent(i: &Intent) -> String {
 }
 
 pub fn blockers(list: &[Blocker]) -> String {
+    blockers_with_intents(list, &[])
+}
+
+pub fn blockers_with_intents(list: &[Blocker], supplied: &[Intent]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "{} change(s) could not be decided automatically\n",
@@ -44,7 +48,290 @@ pub fn blockers(list: &[Blocker]) -> String {
         out.push('\n');
         out.push_str(&one_blocker(b));
     }
+    if let Some(batch) = batch_remedy(list, supplied) {
+        out.push('\n');
+        out.push_str(&batch);
+        out.push('\n');
+    }
     out
+}
+
+/// Keep the complete remedy in one finding rather than copying a growing batch
+/// into every blocker. The individual finding IDs retain their meaning.
+pub fn blocker_findings(list: &[Blocker]) -> Vec<crate::output::Finding> {
+    let mut findings: Vec<_> = list.iter().map(blocker_finding).collect();
+    if let Some(batch) = batch_remedy(list, &[]) {
+        findings.push(
+            crate::output::Finding::note(
+                "identity.batch-required",
+                "Record all pending identity decisions together.",
+            )
+            .remedy(batch),
+        );
+    }
+    findings
+}
+
+fn decision_count(blocker: &Blocker) -> Option<usize> {
+    match blocker {
+        Blocker::AmbiguousColumns { disappeared, .. }
+        | Blocker::AmbiguousRoles { disappeared, .. } => Some(disappeared.len()),
+        Blocker::AmbiguousTables { disappeared, .. } => Some(disappeared.len()),
+        Blocker::DropColumnNeedsReason { .. }
+        | Blocker::DropTableNeedsReason { .. }
+        | Blocker::DropRoleNeedsReason { .. } => Some(1),
+        Blocker::ProvisionalTableIdentity { blocker, .. } => decision_count(blocker),
+        Blocker::UnusedIntent { .. }
+        | Blocker::ConflictingRenameIntents { .. }
+        | Blocker::RenameTargetExists { .. }
+        | Blocker::UnrepresentableName { .. }
+        | Blocker::MoveNotBesideDefault { .. } => None,
+    }
+}
+
+fn pair_flag(flag: &str, first: &str, second: &str, second_name: &str) -> String {
+    format!(
+        "{flag} {} {}",
+        shell_arg(first).unwrap_or_else(|| placeholder("object name")),
+        shell_arg(second).unwrap_or_else(|| placeholder(second_name)),
+    )
+}
+
+fn supplied_flag(intent: &Intent) -> Option<String> {
+    Some(match intent {
+        Intent::RenameColumn { table, from, to } => {
+            pair_flag("--rename", &format!("{table}.{from}"), to, "new column")
+        }
+        Intent::RenameTable { from, to } => pair_flag(
+            "--rename-table",
+            &from.to_string(),
+            &to.to_string(),
+            "new table",
+        ),
+        Intent::RenameRole { from, to } => pair_flag("--rename-role", from, to, "new role"),
+        Intent::DropColumn { column, reason } => {
+            pair_flag("--drop", &column.to_string(), reason.as_ref(), "why")
+        }
+        Intent::DropTable { table, reason } => {
+            pair_flag("--drop-table", &table.to_string(), reason.as_ref(), "why")
+        }
+        Intent::DropRole { role, reason } => pair_flag("--drop-role", role, reason.as_ref(), "why"),
+        // MoveRows remains a separate command (SPEC §6.5); do not advertise an
+        // option the identity batch does not accept.
+        Intent::MoveRows { .. } => return None,
+    })
+}
+
+fn batch_remedy(list: &[Blocker], supplied: &[Intent]) -> Option<String> {
+    // A conflict or unused intent must be corrected before it can be carried
+    // forward as a valid answer. Resolution already classifies those cases.
+    let pending: usize = list
+        .iter()
+        .map(decision_count)
+        .collect::<Option<Vec<_>>>()?
+        .iter()
+        .sum();
+    if pending + supplied.len() < 2 {
+        return None;
+    }
+    let mut flags = supplied
+        .iter()
+        .map(supplied_flag)
+        .collect::<Option<Vec<_>>>()?;
+    let mut choices = Vec::new();
+    for blocker in list {
+        batch_flags(blocker, &mut flags, &mut choices);
+    }
+    let mut out = String::from(
+        "Identity decisions are recorded together; separate single-intent commands cannot record a partial answer.\n",
+    );
+    if !supplied.is_empty() {
+        out.push_str("The supplied intents were valid but not recorded. Include them again with the remaining decisions.\n");
+    }
+    out.push_str("Replace the quoted placeholders with your own values, quoted for your shell.\n");
+    out.push_str(&format!("    pbps intent {}\n", flags.join(" ")));
+    if !choices.is_empty() {
+        out.push_str("Append one chosen disposition for each disappeared object to that same command; no rename is chosen for you:\n");
+        out.push_str(&choices.join("\n"));
+        out.push('\n');
+    }
+    Some(out)
+}
+
+fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<String>) {
+    let mut alternatives = |rename: &str, drop: &str, from: &str, targets: Vec<String>| {
+        for to in targets {
+            choices.push(format!(
+                "    if renamed: {}",
+                pair_flag(rename, from, &to, "new name")
+            ));
+        }
+        choices.push(format!(
+            "    if dropped: {}",
+            pair_flag(drop, from, "<why>", "why")
+        ));
+    };
+    match blocker {
+        Blocker::AmbiguousColumns {
+            table,
+            disappeared,
+            appeared,
+        } => {
+            for from in disappeared {
+                alternatives(
+                    "--rename",
+                    "--drop",
+                    &format!("{table}.{from}"),
+                    appeared.clone(),
+                );
+            }
+        }
+        Blocker::AmbiguousTables {
+            disappeared,
+            appeared,
+        } => {
+            for from in disappeared {
+                alternatives(
+                    "--rename-table",
+                    "--drop-table",
+                    &from.to_string(),
+                    appeared.iter().map(ToString::to_string).collect(),
+                );
+            }
+        }
+        Blocker::AmbiguousRoles {
+            disappeared,
+            appeared,
+        } => {
+            for from in disappeared {
+                alternatives("--rename-role", "--drop-role", from, appeared.clone());
+            }
+        }
+        Blocker::DropColumnNeedsReason { column } => {
+            fixed.push(pair_flag("--drop", &column.to_string(), "<why>", "why"))
+        }
+        Blocker::DropTableNeedsReason { table } => fixed.push(pair_flag(
+            "--drop-table",
+            &table.to_string(),
+            "<why>",
+            "why",
+        )),
+        Blocker::DropRoleNeedsReason { role } => {
+            fixed.push(pair_flag("--drop-role", role, "<why>", "why"))
+        }
+        Blocker::ProvisionalTableIdentity { from, to, blocker } => {
+            // A derived column choice is conditional on its table identity.
+            // Putting its flag on the fixed command would silently decide it.
+            choices.push(format!(
+                "    only if {from} -> {to} is the table rename you choose:"
+            ));
+            let mut conditional = Vec::new();
+            batch_flags(blocker, &mut conditional, choices);
+            choices.extend(conditional.into_iter().map(|flag| format!("      {flag}")));
+        }
+        Blocker::UnusedIntent { .. }
+        | Blocker::ConflictingRenameIntents { .. }
+        | Blocker::RenameTargetExists { .. }
+        | Blocker::UnrepresentableName { .. }
+        | Blocker::MoveNotBesideDefault { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    #[test]
+    fn human_and_json_share_one_complete_batch_without_changing_blocker_ids() {
+        let blockers = vec![
+            Blocker::DropColumnNeedsReason {
+                column: "app.t.old".parse().unwrap(),
+            },
+            Blocker::DropRoleNeedsReason {
+                role: "old reader".into(),
+            },
+        ];
+        let human = super::blockers(&blockers);
+        let findings = blocker_findings(&blockers);
+        assert_eq!(findings.len(), 3);
+        assert_eq!(findings[0].id, "identity.drop-column-needs-reason");
+        assert_eq!(findings[1].id, "identity.drop-role-needs-reason");
+        let remedy = findings[2].remedy.as_ref().unwrap();
+        assert!(human.contains(remedy));
+        assert!(remedy.contains(
+            "pbps intent --drop app.t.old \"<why>\" --drop-role \"old reader\" \"<why>\""
+        ));
+        assert_eq!(blocker_findings(&blockers[..1]).len(), 1);
+    }
+
+    #[test]
+    fn an_ambiguous_group_offers_flags_without_choosing_a_rename() {
+        let blockers = [Blocker::AmbiguousColumns {
+            table: "app.t".parse().unwrap(),
+            disappeared: vec!["a".into(), "b".into()],
+            appeared: vec!["x".into(), "y".into()],
+        }];
+        let remedy = batch_remedy(&blockers, &[]).unwrap();
+        let command = remedy
+            .lines()
+            .find(|line| line.contains("pbps intent"))
+            .unwrap();
+        assert!(!command.contains("--rename"));
+        for from in ["a", "b"] {
+            for to in ["x", "y"] {
+                assert!(remedy.contains(&format!("--rename app.t.{from} {to}")));
+            }
+            assert!(remedy.contains(&format!("--drop app.t.{from} \"<why>\"")));
+        }
+    }
+
+    #[test]
+    fn incomplete_answers_are_retained_but_invalid_answers_are_not_endorsed() {
+        let supplied = Intent::DropColumn {
+            column: "app.t.a".parse().unwrap(),
+            reason: "first reason".parse().unwrap(),
+        };
+        let pending = Blocker::DropColumnNeedsReason {
+            column: "app.t.b".parse().unwrap(),
+        };
+        let remedy = batch_remedy(
+            std::slice::from_ref(&pending),
+            std::slice::from_ref(&supplied),
+        )
+        .unwrap();
+        assert!(remedy.contains("valid but not recorded"));
+        assert!(
+            remedy.contains("pbps intent --drop app.t.a \"first reason\" --drop app.t.b \"<why>\"")
+        );
+        let invalid = Blocker::UnusedIntent {
+            intent: supplied.clone(),
+        };
+        assert!(batch_remedy(&[pending, invalid], &[supplied]).is_none());
+    }
+
+    #[test]
+    fn provisional_decisions_and_shell_sensitive_values_are_never_fixed_arguments() {
+        let blocker = Blocker::ProvisionalTableIdentity {
+            from: "app.old".parse().unwrap(),
+            to: "app.new".parse().unwrap(),
+            blocker: Box::new(Blocker::DropColumnNeedsReason {
+                column: "app.new.old".parse().unwrap(),
+            }),
+        };
+        let supplied = Intent::DropRole {
+            role: "reader".into(),
+            reason: "$REASON".parse().unwrap(),
+        };
+        let remedy = batch_remedy(&[blocker], &[supplied]).unwrap();
+        let command = remedy
+            .lines()
+            .find(|line| line.contains("pbps intent"))
+            .unwrap();
+        assert_eq!(command.trim(), "pbps intent --drop-role reader \"<why>\"");
+        assert!(!remedy.contains("$REASON"));
+        assert!(remedy.contains("only if app.old -> app.new"));
+        assert!(remedy.contains("--drop app.new.old"));
+    }
 }
 
 /// One blocker as a typed finding: a stable id, what happened, and the commands

@@ -27,6 +27,35 @@ mod pty;
 #[path = "support/envelope_archives.rs"]
 mod envelope_archives;
 
+#[path = "support/batch_intent.rs"]
+mod batch_intent;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn forced_pull_with_multiple_decisions_provides_a_complete_batch_remedy() {
+    pull_identity::batch_after_forced_pull(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+fn identity_batches_record_complete_decisions_and_retain_unrecorded_remedies() {
+    batch_intent::complete("mssql");
+}
+
+#[test]
+fn identity_batches_refuse_partial_conflicting_or_malformed_answers_without_writes() {
+    batch_intent::atomic_refusals("mssql");
+}
+
+#[test]
+fn identity_batches_rename_and_drop_tables_and_roles_together() {
+    batch_intent::tables_and_roles("mssql");
+}
+
+#[test]
+fn identity_batches_keep_annotation_provenance_and_single_edit_workflows() {
+    batch_intent::annotations_and_single_edits("mssql");
+}
+
 #[path = "support/audit_reasons.rs"]
 mod audit_reasons;
 

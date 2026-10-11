@@ -729,6 +729,25 @@ pbps drop dbo.customer.national_id --reason "REG-2026-042 PII erasure request"
 
 Fully non-interactive, scriptable, and **needs no database connection**.
 
+When several objects need decisions after one edit, submit them together:
+
+```bash
+pbps intent --drop dbo.customer.legacy_email "email retention expired" --drop dbo.customer.legacy_phone "phone retention expired"
+pbps intent --rename dbo.customer.old_name full_name --rename-role reader auditor
+```
+
+Each option takes two values and may be repeated: `--rename <COLUMN> <NEW>`,
+`--rename-table <FROM> <TO>`, `--rename-role <FROM> <TO>`,
+`--drop <COLUMN> <REASON>`, `--drop-table <TABLE> <REASON>`, and
+`--drop-role <ROLE> <REASON>`. At least one option is required. Qualified name shapes and
+nonblank reasons are checked before project discovery. A missing value cannot
+consume the next option; hyphen-leading values are not accepted.
+
+Annotations and the complete explicit batch go through one identity resolution.
+An invalid, conflicting, or incomplete batch writes nothing; no partial answers
+are saved. The existing single-intent commands use the same path with one
+decision (DEC-1791.1). Compose's existing single-intent input is unchanged.
+
 `drop`, `drop-table` and `drop-role` require a reason containing at least one
 non-whitespace character. A blank `--reason` is a usage error (exit 2), refused
 before project discovery or file writes. Meaningful CLI reasons are recorded
@@ -815,6 +834,15 @@ error: 1 change could not be decided automatically
   if renamed:  pbps rename dbo.customer.customer_name full_name
   if dropped:  pbps drop dbo.customer.customer_name --reason "<why>"
 ```
+
+For several pending decisions, human and JSON reports also give one `pbps intent`
+batch. Drops have their own reason placeholders; ambiguous renames remain
+explicit alternatives for the human to choose. If a single command leaves other
+decisions unresolved, its valid but unrecorded intent is included in the batch
+remedy. A column decision under a provisional table rename remains conditional
+on that table choice. Values that cannot be quoted safely across supported
+shells use quoted placeholders, to be replaced with the original values using
+the operator's shell quoting.
 
 **No flag may stand in for that answer.** Similarity is allowed to order the
 candidates in 6.3's prompt, one pair at a time, but an `--assume-renames` would
