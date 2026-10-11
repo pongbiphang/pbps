@@ -215,6 +215,8 @@ indexes:
 
 ### 4.3 Format rules
 
+- **Formatting preserves scalar text exactly**, including line breaks and
+  control characters, using double-quoted YAML escapes wherever needed.
 - **`columns` is a map, not a list**, and the key is the column name. One less
   level of nesting, and duplicate names become impossible to express.
 - **`nullable` defaults to `true`** and is written only when needed. The field

@@ -2211,6 +2211,10 @@ Three traps sat inside the fix, and each of them is a measurement:
   `nullable`.
 - **`no` / `yes` / `on` / `off` parse as booleans.** `pbps fmt` must quote
   boolean-ish, null-ish (`null` / `~`) and number-shaped string scalars.
+- **Quotes alone do not preserve line breaks.** YAML folds a raw newline
+  inside quotes into a space, or refuses an unindented continuation. Escape
+  line breaks and control characters in both scalar and partition-bound
+  output; block scalars cannot replace values inside flow mappings (#1795).
 - **LF everywhere in version control** (see `.gitattributes`); the tool writes
   files itself, and platform line endings would break "the tool owns the file
   format" on Windows.

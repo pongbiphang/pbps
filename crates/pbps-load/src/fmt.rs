@@ -511,7 +511,7 @@ const NULLISH: &[&str] = &["null", "~"];
 /// Renders a scalar, quoting it when necessary.
 fn scalar(s: &str) -> String {
     if needs_quotes(s) {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+        quoted(s)
     } else {
         s.to_owned()
     }
@@ -521,14 +521,44 @@ fn scalar(s: &str) -> String {
 /// of any key type, and bare it would be read by YAML's rules, `0x1F` as 31
 /// and `MINVALUE` as the unbounded end (#1170).
 fn bound_value(s: &str) -> String {
+    quoted(s)
+}
+
+fn needs_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\\' | '"' | '\u{2028}' | '\u{2029}' | '\u{feff}' | '\u{fffe}' | '\u{ffff}'
+        )
+}
+
+/// A single physical line works in block values, flow mappings and keys.
+/// Raw line breaks inside quotes are folded by YAML; a literal block cannot
+/// replace them in a flow mapping or preserve a bare carriage return (#1795).
+fn quoted(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
+            '\0' => out.push_str("\\0"),
+            '\x07' => out.push_str("\\a"),
+            '\x08' => out.push_str("\\b"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\x0b' => out.push_str("\\v"),
+            '\x0c' => out.push_str("\\f"),
+            '\x1b' => out.push_str("\\e"),
+            '\u{85}' => out.push_str("\\N"),
+            '\u{2028}' => out.push_str("\\L"),
+            '\u{2029}' => out.push_str("\\P"),
+            '\u{feff}' | '\u{fffe}' | '\u{ffff}' => {
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            c if c.is_control() => {
+                let _ = write!(out, "\\x{:02X}", c as u32);
+            }
             c => out.push(c),
         }
     }
@@ -537,7 +567,7 @@ fn bound_value(s: &str) -> String {
 }
 
 fn needs_quotes(s: &str) -> bool {
-    if s.is_empty() || s != s.trim() {
+    if s.is_empty() || s != s.trim() || s.chars().any(needs_escape) {
         return true;
     }
     let lower = s.to_ascii_lowercase();
@@ -663,6 +693,10 @@ mod tests {
     fn round_trip(yaml: &str) {
         let a = crate::load_table_str(Path::new("t.yml"), yaml)
             .unwrap_or_else(|e| panic!("the original file failed to load: {e:?}"));
+        round_trip_loaded(&a, "loaded table");
+    }
+
+    fn round_trip_loaded(a: &crate::LoadedTable, context: &str) {
         let render_all = |t: &crate::LoadedTable| {
             let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
             render_partitioned(
@@ -673,18 +707,189 @@ mod tests {
                 t.strategy.as_ref(),
             )
         };
-        let out = render_all(&a);
+        let out = render_all(a);
         let b = crate::load_table_str(Path::new("t.yml"), &out).unwrap_or_else(|e| {
-            panic!("the rewritten file does not read back: {e:?}\noutput:\n{out}")
+            panic!("{context}: the rewritten file does not read back: {e:?}\noutput:\n{out}")
         });
-        assert_eq!(a.name, b.name, "output:\n{out}");
-        assert_eq!(a.table, b.table, "output:\n{out}");
-        assert_eq!(a.intents, b.intents, "output:\n{out}");
-        assert_eq!(a.partitions, b.partitions, "output:\n{out}");
+        assert_eq!(a, &b, "{context}: output:\n{out}");
 
         // Idempotence: formatting an already-formatted file must change nothing.
         let out2 = render_all(&b);
-        assert_eq!(out, out2, "fmt is not idempotent");
+        assert_eq!(out, out2, "{context}: fmt is not idempotent");
+    }
+
+    fn scalar_corpus() -> Vec<String> {
+        let alphabet = [
+            'a', '0', '-', '?', '&', '[', ']', '{', '}', ':', '#', ',', ' ', '\t', '\r', '\n',
+            '\0', '\x07', '\x08', '\x0b', '\x0c', '\x1b', '\x7f', '\u{85}', '\u{9f}', '\u{2028}',
+            '\u{2029}', '\u{feff}', '\u{fffe}', '\u{ffff}', '"', '\'', '\\', '!', '|', '>', '%',
+            '@', '`', 'é',
+        ];
+        let mut values: Vec<String> = [
+            "",
+            "First line\nSecond line",
+            "a\rb",
+            "a\r\nb",
+            "a\tb",
+            " leading",
+            "trailing ",
+            " both ",
+            "literal\\n",
+            "a\"b\\c",
+            "no",
+            "null",
+            "0123",
+            "1.50",
+            "plain_name",
+            "繁體中文",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for a in alphabet {
+            values.push(a.to_string());
+            for b in alphabet {
+                values.push(format!("{a}{b}"));
+            }
+        }
+        // Interior controls must force quoting too, even when trim changes nothing.
+        for c in (0..=31).chain(127..=159) {
+            values.push(format!("before{}after", char::from_u32(c).unwrap()));
+        }
+        values
+    }
+
+    #[test]
+    fn every_scalar_context_keeps_its_exact_text_and_format() {
+        let base = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: app.t\ncolumns:\n  id: {type: varchar(100), nullable: false}\n  v: {type: varchar(100)}\n  g: {type: int, generated: {expression: '1', stored: true}}\ncomputed:\n  c: {expression: '1'}\nprimary_key: [id]\nchecks: {ck: '1 = 1'}\nindexes:\n  ix: {columns: [v], where: v IS NOT NULL}\ndata:\n  mode: exact\n  rows:\n    row: {v: text}\n",
+        )
+        .unwrap();
+        let positions = [
+            (
+                "table description",
+                (|t: &mut Table, s: &str| t.description = Some(s.into())) as fn(&mut Table, &str),
+            ),
+            ("column description", |t: &mut Table, s: &str| {
+                t.columns["v"].description = Some(s.into())
+            }),
+            ("default", |t: &mut Table, s: &str| {
+                t.columns["v"].default = Some(s.into())
+            }),
+            ("deprecated", |t: &mut Table, s: &str| {
+                t.columns["v"].deprecated = Some(s.into())
+            }),
+            ("check", |t: &mut Table, s: &str| {
+                t.checks.get_mut("ck").unwrap().expression = s.into()
+            }),
+            ("filter", |t: &mut Table, s: &str| {
+                t.indexes.get_mut("ix").unwrap().filter = Some(s.into())
+            }),
+            ("generated", |t: &mut Table, s: &str| {
+                t.columns["g"].generated.as_mut().unwrap().expression = s.into()
+            }),
+            ("computed", |t: &mut Table, s: &str| {
+                t.computed.get_mut("c").unwrap().expression = s.into()
+            }),
+            ("row key", |t: &mut Table, s: &str| {
+                let rows = &mut t.data.as_mut().unwrap().rows;
+                let (_, row) = rows.pop_first().unwrap();
+                rows.insert(s.into(), row);
+            }),
+            ("cell", |t: &mut Table, s: &str| {
+                t.data
+                    .as_mut()
+                    .unwrap()
+                    .rows
+                    .values_mut()
+                    .next()
+                    .unwrap()
+                    .0
+                    .insert("v".into(), pbps_model::Value::Text(s.into()));
+            }),
+        ];
+        for s in scalar_corpus() {
+            for (position, set) in positions {
+                let mut expected = base.clone();
+                set(&mut expected.table, &s);
+                round_trip_loaded(&expected, &format!("{position}: {s:?}"));
+            }
+            let module = Module {
+                kind: pbps_model::ModuleKind::View,
+                description: Some(s.clone()),
+                definition: "SELECT 'first  \nsecond' AS note".into(),
+            };
+            let id = ModuleId::Named("app.v".parse().unwrap());
+            let out = render_module(&id, &module, &Default::default(), false);
+            let back = crate::load_module_str(Path::new("v.yml"), &out).unwrap();
+            assert_eq!(back.module, module, "module description: {s:?}");
+            assert_eq!(
+                render_module(
+                    &back.id,
+                    &back.module,
+                    &back.depends_on,
+                    back.public_execute
+                ),
+                out
+            );
+
+            let role = pbps_model::Role {
+                description: Some(s.clone()),
+                ..Default::default()
+            };
+            let out = render_role("reader", &role, &[]);
+            let back = crate::load_role_str(Path::new("r.yml"), &out).unwrap();
+            assert_eq!(back.role, role, "role description: {s:?}");
+            assert_eq!(render_role(&back.name, &back.role, &back.intents), out);
+        }
+    }
+
+    #[test]
+    fn quoted_controls_do_not_change_non_text_cells_or_plain_names() {
+        let yaml = "table: app.t\ncolumns:\n  id: {type: int, nullable: false}\n  n: {type: int}\n  b: {type: bit}\n  v: {type: varchar(20)}\nprimary_key: [id]\ndata:\n  mode: exact\n  rows:\n    '1': {n: -7, b: true, v: null}\n";
+        round_trip(yaml);
+        let loaded = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        let out = render(&loaded.name, &loaded.table, &[], None);
+        assert!(out.starts_with("table: app.t\n"), "{out}");
+        assert!(out.contains("{b: true, \"n\": -7, v: null}"), "{out}");
+        assert_eq!(scalar("plain_name"), "plain_name");
+    }
+
+    #[test]
+    fn multiline_names_survive_mapping_keys_sequences_and_rename_annotations() {
+        let mut loaded = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: app.t\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+        )
+        .unwrap();
+        loaded.name = TableName::new("app", "table\nname");
+        let column = loaded.table.columns.shift_remove("id").unwrap();
+        loaded.table.columns.insert("column\rname".into(), column);
+        loaded.table.primary_key.as_mut().unwrap().columns = vec!["column\rname".into()];
+        loaded.intents = vec![
+            Intent::RenameTable {
+                from: TableName::new("app", "old\ttable"),
+                to: loaded.name.clone(),
+            },
+            Intent::RenameColumn {
+                table: loaded.name.clone(),
+                from: "old\ncolumn".into(),
+                to: "column\rname".into(),
+            },
+        ];
+        round_trip_loaded(&loaded, "names and rename annotations");
+
+        let role = pbps_model::Role::default();
+        let pending = vec![Intent::RenameRole {
+            from: "old\rrole".into(),
+            to: "role\nname".into(),
+        }];
+        let out = render_role("role\nname", &role, &pending);
+        let back = crate::load_role_str(Path::new("r.yml"), &out).unwrap();
+        assert_eq!(back.name, "role\nname");
+        assert_eq!(back.intents, pending);
+        assert_eq!(render_role(&back.name, &back.role, &back.intents), out);
     }
 
     fn module_round_trip(yaml: &str) -> String {
@@ -1459,13 +1664,17 @@ indexes:
             "x\ny",
             "back\\slash",
             "\"q\"",
-        ] {
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(scalar_corpus())
+        {
             let child = TableName::new("app", "p1");
             let table = pbps_model::Table {
                 partition_of: Some(pbps_model::PartitionOf {
                     parent: TableName::new("app", "t"),
                     bound: B::Range {
-                        from: vec![value(v)],
+                        from: vec![value(&v)],
                         to: vec![D::MaxValue],
                     },
                     columns: Default::default(),
