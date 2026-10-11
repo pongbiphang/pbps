@@ -6950,6 +6950,72 @@ fn partitions_are_added_and_dropped_through_the_cli() {
         scalar(&connection, "SELECT count(*) FROM app.ev_2026 WHERE id = 3"),
         1
     );
+
+    // A range beside the DEFAULT whose own default and NOT NULL are on a
+    // column the parent adds behind a function the column's default calls:
+    // the move does not wait for the column; the partition's own default and
+    // NOT NULL follow it (#1763 review). The moved row takes the parent's
+    // default as the column is added; a row inserted into the partition
+    // after, the partition's.
+    on_server(&connection, "INSERT INTO app.ev VALUES (4, '2031-06-01')");
+    std::fs::write(
+        d.dir.join("schema/app.eight.function.yml"),
+        "function: app.eight()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 8 $$\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "table: app.ev\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+             ts: {{type: date, nullable: false}}\n  extra: {{type: integer, default: app.eight()}}\n\
+             primary_key: [id, ts]\npartition_by: [ts]\npartitions:\n{p2026}{p2030}  \
+             ev_2031:\n    from: [\"2031-01-01\"]\n    to: [\"2032-01-01\"]\n    columns:\n      \
+             extra: {{default: 9, nullable: false}}\n{rest}"
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    // The partition's own NOT NULL is a risk of the change that sets it, as
+    // it was of the `CREATE` it is split from.
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "not-null"],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT extra::int8 FROM ONLY app.ev_2031 WHERE id = 4"
+        ),
+        8,
+        "the moved row takes the parent's default as the column is added"
+    );
+    on_server(
+        &connection,
+        "INSERT INTO app.ev_2031 (id, ts) VALUES (5, '2031-07-01')",
+    );
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT extra::int8 FROM ONLY app.ev_2031 WHERE id = 5"
+        ),
+        9,
+        "a row inserted into the partition after takes its own default"
+    );
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT attnotnull::int::int8 FROM pg_attribute \
+             WHERE attrelid = 'app.ev_2031'::regclass AND attname = 'extra'"
+        ),
+        1
+    );
 }
 
 /// A partition moved out of `partitions:` into a file of its own, of its

@@ -4679,10 +4679,16 @@ name too.
   its place, and its own default is split off into a `SetPartitionDefault`
   right after the last function its text may call (`split_moving_defaults`
   in `dependents.rs`; leon's choice, #1763 review). The move inserts every
-  column of the rows it takes, so it never evaluates the default. The apply
-  guard holds the created partition's own defaults to the `CREATE` plus the
-  defaults the plan sets after it, as it holds a created table's columns
-  (DEC-942.1).
+  column of the rows it takes, so it never evaluates the default. Nor is it
+  held with a column its parent adds behind a function the column's default
+  or expression calls: its own default and NOT NULL on that column are split
+  off too, into a `SetPartitionDefault` and a `SetPartitionNotNull` that the
+  reorder holds behind the column instead, the NOT NULL's risk with them. An
+  own index or check naming such a column cannot be split off, and that plan
+  is refused by name, with the remedy of adding the column first (#1763
+  review). The apply guard holds the created partition's own defaults and
+  NOT NULLs to the `CREATE` plus what the plan sets after it, as it holds a
+  created table's columns (DEC-942.1).
 - **Probes of the DEFAULT after the move.** A change the plan makes to the
   DEFAULT after the create, such as a check of its own, would be counted
   over rows the move has taken away by then. A check that only a moved row

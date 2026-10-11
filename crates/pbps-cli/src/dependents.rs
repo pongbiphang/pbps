@@ -1774,7 +1774,6 @@ pub(crate) fn after_the_rebuilds(
     kept.extend(moved);
     kept.extend(tail);
     cs.changes = kept;
-    split_moving_defaults(cs, declared);
     Ok(count + after_their_functions(cs, deps, &Partitions::of(declared))?)
 }
 
@@ -1787,8 +1786,45 @@ pub(crate) fn after_the_rebuilds(
 /// the last function the text may call. The move inserts every column of
 /// the rows it takes, so it never evaluates the default; only rows inserted
 /// after the plan do, and by then it is set.
-fn split_moving_defaults(cs: &mut ChangeSet, declared: &Schema) {
+///
+/// Nor is it held with a column the parent adds behind a function (the
+/// column's own default or expression calls it): its own default and NOT
+/// NULL on that column are split off into changes that follow the column.
+/// An own index or check naming the column cannot be, and
+/// [`after_their_functions`] refuses that plan by name.
+///
+/// Run before [`after_the_rebuilds`], which holds what calls a function. The
+/// create and what is split off it carry the dialect's risks recomputed: a
+/// NOT NULL the create no longer sets is a risk of the change that does.
+pub(crate) fn split_moving_defaults(cs: &mut ChangeSet, declared: &Schema, dialect: &dyn Dialect) {
     let functions = function_creates(cs);
+    let called_after = |text: &str, at: usize| {
+        functions
+            .iter()
+            .filter(|(f, created)| *created > at && pbps_pg::generated::may_call(text, f))
+            .map(|(_, created)| *created)
+            .max()
+    };
+    let late: BTreeSet<ColumnRef> = cs
+        .changes
+        .iter()
+        .enumerate()
+        .filter_map(|(j, p)| {
+            let Change::AddColumn {
+                table,
+                name,
+                column,
+                ..
+            } = &p.change
+            else {
+                return None;
+            };
+            column_expression(column)
+                .and_then(|text| called_after(text, j))
+                .map(|_| table.column(name))
+        })
+        .collect();
+    // Each split change, with the place it goes right after.
     let mut sets: Vec<(usize, Change)> = Vec::new();
     for (i, p) in cs.changes.iter_mut().enumerate() {
         let Change::CreateTable {
@@ -1804,39 +1840,53 @@ fn split_moving_defaults(cs: &mut ChangeSet, declared: &Schema) {
             continue;
         };
         let parent = of.parent.clone();
+        let before = sets.len();
         for (column, own) in &mut of.columns {
-            let Some(text) = own.default.as_deref() else {
-                continue;
-            };
-            let Some(after) = functions
-                .iter()
-                .filter(|(f, at)| *at > i && pbps_pg::generated::may_call(text, f))
-                .map(|(_, at)| *at)
-                .max()
-            else {
-                continue;
-            };
-            sets.push((
-                after,
-                Change::SetPartitionDefault {
-                    uid: uid.clone(),
-                    table: name.clone(),
-                    parent: parent.clone(),
-                    column: column.clone(),
-                    from: None,
-                    to: own.default.take(),
-                    fallback: parent_default(declared, name, column),
-                },
-            ));
+            let added_late = late.contains(&parent.column(column));
+            let after = own
+                .default
+                .as_deref()
+                .and_then(|text| called_after(text, i));
+            if (after.is_some() || added_late)
+                && let Some(to) = own.default.take()
+            {
+                sets.push((
+                    after.unwrap_or(i),
+                    Change::SetPartitionDefault {
+                        uid: uid.clone(),
+                        table: name.clone(),
+                        parent: parent.clone(),
+                        column: column.clone(),
+                        from: None,
+                        to: Some(to),
+                        fallback: parent_default(declared, name, column),
+                    },
+                ));
+            }
+            if added_late && std::mem::take(&mut own.not_null) {
+                sets.push((
+                    i,
+                    Change::SetPartitionNotNull {
+                        uid: uid.clone(),
+                        table: name.clone(),
+                        column: column.clone(),
+                        not_null: true,
+                    },
+                ));
+            }
         }
         of.columns.retain(|_, c| c.default.is_some() || c.not_null);
+        if sets.len() > before {
+            p.risks = dialect.change_risks(&p.change);
+        }
     }
-    // Each right after its function, inserted from the last place back so
-    // that the earlier places still hold; two after one function keep their
-    // order.
+    // Each right after its place, inserted from the last place back so that
+    // the earlier places still hold; two after one place keep their order.
+    // One split off for a column the parent adds names that column, so the
+    // reorder holds it behind the column as it would have held the create.
     sets.sort_by_key(|(after, _)| *after);
     for (after, change) in sets.into_iter().rev() {
-        cs.changes.insert(after + 1, PlannedChange::new(change));
+        cs.changes.insert(after + 1, planned(change, dialect));
     }
 }
 
@@ -3016,6 +3066,30 @@ fn after_their_functions(
             held.insert(i);
         }
     }
+    // A create that moves rows is never held (`split_moving_defaults`):
+    // what must follow the move would be let past it. One still held names a
+    // column the parent adds behind a function in an own index or check,
+    // which cannot be split off.
+    if let Some(Change::CreateTable {
+        name,
+        beside_default: Some(default),
+        ..
+    }) = held.iter().map(|&i| window[i]).find(|c| {
+        matches!(
+            c,
+            Change::CreateTable {
+                beside_default: Some(_),
+                ..
+            }
+        )
+    }) {
+        return Err(format!(
+            "{name} is made beside the DEFAULT partition {default} and takes its rows, but an \
+             index or check of its own names a column this plan adds after a function the \
+             column calls, so the move would have to wait for that function and let past it \
+             what must follow the move. Add the column in one plan and the partition in the next."
+        ));
+    }
     let mut preds: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
     let mut previous_free: Option<usize> = None;
     for i in 0..n {
@@ -3491,6 +3565,7 @@ mod tests {
     /// `after_the_rebuilds` with no `depends_on:` edges, for an order it
     /// finds.
     fn rebuilds(cs: &mut ChangeSet, released: &BTreeSet<ColumnRef>) -> usize {
+        split_moving_defaults(cs, &pbps_model::Schema::default(), pg().as_ref());
         after_the_rebuilds(
             cs,
             released,
@@ -4508,6 +4583,122 @@ mod tests {
                 .count(),
             1,
             "{order:?}"
+        );
+    }
+
+    /// A partition made beside a DEFAULT, with its own default and NOT NULL on
+    /// a column the parent adds behind a function the column's default calls,
+    /// is not held with that column: both are split off and follow it, and
+    /// the DEFAULT's tightening keeps its place after the move (#1763
+    /// review). With an own index on that column instead, which cannot be
+    /// split off, the plan is refused by name.
+    #[test]
+    fn a_move_beside_a_column_added_behind_a_function_is_not_held_with_it() {
+        let make = |indexed: bool| {
+            let mut t = Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Range {
+                        from: vec![pbps_model::BoundDatum::Value("1".into())],
+                        to: vec![pbps_model::BoundDatum::Value("2".into())],
+                    },
+                    columns: [(
+                        "extra".to_owned(),
+                        pbps_model::PartitionColumn {
+                            default: Some("9".to_owned()),
+                            not_null: true,
+                        },
+                    )]
+                    .into(),
+                }),
+                ..Table::default()
+            };
+            if indexed {
+                t.indexes.insert(
+                    "ev_1_extra".into(),
+                    pbps_model::Index {
+                        columns: vec![pbps_model::IndexColumn {
+                            key: pbps_model::IndexKey::Column("extra".into()),
+                            descending: false,
+                            opclass: None,
+                        }],
+                        include: Vec::new(),
+                        unique: false,
+                        filter: None,
+                        method: Default::default(),
+                        storage_parameters: Default::default(),
+                    },
+                );
+            }
+            let mut extra = Column::new("integer".parse().unwrap());
+            extra.default = Some("app.f(1)".into());
+            plan(vec![
+                Change::AddColumn {
+                    uid: Uid::derived(UidKind::Column, "app.ev.extra", 0),
+                    table: "app.ev".parse().unwrap(),
+                    name: "extra".into(),
+                    column: Box::new(extra),
+                },
+                Change::CreateTable {
+                    uid: Uid::derived(UidKind::Table, "app.ev_1", 0),
+                    name: "app.ev_1".parse().unwrap(),
+                    table: Box::new(t),
+                    beside_default: Some("app.ev_rest".parse().unwrap()),
+                },
+                Change::SetPartitionNotNull {
+                    uid: Uid::derived(UidKind::Table, "app.ev_rest", 0),
+                    table: "app.ev_rest".parse().unwrap(),
+                    column: "v".into(),
+                    not_null: true,
+                },
+                routine("app.f(integer)", "SELECT 1"),
+            ])
+        };
+        let mut cs = make(false);
+        rebuilds(&mut cs, &BTreeSet::new());
+        let order = names(&cs);
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let function =
+            at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
+        let added = at(&|c| matches!(c, Change::AddColumn { .. }));
+        let create = at(&|c| matches!(c, Change::CreateTable { .. }));
+        let tightened = at(
+            &|c| matches!(c, Change::SetPartitionNotNull { table, .. } if table.name == "ev_rest"),
+        );
+        let own_default = at(&|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, to, .. }
+            if table.name == "ev_1" && column == "extra" && to.as_deref() == Some("9"))
+        });
+        let own_not_null = at(&|c| {
+            matches!(c, Change::SetPartitionNotNull { table, column, not_null: true, .. }
+            if table.name == "ev_1" && column == "extra")
+        });
+        assert!(create < tightened && tightened < function, "{order:?}");
+        assert!(function < added, "{order:?}");
+        assert!(added < own_default && added < own_not_null, "{order:?}");
+        let Change::CreateTable { table, .. } = &cs.changes[create].change else {
+            unreachable!()
+        };
+        assert!(
+            table.partition_of.as_ref().unwrap().columns.is_empty(),
+            "{order:?}"
+        );
+        // Negative: an own index on the column cannot be split off, and the
+        // plan is refused by name rather than letting the tightening past.
+        let mut indexed = make(true);
+        split_moving_defaults(&mut indexed, &pbps_model::Schema::default(), pg().as_ref());
+        let why = after_the_rebuilds(
+            &mut indexed,
+            &BTreeSet::new(),
+            &ModuleDeps::new(),
+            &pbps_model::Schema::default(),
+        )
+        .unwrap_err();
+        assert!(
+            why.contains("app.ev_1 is made beside the DEFAULT partition app.ev_rest")
+                && why.contains("Add the column in one plan and the partition in the next"),
+            "{why}"
         );
     }
 
