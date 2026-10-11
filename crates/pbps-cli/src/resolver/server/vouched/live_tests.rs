@@ -2428,6 +2428,54 @@ async fn vouched_compares_an_operator_familys_members_with_the_target() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_takes_a_routine_over_a_staged_type_as_no_part_of_it() {
+    // A routine's signature names its argument types; that does not make it
+    // a part of them. The target's view calls one the shape view need not
+    // stage.
+    let external = [
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!("CREATE TYPE {EXTERNAL}.pair AS (a integer, b integer)"),
+    ];
+    let mut setup = vec![format!("CREATE SCHEMA {MANAGED}")];
+    setup.extend(external.iter().cloned());
+    setup.extend([
+        format!(
+            "CREATE FUNCTION {EXTERNAL}.total({EXTERNAL}.pair) RETURNS integer \
+             LANGUAGE sql IMMUTABLE RETURN ($1).a + ($1).b"
+        ),
+        format!(
+            "CREATE VIEW {EXTERNAL}.v AS SELECT {EXTERNAL}.total(ROW(1, 2)::{EXTERNAL}.pair) AS s"
+        ),
+    ]);
+    let call = format!("SELECT s FROM {EXTERNAL}.v");
+    setup.push(format!("CREATE VIEW {MANAGED}.a AS {call}"));
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let inputs = staging_inputs(&call, &call, &[]);
+    let key = ProjectKey::new(true);
+    let mut baseline = external
+        .iter()
+        .map(|s| format!("{s};\n"))
+        .collect::<String>();
+    baseline.push_str(&format!(
+        "CREATE VIEW {EXTERNAL}.v AS SELECT NULL::integer AS s WHERE false;\n"
+    ));
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &baseline,
+    )
+    .await;
+    target.drop().await;
+    let plan = result.unwrap_or_else(|error| panic!("a routine over a staged type: {error}"));
+    plan.evidence.validate(&plan.changes).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_compares_a_sequence_its_table_owns() {
     // An identity column's sequence is a part of its table by a dependency
     // that no list names; it is compared all the same (#1783).

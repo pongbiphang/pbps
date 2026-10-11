@@ -361,6 +361,13 @@ fn part_of(
             reference(properties, "indrelid").into_iter().collect()
         }
         "pg_opclass" => reference(properties, "opcfamily").into_iter().collect(),
+        // Named in its own right: the signature is the types it takes or
+        // converts, not what holds it, so a routine over a compared type is
+        // no part of the type. Only a dependency makes it a part.
+        "pg_proc" | "pg_operator" | "pg_cast" | "pg_collation" | "pg_opfamily" => Vec::new(),
+        // Every other identity names its holder first: a column's relation,
+        // a label's enum, a member's family. A class no rule here knows is
+        // taken the same way, so it is compared rather than passed.
         _ => object.signature.first().cloned().into_iter().collect(),
     };
     owners.extend(
@@ -648,6 +655,24 @@ mod tests {
         // Negative: a part DEC-1673.1 leaves out stays out, listed or not.
         assert_eq!(shaped, shapes(&owned(1, "false"), &roots));
         assert_ne!(shaped, shapes(&owned(5, "true"), &roots));
+    }
+
+    #[test]
+    fn a_routine_over_a_compared_type_is_no_part_of_it() {
+        // A routine's signature is the types it takes, not what holds it.
+        let pair = id("pg_type", &["ext", "pair"], vec![]);
+        let total = id("pg_proc", &["ext", "total"], vec![pair.clone()]);
+        let label = id("pg_enum", &["x"], vec![pair.clone()]);
+        let roots = BTreeSet::from([pair.clone()]);
+        let inputs = BTreeMap::from([
+            (pair.clone(), input(json!({"typtype": "e"}))),
+            (total.clone(), input(json!({"provolatile": "i"}))),
+            (label.clone(), input(json!({"enumsortorder": 1.0}))),
+        ]);
+        let shaped = shapes(&inputs, &roots);
+        assert!(!shaped.contains_key(&total));
+        // Negative: what the identity names as its holder is a part.
+        assert!(shaped.contains_key(&label));
     }
 
     #[test]

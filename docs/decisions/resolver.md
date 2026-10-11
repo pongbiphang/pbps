@@ -2254,7 +2254,10 @@ comparison is a projection of the manifest's properties.
   or the same internal or automatic dependency `carries` follows, so
   whatever the assessment accepts on an object's account was compared. An
   operator class's header, an identity column's sequence and an operator
-  family's members are parts like any other. Each extension member is
+  family's members are parts like any other. A routine, operator, cast,
+  collation or operator family is named in its own right: the types its
+  signature names do not hold it, so a routine over a compared type is not
+  a part of the type. Each extension member is
   compared on its own, with the roots' projection. A member the capture has no identity for (a text
   search dictionary, as `unaccent` brings) refuses, naming it: a plan that
   reads an extension seals all its members, and the capture refuses one it
