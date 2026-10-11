@@ -2211,6 +2211,11 @@ Three traps sat inside the fix, and each of them is a measurement:
   `nullable`.
 - **`no` / `yes` / `on` / `off` parse as booleans.** `pbps fmt` must quote
   boolean-ish, null-ish (`null` / `~`) and number-shaped string scalars.
+- **YAML numbers exceed Rust's numeric parsers.** Radix integers (`0x1f`,
+  `0o17`, `0b101`), digit separators (`1_000`) and non-finite floats (`.inf`,
+  `.nan`) need quotes when they are text. Ask the loader whether a bare value
+  keeps its exact text and type instead of maintaining a second grammar
+  (DEC-1801.1).
 - **Quotes alone do not preserve line breaks.** YAML folds a raw newline
   inside quotes into a space, or refuses an unindented continuation. Escape
   line breaks and control characters in both scalar and partition-bound

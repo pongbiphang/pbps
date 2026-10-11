@@ -587,6 +587,17 @@ fn needs_quotes(s: &str) -> bool {
     matches!(
         s.chars().next(),
         Some('-' | '?' | '&' | '*' | '!' | '|' | '>' | '%' | '@' | '`')
+    ) || !reads_back_bare(s)
+}
+
+/// Flow items and typeless cells are the strictest contexts this writer uses.
+/// Ask the loader instead of duplicating its implicit scalar grammar: radix
+/// integers, digit separators and non-finite floats exceed Rust's parsers.
+/// A parse failure or any different value needs quotes (DEC-1801.1).
+fn reads_back_bare(s: &str) -> bool {
+    matches!(
+        serde_saphyr::from_str::<Vec<crate::dto::ValueDto>>(&format!("[{s}]")).as_deref(),
+        Ok([crate::dto::ValueDto::Text(text)]) if text == s
     )
 }
 
@@ -742,6 +753,46 @@ mod tests {
             "1.50",
             "plain_name",
             "繁體中文",
+            "0x1f",
+            "0X1F",
+            "-0x1f",
+            "+0X1F",
+            "0o17",
+            "0O17",
+            "-0o17",
+            "+0O17",
+            "0b101",
+            "0B101",
+            "-0b101",
+            "+0b1",
+            "1_000",
+            "-1_0",
+            "+1_000",
+            "-0X1F",
+            "+0x1f",
+            "-0O17",
+            "+0o17",
+            "-0B101",
+            "+0B101",
+            "+.INF",
+            "-.INF",
+            ".NAN",
+            "+.nan",
+            "-.nan",
+            "+.NaN",
+            "-.NaN",
+            ".inf",
+            ".INF",
+            "+.inf",
+            "-.inf",
+            ".nan",
+            ".NaN",
+            "001",
+            "1e3",
+            "2026-10-11",
+            "12:30:00",
+            "yes",
+            "~",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -1165,6 +1216,7 @@ indexes:
         assert_eq!(scalar("customer_id"), "customer_id");
         assert_eq!(scalar("nvarchar(100)"), "nvarchar(100)");
         assert_eq!(scalar("Café clientèle"), "Café clientèle");
+        assert_eq!(scalar("2026-10-11"), "2026-10-11");
 
         assert_eq!(scalar("no"), "\"no\"");
         assert_eq!(scalar("YES"), "\"YES\"");
@@ -1176,6 +1228,46 @@ indexes:
         assert_eq!(scalar("a: b"), "\"a: b\"");
         assert_eq!(scalar("- x"), "\"- x\"");
         assert_eq!(scalar(" x"), "\" x\"");
+    }
+
+    #[test]
+    fn numeric_looking_column_names_keys_and_cells_keep_their_text() {
+        let base = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: app.t\ncolumns:\n  id: {type: varchar(100), nullable: false}\n  v: {type: varchar(100)}\nprimary_key: [id]\ndata:\n  mode: exact\n  rows:\n    row: {v: text}\n",
+        ).unwrap();
+        let mut cases = scalar_corpus();
+        let alphabet = "01xXoObB_fF+-.eE";
+        for a in alphabet.chars() {
+            cases.push(a.to_string());
+            for b in alphabet.chars() {
+                cases.push(format!("{a}{b}"));
+                for c in alphabet.chars() {
+                    cases.push(format!("{a}{b}{c}"));
+                }
+            }
+        }
+        for text in cases {
+            // The loader owns string keys as well as untagged data cells;
+            // exercise all three positions through a whole declaration.
+            // Dots are not representable in a column identity. They remain
+            // valid row keys and cells, so keep testing those positions.
+            let name =
+                if !text.is_empty() && text != "id" && pbps_model::check_segment(&text).is_ok() {
+                    text.clone()
+                } else {
+                    "v".into()
+                };
+            let mut expected = base.clone();
+            let column = expected.table.columns.shift_remove("v").unwrap();
+            expected.table.columns.insert(name.clone(), column);
+            let rows = &mut expected.table.data.as_mut().unwrap().rows;
+            let (_, mut row) = rows.pop_first().unwrap();
+            row.0.clear();
+            row.0.insert(name, pbps_model::Value::Text(text.clone()));
+            rows.insert(text.clone().into(), row);
+            round_trip_loaded(&expected, &format!("numeric spelling: {text:?}"));
+        }
     }
 
     /// Output must be stable, or fmt would manufacture a phantom git diff on

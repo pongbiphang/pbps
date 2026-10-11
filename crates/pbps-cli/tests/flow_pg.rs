@@ -29,6 +29,11 @@ fn formatting_preserves_multiline_data_and_refuses_malformed_yaml() {
     fmt_scalars::check("postgres");
 }
 
+#[test]
+fn formatting_preserves_numeric_looking_text_and_non_text_data() {
+    fmt_scalars::check_numeric("postgres");
+}
+
 #[path = "support/resolver_selection.rs"]
 mod resolver_selection;
 
