@@ -94,7 +94,11 @@ selector directly: existing named-function witnesses check the helper invocation
 route. Witness-only scripts without selector data retain direct module execution;
 this includes the sockets runner. No file-specific entry exception is configured.
 Function witnesses retain runtime branches and exclude inactive literal branches,
-nested definitions, lazy type-alias statements, comments and stringified calls.
+nested definitions, lazy type-alias statements, annotation text, comments and
+stringified calls. Annotation-only statements supply no evidence; annotated
+assignment values still do. This portable source contract applies even to eager
+annotations on older Python versions and to explicit annotation forcing: require
+an independent supported call instead (DEC-1233.1).
 Lazy alias text supplies neither invocation tokens, command literals nor selected
 case calls, in function or module scopes. Explicit alias forcing may run Python
 code, but is not inferred as a direct-call witness; an independent supported call
