@@ -3358,6 +3358,36 @@ fn scratch_containers() -> std::collections::BTreeSet<String> {
         .collect()
 }
 
+/// The volumes of the one scratch container that is not in `before`.
+fn new_container_volumes(before: &std::collections::BTreeSet<String>) -> Vec<String> {
+    let started: Vec<String> = scratch_containers().difference(before).cloned().collect();
+    assert_eq!(started.len(), 1, "one container started: {started:?}");
+    let output = std::process::Command::new("docker")
+        .args([
+            "container",
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{.Name}} {{end}}",
+            &started[0],
+        ])
+        .output()
+        .expect("docker runs");
+    assert!(output.status.success(), "docker inspect: {output:?}");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn volume_exists(name: &str) -> bool {
+    std::process::Command::new("docker")
+        .args(["volume", "inspect", "--format", "{{.Name}}", name])
+        .output()
+        .expect("docker runs")
+        .status
+        .success()
+}
+
 async fn identity_of(target: &str) -> String {
     let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
     pbps_pg::resolver::vouched::cluster_identity(&mut planning)
@@ -3437,17 +3467,24 @@ async fn vouched_docker_starts_and_removes_its_container_without_root() {
             async |scratch: &str| {
                 let mut conn = Conn::connect(Driver::Postgres, scratch).await.unwrap();
                 conn.query("SELECT 1 AS ok").await.unwrap();
-                Ok(scratch_containers())
+                Ok(new_container_volumes(&before))
             },
         )
         .await
         .unwrap();
-        assert_eq!(
-            during.difference(&before).count(),
-            1,
-            "{image}: one started"
+        // The image declares its data directory a volume: the run's own
+        // cluster, which `rm` without `--volumes` leaves behind.
+        assert!(
+            !during.is_empty(),
+            "{image}: the data directory is a volume"
         );
         assert_eq!(before, scratch_containers(), "{image}: and removed");
+        for volume in &during {
+            assert!(
+                !volume_exists(volume),
+                "{image}: {volume} is removed with it"
+            );
+        }
     }
 }
 
@@ -3459,6 +3496,7 @@ async fn vouched_docker_removes_its_container_when_the_run_fails() {
         let identity = identity_of(&target).await;
         let before = scratch_containers();
         let mut ran = false;
+        let mut volumes = Vec::new();
         let result: Result<(), ProduceError> = super::container::with_container(
             Driver::Postgres,
             &target,
@@ -3467,11 +3505,18 @@ async fn vouched_docker_removes_its_container_when_the_run_fails() {
             Default::default(),
             async |_: &str| {
                 ran = true;
+                volumes = new_container_volumes(&before);
                 Err(ProduceError::Run(Error::Binding("a failed run".into())))
             },
         )
         .await;
         assert!(ran, "the run was reached");
+        for volume in &volumes {
+            assert!(
+                !volume_exists(volume),
+                "{image}: {volume} is removed with it"
+            );
+        }
         assert!(
             matches!(&result, Err(ProduceError::Run(Error::Binding(reason))) if reason == "a failed run"),
             "{result:?}"
@@ -3481,6 +3526,46 @@ async fn vouched_docker_removes_its_container_when_the_run_fails() {
             scratch_containers(),
             "{image}: the failed run's container is removed"
         );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn vouched_docker_removes_its_container_when_the_run_is_cancelled() {
+    // A run dropped mid-way, as a cancelled future or a panic drops it,
+    // still has its container and volumes removed, by the drop guard.
+    let target = setting("PBPS_TEST_PG_DB");
+    let image = setting("PBPS_TEST_PG_SCRATCH_IMAGE");
+    let identity = identity_of(&target).await;
+    let before = scratch_containers();
+    let (started, running) = tokio::sync::oneshot::channel();
+    let run = super::container::with_container(
+        Driver::Postgres,
+        &target,
+        &identity,
+        &image,
+        Default::default(),
+        async |_: &str| -> Result<(), ProduceError> {
+            let _ = started.send(new_container_volumes(&before));
+            std::future::pending().await
+        },
+    );
+    let volumes = tokio::select! {
+        _ = run => panic!("the run never ends by itself"),
+        volumes = running => volumes.unwrap(),
+    };
+    // The guard asks for the removal and does not wait for it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while scratch_containers() != before && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_eq!(
+        before,
+        scratch_containers(),
+        "the cancelled run's container is removed"
+    );
+    for volume in &volumes {
+        assert!(!volume_exists(volume), "{volume} is removed with it");
     }
 }
 

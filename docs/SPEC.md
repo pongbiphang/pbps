@@ -1534,9 +1534,9 @@ entry implemented by #1672, a Docker entry by #1674, DEC-1674.1).**
       generated for the run. So the run is the run-owned layout (below), and
       every check below still runs, although the container is a separate
       cluster by construction.
-    - The container is stopped and removed when the run ends, whether it
-      answered or refused. If removal cannot be confirmed, the run fails
-      naming the container, as for any cleanup.
+    - The container is stopped and removed with its volumes when the run
+      ends, whether it answered or refused. If removal cannot be confirmed,
+      the run fails naming the container, as for any cleanup.
     - The target is bound by its `system_identifier` (below) before the
       container is started, so a target connection that reaches another
       cluster starts nothing.

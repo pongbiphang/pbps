@@ -2356,13 +2356,17 @@ measured profiles while it does.
   profile bound it by process observation, so the planning read recorded
   no `system_identifier` for a Docker entry; now it does, and the run
   checks it before starting anything.
-- **The container is removed whatever the outcome.** `kill`, then
-  `rm --force`, then a read that confirms it gone; a removal that cannot be
-  confirmed fails the run naming the container, as any unconfirmed cleanup
-  does. `kill` first, because `rm --force` waits out the runtime's stop
-  grace, measured at ten seconds under Podman. A run that ends otherwise,
-  by a panic or a cancelled future, still removes it from a drop guard,
-  best effort.
+- **The container is removed whatever the outcome.** The run names it
+  before asking for it, so one a failed or cancelled `docker run` created
+  is still the run's to remove. `kill`, then `rm --force --volumes`, then
+  a read that confirms it gone: only the runtime's "no such container" is
+  absence, and anything else fails the run naming the container, as any
+  unconfirmed cleanup does. `kill` first, because `rm --force` waits out
+  the runtime's stop grace; `--volumes`, because the image declares its
+  data directory a volume, which `rm` alone leaves behind (both measured
+  under Podman). A run that ends otherwise, by a panic or a cancelled
+  future, still asks for the removal from a drop guard, which does not
+  wait on the runtime.
 - **`outside_writes: refuse | allow`, on both kinds.** `refuse`, the
   default, is DEC-1673.1's rule. `allow` skips the before-and-after
   comparison of the shared state, and keeps what the baseline wrote there:

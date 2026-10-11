@@ -37,7 +37,7 @@ pub async fn with_container<T>(
     bind_target(driver, target_connection, planned_identity).await?;
     acquire(image, pull).await?;
     let container = Container::start(image).await?;
-    let outcome = match container.ready(driver).await {
+    let outcome = match container.ready(driver, READY).await {
         Ok(()) => run(&container.connection).await,
         Err(error) => Err(error),
     };
@@ -110,11 +110,21 @@ struct Container {
 impl Container {
     async fn start(image: &str) -> Result<Self, ProduceError> {
         let password = format!("{:032x}", rand::random::<u128>());
+        // Named by the run before it is asked for, so a `docker run` that
+        // created the container and then failed, timed out or was cancelled
+        // leaves one this run can still name and remove.
+        let mut container = Self {
+            id: format!("pbps-scratch-{:016x}", rand::random::<u64>()),
+            connection: String::new(),
+            removed: false,
+        };
         // An omitted host port: Docker and Podman both pick a free one, on
         // loopback only, so nothing off this host can reach the server.
-        let id = docker(&[
+        let started = docker(&[
             "run",
             "--detach",
+            "--name",
+            &container.id,
             "--label",
             "pbps.resolver=scratch",
             "--env",
@@ -124,23 +134,14 @@ impl Container {
             image,
         ])
         .await
-        .map_err(|why| ProduceError::Acquire(format!("starting {image}: {why}")))?;
-        let id = id.trim().to_owned();
-        if id.is_empty() {
-            return Err(ProduceError::Acquire(format!(
-                "starting {image}: docker reported no container"
-            )));
-        }
-        // From here on every way out removes it.
-        let mut container = Self {
-            id,
-            connection: String::new(),
-            removed: false,
+        .map_err(|why| ProduceError::Acquire(format!("starting {image}: {why}")));
+        let port = match started {
+            Ok(_) => docker(&["port", &container.id, "5432/tcp"])
+                .await
+                .map_err(|why| ProduceError::Acquire(format!("its published port: {why}")))
+                .and_then(|text| published_port(&text).map_err(ProduceError::Acquire)),
+            Err(error) => Err(error),
         };
-        let port = docker(&["port", &container.id, "5432/tcp"])
-            .await
-            .map_err(|why| ProduceError::Acquire(format!("its published port: {why}")))
-            .and_then(|text| published_port(&text).map_err(ProduceError::Acquire));
         let port = match port {
             Ok(port) => port,
             Err(error) => {
@@ -159,54 +160,82 @@ impl Container {
 
     /// Polls until the server answers: a container runs well before its
     /// server listens on TCP.
-    async fn ready(&self, driver: Driver) -> Result<(), ProduceError> {
-        let started = tokio::time::Instant::now();
+    /// The deadline bounds each attempt too: a server that accepts TCP and
+    /// then stalls in its handshake would otherwise hold the run past it.
+    async fn ready(&self, driver: Driver, within: Duration) -> Result<(), ProduceError> {
+        let deadline = tokio::time::Instant::now() + within;
         loop {
-            let last = match Conn::connect(driver, &self.connection).await {
-                Ok(mut conn) => match conn.query("SELECT 1 AS ok").await {
-                    Ok(_) => return Ok(()),
-                    Err(error) => error.to_string(),
-                },
-                Err(error) => error.to_string(),
+            let attempt = async {
+                let mut conn = Conn::connect(driver, &self.connection)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                conn.query("SELECT 1 AS ok")
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
             };
-            if started.elapsed() > READY {
+            let last = match tokio::time::timeout_at(deadline, attempt).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => error,
+                Err(_) => "the last attempt did not finish".to_owned(),
+            };
+            if tokio::time::Instant::now() >= deadline {
                 return Err(ProduceError::Acquire(format!(
                     "the scratch container did not accept connections within {}s: {last}",
-                    READY.as_secs()
+                    within.as_secs()
                 )));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
-    /// Stops the container at once, then removes it, and confirms it gone.
-    /// `kill` first because `rm --force` stops through the runtime's grace
-    /// period, ten seconds under Podman (measured on #1674).
+    /// Stops the container at once, then removes it with its anonymous
+    /// volumes, and confirms it gone. `kill` first because `rm --force`
+    /// stops through the runtime's grace period, ten seconds under Podman;
+    /// `--volumes` because the image declares its data directory a volume,
+    /// which `rm` alone leaves behind, a whole cluster per run (both
+    /// measured on #1674).
     async fn remove(mut self) -> Result<(), Vec<String>> {
         let _ = docker(&["kill", &self.id]).await;
-        let _ = docker(&["rm", "--force", &self.id]).await;
-        if docker(&["container", "inspect", "--format", "{{.Id}}", &self.id])
-            .await
-            .is_ok()
-        {
-            return Err(vec![format!("the docker container {}", self.id)]);
+        let _ = docker(&["rm", "--force", "--volumes", &self.id]).await;
+        // Only the runtime saying there is no such container is absence. An
+        // unreachable daemon or a timeout says nothing, and the container
+        // may still run.
+        match docker(&["container", "inspect", "--format", "{{.Id}}", &self.id]).await {
+            Err(why) if no_such_container(&why) => {
+                self.removed = true;
+                Ok(())
+            }
+            _ => Err(vec![format!(
+                "the docker container {} and its volumes",
+                self.id
+            )]),
         }
-        self.removed = true;
-        Ok(())
     }
 }
 
-/// A run that ends some other way (a panic, a cancelled future) still
-/// removes its container, best effort and without waiting on the runtime.
+/// A run that ends some other way (a panic, a cancelled future) still asks
+/// for its container's removal, best effort. The command is started and not
+/// waited for: an unresponsive runtime must not hold the executor.
 impl Drop for Container {
     fn drop(&mut self) {
-        if self.removed || self.id.is_empty() {
+        if self.removed {
             return;
         }
         let _ = std::process::Command::new("docker")
-            .args(["rm", "--force", &self.id])
-            .output();
+            .args(["rm", "--force", "--volumes", &self.id])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
+}
+
+/// Docker and Podman both report a missing container this way (measured on
+/// #1674: Podman's CLI `Error: no such container <name>`, its compatible
+/// socket `... found: no such container`, Docker's `No such container:`).
+fn no_such_container(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("no such container")
 }
 
 /// Runs `docker` with `args`, and returns its standard output, or why it
@@ -258,7 +287,67 @@ fn published_port(text: &str) -> Result<u16, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::published_port;
+    use super::{Container, no_such_container, published_port};
+    use pbps_db::Driver;
+    use std::time::Duration;
+
+    /// A server that accepts the connection and never answers its
+    /// handshake: the readiness deadline still returns, so the run reaches
+    /// its cleanup.
+    #[tokio::test]
+    async fn readiness_gives_up_on_a_server_that_stalls_after_accepting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                open.push(socket);
+            }
+        });
+        let container = Container {
+            id: "pbps-scratch-test".into(),
+            connection: format!(
+                "host=127.0.0.1 port={port} user=postgres password=x dbname=postgres sslmode=disable"
+            ),
+            // Nothing was started: the drop guard has nothing to remove.
+            removed: true,
+        };
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            container.ready(Driver::Postgres, Duration::from_secs(2)),
+        )
+        .await;
+        held.abort();
+        let refused = outcome.expect("the deadline bounds the stalled attempt");
+        assert!(
+            matches!(&refused, Err(super::ProduceError::Acquire(reason)) if reason.contains("within 2s")),
+            "{refused:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn only_the_runtime_saying_so_confirms_a_container_gone() {
+        for absent in [
+            "docker container failed (exit status: 1): Error response from daemon: no container with name or ID \"x\" found: no such container",
+            "docker container failed (exit status: 125): Error: no such container x",
+            "docker container failed (exit status: 1): Error: No such container: x",
+        ] {
+            assert!(no_such_container(absent), "{absent}");
+        }
+        // Negative: an unreachable daemon, a refused permission or a timeout
+        // says nothing of whether it still runs.
+        for unknown in [
+            "docker container failed (exit status: 1): Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+            "docker container failed (exit status: 1): permission denied while trying to connect to the Docker daemon socket",
+            "docker container did not finish in 120s",
+            "docker could not be run: No such file or directory (os error 2)",
+        ] {
+            assert!(!no_such_container(unknown), "{unknown}");
+        }
+    }
 
     #[test]
     fn only_one_loopback_mapping_is_a_published_port() {
