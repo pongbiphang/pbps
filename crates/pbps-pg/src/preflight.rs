@@ -3495,6 +3495,19 @@ fn build(
             Ok(probes)
         },
 
+        // `SET EXPRESSION` rewrites every stored value, and a NOT NULL, a
+        // check or a unique index over the column can refuse what it
+        // computes. Evaluating the new expression here would run the
+        // operator's code before approval, as a generated column's add would
+        // (DEC-1168.1). The plan does not say what reads the column, so the
+        // change is reported whatever does: absent from the report would read
+        // as checked (#1318).
+        Change::AlterColumnExpression { .. } => Ok(skip(
+            change,
+            "a generated column's recomputed values cannot be evaluated before apply",
+            unchecked,
+        )),
+
         // Everything else either cannot fail on the data or cannot be counted.
         Change::CreateTable { .. }
         | Change::DropTable { .. }
@@ -3506,7 +3519,6 @@ fn build(
             to_nullable: true, ..
         }
         | Change::AlterColumnDefault { .. }
-        | Change::AlterColumnExpression { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { to: None, .. }
         | Change::DropUnique { .. }
@@ -5014,7 +5026,8 @@ mod tests {
             check.clone(),
         ]));
         assert!(report.probes.is_empty(), "{report:#?}");
-        assert_eq!(report.unchecked.len(), 3, "{report:#?}");
+        // The three, and the recomputation itself (#1318).
+        assert_eq!(report.unchecked.len(), 4, "{report:#?}");
         // The same changes with no recomputation are probed as ever.
         let report = preflight(&set(vec![tighten("g"), unique("g"), check]));
         assert_eq!(report.probes.len(), 3, "{report:#?}");
@@ -5022,15 +5035,54 @@ mod tests {
         // And a key or a tightening over another column of the table is too.
         let report = preflight(&set(vec![recompute.clone(), tighten("a"), unique("a")]));
         assert_eq!(report.probes.len(), 2, "{report:#?}");
-        assert!(report.unchecked.is_empty(), "{report:#?}");
+        assert_eq!(report.unchecked.len(), 1, "{report:#?}");
         // A reference row deleted in the same plan is counted against foreign
         // keys the catalog names at run time, which a recomputed column may
         // be part of: unchecked with a recomputation, probed without one.
         let report = preflight(&set(vec![recompute, deleting("app.p", "1")]));
         assert!(report.probes.is_empty(), "{report:#?}");
-        assert_eq!(report.unchecked.len(), 1, "{report:#?}");
+        assert_eq!(report.unchecked.len(), 2, "{report:#?}");
         let report = preflight(&set(vec![deleting("app.p", "1")]));
         assert!(!report.probes.is_empty(), "{report:#?}");
+        assert!(report.unchecked.is_empty(), "{report:#?}");
+    }
+
+    /// A changed generation expression is reported unchecked on its own,
+    /// whatever reads the column: the new values could refuse a NOT NULL, a
+    /// check or a unique index the plan does not name, and computing them
+    /// would run the operator's expression before approval. Absent, it would
+    /// read as checked (#1318, DEC-1168.1).
+    #[test]
+    fn a_recomputed_generated_column_is_listed_as_unchecked() {
+        let table: TableName = "app.t".parse().unwrap();
+        let report = preflight(&set(vec![Change::AlterColumnExpression {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: table.column("g"),
+            from: "a".into(),
+            to: "COALESCE(a, 0)".into(),
+        }]));
+        assert!(report.probes.is_empty(), "{report:#?}");
+        assert_eq!(
+            report
+                .unchecked
+                .iter()
+                .map(|u| (u.description.as_str(), u.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [(
+                "recomputed generated column app.t.g",
+                "a generated column's recomputed values cannot be evaluated before apply"
+            )],
+            "{report:#?}"
+        );
+        // Negative: an ordinary default change can refuse nothing stored, and
+        // is not listed.
+        let report = preflight(&set(vec![Change::AlterColumnDefault {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: table.column("a"),
+            from: None,
+            to: Some("0".into()),
+        }]));
+        assert!(report.probes.is_empty(), "{report:#?}");
         assert!(report.unchecked.is_empty(), "{report:#?}");
     }
 
