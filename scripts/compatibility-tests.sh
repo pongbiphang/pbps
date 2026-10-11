@@ -37,10 +37,12 @@ case "$PBPS_COMPAT_CELL" in
                 -e "MSSQL_COLLATION=$collation" -e "MSSQL_SA_PASSWORD=$password" \
                 -p "127.0.0.1:$port:1433" "$image" >/dev/null
         fi
+        # SQL Server accepts connections before applying MSSQL_COLLATION.
+        # Wait for the configured identity, then retain full fixture admission.
         ready=false
         for _ in $(seq 1 90); do
             if docker exec "$name" /opt/mssql-tools18/bin/sqlcmd -C -S localhost \
-                -U sa -P "$password" -b -Q 'SELECT 1' >/dev/null 2>&1; then
+                -U sa -P "$password" -b -Q "IF COALESCE(CONVERT(varchar(128), SERVERPROPERTY('Collation')), '') <> '$collation' THROW 50000, 'fixture collation is not ready', 1;" >/dev/null 2>&1; then
                 ready=true; break
             fi
             sleep 2

@@ -2216,6 +2216,16 @@ Three traps sat inside the fix, and each of them is a measurement:
   it looks resource-shaped (`errno 11`, core dump, 2-CPU runner), not
   image-shaped. That step now prints the container's own log on failure, which
   the raw job output otherwise buries under teardown noise.
+- A successful SQL Server login does not prove that `MSSQL_COLLATION` has
+  finished applying. On the pinned SQL Server 2025 Express image, a fresh
+  container answered queries with `SQL_Latin1_General_CP1_CI_AS` for several
+  seconds before switching to the requested `Latin1_General_100_CS_AS`.
+  The compatibility merge-group job for #1308 caught the premature admission.
+  Wait for the configured collation with a failing SQL query (`sqlcmd -b`),
+  then perform full fixture identity admission. Keep a finite deadline and
+  preserve a mismatched fixture; neither a fixed sleep nor a relaxed identity
+  comparison establishes readiness. The local Express and CI edition runners
+  must obey the same condition.
 - The engine is **pinned by digest** in both `ci.yml` and
   `scripts/live-tests.sh`. That is not a fix for the crashes above; it means the
   next one is reproducible rather than unrepeatable, and that a suite whose job

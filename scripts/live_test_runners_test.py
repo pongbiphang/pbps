@@ -12,6 +12,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -38,6 +39,86 @@ def job_commands(workflow, job):
 
 
 class LiveExecution(unittest.TestCase):
+    def test_custom_collation_must_finish_before_clients_start(self):
+        for runner in ('compatibility', 'local', 'ci'):
+            with self.subTest(runner=runner):
+                result, calls = self.collation_script(runner, 'initializing')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                probes = [c for c in calls if c[:2] == ['docker', 'exec']
+                          and 'express' in c[2]]
+                self.assertEqual(len(probes), 3)
+                self.assertTrue(any(c[0] == 'cargo' for c in calls))
+
+    def test_missing_custom_collation_stops_before_clients_and_preserves_fixture(self):
+        for runner, limit in (('compatibility', 90), ('local', 60), ('ci', 60)):
+            with self.subTest(runner=runner):
+                result, calls = self.collation_script(runner, 'never-ready')
+                self.assertNotEqual(result.returncode, 0)
+                probes = [c for c in calls if c[:2] == ['docker', 'exec']
+                          and 'express' in c[2]]
+                self.assertEqual(len(probes), limit)
+                self.assertFalse(any(c[0] == 'cargo' for c in calls))
+                self.assertTrue(any(c[:2] == ['docker', 'logs'] for c in calls))
+                self.assertFalse(any(c[:2] == ['docker', 'rm'] for c in calls))
+
+    def collation_script(self, runner, mode):
+        # Execute each real shell path. The native measurement records a
+        # successful login before the requested collation becomes visible.
+        with tempfile.TemporaryDirectory(prefix='pbps-collation-admission-') as directory:
+            root = Path(directory)
+            fake = root / 'client'
+            fake.write_text(f'#!{sys.executable}\n' + r'''
+import json, os, subprocess, sys
+from pathlib import Path
+root = Path(os.environ['PBPS_COLLATION_CONTROL'])
+command = [Path(sys.argv[0]).name, *sys.argv[1:]]
+with (root / 'calls').open('a') as log:
+    log.write(json.dumps(command) + '\n')
+if command[:2] == ['docker', 'ps']:
+    pass
+elif command[:2] == ['docker', 'run']:
+    print('owned-fixture')
+elif command[:2] == ['docker', 'exec']:
+    if 'express' not in command[2]:
+        sys.exit(0)
+    state = root / 'probes'
+    count = int(state.read_text()) + 1 if state.exists() else 1
+    state.write_text(str(count))
+    query = command[command.index('-Q') + 1]
+    guarded = ('-b' in command and "SERVERPROPERTY('Collation')" in query
+               and 'Latin1_General_100_CS_AS' in query and 'THROW' in query)
+    # The old SELECT 1 succeeds immediately, despite the wrong identity.
+    sys.exit(1 if guarded and (count < 3 or os.environ['PBPS_COLLATION_MODE'] == 'never-ready') else 0)
+elif command[:2] == ['docker', 'logs']:
+    print('controlled collation change pending', file=sys.stderr)
+elif command[:2] == ['python3', '-c']:
+    sys.exit(subprocess.run([sys.executable, *command[1:]]).returncode)
+elif command[0] in ('cargo', 'python3'):
+    if os.environ['PBPS_COLLATION_MODE'] == 'never-ready' or int((root / 'probes').read_text()) < 3:
+        sys.exit('client reached the pre-collation server')
+elif command[0] != 'sleep':
+    raise RuntimeError('Unexpected external command: ' + repr(command))
+''')
+            fake.chmod(0o755)
+            for name in ('docker', 'cargo', 'python3', 'sleep'):
+                (root / name).symlink_to(fake)
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                       PBPS_COLLATION_CONTROL=str(root), PBPS_COLLATION_MODE=mode,
+                       IMAGE='owned-image')
+            if runner == 'ci':
+                workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+                block = workflow.split('      - name: start the two SQL Servers, one after the other\n', 1)[1]
+                block = block.split('        run: |\n', 1)[1].split('      # A name filter', 1)[0]
+                command = ['bash', '-e', '-c', textwrap.dedent(block) + '\ncargo test\n']
+            elif runner == 'local':
+                command = ['bash', 'scripts/live-tests.sh']
+            else:
+                command = ['bash', 'scripts/compatibility-tests.sh', 'mssql2025-express']
+            result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True,
+                                    text=True, timeout=30)
+            calls = [json.loads(line) for line in (root / 'calls').read_text().splitlines()]
+            return result, calls
+
     def test_driver_error_regressions_run_in_their_engine_jobs(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         for job, target in (("live", "live_mssql"), ("live-pg", "live_pg")):

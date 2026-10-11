@@ -392,6 +392,11 @@ class PruneInactive(ast.NodeTransformer):
     def visit_Lambda(self, node):
         return ast.Constant(value="unexecuted lambda")
 
+    def visit_TypeAlias(self, node):
+        # Alias values and type parameters are lazy; their text cannot witness
+        # a direct invocation. Source-form rules still inspect the original AST.
+        return None
+
 
 class PruneModuleEntry(PruneInactive):
     def visit_If(self, node):
