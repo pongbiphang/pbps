@@ -2236,6 +2236,18 @@ target whose recreated `public` has none, the difference #688 removed.
   isolation, and the file is reviewed in git like the declarations (decided
   with the maintainer, 2026-10-11). Running the file as a non-superuser, or
   only on a Docker scratch, is weighed on #1824 with #1674.
+- **The accepted shapes are checked against the sealed capture** (#1755).
+  The comparison reads the target once, and the opening capture the plan
+  seals reads it again. A writer between them would leave scratch compiled
+  against one shape while the evidence seals another, and every later
+  recheck compares against that evidence, so none would notice. The shapes
+  the comparison accepted are kept, the same projection is taken from the
+  opening capture, and any difference refuses as a target that changed
+  under the run. Holding one snapshot across both reads is not taken: each
+  capture opens its own read-only transaction and refuses a caller's open
+  one (`capture::read`), and the
+  scratch compile runs between the two, so one transaction would stay open
+  on the target for the whole compile.
 - **Chains are one hop**, read from the target's `pg_depend` before
   compiling, as §9.3.2 words them. A chain refuses when the compile fails,
   and the refusal names it: the target's dependencies are the current

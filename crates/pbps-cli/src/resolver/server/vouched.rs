@@ -434,6 +434,13 @@ impl Run<'_> {
             }
             None => Staged::default(),
         };
+        #[cfg(test)]
+        if let Ok(Some(sql)) = AFTER_STAGING.try_with(Clone::clone) {
+            target
+                .execute(&sql)
+                .await
+                .map_err(db("the test's target write"))?;
+        }
         let extras = &request.write_path_extras;
         let mut reconstruction =
             engine::reconstruction(driver, extras, binding.bootstrap).map_err(Error::Binding)?;
@@ -515,6 +522,16 @@ impl Run<'_> {
         )
         .await
         .map_err(engine::catalog_read_failed)?;
+        // The shapes the baseline was compared with must be the ones this
+        // capture seals: a target written between the two reads refuses.
+        let changed = staged.changed_since(&current);
+        if !changed.is_empty() {
+            return Err(Error::Read(format!(
+                "the target changed while the run read it, after the baseline was compared \
+                 with it: {}; run again",
+                changed.join("; ")
+            )));
+        }
         let identified = current.dropped();
         reconstruction.identified(
             dropped
@@ -1391,6 +1408,14 @@ fn reported_build(
         "reported",
         &bytes,
     ))
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// SQL a test runs on the target between the baseline's comparison and
+    /// the opening capture: a writer the run cannot otherwise be timed
+    /// against (#1755).
+    static AFTER_STAGING: Option<String>;
 }
 
 #[cfg(test)]

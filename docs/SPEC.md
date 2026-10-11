@@ -1786,7 +1786,10 @@ scratch compile (#1616).
   `xmin(ext.v)` in scope, a view binds the function and a table of the same
   columns binds the system column.
 - **The compared shapes are sealed into the evidence manifest** and rechecked
-  like any other external input.
+  like any other external input. They are also checked against the capture
+  that is sealed: the comparison and that capture are two reads of the
+  target, and a shape that changed between them refuses, naming what
+  changed (#1755).
 - **A chain through the boundary refuses.** In such a chain, a managed object
   binds to an external one whose compared *shape* names a managed object:
   a column, attribute or argument of a managed type, a managed parent
