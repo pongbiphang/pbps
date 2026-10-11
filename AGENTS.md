@@ -257,12 +257,12 @@ checksum-pinned, and state lives in the database itself.
   gates still apply to each dependent before enqueueing; refresh them after the
   base change (DEC-1228.1, DEC-1458.1).
 - A pull request must be green on its **own** head before it can be queued, so
-  a merge costs **two pre-merge runs** of `ci.yml`, plus the post-merge run on
-  `master`, which gates nothing. The pull-request run is a reduced set: it
-  omits `live`, `live-pg`, `resolver` and `release-windows`, which the
-  merge group then runs with every other job (DEC-1835.1). That is the price of
-  the queue and it is the cheap half of the trade: what it buys is that none of
-  them has to be repeated because somebody else merged first.
+  a merge costs **two pre-merge runs** of `ci.yml`, and no post-merge run:
+  `master` runs nightly instead (DEC-1836.1). The pull-request run is a
+  reduced set: it omits `live`, `live-pg`, `resolver` and `release-windows`,
+  which the merge group then runs with every other job (DEC-1835.1). That is
+  the price of the queue and it is the cheap half of the trade: what it buys is
+  that none of them has to be repeated because somebody else merged first.
 - If the queue ejects the pull request, **read the failing job before
   re-queueing**, and say which of the two it was. A merge-group failure that
   reproduces, or that is a test failing on its merits, is a real interaction
@@ -289,14 +289,15 @@ checksum-pinned, and state lives in the database itself.
   and coordinate multiple eligible issues concurrently. Each subagent owns
   exactly one issue at a time, uses an isolated branch and worktree, and never
   merges. Dependency-linked issues merge in topological order.
-- `ci.yml` runs on `master` after a merge. It is not a gate — the merge queue
-  already ran it on the exact tree the merge produced — so do not wait for it
-  before taking the next issue. **A red one is read, not assumed**, by the same
-  procedure as an ejection: the merge group passed this identical tree minutes
-  earlier, so open the failing job before calling it a regression. A test
-  failing on its merits is one, and becomes the next task; the resource-shaped
-  engine startup crash that `ci.yml` and docs/PITFALLS.md both record is not,
-  and a re-run on the same tree settles which it was. The dependency audit is a
+- `ci.yml` runs on `master` nightly, not after each merge (DEC-1836.1). It is
+  not a gate — the merge queue already ran every job on the exact tree each
+  merge produced — so nothing waits for it. **A red one is read, not assumed**,
+  by the same procedure as an ejection. Its tree is `master` at that hour, which
+  may span several merges, each of which passed its merge group: open the
+  failing job before calling it a regression. A test failing on its merits is
+  one, and becomes the next task; the resource-shaped engine startup crash that
+  `ci.yml` and docs/PITFALLS.md both record is not, and a re-run on the same
+  tree settles which it was. The dependency audit is a
   separate workflow and does run on `master` when the merge touched
   `Cargo.toml`, `Cargo.lock`, `deny.toml` or its own workflow — wait for it in
   that case, and a red audit is the next task, not the next issue.

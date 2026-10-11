@@ -1,6 +1,7 @@
 name: CI
 
-# An ordinary workflow: every pull request, and `master`. It was not always.
+# An ordinary workflow: every pull request, every merge group and a nightly
+# run on `master`. It was not always.
 # While the repository was private, the full matrix on every commit of a review
 # round cost more minutes than the allowance carried, so CI was started by hand
 # and reported itself as a *commit status* — a `workflow_dispatch` check suite
@@ -42,15 +43,24 @@ name: CI
 # The pull-request set stays a subset of the merge-group set, so no job can
 # fail a pull request that the merge group would pass.
 #
+# `master` runs nightly, not on push (DEC-1836.1). Under the required merge
+# queue a push to `master` is the merge group's own commit, so a push run
+# re-tested a tree that had just passed. What it still did was refresh the
+# `master` caches every run restores, and the nightly run keeps that: a
+# scheduled run executes on the default branch. It also catches drift in
+# runner images and pinned engines on days nothing merges.
+#
 # Do not add `paths` or `paths-ignore` here. `ci-gate` is a required check, and
 # a required check that never reports leaves a pull request blocked with
 # nothing that can clear it.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
-  push:
-    branches: [master]
   merge_group:
+  # 19:41 UTC: outside the working day, and apart from the dependency audit's
+  # Monday 06:17.
+  schedule:
+    - cron: "41 19 * * *"
   workflow_dispatch:
 
 # Named here so the grant is one line rather than the repository-wide default:
@@ -63,7 +73,7 @@ permissions:
 # A label addition explicitly requests fresh PR-associated CI after a base
 # change (DEC-1457.1). Title/body edits are excluded at the event trigger: a
 # skipped, renamed gate still supersedes qualified checks in GitHub's merge
-# box. Every admitted label runs the same approval/full-matrix route, so label
+# box. Every admitted label runs the same approval route, so label
 # filtering cannot publish a skipped required check or lose its previous name.
 # Only PR runs cancel predecessors; master and merge groups need an answer.
 concurrency:
@@ -135,6 +145,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: python3 scripts/live_transport_test.py
       - run: python3 scripts/release_qualification_test.py
       - run: cargo fmt --all --check
@@ -156,6 +168,8 @@ jobs:
           node-version: 24
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       # Terminal integration tests must fail when their fixture is unavailable.
       - name: Required Linux PTY fixtures (util-linux and coreutils)
         run: |
@@ -192,6 +206,8 @@ jobs:
           node-version: 24
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo test --workspace --all-targets
         env:
           INSTA_UPDATE: "no"
@@ -236,6 +252,8 @@ jobs:
           ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       # The service has no health check hook here; the loop stands in for one.
       #
       # Found by the published port, not by `ancestor=<image>`: that filter
@@ -310,6 +328,8 @@ jobs:
           ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       # Built before the fixture runs: it points `SSL_CERT_FILE` at its own
       # disposable CA for every `cargo test` it starts, so a cargo that still
       # had to download a crate would fail to verify crates.io instead of
@@ -354,6 +374,8 @@ jobs:
           ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: start the two SQL Servers, one after the other
         run: |
           await() {
@@ -490,6 +512,7 @@ jobs:
       # the first to finish would save a cache the other three cannot use.
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
           key: ${{ matrix.suite }}
       # Thirty seconds of this is one test waiting out `CONNECT_TIMEOUT` on
       # purpose: a firewall that drops rather than refuses is a category of its
@@ -571,6 +594,8 @@ jobs:
           ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: plan --dev docker://
         run: |
           # Record the server, not just the client: Docker CLI can also use Podman.
@@ -612,6 +637,7 @@ jobs:
       # fixtures run under, and the second does not.
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
           key: ${{ matrix.half }}
       - name: Preload explicitly trusted fixture images
         run: |
@@ -768,6 +794,8 @@ jobs:
           ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo check --workspace
 
   # The whole point of the run, as far as the merge box is concerned: one
@@ -818,6 +846,8 @@ jobs:
           ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Qualify the pinned engine and core CLI contract
         env:
           CELL: ${{ matrix.cell }}

@@ -130,7 +130,7 @@ test('concurrency cancellation is boolean and never applies to non-PR events', (
   for (const changes of [undefined, {}, { body: { from: 'Old body' } }, { base: { ref: { from: 'master' } } }]) {
     assert.ok(evaluate(policy.cancel, context('pull_request', 'labeled', changes)) instanceof data.BooleanData);
   }
-  for (const event of ['push', 'merge_group', 'workflow_dispatch']) {
+  for (const event of ['schedule', 'merge_group', 'workflow_dispatch']) {
     const github = { workflow: 'CI', event_name: event, event: {}, ref: 'refs/heads/master', run_id: 42 };
     assert.equal(requiresApprovedCi(github, false).group, 'CI-refs/heads/master');
   }
@@ -166,7 +166,7 @@ test('a pull request omits exactly the declared jobs, and every other event runs
       continue;
     }
     assert.deepEqual(conditions, [condition], `${name} is skipped on pull requests and nowhere else`);
-    for (const event of ['merge_group', 'push', 'schedule', 'workflow_dispatch']) {
+    for (const event of ['merge_group', 'schedule', 'workflow_dispatch']) {
       const github = { workflow: 'CI', event_name: event, event: {}, ref: 'refs/heads/master', run_id: 42 };
       assert.equal(falsy(evaluate(condition, github)), false, `${name} runs on ${event}`);
     }
@@ -176,6 +176,26 @@ test('a pull request omits exactly the declared jobs, and every other event runs
   assert.ok(verdict, 'the verdict step reads its inputs from the environment');
   assert.match(verdict[1], /^          EVENT: \$\{\{ github\.event_name \}\}$/m);
   assert.match(verdict[1], /^          NEEDS: \$\{\{ toJSON\(needs\) \}\}$/m);
+});
+
+test('master runs nightly rather than on push, and only master saves caches', () => {
+  const triggers = workflow.match(/^on:\n([\s\S]*?)(?=^\S)/m);
+  assert.ok(triggers, 'the workflow declares its triggers');
+  const events = [...triggers[1].matchAll(/^  ([\w-]+):/gm)].map(match => match[1]).sort();
+  assert.deepEqual(events, ['merge_group', 'pull_request', 'schedule', 'workflow_dispatch'],
+    'a push to master is the merge group\'s own commit, so it is not a trigger');
+  assert.equal([...triggers[1].matchAll(/^    - cron: "[^"]+"$/gm)].length, 1, 'one nightly schedule');
+  const caches = [...workflow.matchAll(/^      - uses: Swatinem\/rust-cache@v2\n((?:        .*\n)*)/gm)];
+  assert.ok(caches.length > 0, 'the workflow restores Rust caches');
+  const saveIf = "${{ github.ref == 'refs/heads/master' }}";
+  for (const [, inputs] of caches) {
+    assert.match(inputs, /^        with:$/m, 'every cache step has inputs');
+    const declared = [...inputs.matchAll(/^          save-if: (.+)$/gm)].map(match => match[1]);
+    assert.deepEqual(declared, [saveIf], 'a pull request or merge group never saves a cache nobody can restore');
+  }
+  for (const [ref, saves] of [['refs/heads/master', true], ['refs/pull/1457/merge', false], ['refs/heads/gh-readonly-queue/master/pr-1457-abc', false]]) {
+    assert.equal(!falsy(evaluate(saveIf, { ref })), saves, `${ref} saves caches: ${saves}`);
+  }
 });
 
 test('every job uses one validated intended-base checkout rather than an unverified event SHA', () => {
