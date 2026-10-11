@@ -7529,6 +7529,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.n", 0),
                 name: TableName::new("app", "n"),
                 table: Box::new(t),
+                beside_default: None,
             }
         };
         let row_of = |trigger: &str| {
