@@ -528,3 +528,32 @@ the hidden object reads NULL, and `HAS_PERMS_BY_NAME` answers 0 for a hidden
 name and an absent one alike. Nothing this login can read says which schema
 the object is in or whether it holds a planned name. A plan refused by a
 `DENY` elsewhere is the cost; reading a hidden name as free is the bug.
+
+<a id="dec-1793-1"></a>
+
+**DEC-1793.1. Both historical declaration readers use one raw Git object
+stream per tree, with exact framing and checked child completion.** Listing
+only names required a `git show` child for every declaration, even for a
+no-op flat schema. The NUL-delimited, full-tree listing now carries validated
+object IDs. A lockstep `cat-file --batch` request reads that exact blob,
+consumes it and releases its bytes before requesting the next one. Empty
+declaration listings start no batch process. The reader checks object ID,
+type, length, trailing LF, final EOF and exit status; unreadable or truncated
+evidence cannot become an empty schema. Non-blob declaration entries and
+non-UTF-8 paths refuse rather than silently disappearing.
+
+Historical configuration, identity admission and the ordinary Git environment
+and configuration keep their existing boundaries. No filters or text
+conversion run. Diagnostics go to an exclusively created temporary file:
+an undrained stderr pipe could block the child while the caller waits for
+stdout, and buffering all diagnostics would defeat the memory bound. Error
+rendering reads at most 64 KiB. Early returns kill and reap the child and
+remove its capture. Parsed schema state and the tree listing still scale
+with the project; declaration payload buffering scales with one blob.
+
+Pinned by fabricated framing/listing refusals, real subprocess completion
+and cleanup cases, constant Git-process counts for both `plan` and
+`validate --since`, historical path/configuration moves, and corrupted Git
+objects. Release measurements at 1,000 and 4,000 files record no-op results,
+wall time, RSS and Git invocation counts; elapsed time is evidence, not a
+timing assertion in CI. Git read failures treated as absent remain #1814.

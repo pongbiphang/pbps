@@ -19,6 +19,8 @@
 //! actually going to be applied to an environment must be based on that
 //! environment's database as queried (Phase 3).
 
+mod git_objects;
+
 use anyhow::Context as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -256,48 +258,6 @@ fn under(prefix: &str, path: &Path) -> anyhow::Result<String> {
     Ok(parts.join("/"))
 }
 
-/// The paths one revision's tree holds under `rel`, as git spells them.
-///
-/// `-z`, because `--name-only` alone renders any path outside ASCII in C
-/// quoting with `core.quotePath` at its default — measured:
-/// `schema/dbo.té.yml` comes back as `"schema/dbo.t\303\251.yml"`, quotes
-/// and all. The failure that caused was silent, which is the part worth
-/// remembering: the quoted form does not end in `.yml`, so the filter below
-/// skipped the file, the revision read as **empty**, and `plan` reported
-/// every table as newly created and exited 0. Absent, empty and unreadable
-/// are three different things (DECISIONS 180).
-///
-/// Split on NUL and never trimmed: a path is what the tree spells it, the
-/// same rule names follow (177, 178).
-fn tree_paths(root: &Path, rev: &str, rel: &str) -> anyhow::Result<Vec<String>> {
-    // `--full-tree` because git resolves an `ls-tree` pathspec against the
-    // current directory, while `<rev>:<path>` resolves against the repo
-    // root. Without it a project in a subdirectory lists nothing, and — since
-    // the identity file is still found — the plan comes back as "no changes"
-    // against a baseline that holds no tables at all.
-    // `rel` is never empty, never the project root and never above it: a
-    // historical config that spells one is refused where its paths are
-    // composed above, and a current one by `pbps-config` (#739). The pathspec
-    // always names a directory below the project rather than the whole tree.
-    let args = [
-        "ls-tree",
-        "-r",
-        "--full-tree",
-        "--name-only",
-        "-z",
-        rev,
-        "--",
-        rel,
-    ];
-    let listing =
-        git(root, &args).map_err(|e| anyhow::anyhow!("cannot read `{rel}` at `{rev}`: {e}"))?;
-    Ok(listing
-        .split('\0')
-        .filter(|p| !p.is_empty())
-        .map(str::to_owned)
-        .collect())
-}
-
 fn load_from_git(
     project: &Project,
     rev: &str,
@@ -334,18 +294,11 @@ fn load_from_git(
     // directory, not today's, or a revision that moved it reads as empty.
     let (rel, ids_rel) = paths_at(project, rev)?;
 
-    let listing = tree_paths(root, rev, &rel)?;
-
     let mut schema = Schema::default();
     let mut hints = pbps_model::Hints::default();
     let mut count = 0usize;
-    for path in &listing {
-        let path = path.as_str();
-        if !(path.ends_with(".yml") || path.ends_with(".yaml")) {
-            continue;
-        }
-        let text = git(root, &["show", &format!("{rev}:{path}")])?;
-        match pbps_load::load_file_str(Path::new(path), &text) {
+    git_objects::read(root, rev, &rel, |path, text| {
+        match pbps_load::load_file_str(Path::new(path), text) {
             Ok(pbps_load::LoadedFile::Table(t)) => {
                 let t = *t;
                 schema.tables.insert(t.name, t.table);
@@ -381,7 +334,8 @@ fn load_from_git(
                 );
             }
         }
-    }
+        Ok(())
+    })?;
 
     // The historical side gets the routine-identity pass the current side
     // gets, or a routine respelled since — `f(int)` then, `f(integer)` now,
@@ -514,10 +468,6 @@ pub fn schema_at(
     // gives — this is the second reader of a historical tree, and both have to
     // ask the same question of it.
     let (dir_rel, _) = paths_at(project, rev)?;
-    // The same listing `load_from_git` takes, through the same function: the
-    // two readers of a historical tree have to ask git the same question, and
-    // written twice they had the same bug twice (DECISIONS 180).
-    let listing = tree_paths(root, rev, &dir_rel)?;
     let scratch = std::env::temp_dir().join(format!(
         "pbps-since-{}-{}",
         std::process::id(),
@@ -529,20 +479,17 @@ pub fn schema_at(
     std::fs::create_dir_all(&scratch)
         .with_context(|| format!("cannot create `{}`", scratch.display()))?;
     let result = (|| {
-        for path in &listing {
-            let path = path.as_str();
-            if !(path.ends_with(".yml") || path.ends_with(".yaml")) {
-                continue;
-            }
+        // Both historical readers consume the same validated object stream.
+        git_objects::read(root, rev, &dir_rel, |path, text| {
             let inside = path.strip_prefix(dir_rel.as_str()).unwrap_or(path);
             let inside = inside.trim_start_matches('/');
-            let text = git(root, &["show", &format!("{rev}:{path}")])?;
             let target = scratch.join(inside);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&target, text)?;
-        }
+            Ok(())
+        })?;
         let mut loaded = pbps_load::load_schema_dir(&scratch).map_err(|errs| {
             anyhow::anyhow!(
                 "the declarations at `{rev}` do not load: {}",
@@ -614,10 +561,14 @@ fn relative_to(path: &Path) -> anyhow::Result<String> {
     Ok(format!("{}{}", prefix.trim(), name.to_string_lossy()))
 }
 
+fn git_command(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir);
+    command
+}
+
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    let out = git_command(dir)
         .args(args)
         .output()
         .map_err(|e| anyhow::anyhow!("cannot run git: {e}"))?;
