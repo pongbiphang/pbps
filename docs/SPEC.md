@@ -1720,9 +1720,13 @@ scratch compile (#1616).
     memberships, role and other databases' settings, shared comments and
     security labels, tablespaces, other databases, parameter privileges,
     replication origins, and any other shared catalog the engine lists, are
-    read before and after it, in its own transaction's snapshot, so another session's writes
-    meanwhile do not count. A change refuses, naming each object, and is
-    rolled back.
+    read before and after it, in its own transaction's snapshot, so another
+    session's writes meanwhile do not count. A change refuses, naming each
+    object, and is rolled back. What is compared is catalog state: an effect
+    a superuser can have outside catalogs and transactions (a replication
+    slot, a server file, `COPY ... TO PROGRAM`) is not seen and outlives the
+    rollback. It is the operator's, under the vouching for the scratch
+    (#1824).
   - The shared compatibility qualification reads scratch after the
     baseline, so a setting the baseline changed must match the target too:
     the scratch database's own settings are its to change.

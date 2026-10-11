@@ -2227,7 +2227,15 @@ target whose recreated `public` has none, the difference #688 removed.
   clean up. The scratch database's own settings, attributes and comment are
   its own and go with it; the compatibility qualification reads its
   settings. A role's password is not in the views a supplied account reads,
-  and is not compared.
+  and is not compared. The guarantee is about catalog state. On the
+  run-owned layout the file runs as the scratch's superuser, which can act
+  outside catalogs and transactions (a replication slot, a server file,
+  `COPY ... TO PROGRAM`); no read sees that and `ROLLBACK` does not undo it.
+  Such effects cannot be listed, so none is checked one by one: they are the
+  operator's, under the vouching DEC-1528.1 gives for the scratch's
+  isolation, and the file is reviewed in git like the declarations (decided
+  with the maintainer, 2026-10-11). Running the file as a non-superuser, or
+  only on a Docker scratch, is weighed on #1824 with #1674.
 - **Chains are one hop**, read from the target's `pg_depend` before
   compiling, as §9.3.2 words them. A chain refuses when the compile fails,
   and the refusal names it: the target's dependencies are the current
