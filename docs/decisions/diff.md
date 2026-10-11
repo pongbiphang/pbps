@@ -4607,8 +4607,12 @@ has before the plan runs:
   to move. `pg_publication_tables` expands `FOR ALL TABLES`, a schema and a
   partitioned table into what each one sends. A row filter sends only the
   deletes of the rows it holds, so a publication whose filter holds none of
-  the moved rows is not counted. pbps does not manage publications
-  (DEC-1444.1); it reads them so as not to break one silently.
+  the moved rows is not counted. An unlogged DEFAULT publishes nothing,
+  through itself or a root above it, and is not asked about: measured on
+  16 and 18, its delete under a publication of the parent via the root
+  decoded to nothing, and was not held to a replica identity (#1763
+  review). pbps does not manage publications (DEC-1444.1); it reads them
+  so as not to break one silently.
 - **Publications of the new table.** These are publications that publish
   inserts, of every table or of every table of the new table's schema,
   counted when there are rows to move. A publication naming its tables

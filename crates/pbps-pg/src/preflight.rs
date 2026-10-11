@@ -4358,6 +4358,11 @@ pub(crate) fn moved_with_it(
 /// is not counted. The filter is the view's text, deparsed with unqualified
 /// columns of the published table, whose names a partition shares, so it is
 /// asked of the DEFAULT's rows as they stand ([`filter_holds_moved`]).
+///
+/// An unlogged DEFAULT publishes nothing, through itself or a root above it:
+/// measured on 16 and 18, a delete from one under a publication of its
+/// parent via the root decoded to nothing, and was not held to a replica
+/// identity, as a published table's delete is (#1763 review).
 pub(crate) fn publications_of(default: &str) -> String {
     format!(
         "FROM pg_catalog.pg_publication p \
@@ -4365,7 +4370,8 @@ pub(crate) fn publications_of(default: &str) -> String {
          JOIN pg_catalog.pg_partition_ancestors({default}) AS a(relid) ON true \
          JOIN pg_catalog.pg_class pc ON pc.oid = a.relid \
          JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
-         WHERE p.pubdelete AND pubt.schemaname = pn.nspname AND pubt.tablename = pc.relname"
+         WHERE p.pubdelete AND pubt.schemaname = pn.nspname AND pubt.tablename = pc.relname \
+         AND (SELECT d.relpersistence FROM pg_catalog.pg_class d WHERE d.oid = {default}) = 'p'"
     )
 }
 

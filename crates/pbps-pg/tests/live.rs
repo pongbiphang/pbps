@@ -4915,6 +4915,77 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         rollback(&mut conn).await;
         conn.execute(&format!("DROP TABLE {s}.sr")).await.unwrap();
 
+        // An unlogged DEFAULT publishes nothing, even under a publication of
+        // its parent via the root: not counted, and the move goes. The same
+        // DEFAULT made logged is counted (#1763 review).
+        conn.execute(&format!(
+            "CREATE TABLE {s}.ul (id integer NOT NULL, ts date NOT NULL) PARTITION BY RANGE (ts);
+             CREATE UNLOGGED TABLE {s}.ul_rest PARTITION OF {s}.ul DEFAULT;
+             INSERT INTO {s}.ul VALUES (1, '2030-01-01');"
+        ))
+        .await
+        .expect("the tree with an unlogged DEFAULT");
+        let ul_base = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
+        let ul_ids = mint_ids(&ul_base, &added_ids, &[]);
+        let mut ul_split = ul_base.clone();
+        ul_split.tables.insert(
+            t("ul_2030"),
+            partition(
+                "ul",
+                range(vec![value("2030-01-01")], vec![value("2031-01-01")]),
+            ),
+        );
+        let ul_step = plan(
+            &ul_base,
+            &ul_ids,
+            &ul_split,
+            &mint_ids(&ul_split, &ul_ids, &[]),
+        );
+        let ul_published = pg
+            .preflight(&ul_step)
+            .probes
+            .into_iter()
+            .find(|p| {
+                p.description
+                    .starts_with("publications that publish deletes")
+            })
+            .expect("the delete-publication probe");
+        let ul_moving = &ul_step.changes[0];
+        let ul_moving = pg
+            .emit(&ul_moving.change, ul_moving.strategy)
+            .expect("emit")
+            .remove(0)
+            .sql;
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!(
+            "CREATE PUBLICATION pbps_pub_1547u FOR TABLE {s}.ul \
+                 WITH (publish_via_partition_root = true); SAVEPOINT ul_published"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &ul_published.sql).await,
+            0,
+            "{}",
+            ul_published.description
+        );
+        conn.execute(&ul_moving)
+            .await
+            .expect("the move out of an unlogged DEFAULT");
+        conn.execute(&format!(
+            "ROLLBACK TO SAVEPOINT ul_published; ALTER TABLE {s}.ul_rest SET LOGGED"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            counted(&mut conn, &ul_published.sql).await,
+            1,
+            "{}",
+            ul_published.description
+        );
+        rollback(&mut conn).await;
+        conn.execute(&format!("DROP TABLE {s}.ul")).await.unwrap();
+
         // A DEFAULT's own NOT NULL, tightened in the plan that moves its only
         // NULL out, under a parent whose column default changes too, which
         // puts the create among the column alterations: the tightening
