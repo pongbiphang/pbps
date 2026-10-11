@@ -2330,6 +2330,43 @@ async fn vouched_compares_each_extension_member_with_the_target() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_refuses_an_extension_with_a_member_no_capture_identifies() {
+    // `unaccent` brings a text search dictionary and template, classes the
+    // capture has no identity for. Sealing a plan that reads the extension
+    // would need them, so the comparison names them first.
+    let call = format!("SELECT {EXTERNAL}.unaccent('pbps') AS r");
+    let baseline =
+        format!("CREATE SCHEMA {EXTERNAL};\nCREATE EXTENSION unaccent SCHEMA {EXTERNAL};");
+    let setup = vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!("CREATE EXTENSION unaccent SCHEMA {EXTERNAL}"),
+        format!("CREATE VIEW {MANAGED}.a AS {call}"),
+    ];
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let inputs = staging_inputs(&call, &call, &[]);
+    let key = ProjectKey::new(true);
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &baseline,
+    )
+    .await;
+    target.drop().await;
+    let refused = baseline_refusal(result);
+    assert!(
+        refused.contains(&format!("text search dictionary {EXTERNAL}.unaccent"))
+            && refused.contains("no plan can seal its extension"),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn vouched_compares_an_operator_familys_members_with_the_target() {
     // A row comparison binds by the strategy its operator serves in a
     // btree family; the same family header with another strategy is a

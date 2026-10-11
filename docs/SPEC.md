@@ -1712,7 +1712,8 @@ scratch compile (#1616).
     text search configuration or a foreign table.
   - An extension's members are each compared like an object it creates:
     an extension's version says nothing of a member altered in place, or
-    one the baseline adds to an extension (#1783).
+    one the baseline adds to an extension (#1783). A member the comparison
+    cannot read refuses, naming it, as a root would.
   - It changes nothing outside the scratch database. Roles, role
     memberships, role and other databases' settings, shared comments and
     security labels, tablespaces and other databases are read before and

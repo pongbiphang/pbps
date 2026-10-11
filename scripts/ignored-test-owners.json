@@ -2184,6 +2184,7 @@
         "resolver::server::vouched::live_tests::vouched_stages_a_routine_in_a_system_schema_by_its_header",
         "resolver::server::vouched::live_tests::vouched_stages_a_cast_and_an_operator_over_external_types_in_the_baseline",
         "resolver::server::vouched::live_tests::vouched_compares_each_extension_member_with_the_target",
+        "resolver::server::vouched::live_tests::vouched_refuses_an_extension_with_a_member_no_capture_identifies",
         "resolver::server::vouched::live_tests::vouched_compares_an_operator_familys_members_with_the_target",
         "resolver::server::vouched::live_tests::vouched_refuses_a_baseline_that_writes_outside_the_scratch_database",
         "resolver::server::vouched::live_tests::vouched_ignores_another_sessions_cluster_writes_during_the_baseline",

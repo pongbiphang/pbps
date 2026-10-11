@@ -2235,9 +2235,11 @@ comparison is a projection of the manifest's properties.
 - **Accepted means compared** (#1783). An object counts as reconstructed
   in the assessment when it was compared itself, or is a part of one that
   was: its row and array types, indexes, owned sequences. Extension
-  membership is no such part. Each member the capture has an identity for
-  is compared on its own, with the roots' projection; one it has none for
-  is no binding candidate. An operator family's operators and support
+  membership is no such part. Each member is compared on its own, with the
+  roots' projection. A member the capture has no identity for (a text
+  search dictionary, as `unaccent` brings) refuses, naming it: a plan that
+  reads an extension seals all its members, and the capture refuses one it
+  cannot read rather than leave it out. An operator family's operators and support
   routines are compared with it, by strategy and support number. A
   same-named routine the target has, that neither the project nor the
   baseline does, names the routine-source remedy.

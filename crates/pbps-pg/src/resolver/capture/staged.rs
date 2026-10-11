@@ -77,15 +77,31 @@ pub async fn compare(
                 )),
             }
         }
-        // An extension's member of a class the capture has no identity for
-        // is no binding candidate, so nothing reads it as reconstructed;
-        // the baseline cannot leave it out, so it is not refused either.
+        // An extension's members are one closure: a plan that reads the
+        // extension seals every member, and the capture refuses a member it
+        // has no identity for rather than leave it out (a text search
+        // dictionary `unaccent` brings). Named here, where the remedy is
+        // known, rather than as a capture failure later.
         for object in &created.members {
-            if let Some(identity) = comparable(catalog, object) {
-                resolved.insert(identity, object.described.clone());
+            match comparable(catalog, object) {
+                Some(identity) => {
+                    resolved.insert(identity, object.described.clone());
+                }
+                None => refused.push(format!(
+                    "the baseline created {}, an extension's member the comparison with the \
+                     target cannot read, so no plan can seal its extension; leave the \
+                     extension out of the baseline, or select no resolver",
+                    object.described
+                )),
             }
         }
-        resolved.keys().cloned().collect()
+        // A refusal stands without reading further: the read follows each
+        // retained extension's members, and fails on the one just named.
+        if refused.is_empty() {
+            resolved.keys().cloned().collect()
+        } else {
+            BTreeSet::new()
+        }
     })
     .await
     .map_err(StageError::Capture)?;
