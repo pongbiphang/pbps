@@ -5284,6 +5284,110 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             .to_owned();
         assert_eq!(kept, "2,3");
 
+        // A temporal foreign key (18): the model leaves the key out, the
+        // catalog holds it, and its `PERIOD` part is compared with the
+        // constraint's own operator, `&&`. Every referenced row of one
+        // `(id, ts)` sits in one partition, so a referencing row that
+        // overlaps a moved row has lost all it was covered by: counted, and
+        // the move stops, as the engine's NO ACTION would stop it. Another
+        // `id` is not counted, and the move goes (#1763 review).
+        // Last, since `btree_gist` adds to the catalog the reads above
+        // compare; the database is this test's own.
+        if server_version_num(&mut conn).await >= 180_000 {
+            conn.execute(&format!(
+                "CREATE EXTENSION IF NOT EXISTS btree_gist SCHEMA public;
+                 CREATE TABLE {s}.tp (id integer NOT NULL, valid daterange NOT NULL,
+                     ts date NOT NULL, PRIMARY KEY (id, ts, valid WITHOUT OVERLAPS))
+                     PARTITION BY RANGE (ts);
+                 CREATE TABLE {s}.tp_rest PARTITION OF {s}.tp DEFAULT;
+                 CREATE TABLE {s}.tp_child (pid integer, pts date, valid daterange,
+                     FOREIGN KEY (pid, pts, PERIOD valid) REFERENCES {s}.tp (id, ts, PERIOD valid));
+                 INSERT INTO {s}.tp VALUES (1, '[2030-01-01,2031-01-01)', '2030-01-01');"
+            ))
+            .await
+            .expect("the temporal tree");
+            let tp_base = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
+            let tp_ids = mint_ids(&tp_base, &IdsFile::default(), &[]);
+            let mut tp_split = tp_base.clone();
+            tp_split.tables.insert(
+                t("tp_2030"),
+                partition(
+                    "tp",
+                    range(vec![value("2030-01-01")], vec![value("2031-01-01")]),
+                ),
+            );
+            let tp_step = plan(
+                &tp_base,
+                &tp_ids,
+                &tp_split,
+                &mint_ids(&tp_split, &tp_ids, &[]),
+            );
+            let tp_probes = pg.preflight(&tp_step).probes;
+            let tp_moving = &tp_step.changes[0];
+            let tp_moving = pg
+                .emit(&tp_moving.change, tp_moving.strategy)
+                .expect("emit")
+                .remove(0)
+                .sql;
+            in_a_transaction(&mut conn).await;
+            conn.execute(&format!(
+                "INSERT INTO {s}.tp_child VALUES (1, '2030-01-01', '[2030-03-01,2030-04-01)'); \
+                 SAVEPOINT referenced"
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                counted(&mut conn, &tp_probes[0].sql).await,
+                1,
+                "{}",
+                tp_probes[0].description
+            );
+            let stopped = conn
+                .execute(&tp_moving)
+                .await
+                .expect_err("the move stops over the covered row");
+            assert!(
+                format!("{stopped:?}").contains("would fire the action of their foreign key"),
+                "{stopped:?}"
+            );
+            // The engine stops the same move: without the guard, the delete's
+            // NO ACTION check finds the reference uncovered.
+            conn.execute("ROLLBACK TO SAVEPOINT referenced")
+                .await
+                .unwrap();
+            let engine = conn
+                .execute(&format!(
+                    "CREATE TABLE {s}.tp_bare (LIKE {s}.tp); \
+                     WITH moved AS (DELETE FROM ONLY {s}.tp_rest RETURNING *) \
+                     INSERT INTO {s}.tp_bare SELECT * FROM moved"
+                ))
+                .await
+                .expect_err("the engine refuses the delete of the covering row");
+            assert_eq!(sqlstate(&engine), "23503", "{engine:?}");
+            rollback(&mut conn).await;
+            // Negative: a row of another `id` references nothing moved.
+            in_a_transaction(&mut conn).await;
+            conn.execute(&format!(
+                "INSERT INTO {s}.tp VALUES (2, '[2020-01-01,2021-01-01)', '2020-01-01');
+                 INSERT INTO {s}.tp_child VALUES (2, '2020-01-01', '[2020-03-01,2020-04-01)')"
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                counted(&mut conn, &tp_probes[0].sql).await,
+                0,
+                "{}",
+                tp_probes[0].description
+            );
+            conn.execute(&tp_moving)
+                .await
+                .expect("the move, with nothing covered by a moved row");
+            rollback(&mut conn).await;
+            conn.execute(&format!("DROP TABLE {s}.tp_child, {s}.tp"))
+                .await
+                .unwrap();
+        }
+
         drop(conn);
         admin
             .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))

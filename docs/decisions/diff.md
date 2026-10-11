@@ -4678,10 +4678,41 @@ name too.
 - **Estimate.** Made on the DEFAULT: ACCESS EXCLUSIVE, every row read.
 - **Plan version 34.** It carries the field.
 
+**What the move does not need to ask.** These were checked before review
+found them:
+- **A partition key with a collation or opclass of its own.** The range
+  predicate compares through the column's collation and default operators.
+  A held tree's key carries neither: the tree is held only while
+  `pg_get_partkeydef` reads `RANGE (` and the bare column names. Measured on
+  18, a key with `COLLATE` or an opclass of its own reads back with it. So
+  does a key whose collation differs from its column's. A key whose
+  collation matches its column's reads bare, and there the predicate's
+  collation is the key's.
+- **A DEFAULT that is partitioned, or a foreign table.** Every child of a
+  held tree is a plain table (`relkind = 'r'`), so such a tree is not held,
+  and no move is planned for it.
+- **A temporal foreign key.** The model leaves it out, so only the catalog
+  holds it, and it is counted with its own operators, `&&` for its `PERIOD`
+  part. Measured on 18, a key over a period accepts no `ON DELETE` action
+  but `NO ACTION`. Every referenced row of one `(key, partition key)` lies
+  in one partition, so a referencing row that overlaps a moved row has lost
+  all it was covered by. The count and the engine's check then refuse
+  together, and a referencing row with another key is counted by neither.
+- **A publication created during the apply.** `CREATE PUBLICATION` locks no
+  table, so one created by another session after the moving statement asked
+  could take its insert. pbps does not manage publications (DEC-1444.1).
+  This is a second writer, which SPEC 7.6 assumes away.
+
+What the catalog cannot answer is left to a human by #1788's move intent:
+- a logical slot that decodes without a publication;
+- an application that reads a row's `xmin`;
+- a table too large to move in one transaction.
+
 Pinned by `a_range_added_beside_a_standing_default_names_it`,
 `a_range_beside_a_default_is_filled_from_it_and_attached`,
 `a_partition_beside_a_default_asks_what_its_move_would_fire`,
 `a_partition_beside_a_default_risks_what_its_own_parts_ask_of_rows`,
 `range_partitions_are_added_and_dropped_on_populated_trees`, which checks the
-moved rows against the engine's routing for two-column bounds, and the CLI's
+moved rows against the engine's routing for two-column bounds, and on 18 a
+temporal key's count against the engine's refusal, and the CLI's
 `a_range_beside_a_default_takes_its_rows_through_the_cli`, on 18 and on 16.
