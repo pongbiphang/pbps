@@ -232,6 +232,7 @@ async fn produce_planned_on(
         Some(ENVIRONMENT),
         standard,
         None,
+        &super::Provenance::server(),
     )
     .await
 }
@@ -251,13 +252,23 @@ fn vouched_refusal(result: Result<ResolvedPlan, ProduceError>) -> String {
 /// stays, and the resolved plan leaves it alone although ADR-0013's
 /// candidate test would rebuild it.
 fn assert_answers_the_overload(plan: &ResolvedPlan) {
+    assert_answers_the_overload_from(plan, pbps_model::resolver::VouchedScratch::Server {});
+}
+
+fn assert_answers_the_overload_from(
+    plan: &ResolvedPlan,
+    scratch: pbps_model::resolver::VouchedScratch,
+) {
     plan.evidence.validate(&plan.changes).unwrap();
     pbps_pg::resolver::validate_evidence(&plan.evidence)
         .expect("the vouched evidence passes the artifact reader");
     assert_eq!(
         plan.evidence.qualification().runtime,
-        pbps_model::resolver::ResolverRuntime::Vouched,
-        "the evidence names the operator-vouched resolver"
+        pbps_model::resolver::ResolverRuntime::Vouched {
+            scratch,
+            outside_writes: pbps_model::resolver::OutsideWrites::Refused,
+        },
+        "the evidence names the operator-vouched resolver and its scratch"
     );
     assert_eq!(
         plan.evidence.qualification().rule,
@@ -1456,6 +1467,7 @@ async fn vouched_run_owned_keeps_what_the_reproduction_put_on_its_database() {
                 Some(ENVIRONMENT),
                 &standard,
                 None,
+                &super::Provenance::server(),
             )
             .await,
         );
@@ -1595,6 +1607,7 @@ async fn produce_staged(
         Some(ENVIRONMENT),
         &Standard::default(),
         Some(baseline),
+        &super::Provenance::server(),
     )
     .await
 }
@@ -3309,5 +3322,638 @@ async fn vouched_answers_a_plan_that_takes_a_view_off_a_chain() {
     target.drop().await;
     if let Err(error) = result {
         panic!("{error}");
+    }
+}
+
+// ---- A Docker scratch (#1674) ----
+
+/// Each target with the image its Docker scratch starts from: the same
+/// release, already on the runner, as the default `pull: never` needs. CI
+/// names the digests its PostgreSQL services pulled;
+/// `scripts/live-tests-pg.sh` the digests it runs.
+const DOCKER_PAIRS: &[(&str, &str)] = &[
+    ("PBPS_TEST_PG_DB", "PBPS_TEST_PG_SCRATCH_IMAGE"),
+    ("PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_OLD_SCRATCH_IMAGE"),
+];
+
+/// The containers a Docker scratch labels, so a test can tell what a run
+/// left behind.
+fn scratch_containers() -> std::collections::BTreeSet<String> {
+    let output = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "--all",
+            "--no-trunc",
+            "--filter",
+            "label=pbps.resolver=scratch",
+            "--format",
+            "{{.ID}}",
+        ])
+        .output()
+        .expect("docker runs");
+    assert!(output.status.success(), "docker ps: {output:?}");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The volumes of the one scratch container that is not in `before`.
+fn new_container_volumes(before: &std::collections::BTreeSet<String>) -> Vec<String> {
+    let started: Vec<String> = scratch_containers().difference(before).cloned().collect();
+    assert_eq!(started.len(), 1, "one container started: {started:?}");
+    let output = std::process::Command::new("docker")
+        .args([
+            "container",
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{.Name}} {{end}}",
+            &started[0],
+        ])
+        .output()
+        .expect("docker runs");
+    assert!(output.status.success(), "docker inspect: {output:?}");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn volume_exists(name: &str) -> bool {
+    std::process::Command::new("docker")
+        .args(["volume", "inspect", "--format", "{{.Name}}", name])
+        .output()
+        .expect("docker runs")
+        .status
+        .success()
+}
+
+async fn identity_of(target: &str) -> String {
+    let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
+    pbps_pg::resolver::vouched::cluster_identity(&mut planning)
+        .await
+        .unwrap()
+}
+
+/// A run on a Docker scratch, as `resolution` makes it: the target bound by
+/// `planned` (the target's own identity when `None`).
+#[allow(clippy::too_many_arguments)]
+async fn produce_in_docker(
+    image: &str,
+    pull: pbps_config::resolver::PullPolicy,
+    target: &str,
+    planned: Option<&str>,
+    inputs: &Inputs,
+    key: &ProjectKey,
+    baseline: Option<&str>,
+    outside_writes: pbps_model::resolver::OutsideWrites,
+) -> Result<ResolvedPlan, ProduceError> {
+    let identity = match planned {
+        Some(identity) => identity.to_owned(),
+        None => identity_of(target).await,
+    };
+    let provenance = super::Provenance {
+        scratch: pbps_model::resolver::VouchedScratch::Docker {
+            image: image.to_owned(),
+        },
+        outside_writes,
+    };
+    super::container::with_container(
+        Driver::Postgres,
+        target,
+        &identity,
+        image,
+        pull,
+        async |scratch: &str| {
+            super::produce(
+                Driver::Postgres,
+                scratch,
+                target,
+                &identity,
+                &inputs.binding(),
+                inputs.base(),
+                inputs.desired(),
+                &inputs.hints,
+                &[],
+                &key.project,
+                Some(ENVIRONMENT),
+                &Standard::default(),
+                baseline,
+                &provenance,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn vouched_docker_starts_and_removes_its_container_without_root() {
+    // Rootless Podman in the local gate, Docker's group in CI: the runner
+    // is never root, and the run's container exists only during the run.
+    let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+    assert_ne!(String::from_utf8_lossy(&uid.stdout).trim(), "0", "not root");
+    for (target, image) in DOCKER_PAIRS {
+        let (target, image) = (setting(target), setting(image));
+        let identity = identity_of(&target).await;
+        let before = scratch_containers();
+        let during = super::container::with_container(
+            Driver::Postgres,
+            &target,
+            &identity,
+            &image,
+            Default::default(),
+            async |scratch: &str| {
+                let mut conn = Conn::connect(Driver::Postgres, scratch).await.unwrap();
+                conn.query("SELECT 1 AS ok").await.unwrap();
+                Ok(new_container_volumes(&before))
+            },
+        )
+        .await
+        .unwrap();
+        // The image declares its data directory a volume: the run's own
+        // cluster, which `rm` without `--volumes` leaves behind.
+        assert!(
+            !during.is_empty(),
+            "{image}: the data directory is a volume"
+        );
+        assert_eq!(before, scratch_containers(), "{image}: and removed");
+        for volume in &during {
+            assert!(
+                !volume_exists(volume),
+                "{image}: {volume} is removed with it"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn vouched_docker_removes_its_container_when_the_run_fails() {
+    for (target, image) in DOCKER_PAIRS {
+        let (target, image) = (setting(target), setting(image));
+        let identity = identity_of(&target).await;
+        let before = scratch_containers();
+        let mut ran = false;
+        let mut volumes = Vec::new();
+        let result: Result<(), ProduceError> = super::container::with_container(
+            Driver::Postgres,
+            &target,
+            &identity,
+            &image,
+            Default::default(),
+            async |_: &str| {
+                ran = true;
+                volumes = new_container_volumes(&before);
+                Err(ProduceError::Run(Error::Binding("a failed run".into())))
+            },
+        )
+        .await;
+        assert!(ran, "the run was reached");
+        for volume in &volumes {
+            assert!(
+                !volume_exists(volume),
+                "{image}: {volume} is removed with it"
+            );
+        }
+        assert!(
+            matches!(&result, Err(ProduceError::Run(Error::Binding(reason))) if reason == "a failed run"),
+            "{result:?}"
+        );
+        assert_eq!(
+            before,
+            scratch_containers(),
+            "{image}: the failed run's container is removed"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn vouched_docker_removes_its_container_when_the_run_is_cancelled() {
+    // A run dropped mid-way, as a cancelled future or a panic drops it,
+    // still has its container and volumes removed, by the drop guard.
+    let target = setting("PBPS_TEST_PG_DB");
+    let image = setting("PBPS_TEST_PG_SCRATCH_IMAGE");
+    let identity = identity_of(&target).await;
+    let before = scratch_containers();
+    let (started, running) = tokio::sync::oneshot::channel();
+    let run = super::container::with_container(
+        Driver::Postgres,
+        &target,
+        &identity,
+        &image,
+        Default::default(),
+        async |_: &str| -> Result<(), ProduceError> {
+            let _ = started.send(new_container_volumes(&before));
+            std::future::pending().await
+        },
+    );
+    let volumes = tokio::select! {
+        _ = run => panic!("the run never ends by itself"),
+        volumes = running => volumes.unwrap(),
+    };
+    // The guard asks for the removal and does not wait for it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while scratch_containers() != before && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_eq!(
+        before,
+        scratch_containers(),
+        "the cancelled run's container is removed"
+    );
+    for volume in &volumes {
+        assert!(!volume_exists(volume), "{volume} is removed with it");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn vouched_docker_names_a_volume_its_removal_left() {
+    // A second container holding the scratch's data volume: `rm --volumes`
+    // succeeds and the container is gone, but the volume stays (measured
+    // under Podman; Docker only logs it). The run names the volume rather
+    // than reporting a clean release.
+    let target = setting("PBPS_TEST_PG_DB");
+    let image = setting("PBPS_TEST_PG_SCRATCH_IMAGE");
+    let identity = identity_of(&target).await;
+    let before = scratch_containers();
+    let holder = format!("pbps-v1674-holder-{:016x}", rand::random::<u64>());
+    let mut volumes = Vec::new();
+    let result = super::container::with_container(
+        Driver::Postgres,
+        &target,
+        &identity,
+        &image,
+        Default::default(),
+        async |_: &str| {
+            volumes = new_container_volumes(&before);
+            let scratch: Vec<String> = scratch_containers().difference(&before).cloned().collect();
+            let held = std::process::Command::new("docker")
+                .args([
+                    "create",
+                    "--name",
+                    &holder,
+                    "--volumes-from",
+                    &scratch[0],
+                    &image,
+                ])
+                .output()
+                .unwrap();
+            assert!(held.status.success(), "docker create: {held:?}");
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "--force", "--volumes", &holder])
+        .output();
+    for volume in &volumes {
+        let _ = std::process::Command::new("docker")
+            .args(["volume", "rm", volume])
+            .output();
+    }
+    assert_eq!(
+        before,
+        scratch_containers(),
+        "the scratch container itself is gone"
+    );
+    match result {
+        Err(ProduceError::Cleanup(names)) => {
+            assert!(!volumes.is_empty());
+            for volume in &volumes {
+                assert!(
+                    names.contains(&format!("the docker volume {volume}")),
+                    "{names:?}"
+                );
+            }
+        }
+        other => panic!("a release that left a volume reported {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn vouched_docker_answers_a_managed_question() {
+    // The question a server scratch answers, answered the same way on a
+    // container started for the run.
+    for (target_var, image) in DOCKER_PAIRS {
+        let image = setting(image);
+        let mut target = Fixture::new(target_var);
+        let target_db = target.target().await;
+        let result = produce_in_docker(
+            &image,
+            Default::default(),
+            &target.on(&target_db),
+            None,
+            &Inputs::overload(),
+            &ProjectKey::new(true),
+            None,
+            pbps_model::resolver::OutsideWrites::Refused,
+        )
+        .await;
+        target.drop().await;
+        let plan = result.unwrap_or_else(|error| panic!("{target_var}: {error}"));
+        assert_answers_the_overload_from(
+            &plan,
+            pbps_model::resolver::VouchedScratch::Docker { image },
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn vouched_docker_records_the_image_as_configured_and_unverified() {
+    // A tag, as most configurations name an image: the evidence records the
+    // reference as written and no digest, since nothing verified one.
+    let source = setting("PBPS_TEST_PG_SCRATCH_IMAGE");
+    let tag = format!(
+        "localhost/pbps-v1674-{:016x}:configured",
+        rand::random::<u64>()
+    );
+    let tagged = std::process::Command::new("docker")
+        .args(["tag", &source, &tag])
+        .status()
+        .unwrap();
+    assert!(tagged.success(), "docker tag");
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let target_db = target.target().await;
+    let result = produce_in_docker(
+        &tag,
+        Default::default(),
+        &target.on(&target_db),
+        None,
+        &Inputs::overload(),
+        &ProjectKey::new(true),
+        None,
+        pbps_model::resolver::OutsideWrites::Refused,
+    )
+    .await;
+    target.drop().await;
+    let _ = std::process::Command::new("docker")
+        .args(["rmi", &tag])
+        .output();
+    let plan = result.unwrap();
+    assert_eq!(
+        plan.evidence.qualification().runtime,
+        pbps_model::resolver::ResolverRuntime::Vouched {
+            scratch: pbps_model::resolver::VouchedScratch::Docker { image: tag.clone() },
+            outside_writes: pbps_model::resolver::OutsideWrites::Refused,
+        }
+    );
+    let runtime = serde_json::to_string(&plan.evidence.qualification().runtime).unwrap();
+    // Negative: no digest is claimed, neither the source's nor any other.
+    assert!(!runtime.contains("sha256"), "{runtime}");
+    assert!(!runtime.contains("digest"), "{runtime}");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn vouched_docker_binds_the_target_by_its_cluster_identity() {
+    // A target connection that reaches another cluster than the planning
+    // read refuses before anything is started.
+    let target = setting("PBPS_TEST_PG_DB");
+    let other = identity_of(&setting("PBPS_TEST_PG_OLD_DB")).await;
+    let before = scratch_containers();
+    let result = produce_in_docker(
+        &setting("PBPS_TEST_PG_SCRATCH_IMAGE"),
+        Default::default(),
+        &target,
+        Some(&other),
+        &Inputs::overload(),
+        &ProjectKey::new(true),
+        None,
+        pbps_model::resolver::OutsideWrites::Refused,
+    )
+    .await;
+    let refused = vouched_refusal(result);
+    assert!(
+        refused.contains("another database cluster") && refused.contains("nothing was started"),
+        "{refused}"
+    );
+    assert_eq!(before, scratch_containers(), "nothing was started");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn vouched_docker_refuses_a_missing_image_it_may_not_pull() {
+    // `pull: never` with no such image: refused by name, nothing started.
+    let target = setting("PBPS_TEST_PG_DB");
+    let image = format!("localhost/pbps-absent-{:016x}:1", rand::random::<u64>());
+    let before = scratch_containers();
+    let result = produce_in_docker(
+        &image,
+        pbps_config::resolver::PullPolicy::Never,
+        &target,
+        None,
+        &Inputs::overload(),
+        &ProjectKey::new(true),
+        None,
+        pbps_model::resolver::OutsideWrites::Refused,
+    )
+    .await;
+    match result {
+        Err(ProduceError::Acquire(reason)) => {
+            assert!(
+                reason.contains(&image) && reason.contains("never"),
+                "{reason}"
+            );
+        }
+        Err(other) => panic!("not an acquisition refusal: {other}"),
+        Ok(_) => panic!("a plan from an image that is not there"),
+    }
+    assert_eq!(before, scratch_containers(), "nothing was started");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn vouched_docker_stages_its_baseline() {
+    // A managed view over a baseline table compiles on a Docker scratch.
+    // Negative: a baseline table that differs from the target refuses.
+    for (target_var, image) in DOCKER_PAIRS {
+        let image = setting(image);
+        for id_type in ["integer", "bigint"] {
+            let mut target = Fixture::new(target_var);
+            let target_db = staging_target(&mut target, &guarded_target()).await;
+            let result = produce_in_docker(
+                &image,
+                Default::default(),
+                &target.on(&target_db),
+                None,
+                &staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]),
+                &ProjectKey::new(true),
+                Some(&plain_baseline(id_type)),
+                pbps_model::resolver::OutsideWrites::Refused,
+            )
+            .await;
+            target.drop().await;
+            if id_type == "integer" {
+                assert_staged(result, "t", target_var);
+            } else {
+                let refused = baseline_refusal(result);
+                assert!(refused.contains("atttypid"), "{target_var}: {refused}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn vouched_baseline_outside_writes_allow_keeps_a_created_role() {
+    // Under `outside_writes: allow` a baseline that creates a role stages,
+    // and the evidence records the choice. Negative: under the default the
+    // same baseline refuses, rolled back, so it leaves no role.
+    let role = format!("pbps_v1674_role_{}", std::process::id());
+    let baseline = format!("{}CREATE ROLE {role} NOLOGIN;\n", plain_baseline("integer"));
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    // A Docker scratch: the role goes with the container.
+    for outside_writes in [
+        pbps_model::resolver::OutsideWrites::Allowed,
+        pbps_model::resolver::OutsideWrites::Refused,
+    ] {
+        let mut target = Fixture::new("PBPS_TEST_PG_DB");
+        let target_db = staging_target(&mut target, &guarded_target()).await;
+        let result = produce_in_docker(
+            &setting("PBPS_TEST_PG_SCRATCH_IMAGE"),
+            Default::default(),
+            &target.on(&target_db),
+            None,
+            &inputs,
+            &key,
+            Some(&baseline),
+            outside_writes,
+        )
+        .await;
+        target.drop().await;
+        assert_outside_writes(result, outside_writes, &role);
+    }
+    // A server scratch: under `allow` the role stays, the operator's to
+    // drop; under the default it was never committed.
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    for outside_writes in [
+        pbps_model::resolver::OutsideWrites::Allowed,
+        pbps_model::resolver::OutsideWrites::Refused,
+    ] {
+        let mut target = Fixture::new("PBPS_TEST_PG_DB");
+        let target_db = staging_target(&mut target, &guarded_target()).await;
+        let target_url = target.on(&target_db);
+        let identity = identity_of(&target_url).await;
+        let result = super::produce(
+            Driver::Postgres,
+            &scratch.server,
+            &target_url,
+            &identity,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+            &Standard::default(),
+            Some(&baseline),
+            &super::Provenance {
+                scratch: pbps_model::resolver::VouchedScratch::Server {},
+                outside_writes,
+            },
+        )
+        .await;
+        target.drop().await;
+        let mut admin = Conn::connect(Driver::Postgres, &scratch.server)
+            .await
+            .unwrap();
+        let kept = !admin
+            .query(&format!(
+                "SELECT 1 AS kept FROM pg_catalog.pg_roles WHERE rolname = '{role}'"
+            ))
+            .await
+            .unwrap()
+            .is_empty();
+        admin
+            .execute(&format!("DROP ROLE IF EXISTS {role}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            kept,
+            outside_writes == pbps_model::resolver::OutsideWrites::Allowed,
+            "the role stays only under allow"
+        );
+        assert_outside_writes(result, outside_writes, &role);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn vouched_supplied_baseline_outside_writes_allow_keeps_the_logins_own_default() {
+    // A supplied account's allowed baseline changes the login's own
+    // default. It is kept, and the release compares the compile's changes
+    // with what the baseline left, not with what was there before it.
+    // Negative: under the default the same baseline refuses.
+    for outside_writes in [
+        pbps_model::resolver::OutsideWrites::Allowed,
+        pbps_model::resolver::OutsideWrites::Refused,
+    ] {
+        let mut fixture = Fixture::new("PBPS_TEST_PG_DB");
+        let target_db = staging_target(&mut fixture, &guarded_target()).await;
+        let (login, scratch_db) = fixture.confined().await;
+        let baseline = format!(
+            "{}ALTER ROLE CURRENT_USER SET work_mem = '5MB';\n",
+            plain_baseline("integer")
+        );
+        let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+        let key = ProjectKey::new(true);
+        let target_url = fixture.on(&target_db);
+        let identity = identity_of(&target_url).await;
+        let result = super::produce(
+            Driver::Postgres,
+            &fixture.as_login(&scratch_db, &login),
+            &target_url,
+            &identity,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+            &Standard::default(),
+            Some(&baseline),
+            &super::Provenance {
+                scratch: pbps_model::resolver::VouchedScratch::Server {},
+                outside_writes,
+            },
+        )
+        .await;
+        fixture.drop().await;
+        assert_outside_writes(result, outside_writes, &login.0);
+    }
+}
+
+fn assert_outside_writes(
+    result: Result<ResolvedPlan, ProduceError>,
+    outside_writes: pbps_model::resolver::OutsideWrites,
+    role: &str,
+) {
+    match outside_writes {
+        pbps_model::resolver::OutsideWrites::Allowed => {
+            let plan = result.unwrap_or_else(|error| panic!("allowed: {error}"));
+            assert!(matches!(
+                plan.evidence.qualification().runtime,
+                pbps_model::resolver::ResolverRuntime::Vouched {
+                    outside_writes: pbps_model::resolver::OutsideWrites::Allowed,
+                    ..
+                }
+            ));
+        }
+        pbps_model::resolver::OutsideWrites::Refused => {
+            let refused = baseline_refusal(result);
+            assert!(
+                refused.contains(role) && refused.contains("outside_writes: allow"),
+                "{refused}"
+            );
+        }
     }
 }

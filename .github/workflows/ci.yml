@@ -503,6 +503,11 @@ jobs:
       PBPS_TEST_PG_DB: "host=localhost port=54320 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
       PBPS_TEST_PG_OLD_DB: "host=localhost port=54321 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
       PBPS_TEST_PG_SCRATCH_DB: "host=localhost port=54322 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
+      # The images a Docker scratch starts from (#1674): the services' own
+      # digests, which the runner pulled to start them, so the default
+      # `pull: never` finds them.
+      PBPS_TEST_PG_SCRATCH_IMAGE: "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280"
+      PBPS_TEST_PG_OLD_SCRATCH_IMAGE: "postgres@sha256:485935f94cc7165afa896978809c37b592dc07f0a37d2c8f645f12412d0212c8"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -530,9 +535,10 @@ jobs:
       # `quick` builds it and does not run it: it is `#[ignore]`d.
       - run: cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1
         if: matrix.suite == 'dialect'
-      # The operator-vouched resolver end to end (#1672): no root, no Docker,
-      # only the three servers above. The filter must not end in `:`, which
-      # YAML reads as a mapping and rejects the whole file.
+      # The operator-vouched resolver end to end (#1672): no root, the three
+      # servers above, and the runner's own Docker for a Docker scratch
+      # (#1674). The filter must not end in `:`, which YAML reads as a
+      # mapping and rejects the whole file.
       - run: cargo test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::vouched::live_tests
         if: matrix.suite == 'dialect'
       # Private capture internals have live snapshot/rendering regressions.

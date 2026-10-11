@@ -127,18 +127,14 @@ pub struct Request<'a> {
 /// target: the planning read's, which the resolver's own target connection
 /// must match, since a target name can reach several clusters (#1685).
 /// Only PostgreSQL is resolved, and resolution refuses the other engines by
-/// name, so they record none. Only a supplied server is bound by it: the
-/// Docker profile does not read it, and must not demand the grant (#1718
-/// review).
+/// name, so they record none. Both kinds of resolver are bound by it: a
+/// Docker scratch, like a supplied server, answers for the cluster the plan
+/// was read from (#1674), so neither plans for a role refused the read.
 pub async fn planning_identity(
     conn: &mut pbps_db::Conn,
-    selection: &ResolverSelection,
+    _selection: &ResolverSelection,
 ) -> Result<Option<String>, Refused> {
-    let binds = matches!(
-        selection.profile,
-        pbps_config::resolver::ResolverProfile::Server { .. }
-    );
-    if !binds || conn.driver() != pbps_db::Driver::Postgres {
+    if conn.driver() != pbps_db::Driver::Postgres {
         return Ok(None);
     }
     pbps_pg::resolver::vouched::cluster_identity(conn)
@@ -282,69 +278,109 @@ mod producer {
             desired: request.desired.schema,
             base: request.base.schema,
         };
-        // A supplied server is the operator-vouched resolver (DEC-1528.1);
-        // Docker stays the measured profile until #1674 gives it a vouched
-        // runtime.
-        if let pbps_config::resolver::ResolverProfile::Server {
-            url_env,
-            standard,
-            baseline,
-        } = &request.selection.profile
-        {
-            let scratch = scratch_connection(request, url_env)?;
-            let baseline = baseline
-                .as_ref()
-                .map(|path| {
-                    super::read_baseline(request.project.root(), path).map_err(|why| {
-                        Refused::Unanswerable(anyhow::anyhow!(
-                            "the resolver `{}` names the baseline {}, which {why}",
-                            request.selection.name,
-                            path.display()
-                        ))
-                    })
+        // Both kinds are the operator-vouched resolver (DEC-1528.1): a
+        // supplied server, or a container started for the run (#1674).
+        use pbps_cli::resolver::server::vouched::{self, Provenance};
+        use pbps_config::resolver::ResolverProfile;
+        let Some(identity) = request.target_identity else {
+            return Err(Refused::Unanswerable(anyhow::anyhow!(
+                "the planning read recorded no cluster identity for the resolver to bind"
+            )));
+        };
+        let (baseline, outside_writes) = match &request.selection.profile {
+            ResolverProfile::Server {
+                baseline,
+                outside_writes,
+                ..
+            }
+            | ResolverProfile::Docker {
+                baseline,
+                outside_writes,
+                ..
+            } => (baseline, *outside_writes),
+        };
+        let baseline = baseline
+            .as_ref()
+            .map(|path| {
+                super::read_baseline(request.project.root(), path).map_err(|why| {
+                    Refused::Unanswerable(anyhow::anyhow!(
+                        "the resolver `{}` names the baseline {}, which {why}",
+                        request.selection.name,
+                        path.display()
+                    ))
                 })
-                .transpose()?;
-            let Some(identity) = request.target_identity else {
-                return Err(Refused::Unanswerable(anyhow::anyhow!(
-                    "the planning read recorded no cluster identity for the resolver to bind"
-                )));
-            };
-            return pbps_cli::resolver::server::vouched::produce(
+            })
+            .transpose()?;
+        let outside_writes = match outside_writes {
+            pbps_config::resolver::OutsideWrites::Refuse => {
+                pbps_model::resolver::OutsideWrites::Refused
+            }
+            pbps_config::resolver::OutsideWrites::Allow => {
+                pbps_model::resolver::OutsideWrites::Allowed
+            }
+        };
+        let run = async |scratch: &str,
+                         standard: &pbps_pg::resolver::standard::Standard,
+                         provenance: Provenance| {
+            vouched::produce(
                 driver,
-                &scratch,
+                scratch,
                 request.target.connection(),
                 identity,
                 &binding,
                 request.base,
                 request.desired,
                 request.hints,
+                // The CLI's PostgreSQL dialect configures no write-path
+                // extras (`dialect_for`), so the plan it diffed has none.
                 &[],
                 request.project,
                 request.target.environment(),
-                &pbps_cli::resolver::server::vouched::declared_standard(standard.as_ref()),
+                standard,
                 baseline.as_deref(),
+                &provenance,
             )
             .await
+        };
+        let produced = match &request.selection.profile {
+            ResolverProfile::Server {
+                url_env, standard, ..
+            } => {
+                let scratch = scratch_connection(request, url_env)?;
+                let provenance = Provenance {
+                    scratch: pbps_model::resolver::VouchedScratch::Server {},
+                    outside_writes,
+                };
+                run(
+                    &scratch,
+                    &vouched::declared_standard(standard.as_ref()),
+                    provenance,
+                )
+                .await
+            }
+            ResolverProfile::Docker { image, pull, .. } => {
+                let provenance = Provenance {
+                    scratch: pbps_model::resolver::VouchedScratch::Docker {
+                        image: image.clone(),
+                    },
+                    outside_writes,
+                };
+                vouched::container::with_container(
+                    driver,
+                    request.target.connection(),
+                    identity,
+                    image,
+                    *pull,
+                    async |scratch: &str| {
+                        run(scratch, &vouched::declared_standard(None), provenance).await
+                    },
+                )
+                .await
+            }
+        };
+        produced
             .map(|resolved| resolved.changes)
-            .map_err(|failure| refused(request, failure));
-        }
-        pbps_cli::resolver::server::produce(
-            driver,
-            &request.selection.profile,
-            request.target.connection(),
-            &binding,
-            request.base,
-            request.desired,
-            request.hints,
-            // The CLI's PostgreSQL dialect configures no write-path extras
-            // (`dialect_for`), so the plan it diffed has none either.
-            &[],
-            request.project,
-            request.target.environment(),
-        )
-        .await
-        .map(|resolved| resolved.changes)
-        .map_err(|failure| refused(request, failure))
+            .map_err(|failure| refused(request, failure))
     }
 
     fn refused(request: &Request<'_>, failure: ProduceError) -> Refused {
@@ -511,14 +547,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// #1718 review: only a supplied server is bound by the planning
-    /// identity, so a Docker profile plans for a role refused
-    /// `pg_control_system()`, while a server profile refuses it and names the
-    /// grant. Function privileges belong to each database: the revoke stays in
-    /// the fixture's own.
+    /// Every resolver kind is bound by the planning identity since #1674, so
+    /// a role refused `pg_control_system()` is refused for a Docker entry as
+    /// for a server entry, and the finding names the grant. Function
+    /// privileges belong to each database: the revoke stays in the fixture's
+    /// own.
     #[test]
     #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
-    fn only_a_supplied_server_demands_the_cluster_identity_grant() {
+    fn every_resolver_kind_demands_the_cluster_identity_grant() {
         use pbps_config::resolver::{ResolverProfile, SelectionSource, SelectionStatus};
         let selection = |profile| ResolverSelection {
             name: "r".into(),
@@ -529,11 +565,14 @@ mod tests {
         let docker = selection(ResolverProfile::Docker {
             image: "postgres:18".into(),
             pull: Default::default(),
+            baseline: None,
+            outside_writes: Default::default(),
         });
         let server = selection(ResolverProfile::Server {
             url_env: "PBPS_UNUSED".into(),
             standard: None,
             baseline: None,
+            outside_writes: Default::default(),
         });
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -554,7 +593,7 @@ mod tests {
             conn.execute(&format!("SET ROLE {role}"))
                 .await
                 .expect("set role");
-            let unbound = planning_identity(&mut conn, &docker).await;
+            let docker_refused = planning_identity(&mut conn, &docker).await;
             let refused = planning_identity(&mut conn, &server).await;
             conn.execute("RESET ROLE").await.expect("reset role");
             drop(conn);
@@ -568,11 +607,12 @@ mod tests {
                 matches!(granted, Ok(Some(ref identity)) if !identity.is_empty()),
                 "a superuser reads it"
             );
-            assert!(matches!(unbound, Ok(None)), "Docker reads no identity");
-            match refused {
-                Err(Refused::Finding(finding)) => assert_eq!(finding.id, "resolver.identity"),
-                Err(Refused::Unanswerable(error)) => panic!("answered, not: {error}"),
-                Ok(identity) => panic!("a refused role read {identity:?}"),
+            for refused in [docker_refused, refused] {
+                match refused {
+                    Err(Refused::Finding(finding)) => assert_eq!(finding.id, "resolver.identity"),
+                    Err(Refused::Unanswerable(error)) => panic!("answered, not: {error}"),
+                    Ok(identity) => panic!("a refused role read {identity:?}"),
+                }
             }
         });
     }
@@ -634,6 +674,7 @@ mod tests {
                 url_env: "PBPS_RESOLVER_UNSET_1515".into(),
                 standard: None,
                 baseline: None,
+                outside_writes: Default::default(),
             },
             status: pbps_config::resolver::SelectionStatus::NotAcquired,
         }

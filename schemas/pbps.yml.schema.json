@@ -237,6 +237,17 @@
               "$ref": "#/$defs/PullPolicy",
               "default": "never"
             },
+            "baseline": {
+              "description": "As a server entry's: the SQL file that stages the objects outside\nthe managed set (#1673).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            },
+            "outside_writes": {
+              "$ref": "#/$defs/OutsideWrites"
+            },
             "kind": {
               "type": "string",
               "const": "docker"
@@ -275,6 +286,9 @@
               ],
               "minLength": 1
             },
+            "outside_writes": {
+              "$ref": "#/$defs/OutsideWrites"
+            },
             "kind": {
               "type": "string",
               "const": "server"
@@ -299,6 +313,21 @@
           "description": "Permit trusted acquisition only when the selected image is absent.",
           "type": "string",
           "const": "if_missing"
+        }
+      ]
+    },
+    "OutsideWrites": {
+      "description": "What a baseline may change outside the scratch database (#1674).",
+      "oneOf": [
+        {
+          "description": "A baseline that changes catalog state outside the scratch database\n(a role, another database's settings) is rolled back and refused\n(DEC-1673.1).",
+          "type": "string",
+          "const": "refuse"
+        },
+        {
+          "description": "Such changes are kept and not checked. pbps does not clean them up: a\nDocker scratch drops them with its container, and on a server scratch\nthey are the operator's. The evidence records the choice.",
+          "type": "string",
+          "const": "allow"
         }
       ]
     },
@@ -708,6 +737,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 38,
+  "x-pbps-schema-version": 39,
   "x-pbps-tool-version": "0.0.0"
 }

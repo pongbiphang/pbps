@@ -6,9 +6,13 @@
 
 use std::path::PathBuf;
 
-/// The first schema set published under DEC-997.1. Earlier sets under the
-/// same wire version predate the rule (DECISIONS 435's `denied` variant).
-const FIRST_SET_UNDER_THE_WIRE_RULE: u32 = 16;
+/// The first schema set the current envelopes must still validate against.
+/// Sets before 16 predate DEC-997.1 (DECISIONS 435's `denied` variant).
+/// Before the first release a breaking change raises it to its own set
+/// instead of moving the wire version (DEC-1734.1): 39, whose Docker
+/// `baseline` and `outside_writes` (#1674) the closed resolver profile of
+/// set 38 and every set before it refuses.
+const FIRST_SET_UNDER_THE_WIRE_RULE: u32 = 39;
 
 fn wire(document: &serde_json::Value) -> serde_json::Value {
     document["$defs"]["envelope.status"]["properties"]["schema_version"]["const"].clone()

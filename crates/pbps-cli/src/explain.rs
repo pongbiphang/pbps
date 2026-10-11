@@ -598,9 +598,27 @@ fn findings(plan: &SavedPlan, e: &Explanation) -> Vec<output::Finding> {
 /// What produced a resolved plan's evidence, so a reviewer can tell an answer
 /// the operator vouched for from a measured one (DEC-1528.1).
 fn resolver_runtime(runtime: &pbps_model::resolver::ResolverRuntime) -> String {
-    use pbps_model::resolver::ResolverRuntime;
+    use pbps_model::resolver::{OutsideWrites, ResolverRuntime, VouchedScratch};
     match runtime {
-        ResolverRuntime::Vouched => "operator-vouched scratch (not measured)".into(),
+        ResolverRuntime::Vouched {
+            scratch,
+            outside_writes,
+        } => {
+            let scratch = match scratch {
+                VouchedScratch::Server {} => "a supplied server".to_owned(),
+                VouchedScratch::Docker { image } => {
+                    format!("a container of {image}, the image as configured and not verified")
+                }
+            };
+            let writes = match outside_writes {
+                OutsideWrites::Refused => "",
+                OutsideWrites::Allowed => {
+                    "; the baseline's writes outside the scratch database were allowed, \
+                     not checked"
+                }
+            };
+            format!("operator-vouched scratch (not measured) on {scratch}{writes}")
+        }
         ResolverRuntime::Container { profile, .. } | ResolverRuntime::Supplied { profile, .. } => {
             format!("measured profile {profile}")
         }
@@ -755,6 +773,31 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reviewer reads where the scratch came from, and whether a baseline's
+    /// writes outside it went unchecked (#1674).
+    #[test]
+    fn the_runtime_line_names_the_scratch_and_an_allowed_outside_write() {
+        use pbps_model::resolver::{OutsideWrites, ResolverRuntime, VouchedScratch};
+        let docker = resolver_runtime(&ResolverRuntime::Vouched {
+            scratch: VouchedScratch::Docker {
+                image: "postgres:18".into(),
+            },
+            outside_writes: OutsideWrites::Allowed,
+        });
+        assert!(docker.contains("postgres:18"), "{docker}");
+        assert!(docker.contains("not verified"), "{docker}");
+        assert!(docker.contains("allowed, not checked"), "{docker}");
+        // Negative: the default says nothing of outside writes.
+        let server = resolver_runtime(&ResolverRuntime::Vouched {
+            scratch: VouchedScratch::Server {},
+            outside_writes: OutsideWrites::Refused,
+        });
+        assert_eq!(
+            server,
+            "operator-vouched scratch (not measured) on a supplied server"
+        );
+    }
 
     /// The line is advertised as copy-pastable, so a path a shell would take
     /// apart has to survive the paste — and one it would not must stay bare, or

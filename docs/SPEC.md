@@ -1541,15 +1541,35 @@ target. [ADR-0016](ADR-0016-engine-assisted-planning.md) records the rationale,
 evidence contract, implementation boundaries and acceptance tests.
 
 **Two kinds of resolver environment (#1528, DEC-1528.1, DEC-1672.1; a server
-entry implemented by #1672, Docker by #1674).**
+entry implemented by #1672, a Docker entry by #1674, DEC-1674.1).**
 
-- **The operator-vouched resolver** is what selecting a `kind: server`
-  resolver gives (#1672). A `kind: docker` entry gets it with #1674. Users see
-  it simply as the resolver. Internally, and in this specification, it is
-  always the *operator-vouched resolver* (`vouched`).
+- **The operator-vouched resolver** is what selecting a resolver gives, of
+  either kind: a `kind: docker` entry, a scratch server pbps starts for the
+  run (#1674), or a `kind: server` entry, one the operator supplies (#1672).
+  Users see it simply as the resolver. Internally, and in this
+  specification, it is always the *operator-vouched resolver* (`vouched`).
   - pbps does not measure or enforce its scratch's isolation, containment, log
     handling or channels. The operator vouches for them, and the evidence and
-    `explain` say so: `resolver: operator-vouched scratch (not measured)`.
+    `explain` say so: `resolver: operator-vouched scratch (not measured) on a
+    supplied server`, or `on a container of postgres:18, the image as
+    configured and not verified`.
+  - **A Docker scratch** (DEC-1674.1) is a PostgreSQL server pbps starts from
+    the entry's `image` for one run, through whatever `docker` command the
+    runner has: Docker, rootless Docker, or Podman's compatible command or
+    socket (`DOCKER_HOST`). Nothing about it is measured: no containment,
+    admission or process observation.
+    - Its port is published on loopback only, and its superuser password is
+      generated for the run. So the run is the run-owned layout (below), and
+      every check below still runs, although the container is a separate
+      cluster by construction.
+    - The container is stopped and removed with its volumes when the run
+      ends, whether it answered or refused. If removal cannot be confirmed,
+      the run fails naming the container, as for any cleanup.
+    - The target is bound by its `system_identifier` (below) before the
+      container is started, so a target connection that reaches another
+      cluster starts nothing.
+    - The evidence records the image reference as configured. No digest is
+      claimed: the content behind a tag can change, and pbps verifies none.
   - Before it writes anything on scratch, it establishes where scratch sits
     and what the scratch account may do (#1667, DEC-1672.1).
     - **Scratch is never the target.** The engines decide this, not the two
@@ -1642,10 +1662,8 @@ entry implemented by #1672, Docker by #1674).**
     Two builds that report the same facts are taken to bind alike, and
     that is part of what the operator vouches for (#1657).
 - **The measured profiles** (`linux-amd64-v1`, `linux-dedicated-v1`,
-  `linux-dedicated-pg16-v1`) are frozen and to be removed (#1636).
-  - A Docker entry is `linux-amd64-v1` until #1674.
-  - The dedicated-server profiles are no longer selectable, since a server
-    entry is the operator-vouched resolver.
+  `linux-dedicated-pg16-v1`) are frozen and to be removed (#1636). No entry
+  selects them: both kinds are the operator-vouched resolver (#1674).
 - **Reading this section:** a paragraph marked **Measured profiles only**
   binds them alone. Text written before #1528 that says "resolver" while
   describing containment, process observation, executable identity or
@@ -1708,11 +1726,17 @@ first, then runs it. Until #1516, its answer is reported and refused as
 `resolver.publication-unavailable`, writing neither file. Selection does not
 replace or waive any existing planning check.
 
-`pbps.yml` can declare Docker or dedicated-server resolvers.
-- A server entry is the operator-vouched resolver.
-- A Docker entry is the frozen measured `linux-amd64-v1` until #1674.
+`pbps.yml` declares Docker or server resolvers, both the operator-vouched
+resolver. `kind` is required: nothing selects one for the user.
+- **A Docker entry is the default to reach for** (DEC-1674.1). Its scratch is
+  started and removed for each run, so there is nothing to keep clean.
+- **A server entry is for special needs:** a managed target whose
+  extensions or build no community image matches; a CI without a container
+  runtime; an engine with no Linux image to run (#620).
 - An entry has no `profile` field (#1654).
 - An entry's optional `baseline` names the baseline file (below; #1673).
+- An entry's optional `outside_writes` decides what a baseline may change
+  outside the scratch database (below): `refuse`, the default, or `allow`.
 
 ```yaml
 resolve_with: pg_local
@@ -1721,6 +1745,7 @@ resolvers:
     kind: docker
     image: postgres:18
     pull: never
+    baseline: db/baseline.sql       # optional; relative to the project root
   internal:
     kind: docker
     image: registry.example:5000/team/pg:approved
@@ -1745,9 +1770,10 @@ environments:
     fingerprint_key_env: PROD_FINGERPRINT_KEY   # or fingerprint_key_file:
 ```
 
-`pull: never` is the default and requires a preloaded image when acquisition
-is implemented; `if_missing` authorizes acquisition of the configured source
-only when absent. It is not permission for compiled code to access a network.
+`pull: never` is the default and requires a preloaded image: an absent one
+refuses, naming the image, before anything is started. `if_missing`
+authorizes acquisition of the configured source only when absent. It is not
+permission for compiled code to access a network.
 Build compatibility still requires qualification for every resolver
 environment. A measured profile also qualifies its actual digest/platform,
 instance separation, transport and containment. A server entry names a
@@ -1839,17 +1865,35 @@ scratch compile (#1616).
     an extension's version says nothing of a member altered in place, or
     one the baseline adds to an extension (#1783). A member the comparison
     cannot read refuses, naming it, as a root would.
-  - It changes nothing outside the scratch database. Roles, role
-    memberships, role and other databases' settings, shared comments and
-    security labels, tablespaces, other databases, parameter privileges,
-    replication origins, and any other shared catalog the engine lists, are
-    read before and after it, in its own transaction's snapshot, so another
-    session's writes meanwhile do not count. A change refuses, naming each
-    object, and is rolled back. What is compared is catalog state: an effect
-    a superuser can have outside catalogs and transactions (a replication
-    slot, a server file, `COPY ... TO PROGRAM`) is not seen and outlives the
-    rollback. It is the operator's, under the vouching for the scratch
-    (#1824).
+  - It changes nothing outside the scratch database, unless the entry sets
+    `outside_writes: allow`. Roles, role memberships, role and other
+    databases' settings, shared comments and security labels, tablespaces,
+    other databases, parameter privileges, replication origins, and any
+    other shared catalog the engine lists, are read before and after it, in
+    its own transaction's snapshot, so another session's writes meanwhile do
+    not count. A change refuses, naming each object, and is rolled back.
+    What is compared is catalog state: an effect a superuser can have
+    outside catalogs and transactions (a replication slot, a server file,
+    `COPY ... TO PROGRAM`) is not seen and outlives the rollback. It is the
+    operator's, under the vouching for the scratch (#1824).
+  - **`outside_writes: allow`** skips that comparison, on either kind
+    (DEC-1674.1). What the baseline changed outside the database, a role
+    for instance, is kept, and pbps does not clean it up: a Docker scratch
+    drops it with the container, and on a server scratch it is the
+    operator's. In the supplied layout the login's own defaults the
+    baseline changed stay too: the release checks the compile's changes to
+    them against what the baseline left. The release's `DROP OWNED` still
+    revokes what reaches the login, a membership it granted included
+    (measured on 18), while a role it created stays. The choice is the user's, never inferred from the kind. The
+    evidence records it, and `explain` shows it, so a reviewer sees a plan
+    whose baseline ran with `allow`. A role the target lacks is not this
+    check's to find: the target-side checks catch it (#1516).
+  - **Writing one.** `pg_dump --schema-only --no-owner --no-privileges`
+    of the objects the managed set reads writes a baseline that names no
+    role the scratch lacks. A baseline that creates an extension only a
+    superuser may create needs the run-owned layout, where it runs as the
+    superuser: a Docker scratch, or a server scratch whose account is a
+    superuser on another cluster.
   - The shared compatibility qualification reads scratch after the
     baseline, so a setting the baseline changed must match the target too:
     the scratch database's own settings are its to change.

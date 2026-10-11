@@ -47,7 +47,7 @@ pub fn validate_evidence(
 /// (#1672). Evidence naming the other rule claims coverage it does not have.
 fn rule_of(runtime: &pbps_model::resolver::ResolverRuntime) -> &'static str {
     match runtime {
-        pbps_model::resolver::ResolverRuntime::Vouched => compatibility::REPORTED_RULE,
+        pbps_model::resolver::ResolverRuntime::Vouched { .. } => compatibility::REPORTED_RULE,
         pbps_model::resolver::ResolverRuntime::Container { .. }
         | pbps_model::resolver::ResolverRuntime::Supplied { .. } => compatibility::RULE,
     }

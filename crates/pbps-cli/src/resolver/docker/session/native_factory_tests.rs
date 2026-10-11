@@ -23,6 +23,8 @@ async fn native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_co
     let profile = ResolverProfile::Docker {
         image: std::env::var("PBPS_RESOLVER_TEST_IMAGE").unwrap(),
         pull: PullPolicy::Never,
+        baseline: None,
+        outside_writes: Default::default(),
     };
     let mut stale_identities = Vec::new();
     for action in [

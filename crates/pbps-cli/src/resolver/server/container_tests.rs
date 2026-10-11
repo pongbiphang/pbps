@@ -163,6 +163,8 @@ async fn candidate(target: &mut NativeTarget, socket: &Path, image: &str) -> Can
         .acquire(&ResolverProfile::Docker {
             image: image.into(),
             pull: PullPolicy::Never,
+            baseline: None,
+            outside_writes: Default::default(),
         })
         .await
         .unwrap();
@@ -181,6 +183,8 @@ async fn candidate_with_start_window(
         .acquire(&ResolverProfile::Docker {
             image: image.into(),
             pull: PullPolicy::Never,
+            baseline: None,
+            outside_writes: Default::default(),
         })
         .await
         .unwrap();

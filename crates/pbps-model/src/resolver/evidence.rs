@@ -41,9 +41,36 @@ pub enum ResolverRuntime {
         identity: String,
     },
     /// A scratch engine the operator vouches for: nothing about it was
-    /// measured, and the evidence claims no image, containment or build
-    /// (DEC-1528.1).
-    Vouched,
+    /// measured, and the evidence claims no image digest, containment or
+    /// build (DEC-1528.1).
+    Vouched {
+        scratch: VouchedScratch,
+        /// Whether the baseline's writes outside the scratch database were
+        /// refused or allowed (#1674).
+        outside_writes: OutsideWrites,
+    },
+}
+
+/// Where an operator-vouched scratch came from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum VouchedScratch {
+    /// A server the operator supplied. A struct variant, not a unit one:
+    /// serde's internally tagged unit variant drops fields it does not
+    /// know, where this one refuses them (#1843 review).
+    Server {},
+    /// A container pbps started for the run and removed after it, from this
+    /// image reference as configured. Unverified: no digest is claimed, and
+    /// the content behind a tag can change (#1674).
+    Docker { image: String },
+}
+
+/// What a baseline was allowed to change outside the scratch database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutsideWrites {
+    Refused,
+    Allowed,
 }
 
 /// Environment-keyed fingerprints of the complete qualified observations.
@@ -201,7 +228,10 @@ impl ResolverEvidence {
             ResolverRuntime::Supplied { profile, identity } => {
                 !profile.is_empty() && hex(identity, 64)
             }
-            ResolverRuntime::Vouched => true,
+            ResolverRuntime::Vouched { scratch, .. } => match scratch {
+                VouchedScratch::Server {} => true,
+                VouchedScratch::Docker { image } => !image.is_empty(),
+            },
         };
         if !qualified {
             return Err(EvidenceError::Incomplete);
@@ -877,6 +907,51 @@ mod tests {
         let mut predicted = evidence.clone();
         predicted.after = with_records(&evidence.after, vec![view.clone()]);
         assert!(predicted.validate(&plan.changes).is_err());
+    }
+
+    #[test]
+    fn a_docker_scratch_is_recorded_by_its_configured_image() {
+        let plan = plan();
+        let mut evidence = resolved(&plan);
+        evidence.qualification.runtime = ResolverRuntime::Vouched {
+            scratch: VouchedScratch::Docker {
+                image: "postgres:18".into(),
+            },
+            outside_writes: OutsideWrites::Allowed,
+        };
+        evidence.validate(&plan.changes).unwrap();
+        assert_eq!(
+            serde_json::to_value(&evidence.qualification.runtime).unwrap(),
+            json!({
+                "kind": "vouched",
+                "scratch": {"kind": "docker", "image": "postgres:18"},
+                "outside_writes": "allowed",
+            })
+        );
+        // Negative: a Docker scratch with no image names nothing.
+        evidence.qualification.runtime = ResolverRuntime::Vouched {
+            scratch: VouchedScratch::Docker { image: "".into() },
+            outside_writes: OutsideWrites::Refused,
+        };
+        assert_eq!(
+            evidence.validate(&plan.changes),
+            Err(EvidenceError::Incomplete)
+        );
+        // Negative: the pre-#1674 unit form names neither the scratch nor
+        // the outside-write choice, and is not read as either.
+        assert!(serde_json::from_value::<ResolverRuntime>(json!({"kind": "vouched"})).is_err());
+        // Negative: a server scratch carries nothing, and a field it does
+        // not have is refused rather than dropped.
+        assert!(
+            serde_json::from_value::<VouchedScratch>(
+                json!({"kind": "server", "image": "postgres:18"})
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::from_value::<VouchedScratch>(json!({"kind": "server"})).unwrap(),
+            VouchedScratch::Server {}
+        );
     }
 
     #[test]

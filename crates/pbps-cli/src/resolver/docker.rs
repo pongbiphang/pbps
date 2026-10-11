@@ -545,7 +545,7 @@ impl LocalApi {
         P: FnOnce(PathBuf, String) -> F,
         F: std::future::Future<Output = Result<(), Error>>,
     {
-        let ResolverProfile::Docker { image, pull } = profile else {
+        let ResolverProfile::Docker { image, pull, .. } = profile else {
             return Err(Error::Profile);
         };
         if let Some(candidate) = self.inspect_image(image).await? {
@@ -698,6 +698,8 @@ mod tests {
         ResolverProfile::Docker {
             image: "registry.example/team/engine:chosen".into(),
             pull,
+            baseline: None,
+            outside_writes: Default::default(),
         }
     }
 
@@ -892,6 +894,8 @@ mod tests {
         let configured = ResolverProfile::Docker {
             image,
             pull: PullPolicy::Never,
+            baseline: None,
+            outside_writes: Default::default(),
         };
         let first = api.acquire(&configured).await.unwrap();
         let second = api.acquire(&configured).await.unwrap();
@@ -903,6 +907,8 @@ mod tests {
                 rand::random::<u128>()
             ),
             pull: PullPolicy::Never,
+            baseline: None,
+            outside_writes: Default::default(),
         };
         assert!(matches!(
             api.acquire(&missing).await,

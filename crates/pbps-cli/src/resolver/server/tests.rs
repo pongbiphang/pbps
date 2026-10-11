@@ -110,6 +110,8 @@ fn only_a_server_profile_yields_an_endpoint() {
         ScratchEndpoint::from_profile(&ResolverProfile::Docker {
             image: "postgres:18".into(),
             pull: PullPolicy::Never,
+            baseline: None,
+            outside_writes: Default::default(),
         }),
         Err(Error::Endpoint)
     ));
@@ -118,6 +120,7 @@ fn only_a_server_profile_yields_an_endpoint() {
             url_env: "PBPS_UNSET_DEDICATED_SERVER_609".into(),
             standard: None,
             baseline: None,
+            outside_writes: Default::default(),
         }),
         Err(Error::Endpoint)
     ));

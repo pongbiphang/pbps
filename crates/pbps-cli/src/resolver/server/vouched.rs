@@ -29,7 +29,7 @@ use pbps_db::resolver::ScratchNames;
 use pbps_db::resolver::environment::{CatalogFacts, Verdict};
 use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
-use pbps_model::resolver::ResolverRuntime;
+use pbps_model::resolver::{OutsideWrites, ResolverRuntime, VouchedScratch};
 use pbps_pg::resolver::baseline;
 use pbps_pg::resolver::capture::{StageError, Staged};
 use pbps_pg::resolver::standard::{self, Standard};
@@ -55,6 +55,7 @@ pub async fn produce(
     environment: Option<&str>,
     standard: &Standard,
     baseline: Option<&str>,
+    provenance: &Provenance,
 ) -> Result<ResolvedPlan, ProduceError> {
     if driver != Driver::Postgres {
         return Err(ProduceError::Run(Error::Binding(
@@ -116,6 +117,7 @@ pub async fn produce(
         backend: &backend,
         standard,
         baseline,
+        provenance,
         created: Created::Nothing,
     };
     let result = run
@@ -134,6 +136,23 @@ pub async fn produce(
         (_, Err(names)) => Err(ProduceError::Cleanup(names)),
         (Err(refused), Ok(())) => Err(ProduceError::Run(refused)),
         (Ok(plan), Ok(())) => Ok(plan),
+    }
+}
+
+/// What the evidence records of the scratch a run used (#1674).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    pub scratch: VouchedScratch,
+    pub outside_writes: OutsideWrites,
+}
+
+impl Provenance {
+    /// A supplied server, its baseline's outside writes refused.
+    pub fn server() -> Self {
+        Self {
+            scratch: VouchedScratch::Server {},
+            outside_writes: OutsideWrites::Refused,
+        }
     }
 }
 
@@ -308,6 +327,7 @@ struct Run<'a> {
     /// into statements as it runs, since a statement can change how the
     /// next is read.
     baseline: Option<&'a str>,
+    provenance: &'a Provenance,
     created: Created,
 }
 
@@ -561,7 +581,10 @@ impl Run<'_> {
             rule: pbps_pg::resolver::compatibility::REPORTED_RULE,
             resolver_build: reported_build(self.key, &prepared.scratch_catalog)?,
             channels: format!("vouched|{}|{}", self.tokens.target, self.tokens.scratch),
-            runtime: ResolverRuntime::Vouched,
+            runtime: ResolverRuntime::Vouched {
+                scratch: self.provenance.scratch.clone(),
+                outside_writes: self.provenance.outside_writes,
+            },
         };
         let producer = super::ProducerOutcome {
             compiled,
@@ -667,7 +690,7 @@ impl Run<'_> {
                     .execute("SET ROLE NONE")
                     .await
                     .map_err(db("the baseline session's role"))?;
-                run_baseline(&mut setup, statements).await?;
+                run_baseline(&mut setup, statements, self.provenance.outside_writes).await?;
                 drop(setup);
                 baseline::created(&before, &inventory(&mut owner).await?)
             }
@@ -791,11 +814,21 @@ impl Run<'_> {
         let created = match self.baseline {
             Some(statements) => {
                 let before = inventory(admin).await?;
-                run_baseline(admin, statements).await?;
+                run_baseline(admin, statements, self.provenance.outside_writes).await?;
                 admin
                     .execute("SET ROLE NONE")
                     .await
                     .map_err(db("the scratch session's role"))?;
+                // An allowed baseline may change the login's own defaults
+                // (#1674). Those are kept, so the release compares the
+                // compile's changes with what the baseline left.
+                if self.provenance.outside_writes == OutsideWrites::Allowed
+                    && let Created::Supplied { defaults, .. } = &mut self.created
+                {
+                    *defaults = sql::login_defaults(admin)
+                        .await
+                        .map_err(db("the scratch account's own defaults"))?;
+                }
                 pinned(admin, self.backend).await?;
                 baseline::created(&before, &inventory(admin).await?)
             }
@@ -1266,7 +1299,14 @@ async fn inventory(conn: &mut Conn) -> Result<baseline::Inventory, Error> {
 /// reads of the shared state, so another session's writes during the
 /// script are in neither. The script cannot end the transaction itself:
 /// [`baseline::run`] refuses transaction control before it runs.
-async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
+/// Under [`OutsideWrites::Allowed`] the shared state is not read: what the
+/// file changes outside the database is kept, and is the operator's (#1674).
+async fn run_baseline(
+    session: &mut Conn,
+    sql: &str,
+    outside_writes: OutsideWrites,
+) -> Result<(), Error> {
+    let checked = outside_writes == OutsideWrites::Refused;
     let read =
         |what: &'static str| move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"));
     session
@@ -1274,9 +1314,13 @@ async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
         .await
         .map_err(read("the baseline's transaction"))?;
     let outcome = async {
-        let before = baseline::shared_state(session)
-            .await
-            .map_err(read("the cluster's shared state"))?;
+        let before = if checked {
+            baseline::shared_state(session)
+                .await
+                .map_err(read("the cluster's shared state"))?
+        } else {
+            baseline::SharedState::new()
+        };
         if let Err(failed) = baseline::run(session, sql).await {
             let mut finding = format!("the engine refused it: {}", failed.error);
             if failed.no_schema() {
@@ -1307,6 +1351,9 @@ async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
         // so one no one listed cannot refuse a valid baseline. The path is
         // pinned again, empty as every pbps session's (DEC-1564.1), since a
         // type the script creates may be named `text`.
+        if !checked {
+            return Ok(());
+        }
         session
             .execute("RESET ALL")
             .await
@@ -1328,7 +1375,8 @@ async fn run_baseline(session: &mut Conn, sql: &str) -> Result<(), Error> {
                     .map(|name| {
                         format!(
                             "it changed {name}, outside the scratch database; a baseline \
-                             creates only objects in the database"
+                             creates only objects in the database, unless the resolver \
+                             sets `outside_writes: allow`"
                         )
                     })
                     .collect(),
@@ -1417,6 +1465,8 @@ tokio::task_local! {
     /// against (#1755).
     static AFTER_STAGING: Option<String>;
 }
+
+pub mod container;
 
 #[cfg(test)]
 mod live_tests;

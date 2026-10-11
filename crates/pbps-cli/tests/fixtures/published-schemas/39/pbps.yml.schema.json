@@ -1,0 +1,742 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Config",
+  "type": "object",
+  "properties": {
+    "dialect": {
+      "$ref": "#/$defs/DialectName"
+    },
+    "schema_dir": {
+      "type": "string",
+      "pattern": "^(?!(?:\\.\\.?(?:[/\\\\]+|$))*$)",
+      "default": "schema"
+    },
+    "ids_file": {
+      "type": "string",
+      "default": "schema.ids.json"
+    },
+    "environments": {
+      "description": "Deployment targets, by name. Optional: a project that only ever passes\n`--db` explicitly needs none.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Environment"
+      }
+    },
+    "hooks": {
+      "$ref": "#/$defs/Hooks",
+      "default": {}
+    },
+    "unmanaged": {
+      "$ref": "#/$defs/Unmanaged",
+      "default": "ignore"
+    },
+    "dev": {
+      "description": "The optional dev database (SPEC §9.3). Absent means previews stay\noffline, which is the default and a supported way to work.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Dev"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "resolvers": {
+      "description": "Explicitly trusted sources for the separate target-planning resolver.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ResolverProfile"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+      }
+    },
+    "resolve_with": {
+      "description": "Default profile name. Selection/acquisition stays lazy and target-only.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "max_data_rows": {
+      "description": "How many rows a `data:` block may declare before `validate` says this\ndoes not look like reference data (ADR-0004).\n\nA knob rather than a constant because the line between a lookup table\nand somebody's business table is a judgement about *this* project — but\nit is a warning either way, never a refusal: pbps does not get to decide\nthat a 1,200-row currency table is illegitimate.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "minimum": 0
+    },
+    "policies": {
+      "description": "The organization's own rules and their suppressions (ADR-0008). Absent\nmeans every built-in rule at its default severity.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Policies"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "dialect"
+  ],
+  "$defs": {
+    "DialectName": {
+      "description": "The target database dialect.\n\nA project is bound to exactly one dialect. \"Supports multiple databases\" means\nthe tool can drive different databases, not that one set of declarations\ndeploys to both (SPEC §1.3).",
+      "type": "string",
+      "enum": [
+        "mssql",
+        "postgres"
+      ]
+    },
+    "Environment": {
+      "description": "One deployment target.\n\n# Why there is no `url:` field\n\nA connection string carries a password, and `pbps.yml` is committed to git.\nThe config therefore names the **environment variable** that holds the\nstring, never the string. This is not an inconvenience to be worked around\nwith a second, undocumented field: an inline `url:` would be a credential in\nversion control, and the one thing worse than not having the feature is\nhaving it and being surprised by it.",
+      "type": "object",
+      "properties": {
+        "url_env": {
+          "description": "The name of the environment variable holding the ADO.NET connection\nstring, e.g. `PROD_CONN`.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Shown by `pbps status`, for humans reading a list of environments.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resolve_with": {
+          "description": "Overrides the project's resolver profile for this deployment target.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+        },
+        "fingerprint_key_env": {
+          "description": "The name of the environment variable holding this target's\nfingerprint key, base64 as `pbps key generate` prints it (DEC-952.1).\nNamed, never inline, for the reason `url_env` is. Exclusive with\n`fingerprint_key_file`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fingerprint_key_file": {
+          "description": "A file holding this target's fingerprint key, readable by its owner\nonly; relative to the project root. Exclusive with\n`fingerprint_key_env`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url_env"
+      ]
+    },
+    "Hooks": {
+      "description": "Exec points (SPEC §9.4): pbps runs a command, and the command does the\ntalking.\n\nThere are no Slack or Teams integrations here on purpose. An exec hook\noutlives any chat API, holds no credentials of its own, and lets a team\ndeliver drift alerts through whatever they already run.",
+      "type": "object",
+      "properties": {
+        "on_apply": {
+          "description": "Run after a successful `apply`, with the unchanged plan JSON on stdin.\n\nThis is the original hook contract. Use `on_apply_attempt` for a\nversioned event that also reports failed attempts.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "on_apply_attempt": {
+          "description": "Run after either outcome of an `apply`, with a versioned event JSON on\nstdin containing the plan path, checksum, outcome and ledger entry or\nerror.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "on_drift": {
+          "description": "Run when `verify` finds drift, with the drift report JSON on stdin.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Unmanaged": {
+      "description": "How to treat objects in the database that the declarations do not mention\n(SPEC §8.2).\n\n`Ignore` is the default because it is the precondition for gradual adoption:\npbps has to be able to share a database with tooling that was there first.",
+      "type": "string",
+      "enum": [
+        "ignore",
+        "warn",
+        "error"
+      ]
+    },
+    "Dev": {
+      "description": "The optional throwaway engine of SPEC §9.3.\n\n# Why it is always optional\n\nThe air-gap promise stands: with no dev database the preview degrades to\nlightweight normalization and says so. This differs from Atlas, where a dev\ndatabase is required for many operations — and the difference is deliberate,\nbecause a tool that cannot answer without Docker cannot be used where this\none has to be.\n\nA dev-verified plan is still a **preview**. Applyable plans come only from\n`plan --db` against the target, and this does not move that line.",
+      "type": "object",
+      "properties": {
+        "url_env": {
+          "description": "The name of an environment variable holding a connection string to a\nthrowaway server — never the string itself, for the reason\n[`Environment`] gives.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "docker": {
+          "description": "A container image to start and throw away, e.g.\n`mcr.microsoft.com/mssql/server:2022-latest`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "docker": {
+              "type": "string"
+            },
+            "url_env": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "docker"
+          ]
+        },
+        {
+          "properties": {
+            "url_env": {
+              "type": "string"
+            },
+            "docker": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "url_env"
+          ]
+        }
+      ]
+    },
+    "ResolverProfile": {
+      "description": "Only a configured source can be selected; an image suggestion is not an\nacquisition instruction. Neither variant can represent two backends.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "image": {
+              "description": "Explicitly trusted image reference, including an internal registry.\nRuntime acquisition must still pin and qualify the actual content.",
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:-]+(/[A-Za-z0-9_.:-]+)*(@sha256:[A-Fa-f0-9]+)?$"
+            },
+            "pull": {
+              "$ref": "#/$defs/PullPolicy",
+              "default": "never"
+            },
+            "baseline": {
+              "description": "As a server entry's: the SQL file that stages the objects outside\nthe managed set (#1673).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            },
+            "outside_writes": {
+              "$ref": "#/$defs/OutsideWrites"
+            },
+            "kind": {
+              "type": "string",
+              "const": "docker"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "image"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "url_env": {
+              "description": "Separate scratch credentials, read only when resolution is needed.",
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+            },
+            "standard": {
+              "description": "The state the scratch database is put into at the start of each\nrun and back into at release, where it differs from what\n`CREATE DATABASE ... TEMPLATE template0` makes (#1708). Omitted, a\nrun uses that.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ScratchStandard"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "baseline": {
+              "description": "A SQL file, relative to the project root, that creates on scratch\nthe objects outside the managed set that managed objects reference\n(#1673). It runs on scratch only, before any managed object, and\neach object it creates is compared with the target.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            },
+            "outside_writes": {
+              "$ref": "#/$defs/OutsideWrites"
+            },
+            "kind": {
+              "type": "string",
+              "const": "server"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "url_env"
+          ]
+        }
+      ]
+    },
+    "PullPolicy": {
+      "oneOf": [
+        {
+          "description": "Use an image already present on the runner.",
+          "type": "string",
+          "const": "never"
+        },
+        {
+          "description": "Permit trusted acquisition only when the selected image is absent.",
+          "type": "string",
+          "const": "if_missing"
+        }
+      ]
+    },
+    "OutsideWrites": {
+      "description": "What a baseline may change outside the scratch database (#1674).",
+      "oneOf": [
+        {
+          "description": "A baseline that changes catalog state outside the scratch database\n(a role, another database's settings) is rolled back and refused\n(DEC-1673.1).",
+          "type": "string",
+          "const": "refuse"
+        },
+        {
+          "description": "Such changes are kept and not checked. pbps does not clean them up: a\nDocker scratch drops them with its container, and on a server scratch\nthey are the operator's. The evidence records the choice.",
+          "type": "string",
+          "const": "allow"
+        }
+      ]
+    },
+    "ScratchStandard": {
+      "description": "A scratch database's declared standard state. Only what the scratch\naccount can change and `DROP OWNED` does not undo is declarable: the\ndatabase's settings, comment and connection limit, and `public`'s\ncomment and grants. The database's own ACL is not: the run keeps it as\nit found it (DEC-1708.1).",
+      "type": "object",
+      "properties": {
+        "settings": {
+          "description": "`ALTER DATABASE <scratch> SET`: operational settings such as\ntimeouts. The settings that decide the resolver's answer come from the\ntarget, as the deployer's session settings, and override these.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SettingValue"
+          }
+        },
+        "comment": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "connection_limit": {
+          "description": "`-1` for no limit. Never `0`, which would lock the scratch account out\nof its own database.",
+          "type": "integer",
+          "format": "int32",
+          "anyOf": [
+            {
+              "const": -1
+            },
+            {
+              "minimum": 1,
+              "maximum": 2147483647
+            }
+          ]
+        },
+        "public": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicStandard"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "SettingValue": {
+      "type": [
+        "string",
+        "number",
+        "boolean"
+      ]
+    },
+    "PublicStandard": {
+      "description": "initdb's `public` schema in the scratch database.",
+      "type": "object",
+      "properties": {
+        "comment": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "grants": {
+          "description": "Granted by `public`'s owner, beyond initdb's `USAGE` to `PUBLIC`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PublicGrant"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "PublicGrant": {
+      "type": "object",
+      "properties": {
+        "to": {
+          "type": "string",
+          "minLength": 1
+        },
+        "privileges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SchemaPrivilege"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "to",
+        "privileges"
+      ]
+    },
+    "SchemaPrivilege": {
+      "type": "string",
+      "enum": [
+        "USAGE",
+        "CREATE"
+      ]
+    },
+    "Policies": {
+      "description": "The whole block. Absent means every rule at its default and nothing\nsuppressed.",
+      "type": "object",
+      "properties": {
+        "rules": {
+          "description": "Rule id to its setting.\n\nA map in Rust, a closed list of keys in the editor schema: see\n[`rules_schema`]. `BTreeMap<String, _>` derives to \"any key\", which\nblessed `naming.tabel` in the editor and left the typo to be found by\n`pbps validate` — the opposite of what a generated schema is for\n(DECISIONS 172).",
+          "type": "object",
+          "properties": {
+            "naming.table": {
+              "description": "Checks a table's name (without its schema) matches `pattern`. Takes pattern.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "description": "A regular expression the name must match in full.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "naming.column": {
+              "description": "Checks a column's name matches `pattern`. Takes pattern.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "description": "A regular expression the name must match in full.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "naming.index": {
+              "description": "Checks an index's name matches `pattern`. Takes pattern.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "description": "A regular expression the name must match in full.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "naming.constraint": {
+              "description": "Checks a named constraint (primary key, unique, foreign key, check) matches `pattern`. Takes pattern.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "description": "A regular expression the name must match in full.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "data.max-rows": {
+              "description": "Checks a `data:` block declares at most `rows` rows — past that it stops looking like reference data (ADR-0004). Takes rows.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    },
+                    "rows": {
+                      "description": "The row count above which a block is reported.",
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "column.no-deprecated-type": {
+              "description": "Checks a column does not use a type the engine has deprecated (text, ntext, image).",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "change.expand-contract": {
+              "description": "Checks one revision does not both add and drop or narrow in the same table, which usually wants expand/contract staging (SPEC §13.3).",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "change.narrowing-on-data": {
+              "description": "Checks a type narrowing depends on the data already stored; the pre-flight probe measures it at apply time.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "grant.widen": {
+              "description": "Checks a grant widens what a role can do (ADR-0005), for a project that wants the label at a severity of its own.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "change.window": {
+              "description": "Checks a connected plan is computed inside an allowed change window: `offset` (`+08:00`) and `allow` (`mon-fri 09:00-17:00`, ...). Takes offset, allow.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    },
+                    "offset": {
+                      "description": "The UTC offset the windows are written in (`+08:00`).",
+                      "type": "string"
+                    },
+                    "allow": {
+                      "description": "Windows such as `mon-fri 09:00-17:00`.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "suppress": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Suppression"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Suppression": {
+      "description": "One suppression: a rule that does not fire, where, why, and until when.",
+      "type": "object",
+      "properties": {
+        "rule": {
+          "type": "string",
+          "enum": [
+            "naming.table",
+            "naming.column",
+            "naming.index",
+            "naming.constraint",
+            "data.max-rows",
+            "column.no-deprecated-type",
+            "change.expand-contract",
+            "change.narrowing-on-data",
+            "grant.widen",
+            "change.window"
+          ]
+        },
+        "on": {
+          "description": "The object it applies to (`dbo.customer`, `role app_reader`). Absent\nmeans the whole project.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "Why. The field an audit reads; blank is refused.",
+          "type": "string"
+        },
+        "until": {
+          "description": "`YYYY-MM-DD`. From that day on the suppression stops applying and the\nfinding comes back at its configured severity (ADR-0008 decision 4).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rule",
+        "reason"
+      ]
+    }
+  },
+  "x-pbps-schema-version": 39,
+  "x-pbps-tool-version": "0.0.0"
+}

@@ -41,7 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 38;
+pub const SCHEMA_VERSION: u32 = 39;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
@@ -52,6 +52,7 @@ pub const SCHEMA_VERSION: u32 = 38;
 // 36: a server resolver's scratch `standard:` (issue #1708).
 // 37: a server resolver's `baseline:` file (issue #1673).
 // 38: a parent's `partitions: external` (issue #1533).
+// 39: a Docker resolver's `baseline:`, and either's `outside_writes:` (issue #1674).
 // 26: index, key and unique-constraint `storage_parameters` (issue #1442).
 // 25: a table's `storage_parameters:` (issue #1441).
 // 24: a table's `replica_identity:` (issue #1444).
@@ -441,6 +442,19 @@ mod tests {
             ),
             (
                 serde_json::json!({"kind": "docker", "image": "pg:18", "baseline": "db/baseline.sql"}),
+                true,
+            ),
+            // A baseline's outside-write choice, on either kind (#1674).
+            (
+                serde_json::json!({"kind": "docker", "image": "pg:18", "outside_writes": "allow"}),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "server", "url_env": "S", "outside_writes": "refuse"}),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "server", "url_env": "S", "outside_writes": "sometimes"}),
                 false,
             ),
         ] {
