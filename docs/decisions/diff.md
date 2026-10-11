@@ -4384,3 +4384,63 @@ Pinned by `a_partitioned_parent_is_renamed`, by
 `an_unlogged_partition_under_a_permanent_key_is_refused_by_name` for #1613,
 and by the CLI's `a_partitioned_parent_is_renamed_through_the_cli`, on 18 and
 on 16.
+
+<a id="dec-1767-1"></a>
+
+**DEC-1767.1. A connected PostgreSQL plan hoists the one later table rename
+that moves a carried name's holder away ahead of the cross-schema rename that
+carries an object onto that name; nothing else moves, and a holder one hoist
+does not clear is still refused (#1767).**
+
+`ALTER TABLE ... SET SCHEMA` carries a table's indexes and owned sequences
+under their catalog names, and PostgreSQL refuses one whose name the
+destination holds (#1749, #1765). The declarations know neither an owned
+sequence's name nor, after a rename, an unnamed key's index name, so
+`rename_order` cannot order a move after the rename that frees such a name.
+For example, `s2.b`, once `s2.a`, still owns `s2.a_id_seq`, and `s1.a -> s2.a`
+carries `s1.a_id_seq` onto it. The differ ran that move first, and the plan
+was refused, although running `s2.b -> s3.b` first frees the name.
+
+The replay that refuses these clashes already holds the catalog facts. So at
+the first move it refuses, each later table rename is tried just before the
+move. The first one that leaves the whole plan with fewer clashes is kept,
+and the replay runs again for the next clash.
+
+The rename moves only across other table renames, so no name a rename waits
+for is taken from it:
+
+- none of them may free a name it takes on its way. That is its target and,
+  when it changes schema and name together, its old name in the target
+  schema, where `SET SCHEMA` puts it before `RENAME TO`;
+- none of them may take its target on their own way.
+
+A drop or any other change in between keeps the order. Two moves that each
+wait for the other are left as they are. Every case that stays is refused
+with the two-plan remedy, as before.
+
+The replay that judges an order also checks what each rename takes as it
+runs, both names, against the occupants and the tables and views still
+there, all read from the catalog (#1785 review). Table names alone did not
+show that a hoisted rename's target was an index which a table move it
+crossed carries away. With the check, an order that runs a rename before
+whatever frees its name has a clash, and the hoist does not keep it. The
+same check refuses a rename into a name the differ's own order leaves
+held, which used to fail at apply.
+
+The hoist runs where the occupant check runs, before the module passes. It
+runs again, over the same catalog reads, after the last pass that reorders
+the plan: a view rebuilt beside a dependent view the declarations leave
+alone makes `account_for_module_dependents` plan the revision again, in the
+differ's order, which undid it (#1785 review).
+
+The alternative was the search DEC-1366.1 gives SQL Server, which tries every
+order of the renames among the drops. Sharing it would mean rebuilding a walk
+written around `sys.objects` for PostgreSQL's relation namespace, for a case
+that needs a table renamed in an earlier plan and a cross-schema shuffle in
+this one. A holder that only a chain of moves clears stays refused until a
+plan needs it.
+
+Pinned by `a_rename_moving_a_carried_names_holder_away_is_hoisted_ahead_of_the_move`,
+by `a_rename_that_moves_a_carried_names_holder_away_runs_first_on_both_servers`,
+on 16 and on 18, and by
+`a_hoisted_rename_stays_ahead_when_a_view_rebuild_plans_again`.

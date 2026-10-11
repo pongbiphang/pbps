@@ -679,17 +679,25 @@ fn roles_are_the_clusters(question: &str) -> anyhow::Error {
 /// Refuses a name this plan creates that a PostgreSQL relation-namespace
 /// entry outside the catalog inventory already holds (#951). SQL Server's
 /// `sys.objects` walk also orders the plan, so it runs after every pass that
-/// changes the plan: [`order_created_object_names`].
+/// changes the plan: [`order_created_object_names`]. On PostgreSQL it first
+/// hoists a table rename that moves a carried object's holder away, where
+/// that clears the plan (#1767, DEC-1767.1). What it read is returned, for
+/// [`NameFacts::order_and_refuse`] again once the module passes, which may
+/// plan the revision afresh in the differ's order, have run.
 pub async fn refuse_created_name_occupants(
     conn: &mut Conn,
-    cs: &ChangeSet,
+    cs: &mut ChangeSet,
     label: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<NameFacts>> {
     match conn.driver() {
         Driver::Postgres => {
+            // The names it creates, and those its table renames take on
+            // their way (#1785 review).
+            let mut asked = crate::deploy::created_relation_names(cs);
+            asked.extend(crate::deploy::rename_claims(cs));
             let mut occupants = pbps_pg::catalog::relation_name_occupants(
                 conn,
-                &crate::deploy::created_relation_names(cs),
+                &asked,
                 &crate::deploy::transferred_tables(cs),
             )
             .await?;
@@ -707,10 +715,34 @@ pub async fn refuse_created_name_occupants(
                     occupants.push(found);
                 }
             }
-            let relations = pbps_pg::catalog::relations_at(conn, &carried).await?;
-            crate::deploy::refuse_uninventoried_occupants(cs, &occupants, &relations, label)
+            let mut at_names = carried;
+            at_names.extend(crate::deploy::rename_claims(cs));
+            let facts = NameFacts {
+                relations: pbps_pg::catalog::relations_at(conn, &at_names).await?,
+                occupants,
+            };
+            facts.order_and_refuse(cs, label)?;
+            Ok(Some(facts))
         }
-        Driver::Mssql => Ok(()),
+        Driver::Mssql => Ok(None),
+    }
+}
+
+/// What [`refuse_created_name_occupants`] read of a PostgreSQL target: the
+/// name occupants the plan's names and moves meet, and the tables and views
+/// at the carried names.
+pub struct NameFacts {
+    occupants: Vec<pbps_pg::catalog::NameOccupant>,
+    relations: Vec<(TableName, &'static str)>,
+}
+
+impl NameFacts {
+    /// Hoists a table rename that moves a carried object's holder away, where
+    /// one hoist clears the plan (#1767, DEC-1767.1), then refuses what is
+    /// left (#951, #1749, #1765).
+    pub fn order_and_refuse(&self, cs: &mut ChangeSet, label: &str) -> anyhow::Result<()> {
+        crate::deploy::order_carried_moves(cs, &self.occupants, &self.relations);
+        crate::deploy::refuse_uninventoried_occupants(cs, &self.occupants, &self.relations, label)
     }
 }
 
