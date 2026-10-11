@@ -21639,3 +21639,142 @@ mod compatibility;
 fn compatibility_core_contract() {
     compatibility::run(pbps_db::Driver::Mssql, "PBPS_TEST_DB", "mssql2025");
 }
+
+#[path = "support/pull_identity.rs"]
+mod pull_identity;
+
+#[test]
+#[ignore = "needs live SQL Server"]
+fn unchanged_forced_pull_preserves_identities_rows_and_history() {
+    pull_identity::unchanged(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live SQL Server"]
+fn forced_pull_mints_only_added_objects() {
+    pull_identity::additions(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live SQL Server"]
+fn yaml_identity_changes_still_require_intent_and_risk_approval() {
+    pull_identity::intent_and_drift(&std::env::var("PBPS_TEST_DB").unwrap(), false, false);
+}
+
+#[test]
+#[ignore = "needs live SQL Server"]
+fn forced_pull_publishes_drift_without_accepting_it() {
+    pull_identity::intent_and_drift(&std::env::var("PBPS_TEST_DB").unwrap(), false, true);
+}
+
+#[test]
+fn forced_pull_refuses_damaged_identity_history_before_connecting() {
+    for (name, contents, expected) in [
+        ("malformed", b"not JSON".as_slice(), "malformed"),
+        (
+            "version",
+            b"{\"version\":999,\"tables\":{},\"columns\":{}}".as_slice(),
+            "inconsistent",
+        ),
+        (
+            "orphan",
+            b"{\"version\":1,\"columns\":{\"c_0rphan\":\"dbo.missing.id\"}}".as_slice(),
+            "inconsistent",
+        ),
+        ("unreadable", b"\xff".as_slice(), "cannot read"),
+    ] {
+        let d = Demo::new(&format!("pull-ids-{name}"));
+        d.table(ONE_COLUMN);
+        std::fs::write(d.ids_path(), contents).unwrap();
+        let out = d.run(&[
+            "pull",
+            "--force",
+            "--db",
+            "Server=127.0.0.1,1;Database=missing",
+        ]);
+        assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
+        assert!(stderr(&out).contains(expected), "{}", stderr(&out));
+        assert!(
+            stderr(&out).contains("restore the identity file from git"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(!stderr(&out).contains("cannot connect"), "{}", stderr(&out));
+        assert_eq!(std::fs::read(d.ids_path()).unwrap(), contents);
+        assert_eq!(
+            std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap(),
+            ONE_COLUMN
+        );
+    }
+    let d = Demo::new("pull-ids-directory");
+    std::fs::create_dir(d.ids_path()).unwrap();
+    let out = d.run(&[
+        "pull",
+        "--force",
+        "--db",
+        "Server=127.0.0.1,1;Database=missing",
+    ]);
+    assert_eq!(code(&out), 1);
+    assert!(
+        stderr(&out).contains("cannot read identity file"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(d.ids_path().is_dir());
+}
+
+#[test]
+#[cfg(unix)]
+fn forced_pull_distinguishes_dangling_identity_links_from_absent_history() {
+    let d = Demo::new("pull-ids-dangling-link");
+    d.table(ONE_COLUMN);
+    let initialized = d.run(&["plan"]);
+    assert_eq!(code(&initialized), 0, "{}", stderr(&initialized));
+    let target = d.dir.join("ids-history.json");
+    std::fs::rename(d.ids_path(), &target).unwrap();
+    std::os::unix::fs::symlink("ids-history.json", d.ids_path()).unwrap();
+    let valid = d.run(&["validate"]);
+    assert_eq!(code(&valid), 0, "{}", stderr(&valid));
+    d.commit();
+    std::fs::remove_file(&target).unwrap();
+
+    let args = [
+        "pull",
+        "--force",
+        "--db",
+        "Server=127.0.0.1,1;Database=missing",
+    ];
+    let refused = d.run(&args);
+    assert_eq!(code(&refused), 1);
+    let error = stderr(&refused);
+    assert!(error.contains("cannot read identity file"), "{error}");
+    assert!(
+        error.contains("restore the identity file from git"),
+        "{error}"
+    );
+    assert!(!error.contains("cannot connect"), "{error}");
+    assert_eq!(
+        std::fs::read_link(d.ids_path()).unwrap(),
+        std::path::Path::new("ids-history.json")
+    );
+    assert!(!target.exists());
+    assert_eq!(
+        std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap(),
+        ONE_COLUMN
+    );
+
+    // A genuinely absent entry still reaches the connection for new adoption.
+    std::fs::remove_file(d.ids_path()).unwrap();
+    let absent = d.run(&args);
+    assert_eq!(code(&absent), 1);
+    let error = stderr(&absent);
+    assert!(error.contains("cannot connect"), "{error}");
+    assert!(!error.contains("cannot read identity file"), "{error}");
+    assert!(!d.ids_path().exists());
+}
+
+#[test]
+#[ignore = "needs live SQL Server"]
+fn forced_pull_preserves_applied_column_rename_and_drop_history() {
+    pull_identity::column_history(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
