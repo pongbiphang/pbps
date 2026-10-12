@@ -36,7 +36,7 @@ The differ sorts every planned change by, in order:
    | 14 | `CreateModule`, `AlterModule`; `PublicExecution` immediately after its routine's create (#687) |
    | 15 | `CreateRole` |
    | 16 | `Grant` |
-   | 17 | `SetDataMode` |
+   | 17 | `SetDataMode`, `SetEnsureKeys` |
 
 2. **A rank inside the class**, `sort_class` and `dependency_rank` in the same
    file:
@@ -204,6 +204,7 @@ requirement is common to all of them, so it is listed once,
 | `PublicExecution` | 14, at its routine's create rank | The routine exists | `PUBLIC`'s execute on a routine, settled in the statement after its `CREATE` (#687) |
 | `Grant` | 16 | The role and the target exist | A permission |
 | `SetDataMode` | 17 | The table's rows written | The table's data mode |
+| `SetEnsureKeys` | 17 | The table's rows written | The table's managed ensure keys |
 
 ## Pairs that interact
 
@@ -314,7 +315,7 @@ and the expression-bearing changes that need a function.
 | `CreateModule` or `AlterModule` → `Grant` on the routine | fixed | class 14 before 16. P: a rebuild's lost grants are restated after it | ✓ ADR-0010 §5 |
 | `CreateModule` or `AlterModule` → `PublicExecution` on the routine | fixed | same class, same create rank and subject: the next statement, so an autocommit `--sql` script never leaves the routine executable by `PUBLIC` past its own `CREATE` | ✓ #687 |
 | Tightening → primary key or unique key over the column | fixed | class 9 before 13 | ✓ |
-| Row writes → `SetDataMode` of their table | fixed | class 11 and 12 before 17 | ✓ |
+| Row writes → `SetDataMode` / `SetEnsureKeys` of their table | fixed | class 11 and 12 before 17 | ✓ |
 | Module → module that names it | content, over-approximated | `creation_order_with`, lexed names (DECISIONS 315) | ✓ |
 | Function created or rebuilt → check, filtered index or set default calling it | content, over-approximated | `after_the_rebuilds`: after the last function create, when its text names the function | ✓ DEC-942.1, DEC-1364.1 |
 | Function created or rebuilt → `AlterColumnExpression` calling it | content, over-approximated | `after_the_rebuilds`, when its text names the function | ✓ DEC-1168.1, DEC-1364.1 |

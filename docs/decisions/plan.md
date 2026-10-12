@@ -581,3 +581,24 @@ exact tables, subsequent no-ops and drift, checksum/baseline refusals, and a
 rename combined with takeover and its approval gate.
 An intervening row edit is refused without adopting the scope; the ordinary
 failed-attempt audit entry remains, as SPEC §7.5 requires.
+
+
+<a id="dec-1808-1"></a>
+
+**DEC-1808.1. Changes to recorded ensure keys are explicit zero-SQL plan
+entries (#1808; ADR-0004).** The connected differ compares the union of
+recorded and declared rows, so matching added keys are already present in
+its baseline, while removed ensure keys need no DELETE. Neither is proof
+that the recorded management scope is unchanged.
+
+Compare the two ensure scopes by retained table uid and carry
+`SetEnsureKeys { table, from, to }` through connected diff re-derivations,
+using the final table name and sorted key sets. First takeovers, mode
+switches, new tables and same-name replacements are different transitions.
+The scope change emits no SQL and adds no data-update/delete risk; it uses
+the ordinary checksum, approval, union baseline check, deployment lock and
+post-apply ledger write. It sorts with `SetDataMode` after row writes. The
+saved-plan format becomes 37 for the new variant and to refuse older plans
+that can silently omit an ensure scope transition. Both live engines test
+additions, removals, empty scopes, no-ops, row writes, renames and checksum
+refusals; a stale baseline retains the failed-attempt audit per SPEC §7.5.

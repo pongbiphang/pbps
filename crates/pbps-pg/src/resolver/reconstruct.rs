@@ -366,6 +366,7 @@ impl Reconstruction {
                 | Change::PublicExecution { .. }
                 | Change::InsertRow { .. }
                 | Change::SetDataMode { .. } => {}
+                Change::SetEnsureKeys { .. } => {}
                 // A bootstrap from an empty schema has no renames, drops or
                 // alterations; one that does is not a bootstrap.
                 Change::DropTable { .. }

@@ -2001,6 +2001,7 @@ fn after_the_alterations(change: &pbps_model::Change) -> bool {
             | pbps_model::Change::Grant { .. }
             | pbps_model::Change::PublicExecution { .. }
             | pbps_model::Change::SetDataMode { .. }
+            | pbps_model::Change::SetEnsureKeys { .. }
     )
 }
 

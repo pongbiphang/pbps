@@ -360,6 +360,7 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::UpdateRow { .. }
                 | Change::DeleteRow { .. }
                 | Change::SetDataMode { .. }
+                | Change::SetEnsureKeys { .. }
                 | Change::CreateModule { .. }
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }

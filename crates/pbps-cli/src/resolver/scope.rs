@@ -270,6 +270,7 @@ pub(crate) fn planned_schema_grants(
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }

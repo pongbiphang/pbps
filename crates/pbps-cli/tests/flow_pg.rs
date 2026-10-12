@@ -26,6 +26,24 @@ mod data_takeovers;
 
 #[test]
 #[ignore = "needs live pg"]
+fn ensure_scope_changes_record_matching_additions_and_removals() {
+    data_takeovers::ensure_scope(&server(), true);
+}
+
+#[test]
+#[ignore = "needs live pg"]
+fn ensure_scope_changes_refuse_edited_plans_and_changed_union_rows() {
+    data_takeovers::ensure_refusals(&server(), true);
+}
+
+#[test]
+#[ignore = "needs live pg"]
+fn ensure_scope_changes_compose_with_row_writes_and_table_renames() {
+    data_takeovers::ensure_writes_and_rename(&server(), true);
+}
+
+#[test]
+#[ignore = "needs live pg"]
 fn matching_rows_still_record_the_first_data_takeover() {
     data_takeovers::matching(&server(), true);
 }
@@ -1189,6 +1207,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::UpdateRow { .. }
             | change @ pbps_model::Change::DeleteRow { .. }
             | change @ pbps_model::Change::SetDataMode { .. }
+            | change @ pbps_model::Change::SetEnsureKeys { .. }
             | change @ pbps_model::Change::CreateModule { .. }
             | change @ pbps_model::Change::AlterModule { .. }
             | change @ pbps_model::Change::DropModule { .. }

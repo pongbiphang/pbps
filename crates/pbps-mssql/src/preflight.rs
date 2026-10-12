@@ -425,6 +425,7 @@ impl<'a> AsStored<'a> {
                 | Change::UpdateRow { .. }
                 | Change::DeleteRow { .. }
                 | Change::SetDataMode { .. }
+                | Change::SetEnsureKeys { .. }
                 | Change::CreateModule { .. }
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }
@@ -649,6 +650,7 @@ impl<'a> AsStored<'a> {
                 | Change::DropModule { .. }
                 // Setting the mode emits nothing and names nothing.
                 | Change::SetDataMode { .. }
+                | Change::SetEnsureKeys { .. }
                 // A role is a principal, not an object: nothing here names a
                 // table or a column, and nothing here moves a name a probe
                 // could ask about.
@@ -1138,6 +1140,7 @@ fn build(
         | Change::InsertRow { .. }
         | Change::UpdateRow { .. }
         | Change::SetDataMode { .. }
+        | Change::SetEnsureKeys { .. }
         // A permission change fails on nothing in the data; the engine refuses
         // an impossible grant inside the transaction.
         | Change::CreateRole { .. }

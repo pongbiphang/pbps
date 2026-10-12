@@ -866,6 +866,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         | Change::UpdateRow { .. }
         | Change::DeleteRow { .. }
         | Change::SetDataMode { .. }
+        | Change::SetEnsureKeys { .. }
         | Change::CreateRole { .. }
         | Change::DropRole { .. }
         | Change::RenameRole { .. }

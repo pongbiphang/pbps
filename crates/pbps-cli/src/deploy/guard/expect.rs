@@ -89,6 +89,7 @@ impl<'a> TableChanges<'a> {
                 | Change::UpdateRow { .. }
                 | Change::DeleteRow { .. }
                 | Change::SetDataMode { .. }
+                | Change::SetEnsureKeys { .. }
                 | Change::CreateModule { .. }
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }

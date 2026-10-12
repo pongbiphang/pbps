@@ -687,6 +687,38 @@ pub fn plan_base(
     Ok(base)
 }
 
+/// Scope changes for retained tables whose mode stays `ensure`.
+///
+/// Scopes use each side's own names. Matching by uid both carries a rename
+/// to its final name and excludes same-name replacement tables: the latter
+/// receive their scope with their create, not from the dropped identity.
+/// Observed rows are deliberately not an input; the union read can contain
+/// an added key already, without that key ever having been recorded.
+pub fn ensure_key_changes(
+    recorded: &DataScopes,
+    declared: &DataScopes,
+    recorded_ids: &crate::IdsFile,
+    declared_ids: &crate::IdsFile,
+) -> Vec<crate::Change> {
+    declared_ids
+        .tables
+        .iter()
+        .filter_map(|(uid, name)| {
+            let previous_name = recorded_ids.tables.get(uid)?;
+            let before = recorded.get(previous_name)?;
+            let after = declared.get(name)?;
+            (before.mode == DataMode::Ensure
+                && after.mode == DataMode::Ensure
+                && before.keys != after.keys)
+                .then(|| crate::Change::SetEnsureKeys {
+                    table: name.clone(),
+                    from: before.keys.clone(),
+                    to: after.keys.clone(),
+                })
+        })
+        .collect()
+}
+
 /// First-time reference-data scopes on tables that already exist live.
 ///
 /// All inputs use the live table names; callers resolve the result to the
@@ -1845,5 +1877,59 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn ensure_scope_changes_follow_identity_and_ignore_other_transitions() {
+        use crate::{Change, IdsFile, Uid, UidKind};
+        let uid = Uid::generate(UidKind::Table);
+        let mut before_ids = IdsFile::default();
+        before_ids.tables.insert(uid.clone(), name());
+        let scope = |mode, keys: &[&str]| -> DataScopes {
+            [(
+                name(),
+                DataScope {
+                    mode,
+                    keys: keys.iter().copied().map(RowKey::from).collect(),
+                },
+            )]
+            .into()
+        };
+        let before = scope(DataMode::Ensure, &["TW"]);
+        for keys in [vec!["TW", "JP"], vec!["JP"], vec![]] {
+            let after = scope(DataMode::Ensure, &keys);
+            assert_eq!(
+                ensure_key_changes(&before, &after, &before_ids, &before_ids),
+                vec![Change::SetEnsureKeys {
+                    table: name(),
+                    from: before[&name()].keys.clone(),
+                    to: after[&name()].keys.clone(),
+                }]
+            );
+        }
+        let after = scope(DataMode::Ensure, &["JP"]);
+        for (old, new) in [
+            (before.clone(), before.clone()),
+            (DataScopes::new(), after.clone()),
+            (before.clone(), DataScopes::new()),
+            (scope(DataMode::Exact, &["TW"]), after.clone()),
+            (before.clone(), scope(DataMode::Exact, &["JP"])),
+        ] {
+            assert!(ensure_key_changes(&old, &new, &before_ids, &before_ids).is_empty());
+        }
+        let mut after_ids = before_ids.clone();
+        let renamed: TableName = "dbo.renamed".parse().unwrap();
+        after_ids.tables.insert(uid.clone(), renamed.clone());
+        let renamed_scope = [(renamed.clone(), after[&name()].clone())].into();
+        assert_eq!(
+            ensure_key_changes(&before, &renamed_scope, &before_ids, &after_ids)[0].table(),
+            Some(&renamed)
+        );
+        after_ids.tables.clear();
+        after_ids
+            .tables
+            .insert(Uid::generate(UidKind::Table), name());
+        assert!(ensure_key_changes(&before, &after, &before_ids, &after_ids).is_empty());
+        assert!(ensure_key_changes(&before, &after, &IdsFile::default(), &after_ids).is_empty());
+        assert!(ensure_key_changes(&before, &after, &before_ids, &IdsFile::default()).is_empty());
     }
 }

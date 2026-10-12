@@ -225,6 +225,7 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::UpdateRow { .. }
                 | Change::DeleteRow { .. }
                 | Change::SetDataMode { .. }
+                | Change::SetEnsureKeys { .. }
                 | Change::CreateModule { .. }
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }
@@ -322,6 +323,7 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::UpdateRow { .. }
                 | Change::DeleteRow { .. }
                 | Change::SetDataMode { .. }
+                | Change::SetEnsureKeys { .. }
                 | Change::CreateModule { .. }
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }

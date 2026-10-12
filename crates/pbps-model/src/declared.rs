@@ -579,6 +579,7 @@ impl Declared {
                 | Change::UpdateRow { .. }
                 | Change::DeleteRow { .. }
                 | Change::SetDataMode { .. }
+                | Change::SetEnsureKeys { .. }
                 | Change::CreateRole { .. }
                 | Change::DropRole { .. }
                 | Change::RenameRole { .. }

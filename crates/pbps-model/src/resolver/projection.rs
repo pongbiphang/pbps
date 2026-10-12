@@ -729,6 +729,7 @@ fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
         | Change::UpdateRow { .. }
         | Change::DeleteRow { .. }
         | Change::SetDataMode { .. }
+        | Change::SetEnsureKeys { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::CreateRole { .. }
         | Change::RenameRole { .. }
@@ -877,6 +878,7 @@ fn changes_catalog(c: &Change) -> bool {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::CreateRole { .. }
             | Change::RenameRole { .. }

@@ -421,6 +421,7 @@ impl Unchecked {
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }

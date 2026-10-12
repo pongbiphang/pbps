@@ -1631,6 +1631,7 @@ pub(crate) fn settle_public_execution(cs: &mut ChangeSet, decisions: Vec<Planned
                     matches!(
                         p.change,
                         Change::CreateRole { .. } | Change::Grant { .. } | Change::SetDataMode { .. }
+                        | Change::SetEnsureKeys { .. }
                     )
                 })
             })

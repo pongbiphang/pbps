@@ -937,6 +937,7 @@ fn diff_partial_rebuilding(
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::CreateRole { .. }
@@ -987,6 +988,7 @@ fn diff_partial_rebuilding(
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -1173,6 +1175,7 @@ fn diff_partial_rebuilding(
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -1225,6 +1228,7 @@ fn diff_partial_rebuilding(
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -2032,6 +2036,7 @@ fn recreate_referenced_foreign_keys(
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -2363,6 +2368,7 @@ fn recreate_retyped_dependents(
         | Change::UpdateRow { .. }
         | Change::DeleteRow { .. }
         | Change::SetDataMode { .. }
+        | Change::SetEnsureKeys { .. }
         | Change::CreateModule { .. }
         | Change::AlterModule { .. }
         | Change::DropModule { .. }
@@ -4215,6 +4221,7 @@ fn refuse_computed_dependencies(
                     | Change::UpdateRow { .. }
                     | Change::DeleteRow { .. }
                     | Change::SetDataMode { .. }
+                    | Change::SetEnsureKeys { .. }
                     | Change::CreateModule { .. }
                     | Change::AlterModule { .. }
                     | Change::DropModule { .. }
@@ -5306,7 +5313,8 @@ fn dependency_rank(
         | Change::DropIndex { .. }
         | Change::AddComputedColumn { .. }
         | Change::DropComputedColumn { .. }
-        | Change::SetDataMode { .. } => 0,
+        | Change::SetDataMode { .. }
+        | Change::SetEnsureKeys { .. } => 0,
         // The clustered index goes in ahead of the rest of the addition
         // class. Building it rebuilds every nonclustered index already on the
         // table, whose row locators become its key, so an index added before
@@ -5995,7 +6003,7 @@ fn order_key(c: &Change) -> u8 {
         Change::Grant { .. } => 16,
         // Emits nothing; it exists so the recorded state matches the file. Last
         // keeps it out of the way of everything that does emit.
-        Change::SetDataMode { .. } => 17,
+        Change::SetDataMode { .. } | Change::SetEnsureKeys { .. } => 17,
     }
 }
 /// The defaults an inserted row is left to: every column the row omits, the

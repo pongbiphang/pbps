@@ -557,6 +557,7 @@ pub(super) fn derive(
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::CreateRole { .. }
             | Change::RenameRole { .. }

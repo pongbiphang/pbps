@@ -856,6 +856,7 @@ impl<'a> AsStored<'a> {
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }
                 | Change::SetDataMode { .. }
+                | Change::SetEnsureKeys { .. }
                 | Change::CreateRole { .. }
                 | Change::DropRole { .. }
                 | Change::RenameRole { .. }
@@ -3573,6 +3574,7 @@ fn build(
         | Change::InsertRow { .. }
         | Change::UpdateRow { .. }
         | Change::SetDataMode { .. }
+        | Change::SetEnsureKeys { .. }
         // The pre-delete probe of ADR-0004 is built by `probes` itself, beside
         // the refusals that go with it.
         | Change::DeleteRow { .. }
@@ -3858,6 +3860,7 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }

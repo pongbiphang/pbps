@@ -112,7 +112,7 @@ same onboarding story as structure.
 
 Built: the block in the model and in `Schema` equality, the loader and `fmt`
 round trip, the model-level rules `validate` reports, the typed `InsertRow` /
-`UpdateRow` / `DeleteRow` / `SetDataMode` changes, the `data-update` and
+`UpdateRow` / `DeleteRow` / `SetDataMode` / `SetEnsureKeys` changes, the `data-update` and
 `data-delete` risk classes, the T-SQL DML, the ordering — including the
 foreign-key order *between* two tables that both declare rows — and the
 connected half: the row read-back into `state_json`, the row half of the drift
@@ -219,7 +219,10 @@ Decisions taken during implementation that this document did not anticipate:
    reports the current row count and carries the first takeover as a zero-SQL
    `SetDataMode { from: None, to: Some(mode) }` change (DEC-1803.1). Even
    when every row already matches, applying it records the new scope, and
-   subsequent verification checks those rows. The baseline is pinned under
+   subsequent verification checks those rows. Changes to an already-recorded
+   `ensure` key set similarly carry `SetEnsureKeys`, including removal of all
+   keys; they record the new scope without deleting the untracked rows
+   (DEC-1808.1). The baseline is pinned under
    the union of the recorded scope and the plan's, table by table, so a key
    added to an `ensure` block or
    an `ensure` -> `exact` switch is checked again before apply (DECISIONS

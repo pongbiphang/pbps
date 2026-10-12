@@ -5130,6 +5130,7 @@ fn refuse_unplanned_movement(
                         | pbps_model::Change::UpdateRow { .. }
                         | pbps_model::Change::DeleteRow { .. }
                         | pbps_model::Change::SetDataMode { .. }
+                        | pbps_model::Change::SetEnsureKeys { .. }
                         | pbps_model::Change::CreateModule { .. }
                         | pbps_model::Change::AlterModule { .. }
                         | pbps_model::Change::DropModule { .. }
@@ -7120,6 +7121,23 @@ pub fn cmd_plan_db(
                     planned
                 })
                 .collect();
+        // The union read is for row comparison, not evidence that a key was
+        // already managed. Carry the recorded scope transition by identity
+        // even when no DML is needed (DEC-1808.1).
+        let ensure_keys: Vec<_> = pbps_model::data::ensure_key_changes(
+            &recorded_data,
+            &declared.data_scopes(),
+            &recorded_ids,
+            &resolved.ids,
+        )
+        .into_iter()
+        .map(|change| {
+            let risks = dialect.change_risks(&change);
+            let mut planned = pbps_model::PlannedChange::new(change);
+            planned.risks = risks;
+            planned
+        })
+        .collect();
         // The read-back goes in beside the overlaid base, for the comparisons
         // the engine makes by parse tree (an attach's checks and generation
         // expressions, #1642 review).
@@ -7143,6 +7161,7 @@ pub fn cmd_plan_db(
                 // Re-derivations and resolver planning must retain the same
                 // zero-SQL changes as the initial connected plan.
                 changes.changes.extend(takeovers.iter().cloned());
+                changes.changes.extend(ensure_keys.iter().cloned());
                 changes
             })
         };
