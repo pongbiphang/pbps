@@ -6,7 +6,7 @@ use super::{
     InputManifest, ManifestError, ObjectTransition, OrderError, OrderingProof, SurfaceResolution,
 };
 use crate::{Change, ChangeSet};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(
@@ -80,6 +80,16 @@ pub struct Qualification {
     pub resolver_build: String,
     pub channels: String,
     pub runtime: ResolverRuntime,
+    /// The `system_identifier` the planning read recorded, keyed with the
+    /// project key as the other fingerprints are, never in clear (#1516).
+    /// The publication recheck holds its session to it, and apply holds
+    /// its own (#616): one target name can reach another cluster
+    /// (DEC-1685.1).
+    pub target_cluster: String,
+    /// The differences the rule accepted as named limitations rather than
+    /// refusing them, such as a differing build string (DEC-1672.1): each
+    /// name, with what it means (#1700).
+    pub limitations: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -100,6 +110,11 @@ pub struct AuthorizationCondition {
 pub enum BindingCoverage {
     CreationTimeV1,
 }
+
+/// The evidence format this build writes and reads. 3 adds the target's
+/// cluster identity and the accepted limitations to the qualification
+/// (#1516, #1700).
+pub const EVIDENCE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,7 +162,7 @@ impl ResolverEvidence {
     ) -> Result<Self, EvidenceError> {
         let after = before.project(changes, compiled, &transitions)?;
         let evidence = Self {
-            version: 2,
+            version: EVIDENCE_VERSION,
             handling: EvidenceHandling::KeyedFingerprints,
             coverage: BindingCoverage::CreationTimeV1,
             qualification,
@@ -183,7 +198,7 @@ impl ResolverEvidence {
 
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn validate(&self, changes: &ChangeSet) -> Result<(), EvidenceError> {
-        if self.version != 2
+        if self.version != EVIDENCE_VERSION
             || self.qualification.rule.is_empty()
             || self.authorization.rule.is_empty()
         {
@@ -197,11 +212,21 @@ impl ResolverEvidence {
             &q.target_build,
             &q.resolver_build,
             &q.channels,
+            &q.target_cluster,
             &self.authorization.before,
             &self.authorization.after,
         ]
         .iter()
         .any(|d| !hex(d, 64))
+        {
+            return Err(EvidenceError::Incomplete);
+        }
+        // A limitation is named and described; an empty one says nothing
+        // about what was accepted.
+        if q
+            .limitations
+            .iter()
+            .any(|(name, description)| name.is_empty() || description.is_empty())
         {
             return Err(EvidenceError::Incomplete);
         }
@@ -576,6 +601,8 @@ mod tests {
                 target_build: "03".repeat(32),
                 resolver_build: "04".repeat(32),
                 channels: "05".repeat(32),
+                target_cluster: "06".repeat(32),
+                limitations: Default::default(),
                 runtime: ResolverRuntime::Scratch {
                     scratch: ScratchSource::Server {},
                     outside_writes: OutsideWrites::Refused,
@@ -685,10 +712,16 @@ mod tests {
             );
         }
         for (pointer, value) in [
-            ("/analysis/evidence/version", json!(3)),
+            // The version before the cluster identity and the limitations.
+            ("/analysis/evidence/version", json!(2)),
             ("/analysis/evidence/coverage", json!("all-runtime-code")),
             ("/analysis/evidence/handling", json!("public")),
             ("/analysis/evidence/qualification/target_build", json!("")),
+            ("/analysis/evidence/qualification/target_cluster", json!("")),
+            (
+                "/analysis/evidence/qualification/limitations",
+                json!({ "build:server_version": "" }),
+            ),
             ("/analysis/evidence/ordering/version", json!(9)),
             (
                 "/analysis/evidence/authorization/after",
@@ -702,6 +735,40 @@ mod tests {
                 assert_ne!(parsed.checksum(), plan.checksum(), "{pointer}");
             }
         }
+    }
+
+    /// #1700: a limitation the rule accepted is sealed with the plan, read
+    /// back from its file, and covered by its checksum, so one removed by
+    /// hand is a different plan from the one approved. Negative: a plan
+    /// accepting nothing seals no limitation.
+    #[test]
+    fn an_accepted_limitation_is_sealed_and_its_removal_changes_the_checksum() {
+        let mut plan = plan();
+        let PlanAnalysis::Resolved(evidence) = &mut plan.analysis else {
+            panic!("resolved")
+        };
+        assert!(evidence.qualification.limitations.is_empty());
+        evidence.qualification.limitations.insert(
+            "build:server_version".into(),
+            "the target and the scratch report different build strings".into(),
+        );
+        plan.validate_analysis().unwrap();
+        let restored: SavedPlan =
+            serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        let PlanAnalysis::Resolved(read) = &restored.analysis else {
+            panic!("resolved")
+        };
+        assert!(read
+            .qualification()
+            .limitations
+            .contains_key("build:server_version"));
+        assert_eq!(restored.checksum(), plan.checksum());
+
+        let mut removed = serde_json::to_value(&plan).unwrap();
+        removed["analysis"]["evidence"]["qualification"]["limitations"] = json!({});
+        let removed: SavedPlan = serde_json::from_value(removed).unwrap();
+        removed.validate_analysis().unwrap();
+        assert_ne!(removed.checksum(), plan.checksum());
     }
 
     #[test]

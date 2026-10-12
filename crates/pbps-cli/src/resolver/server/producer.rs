@@ -35,6 +35,11 @@ pub(super) fn request(
     })
 }
 
+/// The domain the sealed cluster identity is keyed under. The publication
+/// recheck and apply key the identifier their own session reports the same
+/// way and compare digests (#1516, #616).
+pub(crate) const CLUSTER_RULE: &str = "pbps/pg-cluster-identity/v1";
+
 pub(super) fn fingerprint(
     key: &EnvironmentFingerprintKey,
     rule: &str,
@@ -66,6 +71,11 @@ pub(super) struct Identity {
     /// Unkeyed; fingerprinted under the environment key here.
     pub channels: String,
     pub runtime: ResolverRuntime,
+    /// The planning read's `system_identifier`, unkeyed; fingerprinted
+    /// under the environment key here (#1516).
+    pub target_cluster: String,
+    /// The differences the rule accepted, by name (#1700).
+    pub limitations: std::collections::BTreeMap<String, String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -136,6 +146,13 @@ pub(super) fn seal(
             identity.channels.as_bytes(),
         ),
         runtime: identity.runtime,
+        target_cluster: fingerprint(
+            key,
+            CLUSTER_RULE,
+            "system-identifier",
+            identity.target_cluster.as_bytes(),
+        ),
+        limitations: identity.limitations,
     };
     let evidence = ResolverEvidence::new(
         &changes,

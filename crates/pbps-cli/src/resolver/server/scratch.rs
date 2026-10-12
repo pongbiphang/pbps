@@ -110,6 +110,7 @@ pub async fn produce(
     };
     let mut run = Run {
         driver,
+        planned_identity,
         scratch,
         key: &key,
         request: &request,
@@ -315,6 +316,8 @@ enum Created {
 
 struct Run<'a> {
     driver: Driver,
+    /// The `system_identifier` the planning read recorded (DEC-1685.1).
+    planned_identity: &'a str,
     scratch: &'a str,
     key: &'a pbps_db::fingerprint::EnvironmentFingerprintKey,
     request: &'a super::ScopeRequest,
@@ -416,6 +419,7 @@ impl Run<'_> {
                 },
             );
         }
+        let limitations = report.limitations.clone();
         match report.verdict() {
             Verdict::Verified => {}
             Verdict::Mismatch(facts) => return Err(Error::Incompatible(facts)),
@@ -585,6 +589,8 @@ impl Run<'_> {
                 scratch: self.provenance.scratch.clone(),
                 outside_writes: self.provenance.outside_writes,
             },
+            target_cluster: self.planned_identity.to_owned(),
+            limitations,
         };
         let producer = super::ProducerOutcome {
             compiled,
