@@ -108,10 +108,18 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
             }
             let names: Vec<(&str, String)> = match what {
                 Naming::Table => vec![("table", name.name.clone())],
+                // A SQL Server computed column (#1174) is held beside the
+                // columns, and its name is a column name all the same (#1433).
                 Naming::Column => table
                     .columns
                     .keys()
                     .map(|c| ("column", c.clone()))
+                    .chain(
+                        table
+                            .computed
+                            .keys()
+                            .map(|c| ("computed column", c.clone())),
+                    )
                     .collect(),
                 Naming::Index => table.indexes.keys().map(|i| ("index", i.clone())).collect(),
                 Naming::Constraint => table
@@ -199,22 +207,77 @@ enum Naming {
     Constraint,
 }
 
+/// Each change's table as one identity across the plan's table renames, or
+/// `None` for a change to no table. A change is addressed by the name its
+/// table has where it runs: a drop moved ahead of its table's rename names
+/// the source, and the add after it the destination (`object_order`,
+/// `rename_order`). Walking the plan in order, a rename hands its source's
+/// identity to its destination, and a table that takes the source name
+/// afterwards is a new one.
+fn table_identities(cs: &ChangeSet) -> Vec<Option<usize>> {
+    let mut current: BTreeMap<&TableName, usize> = BTreeMap::new();
+    let mut next = 0;
+    cs.changes
+        .iter()
+        .map(|p| {
+            let name = p.change.table()?;
+            let id = *current.entry(name).or_insert_with(|| {
+                next += 1;
+                next - 1
+            });
+            if let Change::RenameTable { from, to, .. } = &p.change {
+                current.remove(from);
+                current.insert(to, id);
+            }
+            Some(id)
+        })
+        .collect()
+}
+
 /// The plan rules over a change set (the `plan` point). Each finding names
 /// the index of the change it attaches to.
 pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, Finding)> {
     let mut out = Vec::new();
 
     if let Some(live) = Live::of(policies, rules::CHANGE_EXPAND_CONTRACT, ctx) {
-        // Per table: the first add, and the first drop or narrowing.
-        let mut adds: BTreeMap<&TableName, usize> = BTreeMap::new();
-        let mut contracts: BTreeMap<&TableName, usize> = BTreeMap::new();
+        // Per table: the first add, and the first drop or narrowing, with
+        // the name the table has there. A table is one identity across the
+        // plan's renames, since a drop is addressed by the name its table
+        // has where it runs (DEC-1433.1).
+        let tables = table_identities(cs);
+        let mut adds: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut contracts: BTreeMap<usize, (usize, &TableName)> = BTreeMap::new();
+        // The column names this change set adds and drops, per table, of
+        // either kind. A computed column dropped and added back under one
+        // name is an expression rebuild, and one converted to or from a
+        // stored column keeps its name too: readers find it there
+        // throughout, so neither half counts (DEC-1433.1).
+        let mut added: BTreeSet<(usize, &str)> = BTreeSet::new();
+        let mut dropped: BTreeSet<(usize, &str)> = BTreeSet::new();
+        for (p, table) in cs.changes.iter().zip(&tables) {
+            let Some(table) = *table else { continue };
+            if let Change::AddColumn { name, .. } | Change::AddComputedColumn { name, .. } =
+                &p.change
+            {
+                added.insert((table, name));
+            }
+            if let Change::DropColumn { column, .. } = &p.change {
+                dropped.insert((table, &column.name));
+            }
+            if let Change::DropComputedColumn { name, .. } = &p.change {
+                dropped.insert((table, name));
+            }
+        }
         for (i, p) in cs.changes.iter().enumerate() {
+            let id = tables[i];
             // Named arms, not a wildcard: every other kind of change is
             // neither side of the pattern, and a new kind that is (a column
             // drop spelled differently, say) should have to be placed here.
             let contract = match &p.change {
-                Change::AddColumn { table, .. } => {
-                    adds.entry(table).or_insert(i);
+                Change::AddColumn { .. } => {
+                    if let Some(id) = id {
+                        adds.entry(id).or_insert(i);
+                    }
                     None
                 }
                 Change::DropColumn { column, .. } => Some(&column.table),
@@ -252,10 +315,21 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                     not_null: true,
                     ..
                 } => Some(table),
-                // Neither side: a computed column stores nothing, and an
-                // expression change drops and re-adds one under its name, so
-                // readers find it there throughout (#1174).
-                Change::AddComputedColumn { .. } | Change::DropComputedColumn { .. } => None,
+                // A computed column is a reader-facing name like any other:
+                // dropping one and adding another moves readers (DEC-1433.1).
+                // Under one name it is a rebuild, which `added`/`dropped`
+                // leave out.
+                Change::AddComputedColumn { name, .. } => {
+                    if let Some(id) = id
+                        && !dropped.contains(&(id, name.as_str()))
+                    {
+                        adds.entry(id).or_insert(i);
+                    }
+                    None
+                }
+                Change::DropComputedColumn { table, name, .. } => id
+                    .is_none_or(|id| !added.contains(&(id, name.as_str())))
+                    .then_some(table),
                 Change::AlterColumnType { .. }
                 | Change::CreateTable { .. }
                 | Change::DetachPartition { .. }
@@ -296,12 +370,12 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::Revoke { .. }
                 | Change::PublicExecution { .. } => None,
             };
-            if let Some(table) = contract {
-                contracts.entry(table).or_insert(i);
+            if let (Some(table), Some(id)) = (contract, id) {
+                contracts.entry(id).or_insert((i, table));
             }
         }
-        for (table, at) in contracts {
-            if adds.contains_key(table) {
+        for (id, (at, table)) in contracts {
+            if adds.contains_key(&id) {
                 let subject = table.to_string();
                 out.extend(
                     live.finding(
@@ -597,6 +671,39 @@ mod tests {
         assert!(!f.iter().any(|x| x.message.contains("`notes`")));
     }
 
+    /// A SQL Server computed column is held beside the columns (#1174), and
+    /// its name is a column name all the same (#1433).
+    #[test]
+    fn a_computed_columns_name_is_held_to_the_column_naming_rule() {
+        let mut s = schema();
+        let t = s.tables.get_mut(&"dbo.customer".parse().unwrap()).unwrap();
+        for name in ["GrossTotal", "net_total"] {
+            t.computed.insert(
+                name.to_owned(),
+                pbps_model::ComputedColumn {
+                    expression: "[a] + 1".into(),
+                    persisted: false,
+                    not_null: false,
+                },
+            );
+        }
+        let p = policies(
+            r#"{"rules": {"naming.column": {"severity": "error", "pattern": "[a-z_]+"},
+                          "column.no-deprecated-type": "off"}}"#,
+        );
+        let f = declarations(&s, &p, &ctx());
+        let messages: Vec<&str> = f.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("computed column `GrossTotal`")),
+            "{f:?}"
+        );
+        // The negative case: a matching computed name is not a finding.
+        assert!(!messages.iter().any(|m| m.contains("`net_total`")), "{f:?}");
+        assert_eq!(ids(&f), ["naming.column", "naming.column"], "{f:?}");
+    }
+
     #[test]
     fn a_suppression_removes_the_finding_and_an_expired_one_does_not() {
         let mut p = policies(
@@ -677,6 +784,143 @@ mod tests {
         // The negative cases: one of the two alone is not a contraction.
         assert!(plan(&cs(vec![add]), &Policies::default(), &ctx()).is_empty());
         assert!(plan(&cs(vec![drop]), &Policies::default(), &ctx()).is_empty());
+    }
+
+    fn add_computed(name: &str) -> PlannedChange {
+        PlannedChange::new(Change::AddComputedColumn {
+            table: table(),
+            name: name.into(),
+            computed: pbps_model::ComputedColumn {
+                expression: "[a] + 1".into(),
+                persisted: false,
+                not_null: false,
+            },
+        })
+    }
+
+    fn drop_computed(name: &str) -> PlannedChange {
+        PlannedChange::new(Change::DropComputedColumn {
+            table: table(),
+            name: name.into(),
+            computed: pbps_model::ComputedColumn {
+                expression: "[a] + 2".into(),
+                persisted: false,
+                not_null: false,
+            },
+        })
+    }
+
+    fn add_column(name: &str) -> PlannedChange {
+        PlannedChange::new(Change::AddColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            table: table(),
+            name: name.into(),
+            column: Box::new(Column::new("int".parse().unwrap())),
+        })
+    }
+
+    fn drop_column(name: &str) -> PlannedChange {
+        PlannedChange::new(Change::DropColumn {
+            uid: "c_bbbbbb".parse().unwrap(),
+            column: table().column(name),
+        })
+    }
+
+    /// A computed column is a reader-facing name (#1433): replacing one with
+    /// another, of either kind, moves readers. Under one name, as an
+    /// expression rebuild or a conversion to or from a stored column, it
+    /// does not.
+    #[test]
+    fn a_computed_column_takes_either_side_of_expand_contract_unless_its_name_stays() {
+        let fires = |changes: Vec<PlannedChange>| {
+            let f = plan(&cs(changes), &Policies::default(), &ctx());
+            assert!(
+                f.iter().all(|(_, f)| f.id == "change.expand-contract"),
+                "{f:?}"
+            );
+            f.iter().map(|(at, _)| *at).collect::<Vec<_>>()
+        };
+        // A new name in, an old name out: the finding sits on the drop.
+        assert_eq!(
+            fires(vec![add_computed("net"), drop_computed("gross")]),
+            [1]
+        );
+        assert_eq!(fires(vec![add_computed("net"), drop_column("gross")]), [1]);
+        assert_eq!(fires(vec![add_column("net"), drop_computed("gross")]), [1]);
+
+        // The name stays: a rebuild, and both conversions.
+        assert!(fires(vec![drop_computed("total"), add_computed("total")]).is_empty());
+        assert!(fires(vec![drop_computed("total"), add_column("total")]).is_empty());
+        assert!(fires(vec![drop_column("total"), add_computed("total")]).is_empty());
+
+        // Neither half alone is the pattern.
+        assert!(fires(vec![add_computed("net")]).is_empty());
+        assert!(fires(vec![drop_computed("gross")]).is_empty());
+    }
+
+    /// A drop moved ahead of its table's rename is addressed by the source
+    /// name, and the add after it by the destination (`object_order`). One
+    /// table under two names is still one table: a computed rebuild across
+    /// the rename is not an add beside another drop, and a computed swap
+    /// across it is the pattern (DEC-1433.1 review).
+    #[test]
+    fn a_table_is_one_table_across_its_rename() {
+        let old: TableName = "dbo.customer_old".parse().unwrap();
+        let rename = |from: &TableName, to: &TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: "t_cccccc".parse().unwrap(),
+                from: from.clone(),
+                to: to.clone(),
+                defaults: Vec::new(),
+            })
+        };
+        let at = |mut p: PlannedChange, t: &TableName| {
+            if let Change::DropComputedColumn { table, .. } = &mut p.change {
+                *table = t.clone();
+            } else if let Change::DropColumn { column, .. } = &mut p.change {
+                column.table = t.clone();
+            } else {
+                panic!("not a drop: {:?}", p.change);
+            }
+            p
+        };
+        let fires = |changes: Vec<PlannedChange>| {
+            plan(&cs(changes), &Policies::default(), &ctx())
+                .iter()
+                .map(|(at, _)| *at)
+                .collect::<Vec<_>>()
+        };
+
+        // A rebuild across the rename, beside a stored drop and no add.
+        assert!(
+            fires(vec![
+                at(drop_computed("total"), &old),
+                rename(&old, &table()),
+                add_computed("total"),
+                drop_column("legacy"),
+            ])
+            .is_empty()
+        );
+        // A computed name swapped across the rename: the drop under the
+        // source name is the contraction.
+        assert_eq!(
+            fires(vec![
+                at(drop_computed("gross"), &old),
+                rename(&old, &table()),
+                add_computed("net"),
+            ]),
+            [0]
+        );
+        // A table that takes the source name after the rename is another
+        // table: its drop does not pair with the renamed table's add.
+        assert!(
+            fires(vec![
+                rename(&old, &table()),
+                add_column("net"),
+                at(drop_column("gross"), &old),
+            ])
+            .is_empty()
+        );
     }
 
     /// A column that stops accepting NULL accepts less than it did, which is

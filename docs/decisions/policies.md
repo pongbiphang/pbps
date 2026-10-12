@@ -221,3 +221,35 @@ both real dialects state theirs explicitly.
 
 Every `Context` is built from a dialect, the plan point's included, so a later
 rule that reads the list cannot see an empty one by accident.
+
+<a id="dec-1433-1"></a>
+
+**DEC-1433.1. A computed column is a column to the policy rules, and a name
+that stays is not a contraction (#1433; amends #1174's placement).** #1174
+put SQL Server computed columns beside the columns, in `Table::computed`, and
+`change.expand-contract` placed their add and drop on neither side of the
+pattern: a computed column stores nothing, and an expression change drops and
+re-adds one under its name. But a reader reads a computed column by name like
+any other. A plan that drops computed `gross` and adds `net` takes one name
+away from its readers and gives them another, the move the rule exists to
+stage, and it passed silently. `naming.column` likewise read `columns` alone,
+so a computed name escaped a project's naming rule.
+
+A computed add now counts as an add and a computed drop as a contraction,
+except where the same table has the other half under the same name. That
+exemption is by name, of either kind. A drop and an add of one computed column
+is an expression rebuild. A computed column dropped and a stored column added
+under its name, or the reverse, is a conversion. In all three, readers find
+the name throughout. The exemption excuses only the computed half. A stored
+column's drop is still a contraction, as before, since its values do not come
+back by recomputing. The conversion to a computed column passes because its
+computed add is not counted as an add; with another column added to the same
+table, the rule fires on that drop as it always did.
+
+A table is one table across the plan's renames. A drop is addressed by the name
+its table has where it runs, so a drop that `object_order` or `rename_order`
+moves ahead of its table's rename names the source, while the add after it
+names the destination. The rule walks the plan in order, and a rename hands its
+source's identity to its destination. A computed rebuild across a rename is
+then still a rebuild, and a table that takes the source name afterwards is
+another table.
