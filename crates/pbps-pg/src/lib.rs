@@ -748,9 +748,19 @@ impl Dialect for Postgres {
     /// transaction with it (DEC-1577.1).
     fn validate_partition(
         &self,
+        name: &TableName,
+        partition: &Table,
+        parent: &Table,
+    ) -> Vec<DialectError> {
+        self.validate_partition_with_sources(name, partition, parent, Default::default())
+    }
+
+    fn validate_partition_with_sources(
+        &self,
         _name: &TableName,
         partition: &Table,
         parent: &Table,
+        parent_sources: pbps_model::diagnostic::ColumnSources<'_>,
     ) -> Vec<DialectError> {
         // The parent's columns as names and types only: what the parent
         // declares of them is its own validation's to report, once.
@@ -820,21 +830,32 @@ impl Dialect for Postgres {
             let Some(default) = &own.default else {
                 continue;
             };
-            match &theirs.value_source {
-                pbps_model::ValueSource::Default(parent_default) => {
-                    if parent_default == default {
-                        found.push(invalid(format!(
-                            "column `{column}`'s default is its parent's, which the partition takes; leave out its `default:`"
-                        )));
+            let (mut generated, mut identity) = (false, false);
+            for source in parent_sources.get(column, theirs) {
+                match source {
+                    pbps_model::ValueSource::Default(parent_default) => {
+                        if parent_default == default {
+                            found.push(invalid(format!(
+                                "column `{column}`'s default is its parent's, which the partition takes; leave out its `default:`"
+                            )));
+                        }
                     }
+                    pbps_model::ValueSource::Generated(_) => generated = true,
+                    pbps_model::ValueSource::Identity(_) => identity = true,
+                    pbps_model::ValueSource::None => {}
                 }
-                pbps_model::ValueSource::Generated(_) => found.push(invalid(format!(
-                    "column `{column}` is generated on its parent, and takes no default of the partition's own"
-                ))),
-                pbps_model::ValueSource::Identity(_) => found.push(invalid(format!(
-                    "column `{column}` is an identity column on its parent, and takes no default of the partition's own"
-                ))),
-                pbps_model::ValueSource::None => {}
+            }
+            // Preserve the diagnostic precedence from before the exclusive
+            // model: equality first, then generation rather than identity.
+            if generated || identity {
+                let kind = if generated {
+                    "generated"
+                } else {
+                    "an identity column"
+                };
+                found.push(invalid(format!(
+                    "column `{column}` is {kind} on its parent, and takes no default of the partition's own"
+                )));
             }
             if crate::LEXICON.expression_in(default) == pbps_dialect::Expression::Absent {
                 found.push(invalid(format!(
@@ -860,14 +881,14 @@ impl Dialect for Postgres {
     /// Returns every problem rather than the first — a schema with three
     /// unspellable columns should need one pass, not three.
     fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError> {
-        self.validate_table_sources(name, table, &Default::default())
+        self.validate_table_sources(name, table, Default::default())
     }
 
     fn validate_table_sources(
         &self,
         name: &TableName,
         table: &Table,
-        sources: &std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>>,
+        sources: pbps_model::diagnostic::ColumnSources<'_>,
     ) -> Vec<DialectError> {
         let mut found = Vec::new();
         // A partition's columns are its parent's, which it does not declare:
@@ -1048,10 +1069,7 @@ impl Dialect for Postgres {
                     continue;
                 }
             };
-            let supplied = sources
-                .get(column_name)
-                .map(Vec::as_slice)
-                .unwrap_or_else(|| std::slice::from_ref(&column.value_source));
+            let supplied = sources.get(column_name, column);
             // Sources retain YAML's canonical default/identity/generated order.
             // A valid model supplies one; diagnostic recovery may supply several.
             let (mut has_default, mut has_identity) = (false, false);
@@ -1100,7 +1118,7 @@ impl Dialect for Postgres {
         // Reference data: the rules whose answer is this engine's, ADR-0013 §2
         // among them. The model's own rules — a row's key is its identity in
         // every dialect — are `pbps_model::data::check`'s.
-        found.extend(rows::data_problems(name, table));
+        found.extend(rows::data_problems(name, table, sources));
         found
     }
 
@@ -1183,6 +1201,15 @@ impl Dialect for Postgres {
         name: &TableName,
         table: &Table,
     ) -> Vec<pbps_dialect::ImplicitRelation> {
+        self.implicit_relation_names_with_sources(name, table, Default::default())
+    }
+
+    fn implicit_relation_names_with_sources(
+        &self,
+        name: &TableName,
+        table: &Table,
+        sources: pbps_model::diagnostic::ColumnSources<'_>,
+    ) -> Vec<pbps_dialect::ImplicitRelation> {
         let mut out = Vec::new();
         if table
             .primary_key
@@ -1201,12 +1228,12 @@ impl Dialect for Postgres {
             });
         }
         for (column, spec) in &table.columns {
-            if match spec.value_source {
+            if sources.get(column, spec).iter().any(|source| match source {
                 pbps_model::ValueSource::Identity(_) => true,
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Default(_)
                 | pbps_model::ValueSource::Generated(_) => false,
-            } {
+            }) {
                 // Named after the table and the column: naming the key moves
                 // nothing here (#990). Renaming the column does not either
                 // once the sequence exists: `RENAME COLUMN` keeps the owned
@@ -1244,6 +1271,16 @@ impl Dialect for Postgres {
         table: &Table,
         suffix: u32,
     ) -> Vec<String> {
+        self.implicit_relation_fallbacks_with_sources(name, table, suffix, Default::default())
+    }
+
+    fn implicit_relation_fallbacks_with_sources(
+        &self,
+        name: &TableName,
+        table: &Table,
+        suffix: u32,
+        sources: pbps_model::diagnostic::ColumnSources<'_>,
+    ) -> Vec<String> {
         let mut out = Vec::new();
         if table
             .primary_key
@@ -1253,12 +1290,12 @@ impl Dialect for Postgres {
             out.push(generated_name(&name.name, None, &format!("pkey{suffix}")));
         }
         for (column, spec) in &table.columns {
-            if match spec.value_source {
+            if sources.get(column, spec).iter().any(|source| match source {
                 pbps_model::ValueSource::Identity(_) => true,
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Default(_)
                 | pbps_model::ValueSource::Generated(_) => false,
-            } {
+            }) {
                 out.push(generated_name(
                     &name.name,
                     Some(column),
@@ -3994,7 +4031,11 @@ mod tests {
                 .insert("a".into(), pbps_model::Column::new(ty("integer")));
             table.columns.insert("b".into(), column);
             Postgres::new()
-                .validate_table_sources(&"app.t".parse().unwrap(), &table, &sources)
+                .validate_table_sources(
+                    &"app.t".parse().unwrap(),
+                    &table,
+                    pbps_model::diagnostic::ColumnSources::new(Some(&sources)),
+                )
                 .into_iter()
                 .map(|e| e.to_string())
                 .collect::<Vec<_>>()
@@ -4065,8 +4106,11 @@ mod tests {
                 column.value_source.clone(),
             ],
         )]);
-        let found =
-            Postgres::new().validate_table_sources(&"app.t".parse().unwrap(), &table, &sources);
+        let found = Postgres::new().validate_table_sources(
+            &"app.t".parse().unwrap(),
+            &table,
+            pbps_model::diagnostic::ColumnSources::new(Some(&sources)),
+        );
         assert_eq!(found.len(), 3, "{found:?}");
         assert!(found.iter().any(|e| e.to_string().contains("nullable")));
         assert!(found.iter().any(|e| e.to_string().contains("`default:`")));

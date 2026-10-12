@@ -1765,21 +1765,20 @@ fn declaration_problems_with_sources(
     // IDENTITY on nvarchar), and the whole-schema checks below see what no
     // single declaration can.
     for (name, table) in &schema.tables {
-        for e in dialect.validate_table_sources(
-            name,
-            table,
-            conflicts.get(name).unwrap_or(&Default::default()),
-        ) {
+        let sources = pbps_model::diagnostic::ColumnSources::new(conflicts.get(name));
+        for e in dialect.validate_table_sources(name, table, sources) {
             out.push(("dialect.rejected", format!("{name}: {e}")));
         }
         // A partition's own checks and indexes, against the columns it has
         // from its parent (#1577). A missing parent is `check_partitions`'s.
-        if let Some(parent) = table
+        if let Some((parent_name, parent)) = table
             .partition_of
             .as_ref()
-            .and_then(|of| schema.tables.get(&of.parent))
+            .and_then(|of| schema.tables.get_key_value(&of.parent))
         {
-            for e in dialect.validate_partition(name, table, parent) {
+            let parent_sources =
+                pbps_model::diagnostic::ColumnSources::new(conflicts.get(parent_name));
+            for e in dialect.validate_partition_with_sources(name, table, parent, parent_sources) {
                 out.push(("dialect.rejected", format!("{name}: {e}")));
             }
         }
@@ -1824,7 +1823,7 @@ fn declaration_problems_with_sources(
     // index (or the index behind a named primary key or unique constraint)
     // shares a schema's relation namespace with tables and views on
     // PostgreSQL, but only a table's own namespace on SQL Server (issue #176).
-    for problem in pbps_dialect::check_index_names(schema, dialect) {
+    for problem in pbps_dialect::check_index_names_with_sources(schema, dialect, conflicts) {
         out.push(("schema.name-collision", problem));
     }
     // And a fourth: on SQL Server every constraint is a schema object beside
@@ -1861,7 +1860,8 @@ fn declaration_problems_with_sources(
     // key is its identity in every dialect — so they come from the model
     // rather than from `validate_table`.
     for (name, table) in &schema.tables {
-        for problem in pbps_model::data::check(name, table) {
+        let sources = pbps_model::diagnostic::ColumnSources::new(conflicts.get(name));
+        for problem in pbps_model::data::check_with_sources(name, table, sources) {
             out.push(("schema.data-invalid", problem));
         }
     }
@@ -2067,12 +2067,19 @@ fn validate_inspected(
                 }),
                 read_ids_opt(project),
             ) {
-                (Ok((before, before_schema)), Ok(now)) => Some(baseline::changed_subjects(
-                    &before,
-                    &now.unwrap_or_default(),
-                    &before_schema,
-                    &l.schema,
-                )),
+                (Ok((before, before_schema)), Ok(now)) => {
+                    let mut changed = baseline::changed_subjects(
+                        &before,
+                        &now.unwrap_or_default(),
+                        &before_schema,
+                        &l.schema,
+                    );
+                    // The checked baseline cannot contain a source conflict.
+                    // Recovery's `None` can equal its old ordinary column,
+                    // but the supplied conflicting declaration did change.
+                    changed.extend(source_conflicts.keys().map(ToString::to_string));
+                    Some(changed)
+                }
                 (Err(e), _) => {
                     findings.push(output::Finding::error(
                         "baseline.unreadable",

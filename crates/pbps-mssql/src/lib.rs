@@ -215,14 +215,14 @@ impl Dialect for Mssql {
     }
 
     fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError> {
-        self.validate_table_sources(name, table, &Default::default())
+        self.validate_table_sources(name, table, Default::default())
     }
 
     fn validate_table_sources(
         &self,
         name: &TableName,
         table: &Table,
-        sources: &std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>>,
+        sources: pbps_model::diagnostic::ColumnSources<'_>,
     ) -> Vec<DialectError> {
         let mut found = validate::table_sources(name, table, sources);
         // The pull filters the ledger tables out by their qualified names, so a

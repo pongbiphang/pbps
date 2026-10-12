@@ -1445,7 +1445,11 @@ pub fn decode_collision(
 /// Model rules — a row's key is its identity in every dialect — live in
 /// `pbps_model::data::check`. These are the ones whose answer is this
 /// engine's.
-pub(crate) fn data_problems(name: &TableName, table: &Table) -> Vec<DialectError> {
+pub(crate) fn data_problems(
+    name: &TableName,
+    table: &Table,
+    sources: pbps_model::diagnostic::ColumnSources<'_>,
+) -> Vec<DialectError> {
     let Some(data) = &table.data else {
         return Vec::new();
     };
@@ -1486,13 +1490,12 @@ pub(crate) fn data_problems(name: &TableName, table: &Table) -> Vec<DialectError
     // once (DECISIONS 321).
     if let Some(pk) = &table.primary_key
         && let [key] = pk.columns.as_slice()
-        && table
-            .columns
-            .get(key)
-            .is_some_and(|c| match &c.value_source {
+        && table.columns.get(key).is_some_and(|c| {
+            sources.get(key, c).iter().any(|source| match source {
                 ValueSource::Identity(_) => true,
                 ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => false,
             })
+        })
     {
         errs.push(invalid(format!(
             "a `data:` block cannot key its rows by `{key}`, an identity column. This engine \
@@ -2366,7 +2369,7 @@ mod tests {
                 increment: 1,
             });
         with_rows(&mut t, &[("1", &[])]);
-        let problems = data_problems(&name(), &t);
+        let problems = data_problems(&name(), &t, Default::default());
         assert_eq!(problems.len(), 1, "{problems:?}");
         let message = problems[0].to_string();
         assert!(message.contains("app.status_id_seq"), "{message}");
@@ -2388,7 +2391,7 @@ mod tests {
             increment: 1,
         });
         with_rows(&mut beside, &[("a", &[])]);
-        assert!(data_problems(&name(), &beside).is_empty());
+        assert!(data_problems(&name(), &beside, Default::default()).is_empty());
     }
 
     /// A cell whose *kind* the read-back would not produce, and one the type
@@ -2425,7 +2428,7 @@ mod tests {
                 ("g", &[("label", Value::Null)]),
             ],
         );
-        let messages: Vec<String> = data_problems(&name(), &t)
+        let messages: Vec<String> = data_problems(&name(), &t, Default::default())
             .iter()
             .map(ToString::to_string)
             .collect();
