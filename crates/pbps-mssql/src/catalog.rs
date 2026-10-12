@@ -1773,6 +1773,9 @@ pub use pbps_db::catalog::Spellings;
 /// (DECISIONS 101, 106). Asked of the engine, not of the table: a table this
 /// plan creates can be asked too.
 ///
+/// A date or time is read under every `DATEFORMAT` as well, and one that
+/// reads two ways is reported in `ambiguous` instead (DEC-1883.1).
+///
 /// `_at` is the names the catalog has now, which the PostgreSQL side needs.
 /// This one needs none since #1175: the only question it asked the catalog was
 /// a key column's collation, and the declaration now says what it will be.
@@ -1807,20 +1810,59 @@ pub async fn misspelt(
                     });
                 }
             }
-            for row in &conn.query(&q.sql).await.map_err(read)? {
-                let (i, canonical) = crate::rows::decode_spelling(name, row)?;
-                let Some((key, declared)) = q.literals.get(i) else {
-                    return Err(read(pbps_db::DbError::BadRow(format!(
-                        "the spelling query returned index {i} for {} literal(s)",
-                        q.literals.len()
-                    ))));
-                };
+            let readings = read_spellings(conn, name, &q.sql, q.literals.len()).await?;
+            // A date or time is read under every `DATEFORMAT` too: the
+            // reading it is taken as must be the only one it has
+            // (DEC-1883.1), or it is a guess at what the author meant.
+            let mut contrasts = Vec::new();
+            if q.temporal {
+                for order in crate::rows::DATEFORMATS {
+                    let sql = crate::rows::under_dateformat(&q.sql, order);
+                    contrasts.push((
+                        order,
+                        read_spellings(conn, name, &sql, q.literals.len()).await?,
+                    ));
+                }
+            }
+            for (i, canonical) in readings.into_iter().enumerate() {
+                let (key, declared) = &q.literals[i];
+                if let Some(reading) = &canonical {
+                    let mut otherwise: Vec<(String, String)> = Vec::new();
+                    for (order, other) in &contrasts {
+                        let Some(other) = &other[i] else {
+                            continue;
+                        };
+                        if other == reading || otherwise.iter().any(|(o, _)| o == other) {
+                            continue;
+                        }
+                        otherwise.push((other.clone(), format!("DATEFORMAT {order}")));
+                    }
+                    if !otherwise.is_empty() {
+                        out.ambiguous.push(pbps_db::catalog::Ambiguous {
+                            at: pbps_db::catalog::LiteralAt::Cell {
+                                table: name.clone(),
+                                key: key.clone(),
+                                column: q.column.clone(),
+                            },
+                            declared: declared.clone(),
+                            ty: q.ty.clone(),
+                            pinned: Some(reading.clone()),
+                            otherwise,
+                            remedy: "write it in ISO 8601 with a `T`, \
+                                     `YYYY-MM-DDTHH:MM:SS`, which every DATEFORMAT reads alike"
+                                .to_owned(),
+                        });
+                        continue;
+                    }
+                }
                 // A key's spelling is aliased at read time (71); only a text
-                // the type cannot read at all is wrong there.
+                // the type cannot read at all is wrong there. A date or time
+                // is taken as its reading, key or cell (DEC-1883.1), so the
+                // reading is handed back beside it.
                 let agrees = match (&q.column, &canonical) {
                     (_, None) => false,
-                    (None, Some(_)) => true,
-                    (Some(_), Some(c)) => c == declared,
+                    (None, Some(_)) if !q.temporal => true,
+                    (_, Some(c)) => c == declared,
                 };
                 if !agrees {
                     out.misspelt.push(crate::rows::Misspelt {
@@ -1830,10 +1872,45 @@ pub async fn misspelt(
                         declared: declared.clone(),
                         ty: q.ty.clone(),
                         canonical,
+                        temporal: q.temporal,
                     });
                 }
             }
         }
+    }
+    Ok(out)
+}
+
+/// One spelling query's answers, by the index of the literal each is about:
+/// what the engine reads it as, or `None` where it cannot read it.
+async fn read_spellings(
+    conn: &mut Conn,
+    name: &TableName,
+    sql: &str,
+    literals: usize,
+) -> Result<Vec<Option<String>>, crate::rows::RowsError> {
+    let read = |source| crate::rows::RowsError::Read {
+        table: name.clone(),
+        source: Box::new(source),
+    };
+    let mut out = vec![None; literals];
+    let mut seen = vec![false; literals];
+    for row in &conn.query(sql).await.map_err(read)? {
+        let (i, canonical) = crate::rows::decode_spelling(name, row)?;
+        let (Some(slot), Some(seen)) = (out.get_mut(i), seen.get_mut(i)) else {
+            return Err(read(pbps_db::DbError::BadRow(format!(
+                "the spelling query returned index {i} for {literals} literal(s)"
+            ))));
+        };
+        *slot = canonical;
+        *seen = true;
+    }
+    // Every literal is one row of the `VALUES` list, so a missing index is
+    // a query that did not run as written, not a value it could not read.
+    if let Some(i) = seen.iter().position(|s| !s) {
+        return Err(read(pbps_db::DbError::BadRow(format!(
+            "the spelling query returned no row for literal {i} of {literals}"
+        ))));
     }
     Ok(out)
 }

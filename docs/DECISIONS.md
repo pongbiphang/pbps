@@ -183,7 +183,7 @@ other numbers before landing. Some records still mention them as proposals.
 | 98 | [plan](decisions/plan.md#decision-98) | The pinned baseline is the union of the recorded scope and the plan's, table by table. |
 | 99 | [data/declared](decisions/data/declared.md#decision-99) | A row key has to be spellable in its key column's type. |
 | 100 | [plan](decisions/plan.md#decision-100) | An object a statement creates enters the live identities the moment the statement commits. |
-| 101 | [data/declared](decisions/data/declared.md#decision-101) | A declared text is refused before it is written unless the engine reads it back as written. |
+| 101 | [data/declared](decisions/data/declared.md#decision-101) | A declared text is refused before it is written unless the engine reads it back as written; a date or time is taken as its one reading (DEC-1883.1). |
 | 102 | [roles](decisions/roles.md#decision-102) | A staged resume re-checks a role drop for the members whose statements have not run. |
 | 103 | [data/declared](decisions/data/declared.md#decision-103) | `validate` refuses a key whose text no spelling of its type has. |
 | 104 | [data/declared](decisions/data/declared.md#decision-104) | An integer outside what its column holds is refused offline. |

@@ -315,6 +315,10 @@ pub struct Misspelt {
     pub ty: String,
     /// What the engine reads back; `None` when it cannot convert the text.
     pub canonical: Option<String>,
+    /// Whether the column holds a date or time, whose declared text stands
+    /// for the value the engine reads rather than for a spelling: a readable
+    /// one is taken as `canonical` instead of refused (DEC-1883.1).
+    pub temporal: bool,
 }
 
 /// One declared partition bound value the engine reads back differently, or
@@ -328,6 +332,8 @@ pub struct MisspeltBound {
     pub ty: String,
     /// What the engine reads back; `None` when it cannot convert the text.
     pub canonical: Option<String>,
+    /// As [`Misspelt::temporal`] (DEC-1883.1).
+    pub temporal: bool,
 }
 
 /// A partition's declared own default that the engine stores in the same text
@@ -384,11 +390,14 @@ pub struct Ambiguous {
 /// it reads as one row. And of every partition bound's values.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Spellings {
-    /// Declared texts the engine reads back differently, or not at all.
+    /// Declared texts the engine reads back differently, or not at all. One
+    /// marked [`Misspelt::temporal`] that has a reading is not a finding: the
+    /// caller takes the reading in its place (DEC-1883.1).
     pub misspelt: Vec<Misspelt>,
     /// Two declared keys the engine reads as one row (DECISIONS 106).
     pub conflicts: Vec<RowConflict>,
-    /// Declared bound values the engine reads back differently (#1170).
+    /// Declared bound values the engine reads back differently (#1170), with
+    /// the same exception as `misspelt` (DEC-1883.1).
     pub bounds: Vec<MisspeltBound>,
     /// Partitions' own defaults the engine stores as their parents' (#1609).
     pub defaults_as_parents: Vec<DefaultAsParents>,

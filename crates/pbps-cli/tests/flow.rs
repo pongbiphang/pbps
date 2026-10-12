@@ -12569,7 +12569,9 @@ fn a_column_a_filtered_index_names_is_renamed_after_the_index_is_dropped() {
 /// `decimal(5,2)` comes back `1.50` — would be recorded as the engine spells
 /// it and drift from the declaration on every later plan. Every connected
 /// command asks the engine first and refuses with the spelling to write
-/// (DECISIONS 101); only a real engine can say what that spelling is.
+/// (DECISIONS 101); only a real engine can say what that spelling is. A date
+/// is the exception: `2026-9-3` is the value the engine reads, and is taken
+/// as that (DEC-1883.1).
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is_written() {
@@ -12608,18 +12610,27 @@ fn a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is
         err.contains("`pct` is written \"1.5\"") && err.contains("\"1.50\""),
         "{err}"
     );
-    assert!(
-        err.contains("`since` is written \"2026-9-3\"") && err.contains("\"2026-09-03\""),
-        "{err}"
-    );
+    // The date is not among them: it is taken as the value it reads.
+    assert!(!err.contains("`since`"), "{err}");
 
     // Written the engine's way, it goes in and comes back as declared: the
-    // next connected plan has nothing to say.
-    d.table(&declared("1.50", "2026-09-03", ""));
+    // next connected plan has nothing to say. The date is still written its
+    // own way, and is stored as the date it reads (DEC-1883.1).
+    d.table(&declared("1.50", "2026-9-3", ""));
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
     let o = d.run(&["bootstrap", "--db", &connection]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+    on_server(
+        &connection,
+        "IF (SELECT since FROM dbo.rate WHERE code = 'std') <> '20260903' \
+           THROW 50000, 'not the date it reads', 1;",
+    );
+    // And so is the engine's own spelling of the same date.
+    d.table(&declared("1.50", "2026-09-03", ""));
     let o = d.run(&["plan", "--db", &connection]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
@@ -12634,6 +12645,118 @@ fn a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is
         "{}",
         stderr(&o)
     );
+}
+
+/// A date or time written otherwise than the engine spells it is the value
+/// the engine reads (DEC-1883.1), on SQL Server as on PostgreSQL: a key and
+/// cells of five date and time types, written `2026-02-01` or `20260201`,
+/// bootstrap, verify and plan clean, are stored as that value, and plan clean
+/// again written the engine's way; `pull --data` writes the engine's spelling.
+/// Two keys that read as one stay refused (DECISIONS 106), as do a `decimal`
+/// spelling (DECISIONS 101 outside the date and time types), a text that
+/// reads differently under another `DATEFORMAT`, and one the engine cannot
+/// read at all.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_date_or_time_is_taken_as_the_value_the_engine_reads() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "temporal-1883");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("temporal-1883-live");
+    let declare = |key: &str, at: &str, old: &str, amount: &str, extra: &str| {
+        d.table(&format!(
+            "table: dbo.ev\ncolumns:\n  k: {{type: datetime2, nullable: false}}\n  \
+             at: {{type: datetime2}}\n  d: {{type: date}}\n  zoned: {{type: datetimeoffset}}\n  \
+             old: {{type: datetime}}\n  amount: {{type: \"decimal(5,2)\"}}\n\
+             primary_key: [k]\ndata:\n  mode: exact\n  rows:\n    \
+             \"{key}\": {{at: \"{at}\", d: \"20260201\", zoned: \"2026-02-01 00:00:00Z\", \
+             old: \"{old}\", amount: \"{amount}\"}}\n{extra}"
+        ));
+        d.commit();
+    };
+    declare("2026-02-01", "2026-02-01", "20260201", "1.50", "");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+    let stored = "IF (SELECT COUNT(*) FROM dbo.ev WHERE k = '2026-02-01T00:00:00' \
+                    AND at = '2026-02-01T00:00:00' AND d = '20260201' \
+                    AND zoned = '2026-02-01T00:00:00+00:00' AND old = '20260201') <> 1 \
+                  THROW 50000, 'not the values they read', 1;";
+    on_server(&connection, stored);
+
+    // Written the engine's way, the same values: nothing to change.
+    declare(
+        "2026-02-01T00:00:00",
+        "2026-02-01T00:00:00",
+        "2026-02-01T00:00:00",
+        "1.50",
+        "",
+    );
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+
+    // `pull --data` writes what the engine reads, in its spelling.
+    let pulled = Demo::new("temporal-1883-pull");
+    let o = pulled.run(&["pull", "--db", &connection, "--data", "dbo.ev"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let text = std::fs::read_to_string(pulled.dir.join("schema/dbo.ev.yml")).unwrap();
+    for needle in [
+        "\"2026-02-01T00:00:00\": {",
+        "at: \"2026-02-01T00:00:00\"",
+        "d: 2026-02-01,",
+        "old: \"2026-02-01T00:00:00\"",
+        "zoned: \"2026-02-01T00:00:00+00:00\"",
+    ] {
+        assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+    }
+
+    // Still refused, each by name, and nothing changes.
+    for (extra, at, old, amount, needle) in [
+        (
+            "    \"2026-02-01T00:00:00\": {}\n",
+            "2026-02-01",
+            "20260201",
+            "1.50",
+            "are the same row to the database",
+        ),
+        (
+            "",
+            "2026-02-01",
+            "20260201",
+            "1.5",
+            "`amount` is written \"1.5\"",
+        ),
+        (
+            "",
+            "2026-02-01",
+            "2026-02-01",
+            "1.50",
+            "but as 2026-01-02T00:00:00 under DATEFORMAT dmy",
+        ),
+        (
+            "",
+            "2026-02-30",
+            "20260201",
+            "1.50",
+            "`at` = \"2026-02-30\" cannot be read as datetime2",
+        ),
+    ] {
+        declare("2026-02-01", at, old, amount, extra);
+        let o = d.run(&["plan", "--db", &connection]);
+        assert_ne!(code(&o), 0, "{needle}: {}", stdout(&o));
+        assert!(stderr(&o).contains(needle), "{needle}: {}", stderr(&o));
+    }
+    on_server(&connection, stored);
 }
 
 /// `plan --db` and `bootstrap` hand statements to a database that is not a

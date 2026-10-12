@@ -169,11 +169,10 @@ fn decided_by_the_clock(text: &str) -> bool {
 
 /// What to write instead, by type.
 ///
-/// Each is a spelling the engine also gives back as written, so the remedy
-/// does not run straight into the spelling check's own (DECISIONS 101): a row
-/// value or a bound must be written the way the engine reads it back, and a
-/// `timestamptz` reads back in UTC. `+08` would be one reading, and refused
-/// on the next plan as not the engine's spelling.
+/// Each is a spelling the engine also gives back as written. Since
+/// DEC-1883.1 a row value or bound with one reading is taken as that reading
+/// whatever its spelling, so `+08` would do as well; the engine's own is
+/// named because it is the one `pull` writes.
 fn remedy(base: &str, clock: bool) -> &'static str {
     if clock {
         return "write the value itself, or for a default a function the engine runs on each \

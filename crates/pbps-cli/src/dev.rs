@@ -269,7 +269,9 @@ async fn rehearse_in(
     .await;
     // Before the refusal, beside it, as the plan prints them (DEC-1726.1).
     crate::deploy::warn_unasked(&unasked);
-    refused?;
+    // What the rows are compared against: a date or time as the engine reads
+    // it, which is what the plan's statements stored (DEC-1883.1).
+    let declared = &refused?;
 
     for (i, stmt) in build.iter().enumerate() {
         conn.execute(&stmt.sql).await.map_err(|e| {

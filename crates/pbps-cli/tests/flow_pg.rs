@@ -7448,15 +7448,19 @@ fn a_partition_tree_round_trips_through_the_cli() {
             && said.contains("index `ev_2025_id` references `nope`, which is not a column"),
         "{said}"
     );
-    // A bound spelled otherwise than the engine does, refused with its
-    // spelling before a plan exists.
+    // A date bound spelled otherwise than the engine does is the date it
+    // reads, and the partition that stands has it (DEC-1883.1).
     std::fs::write(&path, text.replace("[\"2026-01-01\"]", "[\"2026-1-1\"]")).unwrap();
+    d.commit();
+    let o = succeeds(d.run(&["plan", "--db", &tgt]));
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+    // One the engine cannot read as a date at all is still refused by name.
+    std::fs::write(&path, text.replace("[\"2026-01-01\"]", "[\"2026-13-01\"]")).unwrap();
     d.commit();
     let o = d.run(&["plan", "--db", &tgt]);
     assert_ne!(code(&o), 0, "{}", stdout(&o));
     assert!(
-        stderr(&o).contains("partition app.ev_2025 bound on `ts` is written \"2026-1-1\"")
-            && stderr(&o).contains("\"2026-01-01\""),
+        stderr(&o).contains("partition app.ev_2025 bound on `ts`: \"2026-13-01\" cannot be read"),
         "{}",
         stderr(&o)
     );
@@ -24048,6 +24052,145 @@ fn forced_pull_publishes_drift_without_accepting_it() {
 #[ignore = "needs live PostgreSQL"]
 fn forced_pull_preserves_applied_column_rename_and_drop_history() {
     pull_identity::column_history(&server(), true);
+}
+
+/// A date or time written otherwise than the engine spells it is the value
+/// the engine reads (DEC-1883.1): a row's cell, its key and a partition bound written `2026-02-01` for a `timestamp` plan, apply,
+/// bootstrap, verify and plan clean, are stored as that value, and plan clean
+/// again written the engine's way; `pull --data` writes the engine's spelling.
+/// Two keys that read as one stay refused (DECISIONS 106), as do a `numeric`
+/// spelling (DECISIONS 101 outside the date and time types), a text with two
+/// readings (DEC-1756.1) and one the engine cannot read at all.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_date_or_time_is_taken_as_the_value_the_engine_reads() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "temporal-1883");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("temporal-1883");
+    let ev = d.dir.join("schema/app.ev.yml");
+    let p = d.dir.join("schema/app.p.yml");
+    let declare = |key: &str, at: &str, amount: &str, bound: &str, extra: &str| {
+        std::fs::write(
+            &ev,
+            format!(
+                "table: app.ev\ncolumns:\n  k: {{type: timestamp without time zone, \
+                 nullable: false}}\n  at: {{type: timestamp without time zone}}\n  \
+                 tz: {{type: timestamp with time zone}}\n  \
+                 amount: {{type: \"numeric(5,2)\"}}\n\
+                 primary_key: {{name: ev_pkey, columns: [k]}}\n\
+                 data:\n  mode: exact\n  rows:\n    \
+                 \"{key}\": {{at: \"{at}\", tz: \"2026-02-01 00:00:00Z\", \
+                 amount: \"{amount}\"}}\n{extra}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &p,
+            format!(
+                "table: app.p\ncolumns:\n  ts: {{type: timestamp without time zone, \
+                 nullable: false}}\npartition_by: [ts]\npartitions:\n  p_a:\n    \
+                 from: [\"{bound}\"]\n    to: [\"2026-06-01\"]\n"
+            ),
+        )
+        .unwrap();
+        d.commit();
+    };
+    let stored = |connection: &str| {
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.ev WHERE k = '2026-02-01 00:00:00' \
+               AND at = '2026-02-01 00:00:00' AND tz = '2026-02-01 00:00:00+00'",
+        )
+    };
+    let bound = |connection: &str| {
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class WHERE oid = 'app.p_a'::regclass \
+               AND pg_get_expr(relpartbound, oid) \
+                   = 'FOR VALUES FROM (''2026-02-01 00:00:00'') TO (''2026-06-01 00:00:00'')'",
+        )
+    };
+    declare("2026-02-01", "2026-02-01", "1.50", "2026-02-01", "");
+    // Identities for what is declared, as an author's offline plan mints.
+    // Only here: offline, a bound written another way is a changed bound, as
+    // it always was — only the engine can say the two are one value.
+    succeeds(d.run(&["plan"]));
+    d.commit();
+
+    // Planned, applied, verified and planned again: nothing left to say.
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(stored(connection), 1);
+    assert_eq!(bound(connection), 1);
+
+    // Bootstrapped into an empty database, the same.
+    let fresh = OwnDatabase::new(&server, "temporal-1883-boot");
+    on_server(fresh.connection(), "CREATE SCHEMA app");
+    succeeds(d.run(&["bootstrap", "--db", fresh.connection()]));
+    succeeds(d.run(&["verify", "--db", fresh.connection()]));
+    let next = succeeds(d.run(&["plan", "--db", fresh.connection()]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(stored(fresh.connection()), 1);
+    assert_eq!(bound(fresh.connection()), 1);
+
+    // Written the engine's way, the same values: nothing to change.
+    declare(
+        "2026-02-01 00:00:00",
+        "2026-02-01 00:00:00",
+        "1.50",
+        "2026-02-01 00:00:00",
+        "",
+    );
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // `pull --data` writes what the engine reads, in its spelling.
+    let pulled = Demo::new("temporal-1883-pull");
+    succeeds(pulled.run(&["pull", "--db", connection, "--data", "app.ev"]));
+    let text = std::fs::read_to_string(pulled.dir.join("schema/app.ev.yml")).unwrap();
+    for needle in [
+        "\"2026-02-01 00:00:00\": {",
+        "at: \"2026-02-01 00:00:00\"",
+        "tz: \"2026-02-01 00:00:00+00\"",
+    ] {
+        assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+    }
+
+    // Still refused, each by name, and nothing changes.
+    for (extra, at, amount, needle) in [
+        (
+            "    \"2026-02-01 00:00:00\": {}\n",
+            "2026-02-01",
+            "1.50",
+            "are the same row to the database",
+        ),
+        ("", "2026-02-01", "1.5", "`amount` is written \"1.5\""),
+        (
+            "",
+            "01/02/2026",
+            "1.50",
+            "`at` \"01/02/2026\" is read as 2026-01-02 00:00:00 under this tool's settings",
+        ),
+        (
+            "",
+            "2026-02-30",
+            "1.50",
+            "`at` = \"2026-02-30\" cannot be read as timestamp without time zone",
+        ),
+    ] {
+        declare("2026-02-01", at, amount, "2026-02-01", extra);
+        let o = d.run(&["plan", "--db", connection]);
+        assert_ne!(code(&o), 0, "{needle}: {}", stdout(&o));
+        assert!(stderr(&o).contains(needle), "{needle}: {}", stderr(&o));
+    }
+    assert_eq!(stored(connection), 1);
 }
 
 /// A date/time literal the engine reads two ways is refused by a connected

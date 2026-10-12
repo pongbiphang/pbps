@@ -227,7 +227,9 @@ Decisions taken during implementation that this document did not anticipate:
    and every connected command asks the engine, before anything is written,
    whether each declared text comes back as written — `"1.5"` in a
    `decimal(5,2)` does not, it comes back `1.50` — and refuses the
-   declaration with the spelling to write (101); a table this plan creates
+   declaration with the spelling to write (101) — except a date or time it
+   reads one way only, which is taken as that reading, in its spelling
+   (DEC-1883.1); a table this plan creates
    is asked about the same way, since the question needs the type and not
    the table — and the same question groups the keys by what the engine
    reads them as, so two spellings of one row are refused there too, where

@@ -2527,13 +2527,20 @@ pub(crate) fn warn_unasked(unasked: &[String]) {
 /// the error, never inside it, so a refusal is the plain error every caller
 /// and every downcast already knows, and the caller writes the warnings
 /// wherever it writes the refusal (#1702, DEC-1726.1).
+///
+/// What it hands back, when it does not refuse, is `schema` as the engine
+/// reads it: every date or time value it read one way only in the engine's
+/// own spelling, cells, keys and bounds alike (DEC-1883.1). Every caller
+/// plans, compares and records that schema from here on, never the one it
+/// passed in — a plan written from the declared text would restate, on every
+/// plan after, a value the table already holds.
 pub(crate) async fn refuse_misspelt(
     conn: &mut Conn,
     schema: &Schema,
     at: &pbps_db::catalog::CatalogNames,
     unasked: &mut Vec<String>,
-) -> anyhow::Result<()> {
-    let found = crate::engine::misspelt(conn, schema, at)
+) -> anyhow::Result<Schema> {
+    let mut found = crate::engine::misspelt(conn, schema, at)
         .await
         .context("cannot ask the engine how it reads the declared rows")?;
     unasked.extend(found.defaults_unasked.iter().map(|why| {
@@ -2542,13 +2549,24 @@ pub(crate) async fn refuse_misspelt(
              default: {why}"
         )
     }));
+    // A date or time the engine reads, and reads one way only — the probe
+    // has already moved every text with two readings to `ambiguous` — is the
+    // value it reads (DEC-1883.1). Every other type keeps DECISIONS 101.
+    let (cells, misspelt): (Vec<_>, Vec<_>) = std::mem::take(&mut found.misspelt)
+        .into_iter()
+        .partition(|m| m.temporal && m.canonical.is_some());
+    found.misspelt = misspelt;
+    let (bounds, misspelt_bounds): (Vec<_>, Vec<_>) = std::mem::take(&mut found.bounds)
+        .into_iter()
+        .partition(|b| b.temporal && b.canonical.is_some());
+    found.bounds = misspelt_bounds;
     if found.misspelt.is_empty()
         && found.conflicts.is_empty()
         && found.bounds.is_empty()
         && found.defaults_as_parents.is_empty()
         && found.ambiguous.is_empty()
     {
-        return Ok(());
+        return Ok(as_read(schema, &cells, &bounds));
     }
     // Two keys the engine reads as one row would insert twice and fail on
     // the second; the alias check (74) cannot see them on a table that holds
@@ -2559,9 +2577,13 @@ pub(crate) async fn refuse_misspelt(
             .misspelt
             .iter()
             .map(|m| match (&m.column, &m.canonical) {
-                (None, _) => format!(
+                (None, None) => format!(
                     "{} row key `{}` cannot be read as {} by the engine",
                     m.table, m.key, m.ty
+                ),
+                (None, Some(canonical)) => format!(
+                    "{} row key `{}` is read back by the engine as {:?}; write it that way",
+                    m.table, m.key, canonical
                 ),
                 (Some(c), None) => format!(
                     "{} row `{}`: `{c}` = {:?} cannot be read as {} by the engine",
@@ -2621,6 +2643,85 @@ pub(crate) async fn refuse_misspelt(
         ));
     }
     bail!("{}", sections.join("\n\n"))
+}
+
+/// `schema` with each date or time the engine read in place of the text that
+/// declared it (DEC-1883.1): a cell's value, a row's key, a partition's bound.
+///
+/// The cells go first, found under the keys as declared, and only then are
+/// the keys themselves replaced. Two declared keys the engine reads as one are
+/// never here: they are a conflict, refused before this is reached (DECISIONS
+/// 106), so a replaced key cannot land on another row.
+fn as_read(
+    schema: &Schema,
+    cells: &[pbps_db::catalog::Misspelt],
+    bounds: &[pbps_db::catalog::MisspeltBound],
+) -> Schema {
+    let mut out = schema.clone();
+    for m in cells {
+        let (Some(column), Some(canonical)) = (&m.column, &m.canonical) else {
+            continue;
+        };
+        if let Some(row) = out
+            .tables
+            .get_mut(&m.table)
+            .and_then(|t| t.data.as_mut())
+            .and_then(|d| d.rows.get_mut(&m.key))
+        {
+            row.0
+                .insert(column.clone(), pbps_model::Value::Text(canonical.clone()));
+        }
+    }
+    for m in cells {
+        let (None, Some(canonical)) = (&m.column, &m.canonical) else {
+            continue;
+        };
+        if let Some(data) = out.tables.get_mut(&m.table).and_then(|t| t.data.as_mut())
+            && let Some(row) = data.rows.remove(&m.key)
+        {
+            data.rows
+                .insert(pbps_model::RowKey::from(canonical.as_str()), row);
+        }
+    }
+    for b in bounds {
+        let Some(canonical) = &b.canonical else {
+            continue;
+        };
+        let Some(of) = out
+            .tables
+            .get(&b.partition)
+            .and_then(|t| t.partition_of.as_ref())
+        else {
+            continue;
+        };
+        let Some(position) = schema
+            .tables
+            .get(&of.parent)
+            .and_then(|p| p.partition_by.as_ref())
+            .and_then(|by| by.columns.iter().position(|c| *c == b.column))
+        else {
+            continue;
+        };
+        let Some(pbps_model::PartitionBound::Range { from, to }) = out
+            .tables
+            .get_mut(&b.partition)
+            .and_then(|t| t.partition_of.as_mut())
+            .map(|of| &mut of.bound)
+        else {
+            continue;
+        };
+        // Both ends, wherever the declared text stands: the same text is
+        // the same reading.
+        for datum in [from.get_mut(position), to.get_mut(position)]
+            .into_iter()
+            .flatten()
+        {
+            if *datum == pbps_model::BoundDatum::Value(b.declared.clone()) {
+                *datum = pbps_model::BoundDatum::Value(canonical.clone());
+            }
+        }
+    }
+    out
 }
 
 /// One ambiguous literal, where it is and what it can mean.
@@ -6455,10 +6556,9 @@ pub fn cmd_bootstrap(
     sql_out: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let dialect = crate::dialect(project)?;
-    let loaded = crate::load(project, dialect.as_ref())?;
+    let mut loaded = crate::load(project, dialect.as_ref())?;
     let ids = crate::read_ids(project)?;
     refuse_invalid_declarations(&loaded, dialect.as_ref(), false)?;
-    let declared_modules = managed_modules(None, Some(&loaded.schema));
 
     // Every declared object needs its identity, not just "some": a role the
     // ids file does not know is skipped by the differ, and a bootstrap that
@@ -6491,6 +6591,31 @@ pub fn cmd_bootstrap(
             unidentified.join(", ")
         );
     }
+
+    // Every declared text, as the engine reads it, before anything is built
+    // from them: a spelling it would read back differently would be recorded
+    // as the engine spells it and drift from the declaration on the next plan
+    // (DECISIONS 101), and a date or time it reads one way only is built,
+    // scripted and recorded as that reading (DEC-1883.1) — so this is asked
+    // ahead of the diff, not inside the build where it used to be, since the
+    // statements and the `--sql` script are made from what it answers. Into
+    // an empty database, so nothing is under an older name: the declared
+    // names are the only ones the catalog could have. Not under the lock: the
+    // engine's reading of a text does not turn on what the database holds.
+    // Without a target nothing can be asked, and the script carries the
+    // declared text, as it always has.
+    if let Some(target) = target {
+        loaded.schema = db::runtime()?.block_on(async {
+            let mut conn = db::connect(target).await?;
+            let mut unasked = Vec::new();
+            let refused =
+                refuse_misspelt(&mut conn, &loaded.schema, &Default::default(), &mut unasked).await;
+            // Printed before the refusal, beside it, as the plan prints them.
+            warn_unasked(&unasked);
+            refused
+        })?;
+    }
+    let declared_modules = managed_modules(None, Some(&loaded.schema));
 
     // Bootstrap is the plan from nothing: every declared table is created.
     let cs = pbps_diff::diff(
@@ -6645,17 +6770,6 @@ pub fn cmd_bootstrap(
         crate::engine::lock(&mut conn, &operator).await?;
         let mut transaction_attempted = false;
         let result = async {
-            // Before the declared rows go in: a spelling the engine reads back
-            // differently would be recorded as the engine spells it and drift
-            // from the declaration on the next plan (DECISIONS 101).
-            // Into an empty database, so nothing is under an older name: the
-            // declared names are the only ones the catalog could have.
-            let mut unasked = Vec::new();
-            let refused =
-                refuse_misspelt(&mut conn, &loaded.schema, &Default::default(), &mut unasked).await;
-            // Printed before the refusal, beside it, as the plan prints them.
-            warn_unasked(&unasked);
-            refused?;
             refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
 
             // The empty-target check is protected by the same lock as the
@@ -6970,7 +7084,7 @@ pub fn cmd_plan_db(
     carried: &mut Vec<crate::output::Finding>,
 ) -> anyhow::Result<()> {
     let dialect = crate::dialect(project)?;
-    let loaded = crate::load(project, dialect.as_ref())?;
+    let mut loaded = crate::load(project, dialect.as_ref())?;
     let ids = crate::read_ids(project)?;
     refuse_invalid_declarations(&loaded, dialect.as_ref(), json)?;
     let created_at = crate::now();
@@ -7056,13 +7170,6 @@ pub fn cmd_plan_db(
         // declarations against — every row an `exact` declaration is about to
         // delete included.
         let recorded_data = entry.snapshot.schema.data_scopes();
-        // The declarations under the names the database has *now*: a table
-        // this plan renames is read, scoped and measured under its old name,
-        // and a declared scope keyed by the new one would find no table and
-        // be skipped — an `ensure` -> `exact` switch in the same revision as
-        // the rename then planned none of its deletes.
-        let declared_live = tables_under(&loaded.schema, &resolved.ids, &recorded_ids);
-        let declared_data = declared_live.data_scopes();
         // Every declared text, as the engine reads it: a spelling it would
         // read back differently is refused before a plan is written that
         // could never converge (DECISIONS 101).
@@ -7091,7 +7198,16 @@ pub fn cmd_plan_db(
         if json {
             carried.clone_from(&findings);
         }
-        refused?;
+        // The declarations as the engine reads them, a date or time in its
+        // own spelling (DEC-1883.1), from here to the plan's recorded scope.
+        loaded.schema = refused?;
+        // The declarations under the names the database has *now*: a table
+        // this plan renames is read, scoped and measured under its old name,
+        // and a declared scope keyed by the new one would find no table and
+        // be skipped — an `ensure` -> `exact` switch in the same revision as
+        // the rename then planned none of its deletes.
+        let declared_live = tables_under(&loaded.schema, &resolved.ids, &recorded_ids);
+        let declared_data = declared_live.data_scopes();
         refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
         let managed = managed_state_full(
             &mut conn,
@@ -11073,6 +11189,131 @@ mod tests {
         );
         refuse_occupied_objects(&temporal(false), &[at_history], "prod")
             .expect("no history to collide");
+    }
+
+    /// DEC-1883.1: each date or time the engine read takes the place of the
+    /// text that declared it, a cell under its row's declared key before the
+    /// key itself is replaced, and a bound at both ends of its own column
+    /// only. Nothing it was not handed moves: another row, another column,
+    /// another key column's bound, the same text elsewhere.
+    #[test]
+    fn the_engines_reading_replaces_only_the_texts_it_was_read_for() {
+        use pbps_db::catalog::{Misspelt, MisspeltBound};
+        use pbps_model::{
+            BoundDatum, Column, DataMode, PartitionBound, PartitionBy, PartitionOf, Row, RowKey,
+            Table, TableData, Value,
+        };
+        let text = |t: &str| Value::Text(t.to_owned());
+        let row = |cells: &[(&str, &str)]| {
+            Row(cells
+                .iter()
+                .map(|(c, v)| ((*c).to_owned(), text(v)))
+                .collect())
+        };
+        let ev = TableName::new("app", "ev");
+        let p = TableName::new("app", "p");
+        let p_a = TableName::new("app", "p_a");
+        let column = || Column::new("timestamp".parse().unwrap());
+        let mut schema = Schema::default();
+        schema.tables.insert(
+            ev.clone(),
+            Table {
+                columns: [("k", column()), ("at", column()), ("note", column())]
+                    .into_iter()
+                    .map(|(n, c)| (n.to_owned(), c))
+                    .collect(),
+                data: Some(TableData {
+                    mode: DataMode::Exact,
+                    rows: [
+                        (
+                            RowKey::from("2026-02-01"),
+                            row(&[("at", "2026-02-01"), ("note", "2026-02-01")]),
+                        ),
+                        (
+                            RowKey::from("2026-03-01 00:00:00"),
+                            row(&[("at", "2026-02-01")]),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }),
+                ..Table::default()
+            },
+        );
+        schema.tables.insert(
+            p.clone(),
+            Table {
+                columns: [("a", column()), ("b", column())]
+                    .into_iter()
+                    .map(|(n, c)| (n.to_owned(), c))
+                    .collect(),
+                partition_by: Some(PartitionBy {
+                    external: false,
+                    columns: vec!["a".into(), "b".into()],
+                }),
+                ..Table::default()
+            },
+        );
+        let value = |v: &str| BoundDatum::Value(v.to_owned());
+        schema.tables.insert(
+            p_a.clone(),
+            Table {
+                partition_of: Some(PartitionOf {
+                    parent: p.clone(),
+                    bound: PartitionBound::Range {
+                        from: vec![value("2026-02-01"), value("2026-02-01")],
+                        to: vec![value("2026-02-01"), BoundDatum::MaxValue],
+                    },
+                    columns: Default::default(),
+                }),
+                ..Table::default()
+            },
+        );
+        let cell = |key: &str, column: Option<&str>| Misspelt {
+            table: ev.clone(),
+            key: RowKey::from(key),
+            column: column.map(str::to_owned),
+            declared: "2026-02-01".to_owned(),
+            ty: "timestamp without time zone".to_owned(),
+            canonical: Some("2026-02-01 00:00:00".to_owned()),
+            temporal: true,
+        };
+        let read = super::as_read(
+            &schema,
+            &[cell("2026-02-01", None), cell("2026-02-01", Some("at"))],
+            &[MisspeltBound {
+                partition: p_a.clone(),
+                column: "a".to_owned(),
+                declared: "2026-02-01".to_owned(),
+                ty: "timestamp without time zone".to_owned(),
+                canonical: Some("2026-02-01 00:00:00".to_owned()),
+                temporal: true,
+            }],
+        );
+        let rows = &read.tables[&ev].data.as_ref().unwrap().rows;
+        assert_eq!(
+            rows.keys().map(RowKey::as_str).collect::<Vec<_>>(),
+            ["2026-02-01 00:00:00", "2026-03-01 00:00:00"]
+        );
+        let moved = &rows[&RowKey::from("2026-02-01 00:00:00")];
+        assert_eq!(moved.get("at"), Some(&text("2026-02-01 00:00:00")));
+        // Not handed over: the same text in another column, and in another row.
+        assert_eq!(moved.get("note"), Some(&text("2026-02-01")));
+        assert_eq!(
+            rows[&RowKey::from("2026-03-01 00:00:00")].get("at"),
+            Some(&text("2026-02-01"))
+        );
+        let Some(PartitionOf {
+            bound: PartitionBound::Range { from, to },
+            ..
+        }) = &read.tables[&p_a].partition_of
+        else {
+            panic!("the bound is still a range");
+        };
+        assert_eq!(from, &[value("2026-02-01 00:00:00"), value("2026-02-01")]);
+        assert_eq!(to, &[value("2026-02-01 00:00:00"), BoundDatum::MaxValue]);
+        // Nothing to replace leaves the declarations as they were.
+        assert_eq!(super::as_read(&schema, &[], &[]), schema);
     }
 
     /// A table this plan attaches is held to its declared shape once it reads
