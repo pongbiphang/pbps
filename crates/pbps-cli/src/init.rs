@@ -168,6 +168,9 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         // number written into every generated pbps.yml is one more line to
         // explain in the first hour.
         max_data_rows: None,
+        // Like the line above: the default is twice the newest partition's
+        // width, and a new project has no partitioned table to be ahead of.
+        partition_runway: None,
         policies: None,
     };
     let config_text = render_config(&config);
@@ -730,6 +733,7 @@ mod tests {
             resolvers: BTreeMap::new(),
             resolve_with: None,
             max_data_rows: None,
+            partition_runway: None,
             policies: None,
         };
         let text = render_config(&config);

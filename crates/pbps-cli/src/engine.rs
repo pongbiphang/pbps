@@ -2380,6 +2380,23 @@ pub async fn permissions(
     }
 }
 
+/// Whether each partitioned parent's partitions reach far enough past its
+/// rows, and whether its DEFAULT holds rows of a range not created yet
+/// (#1789, DEC-1789.2). Reads existence, never a value, and writes nothing.
+///
+/// SQL Server has no RANGE partitions to run out of, so the question does not
+/// apply and the report is empty.
+pub async fn partition_runway(
+    conn: &mut Conn,
+    ask: &pbps_db::doctor::RunwayAsk<'_>,
+    project_ids: &IdsFile,
+) -> Result<pbps_db::doctor::RunwayReport, DbError> {
+    match conn.driver() {
+        Driver::Mssql => Ok(pbps_db::doctor::RunwayReport::default()),
+        Driver::Postgres => pbps_pg::doctor::partition_runway(conn, ask, project_ids).await,
+    }
+}
+
 /// What `doctor` tells the operator when its lock read was refused, in this
 /// engine's words: why, and the one statement that repairs what a fresh
 /// session could see (#822).

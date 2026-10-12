@@ -2159,6 +2159,30 @@ async fn close<T>(
     }
 }
 
+/// Opens a `REPEATABLE READ READ ONLY` transaction under the canonical
+/// session ([`CANONICAL_PATH`]), for a reader that asks several statements of
+/// one snapshot and must see a bound as [`introspect`] does. Ended by
+/// [`close_canonical_read`] on every path, since a transaction the engine has
+/// aborted must still be ended.
+///
+/// Refused inside a caller's transaction, for the reason [`introspect`] is.
+pub(crate) async fn open_canonical_read(conn: &mut Conn) -> Result<(), DbError> {
+    open(conn, Scope::Own).await?;
+    if let Err(error) = conn.query(CANONICAL_PATH).await {
+        let _ = conn.execute("ROLLBACK").await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Ends [`open_canonical_read`]'s transaction the way `outcome` requires.
+pub(crate) async fn close_canonical_read<T>(
+    conn: &mut Conn,
+    outcome: Result<T, DbError>,
+) -> Result<T, DbError> {
+    close(conn, Scope::Own, outcome).await
+}
+
 /// A permission query that compares catalog-rendered routine types must use
 /// the same spelling as introspection. Reuse its transaction/savepoint scope
 /// so both successful and failed reads restore the caller's settings (#330).

@@ -68,6 +68,17 @@
       "format": "uint",
       "minimum": 0
     },
+    "partition_runway": {
+      "description": "How far ahead of its rows a RANGE-partitioned table's partitions must\nrun before `doctor` warns that they are running out. Absent means twice\nthe newest partition's width.\n\nA plain number is a count of partitions, for every key type: a number\nalone cannot say whether it counts key values or partitions, and a\npartition count means the same on a `date` key and a `bigint` one. A\ndate or time key may instead be given a width in the grammar of\n`pbps partitions extend --every`: a number and `day`, `week`, `month`\nor `year` (`2month`, `1year`). The text is read where it is used, by\nthe engine that knows the key, and one it cannot read is reported by\n`doctor` rather than ignored.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PartitionRunway"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "policies": {
       "description": "The organization's own rules and their suppressions (ADR-0008). Absent\nmeans every built-in rule at its default severity.",
       "anyOf": [
@@ -430,6 +441,21 @@
         "CREATE"
       ]
     },
+    "PartitionRunway": {
+      "description": "The horizon of `partition_runway:`: a count of partitions, or a width.\n\nTwo spellings of one setting, told apart by the YAML itself: an integer is\na count, text is a width (`2month`). Text made only of digits is read as a\ncount by the engine, so `\"3\"` and `3` agree.",
+      "anyOf": [
+        {
+          "description": "This many partitions, counting the one the newest rows are in.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        {
+          "description": "This much of the key's range, as `--every` writes it: `2month`.",
+          "type": "string"
+        }
+      ]
+    },
     "Policies": {
       "description": "The whole block. Absent means every rule at its default and nothing\nsuppressed.",
       "type": "object",
@@ -737,6 +763,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 40,
+  "x-pbps-schema-version": 41,
   "x-pbps-tool-version": "0.0.0"
 }

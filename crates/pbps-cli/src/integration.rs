@@ -41,7 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 40;
+pub const SCHEMA_VERSION: u32 = 41;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
@@ -54,6 +54,7 @@ pub const SCHEMA_VERSION: u32 = 40;
 // 38: a parent's `partitions: external` (issue #1533).
 // 39: a Docker resolver's `baseline:`, and either's `outside_writes:` (issue #1674).
 // 40: a column's `serial` types, `sequence:` and optional `nullable:` (issue #1631).
+// 41: pbps.yml's `partition_runway:` (issue #1789).
 // 26: index, key and unique-constraint `storage_parameters` (issue #1442).
 // 25: a table's `storage_parameters:` (issue #1441).
 // 24: a table's `replica_identity:` (issue #1444).
@@ -966,6 +967,34 @@ mod tests {
                     .is_ok(),
                 valid,
                 "loader: {partitions}"
+            );
+        }
+    }
+
+    /// The configuration schema and the loader agree on `partition_runway:`
+    /// (#1789): a count of at least one partition, or a width as text.
+    #[test]
+    fn config_schema_and_loader_agree_on_partition_runway() {
+        let validator = jsonschema::validator_for(&schema(SchemaKind::Config)).unwrap();
+        for (value, valid) in [
+            (serde_json::json!(3), true),
+            (serde_json::json!(1), true),
+            (serde_json::json!("2month"), true),
+            (serde_json::json!("3 weeks"), true),
+            (serde_json::json!(0), false),
+            (serde_json::json!(-1), false),
+            (serde_json::json!(1.5), false),
+            (serde_json::json!([3]), false),
+            (serde_json::json!({"count": 3}), false),
+            (serde_json::json!(true), false),
+        ] {
+            let config = serde_json::json!({"dialect": "postgres", "partition_runway": value});
+            assert_eq!(validator.is_valid(&config), valid, "schema: {value}");
+            assert_eq!(
+                pbps_config::Config::parse(&config.to_string(), std::path::Path::new("pbps.yml"))
+                    .is_ok(),
+                valid,
+                "loader: {value}"
             );
         }
     }

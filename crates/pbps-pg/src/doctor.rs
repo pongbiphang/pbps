@@ -56,8 +56,10 @@ mod data;
 mod grants;
 mod identity;
 mod managed;
+mod partitions;
 mod referenced;
 
+pub use partitions::partition_runway;
 pub use pbps_db::doctor::Ask;
 
 /// Where a permission has to be held for a deployment to succeed.

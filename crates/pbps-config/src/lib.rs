@@ -338,10 +338,52 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_data_rows: Option<usize>,
 
+    // #1789, DEC-1789.2.
+    /// How far ahead of its rows a RANGE-partitioned table's partitions must
+    /// run before `doctor` warns that they are running out. Absent means twice
+    /// the newest partition's width.
+    ///
+    /// A plain number is a count of partitions, for every key type: a number
+    /// alone cannot say whether it counts key values or partitions, and a
+    /// partition count means the same on a `date` key and a `bigint` one. A
+    /// date or time key may instead be given a width in the grammar of
+    /// `pbps partitions extend --every`: a number and `day`, `week`, `month`
+    /// or `year` (`2month`, `1year`). The text is read where it is used, by
+    /// the engine that knows the key, and one it cannot read is reported by
+    /// `doctor` rather than ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_runway: Option<PartitionRunway>,
+
     /// The organization's own rules and their suppressions (ADR-0008). Absent
     /// means every built-in rule at its default severity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policies: Option<pbps_policy::Policies>,
+}
+
+/// The horizon of `partition_runway:`: a count of partitions, or a width.
+///
+/// Two spellings of one setting, told apart by the YAML itself: an integer is
+/// a count, text is a width (`2month`). Text made only of digits is read as a
+/// count by the engine, so `"3"` and `3` agree.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(untagged)]
+pub enum PartitionRunway {
+    /// This many partitions, counting the one the newest rows are in.
+    Partitions(std::num::NonZeroU32),
+    /// This much of the key's range, as `--every` writes it: `2month`.
+    Width(String),
+}
+
+impl PartitionRunway {
+    /// The setting as the engine reads it: the count's digits, or the width.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Partitions(n) => n.to_string(),
+            Self::Width(text) => text.clone(),
+        }
+    }
 }
 
 impl Config {
@@ -601,6 +643,34 @@ mod tests {
             both,
             Err(ConfigError::AmbiguousFingerprintKey { ref name }) if name == "prod"
         ));
+    }
+
+    /// `partition_runway:` is a count of partitions or a width, and nothing
+    /// else reads: a typo in the unit is the engine's to name, but a list, a
+    /// negative number, a fraction or a zero count never reaches it.
+    #[test]
+    fn partition_runway_is_a_count_or_a_width_and_absent_by_default() {
+        let parse = |value: &str| {
+            Config::parse(
+                &format!("dialect: postgres\npartition_runway: {value}\n"),
+                Path::new("pbps.yml"),
+            )
+        };
+        let runway = |value: &str| parse(value).unwrap().partition_runway.unwrap();
+        assert_eq!(
+            runway("3"),
+            PartitionRunway::Partitions(std::num::NonZeroU32::new(3).unwrap())
+        );
+        assert_eq!(runway("2month"), PartitionRunway::Width("2month".into()));
+        assert_eq!(runway("\"3\""), PartitionRunway::Width("3".into()));
+        assert_eq!(runway("3").text(), "3");
+        assert_eq!(runway("\"3 weeks\"").text(), "3 weeks");
+        let none = Config::parse("dialect: postgres\n", Path::new("pbps.yml")).unwrap();
+        assert_eq!(none.partition_runway, None);
+        // Negative: none of these is a count or a width.
+        for refused in ["0", "-1", "1.5", "[1, 2]", "{a: 1}", "true"] {
+            assert!(parse(refused).is_err(), "{refused} must be refused");
+        }
     }
 
     #[test]

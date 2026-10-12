@@ -19,6 +19,11 @@
 //! sure what they are pointed at, which is quite possibly production. So the
 //! permissions are asked for rather than tried, and the ledger is read rather
 //! than created.
+//!
+//! The one thing it reads of a managed table's rows is whether one is there
+//! (#1789, DEC-1789.2): a range-partitioned table whose series is about to run
+//! out, and a DEFAULT partition holding rows of a partition not created yet,
+//! are warnings. A plan reads no data (SPEC 7.2), so they are `doctor`'s.
 
 use pbps_config::Project;
 use pbps_db::Conn;
@@ -172,6 +177,28 @@ pub struct EnvDiagnosis {
     /// as it was.
     #[serde(skip)]
     lock_gap: Option<pbps_db::doctor::LockReadGap>,
+
+    /// What the partitioned parents' runway and DEFAULT questions found
+    /// (#1789, DEC-1789.2). Not serialized, like the ledger check: the
+    /// findings carry it, and the published schema stays as it was.
+    #[serde(skip)]
+    #[schemars(skip)]
+    partitions: PartitionCheck,
+}
+
+/// What asking the partitioned parents established. Absent, empty and
+/// unreadable are three different things here too: a parent the question
+/// found nothing to say about is in no list, and one that could not be read
+/// is a finding of its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum PartitionCheck {
+    /// Nothing was asked: the project declares no such parent, or the
+    /// environment was never reached.
+    #[default]
+    NotChecked,
+    Checked(pbps_db::doctor::RunwayReport),
+    /// Asking stopped before any parent was answered, for this reason.
+    Unreadable(String),
 }
 
 /// What the ledger check established. One of three, because they need three
@@ -232,6 +259,7 @@ impl EnvDiagnosis {
             detail: None,
             ledger: LedgerCheck::NotChecked,
             lock_gap: None,
+            partitions: PartitionCheck::NotChecked,
         }
     }
 
@@ -341,6 +369,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     // actually asked (DECISIONS 439).
     let ids = crate::read_ids(project).unwrap_or_default();
     let keys = foreign_keys(project);
+    let loaded = crate::load_quiet(project).ok();
     let declared = Declared {
         referenced: keys.referenced,
         referenced_columns: keys.referenced_columns,
@@ -350,7 +379,16 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         data: data_tables(project),
         schemas: managed_schemas,
         ids,
-        loaded: crate::load_quiet(project).ok(),
+        partitioned: loaded
+            .as_ref()
+            .map(|loaded| pbps_db::doctor::PartitionedParent::all(&loaded.schema))
+            .unwrap_or_default(),
+        partition_runway: project
+            .config
+            .partition_runway
+            .as_ref()
+            .map(pbps_config::PartitionRunway::text),
+        loaded,
         dialect: project.config.dialect,
     };
 
@@ -848,6 +886,11 @@ struct Declared {
     /// (uid -> its name there) and looks the two maps up together (DECISIONS
     /// 439).
     ids: pbps_model::IdsFile,
+    /// The RANGE-partitioned parents whose runway is asked about, and the
+    /// ranges the declarations give them (#1789, DEC-1789.2).
+    partitioned: Vec<pbps_db::doctor::PartitionedParent>,
+    /// `partition_runway:` as written, or `None` for the default.
+    partition_runway: Option<String>,
     /// The declarations themselves, for the one question only the differ can
     /// answer: which declared keys the next apply drops and re-adds
     /// ([`surviving_keys`]). `None` when they do not load.
@@ -1058,6 +1101,20 @@ async fn examine(
             d.permissions_unknown = true;
             d.note(format!("could not read this account's permissions: {e}"));
         }
+    }
+
+    // The partitioned parents' runway and DEFAULT rows (#1789, DEC-1789.2):
+    // two advisory questions, so a failure to ask them is a warning of its
+    // own and never a reason the environment is not ready.
+    if !declared.partitioned.is_empty() {
+        let ask = pbps_db::doctor::RunwayAsk {
+            parents: &declared.partitioned,
+            horizon: declared.partition_runway.as_deref(),
+        };
+        d.partitions = match crate::engine::partition_runway(&mut conn, &ask, &declared.ids).await {
+            Ok(report) => PartitionCheck::Checked(report),
+            Err(error) => PartitionCheck::Unreadable(error.to_string()),
+        };
     }
 
     // The ledger last, because it is the only question whose answer changes
@@ -1382,6 +1439,7 @@ fn env_findings(
             .remedy("upgrade the server to 2016 SP1 or later, or remove the declared modules"),
         );
     }
+    out.extend(partition_findings(d));
     if d.supports_online == Some(false) {
         out.push(output::Finding::note(
             "edition.no-online",
@@ -1391,6 +1449,163 @@ fn env_findings(
                 d.environment
             ),
         ));
+    }
+    out
+}
+
+/// How many declared partitions a finding names before it counts the rest.
+const NAMED: usize = 3;
+
+/// The partitioned parents' findings (#1789, DEC-1789.2), all warnings: a
+/// series about to run out, or rows in the DEFAULT, stops no deployment, and a
+/// question that could not be asked is not a clean bill either.
+fn partition_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
+    use pbps_db::doctor::{DefaultRows, Reach, Runway};
+    let recheck = || format!("pbps doctor {}", target_arg(d));
+    let parent_arg = |parent: &pbps_model::ObjectName| {
+        crate::report::shell_arg(&parent.to_string())
+            .unwrap_or_else(|| crate::report::placeholder("table"))
+    };
+    let report = match &d.partitions {
+        PartitionCheck::NotChecked => return Vec::new(),
+        PartitionCheck::Unreadable(why) => {
+            return vec![
+                output::Finding::warning(
+                    "doctor.partition-runway-unknown",
+                    format!(
+                        "{}: whether the partitioned tables' series run out, and whether their \
+                         DEFAULT partitions hold rows, could not be checked ({why}); that is \
+                         undetermined, not fine",
+                        d.environment
+                    ),
+                )
+                .remedy(recheck()),
+            ];
+        }
+        PartitionCheck::Checked(report) => report,
+    };
+    let mut out = Vec::new();
+    for found in &report.parents {
+        let parent = &found.parent;
+        match &found.runway {
+            None => {}
+            Some(Runway::Short(short)) => {
+                let reach = match &short.reach {
+                    Reach::Until(value) => format!("to `{value}` at least"),
+                    Reach::Partitions(1) => {
+                        "for 1 partition, the one holding the newest rows".to_owned()
+                    }
+                    Reach::Partitions(n) => {
+                        format!("for {n} partitions, counting the one holding the newest rows")
+                    }
+                };
+                let past = match &short.default {
+                    Some(default) => {
+                        format!("rows past it land in the DEFAULT partition {default}")
+                    }
+                    None => "rows past it are refused, as no partition takes them".to_owned(),
+                };
+                let (declared, remedy) = if short.declared_covers {
+                    (
+                        " The declarations already reach that far, so what is missing is a plan \
+                         applied here.",
+                        format!("pbps plan {}", target_arg(d)),
+                    )
+                } else {
+                    (
+                        "",
+                        format!(
+                            "pbps partitions extend {} --every {} --until {}",
+                            parent_arg(parent),
+                            short
+                                .every
+                                .clone()
+                                .unwrap_or_else(|| crate::report::placeholder("step")),
+                            crate::report::placeholder("end")
+                        ),
+                    )
+                };
+                out.push(
+                    output::Finding::warning(
+                        "doctor.partition-runway",
+                        format!(
+                            "{}: {parent}'s partitions end at `{}`, which is short of the horizon \
+                             ({}): its newest rows are in the partition from `{}`, so the series \
+                             should run {reach}, and {past}.{declared}",
+                            d.environment, short.frontier, short.horizon, short.held_from
+                        ),
+                    )
+                    .remedy(remedy),
+                );
+            }
+            Some(Runway::Unknown(why)) => out.push(
+                output::Finding::warning(
+                    "doctor.partition-runway-unknown",
+                    format!(
+                        "{}: whether {parent}'s partitions run out could not be determined \
+                         ({why}); that is undetermined, not fine",
+                        d.environment
+                    ),
+                )
+                .remedy(recheck()),
+            ),
+        }
+        match &found.default_rows {
+            None => {}
+            Some(DefaultRows::Held {
+                default,
+                missing,
+                holding,
+            }) => {
+                // The partitions that hold rows when the read could say; the
+                // ones that might otherwise.
+                let (shown, which) = if holding.is_empty() {
+                    (missing, "one of the partitions")
+                } else {
+                    (holding, "the range of")
+                };
+                let named: Vec<String> =
+                    shown.iter().take(NAMED).map(ToString::to_string).collect();
+                let more = shown.len().saturating_sub(NAMED);
+                let names = if more == 0 {
+                    named.join(", ")
+                } else {
+                    format!("{}, and {more} more", named.join(", "))
+                };
+                out.push(
+                    output::Finding::warning(
+                        "doctor.partition-default-rows",
+                        format!(
+                            "{}: {default} holds rows inside {which} {names}, which {parent}'s \
+                             declarations give and this database does not have yet. Creating \
+                             a partition moves its rows out of the DEFAULT (DEC-1547.1), and only \
+                             as far as `pbps move-rows` allowed (DEC-1788.1)",
+                            d.environment
+                        ),
+                    )
+                    .remedy(format!(
+                        "pbps move-rows {} --max-rows {} --reason {}",
+                        shown
+                            .first()
+                            .map_or_else(|| crate::report::placeholder("partition"), parent_arg),
+                        crate::report::placeholder("max-rows"),
+                        crate::report::placeholder("why")
+                    )),
+                );
+            }
+            Some(DefaultRows::Unknown(why)) => out.push(
+                output::Finding::warning(
+                    "doctor.partition-default-rows-unknown",
+                    format!(
+                        "{}: whether {parent}'s DEFAULT partition holds rows of partitions not \
+                         created yet could not be determined ({why}); that is undetermined, not \
+                         fine",
+                        d.environment
+                    ),
+                )
+                .remedy(recheck()),
+            ),
+        }
     }
     out
 }
@@ -1587,6 +1802,8 @@ mod tests {
                     declared_keys: Default::default(),
                     granted: Default::default(),
                     data: Default::default(),
+                    partitioned: Vec::new(),
+                    partition_runway: None,
                     ids: declared_ids,
                     loaded: Some(declared),
                     dialect: pbps_config::DialectName::Mssql,
@@ -1643,6 +1860,8 @@ mod tests {
                     declared_keys: Default::default(),
                     granted: Default::default(),
                     data: Default::default(),
+                    partitioned: Vec::new(),
+                    partition_runway: None,
                     ids: ids("dst", "p"),
                     loaded: Some(pending),
                     dialect: pbps_config::DialectName::Mssql,
@@ -1745,6 +1964,8 @@ mod tests {
                 declared_keys: Default::default(),
                 granted: Default::default(),
                 data: Default::default(),
+                partitioned: Vec::new(),
+                partition_runway: None,
                 ids,
                 loaded: Some(declared),
                 dialect: pbps_config::DialectName::Mssql,
@@ -2733,5 +2954,285 @@ mod tests {
         assert_eq!(held.len(), 1, "{held:?}");
         assert!(held[0].contains(r#"--env "US West""#), "{held:?}");
         assert!(!held[0].contains("--db"), "{held:?}");
+    }
+    // -- The partitioned parents' findings (#1789, DEC-1789.2) ---------------
+
+    fn partitioned(report: pbps_db::doctor::RunwayReport) -> EnvDiagnosis {
+        let mut d = EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready");
+        d.partitions = PartitionCheck::Checked(report);
+        d
+    }
+
+    fn name(text: &str) -> pbps_model::ObjectName {
+        text.parse().unwrap()
+    }
+
+    fn short(declared_covers: bool, default: Option<&str>) -> pbps_db::doctor::Runway {
+        pbps_db::doctor::Runway::Short(pbps_db::doctor::ShortRunway {
+            frontier: "2027-01-01".to_owned(),
+            held_from: "2026-12-01".to_owned(),
+            reach: pbps_db::doctor::Reach::Until("2027-02-01".to_owned()),
+            horizon: "twice the newest partition's width".to_owned(),
+            every: Some("1month".to_owned()),
+            declared_covers,
+            default: default.map(name),
+        })
+    }
+
+    fn parent_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
+        partition_findings(d)
+    }
+
+    /// A short runway is a warning, and a warning leaves the environment as
+    /// ready as it was: the finding is the only thing it changes.
+    #[test]
+    fn a_short_runway_is_a_warning_that_names_the_generator() {
+        let d = partitioned(pbps_db::doctor::RunwayReport {
+            parents: vec![pbps_db::doctor::ParentRunway {
+                parent: name("app.ev"),
+                runway: Some(short(false, Some("app.ev_default"))),
+                default_rows: None,
+            }],
+        });
+        let findings = parent_findings(&d);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let finding = &findings[0];
+        assert_eq!(finding.id, "doctor.partition-runway");
+        assert_eq!(finding.severity, output::Severity::Warning);
+        assert_eq!(d.state, "ready");
+        for named in [
+            "prod: app.ev's partitions end at `2027-01-01`",
+            "twice the newest partition's width",
+            "the partition from `2026-12-01`",
+            "to `2027-02-01` at least",
+            "land in the DEFAULT partition app.ev_default",
+        ] {
+            assert!(
+                finding.message.contains(named),
+                "{named:?} in {}",
+                finding.message
+            );
+        }
+        let remedy = finding.remedy.as_deref().unwrap();
+        assert_eq!(
+            remedy,
+            "pbps partitions extend app.ev --every 1month --until \"<end>\""
+        );
+        assert!(!crate::report::has_bare_placeholder(remedy), "{remedy}");
+        // Without a DEFAULT the rows are refused, and the message says so.
+        let no_default = partitioned(pbps_db::doctor::RunwayReport {
+            parents: vec![pbps_db::doctor::ParentRunway {
+                parent: name("app.ev"),
+                runway: Some(short(false, None)),
+                default_rows: None,
+            }],
+        });
+        assert!(
+            parent_findings(&no_default)[0]
+                .message
+                .contains("rows past it are refused"),
+        );
+    }
+
+    /// When the declarations already reach the horizon, the series is not
+    /// missing a declaration: a plan has not been applied here.
+    #[test]
+    fn declarations_that_already_reach_the_horizon_are_remedied_by_a_plan() {
+        let d = partitioned(pbps_db::doctor::RunwayReport {
+            parents: vec![pbps_db::doctor::ParentRunway {
+                parent: name("app.ev"),
+                runway: Some(short(true, None)),
+                default_rows: None,
+            }],
+        });
+        let finding = &parent_findings(&d)[0];
+        assert_eq!(finding.remedy.as_deref(), Some("pbps plan --env prod"));
+        assert!(
+            finding.message.contains("a plan applied here"),
+            "{}",
+            finding.message
+        );
+        assert!(!finding.message.contains("extend"), "{}", finding.message);
+    }
+
+    /// The step the remedy needs is the newest partition's, and one that has
+    /// no spelling is a placeholder rather than a guess.
+    #[test]
+    fn a_width_the_generator_cannot_spell_is_a_placeholder() {
+        let mut runway = short(false, None);
+        if let pbps_db::doctor::Runway::Short(short) = &mut runway {
+            short.every = None;
+            short.reach = pbps_db::doctor::Reach::Partitions(3);
+        }
+        let d = partitioned(pbps_db::doctor::RunwayReport {
+            parents: vec![pbps_db::doctor::ParentRunway {
+                parent: name("app.ev"),
+                runway: Some(runway),
+                default_rows: None,
+            }],
+        });
+        let finding = &parent_findings(&d)[0];
+        assert!(
+            finding
+                .message
+                .contains("for 3 partitions, counting the one holding the newest rows"),
+            "{}",
+            finding.message
+        );
+        let remedy = finding.remedy.as_deref().unwrap();
+        assert!(remedy.contains("--every \"<step>\""), "{remedy}");
+        assert!(!crate::report::has_bare_placeholder(remedy), "{remedy}");
+    }
+
+    #[test]
+    fn rows_in_the_default_name_the_move_that_takes_them() {
+        let missing: Vec<_> = (1..=5)
+            .map(|m| name(&format!("app.ev_2027_{m:02}")))
+            .collect();
+        let held = |holding: Vec<pbps_model::ObjectName>| {
+            partitioned(pbps_db::doctor::RunwayReport {
+                parents: vec![pbps_db::doctor::ParentRunway {
+                    parent: name("app.ev"),
+                    runway: None,
+                    default_rows: Some(pbps_db::doctor::DefaultRows::Held {
+                        default: name("app.ev_rest"),
+                        missing: missing.clone(),
+                        holding,
+                    }),
+                }],
+            })
+        };
+        // Which partition holds rows, when the read could say: that one is
+        // named, and it is the one the remedy moves.
+        let findings = parent_findings(&held(vec![name("app.ev_2027_03")]));
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let finding = &findings[0];
+        assert_eq!(finding.id, "doctor.partition-default-rows");
+        assert_eq!(finding.severity, output::Severity::Warning);
+        for named in [
+            "app.ev_rest holds rows inside the range of app.ev_2027_03, which app.ev's",
+            "DEC-1547.1",
+            "`pbps move-rows`",
+        ] {
+            assert!(
+                finding.message.contains(named),
+                "{named:?} in {}",
+                finding.message
+            );
+        }
+        let remedy = finding.remedy.as_deref().unwrap();
+        assert_eq!(
+            remedy,
+            "pbps move-rows app.ev_2027_03 --max-rows \"<max-rows>\" --reason \"<why>\""
+        );
+        assert!(!crate::report::has_bare_placeholder(remedy), "{remedy}");
+        // When it could not, the declared partitions it might be are named,
+        // a few and a count, and the remedy starts at the first.
+        let finding = &parent_findings(&held(Vec::new()))[0];
+        assert!(
+            finding.message.contains(
+                "holds rows inside one of the partitions app.ev_2027_01, app.ev_2027_02, \
+                 app.ev_2027_03, and 2 more, which"
+            ),
+            "{}",
+            finding.message
+        );
+        assert!(
+            finding
+                .remedy
+                .as_deref()
+                .unwrap()
+                .starts_with("pbps move-rows app.ev_2027_01 --max-rows"),
+            "{finding:?}"
+        );
+    }
+
+    /// Absent, empty and unreadable are three different things. An unreadable
+    /// answer is a finding of its own, never silence, and each question
+    /// reports for itself.
+    #[test]
+    fn a_question_that_could_not_be_answered_is_its_own_finding() {
+        let d = partitioned(pbps_db::doctor::RunwayReport {
+            parents: vec![pbps_db::doctor::ParentRunway {
+                parent: name("app.ev"),
+                runway: Some(pbps_db::doctor::Runway::Unknown(
+                    "permission denied for table ev".to_owned(),
+                )),
+                default_rows: Some(pbps_db::doctor::DefaultRows::Unknown(
+                    "canceling statement due to statement timeout".to_owned(),
+                )),
+            }],
+        });
+        let findings = parent_findings(&d);
+        let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "doctor.partition-runway-unknown",
+                "doctor.partition-default-rows-unknown"
+            ]
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.severity == output::Severity::Warning)
+        );
+        assert!(
+            findings[0]
+                .message
+                .contains("permission denied for table ev")
+        );
+        assert!(findings[0].message.contains("undetermined, not fine"));
+        assert!(findings[1].message.contains("statement timeout"));
+        assert_eq!(
+            findings[0].remedy.as_deref(),
+            Some("pbps doctor --env prod")
+        );
+        // The whole read failing is one finding for the environment.
+        let mut d = EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready");
+        d.partitions = PartitionCheck::Unreadable("cannot read recorded identities".to_owned());
+        let findings = parent_findings(&d);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].id, "doctor.partition-runway-unknown");
+        assert!(
+            findings[0]
+                .message
+                .contains("cannot read recorded identities")
+        );
+    }
+
+    /// Negative: nothing asked, and nothing found, report nothing. A covered
+    /// horizon is a parent with no entry in the report.
+    #[test]
+    fn a_covered_horizon_and_a_question_not_asked_report_nothing() {
+        let d = EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready");
+        assert!(parent_findings(&d).is_empty());
+        let d = partitioned(pbps_db::doctor::RunwayReport::default());
+        assert!(parent_findings(&d).is_empty());
+        assert!(
+            env_findings(
+                &d,
+                false,
+                &pbps_pg::Postgres::new(),
+                pbps_db::Driver::Postgres
+            )
+            .is_empty()
+        );
+    }
+
+    /// A parent whose name cannot be written in a shell without quoting still
+    /// gets a remedy that pastes, or a placeholder that says what to fill in.
+    #[test]
+    fn a_parent_name_the_shell_would_misread_is_not_pasted_bare() {
+        let d = partitioned(pbps_db::doctor::RunwayReport {
+            parents: vec![pbps_db::doctor::ParentRunway {
+                parent: name("app.\"a b$c\""),
+                runway: Some(short(false, None)),
+                default_rows: None,
+            }],
+        });
+        let remedy = parent_findings(&d)[0].remedy.clone().unwrap();
+        assert!(!remedy.contains("$c"), "{remedy}");
+        assert!(!crate::report::has_bare_placeholder(&remedy), "{remedy}");
     }
 }

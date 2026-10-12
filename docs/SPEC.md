@@ -147,6 +147,12 @@ equivalents are refused by name when the project loads, and so is a historical
 config that names one when a baseline is read from git (#739). A sibling such
 as `../shared/schema` is fine.
 
+`partition_runway:` sets how far ahead of its rows a RANGE-partitioned table's
+partitions must run before `doctor` warns that they are running out (9.5): a
+count of partitions (`3`) or, for a date or time key, a width in the grammar of
+`pbps partitions extend --every` (`2month`). Absent, it is twice the newest
+partition's width (DEC-1789.2).
+
 The `policies:` block selects built-in rules and their severities and records
 suppressions — a rule id, a reason and an optional expiry — with parameters
 that are data (a pattern, a number, a change window) and never code
@@ -2304,6 +2310,30 @@ Permissions are named individually rather than as "make it `db_owner`". An
 organization that grants the deployment account exactly what it needs should be
 able to see the list; "make it an owner" is the advice that makes that
 organization say no to the tool.
+
+**A RANGE-partitioned table's series running out, and rows waiting in its
+DEFAULT partition, are warnings** (DEC-1789.2), asked of each PostgreSQL parent
+the declarations hold that has one key column of a type `pbps partitions extend`
+steps. They are `doctor`'s and not a plan's because a plan reads no data (7.2):
+- `doctor.partition-runway`: the partitions end less than the horizon past the
+  newest partition that holds a row. The measure is that occupancy, not a clock,
+  so it works for an integer key and gives the same answer on every day it is
+  asked. The horizon is `partition_runway:` (4.1). The remedy is `pbps partitions
+  extend`, or `pbps plan` when the declarations already reach the horizon and what
+  is missing is a plan applied here. A table with no row in a range partition, and
+  a series that reaches the horizon, report nothing.
+- `doctor.partition-default-rows`: the DEFAULT holds a row inside the range of a
+  declared partition the database does not have yet, which creating it will move
+  (DEC-1547.1), only as far as `pbps move-rows` allowed (DEC-1788.1). A row outside
+  every declared range is not a finding.
+- `doctor.partition-runway-unknown` and `doctor.partition-default-rows-unknown`: the
+  question could not be answered, with the reason (a denied `SELECT`, a lock or
+  statement timeout). That is never read as a series that is long enough.
+
+All four are warnings, and leave the environment `ready`. The reads are `EXISTS`
+through the parent, in a `READ ONLY` transaction, under a lock timeout, so a
+rebuild holding the table is not waited for; the account needs `SELECT` on the
+parent alone. Nothing is read of a row but whether one is there.
 
 **Each is asked for at the securable where it is actually needed**, and the
 report names that securable. The four `CREATE` permissions cannot be granted

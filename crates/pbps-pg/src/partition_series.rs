@@ -75,14 +75,14 @@ fn invalid(message: impl Into<String>) -> DialectError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Int {
-    name: &'static str,
-    min: i128,
-    max: i128,
+pub(crate) struct Int {
+    pub(crate) name: &'static str,
+    pub(crate) min: i128,
+    pub(crate) max: i128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Key {
+pub(crate) enum Key {
     Date,
     Timestamp,
     TimestampTz,
@@ -93,7 +93,7 @@ impl Key {
     /// The key a column of this type makes, if it makes one. The type is
     /// normalized first, so `int4`, `timestamptz` and `timestamp with time
     /// zone` are what they are, and an array of any of them is none.
-    fn of(ty: &ColumnType) -> Option<Self> {
+    pub(crate) fn of(ty: &ColumnType) -> Option<Self> {
         let ty = crate::types::normalize(ty).ok()?;
         if ty.is_array() {
             return None;
@@ -121,7 +121,7 @@ impl Key {
         })
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Key::Date => "date",
             Key::Timestamp => "timestamp",
@@ -148,7 +148,7 @@ impl Key {
 /// Days from 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's
 /// `days_from_civil`). The engine's calendar is proleptic Gregorian too, and
 /// a year in 1 to 9999 is all this is asked about.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -159,7 +159,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// The inverse of [`days_from_civil`].
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -176,7 +176,7 @@ fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-fn days_in_month(y: i64, m: i64) -> i64 {
+pub(crate) fn days_in_month(y: i64, m: i64) -> i64 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -190,18 +190,18 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 /// `Ord` is the order of the instants, since the fields run from the most
 /// significant to the least.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Civil {
-    y: i64,
-    m: i64,
-    d: i64,
+pub(crate) struct Civil {
+    pub(crate) y: i64,
+    pub(crate) m: i64,
+    pub(crate) d: i64,
     /// Whole seconds into the day.
-    secs: i64,
+    pub(crate) secs: i64,
     /// A fraction of a second that is not zero.
-    frac: bool,
+    pub(crate) frac: bool,
 }
 
 /// Why a text is not a bound of the key's type.
-enum Reject {
+pub(crate) enum Reject {
     /// Not the spelling the engine prints.
     Spelling,
     /// A `timestamptz` in another zone than UTC.
@@ -217,7 +217,7 @@ fn digits(text: &str, width: usize) -> Option<i64> {
 /// `text` as `key` prints a bound, and no other way: years 1 to 9999, a
 /// two-digit month, day, hour, minute and second, and for `timestamptz` the
 /// UTC offset `+00`.
-fn parse_civil(key: Key, text: &str) -> Result<Civil, Reject> {
+pub(crate) fn parse_civil(key: Key, text: &str) -> Result<Civil, Reject> {
     // Ascii, so that every slice below is on a character boundary.
     let date = text
         .get(..10)
@@ -293,7 +293,7 @@ fn parse_civil(key: Key, text: &str) -> Result<Civil, Reject> {
     }
 }
 
-fn why(key: Key, reject: &Reject) -> String {
+pub(crate) fn why(key: Key, reject: &Reject) -> String {
     match reject {
         Reject::Spelling => format!(
             "which is not how the engine prints a {} bound (years 1 to 9999, as `{}`)",
@@ -313,29 +313,37 @@ fn why(key: Key, reject: &Reject) -> String {
 
 /// What a step counts: days since 1970-01-01, or months since year 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(crate) enum Mode {
     Days,
     Months,
 }
 
 /// A step: whole `len` units of `mode`, and the unit that names its
 /// partitions.
-#[derive(Debug, Clone, Copy)]
-struct Step {
-    mode: Mode,
-    len: i64,
-    unit: Unit,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Step {
+    pub(crate) mode: Mode,
+    pub(crate) len: i64,
+    pub(crate) unit: Unit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Unit {
+pub(crate) enum Unit {
     Day,
     Week,
     Month,
     Year,
 }
 
+/// A step as `--every` writes it.
 fn parse_step(every: &str) -> Result<Step, String> {
+    parse_step_as("--every", every)
+}
+
+/// The same grammar for another setting that writes a step, named in the
+/// refusal as `what` (`partition_runway:` reads it too, DEC-1789.2): one
+/// parser, so the two cannot disagree on what a month is.
+pub(crate) fn parse_step_as(what: &str, every: &str) -> Result<Step, String> {
     let text = every.trim();
     let split = text
         .find(|c: char| !c.is_ascii_digit())
@@ -345,17 +353,17 @@ fn parse_step(every: &str) -> Result<Step, String> {
         Ok(n) if n > 0 => n,
         _ if count.is_empty() || count.bytes().all(|b| b == b'0') => {
             return Err(format!(
-                "--every `{every}` starts with no positive whole number: write a step such as \
+                "{what} `{every}` starts with no positive whole number: write a step such as \
                  `1month`, `7day`, `1week` or `1year`"
             ));
         }
         _ => {
-            return Err(format!("--every `{every}` is too large a step"));
+            return Err(format!("{what} `{every}` is too large a step"));
         }
     };
     if n > MAX_STEP {
         return Err(format!(
-            "--every `{every}` is too large a step (at most {MAX_STEP})"
+            "{what} `{every}` is too large a step (at most {MAX_STEP})"
         ));
     }
     let unit = match unit.trim().to_ascii_lowercase().as_str() {
@@ -365,13 +373,13 @@ fn parse_step(every: &str) -> Result<Step, String> {
         "year" | "years" => Unit::Year,
         "" => {
             return Err(format!(
-                "--every `{every}` has no unit: a date or time key steps in `day`, `week`, \
+                "{what} `{every}` has no unit: a date or time key steps in `day`, `week`, \
                  `month` or `year`, as `1month`"
             ));
         }
         other => {
             return Err(format!(
-                "--every `{every}`: `{other}` is not a unit; use `day`, `week`, `month` or \
+                "{what} `{every}`: `{other}` is not a unit; use `day`, `week`, `month` or \
                  `year`"
             ));
         }
@@ -695,7 +703,7 @@ fn temporal(
 }
 
 /// An integer as the engine prints it: no sign but `-`, no leading zero.
-fn parse_integer(int: Int, text: &str) -> Result<i128, String> {
+pub(crate) fn parse_integer(int: Int, text: &str) -> Result<i128, String> {
     let digits = text.strip_prefix('-').unwrap_or(text);
     let canonical = !digits.is_empty()
         && digits.len() <= 20
