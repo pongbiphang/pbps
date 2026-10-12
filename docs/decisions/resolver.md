@@ -2509,9 +2509,10 @@ the resolver's plan.
   read is coherent in its own right, as the run's were (ADR-0016). A
   difference is the finding `resolver.recheck`, exit 2, naming each change;
   a failed read is `unanswerable`.
-- **A skipped recheck cannot be sealed.** `Unsealed::seal` takes a
-  `Rechecked`, which only a passed recheck makes. The library's `produce`
-  rechecks too, so every sealed answer has passed one.
+- **A skipped recheck cannot be sealed.** Only `Rechecked::seal` seals,
+  and only a passed recheck makes a `Rechecked`. It holds the run it
+  rechecked, so one run's recheck cannot seal another. The library's
+  `produce` rechecks too, so every sealed answer has passed one.
 - **An index the evidence rebuilds takes over its parameter change.** The
   resolver's rebuilds get the normalization the differ's and the
   dependents pass's get (`drop_parameter_changes_of_rebuilt_indexes`): a

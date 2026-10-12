@@ -10,7 +10,7 @@ use pbps_db::resolver::ScratchNames;
 
 pub(crate) mod engine;
 mod producer;
-pub use producer::{ProduceError, Rechecked, Unsealed};
+pub use producer::{ProduceError, Rechecked, Refused, Unsealed};
 mod resolution;
 pub mod scratch;
 mod transitions;

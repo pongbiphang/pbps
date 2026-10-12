@@ -3991,18 +3991,23 @@ async fn produce_unsealed(
 }
 
 /// The recheck on a new session to `target`, as `plan` opens one. What it
-/// refused names, or its proof when it passed. Never panics on the
-/// recheck's own answer, so the caller can drop its fixture first.
+/// refused names, with the run handed back, or its proof when it passed.
+/// Never panics on the recheck's own answer, so the caller can drop its
+/// fixture first.
 async fn recheck(
-    unsealed: &super::super::Unsealed,
+    unsealed: super::super::Unsealed,
     target: &str,
-) -> Result<super::super::Rechecked, String> {
+) -> Result<super::super::Rechecked, (String, Box<super::super::Unsealed>)> {
     let mut session = Conn::connect(Driver::Postgres, target).await.unwrap();
-    match unsealed.recheck(&mut session).await {
-        Ok(rechecked) => Ok(rechecked),
-        Err(Error::Changed(changed)) => Err(changed.join("; ")),
-        Err(other) => Err(format!("not a recheck refusal: {other}")),
-    }
+    unsealed.recheck(&mut session).await.map_err(|refused| {
+        let super::super::Refused { error, unsealed } = *refused;
+        let said = if let Error::Changed(changed) = &error {
+            changed.join("; ")
+        } else {
+            format!("not a recheck refusal: {error}")
+        };
+        (said, Box::new(unsealed))
+    })
 }
 
 #[tokio::test]
@@ -4026,24 +4031,29 @@ async fn resolver_recheck_binds_the_target_by_engine_identity() {
         )
         .await;
         let unsealed = result.unwrap_or_else(|error| panic!("{server}: {error}"));
-        let elsewhere = recheck(&unsealed, &setting(other)).await;
-        let same = recheck(&unsealed, &fixture.on(&target_db)).await;
-        fixture.drop().await;
-        let Err(elsewhere) = elsewhere else {
-            panic!("{server}: a recheck on another cluster refuses");
+        let (elsewhere, same) = match recheck(unsealed, &setting(other)).await {
+            Ok(_) => (None, None),
+            Err((refused, unsealed)) => (
+                Some(refused),
+                Some(recheck(*unsealed, &fixture.on(&target_db)).await),
+            ),
         };
+        fixture.drop().await;
+        let elsewhere =
+            elsewhere.unwrap_or_else(|| panic!("{server}: a recheck on another cluster refuses"));
         assert!(
             elsewhere.contains("another cluster"),
             "{server}: {elsewhere}"
         );
-        let rechecked =
-            same.unwrap_or_else(|refused| panic!("{server}: the same cluster passes: {refused}"));
+        let rechecked = same
+            .unwrap()
+            .unwrap_or_else(|(refused, _)| panic!("{server}: the same cluster passes: {refused}"));
         // The sealed evidence carries the planning read's identity, keyed.
         let environment =
             crate::resolver::sealing::environment_key(&key.project, Some(ENVIRONMENT)).unwrap();
-        let changes = unsealed.changes().clone();
-        let plan = unsealed
-            .seal(rechecked, changes, inputs.base(), inputs.desired())
+        let changes = rechecked.changes().clone();
+        let plan = rechecked
+            .seal(changes, inputs.base(), inputs.desired())
             .unwrap();
         assert_eq!(
             plan.evidence.qualification().target_cluster,
@@ -4120,12 +4130,12 @@ async fn resolver_recheck_refuses_a_target_changed_after_the_run() {
                 Ok(unsealed) => {
                     let sql = sql.replace("{db}", &target_db).replace("{role}", &role);
                     fixture.run(&target_db, &[&sql]).await;
-                    Ok(recheck(&unsealed, &target).await)
+                    Ok(recheck(unsealed, &target).await)
                 }
                 Err(error) => Err(error.to_string()),
             };
             fixture.drop().await;
-            let Err(refused) =
+            let Err((refused, _)) =
                 outcome.unwrap_or_else(|error| panic!("{server} {case}: the run: {error}"))
             else {
                 panic!("{server} {case}: a changed target refuses");
@@ -4166,14 +4176,14 @@ async fn resolver_recheck_refuses_an_external_shape_changed_after_planning() {
                             )
                             .await;
                     }
-                    Ok(recheck(&unsealed, &fixture.on(&target_db)).await)
+                    Ok(recheck(unsealed, &fixture.on(&target_db)).await)
                 }
                 Err(error) => Err(error.to_string()),
             };
             fixture.drop().await;
             let outcome = outcome.unwrap_or_else(|error| panic!("{server}: the run: {error}"));
             if changed {
-                let Err(refused) = outcome else {
+                let Err((refused, _)) = outcome else {
                     panic!("{server}: a changed external shape refuses");
                 };
                 assert!(
@@ -4181,7 +4191,7 @@ async fn resolver_recheck_refuses_an_external_shape_changed_after_planning() {
                     "{server}: {refused}"
                 );
             } else {
-                outcome.unwrap_or_else(|refused| {
+                outcome.unwrap_or_else(|(refused, _)| {
                     panic!("{server}: the unchanged shape publishes: {refused}")
                 });
             }
@@ -4220,25 +4230,28 @@ async fn resolver_seals_an_accepted_build_limitation_and_rechecks_it() {
                     let upgraded = super::super::producer::RECHECK_BUILD
                         .scope(
                             Some("pbps test upgrade".to_owned()),
-                            recheck(&unsealed, &target),
+                            recheck(unsealed, &target),
                         )
                         .await;
-                    let unchanged = recheck(&unsealed, &target).await;
-                    Ok((unsealed, upgraded, unchanged))
+                    Ok(match upgraded {
+                        Ok(rechecked) => (None, Ok(rechecked)),
+                        Err((refused, unsealed)) => {
+                            (Some(refused), recheck(*unsealed, &target).await)
+                        }
+                    })
                 }
                 Err(error) => Err(error.to_string()),
             };
             fixture.drop().await;
-            let (unsealed, upgraded, unchanged) =
+            let (upgraded, unchanged) =
                 outcome.unwrap_or_else(|error| panic!("{server}: the run: {error}"));
-            let Err(refused) = upgraded else {
-                panic!("{server}: a target whose build changed refuses");
-            };
+            let refused = upgraded
+                .unwrap_or_else(|| panic!("{server}: a target whose build changed refuses"));
             assert!(refused.contains("reported facts"), "{server}: {refused}");
-            let rechecked = unchanged.unwrap_or_else(|refused| panic!("{server}: {refused}"));
-            let changes = unsealed.changes().clone();
-            let plan = unsealed
-                .seal(rechecked, changes, inputs.base(), inputs.desired())
+            let rechecked = unchanged.unwrap_or_else(|(refused, _)| panic!("{server}: {refused}"));
+            let changes = rechecked.changes().clone();
+            let plan = rechecked
+                .seal(changes, inputs.base(), inputs.desired())
                 .unwrap();
             let limitations = &plan.evidence.qualification().limitations;
             match scratch_build {

@@ -180,7 +180,7 @@ pub(super) fn seal(
 /// A run's answer before its evidence is sealed (#1516). The run is over and
 /// its scratch released. The caller runs its ordinary passes on
 /// [`Unsealed::changes`], [rechecks](Unsealed::recheck) the target, then
-/// [seals](Unsealed::seal) the plan in its final order, so the sealed order
+/// [seals](Rechecked::seal) the plan in its final order, so the sealed order
 /// already holds whatever those passes added or moved (DEC-1516.1).
 pub struct Unsealed {
     pub(super) key: EnvironmentFingerprintKey,
@@ -207,24 +207,6 @@ impl Unsealed {
         &self.ordered.changes
     }
 
-    /// Seals `changes`, the resolver's plan after the caller's passes. Every
-    /// edge the resolver ordered must still hold in the final order, and no
-    /// change it ordered may be gone: a pass that undoes the resolver's
-    /// order is a defect, refused here rather than sealed (#1516). Only a
-    /// passed [recheck](Self::recheck) makes the [`Rechecked`] it takes.
-    pub fn seal(
-        self,
-        _rechecked: Rechecked,
-        changes: pbps_model::ChangeSet,
-        base: pbps_diff::Side<'_>,
-        desired: pbps_diff::Side<'_>,
-    ) -> Result<ResolvedPlan, Error> {
-        let edges = remap(&self.ordered.changes, &changes, self.ordered.proof.edges())?;
-        let proof = pbps_model::resolver::OrderingProof::new(&changes, edges)
-            .map_err(|error| Error::Binding(format!("the final order: {error}")))?;
-        seal(&self.key, self.sealing, changes, proof, base, desired)
-    }
-
     /// The fresh pre-publication recheck (#1516). The session must reach
     /// the cluster the planning read recorded (DEC-1685.1). The target's
     /// reported facts and its deployer's authorization are read again and
@@ -232,7 +214,26 @@ impl Unsealed {
     /// which holds the objects the baseline staged, is captured afresh and
     /// must equal it. Any difference refuses: the evidence would describe
     /// a target that is no longer there.
-    pub async fn recheck(&self, target: &mut pbps_db::Conn) -> Result<Rechecked, Error> {
+    ///
+    /// The run moves into the [`Rechecked`] it returns, the one value that
+    /// can seal it: a recheck of one run cannot seal another (#1516
+    /// review). A refusal hands the run back with its reason.
+    pub async fn recheck(self, target: &mut pbps_db::Conn) -> Result<Rechecked, Box<Refused>> {
+        match self.differences(target).await {
+            Ok(changed) if changed.is_empty() => Ok(Rechecked(self)),
+            Ok(changed) => Err(Box::new(Refused {
+                error: Error::Changed(changed),
+                unsealed: self,
+            })),
+            Err(error) => Err(Box::new(Refused {
+                error,
+                unsealed: self,
+            })),
+        }
+    }
+
+    /// What the recheck finds changed since the run's opening read.
+    async fn differences(&self, target: &mut pbps_db::Conn) -> Result<Vec<String>, Error> {
         let read = |what: &'static str| {
             move |error: pbps_db::DbError| Error::Read(format!("the recheck's {what}: {error}"))
         };
@@ -240,9 +241,9 @@ impl Unsealed {
             .await
             .map_err(read("cluster identity"))?;
         if identity != self.opening.planned_identity {
-            return Err(Error::Changed(vec![
+            return Ok(vec![
                 "the recheck reached another cluster than the planning read".into(),
-            ]));
+            ]);
         }
         let request = &self.opening.request;
         let (catalog, authorization) = scope::read_target(
@@ -292,18 +293,60 @@ impl Unsealed {
                 None => format!("the capture's {change}"),
             }
         }));
-        if changed.is_empty() {
-            Ok(Rechecked(()))
-        } else {
-            Err(Error::Changed(changed))
-        }
+        Ok(changed)
     }
 }
 
-/// That the target passed the publication recheck. Made only by
-/// [`Unsealed::recheck`] and taken by [`Unsealed::seal`]: a plan cannot be
+/// A run whose target passed the publication recheck. Made only by
+/// [`Unsealed::recheck`], and the only way to seal: a plan cannot be
 /// sealed, and so cannot be published, past a recheck it skipped (#1516).
-pub struct Rechecked(());
+///
+/// It holds the run it rechecked, so one run's recheck cannot seal another
+/// (#1516 review). A run has no seal of its own to hand a proof to:
+/// ```compile_fail,E0599
+/// use pbps_cli::resolver::server::{Rechecked, Unsealed};
+/// fn reuse(proof: Rechecked, other: Unsealed) {
+///     let _ = other.seal(proof, todo!(), todo!(), todo!());
+/// }
+/// ```
+/// and no proof is made around a run outside the recheck:
+/// ```compile_fail,E0423
+/// use pbps_cli::resolver::server::{Rechecked, Unsealed};
+/// fn forge(other: Unsealed) -> Rechecked {
+///     Rechecked(other)
+/// }
+/// ```
+pub struct Rechecked(Unsealed);
+
+impl Rechecked {
+    /// Seals `changes`, the resolver's plan after the caller's passes. Every
+    /// edge the resolver ordered must still hold in the final order, and no
+    /// change it ordered may be gone: a pass that undoes the resolver's
+    /// order is a defect, refused here rather than sealed (#1516).
+    pub fn seal(
+        self,
+        changes: pbps_model::ChangeSet,
+        base: pbps_diff::Side<'_>,
+        desired: pbps_diff::Side<'_>,
+    ) -> Result<ResolvedPlan, Error> {
+        let run = self.0;
+        let edges = remap(&run.ordered.changes, &changes, run.ordered.proof.edges())?;
+        let proof = pbps_model::resolver::OrderingProof::new(&changes, edges)
+            .map_err(|error| Error::Binding(format!("the final order: {error}")))?;
+        seal(&run.key, run.sealing, changes, proof, base, desired)
+    }
+
+    /// The plan in the resolver's own order.
+    pub fn changes(&self) -> &pbps_model::ChangeSet {
+        self.0.changes()
+    }
+}
+
+/// A recheck that did not pass: why, and the run it leaves unsealed.
+pub struct Refused {
+    pub error: Error,
+    pub unsealed: Unsealed,
+}
 
 #[cfg(test)]
 tokio::task_local! {

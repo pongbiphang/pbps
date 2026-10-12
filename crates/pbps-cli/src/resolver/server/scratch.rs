@@ -84,10 +84,10 @@ pub async fn produce(
     let rechecked = unsealed
         .recheck(&mut session)
         .await
-        .map_err(ProduceError::Run)?;
-    let changes = unsealed.changes().clone();
-    unsealed
-        .seal(rechecked, changes, base, desired)
+        .map_err(|refused| ProduceError::Run(refused.error))?;
+    let changes = rechecked.changes().clone();
+    rechecked
+        .seal(changes, base, desired)
         .map_err(ProduceError::Run)
 }
 

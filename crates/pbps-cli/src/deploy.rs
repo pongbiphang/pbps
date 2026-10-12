@@ -7575,16 +7575,19 @@ pub fn cmd_plan_db(
                     .with_context(|| format!("cannot reach `{}` for the recheck", target.label))?;
                 let rechecked = match unsealed.recheck(&mut fresh).await {
                     Ok(rechecked) => rechecked,
-                    Err(changed @ pbps_cli::resolver::server::Error::Changed(_)) => {
+                    Err(refused) => {
+                        let error = refused.error;
+                        if !matches!(error, pbps_cli::resolver::server::Error::Changed(_)) {
+                            return Err(error.into());
+                        }
                         let finding =
-                            crate::output::Finding::error("resolver.recheck", changed.to_string())
+                            crate::output::Finding::error("resolver.recheck", error.to_string())
                                 .remedy("plan again");
                         return Ok(Connected::Refused { finding, findings });
                     }
-                    Err(error) => return Err(error.into()),
                 };
-                let sealed = unsealed
-                    .seal(rechecked, cs.clone(), base_side, desired_side)
+                let sealed = rechecked
+                    .seal(cs.clone(), base_side, desired_side)
                     .map_err(|e| {
                         anyhow::anyhow!(
                             "the resolver's evidence could not be sealed over the final plan: {e}; \

@@ -182,6 +182,8 @@ jobs:
       # --all-targets excludes doctests. These compile-fail cases pin the
       # downstream opacity of source-bearing native capture inputs (#876).
       - run: cargo test -p pbps-pg --doc
+      # And that a resolver plan is sealed only by its own recheck (#1516).
+      - run: cargo test -p pbps-cli --doc
 
   # Development happens on Linux, so Windows coverage rests entirely on this
   # job: line endings, path separators and terminal detection are the kinds of
