@@ -150,6 +150,38 @@ pub fn cmd_extend(
         );
     }
 
+    // And the project's own rules, which `validate` runs and the checks above
+    // do not (ADR-0008, #1904). Only an error the tree did not already carry
+    // refuses: a finding it had before is not this change's, and a rule left
+    // at `warning` or `note` is advice that `validate` prints beside a valid
+    // project. A rule whose pattern the existing partitions break must not
+    // make the series impossible to extend.
+    let had: std::collections::BTreeSet<(String, String)> =
+        crate::declaration_policy_findings(project, dialect.as_ref(), &loaded.schema, None)
+            .into_iter()
+            .filter(|f| f.severity == crate::output::Severity::Error)
+            .map(|f| (f.id, f.message))
+            .collect();
+    let broken: Vec<_> =
+        crate::declaration_policy_findings(project, dialect.as_ref(), &after.schema, None)
+            .into_iter()
+            .filter(|f| f.severity == crate::output::Severity::Error)
+            .filter(|f| !had.contains(&(f.id.clone(), f.message.clone())))
+            .collect();
+    if !broken.is_empty() {
+        let lines: Vec<String> = broken
+            .iter()
+            .map(|f| format!("{}: {}", f.id, f.message))
+            .collect();
+        bail!(
+            "the {} generated partition(s) would break a rule `pbps.yml` sets to `error`, so \
+             nothing was written:\n{}\nChange the rule in the `policies:` block (a suppression \
+             with a reason, a different severity or pattern), or declare the partitions by hand.",
+            series.partitions.len(),
+            list(lines.iter().map(String::as_str))
+        );
+    }
+
     std::fs::write(&path, &text).with_context(|| format!("cannot write `{}`", path.display()))?;
 
     let count = series.partitions.len();
