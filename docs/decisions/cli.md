@@ -934,3 +934,80 @@ independent errors, period checks, partition diagnostic precedence, generated
 names and reachable retries, and the policy filter. The existing 24 conflict
 fixtures retain their messages and order. Removing only context forwarding
 while retaining the exclusive model makes the regressions fail at runtime.
+
+<a id="dec-1789-1"></a>
+
+**DEC-1789.1. `pbps partitions extend` declares a series from where the last range ends to an
+end the user states, as a function of the declarations alone; it reads no clock, writes no
+identity and never connects (#1789).** A RANGE-partitioned table needs each partition to
+exist before a row arrives for it, and keeping the series ahead is a chore done by hand until
+the day it is not. The maintainer chose the shape on the issue (2026-10-12), after weighing a
+command that reads the date against one that does not.
+
+- **A generator, not a clock.** The end is an argument: `--until` is an exclusive bound
+  spelled as a full key value (`2028-01-01`, `2028-01-01 00:00:00`,
+  `2028-01-01 00:00:00+00`, `5000`), like `to:` and with no off-by-one a month spelled
+  `2027-12` would carry. The same tree and the same words give the same file on every machine
+  and in every CI run, and the diff in git is the decision. Whether the series is long enough
+  is a question about a live database (the runway of rows), and so is `doctor`'s, not this
+  command's.
+- **Where it starts.** At the highest finite `to:` among the parent's declared ranges.
+  `--from` names the start only for a parent that declares no range yet, and is refused
+  beside one: two starts would be one guess. A range already reaching `MAXVALUE` leaves
+  nothing to extend and is refused by name.
+- **A step that does not tile is refused, with the nearest values that do.** A gap in a key
+  space is rows with no partition. The start and `--until` must both lie on the grid the
+  step makes: a month steps from the first of a month at midnight, a day or a week from
+  midnight, a year from the first of a month (so a fiscal year from July is `1year` from
+  `2026-07-01`). Dates are counted on the calendar from the start, not stepped one after
+  another. A run that finds the frontier at or past `--until` writes nothing and says so,
+  which makes a rerun a no-op, byte for byte.
+- **The spelling is what the engine prints, nothing else.** Measured on 16.15 and 18.6 under
+  the pins (`TimeZone` UTC, ISO dates, DEC-1170.1): `date` is `2027-01-01`, `timestamp`
+  `2027-01-01 00:00:00`, `timestamptz` `2027-01-01 00:00:00+00`, an integer its decimal text
+  (quoted by the catalog for `bigint`, as `parse_bound` reads either). Each reads the same
+  under the contrasting `DateStyle`, `TimeZone` and abbreviation sets DEC-1756.1 asks the
+  engine about, so they pass its check with no rule of their own about them; `plan --db` of a generated series is the live proof,
+  and a project pulled back from the target declares the same partitions byte for byte. A
+  declared end or `--from` in any other spelling is refused, naming the spelling: guessing
+  which of two readings was meant is what DEC-1756.1 refuses a plan for.
+- **Names.** `<parent>_<YYYY>`, `<parent>_<YYYY>_<MM>` or `<parent>_<YYYY>_<MM>_<DD>` by the
+  step's unit, and `<parent>_<lower bound>` for an integer key, in the parent's schema. A
+  name over 63 bytes (the engine truncates it, and two such names can collide) or one a
+  declared table already holds is refused. A negative integer lower bound has no name, since
+  `ev_-5` is not an identifier, and is refused rather than given a convention of its own.
+- **Limits, each a refusal.** One key column of `date`, `timestamp`, `timestamptz`,
+  `smallint`, `integer` or `bigint` (a `text` key has no step; several columns have no
+  single frontier). Years 1 to 9999, so the calendar helper need not know the five-digit and
+  ` BC` forms the engine prints outside them. A `timestamptz` bound in a zone other than UTC
+  (#1757 gives a project a zone). A parent declared `partitions: external`, whose partitions
+  are another tool's (DEC-1533.1). At most 2000 partitions in one run, because `--every 1`
+  on a `bigint` is otherwise a request for nine quintillion tables.
+- **The calendar is a small proleptic Gregorian helper** in `pbps-pg`
+  (`partition_series.rs`), pinned over a whole 400-year cycle, not a crate: no `deny.toml`
+  or audit change, and the engine's calendar is the proleptic Gregorian one. The tiling,
+  the arithmetic and the spelling are the engine's, so they sit behind
+  `Dialect::range_series`, which refuses by default (SQL Server, which has no RANGE
+  partitions, by name); the CLI holds none of it.
+- **The write.** The parent's file is found as `fmt` finds it and must already be what
+  `fmt` writes, with the ids file's absorbed annotations dropped as `fmt` drops them:
+  anything else would put a reformatting of the whole file into the diff beside the new
+  entries, so the remedy is `pbps fmt` first. The new entries are added and the file
+  re-rendered by the same function `fmt` uses, read back and compared with what was
+  generated, and the whole project is then run through the declaration checks `plan` and
+  `validate` share before a byte is written. The `policies:` rules are not among them, so
+  `validate` can still refuse a generated name a naming rule rejects (#1904). A tree that
+  already fails those checks is refused first, so that what they say afterwards is about
+  this change alone.
+- **What it leaves alone.** The ids file: `plan` gives the partitions identities as it does
+  for any table added by hand (SPEC 6.2), and a flag that supplied them would be identity
+  intent no human gave (SPEC 14.3). Every file but the parent's. The database: nothing is
+  created until `plan` and `apply`. Beside a standing DEFAULT partition a new range is
+  planned as a plain table filled and attached (DEC-1547.1), and takes rows only as far as
+  `pbps move-rows` allows (DEC-1788.1); the command says so and does not record the move.
+
+Pinned by the unit tests in `partition_series.rs` (a year end, a leap February, daily,
+weekly, monthly, yearly, `timestamp`, `timestamptz` and `bigint` series, and each refusal
+above), by `tests/partitions_extend.rs` without a database (canonical output, a no-op rerun,
+other files untouched, a file not canonical, a taken name, a tree already invalid, SQL
+Server), and on 16 and 18 by `a_generated_series_is_planned_applied_and_verified_through_the_cli`.

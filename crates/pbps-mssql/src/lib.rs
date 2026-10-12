@@ -321,6 +321,31 @@ impl Dialect for Mssql {
 mod tests {
     use super::*;
 
+    /// SQL Server has no RANGE partitions to extend (#1789): it refuses by
+    /// name, rather than answering with an empty series that would read as
+    /// "nothing to add".
+    #[test]
+    fn a_series_of_range_partitions_is_refused_by_name() {
+        let schema = pbps_model::Schema::default();
+        let parent: TableName = "dbo.ev".parse().unwrap();
+        let said = Mssql
+            .range_series(&pbps_dialect::RangeSeriesRequest {
+                schema: &schema,
+                parent: &parent,
+                every: "1month",
+                until: "2027-01-01",
+                from: Some("2026-01-01"),
+            })
+            .unwrap_err();
+        assert_eq!(
+            said,
+            DialectError::Unsupported {
+                dialect: "mssql",
+                feature: "generating a series of range partitions".to_owned()
+            }
+        );
+    }
+
     /// A collation change on a non-Unicode column can change its bytes, so
     /// it is `narrowing`; on a Unicode column it changes comparison only, and
     /// takes no class of its own (#1175).

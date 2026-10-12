@@ -349,7 +349,13 @@ indexes:
   same plan name it as declared; a rename in a plan that attaches, detaches
   or drops under it is refused by name, as is a partition's own rename
   (DEC-1690.1). Every other change stays refused by name: attaching as the
-  DEFAULT partition until #1639.
+  DEFAULT partition until #1639. `pbps partitions extend <table> --every <step>
+  --until <end>` declares a range series's next partitions in the parent's file
+  (single-column `date`, `timestamp`, `timestamptz`, `smallint`, `integer` or
+  `bigint` key), from where the last declared range ends to the exclusive end
+  stated, each bound spelled as the engine prints it. It reads no clock and
+  creates nothing, a step that does not tile is refused with the nearest values
+  that do, and `plan` gives the partitions their identities (DEC-1789.1).
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first
@@ -1391,6 +1397,7 @@ back is structure: a column that was dropped returns empty (14.3).
 | `pbps plan --base <file>` | Use a state snapshot file as the baseline instead (for environments without git) |
 | `pbps plan --check` | CI mode: fail only when intent is missing, never prompt, and never connect |
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
+| `pbps partitions extend <table> --every <step> --until <end> [--from <start>]` | Declare a PostgreSQL RANGE-partitioned table's next partitions in its file, from the last declared range to an end the user states; reads no clock and no database, writes no identity (see 4.3) |
 | `pbps rename` / `rename-table` / `rename-role` / `drop` / `drop-table` / `drop-role` / `move-rows` | Record intent into the ids file |
 | `pbps validate` | Static checks: type validity, FK targets exist, identity consistency (one name may not map to more than one uid, see 5.3), module shape and namespace collisions (4.5), grant targets (4.7), and the declaration rules of the `policies:` block ([ADR-0008](ADR-0008-policies.md)); `--since <rev>` evaluates the rules only for objects whose identity changed since that revision |
 | `pbps docs` | Render documentation and an ERD from the declarations (see 9.4) |

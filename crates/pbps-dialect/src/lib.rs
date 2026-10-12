@@ -1970,6 +1970,47 @@ pub struct RetypeDependents {
     pub foreign_keys: bool,
 }
 
+/// What [`Dialect::range_series`] is asked (#1789).
+///
+/// Text, not parsed values: how a bound is spelled and what a step of
+/// `--every` is belong to the engine, and the CLI holds neither.
+#[derive(Debug, Clone, Copy)]
+pub struct RangeSeriesRequest<'a> {
+    /// The declarations: the parent, every partition declared under it, and
+    /// every table a generated name must not meet.
+    pub schema: &'a Schema,
+    pub parent: &'a TableName,
+    /// The step, as the user wrote it: `1month`, `7day`, or a plain count for
+    /// an integer key.
+    pub every: &'a str,
+    /// The exclusive end of the last partition, spelled as the key's value.
+    pub until: &'a str,
+    /// Where the first partition starts. Accepted only when the parent
+    /// declares no range yet; otherwise the series starts where the last one
+    /// ends.
+    pub from: Option<&'a str>,
+}
+
+/// One range partition to add: its name and its bound, one value per end,
+/// each spelled as the engine prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesPartition {
+    pub name: TableName,
+    pub from: String,
+    pub to: String,
+}
+
+/// What [`Dialect::range_series`] answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeSeries {
+    /// Where the series starts: the end of the highest declared range, or
+    /// `from`.
+    pub start: String,
+    /// The partitions to add, in order. Empty when the declarations already
+    /// reach `until`: that is an answer, not a failure.
+    pub partitions: Vec<SeriesPartition>,
+}
+
 /// Dialect knowledge that needs no database connection.
 pub trait Dialect {
     fn name(&self) -> &'static str;
@@ -2583,6 +2624,21 @@ pub trait Dialect {
         _parent_sources: pbps_model::diagnostic::ColumnSources<'_>,
     ) -> Vec<DialectError> {
         self.validate_partition(name, partition, parent)
+    }
+
+    /// The range partitions that extend a partitioned parent's declared
+    /// series, from where its last one ends to `request.until` (#1789,
+    /// DEC-1789.1). Pure: it reads the declarations in the request and
+    /// nothing else, and the clock least of all.
+    ///
+    /// Refuses by default. A dialect without RANGE partitions has no series,
+    /// and an empty answer would read as "nothing to add" about a table that
+    /// can never take one.
+    fn range_series(&self, _request: &RangeSeriesRequest<'_>) -> Result<RangeSeries, DialectError> {
+        Err(DialectError::Unsupported {
+            dialect: self.name(),
+            feature: "generating a series of range partitions".to_owned(),
+        })
     }
 
     /// Renders one change as statements.

@@ -93,6 +93,11 @@ by name. `partitions: external` hands a parent's partitions to another tool:
 pbps manages the parent alone, refuses a partition holding anything of its
 own, and `pull` declares it on pg_partman's parents and on each
 `--partitions-external` (#1533, DEC-1533.1).
+`pbps partitions extend` declares a range series's next partitions in the
+parent's file, from the last declared range to an exclusive end the user states,
+in the engine's own bound spelling; it reads no clock and creates nothing (#1789,
+DEC-1789.1). Open: the `doctor` warning that the series is running short (#1789,
+second part), and non-UTC `timestamptz` bounds (#1757).
 
 A SQL Server column may name its collation (`collation:`); `pull` declares one
 that differs from the database's default, and a collation change is a planned
@@ -102,6 +107,7 @@ Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`)
 `validate` (`--since`), `fmt` (`--check`), `rename`, `rename-table`, `rename-role`, `drop`,
 `drop-table`, `drop-role`, `intent` (repeatable rename/drop pairs),
 `move-rows` (`--max-rows` / `--reason`),
+`partitions extend` (`--every` / `--until` / `--from`),
 `docs` (`--format` / `--out` / `--title`), `explain` (`--plan`), `doctor`
 (`--env`), `schema` (`--kind declaration|config|envelope`), `completions`,
 `man`, `key generate` (`--out`). Every read-only command
