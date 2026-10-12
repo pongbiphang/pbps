@@ -385,9 +385,20 @@ pub(super) fn changes(
                     }
                     continue;
                 }
-                // A surface the plan rebuilds had a default to bind: one that
-                // is gone is a definition the rebuild cannot spell, not
-                // nothing to rebuild (#1610).
+                // A column the ordinary plan replaces, its name taken by a
+                // new column under a new UID, is rebuilt by that replacement:
+                // the `AddColumn` writes the new default, and the old column
+                // may have had none, such as a generated one (#1610 review).
+                if ordinary.changes.iter().any(|p| {
+                    matches!(&p.change, Change::DropColumn { column: c, .. } if c == before_column)
+                        || matches!(&p.change, Change::AddColumn { table, name, .. }
+                            if *table == column.table && *name == column.name)
+                }) {
+                    continue;
+                }
+                // Otherwise a surface the plan rebuilds had a default to bind:
+                // one that is gone is a definition the rebuild cannot spell,
+                // not nothing to rebuild (#1610).
                 let old = base
                     .tables
                     .get(&before_column.table)

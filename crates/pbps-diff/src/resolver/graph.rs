@@ -334,15 +334,24 @@ pub(super) fn constraints(
     // the engine recurses the parent's `SET DEFAULT` or `DROP DEFAULT` into
     // every partition, over the partition's own default, so the partition's
     // must come after it to stay (DEC-1687.1, docs/ORDERING.md). The ordinary
-    // plan's (9, 4) rank is no edge here (#1610).
+    // plan's (9, 4) rank is no edge here (#1610). Only what sets the
+    // partition's default waits: its release has nothing to keep, and when
+    // one routine both defaults call is rebuilt, the release must precede
+    // the routine's drop, which precedes the parent's restoration (#1610
+    // review).
     for (i, change) in steps.iter().enumerate() {
         let Change::AlterColumnDefault { column, .. } = change else {
             continue;
         };
         for (j, other) in steps.iter().enumerate() {
             if let Change::SetPartitionDefault {
-                parent, column: c, ..
+                parent,
+                column: c,
+                to,
+                fallback,
+                ..
             } = other
+                && (to.is_some() || fallback.is_some())
                 && *parent == column.table
                 && *c == column.name
             {
