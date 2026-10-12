@@ -1667,7 +1667,11 @@ fn diff_partial_rebuilding(
             (order_key(c), 1)
         }
     };
-    planned.sort_by_key(|p| {
+    // Cached: `sort_by_key` computed this key, `Debug` text and all, on both
+    // sides of every comparison, a third of a 4,000-table plan's CPU
+    // (#1908). The cache keeps equal keys in their original order, as the
+    // stable sort did, so the order is the same.
+    planned.sort_by_cached_key(|p| {
         let (class, within) = sort_class(&p.change);
         (
             class,
@@ -12418,6 +12422,50 @@ mod tests {
         ] {
             assert!(k.contains(&kind.to_owned()), "{kind}: {k:?}");
         }
+    }
+
+    /// Changes tied on class, rank and subject are ordered by their `Debug`
+    /// text, not by the order the differ produced them in.
+    ///
+    /// Ten columns of one table are widened and ten others become nullable.
+    /// Both kinds tie on class, rank and table. The differ walks the columns
+    /// by uid, which is random, so it interleaves the two kinds. Only the
+    /// `Debug` tiebreak puts every `AlterColumnNullability` before every
+    /// `AlterColumnType`; the walk gives that order in one run in C(20, 10).
+    /// The key is now computed once per change (#1908) and must give this
+    /// same order.
+    #[test]
+    fn changes_tied_on_class_and_table_are_ordered_by_their_debug_text() {
+        let shape = |changed: bool| {
+            let mut columns: Vec<(String, Column)> = Vec::new();
+            for i in 0..10 {
+                let widened = Column::new(ty(if changed { "bigint" } else { "int" }));
+                columns.push((format!("w{i:02}"), widened));
+                let mut loosened = Column::new(ty("int"));
+                loosened.nullable = changed;
+                columns.push((format!("n{i:02}"), loosened));
+            }
+            let columns: Vec<(&str, Column)> = columns
+                .iter()
+                .map(|(n, c)| (n.as_str(), c.clone()))
+                .collect();
+            schema_of("dbo.t", table(&columns))
+        };
+        let changes: Vec<String> = run(&shape(false), &shape(true), &[])
+            .changes
+            .iter()
+            .map(|p| format!("{:?}", p.change))
+            .collect();
+        assert_eq!(changes.len(), 20, "{changes:?}");
+        let kinds: Vec<&str> = changes
+            .iter()
+            .map(|c| c.split_once(' ').map_or(c.as_str(), |(kind, _)| kind))
+            .collect();
+        assert_eq!(kinds[..10], ["AlterColumnNullability"; 10], "{changes:?}");
+        assert_eq!(kinds[10..], ["AlterColumnType"; 10], "{changes:?}");
+        let mut by_debug = changes.clone();
+        by_debug.sort();
+        assert_eq!(changes, by_debug);
     }
 
     fn row_ops(cs: &ChangeSet) -> Vec<String> {
