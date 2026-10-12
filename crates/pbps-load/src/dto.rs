@@ -461,6 +461,12 @@ pub struct StrategyDto {
     pub online: bool,
 }
 
+/// A key that is there holds a boolean; only a key that is not is `None`.
+/// `Option<bool>` alone reads an explicit null as the key left out.
+fn a_boolean<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<bool>, D::Error> {
+    <bool as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ColumnDto {
@@ -469,7 +475,9 @@ pub struct ColumnDto {
     pub ty: Spanned<String>,
 
     /// Absent is `true`, except on a `serial`, which PostgreSQL makes NOT NULL.
-    #[serde(default)]
+    // Present, it is a boolean: `nullable: null` is refused, as it was while
+    // the field was a plain `bool`, not read as absent (#1631).
+    #[serde(default, deserialize_with = "a_boolean")]
     #[schemars(with = "bool")]
     pub nullable: Option<bool>,
 

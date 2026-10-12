@@ -3097,6 +3097,74 @@ async fn a_stored_generated_column_round_trips_and_changes_its_expression() {
     assert!(plan(&after, &ids, &changed, &ids).is_empty());
 }
 
+/// A `serial` added to a table another role owns, applied by a superuser:
+/// `CREATE SEQUENCE` gives the sequence to the superuser, and `OWNED BY`
+/// refuses a sequence whose owner is not the table's. Measured on 16 and 18,
+/// "sequence must have same owner as table it is linked to". The plan gives
+/// the sequence to the table's owner first, as the engine's own `serial`
+/// does, and the rows are numbered (#1631).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_serial_added_to_another_roles_table_is_that_roles() {
+    use pbps_model::OwnedSequence;
+    let s = emit_schema("ser1631o");
+    let t = TableName::new(&s, "t");
+    let owner = format!("ser1631_owner_{}", std::process::id());
+    let mut db = TestDb::create("ser1631_own").await;
+    fresh(&mut db, &s).await;
+    db.execute(&format!(
+        "DROP ROLE IF EXISTS {owner};
+         CREATE ROLE {owner};
+         CREATE TABLE {s}.t (id integer PRIMARY KEY);
+         INSERT INTO {s}.t VALUES (1), (2);
+         ALTER TABLE {s}.t OWNER TO {owner};"
+    ))
+    .await
+    .expect("a table another role owns");
+    let read = ours_only(&pull(&mut db).await, &s);
+    let ids = mint_ids(&read, &IdsFile::default(), &[]);
+    let mut changed = read.clone();
+    let mut added = pbps_model::Column::new(ty("integer")).not_null();
+    added.value_source = pbps_model::ValueSource::Sequence(OwnedSequence::serial());
+    changed
+        .tables
+        .get_mut(&t)
+        .unwrap()
+        .columns
+        .insert("n".into(), added);
+    let changed_ids = mint_ids(&changed, &ids, &[]);
+    apply(
+        &mut db,
+        &Postgres::new(),
+        &plan(&read, &ids, &changed, &changed_ids),
+    )
+    .await;
+    let sequence_owner = text(
+        &mut db,
+        &format!(
+            "SELECT pg_get_userbyid(relowner)::text FROM pg_class \
+             WHERE oid = pg_get_serial_sequence('{s}.t', 'n')::regclass"
+        ),
+    )
+    .await;
+    let numbered = text(
+        &mut db,
+        &format!("SELECT string_agg(n::text, ',' ORDER BY n) FROM {s}.t"),
+    )
+    .await;
+    let after = ours_only(&pull(&mut db).await, &s);
+    drop_schema(&mut db, &s).await;
+    db.drop().await;
+    connect()
+        .await
+        .execute(&format!("DROP ROLE {owner}"))
+        .await
+        .expect("drop the role");
+    assert_eq!(sequence_owner, owner);
+    assert_eq!(numbered, "1,2");
+    assert!(plan(&after, &changed_ids, &changed, &changed_ids).is_empty());
+}
+
 /// A `serial`, `bigserial` and `smallserial` written by hand, one under a
 /// renamed sequence with its own start and increment, and one on an
 /// `UNLOGGED` table, are read as the `serial` columns they are, rebuilt from

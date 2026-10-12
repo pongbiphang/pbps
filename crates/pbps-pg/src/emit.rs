@@ -754,11 +754,12 @@ fn owned_sequence_statements(
     column: &str,
     declared: &Column,
     unlogged: bool,
-) -> Result<Option<(String, String)>, DialectError> {
+) -> Result<Option<(String, String, TableName)>, DialectError> {
     let pbps_model::ValueSource::Sequence(sequence) = &declared.value_source else {
         return Ok(None);
     };
-    let q = qualified(&owned_sequence(table, column, sequence))?;
+    let name = owned_sequence(table, column, sequence);
+    let q = qualified(&name)?;
     Ok(Some((
         format!(
             "CREATE {}SEQUENCE {q} AS {} START WITH {} INCREMENT BY {};",
@@ -772,7 +773,33 @@ fn owned_sequence_statements(
             qualified(table)?,
             quote(column)?
         ),
+        name,
     )))
+}
+
+/// `CREATE SEQUENCE` gives the sequence to the role that runs it, and `OWNED
+/// BY` refuses one whose owner is not the table's. Measured on 16 and 18: a
+/// superuser, or a member of the role owning the table, adding a `serial` to
+/// it failed with "sequence must have same owner as table it is linked to".
+/// So a sequence for a table that already exists is given to the table's
+/// owner first, as the engine's own `serial` expansion does; for a table the
+/// running role owns, that is no change. The owner is the catalog's at apply
+/// time, which no plan holds (#1631).
+fn sequence_to_table_owner(
+    table: &TableName,
+    sequence: &TableName,
+) -> Result<String, DialectError> {
+    let body = format!(
+        "BEGIN\n\
+         \x20 EXECUTE pg_catalog.format('ALTER SEQUENCE %s OWNER TO %I', {}, \
+         (SELECT pg_catalog.pg_get_userbyid(c.relowner) FROM pg_catalog.pg_class c \
+         WHERE c.oid = {}::pg_catalog.regclass));\n\
+         END",
+        literal(&qualified(sequence)?),
+        literal(&qualified(table)?),
+    );
+    let tag = dollar_tag(&body);
+    Ok(format!("DO {tag}\n{body}\n{tag};"))
 }
 
 /// One line of a `CREATE TABLE` column list, or the body of an `ALTER TABLE ADD`.
@@ -2531,7 +2558,10 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 column_definition(table, name, column)?
             );
             let body = match owned_sequence_statements(table, name, column, false)? {
-                Some((create, owned)) => format!("{create}\n{add}\n{owned}"),
+                Some((create, owned, sequence)) => {
+                    let owner = sequence_to_table_owner(table, &sequence)?;
+                    format!("{create}\n{owner}\n{add}\n{owned}")
+                }
                 None => add,
             };
             Ok(vec![
@@ -3855,9 +3885,9 @@ fn create_table(
     // limitation (#1631).
     let body = sequences
         .iter()
-        .map(|(sequence, _)| sequence.as_str())
+        .map(|(sequence, _, _)| sequence.as_str())
         .chain([create.as_str()])
-        .chain(sequences.iter().map(|(_, owned)| owned.as_str()))
+        .chain(sequences.iter().map(|(_, owned, _)| owned.as_str()))
         .collect::<Vec<_>>()
         .join("\n");
     let mut out = vec![on(pg, name, &body)?];

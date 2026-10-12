@@ -541,6 +541,16 @@ indexes:
             "{}",
             render(&refused)
         );
+        // `nullable:` that is there is a boolean, on a serial and off one:
+        // an explicit null is not the key left out.
+        for spelled in ["null", "~", ""] {
+            for ty in ["serial", "integer"] {
+                let doc =
+                    format!("table: app.t\ncolumns:\n  id: {{type: {ty}, nullable: {spelled}}}\n");
+                let refused = errors(&doc);
+                assert!(!refused.is_empty(), "{ty}, `nullable: {spelled}` was read");
+            }
+        }
         // Its default is its sequence's: a `default:` beside it is a second
         // value source.
         let twice = errors("table: app.t\ncolumns:\n  id: {type: serial, default: '1'}\n");

@@ -1280,6 +1280,7 @@
         "a_rule_on_the_view_is_named_and_refused_because_the_rebuild_would_lose_it",
         "a_schema_a_broken_pattern_would_swallow_is_in_the_pull",
         "a_serial_column_reads_back_as_an_integer_with_a_sequence_it_owns",
+        "a_serial_added_to_another_roles_table_is_that_roles",
         "a_serial_round_trips_and_numbers_the_rows_it_is_added_to",
         "a_session_setting_left_behind_cannot_answer_the_transaction_probe",
         "a_session_the_connection_string_excludes_is_refused",

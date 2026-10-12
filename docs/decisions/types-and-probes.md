@@ -1795,9 +1795,14 @@ Measured on 16.15 and 18.6:
 - `ADD COLUMN` with a `nextval` default rewrites the table and numbers the
   stored rows from the sequence's start by its increment. The emitter creates
   the sequence by name with `START WITH` and `INCREMENT BY` first, then the
-  column with that default, then `ALTER SEQUENCE … OWNED BY`. Writing `serial`
-  in the DDL could not carry the start, which an added column numbers its
-  rows from. The estimate is a rewrite, and the pre-flight treats the
+  column with that default, then `ALTER SEQUENCE … OWNED BY`, all in one
+  statement. Writing `serial` in the DDL could not carry the start, which an
+  added column numbers its rows from. `OWNED BY` needs the sequence and the
+  table to have one owner, and `CREATE SEQUENCE` gives the sequence to the
+  running role, so for a table that already exists the sequence is given to
+  the table's owner first, read from the catalog at apply time, as the
+  engine's own `serial` does. Measured on 16 and 18: without it, a superuser
+  or a member of the owning role was refused. The estimate is a rewrite, and the pre-flight treats the
   backfill as the identity's: a value no probe can evaluate.
 - Dropping the table or the column drops an owned sequence with it, so the
   plan has nothing to drop.
