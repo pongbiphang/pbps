@@ -34461,3 +34461,112 @@ mod plan_fixture {
     ));
 }
 use plan_fixture::FixturePreflight as _;
+
+/// The differ emits one rename per UID when comparing its before/after maps;
+/// it does not currently produce a repeated-UID chain. Exercise the actual
+/// target/report consumer with a consistent typed plan, whose index supports
+/// such chains, without claiming this fixture came from the planner (#1860).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; run scripts/live-tests-pg.sh"]
+async fn rename_chains_report_each_identity_once_without_changing_dependency_decisions() {
+    use pbps_model::{Change, IdsFile, PlannedChange, plan_names::PlanNames};
+    use pbps_pg::impact::{RenameTarget, rename_impact, rename_targets};
+
+    let mut db = TestDb::create("impact_chain1860").await;
+    db.conn
+        .execute("CREATE TABLE public.client (id int, email text NULL);")
+        .await
+        .unwrap();
+    db.conn
+        .execute("CREATE VIEW public.v_client AS SELECT id, email FROM public.client;")
+        .await
+        .unwrap();
+    let table = |from: &str, to: &str| {
+        PlannedChange::new(Change::RenameTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            from: from.parse().unwrap(),
+            to: to.parse().unwrap(),
+            defaults: vec![],
+        })
+    };
+    let column = |owner: &str, from: &str, to: &str| {
+        PlannedChange::new(Change::RenameColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            table: owner.parse().unwrap(),
+            from: from.into(),
+            to: to.into(),
+            table_was: None,
+        })
+    };
+    let changes = [
+        table("public.client", "public.tmp"),
+        column("public.tmp", "email", "intermediate"),
+        table("public.tmp", "public.customer"),
+        column("public.customer", "intermediate", "contact"),
+    ];
+    let after = IdsFile {
+        tables: [(
+            "t_aaaaaa".parse().unwrap(),
+            "public.customer".parse().unwrap(),
+        )]
+        .into(),
+        columns: [(
+            "c_aaaaaa".parse().unwrap(),
+            "public.customer.contact".parse().unwrap(),
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let names = PlanNames::of(&changes, &after).unwrap();
+    let targets = rename_targets(&names);
+    let expected_targets = [
+        RenameTarget::Table("public.client".parse().unwrap()),
+        RenameTarget::Column("public.client.email".parse().unwrap()),
+    ];
+    // Like deploy::preflight, read one report per selected target. Compare the
+    // whole report with the ordinary stored-address read, not just its count.
+    for dependent_exists in [true, false] {
+        let mut expected = Vec::new();
+        for target in &expected_targets {
+            expected.push(rename_impact(&mut db.conn, target).await.unwrap());
+        }
+        let mut reports = Vec::new();
+        for target in &targets {
+            reports.push(rename_impact(&mut db.conn, target).await.unwrap());
+        }
+        assert_eq!(
+            reports.len(),
+            2,
+            "one report per identity, not per rename step"
+        );
+        assert_eq!(
+            reports, expected,
+            "classification and the accept/refuse decision must agree"
+        );
+        assert!(
+            reports.iter().all(|r| r.blocking.is_empty()),
+            "PostgreSQL carries the view and permits both renames"
+        );
+        if dependent_exists {
+            assert!(
+                reports
+                    .iter()
+                    .all(|r| r.carried.iter().any(|d| d.removed_with
+                        == Some((
+                            pbps_model::ModuleKind::View,
+                            "public.v_client".parse().unwrap()
+                        )))),
+                "the view must still be classified as carried: {reports:?}"
+            );
+        }
+        if dependent_exists {
+            db.conn.execute("DROP VIEW public.v_client;").await.unwrap();
+        } else {
+            assert!(
+                reports.iter().all(|r| r.is_empty()),
+                "no dependency remains: {reports:?}"
+            );
+        }
+    }
+    db.drop().await;
+}
