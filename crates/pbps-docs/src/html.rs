@@ -76,7 +76,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         schema
             .tables
             .values()
-            .map(|t| t.columns.len())
+            .map(|t| t.columns.len() + t.computed.len())
             .sum::<usize>(),
         schema.modules.len()
     );
@@ -157,6 +157,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
         );
     }
     s.push_str("</table>\n");
+    computed_table(s, table);
 
     let mut facts: Vec<String> = Vec::new();
     if let Some(pk) = &table.primary_key {
@@ -264,6 +265,35 @@ fn graveyard(s: &mut String, ids: &IdsFile) {
     s.push_str("</table>\n");
 }
 
+/// SQL Server computed columns (#1174), held beside the columns. Their own
+/// table, since they have no type to show (DEC-1174.1) and the expression is
+/// not a default.
+fn computed_table(s: &mut String, table: &Table) {
+    if table.computed.is_empty() {
+        return;
+    }
+    s.push_str("<table>\n<tr><th>Computed column</th><th>Expression</th><th>Stored</th></tr>\n");
+    for (col_name, c) in &table.computed {
+        let mut label = code(col_name);
+        if table
+            .primary_key
+            .as_ref()
+            .is_some_and(|pk| pk.columns.iter().any(|p| p == col_name))
+        {
+            label.push_str(" <strong>PK</strong>");
+        }
+        let _ = writeln!(
+            s,
+            "<tr><td>{label}</td><td>{}</td><td>{}</td></tr>",
+            code(&c.expression),
+            crate::markdown::computed_flags(c)
+                .map(|f| esc(&f))
+                .unwrap_or_else(dash)
+        );
+    }
+    s.push_str("</table>\n");
+}
+
 fn columns(cols: &[String]) -> String {
     cols.iter().map(|c| code(c)).collect::<Vec<_>>().join(", ")
 }
@@ -275,7 +305,7 @@ fn dash() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pbps_model::{Column, ColumnType};
+    use pbps_model::{Column, ColumnType, ComputedColumn, Index, IndexColumn};
 
     fn ty(s: &str) -> ColumnType {
         s.parse().unwrap()
@@ -323,6 +353,69 @@ mod tests {
         let out = render(&schema_with_description("x"), &IdsFile::default(), "Schema");
         assert!(out.contains("erDiagram"), "{out}");
         assert!(out.contains("<pre>"), "{out}");
+    }
+
+    /// The model holds SQL Server computed columns beside the columns
+    /// (#1174); the page must show them, since an index can name one.
+    #[test]
+    fn computed_columns_are_rendered_beside_the_columns() {
+        let mut s = schema_with_description("x");
+        let t = s.tables.get_mut(&TableName::new("dbo", "t")).unwrap();
+        t.computed.insert(
+            "total".into(),
+            ComputedColumn {
+                expression: "[qty] * [price]".into(),
+                persisted: true,
+                not_null: true,
+            },
+        );
+        t.computed.insert(
+            "flags".into(),
+            ComputedColumn {
+                expression: "[a] & 4".into(),
+                persisted: false,
+                not_null: false,
+            },
+        );
+        t.indexes.insert(
+            "ix_total".into(),
+            Index {
+                columns: vec![IndexColumn::column("total")],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            },
+        );
+        let out = render(&s, &IdsFile::default(), "Schema");
+        assert!(
+            out.contains(
+                "<tr><td><code>total</code></td><td><code>[qty] * [price]</code></td>\
+                 <td>persisted, not null</td></tr>"
+            ),
+            "{out}"
+        );
+        // Computed on read: no flags, and the expression is escaped.
+        assert!(
+            out.contains(
+                "<tr><td><code>flags</code></td><td><code>[a] &amp; 4</code></td>\
+                 <td>&mdash;</td></tr>"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("<strong>Index</strong> <code>ix_total</code>: <code>total</code>"),
+            "{out}"
+        );
+        assert!(out.contains("3 column(s)"), "{out}");
+    }
+
+    #[test]
+    fn a_table_without_computed_columns_has_no_computed_table() {
+        let out = render(&schema_with_description("x"), &IdsFile::default(), "Schema");
+        assert!(!out.contains("Computed column"), "{out}");
+        assert!(out.contains("1 column(s)"), "{out}");
     }
 
     #[test]
