@@ -315,6 +315,91 @@ fn identity_problems(
     found
 }
 
+/// What the engine refuses in a column with an owned sequence (`serial`), or
+/// this model does not hold, refused before it is applied (#1631,
+/// DEC-1631.1). The sequence is created `AS` the column's type with the
+/// engine's own bounds for it, which are an identity's, so its start and
+/// increment are held to the same ranges (`types::identity_seed_range`).
+fn sequence_problems(
+    table_name: &TableName,
+    table: &Table,
+    column: &str,
+    declared: &pbps_model::Column,
+    sequence: &pbps_model::OwnedSequence,
+) -> Vec<DialectError> {
+    let invalid = |message: String| DialectError::Invalid {
+        dialect: types::DIALECT,
+        message,
+    };
+    let mut found = Vec::new();
+    match types::identity_seed_range(&declared.ty, sequence.increment) {
+        None => found.push(invalid(format!(
+            "column `{column}` has an owned sequence on `{}`; a `serial` column is a smallint, \
+             an integer or a bigint",
+            declared.ty
+        ))),
+        Some(accepted) if !accepted.contains(&sequence.start) => found.push(invalid(format!(
+            "column `{column}`'s sequence starts at {}, and a sequence on `{}` counting by {} \
+             starts somewhere in {}..={}: the engine refuses START value ({}) out of the \
+             sequence's own bounds.",
+            sequence.start,
+            declared.ty,
+            sequence.increment,
+            accepted.start(),
+            accepted.end(),
+            sequence.start
+        ))),
+        Some(accepted) => {
+            let span = i128::from(*accepted.end()) - i128::from(*accepted.start());
+            if i128::from(sequence.increment).abs() > span {
+                found.push(invalid(format!(
+                    "column `{column}`'s sequence has an increment of {} whose magnitude \
+                     exceeds its span {span} for `{}`, so no start can produce a second value",
+                    sequence.increment, declared.ty
+                )));
+            }
+        }
+    }
+    if sequence.increment == 0 {
+        found.push(invalid(format!(
+            "column `{column}`'s sequence has an increment of 0, which never advances: the \
+             engine refuses it as INCREMENT must not be zero."
+        )));
+    }
+    // `serial` makes the column NOT NULL; a NULL in it is a row the sequence
+    // was never asked for.
+    if declared.nullable {
+        found.push(invalid(format!(
+            "column `{column}` is a `serial`, which is NOT NULL; leave out `nullable: true`"
+        )));
+    }
+    // A partition carries its own copy of its parent's default, so the
+    // parent's sequence is called by more than one: not held yet (#1893).
+    if table.partition_by.is_some() || table.partition_of.is_some() {
+        found.push(invalid(format!(
+            "column `{column}` is a `serial` on a partitioned table or a partition, which this \
+             model does not hold yet (issue #1893)"
+        )));
+    }
+    if let Some(named) = &sequence.name {
+        if *named == generated_name(&table_name.name, Some(column), "seq") {
+            found.push(invalid(format!(
+                "column `{column}`'s sequence is named `{named}`, the name the engine generates; \
+                 leave out `name:`"
+            )));
+        }
+        // The engine truncates a longer name to 63 bytes with a notice, and
+        // then reads back a name the declaration does not hold.
+        if named.len() > 63 {
+            found.push(invalid(format!(
+                "column `{column}`'s sequence name `{named}` is longer than 63 bytes, which the \
+                 engine truncates"
+            )));
+        }
+    }
+    found
+}
+
 /// The PostgreSQL dialect.
 ///
 /// It carries one thing, and that is not decoration: the schemas that follow
@@ -841,7 +926,7 @@ impl Dialect for Postgres {
             let Some(default) = &own.default else {
                 continue;
             };
-            let (mut generated, mut identity) = (false, false);
+            let (mut generated, mut identity, mut serial) = (false, false, false);
             for source in parent_sources.get(column, theirs) {
                 match source {
                     pbps_model::ValueSource::Default(parent_default) => {
@@ -853,16 +938,20 @@ impl Dialect for Postgres {
                     }
                     pbps_model::ValueSource::Generated(_) => generated = true,
                     pbps_model::ValueSource::Identity(_) => identity = true,
+                    pbps_model::ValueSource::Sequence(_) => serial = true,
                     pbps_model::ValueSource::None => {}
                 }
             }
             // Preserve the diagnostic precedence from before the exclusive
             // model: equality first, then generation rather than identity.
-            if generated || identity {
+            // A `serial` is the third (#1631).
+            if generated || identity || serial {
                 let kind = if generated {
                     "generated"
-                } else {
+                } else if identity {
                     "an identity column"
+                } else {
+                    "a `serial`"
                 };
                 found.push(invalid(format!(
                     "column `{column}` is {kind} on its parent, and takes no default of the partition's own"
@@ -1081,14 +1170,16 @@ impl Dialect for Postgres {
                 }
             };
             let supplied = sources.get(column_name, column);
-            // Sources retain YAML's canonical default/identity/generated order.
-            // A valid model supplies one; diagnostic recovery may supply several.
-            let (mut has_default, mut has_identity) = (false, false);
+            // Sources retain YAML's canonical default/identity/serial/generated
+            // order. A valid model supplies one; diagnostic recovery may supply
+            // several.
+            let (mut has_default, mut has_identity, mut has_sequence) = (false, false, false);
             for source in supplied {
                 match source {
                     pbps_model::ValueSource::None => {}
                     pbps_model::ValueSource::Default(_) => has_default = true,
                     pbps_model::ValueSource::Identity(_) => has_identity = true,
+                    pbps_model::ValueSource::Sequence(_) => has_sequence = true,
                     pbps_model::ValueSource::Generated(_) => {}
                 }
             }
@@ -1110,7 +1201,33 @@ impl Dialect for Postgres {
                             )));
                         }
                     }
+                    // A `serial`'s default is its sequence's `nextval`, so it
+                    // takes no other source (#1631).
+                    pbps_model::ValueSource::Sequence(sequence) => {
+                        found.extend(sequence_problems(
+                            name,
+                            table,
+                            column_name,
+                            column,
+                            sequence,
+                        ));
+                        if has_default {
+                            found.push(invalid(format!(
+                                "column `{column_name}` is a `serial` and has a `default:`; its default is its sequence's `nextval`"
+                            )));
+                        }
+                        if has_identity {
+                            found.push(invalid(format!(
+                                "column `{column_name}` is both a `serial` and an identity; the engine refuses an identity on a column that has a default"
+                            )));
+                        }
+                    }
                     pbps_model::ValueSource::Generated(generated) => {
+                        if has_sequence {
+                            found.push(invalid(format!(
+                                "column `{column_name}` is both a `serial` and a generated column"
+                            )));
+                        }
                         if has_default {
                             found.push(invalid(format!(
                                 "column `{column_name}` has both a default and a generation expression; a generated column is computed on every write, and a default would never apply"
@@ -1204,9 +1321,20 @@ impl Dialect for Postgres {
     /// The index behind an unnamed primary key, `<table>_pkey`, and the
     /// sequence behind each identity column, `<table>_<column>_seq`: the
     /// names the engine generates for what a `CREATE TABLE` implies (#465,
-    /// DEC-465.1). A unique constraint is always named in a declaration and a
-    /// `serial` column is refused (`types::refuse_serial`), so neither of
-    /// their generated names can arise.
+    /// DEC-465.1). A unique constraint is always named in a declaration, so
+    /// its generated name cannot arise. A `serial` column's sequence is
+    /// created by name, the declared one or that same generated one (#1631,
+    /// `emit::owned_sequence`), and claims it the same way, with no fallback:
+    /// the engine does not choose it.
+    fn owned_sequence_name(
+        &self,
+        table: &TableName,
+        column: &str,
+        sequence: &pbps_model::OwnedSequence,
+    ) -> Option<String> {
+        Some(emit::owned_sequence(table, column, sequence).name)
+    }
+
     fn implicit_relation_names(
         &self,
         name: &TableName,
@@ -1241,8 +1369,10 @@ impl Dialect for Postgres {
         for (column, spec) in &table.columns {
             if sources.get(column, spec).iter().any(|source| match source {
                 pbps_model::ValueSource::Identity(_) => true,
+                // Claimed below, under the name it is created with.
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_) => false,
             }) {
                 // Named after the table and the column: naming the key moves
@@ -1257,6 +1387,15 @@ impl Dialect for Postgres {
                         types::DIALECT
                     ),
                     remedy: "Rename the other object.",
+                    yields_to_constraints: false,
+                });
+            }
+            if let pbps_model::ValueSource::Sequence(sequence) = &spec.value_source {
+                out.push(pbps_dialect::ImplicitRelation {
+                    name: emit::owned_sequence(name, column, sequence).name,
+                    descriptor: format!("the sequence of `serial` column `{name}.{column}`"),
+                    remedy: "Rename the other object, or name the sequence with `sequence: \
+                             {name: ...}`.",
                     yields_to_constraints: false,
                 });
             }
@@ -1303,8 +1442,10 @@ impl Dialect for Postgres {
         for (column, spec) in &table.columns {
             if sources.get(column, spec).iter().any(|source| match source {
                 pbps_model::ValueSource::Identity(_) => true,
+                // Created by name, so the engine never retries one (#1631).
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_) => false,
             }) {
                 out.push(generated_name(
@@ -1531,7 +1672,7 @@ pub fn implicit_primary_key_fallback(table: &str, n: u32) -> String {
 /// and `_id_seq`. A name the engine finds taken gets a numeric suffix instead
 /// (`ChooseRelationName`); that is the order-dependent case the caller refuses
 /// rather than predicts.
-fn generated_name(name1: &str, name2: Option<&str>, label: &str) -> String {
+pub(crate) fn generated_name(name1: &str, name2: Option<&str>, label: &str) -> String {
     const MAX: usize = 63;
     let overhead = label.len() + 1 + usize::from(name2.is_some());
     let available = MAX - overhead;
@@ -4130,6 +4271,112 @@ mod tests {
                 .iter()
                 .any(|e| e.to_string().contains("never advances"))
         );
+    }
+
+    /// A `serial` is NOT NULL with its sequence's default and no other value
+    /// source, on a table that is not partitioned, and names its sequence
+    /// only where the name is not the engine's own (#1631, DEC-1631.1).
+    #[test]
+    fn a_serial_that_is_nullable_defaulted_partitioned_or_misnamed_is_refused() {
+        let serial = |name: Option<&str>| {
+            let mut c = pbps_model::Column::new(ty("integer")).not_null();
+            c.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                start: 1,
+                increment: 1,
+                name: name.map(str::to_owned),
+            });
+            c
+        };
+        let t: TableName = "app.t".parse().unwrap();
+        let found = |table: &Table| {
+            Postgres::new()
+                .validate_table(&t, table)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        // The negative case: a plain one, and one under another name.
+        let mut table = Table::default();
+        table.columns.insert("id".to_owned(), serial(None));
+        table
+            .columns
+            .insert("other".to_owned(), serial(Some("other_numbers")));
+        assert_eq!(found(&table), Vec::<String>::new());
+
+        let mut bad = serial(Some("t_id_seq"));
+        bad.nullable = true;
+        table.columns.insert("id".to_owned(), bad.clone());
+        let refused = found(&table);
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert!(
+            refused.iter().any(|m| m.contains("NOT NULL")),
+            "{refused:?}"
+        );
+        assert!(
+            refused.iter().any(|m| m.contains("leave out `name:`")),
+            "{refused:?}"
+        );
+        // A `default:` beside it is a second source, which the loader keeps
+        // beside the column for the dialect to name.
+        let sources = [(
+            "id".to_owned(),
+            vec![
+                pbps_model::ValueSource::Default("7".to_owned()),
+                bad.value_source.clone(),
+            ],
+        )]
+        .into_iter()
+        .collect();
+        let refused: Vec<String> = Postgres::new()
+            .validate_table_sources(&t, &table, &sources)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(
+            refused
+                .iter()
+                .any(|m| m.contains("is a `serial` and has a `default:`")),
+            "{refused:?}"
+        );
+
+        let mut parent = Table::default();
+        parent.columns.insert("id".to_owned(), serial(None));
+        parent.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
+            columns: vec!["id".to_owned()],
+        });
+        assert!(
+            found(&parent)
+                .iter()
+                .any(|m| m.contains("partitioned table")),
+            "{:?}",
+            found(&parent)
+        );
+    }
+
+    /// A `serial`'s sequence is `AS` the column's type with an identity's
+    /// bounds, so its start and increment are held to the same ranges, and a
+    /// type no serial stands for is refused (#1631).
+    #[test]
+    fn a_serials_start_and_type_are_held_to_the_sequences_bounds() {
+        let t: TableName = "app.t".parse().unwrap();
+        let refused = |type_: &str, start: i64, increment: i64| {
+            let mut c = pbps_model::Column::new(ty(type_)).not_null();
+            c.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                start,
+                increment,
+                name: None,
+            });
+            let mut table = Table::default();
+            table.columns.insert("id".to_owned(), c);
+            Postgres::new().validate_table(&t, &table)
+        };
+        assert!(refused("integer", 1, 1).is_empty());
+        assert!(refused("bigint", -1, -1).is_empty());
+        assert_eq!(refused("integer", 0, 1).len(), 1);
+        assert_eq!(refused("smallint", 40_000, 1).len(), 1);
+        assert_eq!(refused("integer", 1, 0).len(), 1);
+        assert_eq!(refused("numeric(10, 0)", 1, 1).len(), 1);
     }
 
     /// The seed is bounded by the sequence, not by the column.

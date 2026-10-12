@@ -544,6 +544,11 @@ pub(crate) fn table_sources(
                 pbps_model::ValueSource::Generated(_) => errs.push(invalid(format!(
                     "column `{col_name}` is a generated column, which this model holds for PostgreSQL only"
                 ))),
+                // PostgreSQL's `serial` (#1631): SQL Server numbers a column
+                // with an `identity:`.
+                pbps_model::ValueSource::Sequence(_) => errs.push(invalid(format!(
+                    "column `{col_name}` is a `serial`, which this model holds for PostgreSQL only; declare an `identity:`"
+                ))),
                 pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) | pbps_model::ValueSource::Identity(_) => {}
             }
         }
@@ -579,6 +584,7 @@ pub(crate) fn table_sources(
                 pbps_model::ValueSource::Identity(identity) => identity,
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_) => continue,
             };
             identity_columns.push(col_name.clone());
@@ -602,6 +608,7 @@ pub(crate) fn table_sources(
                 pbps_model::ValueSource::Default(_) => true,
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_) => false,
             }) {
                 errs.push(invalid(format!(
@@ -1018,8 +1025,10 @@ fn system_time(
         }
         if sources.get(column, col).iter().any(|source| match source {
             pbps_model::ValueSource::Identity(_) => true,
+            // Refused on this engine by name, above.
             pbps_model::ValueSource::None
             | pbps_model::ValueSource::Default(_)
+            | pbps_model::ValueSource::Sequence(_)
             | pbps_model::ValueSource::Generated(_) => false,
         }) {
             errs.push(invalid(format!(
@@ -1291,6 +1300,32 @@ mod tests {
         let refused = found(&table);
         assert!(
             refused.iter().any(|m| m.contains("generated column")),
+            "{refused:?}"
+        );
+    }
+
+    /// A `serial` is PostgreSQL's in this model, and is refused on SQL Server
+    /// by name, pointing at the identity that numbers a column there (#1631).
+    #[test]
+    fn a_serial_column_is_refused_on_sql_server() {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()).not_null());
+        let found = |t: &Table| {
+            super::table(&"dbo.t".parse().unwrap(), t)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(found(&table).is_empty());
+        table.columns.get_mut("a").unwrap().value_source =
+            pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        let refused = found(&table);
+        assert!(
+            refused
+                .iter()
+                .any(|m| m.contains("`serial`") && m.contains("identity")),
             "{refused:?}"
         );
     }

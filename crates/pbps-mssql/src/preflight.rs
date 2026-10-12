@@ -472,7 +472,7 @@ impl<'a> AsStored<'a> {
                     let added = if column.nullable {
                         Added::Null
                     } else {
-                        match (match &column.value_source { ValueSource::Default(value) => Some(value.as_str()), ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None }).and_then(constant_default).and_then(|e| {
+                        match (match &column.value_source { ValueSource::Default(value) => Some(value.as_str()), ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) | ValueSource::Generated(_) => None }).and_then(constant_default).and_then(|e| {
                             assigned_default(e, Some(&column.ty), column.collation.as_ref())
                         }) {
                             Some(sql) => Added::Backfilled(sql),
@@ -756,7 +756,7 @@ fn build(
             // expression is the case DECISIONS 124 answers with no probe rather
             // than a guess; asking the engine `(expr) IS NULL` would run the
             // operator's expression before approval, the hazard in #274.
-            if let Some(default) = match &column.value_source { ValueSource::Default(value) => Some(value.as_str()), ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None } {
+            if let Some(default) = match &column.value_source { ValueSource::Default(value) => Some(value.as_str()), ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) | ValueSource::Generated(_) => None } {
                 if !crate::rows::is_constant(default) {
                     return Ok(skip(change, "the default cannot be evaluated before apply", unchecked));
                 }

@@ -154,6 +154,9 @@ pub struct RawColumn {
     /// `pg_depend` entry is `deptype = 'a'`. An identity's sequence is not
     /// here: that one is part of the column, and arrives as [`RawIdentity`].
     pub owned_sequence: Option<String>,
+    /// The one sequence this column owns that its default uses, with what
+    /// decides whether the column is held as a `serial` (#1631).
+    pub serial: Option<RawSerial>,
     /// The sequences this column's default *uses* without owning any of them —
     /// `DEFAULT nextval('app.s')` over a sequence somebody created separately.
     ///
@@ -164,6 +167,28 @@ pub struct RawColumn {
     pub default_sequences: Option<String>,
     /// The column's collation, when it is not the one its type carries.
     pub collation: Option<String>,
+}
+
+/// A sequence a column owns and its default uses (#1631): its own facts,
+/// and how it stands against the column and the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawSerial {
+    pub name: String,
+    /// The default is `nextval` of this sequence and nothing else.
+    pub exact: bool,
+    pub same_schema: bool,
+    /// The sequence is `AS` the column's type.
+    pub same_type: bool,
+    /// Logged or unlogged as its table is.
+    pub same_persistence: bool,
+    pub start: i64,
+    pub increment: i64,
+    pub min: i64,
+    pub max: i64,
+    pub cache: i64,
+    pub cycles: bool,
+    /// The defaults that use it, this column's included.
+    pub users: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -652,6 +677,9 @@ struct Parts<'a> {
     /// is simply not in it — which is what makes an unresolvable attnum a
     /// reportable fact rather than an off-by-one.
     by_attnum: HashMap<i32, &'a str>,
+    /// A partitioned parent or a partition: a `serial` on either is not held
+    /// (#1631), since a partition takes its parent's sequence and owns none.
+    partitioned: bool,
 }
 
 impl Parts<'_> {
@@ -795,6 +823,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     .iter()
                     .map(|c| (c.attnum, c.name.as_str()))
                     .collect(),
+                partitioned: true,
             };
             for column in raw_columns {
                 let Some(theirs) = parent_columns.iter().find(|p| p.name == column.name) else {
@@ -809,7 +838,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 // A default of its own may use a sequence, as a column's may;
                 // one equal to the parent's is the parent's, named there.
                 if own.default.is_some() {
-                    sequence_limitations(column, &parts, &mut pulled);
+                    sequence_limitations(column, &parts, false, &mut pulled);
                 }
                 if own != pbps_model::PartitionColumn::default() {
                     own_columns.insert(column.name.clone(), own);
@@ -881,6 +910,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 .iter()
                 .map(|c| (c.attnum, c.name.as_str()))
                 .collect(),
+            partitioned: raw_table.partition_key.is_some(),
         };
 
         let mut table = Table {
@@ -1621,19 +1651,18 @@ fn target_named(
         // on 16 and 18, it does not reach direct access to a partition
         // (DEC-1579.1).
         GrantedKind::Relation('r' | 'v' | 'p') => Ok(pbps_model::GrantTarget::Object(name)),
-        // ADR-0010 §7, and the other half of why `serial` is refused at load
-        // (#77). A `serial` column creates a sequence the declaration never
-        // named, and inserting into such a column needs a privilege on it —
-        // measured, `permission denied for sequence ser_id_seq` where the
-        // same insert into an identity column succeeds. The model has no
-        // sequence to grant on, so the grant is reported rather than dropped:
-        // dropped, `pull` would write a role that cannot insert.
+        // ADR-0010 §7. Inserting into a `serial` column needs a privilege on
+        // its sequence — measured, `permission denied for sequence
+        // ser_id_seq` where the same insert into an identity column
+        // succeeds. The model holds a `serial` (#1631) and has no sequence
+        // to grant on yet (#1892), so the grant is reported rather than
+        // dropped: dropped, `pull` would write a role that cannot insert.
         GrantedKind::Relation('S') => Err(Unsupported::on(
             pbps_model::GrantTarget::Object(name.clone()),
             format!(
                 "{} on sequence `{name}` is a grant on a sequence, which this model does not \
-                 declare -- an identity column needs no such grant and a `serial` column does, \
-                 which is why `serial` is refused at load (ADR-0010 section 7)",
+                 declare yet -- an identity column needs no such grant, and a role inserting \
+                 into a `serial` column does (ADR-0010 section 7, issue #1892)",
                 permission
             ),
         )),
@@ -2210,14 +2239,14 @@ fn note_target(pulled: &mut Pulled, target: LimitationTarget, detail: String) {
 /// The sequences a column's default uses, each named as a limitation: the
 /// model holds the default and has nowhere to put a sequence. A table's
 /// column, and a partition's own default (#1578).
-fn sequence_limitations(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) {
+fn sequence_limitations(raw: &RawColumn, parts: &Parts, held: bool, pulled: &mut Pulled) {
     // A `serial` is not a type (DECISIONS 227): the column is an `integer`
     // whose default is `nextval(...)`, and the sequence that default needs is a
     // separate object with nowhere to live in this model. The column is carried
     // — it is exactly what the model says — and the sequence is named, because
     // a declaration pulled from here cannot recreate this table in an empty
     // database.
-    if let Some(sequence) = &raw.owned_sequence {
+    if let Some(sequence) = raw.owned_sequence.as_ref().filter(|_| !held) {
         note(
             pulled,
             &parts.name,
@@ -2255,6 +2284,41 @@ fn sequence_limitations(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) {
 }
 
 /// One column, and everything about it the model has nowhere to put.
+/// The column's owned sequence as this model holds it, where the column is
+/// the shape `serial` creates and nothing more (#1631, DEC-1631.1): its
+/// default is `nextval` of the one sequence it owns, which no other default
+/// uses, in the table's schema, `AS` the column's type, as logged as the
+/// table, with the bounds, cache and cycling `serial` gives it. Anything else
+/// is left as the default it is, with the sequence named, because a
+/// declaration could not recreate it.
+fn held_serial(
+    raw: &RawColumn,
+    parts: &Parts,
+    ty: &pbps_model::ColumnType,
+) -> Option<pbps_model::OwnedSequence> {
+    let s = raw.serial.as_ref()?;
+    let bounds = crate::types::identity_seed_range(ty, s.increment)?;
+    let plain = s.exact
+        && s.same_schema
+        && s.same_type
+        && s.same_persistence
+        && s.users == 1
+        && !s.cycles
+        && s.cache == DEFAULT_SEQUENCE_CACHE
+        && (s.min, s.max) == (*bounds.start(), *bounds.end())
+        && !raw.nullable
+        && raw.identity.is_none()
+        && raw.generated.is_none()
+        && raw.default_sequences.is_none()
+        && !parts.partitioned;
+    plain.then(|| pbps_model::OwnedSequence {
+        start: s.start,
+        increment: s.increment,
+        name: (s.name != crate::generated_name(&parts.name.name, Some(&raw.name), "seq"))
+            .then(|| s.name.clone()),
+    })
+}
+
 fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
     let ty = match stored_type(&raw.ty) {
         Ok(ty) => ty,
@@ -2309,7 +2373,8 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
         }
     };
 
-    sequence_limitations(raw, parts, pulled);
+    let sequence = held_serial(raw, parts, &ty);
+    sequence_limitations(raw, parts, sequence.is_some(), pulled);
 
     // A collation decides comparison, ordering and therefore which values a
     // unique key calls equal. Read back as an ordinary column, one collated
@@ -2397,7 +2462,12 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
         .is_none()
         .then(|| raw.default.clone())
         .flatten();
+    // A `serial`'s default is its sequence's, held as the sequence: the shape
+    // `held_serial` checks has no identity and no generation (#1631).
     let value_source = match (identity, generated, default) {
+        (None, None, Some(_)) if let Some(sequence) = sequence => {
+            pbps_model::ValueSource::Sequence(sequence)
+        }
         (None, None, None) => pbps_model::ValueSource::None,
         (Some(identity), None, None) => pbps_model::ValueSource::Identity(identity),
         (None, Some(generated), None) => pbps_model::ValueSource::Generated(generated),
@@ -3787,7 +3857,7 @@ mod tests {
             what.iter().any(|w| w.contains("column-level grant")),
             "{what:?}"
         );
-        // ADR-0010 §7: the other half of why `serial` is refused at load.
+        // ADR-0010 §7: a sequence is no grant target yet (#1892).
         assert!(what.iter().any(|w| w.contains("sequence")), "{what:?}");
         assert!(pulled.unexpressible.iter().all(|u| u.role == "app_reader"));
     }
@@ -4754,6 +4824,7 @@ mod tests {
             identity: None,
             generated: None,
             owned_sequence: None,
+            serial: None,
             default_sequences: None,
             collation: None,
         }
@@ -6003,6 +6074,145 @@ mod tests {
         assert!(only(&pulled).unique.is_empty());
         assert!(only(&pulled).indexes.is_empty());
         assert!(pulled.warnings.iter().any(|w| w.contains("`t_uq`")));
+    }
+
+    /// A column that is the shape `serial` makes, and nothing more, is held
+    /// as a `serial`: its default is its sequence's, with no limitation, and
+    /// its sequence's name only where the engine did not generate it. Any
+    /// one fact off that shape leaves it as the default it is, with the
+    /// sequence named (#1631, DEC-1631.1).
+    #[test]
+    fn a_column_of_serials_shape_is_held_and_anything_else_is_named() {
+        let plain = || RawSerial {
+            name: "t_id_seq".to_owned(),
+            exact: true,
+            same_schema: true,
+            same_type: true,
+            same_persistence: true,
+            start: 1,
+            increment: 1,
+            min: 1,
+            max: i64::from(i32::MAX),
+            cache: 1,
+            cycles: false,
+            users: 1,
+        };
+        let pull = |serial: RawSerial, nullable: bool| {
+            let mut column = col(1, 1, "id", "integer");
+            column.nullable = nullable;
+            column.default = Some("nextval('app.t_id_seq'::regclass)".to_owned());
+            column.owned_sequence = Some(serial.name.clone());
+            column.serial = Some(serial);
+            assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![column],
+                ..RawCatalog::default()
+            })
+        };
+
+        let held = pull(plain(), false);
+        let id = &only(&held).columns["id"];
+        assert_eq!(
+            id.value_source,
+            pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial())
+        );
+        assert!(held.limitations.is_empty(), "{:?}", held.warnings);
+
+        let renamed = pull(
+            RawSerial {
+                name: "numbers".to_owned(),
+                start: 100,
+                increment: 5,
+                ..plain()
+            },
+            false,
+        );
+        assert_eq!(
+            only(&renamed).columns["id"].value_source,
+            pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                start: 100,
+                increment: 5,
+                name: Some("numbers".to_owned()),
+            })
+        );
+
+        let off_shape: [(&str, RawSerial, bool); 9] = [
+            (
+                "not exactly nextval",
+                RawSerial {
+                    exact: false,
+                    ..plain()
+                },
+                false,
+            ),
+            (
+                "another schema",
+                RawSerial {
+                    same_schema: false,
+                    ..plain()
+                },
+                false,
+            ),
+            (
+                "another type",
+                RawSerial {
+                    same_type: false,
+                    ..plain()
+                },
+                false,
+            ),
+            (
+                "another persistence",
+                RawSerial {
+                    same_persistence: false,
+                    ..plain()
+                },
+                false,
+            ),
+            (
+                "shared",
+                RawSerial {
+                    users: 2,
+                    ..plain()
+                },
+                false,
+            ),
+            (
+                "cycling",
+                RawSerial {
+                    cycles: true,
+                    ..plain()
+                },
+                false,
+            ),
+            (
+                "cached",
+                RawSerial {
+                    cache: 20,
+                    ..plain()
+                },
+                false,
+            ),
+            (
+                "bounded",
+                RawSerial {
+                    max: 1000,
+                    ..plain()
+                },
+                false,
+            ),
+            ("nullable", plain(), true),
+        ];
+        for (why, serial, nullable) in off_shape {
+            let pulled = pull(serial, nullable);
+            let id = &only(&pulled).columns["id"];
+            assert_eq!(
+                id.value_source,
+                pbps_model::ValueSource::Default("nextval('app.t_id_seq'::regclass)".to_owned()),
+                "{why}"
+            );
+            assert_eq!(pulled.limitations.len(), 1, "{why}: {:?}", pulled.warnings);
+        }
     }
 
     /// A `serial` column is an `integer` with a `nextval(...)` default and a

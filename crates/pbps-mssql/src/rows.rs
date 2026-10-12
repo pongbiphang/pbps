@@ -181,7 +181,10 @@ pub fn query(
         default_at: None,
         has_default: (match &key_spec.value_source {
             ValueSource::Default(_) => true,
-            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => false,
+            ValueSource::None
+            | ValueSource::Identity(_)
+            | ValueSource::Sequence(_)
+            | ValueSource::Generated(_) => false,
         }),
         assume_default: false,
     };
@@ -200,7 +203,8 @@ pub fn query(
         let default = match &spec.value_source {
             ValueSource::Default(default) => Some(default),
             ValueSource::None | ValueSource::Generated(_) => None,
-            ValueSource::Identity(_) => continue,
+            // Refused on this engine; never set by a row where it is held.
+            ValueSource::Identity(_) | ValueSource::Sequence(_) => continue,
         };
         let quoted = quote(column)?;
         let value_at = select.len();
@@ -455,7 +459,7 @@ pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQ
     for (column, spec) in &table.columns {
         if *column == key
             || (match &spec.value_source {
-                ValueSource::Identity(_) => true,
+                ValueSource::Identity(_) | ValueSource::Sequence(_) => true,
                 ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => false,
             })
         {
@@ -722,7 +726,10 @@ pub(crate) fn same_value(stored: &str, other: &str, base: &str) -> String {
 pub fn confirms_default(spec: &pbps_model::Column) -> bool {
     (match &spec.value_source {
         ValueSource::Default(value) => Some(value.as_str()),
-        ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+        ValueSource::None
+        | ValueSource::Identity(_)
+        | ValueSource::Sequence(_)
+        | ValueSource::Generated(_) => None,
     })
     .is_some_and(is_constant)
 }

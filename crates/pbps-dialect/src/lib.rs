@@ -2406,6 +2406,21 @@ pub trait Dialect {
         self.implicit_relation_names(name, table)
     }
 
+    /// The name of the sequence `table`'s `column` owns (#1631, DEC-1631.1):
+    /// the one `sequence` holds, or the one this engine generates where it
+    /// holds none. Two reads of one sequence compare by it, because a rename
+    /// of the column or the table changes the generated name and not the
+    /// sequence's. The default, the held name, is right for an engine that
+    /// generates none: no other engine holds an owned sequence.
+    fn owned_sequence_name(
+        &self,
+        _table: &TableName,
+        _column: &str,
+        sequence: &pbps_model::OwnedSequence,
+    ) -> Option<String> {
+        sequence.name.clone()
+    }
+
     /// Whether a module is also a constraint under its own name in its
     /// schema, which a retry that yields to constraints finds taken (#1112):
     /// PostgreSQL's constraint trigger has a `pg_constraint` row. The default,
@@ -2592,7 +2607,7 @@ pub trait Dialect {
             found.push(DialectError::Invalid {
                 dialect: self.name(),
                 message: format!(
-                    "column `{column}` can have only one of default, identity or generated"
+                    "column `{column}` can have only one of default, identity, a `serial` type or generated"
                 ),
             });
         }

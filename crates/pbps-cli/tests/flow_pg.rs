@@ -2105,6 +2105,54 @@ fn a_new_column_calling_a_function_that_reads_it_is_refused_by_name() {
     }
 }
 
+/// A `data:` block beside a `serial` leaves the column to its sequence, as
+/// beside an identity (DECISIONS 94): its rows are inserted and numbered,
+/// the apply holds them as declared, and the next plan is empty. A row
+/// added later is numbered after them (#1631).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_data_block_beside_a_serial_leaves_it_to_the_sequence() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "serial-data");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.s (code text PRIMARY KEY, num serial, label text)",
+    );
+    let d = Demo::new("serial-data");
+    succeeds(d.run(&["pull", "--db", connection]));
+    let pulled = std::fs::read_to_string(d.dir.join("schema/app.s.yml")).unwrap();
+    assert!(pulled.contains("  num:\n    type: serial\n"), "{pulled}");
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let declare = |rows: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.s.yml"),
+            format!(
+                "{pulled}\ndata:\n  mode: exact\n  rows:\n{rows}",
+                pulled = pulled.trim_end()
+            ),
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(&d, connection, &plan, &[]));
+        succeeds(d.run(&["verify", "--db", connection]));
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    };
+    declare("    a: {label: A}\n    b: {label: B}\n");
+    assert_eq!(scalar(connection, "SELECT sum(num)::bigint FROM app.s"), 3);
+    declare("    a: {label: A}\n    b: {label: B}\n    c: {label: C}\n");
+    assert_eq!(
+        scalar(connection, "SELECT num::bigint FROM app.s WHERE code = 'c'"),
+        3
+    );
+}
+
 /// A new default calling a function the revision rebuilds, on a table whose
 /// row the same plan updates in another column: the update takes nothing from
 /// the default, so the default follows `CREATE FUNCTION` and the plan applies

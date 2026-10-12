@@ -412,7 +412,8 @@ driver dependency, initially refusing every part not yet built. Two long-standin
 seam defects landed with it: `normalize_definition` now takes each engine's own
 lexis instead of inheriting SQL Server's scanner (DECISIONS 226), and
 `normalize_type` has a stated contract under which `serial` is refused rather
-than normalized (DECISIONS 227). A PostgreSQL live suite runs against a
+than normalized (DECISIONS 227; the loader now holds a bare `type: serial` as
+an integer with an owned sequence, DEC-1631.1). A PostgreSQL live suite runs against a
 digest-pinned server, and found on its first connection that the seam panicked
 where two rustls providers were compiled in (DECISIONS 228).
 

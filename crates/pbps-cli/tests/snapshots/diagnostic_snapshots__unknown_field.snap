@@ -11,7 +11,7 @@ pbps::load::yaml
   × there is a problem with the YAML in `./schema/dbo.t.yml`
   │ 
   │ error: line 5 column 5: unknown field `nulable`, expected one of type,
-  │ nullable, default, identity, generated, collation, description,
+  │ nullable, default, identity, sequence, generated, collation, description,
   │ deprecated, renamed_from
   │  --> <input>:5:5
   │   |
@@ -19,7 +19,7 @@ pbps::load::yaml
   │ 4 |     type: int
   │ 5 |     nulable: false
   │   |     ^ unknown field `nulable`, expected one of type, nullable,
-  │ default, identity, generated, collation, description, deprecated,
-  │ renamed_from
+  │ default, identity, sequence, generated, collation, description,
+  │ deprecated, renamed_from
 
 --- end ---

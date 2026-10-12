@@ -43,6 +43,19 @@ pub enum DiffError {
     )]
     IdentityChangeUnsupported { column: ColumnRef },
 
+    /// A column whose owned sequence (`serial`) is added, removed, or given
+    /// another start, increment or name, or which is retyped under one, or a
+    /// `serial` added to an `UNLOGGED` table (#1631, DEC-1631.1). None is
+    /// planned yet: a sequence added to a column that holds values starts
+    /// where it may meet them, and one left behind by a retype keeps its old
+    /// type's bounds.
+    #[error(
+        "column {column}: its `serial` sequence is added, removed or changed, the column is \
+         retyped under it, or it is added to an UNLOGGED table, none of which is planned yet. \
+         Make the change by hand, then pull."
+    )]
+    SequenceChangeUnsupported { column: ColumnRef },
+
     /// A column that becomes generated, stops being generated, or changes
     /// its generation kind (DEC-1168.1). The engine has no in-place form for
     /// any of those: an ordinary column cannot be given an expression, and
@@ -552,9 +565,11 @@ fn diff_partial_rebuilding(
                         .value_source
                     {
                         ValueSource::Identity(_) => true,
-                        ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => {
-                            false
-                        }
+                        // A `serial` key is refused by its dialect (#1631).
+                        ValueSource::None
+                        | ValueSource::Default(_)
+                        | ValueSource::Sequence(_)
+                        | ValueSource::Generated(_) => false,
                     });
                     for (key, row) in &data.rows {
                         let (defaults, types) = omitted_defaults(&table, &pk.columns[0], row);
@@ -647,6 +662,7 @@ fn diff_partial_rebuilding(
                             ValueSource::Default(_) => true,
                             ValueSource::None
                             | ValueSource::Identity(_)
+                            | ValueSource::Sequence(_)
                             | ValueSource::Generated(_) => false,
                         })
                         .map(|(name, _)| name.clone())
@@ -785,6 +801,7 @@ fn diff_partial_rebuilding(
                                 ValueSource::Default(value) => Some(value.clone()),
                                 ValueSource::None
                                 | ValueSource::Identity(_)
+                                | ValueSource::Sequence(_)
                                 | ValueSource::Generated(_) => None,
                             }
                         });
@@ -1374,7 +1391,10 @@ fn diff_partial_rebuilding(
                 .iter()
                 .filter(|(_, c)| match &c.value_source {
                     ValueSource::Generated(_) => true,
-                    ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
+                    ValueSource::None
+                    | ValueSource::Default(_)
+                    | ValueSource::Identity(_)
+                    | ValueSource::Sequence(_) => false,
                 })
                 .filter_map(|(column, _)| index.base.column_uid(&name.column(column)).cloned())
         })
@@ -1607,7 +1627,10 @@ fn diff_partial_rebuilding(
         if let Change::AddColumn { column, .. } = c
             && (match &column.value_source {
                 ValueSource::Generated(_) => true,
-                ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
+                ValueSource::None
+                | ValueSource::Default(_)
+                | ValueSource::Identity(_)
+                | ValueSource::Sequence(_) => false,
             })
         {
             return (COLUMN_ALTERATIONS, 2);
@@ -1725,6 +1748,15 @@ fn diff_columns(
         let Some(base_ref) = base_cols.get(uid) else {
             // Present only on the declared side: a new column.
             if let Some(c) = declared_table.columns.get(&declared_ref.name) {
+                // The change does not carry the table's persistence, and the
+                // emitter creates the sequence logged (#1631).
+                if let ValueSource::Sequence(_) = &c.value_source
+                    && declared_table.unlogged
+                {
+                    errs.push(DiffError::SequenceChangeUnsupported {
+                        column: declared_ref.clone(),
+                    });
+                }
                 changes.push(Change::AddColumn {
                     uid: uid.clone(),
                     table: declared_table_name.clone(),
@@ -1799,6 +1831,37 @@ fn diff_columns(
                 });
                 (None, None)
             }
+            // A name is compared only where the declaration gives one: a
+            // rename keeps the sequence's, so the generated name stops
+            // matching (`OwnedSequence::declares`). Any other change to a
+            // `serial`'s sequence, or to or from one, is #1889's (#1631).
+            (ValueSource::Sequence(from), ValueSource::Sequence(to)) => {
+                if !to.declares(from) {
+                    errs.push(DiffError::SequenceChangeUnsupported {
+                        column: declared_ref.clone(),
+                    });
+                }
+                (None, None)
+            }
+            (
+                ValueSource::Sequence(_),
+                ValueSource::None
+                | ValueSource::Default(_)
+                | ValueSource::Identity(_)
+                | ValueSource::Generated(_),
+            )
+            | (
+                ValueSource::None
+                | ValueSource::Default(_)
+                | ValueSource::Identity(_)
+                | ValueSource::Generated(_),
+                ValueSource::Sequence(_),
+            ) => {
+                errs.push(DiffError::SequenceChangeUnsupported {
+                    column: declared_ref.clone(),
+                });
+                (None, None)
+            }
             (ValueSource::Identity(_), ValueSource::Generated(_))
             | (ValueSource::Generated(_), ValueSource::Identity(_)) => {
                 errs.push(DiffError::IdentityChangeUnsupported {
@@ -1813,6 +1876,15 @@ fn diff_columns(
 
         let norm = |t: &ColumnType| dialect.normalize_type(t).unwrap_or_else(|_| t.clone());
         let (from_ty, to_ty) = (norm(&base_col.ty), norm(&col.ty));
+        // A retype leaves the sequence `AS` the old type (#1631).
+        if let (ValueSource::Sequence(_), ValueSource::Sequence(_)) =
+            (&base_col.value_source, &col.value_source)
+            && from_ty != to_ty
+        {
+            errs.push(DiffError::SequenceChangeUnsupported {
+                column: declared_ref.clone(),
+            });
+        }
         // A collation change is the same `ALTER COLUMN` as a type change, and
         // takes down the same dependents (#1175), so it is carried by the
         // same change with the type restated.
@@ -2930,6 +3002,7 @@ fn attached(
                     value_source: match &c.value_source {
                         ValueSource::Default(_) | ValueSource::None => ValueSource::None,
                         ValueSource::Identity(identity) => ValueSource::Identity(*identity),
+                        ValueSource::Sequence(sequence) => ValueSource::Sequence(sequence.clone()),
                         ValueSource::Generated(generated) => {
                             ValueSource::Generated(generated.clone())
                         }
@@ -2967,7 +3040,10 @@ fn attached(
         for (column, spec) in &mut t.columns {
             let generated = match &mut spec.value_source {
                 ValueSource::Generated(generated) => generated,
-                ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => continue,
+                ValueSource::None
+                | ValueSource::Default(_)
+                | ValueSource::Identity(_)
+                | ValueSource::Sequence(_) => continue,
             };
             match read {
                 Some(read) => {
@@ -2976,7 +3052,8 @@ fn attached(
                             ValueSource::Generated(value) => Some(value),
                             ValueSource::None
                             | ValueSource::Default(_)
-                            | ValueSource::Identity(_) => None,
+                            | ValueSource::Identity(_)
+                            | ValueSource::Sequence(_) => None,
                         }
                     }) {
                         generated.expression = engine.expression.clone();
@@ -3016,7 +3093,10 @@ fn attached(
                 ));
             } else if (match &a.value_source {
                 ValueSource::Generated(_) => true,
-                ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
+                ValueSource::None
+                | ValueSource::Default(_)
+                | ValueSource::Identity(_)
+                | ValueSource::Sequence(_) => false,
             }) && base_name.schema != of.parent.schema
             {
                 // The engine does not compare generation expressions as it
@@ -3051,7 +3131,10 @@ fn attached(
             // parent's under the parent's path (DEC-1581.1).
             default: (match &c.value_source {
                 ValueSource::Default(value) => Some(value.clone()),
-                ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+                ValueSource::None
+                | ValueSource::Identity(_)
+                | ValueSource::Sequence(_)
+                | ValueSource::Generated(_) => None,
             })
             .filter(|d| {
                 base_name.schema != of.parent.schema
@@ -3060,6 +3143,7 @@ fn attached(
                             ValueSource::Default(value) => Some(value),
                             ValueSource::None
                             | ValueSource::Identity(_)
+                            | ValueSource::Sequence(_)
                             | ValueSource::Generated(_) => None,
                         })
             }),
@@ -3067,10 +3151,16 @@ fn attached(
         };
         if (match &c.value_source {
             ValueSource::Default(_) => false,
-            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => true,
+            ValueSource::None
+            | ValueSource::Identity(_)
+            | ValueSource::Sequence(_)
+            | ValueSource::Generated(_) => true,
         }) && (match &p.value_source {
             ValueSource::Default(_) => true,
-            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => false,
+            ValueSource::None
+            | ValueSource::Identity(_)
+            | ValueSource::Sequence(_)
+            | ValueSource::Generated(_) => false,
         }) {
             defaultless.push(name.clone());
         }
@@ -3675,9 +3765,11 @@ fn refuse_partition_changes(
             } else if let Change::AddColumn { column: c, .. } = change
                 && (match &c.value_source {
                     ValueSource::Identity(_) => true,
-                    ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => {
-                        false
-                    }
+                    // Refused on a partitioned table by validation (#1893).
+                    ValueSource::None
+                    | ValueSource::Default(_)
+                    | ValueSource::Sequence(_)
+                    | ValueSource::Generated(_) => false,
                 })
             {
                 refuse(
@@ -4060,7 +4152,10 @@ fn diff_partition_columns(
         let theirs_was = base_of.get(column);
         let parent_default = |c: &pbps_model::Column| match &c.value_source {
             ValueSource::Default(default) => Some(default.clone()),
-            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+            ValueSource::None
+            | ValueSource::Identity(_)
+            | ValueSource::Sequence(_)
+            | ValueSource::Generated(_) => None,
         };
         let default_moved =
             theirs_was.is_some_and(|b| Some(parent_default(b)) != theirs.map(parent_default));
@@ -4079,6 +4174,7 @@ fn diff_partition_columns(
                         ValueSource::Default(value) => Some(value.clone()),
                         ValueSource::None
                         | ValueSource::Identity(_)
+                        | ValueSource::Sequence(_)
                         | ValueSource::Generated(_) => None,
                     }
                 }),
@@ -4868,7 +4964,11 @@ fn diff_data(
         .get(&key_column)
         .is_some_and(|c| match &c.value_source {
             ValueSource::Identity(_) => true,
-            ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => false,
+            // A `serial` key is refused by its dialect (#1631).
+            ValueSource::None
+            | ValueSource::Default(_)
+            | ValueSource::Sequence(_)
+            | ValueSource::Generated(_) => false,
         });
 
     let Some(declared_data) = &declared.data else {
@@ -4976,6 +5076,7 @@ fn diff_data(
                     // held to — the engine assigned it.
                     if match spec.value_source {
                         pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Sequence(_)
                         | pbps_model::ValueSource::Generated(_) => true,
                         pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) => {
                             false
@@ -5104,6 +5205,7 @@ fn diff_data(
                     };
                     if match spec.value_source {
                         pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Sequence(_)
                         | pbps_model::ValueSource::Generated(_) => true,
                         pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) => {
                             false
@@ -5145,6 +5247,7 @@ fn diff_data(
                 for (base_column, spec) in &base.columns {
                     if (match spec.value_source {
                         pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Sequence(_)
                         | pbps_model::ValueSource::Generated(_) => true,
                         pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) => {
                             false
@@ -6023,7 +6126,10 @@ fn omitted_defaults(
     let defaults = omitted_columns(table, key_column, row)
         .filter_map(|(c, spec)| match &spec.value_source {
             ValueSource::Default(value) => Some((c.clone(), value.clone())),
-            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+            ValueSource::None
+            | ValueSource::Identity(_)
+            | ValueSource::Sequence(_)
+            | ValueSource::Generated(_) => None,
         })
         .collect();
     (defaults, types)
@@ -6135,7 +6241,7 @@ mod tests {
             .filter(|(c, spec)| {
                 c.as_str() != "code"
                     && (match &spec.value_source {
-                        ValueSource::Identity(_) => false,
+                        ValueSource::Identity(_) | ValueSource::Sequence(_) => false,
                         ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => {
                             true
                         }
@@ -17118,9 +17224,10 @@ mod tests {
                 .iter()
                 .filter(|(_, c)| match &c.value_source {
                     ValueSource::Default(_) => true,
-                    ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => {
-                        false
-                    }
+                    ValueSource::None
+                    | ValueSource::Identity(_)
+                    | ValueSource::Sequence(_)
+                    | ValueSource::Generated(_) => false,
                 })
                 .map(|(column, _)| format!("df_{}_{column}", name.name))
                 .collect()
@@ -18086,6 +18193,99 @@ mod tests {
 
         assert_eq!(kinds(&cs), ["SetColumnDeprecated"]);
         assert!(cs.risks().is_empty());
+    }
+
+    /// A `serial`'s sequence added, removed or changed on a kept column, a
+    /// kept `serial` retyped, and a `serial` added to an `UNLOGGED` table are
+    /// each refused by name; a rename that leaves the sequence's generated
+    /// name behind is not a change, nor is a `serial` added to a logged table
+    /// (#1631, DEC-1631.1).
+    #[test]
+    fn a_serials_sequence_change_is_refused_and_a_rename_is_not_one() {
+        let serial = |ty_: &str, start: i64| {
+            let mut c = Column::new(ty(ty_)).not_null();
+            c.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                start,
+                increment: 1,
+                name: None,
+            });
+            c
+        };
+        let errors = |base: &Schema, want: &Schema, intents: &[Intent]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(want, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            match diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: want,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            ) {
+                Ok(_) => Vec::new(),
+                Err(errs) => errs,
+            }
+        };
+        let refused = |errs: Vec<DiffError>| {
+            matches!(
+                errs.as_slice(),
+                [DiffError::SequenceChangeUnsupported { .. }]
+            )
+        };
+        let base = schema_of("app.t", table(&[("id", serial("integer", 1))]));
+        for (why, want) in [
+            (
+                "start",
+                schema_of("app.t", table(&[("id", serial("integer", 5))])),
+            ),
+            (
+                "retype",
+                schema_of("app.t", table(&[("id", serial("bigint", 1))])),
+            ),
+            (
+                "removed",
+                schema_of(
+                    "app.t",
+                    table(&[("id", Column::new(ty("integer")).not_null())]),
+                ),
+            ),
+        ] {
+            assert!(refused(errors(&base, &want, &[])), "{why}");
+        }
+        let plain = schema_of(
+            "app.t",
+            table(&[("id", Column::new(ty("integer")).not_null())]),
+        );
+        assert!(refused(errors(&plain, &base, &[])), "added");
+
+        // The negative cases.
+        assert!(errors(&base, &base, &[]).is_empty());
+        let renamed = schema_of("app.t", table(&[("n", serial("integer", 1))]));
+        let rename = [Intent::RenameColumn {
+            table: "app.t".parse().unwrap(),
+            from: "id".into(),
+            to: "n".into(),
+        }];
+        assert!(errors(&base, &renamed, &rename).is_empty());
+        let mut grown = table(&[("id", serial("integer", 1)), ("n", serial("integer", 1))]);
+        let logged = schema_of("app.t", grown.clone());
+        assert!(errors(&base, &logged, &[]).is_empty());
+        grown.unlogged = true;
+        let mut unlogged_base = table(&[("id", serial("integer", 1))]);
+        unlogged_base.unlogged = true;
+        assert!(refused(errors(
+            &schema_of("app.t", unlogged_base),
+            &schema_of("app.t", grown),
+            &[]
+        )));
     }
 
     /// IDENTITY cannot be modified with ALTER, so it must be blocked explicitly

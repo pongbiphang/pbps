@@ -121,6 +121,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
                 pbps_model::ValueSource::Default(text) => format!("`{text}`"),
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_) => "—".into(),
             },
             cell(c.description.as_deref())

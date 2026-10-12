@@ -201,14 +201,20 @@ pub(super) fn classify(
             // A generated attrdef is an explicit root too (DEC-1168.1).
             // Its internal column edge must not broaden its exact owner.
             if capture.inputs.contains_key(&default_id)
+                // A `serial`'s attrdef is the engine's `nextval`, not text the
+                // declaration holds, as before the sources were one (#1631).
                 && ((match &declaration.value_source {
                     ValueSource::Default(_) => true,
-                    ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => {
-                        false
-                    }
+                    ValueSource::None
+                    | ValueSource::Identity(_)
+                    | ValueSource::Sequence(_)
+                    | ValueSource::Generated(_) => false,
                 }) || (match &declaration.value_source {
                     ValueSource::Generated(_) => true,
-                    ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
+                    ValueSource::None
+                    | ValueSource::Default(_)
+                    | ValueSource::Identity(_)
+                    | ValueSource::Sequence(_) => false,
                 }))
             {
                 assign(&mut owned, default_id, Surface::Default(reference))?;

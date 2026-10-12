@@ -165,7 +165,8 @@ impl Reconstruction {
                                 ValueSource::Generated(value) => Some(value),
                                 ValueSource::None
                                 | ValueSource::Default(_)
-                                | ValueSource::Identity(_) => None,
+                                | ValueSource::Identity(_)
+                                | ValueSource::Sequence(_) => None,
                             })
                             .map(|g| g.expression.clone())
                         })
@@ -189,8 +190,11 @@ impl Reconstruction {
                                 defaults.push((column.clone(), std::mem::take(default)));
                                 spec.value_source = ValueSource::None;
                             }
+                            // A `serial` stays with its table, as an identity
+                            // does: its sequence is created with it (#1631).
                             ValueSource::None
                             | ValueSource::Identity(_)
+                            | ValueSource::Sequence(_)
                             | ValueSource::Generated(_) => {}
                         }
                     }

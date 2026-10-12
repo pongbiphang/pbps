@@ -1802,6 +1802,7 @@ pub(crate) fn order_after_releases(
                     pbps_model::ValueSource::None
                     | pbps_model::ValueSource::Default(_)
                     | pbps_model::ValueSource::Identity(_)
+                    | pbps_model::ValueSource::Sequence(_)
                     | pbps_model::ValueSource::Generated(_) => continue,
                 },
                 _ => continue,

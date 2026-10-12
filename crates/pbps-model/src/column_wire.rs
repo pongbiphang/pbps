@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{Collation, Column, ColumnType, Generated, Identity, ValueSource};
+use crate::{Collation, Column, ColumnType, Generated, Identity, OwnedSequence, ValueSource};
 
 #[derive(Serialize)]
 struct ColumnRef<'a> {
@@ -14,6 +14,8 @@ struct ColumnRef<'a> {
     default: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     identity: Option<&'a Identity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequence: Option<&'a OwnedSequence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     generated: Option<&'a Generated>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -26,17 +28,20 @@ struct ColumnRef<'a> {
 
 impl Serialize for Column {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let (default, identity, generated) = match &self.value_source {
-            ValueSource::None => (None, None, None),
-            ValueSource::Default(text) => (Some(text.as_str()), None, None),
-            ValueSource::Identity(identity) => (None, Some(identity), None),
-            ValueSource::Generated(generated) => (None, None, Some(generated)),
-        };
+        let (mut default, mut identity, mut sequence, mut generated) = (None, None, None, None);
+        match &self.value_source {
+            ValueSource::None => {}
+            ValueSource::Default(text) => default = Some(text.as_str()),
+            ValueSource::Identity(i) => identity = Some(i),
+            ValueSource::Sequence(s) => sequence = Some(s),
+            ValueSource::Generated(g) => generated = Some(g),
+        }
         ColumnRef {
             ty: &self.ty,
             nullable: self.nullable,
             default,
             identity,
+            sequence,
             generated,
             collation: self.collation.as_ref(),
             description: self.description.as_deref(),
@@ -56,6 +61,8 @@ struct ColumnWire {
     default: Option<Option<String>>,
     #[serde(default, deserialize_with = "present")]
     identity: Option<Option<Identity>>,
+    #[serde(default, deserialize_with = "present")]
+    sequence: Option<Option<OwnedSequence>>,
     #[serde(default, deserialize_with = "present")]
     generated: Option<Option<Generated>>,
     #[serde(default, deserialize_with = "present")]
@@ -77,21 +84,20 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
 impl<'de> Deserialize<'de> for Column {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = ColumnWire::deserialize(deserializer)?;
-        let value_source = match (
-            raw.default.flatten(),
-            raw.identity.flatten(),
-            raw.generated.flatten(),
-        ) {
-            (None, None, None) => ValueSource::None,
-            (Some(text), None, None) => ValueSource::Default(text),
-            (None, Some(identity), None) => ValueSource::Identity(identity),
-            (None, None, Some(generated)) => ValueSource::Generated(generated),
-            (Some(_), Some(_), None)
-            | (Some(_), None, Some(_))
-            | (None, Some(_), Some(_))
-            | (Some(_), Some(_), Some(_)) => {
+        let mut sources = [
+            raw.default.flatten().map(ValueSource::Default),
+            raw.identity.flatten().map(ValueSource::Identity),
+            raw.sequence.flatten().map(ValueSource::Sequence),
+            raw.generated.flatten().map(ValueSource::Generated),
+        ]
+        .into_iter()
+        .flatten();
+        let value_source = match (sources.next(), sources.next()) {
+            (None, _) => ValueSource::None,
+            (Some(source), None) => source,
+            (Some(_), Some(_)) => {
                 return Err(serde::de::Error::custom(
-                    "a column can have only one of default, identity or generated",
+                    "a column can have only one of default, identity, sequence or generated",
                 ));
             }
         };

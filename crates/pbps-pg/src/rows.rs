@@ -191,7 +191,11 @@ pub fn query(
         default_at: None,
         has_default: (match &key_spec.value_source {
             ValueSource::Default(_) => true,
-            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => false,
+            // A `serial` key is refused (`data_problems`).
+            ValueSource::None
+            | ValueSource::Identity(_)
+            | ValueSource::Sequence(_)
+            | ValueSource::Generated(_) => false,
         }),
         assume_default: false,
     };
@@ -208,10 +212,14 @@ pub fn query(
         // omission every declaration has to make, and every connected plan
         // would restate an UPDATE the engine refuses. So it is never read:
         // both sides omit it, and omission agrees with omission (DECISIONS 94).
+        // A `serial` beside the key is its sequence's to number, as an
+        // identity is, and is never read for the same reason (#1631).
         let default = match &spec.value_source {
             ValueSource::Default(default) => Some(default),
             ValueSource::None => None,
-            ValueSource::Identity(_) | ValueSource::Generated(_) => continue,
+            ValueSource::Identity(_) | ValueSource::Sequence(_) | ValueSource::Generated(_) => {
+                continue;
+            }
         };
         let quoted = quote(column)?;
         let value_at = select.len();
@@ -380,7 +388,11 @@ pub(crate) fn read_expr(quoted: &str) -> String {
 pub fn confirms_default(spec: &pbps_model::Column) -> bool {
     (match &spec.value_source {
         ValueSource::Default(value) => Some(value.as_str()),
-        ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+        // A `serial`'s `nextval` is never asked about: it would run (#1631).
+        ValueSource::None
+        | ValueSource::Identity(_)
+        | ValueSource::Sequence(_)
+        | ValueSource::Generated(_) => None,
     })
     .is_some_and(is_constant)
 }
@@ -1282,6 +1294,7 @@ pub fn spelling_queries(
                 pbps_model::ValueSource::Identity(_) | pbps_model::ValueSource::Generated(_) => {
                     true
                 }
+                pbps_model::ValueSource::Sequence(_) => true,
                 pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) => false,
             })
         {
@@ -1493,7 +1506,11 @@ pub(crate) fn data_problems(
         && table.columns.get(key).is_some_and(|c| {
             sources.get(key, c).iter().any(|source| match source {
                 ValueSource::Identity(_) => true,
-                ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => false,
+                // Refused below, naming its own sequence.
+                ValueSource::None
+                | ValueSource::Default(_)
+                | ValueSource::Sequence(_)
+                | ValueSource::Generated(_) => false,
             })
         })
     {
@@ -1507,6 +1524,24 @@ pub(crate) fn data_problems(
              a failed apply (ADR-0013 section 2). Declare the rows by a natural key, or place them \
              outside pbps and adopt them with `pbps baseline`.",
             name.schema, name.name
+        )));
+    }
+    // A `serial` key is the same construct with the same sequence left behind
+    // (#1631): a pinned key is an ordinary insert there, and the sequence the
+    // default calls hands out the pinned values again.
+    if let Some(pk) = &table.primary_key
+        && let [key] = pk.columns.as_slice()
+        && let Some(spec) = table.columns.get(key)
+        && let ValueSource::Sequence(sequence) = &spec.value_source
+    {
+        errs.push(invalid(format!(
+            "a `data:` block cannot key its rows by `{key}`, a `serial` column. A pinned key is \
+             inserted as written and leaves the sequence `{}` behind, so the next ordinary insert \
+             is handed a value a pinned row already holds and fails on the primary key: the \
+             deployment succeeds and the application breaks afterwards. There is nothing pbps \
+             can safely do to the sequence (ADR-0013 section 2). Declare the rows by a natural \
+             key, or place them outside pbps and adopt them with `pbps baseline`.",
+            crate::emit::owned_sequence(name, key, sequence)
         )));
     }
 
@@ -2243,6 +2278,29 @@ mod tests {
         assert!(!slot("doc").assume_default);
     }
 
+    /// A `serial` beside the key is its sequence's to number, as an identity
+    /// is: never read, so a row that leaves it out, as every row must, agrees
+    /// with the read-back (#1631, DECISIONS 94).
+    #[test]
+    fn a_serial_beside_the_key_is_never_read() {
+        let mut t = table(
+            Some(vec!["code"]),
+            &[
+                ("code", "text", None),
+                ("n", "integer", None),
+                ("v", "integer", None),
+            ],
+        );
+        t.columns.get_mut("n").expect("the column").value_source =
+            pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        let q = query(&name(), &t, &every())
+            .expect("readable")
+            .expect("rows");
+        let read: Vec<&str> = q.columns.iter().map(|s| s.column.as_str()).collect();
+        assert_eq!(read, ["v"], "{}", q.sql);
+        assert!(!q.sql.contains("\"n\""), "{}", q.sql);
+    }
+
     /// The engine's own spelling of a boolean, and only it. A `t` would mean
     /// the read went through some other rendering, and taking it would let two
     /// readers disagree about what the table holds.
@@ -2392,6 +2450,35 @@ mod tests {
         });
         with_rows(&mut beside, &[("a", &[])]);
         assert!(data_problems(&name(), &beside, Default::default()).is_empty());
+    }
+
+    /// A `serial` key is the same construct as an identity key, with the same
+    /// sequence left behind, and is refused naming it; a `serial` beside the
+    /// key is not (#1631).
+    #[test]
+    fn a_serial_keyed_data_block_is_refused_and_names_its_sequence() {
+        let mut t = table(Some(vec!["id"]), &[("id", "integer", None)]);
+        t.columns.get_mut("id").expect("the column").value_source =
+            pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        with_rows(&mut t, &[("1", &[])]);
+        let problems = data_problems(&name(), &t);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let message = problems[0].to_string();
+        assert!(message.contains("`serial` column"), "{message}");
+        assert!(message.contains("status_id_seq"), "{message}");
+        assert!(message.contains("pbps baseline"), "{message}");
+
+        let mut beside = table(
+            Some(vec!["code"]),
+            &[("code", "text", None), ("n", "integer", None)],
+        );
+        beside
+            .columns
+            .get_mut("n")
+            .expect("the column")
+            .value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        with_rows(&mut beside, &[("a", &[])]);
+        assert!(data_problems(&name(), &beside).is_empty());
     }
 
     /// A cell whose *kind* the read-back would not produce, and one the type

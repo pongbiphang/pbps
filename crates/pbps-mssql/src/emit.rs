@@ -1585,6 +1585,14 @@ fn generated_column_definition(
                 ),
             });
         }
+        pbps_model::ValueSource::Sequence(_) => {
+            return Err(DialectError::Invalid {
+                dialect: "mssql",
+                message: format!(
+                    "column `{name}` is a `serial`, which this model holds for PostgreSQL only"
+                ),
+            });
+        }
     };
     if let Some(generated) = generated {
         s.push(' ');

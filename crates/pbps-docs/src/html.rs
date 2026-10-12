@@ -156,6 +156,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
                 pbps_model::ValueSource::Default(text) => code(text),
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_) => dash(),
             },
             c.description.as_deref().map(esc).unwrap_or_else(dash)

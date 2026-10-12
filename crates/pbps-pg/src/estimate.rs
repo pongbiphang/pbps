@@ -572,7 +572,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             match &column.value_source {
                 // Both sources populate every existing row. A stored generated
                 // ADD rewrites even when nullable, measured on PG16 and PG18.
-                pbps_model::ValueSource::Identity(_) | pbps_model::ValueSource::Generated(_) => e(
+                // A `serial`'s `nextval` default is volatile, and numbers
+                // every row the same way (#1631).
+                pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Sequence(_)
+                | pbps_model::ValueSource::Generated(_) => e(
                     about,
                     table,
                     Rewrite::Yes,
@@ -1905,6 +1909,25 @@ mod tests {
             assert_eq!(ours.lock, Lock::AccessExclusive);
             assert_eq!(ours.is_cheap(), identity.is_none());
         }
+    }
+
+    /// A `serial`'s `nextval` default is volatile: the engine computes it for
+    /// every stored row, rewriting the table as an identity does (#1631).
+    #[test]
+    fn adding_a_serial_rewrites_the_table() {
+        let mut column = pbps_model::Column::new(ty("integer")).not_null();
+        column.value_source =
+            pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        let change = Change::AddColumn {
+            uid: "c_aaaaaa".parse().expect("a uid"),
+            table: tname("app.t"),
+            name: "v".into(),
+            column: Box::new(column),
+        };
+        let ours = estimate(&change, Strategy::default()).expect("an estimate");
+        assert_eq!(ours.rewrite, Rewrite::Yes);
+        assert_eq!(ours.reads, Reads::EveryRow);
+        assert!(!ours.is_cheap(), "{ours:#?}");
     }
 
     /// A foreign key locks the table nobody was looking at.

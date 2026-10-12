@@ -232,6 +232,7 @@ pub(super) fn changes(
                         ValueSource::Default(default) => std::mem::take(default),
                         ValueSource::None
                         | ValueSource::Identity(_)
+                        | ValueSource::Sequence(_)
                         | ValueSource::Generated(_) => continue,
                     };
                     spec.value_source = ValueSource::None;
@@ -365,6 +366,7 @@ pub(super) fn changes(
                             ValueSource::Generated(value) => Some(value.clone()),
                             ValueSource::None
                             | ValueSource::Identity(_)
+                            | ValueSource::Sequence(_)
                             | ValueSource::Default(_) => None,
                         })
                 };
@@ -577,12 +579,16 @@ pub(super) fn changes(
     Ok((ChangeSet { changes }, ordinary))
 }
 
-/// A column's default, where its value comes from one: not an identity's
-/// or a generation expression's, which are not defaults to rebuild.
+/// A column's default, where its value comes from one: not an identity's,
+/// a `serial`'s `nextval` (#1631) or a generation expression's, which are not
+/// defaults to rebuild.
 fn default_of(column: &pbps_model::Column) -> Option<String> {
     match &column.value_source {
         ValueSource::Default(value) => Some(value.clone()),
-        ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+        ValueSource::None
+        | ValueSource::Identity(_)
+        | ValueSource::Sequence(_)
+        | ValueSource::Generated(_) => None,
     }
 }
 
