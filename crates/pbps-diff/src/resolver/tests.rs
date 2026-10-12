@@ -2131,7 +2131,9 @@ mod generated_surface_coverage {
     fn partitioned(parent: Option<&str>, own: Option<&str>) -> Schema {
         use pbps_model::{PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
         let mut d = Column::new("int".parse().unwrap());
-        d.default = parent.map(Into::into);
+        if let Some(parent) = parent {
+            d.value_source = pbps_model::ValueSource::Default(parent.into());
+        }
         let mut schema = Schema::default();
         schema.tables.insert(
             "app.t".parse().unwrap(),
@@ -2438,7 +2440,7 @@ mod generated_surface_coverage {
         base.tables.insert(t.clone(), table.clone());
         let mut desired = base.clone();
         let mut c = Column::new("int".parse().unwrap());
-        c.default = Some("app.f(1)".into());
+        c.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
         desired
             .tables
             .get_mut(&t)
@@ -2868,7 +2870,7 @@ mod generated_surface_coverage {
             .columns
             .insert("a".into(), Column::new("int".parse().unwrap()));
         let mut c = Column::new("int".parse().unwrap());
-        c.default = Some("app.f(1)".into());
+        c.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
         table.columns.insert("c".into(), c);
         base.tables.insert(t.clone(), table);
         let before_ids = ids(&base, &IdsFile::default());
@@ -2924,7 +2926,7 @@ mod generated_surface_coverage {
         let p: pbps_model::TableName = "app.p".parse().unwrap();
         let mut base = partitioned(None, None);
         let mut d = Column::new("int".parse().unwrap());
-        d.default = Some("app.f(1)".into());
+        d.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
         base.tables.insert(
             p.clone(),
             Table {
@@ -3097,7 +3099,7 @@ mod generated_surface_coverage {
         base.tables.insert(t.clone(), table);
         let mut desired = base.clone();
         let mut c = Column::new("int".parse().unwrap());
-        c.default = Some("app.f(1)".into());
+        c.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
         desired
             .tables
             .get_mut(&t)
@@ -3147,7 +3149,7 @@ mod generated_surface_coverage {
         let mut desired = base.clone();
         let p: pbps_model::TableName = "app.p".parse().unwrap();
         let mut d = Column::new("int".parse().unwrap());
-        d.default = Some("app.f(1)".into());
+        d.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
         desired.tables.insert(
             p.clone(),
             Table {
