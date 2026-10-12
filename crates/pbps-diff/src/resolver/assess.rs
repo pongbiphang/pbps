@@ -248,6 +248,7 @@ fn moves_bindings(
         | Change::UpdateRow { .. }
         | Change::DeleteRow { .. }
         | Change::SetDataMode { .. }
+        | Change::SetEnsureKeys { .. }
         | Change::CreateRole { .. }
         | Change::DropRole { .. }
         | Change::RenameRole { .. }

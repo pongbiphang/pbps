@@ -226,7 +226,10 @@ use crate::schema::Schema;
 ///
 /// Bumped to 36 for a parent's `partitions: external` (DEC-1533.1): a created
 /// table's `partition_by.external`, which an older build cannot read.
-pub const CURRENT_VERSION: u32 = 36;
+///
+/// Bumped to 37 for `SetEnsureKeys` (DEC-1808.1), which older readers cannot
+/// decode and older plans can omit even when the managed scope changes.
+pub const CURRENT_VERSION: u32 = 37;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -685,7 +688,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 36);
+        assert_eq!(CURRENT_VERSION, 37);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

@@ -633,6 +633,7 @@ fn role_of(change: &Change) -> Option<&str> {
         | Change::UpdateRow { .. }
         | Change::DeleteRow { .. }
         | Change::SetDataMode { .. }
+        | Change::SetEnsureKeys { .. }
         | Change::CreateModule { .. }
         | Change::AlterModule { .. }
         | Change::DropModule { .. }
@@ -1092,6 +1093,17 @@ pub fn describe(c: &Change) -> String {
             Some(m) => format!("~ reference data is now `{m}`"),
             None => "~ reference data is no longer declared".to_owned(),
         },
+        Change::SetEnsureKeys { from, to, .. } => format!(
+            "~ ensure keys: manage [{}]; stop managing [{}]",
+            to.difference(from)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            from.difference(to)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
         // Roles (ADR-0005). The permissions are spelled out: "grant on
         // dbo.customer" tells a reviewer nothing about how much wider access
         // just got.

@@ -326,6 +326,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
         | Change::UpdateRow { .. }
         | Change::DeleteRow { .. }
         | Change::SetDataMode { .. }
+        | Change::SetEnsureKeys { .. }
         | Change::CreateModule { .. }
         | Change::AlterModule { .. }
         | Change::DropModule { .. }

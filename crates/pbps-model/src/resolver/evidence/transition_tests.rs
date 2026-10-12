@@ -1379,6 +1379,7 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }

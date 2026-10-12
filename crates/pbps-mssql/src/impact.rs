@@ -103,6 +103,7 @@ pub async fn key_drop_blockers(
                 | Change::UpdateRow { .. }
                 | Change::DeleteRow { .. }
                 | Change::SetDataMode { .. }
+                | Change::SetEnsureKeys { .. }
                 | Change::CreateModule { .. }
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }
@@ -266,6 +267,7 @@ pub async fn key_drop_blockers(
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }

@@ -721,6 +721,15 @@ pub enum Change {
         to: Option<DataMode>,
     },
 
+    /// The keys an existing `ensure` declaration manages. Matching live rows
+    /// need no DML, but the new scope must still reach the ordinary recording
+    /// gate; observed row membership cannot stand in for it (DEC-1808.1).
+    SetEnsureKeys {
+        table: TableName,
+        from: BTreeSet<RowKey>,
+        to: BTreeSet<RowKey>,
+    },
+
     // Modules (ADR-0002) carry no uid: they carry no data either, so a rename
     // is drop + add and the audit trail is git.
     CreateModule {
@@ -1259,6 +1268,7 @@ impl Change {
             | Change::UpdateRow { table, .. }
             | Change::DeleteRow { table, .. }
             | Change::SetDataMode { table, .. }
+            | Change::SetEnsureKeys { table, .. }
             | Change::DetachPartition { table, .. }
             | Change::AttachPartition { table, .. } => table,
             Change::DropColumn { column, .. }
@@ -1343,6 +1353,7 @@ impl Change {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -1458,6 +1469,7 @@ impl Change {
             | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -1530,6 +1542,7 @@ impl Change {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -1640,6 +1653,7 @@ impl Change {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -1704,6 +1718,7 @@ impl Change {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::CreateRole { .. }
@@ -1786,6 +1801,7 @@ impl Change {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -1845,6 +1861,7 @@ impl Change {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. } => (None, None),
@@ -1902,6 +1919,7 @@ impl Change {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -1998,6 +2016,7 @@ impl Change {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -2064,6 +2083,7 @@ impl Change {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -2185,6 +2205,7 @@ impl Change {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -2248,6 +2269,7 @@ impl Change {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -2309,6 +2331,7 @@ impl Change {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -2358,6 +2381,7 @@ impl Change {
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -2572,6 +2596,7 @@ impl Change {
             // the plan. Changing the mode emits nothing at all.
             | Change::InsertRow { .. }
             | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
             // Creating a role grants nothing by itself.
             | Change::CreateRole { .. }
             // A replica identity changes what logical replication carries to

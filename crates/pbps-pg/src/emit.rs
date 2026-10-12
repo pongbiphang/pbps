@@ -2976,7 +2976,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         // The mode is a property of the declaration, not of the database: it
         // decides what future plans do about undeclared rows. The row changes
         // it implies are separate entries in this same plan.
-        Change::SetDataMode { .. } => Ok(Vec::new()),
+        Change::SetDataMode { .. } | Change::SetEnsureKeys { .. } => Ok(Vec::new()),
 
         // A module is created, never replaced. `CREATE OR REPLACE` exists on
         // this engine and buys nothing: measured, it refuses a changed return

@@ -396,7 +396,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         // The mode is a property of the declaration, not of the database: it
         // decides what future plans do about undeclared rows. The row changes
         // it implies are separate entries in this same plan.
-        Change::SetDataMode { .. } => Ok(Vec::new()),
+        Change::SetDataMode { .. } | Change::SetEnsureKeys { .. } => Ok(Vec::new()),
 
         // Roles (ADR-0005). `ALTER ROLE ... WITH NAME` keeps the membership,
         // which is the reason a role rename is intent rather than drop + add.

@@ -50,6 +50,24 @@ mod data_takeovers;
 
 #[test]
 #[ignore = "needs live mssql"]
+fn ensure_scope_changes_record_matching_additions_and_removals() {
+    data_takeovers::ensure_scope(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn ensure_scope_changes_refuse_edited_plans_and_changed_union_rows() {
+    data_takeovers::ensure_refusals(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn ensure_scope_changes_compose_with_row_writes_and_table_renames() {
+    data_takeovers::ensure_writes_and_rename(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
 fn matching_rows_still_record_the_first_data_takeover() {
     data_takeovers::matching(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }

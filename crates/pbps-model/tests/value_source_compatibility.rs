@@ -70,7 +70,7 @@ fn artifacts() -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
         moves_at_most: None,
     })];
     changes.extend(adds);
-    let plan = SavedPlan::new(
+    let mut plan = SavedPlan::new(
         PlanOrigin::Database,
         "postgres",
         "2026-10-12T00:00:00Z",
@@ -82,6 +82,9 @@ fn artifacts() -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
         ChangeSet { changes },
         ids.clone(),
     );
+    // These bytes pin the historical value-source wire layout. A later plan
+    // format must not silently change the fixture's version or checksum.
+    plan.version = 36;
     let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids.clone(), "fixture");
     state.declared = Declared::from_schema(&schema);
     state.plan_checksum = Some(plan.checksum());
