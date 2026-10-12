@@ -549,10 +549,13 @@ pub(crate) fn refuse_policy_errors(
         return Ok(Vec::new());
     }
     let spelled = crate::types_as_the_dialect_spells_them(&loaded.schema, dialect);
-    let (errors, rest): (Vec<_>, Vec<_>) =
-        pbps_policy::declarations(&spelled, &policies, &crate::policy_context(project, false))
-            .into_iter()
-            .partition(|f| f.severity == pbps_model::Severity::Error);
+    let (errors, rest): (Vec<_>, Vec<_>) = pbps_policy::declarations(
+        &spelled,
+        &policies,
+        &crate::policy_context(project, dialect, false),
+    )
+    .into_iter()
+    .partition(|f| f.severity == pbps_model::Severity::Error);
     if !errors.is_empty() {
         anyhow::bail!(
             "these declarations break a rule `pbps.yml` sets to `error`:\n  {}\n\

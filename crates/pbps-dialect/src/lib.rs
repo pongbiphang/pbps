@@ -2678,6 +2678,19 @@ pub trait Dialect {
     fn declaration_notes(&self, _schema: &Schema) -> Vec<String> {
         Vec::new()
     }
+
+    /// The column base types this engine has deprecated, each with the advice
+    /// a `column.no-deprecated-type` finding gives, in the type's canonical
+    /// spelling ([`normalize_type`](Dialect::normalize_type)).
+    ///
+    /// The dialect answers because the policy crate holds no dialect
+    /// knowledge (DECISIONS 187), and what one engine deprecated is ordinary
+    /// on another: `text` is SQL Server's deprecated LOB type and PostgreSQL's
+    /// everyday string (DEC-1869.1). Empty by default, for the stand-ins in
+    /// tests; each real dialect states its own list.
+    fn deprecated_types(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
 }
 
 /// Renders emitted statements as one script, honouring [`Statement::own_batch`].

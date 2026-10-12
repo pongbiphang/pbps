@@ -199,3 +199,25 @@ would quietly shrink the adoption to what the rules happen to like. This is
 DECISIONS 114's reason, extended from one rule to all of them. A finding below
 `error` is printed and the files are written. A `policies:` block that is itself
 invalid is not evaluated, as in `validate`, which reports the block.
+
+<a id="dec-1869-1"></a>
+
+**DEC-1869.1. `column.no-deprecated-type` takes its list from the target
+dialect (#1869; amends DECISIONS 187).** The rule matched `text`, `ntext` and
+`image` with no dialect condition, which predates PostgreSQL support. On
+PostgreSQL, `text` is the ordinary unbounded string and the canonical spelling
+of it, so every `text` column of a PostgreSQL project was told it had been
+"deprecated since SQL Server 2005" and to use `varchar(max)`, a type PostgreSQL
+does not have.
+
+187's boundary still holds: the dialect says what a type is, the policy says
+what to think of it. A type being deprecated is a fact about an engine, so it
+is the dialect's to state. `Dialect::deprecated_types` lists the base types,
+each with the advice its finding gives, and `policy_context` hands that list to
+the evaluator through `Context`. The policy crate still depends on no dialect.
+SQL Server states the three LOB types and its advice is unchanged. PostgreSQL
+states none. The trait's default is the empty list, for test stand-ins only;
+both real dialects state theirs explicitly.
+
+Every `Context` is built from a dialect, the plan point's included, so a later
+rule that reads the list cannot see an empty one by accident.

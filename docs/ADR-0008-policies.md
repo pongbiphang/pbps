@@ -95,7 +95,7 @@ Declaration rules, evaluated by `validate`:
 |---|---|---|
 | `naming.table`, `naming.column`, `naming.index`, `naming.constraint` | regex | off |
 | `data.max-rows` | rows | on, `warning` — the existing `max_data_rows` becomes this rule's parameter |
-| `column.no-deprecated-type` | — | on, `warning` (`text`, `ntext`, `image`) |
+| `column.no-deprecated-type` | — | on, `warning` — the types the target engine deprecated: SQL Server `text`, `ntext`, `image`; none on PostgreSQL (DEC-1869.1) |
 
 Plan rules, evaluated by `plan`:
 

@@ -29,6 +29,11 @@ pub struct Context {
     /// Only these objects are evaluated when set (`validate --since`): the
     /// subjects, as a finding names them.
     pub only: Option<BTreeSet<String>>,
+    /// The column base types the target engine has deprecated, with the
+    /// advice each finding gives — the dialect's answer, handed over by the
+    /// caller because this crate holds no dialect knowledge (DECISIONS 187,
+    /// DEC-1869.1).
+    pub deprecated_types: &'static [(&'static str, &'static str)],
 }
 
 impl Context {
@@ -169,14 +174,14 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
                 continue;
             }
             for (column, spec) in &table.columns {
-                if matches!(spec.ty.base.as_str(), "text" | "ntext" | "image") {
+                if let Some((_, advice)) = ctx
+                    .deprecated_types
+                    .iter()
+                    .find(|(base, _)| *base == spec.ty.base)
+                {
                     out.extend(live.finding(
                         Some(&subject),
-                        format!(
-                            "{name}.{column}: `{}` has been deprecated since SQL Server 2005; \
-                             use varchar(max), nvarchar(max) or varbinary(max)",
-                            spec.ty
-                        ),
+                        format!("{name}.{column}: `{}` {advice}", spec.ty),
                     ));
                 }
             }
@@ -481,8 +486,26 @@ mod tests {
             max_rows: 1000,
             connected: false,
             only: None,
+            deprecated_types: SQL_SERVER_LOBS,
         }
     }
+
+    /// SQL Server's list, as its dialect states it; the crate cannot depend on
+    /// the dialect, so the tests spell it out.
+    const SQL_SERVER_LOBS: &[(&str, &str)] = &[
+        (
+            "text",
+            "has been deprecated since SQL Server 2005; use varchar(max)",
+        ),
+        (
+            "ntext",
+            "has been deprecated since SQL Server 2005; use nvarchar(max)",
+        ),
+        (
+            "image",
+            "has been deprecated since SQL Server 2005; use varbinary(max)",
+        ),
+    ];
 
     fn schema() -> Schema {
         let mut s = Schema::default();
@@ -520,6 +543,41 @@ mod tests {
         assert_eq!(ids(&f), ["column.no-deprecated-type"], "{f:?}");
         assert_eq!(f[0].severity, Severity::Warning);
         assert_eq!(f[0].subject.as_deref(), Some("dbo.customer"));
+    }
+
+    /// The finding quotes the dialect's advice, not a fixed engine's.
+    #[test]
+    fn a_deprecated_type_finding_gives_the_dialects_advice() {
+        let f = declarations(&schema(), &Policies::default(), &ctx());
+        assert_eq!(
+            f[0].message,
+            "dbo.customer.notes: `text` has been deprecated since SQL Server 2005; \
+             use varchar(max)"
+        );
+    }
+
+    /// `text` is PostgreSQL's ordinary string: a target engine that
+    /// deprecates nothing gets no finding, however the rule is configured
+    /// (#1869).
+    #[test]
+    fn a_type_the_target_engine_never_deprecated_is_not_reported() {
+        let none = Context {
+            deprecated_types: &[],
+            ..ctx()
+        };
+        for p in [
+            Policies::default(),
+            policies(r#"{"rules": {"column.no-deprecated-type": "error"}}"#),
+        ] {
+            let f = declarations(&schema(), &p, &none);
+            assert!(f.is_empty(), "{f:?}");
+        }
+        // The same declarations against a list that names the type are
+        // reported, so the empty result above is the list's doing.
+        let p = policies(r#"{"rules": {"column.no-deprecated-type": "error"}}"#);
+        let f = declarations(&schema(), &p, &ctx());
+        assert_eq!(ids(&f), ["column.no-deprecated-type"], "{f:?}");
+        assert_eq!(f[0].severity, Severity::Error);
     }
 
     #[test]
