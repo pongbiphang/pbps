@@ -261,13 +261,20 @@ fn assert_answers_the_overload_from(
     plan.evidence.validate(&plan.changes).unwrap();
     pbps_pg::resolver::validate_evidence(&plan.evidence)
         .expect("the resolver's evidence passes the artifact reader");
+    let pbps_model::resolver::ResolverRuntime::Scratch {
+        entry,
+        scratch: sealed,
+        outside_writes,
+        ..
+    } = &plan.evidence.qualification().runtime;
     assert_eq!(
-        plan.evidence.qualification().runtime,
-        pbps_model::resolver::ResolverRuntime::Scratch {
-            scratch,
-            outside_writes: pbps_model::resolver::OutsideWrites::Refused,
-        },
-        "the evidence names the resolver's scratch"
+        (entry.as_str(), sealed, *outside_writes),
+        (
+            "scratch",
+            &scratch,
+            pbps_model::resolver::OutsideWrites::Refused
+        ),
+        "the evidence names the resolver's entry and scratch"
     );
     assert_eq!(
         plan.evidence.qualification().rule,
@@ -310,10 +317,18 @@ async fn resolver_answers_a_managed_question_without_root_or_observation() {
     target.drop().await;
     let plan = result.unwrap();
     assert_answers_the_overload(&plan);
+    assert_layout(&plan, pbps_model::resolver::ScratchLayout::RunOwned);
     assert_eq!(
         before, after,
         "the run-owned database, login and roles are all dropped"
     );
+}
+
+/// The layout the run used is sealed as its own (#1517).
+fn assert_layout(plan: &ResolvedPlan, layout: pbps_model::resolver::ScratchLayout) {
+    let pbps_model::resolver::ResolverRuntime::Scratch { layout: sealed, .. } =
+        &plan.evidence.qualification().runtime;
+    assert_eq!(*sealed, layout);
 }
 
 #[tokio::test]
@@ -352,7 +367,10 @@ async fn resolver_runs_in_a_precreated_database_with_a_confined_account() {
         .await;
         let left = fixture.foreign_objects(&scratch_db).await;
         fixture.drop().await;
-        assert_answers_the_overload(&result.unwrap());
+        let plan = result.unwrap();
+        assert_answers_the_overload(&plan);
+        // Negative of the run-owned case: a precreated database is supplied.
+        assert_layout(&plan, pbps_model::resolver::ScratchLayout::Supplied);
         assert_eq!(
             left.1, 0,
             "{server}: the run empties its database: {left:?}"
@@ -3412,6 +3430,7 @@ async fn produce_in_docker(
         None => identity_of(target).await,
     };
     let provenance = super::Provenance {
+        entry: "scratch".into(),
         scratch: pbps_model::resolver::ScratchSource::Docker {
             image: image.to_owned(),
         },
@@ -3698,7 +3717,10 @@ async fn resolver_docker_records_the_image_as_configured_and_unverified() {
     assert_eq!(
         plan.evidence.qualification().runtime,
         pbps_model::resolver::ResolverRuntime::Scratch {
+            entry: "scratch".into(),
             scratch: pbps_model::resolver::ScratchSource::Docker { image: tag.clone() },
+            // A container's superuser provisions its own database.
+            layout: pbps_model::resolver::ScratchLayout::RunOwned,
             outside_writes: pbps_model::resolver::OutsideWrites::Refused,
         }
     );
@@ -3855,6 +3877,7 @@ async fn resolver_baseline_outside_writes_allow_keeps_a_created_role() {
             &Standard::default(),
             Some(&baseline),
             &super::Provenance {
+                entry: "scratch".into(),
                 scratch: pbps_model::resolver::ScratchSource::Server {},
                 outside_writes,
             },
@@ -3921,6 +3944,7 @@ async fn resolver_supplied_baseline_outside_writes_allow_keeps_the_logins_own_de
             &Standard::default(),
             Some(&baseline),
             &super::Provenance {
+                entry: "scratch".into(),
                 scratch: pbps_model::resolver::ScratchSource::Server {},
                 outside_writes,
             },

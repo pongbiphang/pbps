@@ -1104,6 +1104,17 @@
               "type": "null"
             }
           ]
+        },
+        "resolver": {
+          "description": "The sealed resolver evidence: present exactly when the plan is\nresolved (#1517). An ordinary plan carries no resolver provenance.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResolverDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1183,6 +1194,166 @@
       "required": [
         "environment",
         "state"
+      ]
+    },
+    "ResolverDetail": {
+      "description": "What `explain` shows of a resolved plan's evidence.",
+      "type": "object",
+      "properties": {
+        "entry": {
+          "description": "The `pbps.yml` resolver entry that ran.",
+          "type": "string"
+        },
+        "scratch": {
+          "description": "`server` or `docker`.",
+          "type": "string"
+        },
+        "image": {
+          "description": "A docker scratch's image reference as configured: unverified, since\nthe content behind a tag can change.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "layout": {
+          "description": "`run-owned`: a login and database the run created and dropped.\n`supplied`: the database the entry names, emptied after the run.",
+          "type": "string"
+        },
+        "outside_writes": {
+          "description": "Whether the baseline's writes outside the scratch database were\n`refused` or `allowed` (and then not checked).",
+          "type": "string"
+        },
+        "rule": {
+          "description": "The compatibility rule the scratch was qualified under.",
+          "type": "string"
+        },
+        "key_id": {
+          "description": "The identifier of the fingerprint key the evidence is keyed with.",
+          "type": "string"
+        },
+        "sealed": {
+          "description": "The facts the qualification seals as keyed fingerprints: named,\nnever their values.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "limitations": {
+          "description": "Differences the rule accepted rather than refused (#1700).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Limitation"
+          }
+        },
+        "surfaces": {
+          "description": "Each managed surface the resolver answered for, with its verdict.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SurfaceVerdict"
+          }
+        },
+        "order": {
+          "description": "The order the evidence proves, edge by edge.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OrderStep"
+          }
+        },
+        "prerequisites": {
+          "description": "The external inputs the bindings read, by identity.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PrerequisiteDetail"
+          }
+        }
+      },
+      "required": [
+        "entry",
+        "scratch",
+        "layout",
+        "outside_writes",
+        "rule",
+        "key_id",
+        "sealed",
+        "limitations",
+        "surfaces",
+        "order",
+        "prerequisites"
+      ]
+    },
+    "Limitation": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description"
+      ]
+    },
+    "SurfaceVerdict": {
+      "type": "object",
+      "properties": {
+        "surface": {
+          "description": "Its kind and name, such as `default app.t.c`.",
+          "type": "string"
+        },
+        "verdict": {
+          "description": "`unaffected`, `rebuilt`, `created` or `removed`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "surface",
+        "verdict"
+      ]
+    },
+    "OrderStep": {
+      "type": "object",
+      "properties": {
+        "before": {
+          "description": "The 1-based position, in the plan's changes, of the change that goes\nfirst.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "after": {
+          "description": "The position of the change that must follow it.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "reason": {
+          "description": "Why: `structural`, `binding`, `identity`, `data`, `authorization` or\n`restoration`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "before",
+        "after",
+        "reason"
+      ]
+    },
+    "PrerequisiteDetail": {
+      "type": "object",
+      "properties": {
+        "object": {
+          "description": "The catalog class and name, such as `pg_proc app.f(numeric)`.",
+          "type": "string"
+        },
+        "fingerprinted": {
+          "description": "Whether a keyed fingerprint of its properties is sealed. One the plan\nitself installs has none.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "object",
+        "fingerprinted"
       ]
     },
     "envelope.explain": {
@@ -2080,6 +2251,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 43,
+  "x-pbps-schema-version": 44,
   "x-pbps-tool-version": "0.0.0"
 }

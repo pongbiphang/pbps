@@ -123,6 +123,7 @@ pub fn published(server: &str) {
         "keyed, never the identifier in clear: {cluster}"
     );
     assert_exact_order(&std::fs::read_to_string(&sql).unwrap());
+    assert_explained(&d, &artifact);
 
     // A hand-edited cluster identity is a plan other than the one whose
     // checksum was approved.
@@ -225,6 +226,134 @@ pub fn ordinary_checks(server: &str, refused: bool) {
             "the expression change is published with the resolver's answer"
         );
     }
+}
+
+/// `explain` of the published plan, from the file alone (#1517): the
+/// entry, its scratch kind and layout, each surface's verdict and every
+/// edge with its reason, in the JSON and the human form alike. The
+/// prerequisites are the whole captured scope, which depends on the
+/// cluster, so only their shape is pinned: identities, never a fingerprint.
+fn assert_explained(d: &Demo, artifact: &std::path::Path) {
+    let plan = artifact.to_str().unwrap();
+    let json = successful(run(
+        d,
+        &["explain", "--plan", plan, "--format", "json"],
+        None,
+    ));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+    let resolver = &value["data"]["resolver"];
+    assert_eq!(
+        (
+            &resolver["entry"],
+            &resolver["scratch"],
+            &resolver["layout"]
+        ),
+        (
+            &serde_json::json!("scratch"),
+            &serde_json::json!("server"),
+            &serde_json::json!("supplied")
+        ),
+        "{resolver}"
+    );
+    let surfaces: Vec<(String, String)> = resolver["surfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["verdict"].as_str().unwrap().to_owned(),
+                s["surface"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        surfaces,
+        [
+            ("rebuilt", "default app.t.c"),
+            ("rebuilt", "check app.t.ck"),
+            ("rebuilt", "index app.t.ix"),
+            ("rebuilt", "module app.v"),
+            ("unaffected", "module app.w"),
+            ("created", "module app.f(integer)"),
+            ("unaffected", "module app.f(numeric)"),
+            ("rebuilt", "module app.h(numeric)"),
+        ]
+        .map(|(v, s)| (v.to_owned(), s.to_owned()))
+    );
+    let prerequisites = resolver["prerequisites"].as_array().unwrap();
+    for named in ["pg_namespace app", "pg_class app.t", "pg_class app.v"] {
+        assert!(
+            prerequisites
+                .iter()
+                .any(|p| p["object"] == named && p["fingerprinted"] == true),
+            "{named}"
+        );
+    }
+    let text = stdout(&successful(run(d, &["explain", "--plan", plan], None)));
+    assert!(
+        text.contains("  resolver    scratch (server scratch, supplied)\n"),
+        "{text}"
+    );
+    let block = text
+        .split_once("\n  surfaces\n")
+        .and_then(|(_, rest)| rest.split_once("\n  prerequisites "))
+        .map(|(block, _)| block)
+        .unwrap_or_else(|| panic!("{text}"));
+    let expected = [
+        "  surfaces",
+        "    rebuilt     default app.t.c",
+        "    rebuilt     check app.t.ck",
+        "    rebuilt     index app.t.ix",
+        "    rebuilt     module app.v",
+        "    unaffected  module app.w",
+        "    created     module app.f(integer)",
+        "    unaffected  module app.f(numeric)",
+        "    rebuilt     module app.h(numeric)",
+        "  order",
+        "    #1 create_module app.f(integer) before #2 public_execution app.f(integer) (restoration)",
+        "    #1 create_module app.f(integer) before #4 create_module app.v (binding)",
+        "    #1 create_module app.f(integer) before #7 create_module app.h(numeric) (binding)",
+        "    #1 create_module app.f(integer) before #13 alter_column_default app.t (binding)",
+        "    #1 create_module app.f(integer) before #14 add_check app.t (binding)",
+        "    #1 create_module app.f(integer) before #15 add_index app.t (binding)",
+        "    #2 public_execution app.f(integer) before #13 alter_column_default app.t (authorization)",
+        "    #2 public_execution app.f(integer) before #14 add_check app.t (authorization)",
+        "    #2 public_execution app.f(integer) before #15 add_index app.t (authorization)",
+        "    #3 drop_module app.v before #4 create_module app.v (identity)",
+        "    #3 drop_module app.v before #4 create_module app.v (restoration)",
+        "    #5 drop_module app.w before #6 drop_module app.h(numeric) (binding)",
+        "    #5 drop_module app.w before #9 create_module app.w (identity)",
+        "    #5 drop_module app.w before #9 create_module app.w (restoration)",
+        "    #6 drop_module app.h(numeric) before #7 create_module app.h(numeric) (identity)",
+        "    #6 drop_module app.h(numeric) before #7 create_module app.h(numeric) (restoration)",
+        "    #7 create_module app.h(numeric) before #8 public_execution app.h(numeric) (restoration)",
+        "    #7 create_module app.h(numeric) before #9 create_module app.w (binding)",
+        "    #10 drop_check app.t before #12 alter_column_default app.t (binding)",
+        "    #10 drop_check app.t before #13 alter_column_default app.t (binding)",
+        "    #10 drop_check app.t before #13 alter_column_default app.t (restoration)",
+        "    #10 drop_check app.t before #14 add_check app.t (restoration)",
+        "    #10 drop_check app.t before #15 add_index app.t (restoration)",
+        "    #11 drop_index app.t before #12 alter_column_default app.t (binding)",
+        "    #11 drop_index app.t before #13 alter_column_default app.t (binding)",
+        "    #11 drop_index app.t before #13 alter_column_default app.t (restoration)",
+        "    #11 drop_index app.t before #14 add_check app.t (restoration)",
+        "    #11 drop_index app.t before #15 add_index app.t (restoration)",
+        "    #12 alter_column_default app.t before #13 alter_column_default app.t (restoration)",
+        "    #12 alter_column_default app.t before #14 add_check app.t (restoration)",
+        "    #12 alter_column_default app.t before #15 add_index app.t (restoration)",
+    ];
+    assert_eq!(
+        format!("  surfaces\n{block}"),
+        expected.join("\n"),
+        "{text}"
+    );
+    // No fingerprint is shown: the sealed values are 64 hex digits.
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(artifact).unwrap()).unwrap();
+    let cluster = saved["analysis"]["evidence"]["qualification"]["target_cluster"]
+        .as_str()
+        .unwrap();
+    assert!(!text.contains(cluster) && !stdout(&json).contains(cluster));
 }
 
 /// The declarations every case starts from: `app.f(numeric)`, the

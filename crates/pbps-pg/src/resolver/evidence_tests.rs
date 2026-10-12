@@ -33,7 +33,9 @@ fn evidence() -> ResolverEvidence {
             target_cluster: "09".repeat(32),
             limitations: Default::default(),
             runtime: ResolverRuntime::Scratch {
+                entry: "scratch".into(),
                 scratch: ScratchSource::Server {},
+                layout: ScratchLayout::Supplied,
                 outside_writes: OutsideWrites::Refused,
             },
         },

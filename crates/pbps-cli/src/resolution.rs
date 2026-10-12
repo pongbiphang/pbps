@@ -354,6 +354,7 @@ mod producer {
             } => {
                 let scratch = scratch_connection(request, url_env)?;
                 let provenance = Provenance {
+                    entry: request.selection.name.to_owned(),
                     scratch: pbps_model::resolver::ScratchSource::Server {},
                     outside_writes,
                 };
@@ -366,6 +367,7 @@ mod producer {
             }
             ResolverProfile::Docker { image, pull, .. } => {
                 let provenance = Provenance {
+                    entry: request.selection.name.to_owned(),
                     scratch: pbps_model::resolver::ScratchSource::Docker {
                         image: image.clone(),
                     },

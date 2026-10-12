@@ -9,6 +9,10 @@ use std::process::{Command, Output};
 mod envelope_archives;
 
 fn resolved_plan() -> SavedPlan {
+    resolved_plan_with(Default::default())
+}
+
+fn resolved_plan_with(limitations: std::collections::BTreeMap<String, String>) -> SavedPlan {
     // Synthetic, source-free reader evidence, not a claim of live qualification.
     // Use the public sealing constructors so an invalid fixture cannot turn an
     // explanation regression into an unrelated deserialization refusal.
@@ -40,9 +44,11 @@ fn resolved_plan() -> SavedPlan {
             resolver_build: "07".repeat(32),
             channels: "08".repeat(32),
             target_cluster: "09".repeat(32),
-            limitations: Default::default(),
+            limitations,
             runtime: ResolverRuntime::Scratch {
+                entry: "scratch".into(),
                 scratch: ScratchSource::Server {},
+                layout: ScratchLayout::Supplied,
                 outside_writes: OutsideWrites::Refused,
             },
         },
@@ -173,6 +179,10 @@ fn ordinary_database_approval_and_preview_remedy_keep_their_meaning() {
                 let value = report(&out);
                 assert_eq!(value["data"]["applyable"], origin == PlanOrigin::Database);
                 assert!(value["data"].get("apply_limitation").is_none(), "{value}");
+                // An ordinary plan carries no resolver provenance (#1517).
+                assert!(value["data"].get("resolver").is_none(), "{value}");
+            } else {
+                assert!(!text.contains("resolver"), "{text}");
             }
             if origin == PlanOrigin::Database {
                 assert!(text.contains("pbps apply --env"), "{text}");
@@ -185,6 +195,87 @@ fn ordinary_database_approval_and_preview_remedy_keep_their_meaning() {
             }
         }
     }
+}
+
+/// The plan alone tells a reviewer where its evidence came from and what
+/// it seals, in human and JSON output alike, with no project, credentials
+/// or resolver (#1517). The JSON is the shared field the human line and
+/// the viewer read.
+#[test]
+fn a_resolved_plan_explains_its_provenance_and_sealed_qualification() {
+    let limited = resolved_plan_with(
+        [(
+            "build:server_version".to_owned(),
+            "the scratch reports another build string of the same version".to_owned(),
+        )]
+        .into(),
+    );
+    let artifact = Artifact::new(&serde_json::to_value(&limited).unwrap());
+    let value = report(&artifact.explain("json"));
+    assert_eq!(
+        value["data"]["resolver"],
+        serde_json::json!({
+            "entry": "scratch",
+            "scratch": "server",
+            "layout": "supplied",
+            "outside_writes": "refused",
+            "rule": pbps_pg::resolver::compatibility::REPORTED_RULE,
+            "key_id": "01".repeat(8),
+            "sealed": [
+                "target environment",
+                "target environment after the plan's grants",
+                "resolver environment",
+                "target build",
+                "resolver build",
+                "channels",
+                "target cluster identity",
+            ],
+            "limitations": [{
+                "name": "build:server_version",
+                "description": "the scratch reports another build string of the same version",
+            }],
+            "surfaces": [],
+            "order": [],
+            "prerequisites": [],
+        })
+    );
+    let text = String::from_utf8(artifact.explain("text").stdout).unwrap();
+    assert!(
+        text.contains("  resolver    scratch (server scratch, supplied)\n"),
+        "{text}"
+    );
+    let section = &text[text.find("\nResolver evidence\n").expect(&text)..];
+    let section = &section[..section.find("\nThe environment\n").unwrap()];
+    assert_eq!(
+        section,
+        format!(
+            "\nResolver evidence\n  rule        {}\n  key id      {}\n  sealed      \
+             target environment, target environment after the plan's grants, resolver \
+             environment, target build, resolver build, channels, target cluster identity \
+             (keyed fingerprints; values not shown)\n  limitations accepted, not refused:\n    \
+             build:server_version: the scratch reports another build string of the same \
+             version\n  surfaces\n",
+            pbps_pg::resolver::compatibility::REPORTED_RULE,
+            "01".repeat(8)
+        )
+    );
+    // No fingerprint value is shown, in either form.
+    let json = serde_json::to_string(&value).unwrap();
+    for digest in ["04", "05", "06", "07", "08", "09"] {
+        let value = digest.repeat(32);
+        assert!(!json.contains(&value) && !text.contains(&value), "{digest}");
+    }
+
+    // Negative: a plan that seals no limitation shows none.
+    let plain = Artifact::new(&serde_json::to_value(resolved_plan()).unwrap());
+    let value = report(&plain.explain("json"));
+    assert_eq!(
+        value["data"]["resolver"]["limitations"],
+        serde_json::json!([])
+    );
+    let text = String::from_utf8(plain.explain("text").stdout).unwrap();
+    assert!(text.contains("  limitations none\n"), "{text}");
+    assert!(!text.contains("build:server_version"), "{text}");
 }
 
 #[test]
@@ -389,6 +480,12 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
     const titles = [...elements.content.walk()].filter(e => e.tagName === "h2").map(e => e.textContent);
     assert(titles.includes(item.title), JSON.stringify(titles));
     for (const other of CASES.filter(other => other.title !== item.title)) assert(!titles.includes(other.title));
+    // A resolved plan's provenance, read from its JSON (#1517); none for
+    // any other plan.
+    const resolved = item.title === "Unsupported deployment plan";
+    assert(titles.includes("Resolver evidence") === resolved, JSON.stringify(titles));
+    const lines = [...elements.content.walk()].filter(e => e.tagName === "p").map(e => e.textContent);
+    assert(lines.includes("scratch (server scratch, supplied)") === resolved, JSON.stringify(lines));
   }
 })().catch(error => { console.error(error); process.exit(1); });
 "#).unwrap();

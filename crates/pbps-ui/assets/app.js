@@ -99,6 +99,13 @@
         const stat = node("div", undefined, "stat"); stat.append(node("strong", data[key]), node("span", text)); stats.append(stat);
       }
       summary.append(stats); content.append(summary);
+      if (data.resolver) {
+        // Where a resolved plan's evidence came from, read from the plan (#1517).
+        // Its prerequisites are counted: the full list is the JSON's.
+        const {prerequisites, ...resolver} = data.resolver, box = panel("Resolver evidence");
+        box.append(node("p", `${resolver.entry} (${resolver.scratch} scratch, ${resolver.layout})`), fields({...resolver, prerequisites: prerequisites.length}));
+        content.append(box);
+      }
       for (const risk of data.risks) {
         const box = panel(risk.class); box.append(node("p", risk.why));
         const list = node("ul"); for (const change of risk.changes) list.append(node("li", change));

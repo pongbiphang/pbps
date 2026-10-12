@@ -26,6 +26,8 @@ use pbps_dialect::Dialect;
 use pbps_model::{PlanMode, PlanOrigin, RiskClass, SavedPlan};
 
 use crate::report::{placeholder, shell_arg};
+
+mod resolver;
 use crate::{db, output, report};
 
 /// What `explain` found, for `--format json`.
@@ -86,6 +88,10 @@ pub struct Explanation {
     /// Only present when a target was given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<TargetState>,
+    /// The sealed resolver evidence: present exactly when the plan is
+    /// resolved (#1517). An ordinary plan carries no resolver provenance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolver: Option<resolver::ResolverDetail>,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -441,6 +447,12 @@ fn explain(
                 detail: Some(format!("{e:#}")),
             }),
         },
+        resolver: match &plan.analysis {
+            pbps_model::resolver::PlanAnalysis::Resolved(evidence) => {
+                Some(resolver::detail(evidence))
+            }
+            pbps_model::resolver::PlanAnalysis::Ordinary => None,
+        },
     })
 }
 
@@ -596,30 +608,6 @@ fn findings(plan: &SavedPlan, e: &Explanation) -> Vec<output::Finding> {
     out
 }
 
-/// Where a resolved plan's scratch came from, and whether its baseline's
-/// outside writes went unchecked (DEC-1674.1). #1517 adds the entry's name
-/// and layout from the sealed provenance.
-fn resolver_runtime(runtime: &pbps_model::resolver::ResolverRuntime) -> String {
-    use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchSource};
-    let ResolverRuntime::Scratch {
-        scratch,
-        outside_writes,
-    } = runtime;
-    let scratch = match scratch {
-        ScratchSource::Server {} => "server scratch".to_owned(),
-        ScratchSource::Docker { image } => {
-            format!("docker scratch from {image} (the image as configured, not verified)")
-        }
-    };
-    let writes = match outside_writes {
-        OutsideWrites::Refused => "",
-        OutsideWrites::Allowed => {
-            "; the baseline's writes outside the scratch database were allowed, not checked"
-        }
-    };
-    format!("{scratch}{writes}")
-}
-
 fn render(plan: &SavedPlan, e: &Explanation) -> String {
     let mut out = String::from("Plan\n");
     out.push_str(&format!(
@@ -631,11 +619,8 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
             PlanOrigin::Preview => "computed offline — a preview; `apply` will refuse it",
         }
     ));
-    if let pbps_model::resolver::PlanAnalysis::Resolved(evidence) = &plan.analysis {
-        out.push_str(&format!(
-            "  resolver    {}\n",
-            resolver_runtime(&evidence.qualification().runtime)
-        ));
+    if let Some(detail) = &e.resolver {
+        out.push_str(&format!("  resolver    {}\n", resolver::line(detail)));
     }
     out.push_str(&format!("  dialect     {}\n", e.dialect));
     out.push_str(&format!("  created     {}\n", e.created_at));
@@ -725,6 +710,10 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         );
     }
 
+    if let Some(detail) = &e.resolver {
+        out.push_str(&resolver::render(detail, &plan.changes));
+    }
+
     out.push_str("\nThe environment\n");
     match &e.target {
         None => out.push_str(
@@ -769,38 +758,6 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
 mod tests {
     use super::*;
 
-    /// A reviewer reads where the scratch came from, and whether a baseline's
-    /// writes outside it went unchecked (#1674).
-    #[test]
-    fn the_runtime_line_names_the_scratch_and_an_allowed_outside_write() {
-        use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchSource};
-        let docker = resolver_runtime(&ResolverRuntime::Scratch {
-            scratch: ScratchSource::Docker {
-                image: "postgres:18".into(),
-            },
-            outside_writes: OutsideWrites::Allowed,
-        });
-        assert!(docker.contains("postgres:18"), "{docker}");
-        assert!(docker.contains("not verified"), "{docker}");
-        assert!(docker.contains("allowed, not checked"), "{docker}");
-        // Negative: the default says nothing of outside writes.
-        let server = resolver_runtime(&ResolverRuntime::Scratch {
-            scratch: ScratchSource::Server {},
-            outside_writes: OutsideWrites::Refused,
-        });
-        assert_eq!(server, "server scratch");
-        // Negative: neither says "vouched" or "measured" any more (#1636).
-        for line in [&docker, &server] {
-            assert!(
-                !line.contains("vouched") && !line.contains("measured"),
-                "{line}"
-            );
-        }
-    }
-
-    /// The line is advertised as copy-pastable, so a path a shell would take
-    /// apart has to survive the paste — and one it would not must stay bare, or
-    /// the ordinary case looks like it needs care.
     #[test]
     fn only_a_value_a_shell_would_reinterpret_is_quoted() {
         assert_eq!(shell_arg("plan.json").unwrap(), "plan.json");
