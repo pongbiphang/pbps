@@ -552,7 +552,7 @@ can disagree with the first. #1917 adds `timezone:` as a check only.
   spelling costs a DBA one `ALTER` where a wrong instant costs every value
   written.
 - **Recorded** in `PlanBaseline.time_zone` (plan version 38) and named in the
-  plan's output, text and JSON (schema set 42): nothing in a statement shows
+  plan's output, text and JSON (schema set 43): nothing in a statement shows
   it, and the same `2026-02-01` is another instant in another zone.
 - **Pinned** by the write pins, the transaction framing, a rendered script,
   the canonical read scope and the #1883 spelling probe. The dialect takes the
