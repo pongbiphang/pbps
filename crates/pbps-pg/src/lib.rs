@@ -1400,11 +1400,14 @@ impl Dialect for Postgres {
             // sequence's, and claiming it refused a valid declaration that
             // used it. The name a plan creates one under is the connected
             // plan's to claim (#1631, #1899).
-            if let pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
-                name: Some(sequence),
-                ..
-            }) = &spec.value_source
-            {
+            for source in sources.get(column, spec) {
+                let pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                    name: Some(sequence),
+                    ..
+                }) = source
+                else {
+                    continue;
+                };
                 by_name.push(pbps_dialect::ImplicitRelation {
                     name: sequence.clone(),
                     descriptor: format!("the sequence of `serial` column `{name}.{column}`"),
@@ -4506,7 +4509,7 @@ mod tests {
         );
         // A `default:` beside it is a second source, which the loader keeps
         // beside the column for the dialect to name.
-        let sources = [(
+        let sources: std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>> = [(
             "id".to_owned(),
             vec![
                 pbps_model::ValueSource::Default("7".to_owned()),
@@ -4516,7 +4519,11 @@ mod tests {
         .into_iter()
         .collect();
         let refused: Vec<String> = Postgres::new()
-            .validate_table_sources(&t, &table, &sources)
+            .validate_table_sources(
+                &t,
+                &table,
+                pbps_model::diagnostic::ColumnSources::new(Some(&sources)),
+            )
             .into_iter()
             .map(|e| e.to_string())
             .collect();

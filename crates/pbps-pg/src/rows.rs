@@ -2461,7 +2461,7 @@ mod tests {
         t.columns.get_mut("id").expect("the column").value_source =
             pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial());
         with_rows(&mut t, &[("1", &[])]);
-        let problems = data_problems(&name(), &t);
+        let problems = data_problems(&name(), &t, Default::default());
         assert_eq!(problems.len(), 1, "{problems:?}");
         let message = problems[0].to_string();
         assert!(message.contains("`serial` column"), "{message}");
@@ -2478,7 +2478,7 @@ mod tests {
             .expect("the column")
             .value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial());
         with_rows(&mut beside, &[("a", &[])]);
-        assert!(data_problems(&name(), &beside).is_empty());
+        assert!(data_problems(&name(), &beside, Default::default()).is_empty());
     }
 
     /// A cell whose *kind* the read-back would not produce, and one the type
