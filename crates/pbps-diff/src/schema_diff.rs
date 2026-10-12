@@ -4699,6 +4699,29 @@ fn diff_replica_identity(
     early
 }
 
+/// `Some(None)` keeps a part without an edit; `None` replaces it. Keeping
+/// those answers distinct lets storage parameters change without a rebuild.
+fn by_name<T>(
+    base: &BTreeMap<String, T>,
+    declared: &BTreeMap<String, T>,
+    kept: impl Fn(&String, &T, &T) -> Option<Option<Change>>,
+    drop: impl Fn(&String) -> Change,
+    add: impl Fn(&String, &T) -> Change,
+    changes: &mut Vec<Change>,
+) {
+    for (name, part) in declared {
+        if let Some(edit) = base.get(name).and_then(|was| kept(name, was, part)) {
+            changes.extend(edit);
+        } else {
+            if base.contains_key(name) {
+                changes.push(drop(name));
+            }
+            changes.push(add(name, part));
+        }
+    }
+    changes.extend(base.keys().filter(|n| !declared.contains_key(*n)).map(drop));
+}
+
 fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &mut Vec<Change>) {
     // Storage parameters change in place, every supported one of both
     // methods (measured on 16 and 18), so a part is rebuilt only where it
@@ -4715,8 +4738,7 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
     let parameters = |target: IndexPart,
                       method: IndexMethod,
                       was: &BTreeMap<String, String>,
-                      now: &BTreeMap<String, String>,
-                      changes: &mut Vec<Change>| {
+                      now: &BTreeMap<String, String>| {
         let set: BTreeMap<String, String> = now
             .iter()
             .filter(|(k, v)| was.get(*k) != Some(*v))
@@ -4727,15 +4749,13 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
             .filter(|k| !now.contains_key(*k))
             .cloned()
             .collect();
-        if !set.is_empty() || !reset.is_empty() {
-            changes.push(Change::SetIndexStorageParameters {
-                table: name.clone(),
-                target,
-                method,
-                set,
-                reset,
-            });
-        }
+        (!set.is_empty() || !reset.is_empty()).then(|| Change::SetIndexStorageParameters {
+            table: name.clone(),
+            target,
+            method,
+            set,
+            reset,
+        })
     };
 
     // A declaration that leaves the key unnamed (`primary_key: [id]`) leaves
@@ -4761,13 +4781,12 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
         && declared.primary_key.is_some()
         && base.primary_key_is_clustered() != declared.primary_key_is_clustered());
     if !pk_differs && let (Some(b), Some(d)) = (&base.primary_key, &declared.primary_key) {
-        parameters(
+        changes.extend(parameters(
             IndexPart::PrimaryKey,
             IndexMethod::Btree,
             &b.storage_parameters,
             &d.storage_parameters,
-            changes,
-        );
+        ));
     }
     if pk_differs {
         // A key that is *replaced* is emitted as two changes: the old one's
@@ -4815,123 +4834,90 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
         }
     }
 
-    macro_rules! by_name {
-        ($field:ident, $add:ident, $drop:ident, $wrap:expr) => {
-            for (n, c) in &declared.$field {
-                if base.$field.get(n) != Some(c) {
-                    if base.$field.contains_key(n) {
-                        changes.push(Change::$drop {
-                            table: name.clone(),
-                            name: n.clone(),
-                        });
-                    }
-                    changes.push(Change::$add {
-                        table: name.clone(),
-                        name: n.clone(),
-                        constraint: $wrap(c.clone()),
-                    });
-                }
-            }
-            for n in base
-                .$field
-                .keys()
-                .filter(|n| !declared.$field.contains_key(*n))
-            {
-                changes.push(Change::$drop {
-                    table: name.clone(),
-                    name: n.clone(),
-                });
-            }
-        };
-    }
-
-    by_name!(foreign_keys, AddForeignKey, DropForeignKey, Box::new);
-    by_name!(checks, AddCheck, DropCheck, std::convert::identity);
-
-    // Out of the macro because these two carry a layout: a constraint or an
-    // index whose definition is unchanged but which becomes, or stops being,
-    // the clustered one is rebuilt, for the reason a key is above.
-    for (n, c) in &declared.unique {
-        let clustered = declared.unique_is_clustered(n);
-        if let Some(b) = base.unique.get(n)
-            && unique_bare(b) == unique_bare(c)
-            && base.unique_is_clustered(n) == clustered
-        {
-            parameters(
-                IndexPart::Unique(n.clone()),
-                IndexMethod::Btree,
-                &b.storage_parameters,
-                &c.storage_parameters,
-                changes,
-            );
-            continue;
-        }
-        if base.unique.get(n) != Some(c) || base.unique_is_clustered(n) != clustered {
-            if base.unique.contains_key(n) {
-                changes.push(Change::DropUnique {
-                    table: name.clone(),
-                    name: n.clone(),
-                });
-            }
-            changes.push(Change::AddUnique {
-                table: name.clone(),
-                name: n.clone(),
-                constraint: c.clone(),
-                clustered,
-            });
-        }
-    }
-    for n in base
-        .unique
-        .keys()
-        .filter(|n| !declared.unique.contains_key(*n))
-    {
-        changes.push(Change::DropUnique {
+    by_name(
+        &base.foreign_keys,
+        &declared.foreign_keys,
+        |_, b, d| (b == d).then_some(None),
+        |n| Change::DropForeignKey {
             table: name.clone(),
             name: n.clone(),
-        });
-    }
-
-    for (n, ix) in &declared.indexes {
-        let clustered = declared.index_is_clustered(n);
-        if let Some(b) = base.indexes.get(n)
-            && index_bare(b) == index_bare(ix)
-            && base.index_is_clustered(n) == clustered
-        {
-            parameters(
-                IndexPart::Index(n.clone()),
-                ix.method,
-                &b.storage_parameters,
-                &ix.storage_parameters,
-                changes,
-            );
-            continue;
-        }
-        if base.indexes.get(n) != Some(ix) || base.index_is_clustered(n) != clustered {
-            if base.indexes.contains_key(n) {
-                changes.push(Change::DropIndex {
-                    table: name.clone(),
-                    name: n.clone(),
-                });
-            }
-            changes.push(Change::AddIndex {
-                table: name.clone(),
-                name: n.clone(),
-                index: Box::new(ix.clone()),
-                clustered,
-            });
-        }
-    }
-    for n in base
-        .indexes
-        .keys()
-        .filter(|n| !declared.indexes.contains_key(*n))
-    {
-        changes.push(Change::DropIndex {
+        },
+        |n, c| Change::AddForeignKey {
             table: name.clone(),
             name: n.clone(),
-        });
-    }
+            constraint: Box::new(c.clone()),
+        },
+        changes,
+    );
+    by_name(
+        &base.checks,
+        &declared.checks,
+        |_, b, d| (b == d).then_some(None),
+        |n| Change::DropCheck {
+            table: name.clone(),
+            name: n.clone(),
+        },
+        |n, c| Change::AddCheck {
+            table: name.clone(),
+            name: n.clone(),
+            constraint: c.clone(),
+        },
+        changes,
+    );
+    by_name(
+        &base.unique,
+        &declared.unique,
+        |n, b, d| {
+            (unique_bare(b) == unique_bare(d)
+                && base.unique_is_clustered(n) == declared.unique_is_clustered(n))
+            .then(|| {
+                parameters(
+                    IndexPart::Unique(n.clone()),
+                    IndexMethod::Btree,
+                    &b.storage_parameters,
+                    &d.storage_parameters,
+                )
+            })
+        },
+        |n| Change::DropUnique {
+            table: name.clone(),
+            name: n.clone(),
+        },
+        |n, c| Change::AddUnique {
+            table: name.clone(),
+            name: n.clone(),
+            constraint: c.clone(),
+            clustered: declared.unique_is_clustered(n),
+        },
+        changes,
+    );
+    by_name(
+        &base.indexes,
+        &declared.indexes,
+        |n, b, d| {
+            (index_bare(b) == index_bare(d)
+                && base.index_is_clustered(n) == declared.index_is_clustered(n))
+            .then(|| {
+                parameters(
+                    IndexPart::Index(n.clone()),
+                    d.method,
+                    &b.storage_parameters,
+                    &d.storage_parameters,
+                )
+            })
+        },
+        |n| Change::DropIndex {
+            table: name.clone(),
+            name: n.clone(),
+        },
+        |n, ix| Change::AddIndex {
+            table: name.clone(),
+            name: n.clone(),
+            index: Box::new(ix.clone()),
+            clustered: declared.index_is_clustered(n),
+        },
+        changes,
+    );
 }
 
 /// Declared reference data (ADR-0004).
@@ -12186,6 +12172,39 @@ mod tests {
         ] {
             let t = schema_of("dbo.t", clustered_on(layout.clone()));
             assert!(run(&t, &t, &[]).changes.is_empty(), "{layout:?}");
+        }
+    }
+
+    #[test]
+    fn a_unique_layout_change_rebuilds_only_that_unique_in_both_directions() {
+        use pbps_model::Clustered;
+        let heap = schema_of("dbo.t", clustered_on(Some(Clustered::Heap)));
+        let clustered = schema_of(
+            "dbo.t",
+            clustered_on(Some(Clustered::Unique("uq_code".into()))),
+        );
+        for (base, declared, takes_clustered) in
+            [(&heap, &clustered, true), (&clustered, &heap, false)]
+        {
+            let cs = run(base, declared, &[]);
+            let changes: Vec<_> = cs.changes.iter().map(|p| &p.change).collect();
+            assert_eq!(
+                changes,
+                [
+                    &Change::DropUnique {
+                        table: "dbo.t".parse().unwrap(),
+                        name: "uq_code".into(),
+                    },
+                    &Change::AddUnique {
+                        table: "dbo.t".parse().unwrap(),
+                        name: "uq_code".into(),
+                        constraint: declared.tables[&"dbo.t".parse().unwrap()].unique["uq_code"]
+                            .clone(),
+                        clustered: takes_clustered,
+                    },
+                ]
+            );
+            assert!(run(declared, declared, &[]).changes.is_empty());
         }
     }
 
