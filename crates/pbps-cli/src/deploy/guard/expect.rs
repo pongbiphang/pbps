@@ -760,13 +760,14 @@ impl ColumnChanges<'_> {
                 .map(|column| {
                     let mut fields = changed(column).clone();
                     let from = self.renamed.get(name).and_then(|r| r.get(column));
-                    // Only the read that spans the rename can hand the old spelling
-                    // to another identity. At close both reads already use the result;
-                    // after DROP alone the surviving source still exists (DECISIONS 474).
-                    let spanning = from.is_some_and(|from| {
-                        baseline.contains_key(from) && !now.columns.contains_key(from)
-                    });
-                    let replaced = spanning && self.replaced.contains(&name.column(column));
+                    // A newly added UID has no baseline source. A surviving UID
+                    // only takes the retired holder's name in the read spanning
+                    // its rename; later reads already hold that survivor, and
+                    // after DROP alone its source still exists (DECISIONS 474).
+                    let replaced = self.replaced.contains(&name.column(column))
+                        && from.is_none_or(|from| {
+                            baseline.contains_key(from) && !now.columns.contains_key(from)
+                        });
                     let kept = baseline
                         .get(column)
                         .copied()

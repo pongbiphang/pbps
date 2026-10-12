@@ -1438,3 +1438,106 @@ fn own_field_requirements_follow_the_column_through_a_name_swap() {
         }
     }
 }
+
+#[test]
+fn a_same_named_new_column_does_not_inherit_the_retired_definition() {
+    use pbps_model::{Generated, IdsFile, ValueSource};
+    let name = TableName::new("app", "t");
+    let mut replacement = Column::new("bigint".parse().unwrap());
+    replacement.nullable = false;
+    replacement.value_source = ValueSource::Default("1".into());
+    for generated in [true, false] {
+        for move_table in [false, true] {
+            let mut old = Column::new("integer".parse().unwrap());
+            if generated {
+                old.value_source = ValueSource::Generated(Generated {
+                    expression: "id + 1".into(),
+                    stored: true,
+                });
+            }
+            let mut t = table();
+            t.columns.insert("value".into(), old.clone());
+            let before = schema(t);
+            let mut changes = vec![
+                Change::DropColumn {
+                    uid: "c_000001".parse().unwrap(),
+                    column: name.column("value"),
+                },
+                Change::AddColumn {
+                    uid: "c_000002".parse().unwrap(),
+                    table: name.clone(),
+                    name: "value".into(),
+                    column: Box::new(replacement.clone()),
+                },
+            ];
+            let final_name = if move_table {
+                let to = TableName::new("app", "moved");
+                changes.push(Change::RenameTable {
+                    uid: "t_000001".parse().unwrap(),
+                    from: name.clone(),
+                    to: to.clone(),
+                    defaults: Vec::new(),
+                });
+                to
+            } else {
+                name.clone()
+            };
+            let changes = plan(changes);
+            let mut ids = IdsFile::default();
+            ids.tables
+                .insert("t_000001".parse().unwrap(), final_name.clone());
+            ids.columns
+                .insert("c_000002".parse().unwrap(), final_name.column("value"));
+            ids.columns
+                .insert("c_000003".parse().unwrap(), final_name.column("id"));
+            let mut after = Schema::default();
+            let mut t = table();
+            t.columns.insert("value".into(), replacement.clone());
+            after.tables.insert(final_name.clone(), t);
+            let check = |after: &Schema| {
+                super::super::refuse_pinned_movement(
+                    &pbps_pg::Postgres::new(),
+                    super::Plan {
+                        changes: &changes,
+                        ids: &ids,
+                    },
+                    &before,
+                    after,
+                    "test",
+                    Settled::Whole,
+                )
+            };
+            check(&after).expect("the new UID answers to its declaration, not the retired column");
+            for field in [
+                "type",
+                "nullability",
+                "default",
+                "generation",
+                "presence",
+                "unrelated",
+            ] {
+                let mut wrong = after.clone();
+                let t = wrong.tables.get_mut(&final_name).unwrap();
+                match field {
+                    "type" => t.columns.get_mut("value").unwrap().ty = "text".parse().unwrap(),
+                    "nullability" => t.columns.get_mut("value").unwrap().nullable = true,
+                    "default" => {
+                        t.columns.get_mut("value").unwrap().value_source = ValueSource::None
+                    }
+                    "generation" => {
+                        t.columns.insert("value".into(), old.clone());
+                    }
+                    "presence" => {
+                        t.columns.shift_remove("value");
+                    }
+                    "unrelated" => t.columns.get_mut("id").unwrap().ty = "bigint".parse().unwrap(),
+                    _ => unreachable!(),
+                }
+                let error = check(&wrong)
+                    .expect_err("replacement holds its promise and keeps unrelated fields");
+                let column = if field == "unrelated" { "id" } else { "value" };
+                assert!(format!("{error:#}").contains(&format!("column `{column}`")));
+            }
+        }
+    }
+}

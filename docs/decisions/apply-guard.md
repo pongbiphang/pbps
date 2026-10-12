@@ -1349,6 +1349,16 @@ already aligned and must not be undone again. This also preserves the other
 column's own fields through a rename chain and a parent-table rename; no
 retired spelling is added to a name-only rename map.
 
+A replacement UID born in the plan has no baseline column to keep, even when
+it takes exactly the retired column's spelling. Its own whole-column promise
+holds the resulting definition. A surviving UID renamed into that spelling
+still carries its baseline fields, and the existing checkpoint boundary rule
+keeps them held after the rename. Requiring a rename span for both origins
+refused a generated-to-ordinary replacement represented by DROP and ADD. The
+origin lookup distinguishes these cases without inferring identity from equal
+names. PostgreSQL 16 and 18 confirm the replacement's type, source and default;
+negative controls hold its definition and every unrelated column.
+
 `Column` is destructured without `..` both when deriving kept requirements and
 when comparing held or declared columns. Kept type, nullability, collation,
 expression text, source metadata and annotations compare exactly; a field the
