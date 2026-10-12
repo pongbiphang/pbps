@@ -145,6 +145,8 @@ pub(super) fn classify(
         .validate()
         .map_err(|_| Uncovered::class("recorded-uid", "recorded managed identities are invalid"))?;
     let mut owned = BTreeMap::new();
+    // Asked once per declared table and column (#1870).
+    let recorded_names = recorded.ids.index();
     for schema in recorded.namespaces {
         let namespace = identity("pg_namespace", vec![schema.clone()], Vec::new());
         if capture.inputs.contains_key(&namespace) {
@@ -152,7 +154,7 @@ pub(super) fn classify(
         }
     }
     for (name, table) in &recorded.schema.tables {
-        if recorded.ids.table_uid(name).is_none() {
+        if recorded_names.table_uid(name).is_none() {
             return Err(Uncovered::class(
                 "recorded-uid",
                 "declared table lacks its recorded UID",
@@ -173,7 +175,7 @@ pub(super) fn classify(
         }
         for (column, declaration) in &table.columns {
             let reference = name.column(column);
-            if recorded.ids.column_uid(&reference).is_none() {
+            if recorded_names.column_uid(&reference).is_none() {
                 return Err(Uncovered::class(
                     "recorded-uid",
                     "declared column lacks its recorded UID",

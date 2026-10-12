@@ -1,7 +1,7 @@
 use super::Error;
 use pbps_dialect::Dialect;
 use pbps_model::resolver::{Surface, SurfaceResolution};
-use pbps_model::{Change, ChangeSet, IdsFile, PlannedChange, Schema, ValueSource};
+use pbps_model::{Change, ChangeSet, IdsFile, IdsIndex, PlannedChange, Schema, ValueSource};
 use std::collections::BTreeSet;
 
 pub(super) fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
@@ -39,9 +39,10 @@ pub(super) fn coverage(
 ) -> Result<(), Error> {
     let after = surfaces(desired.schema);
     let opening = surfaces(base.schema);
+    let base_names = base.ids.index();
     let before: BTreeSet<_> = opening
         .iter()
-        .map(|surface| removal_spelling(surface, base, desired, &opening, &after))
+        .map(|surface| removal_spelling(surface, &base_names, desired.ids, &opening, &after))
         .collect();
     let expected: BTreeSet<_> = before.union(&after).cloned().collect();
     let actual: BTreeSet<_> = observations.iter().map(|o| o.surface.clone()).collect();
@@ -70,15 +71,15 @@ pub(super) fn coverage(
 /// and two removals are never collapsed onto one spelling.
 pub(super) fn removal_spelling(
     surface: &Surface,
-    base: crate::Side<'_>,
-    desired: crate::Side<'_>,
+    base_names: &IdsIndex<'_>,
+    desired_ids: &IdsFile,
     before: &BTreeSet<Surface>,
     after: &BTreeSet<Surface>,
 ) -> Surface {
     if after.contains(surface) {
         return surface.clone();
     }
-    let named = forward(surface, base.ids, desired.ids);
+    let named = forward(surface, base_names, desired_ids);
     if after.contains(&named) || (&named != surface && before.contains(&named)) {
         surface.clone()
     } else {
@@ -96,8 +97,9 @@ pub(super) fn rebuilds(
     before_ids: &IdsFile,
     after_ids: &IdsFile,
 ) -> BTreeSet<Surface> {
+    let before_names = before_ids.index();
     let desired_for = |o: &SurfaceResolution| {
-        let surface = forward(&o.surface, before_ids, after_ids);
+        let surface = forward(&o.surface, &before_names, after_ids);
         observations
             .iter()
             .find(|d| d.surface == surface)
@@ -105,20 +107,20 @@ pub(super) fn rebuilds(
     };
     let mut result: BTreeSet<_> = observations.iter().filter(|o| {
         matches!((&o.current, desired_for(o)), (Some(a), Some(b)) if a.bindings != b.bindings)
-    }).map(|o| forward(&o.surface, before_ids, after_ids)).collect();
+    }).map(|o| forward(&o.surface, &before_names, after_ids)).collect();
     loop {
         let before = result.len();
         for o in observations {
             if let (Some(current), Some(_)) = (&o.current, desired_for(o))
                 && current.managed_inputs.iter().any(|input| {
-                    result.contains(&forward(input, before_ids, after_ids))
+                    result.contains(&forward(input, &before_names, after_ids))
                         || ordinary.changes.iter().any(|p| {
                             invalidates(&p.change, input)
                                 || (rebuilds_modules && matches!((&p.change, input),
                                     (Change::AlterModule { id, .. }, Surface::Module(m)) if id == m))
                         })
                 }) {
-                result.insert(forward(&o.surface, before_ids, after_ids));
+                result.insert(forward(&o.surface, &before_names, after_ids));
             }
         }
         if result.len() == before {
@@ -130,7 +132,10 @@ pub(super) fn rebuilds(
 /// Only recorded identities move a surface between names. A namespace/name
 /// resemblance is never a rename decision. Reversing the maps gives teardown
 /// its pre-rename address while creation retains the approved final address.
-pub(super) fn forward(surface: &Surface, from: &IdsFile, to: &IdsFile) -> Surface {
+///
+/// `from` is indexed by the caller, once for all the surfaces it asks about
+/// (#1870).
+pub(super) fn forward(surface: &Surface, from: &IdsIndex<'_>, to: &IdsFile) -> Surface {
     let column = |c: &pbps_model::ColumnRef| {
         from.column_uid(c)
             .and_then(|uid| to.columns.get(uid))
@@ -199,6 +204,7 @@ pub(super) fn changes(
     hints: &pbps_model::Hints,
     dialect: &dyn Dialect,
 ) -> Result<(ChangeSet, usize), Error> {
+    let names = ids.index();
     let mut changes = Vec::new();
     for planned in &ordinary.changes {
         let expanded = match &planned.change {
@@ -231,7 +237,7 @@ pub(super) fn changes(
                     spec.value_source = ValueSource::None;
                     let reference = name.column(column);
                     defaults.push(Change::AlterColumnDefault {
-                        uid: ids
+                        uid: names
                             .column_uid(&reference)
                             .ok_or_else(|| Error::Definition(Surface::Default(reference.clone())))?
                             .clone(),
@@ -329,7 +335,7 @@ pub(super) fn changes(
     // the graph reads their tables by kind, not by position (DEC-1498.1).
     let mut added: Vec<PlannedChange> = Vec::new();
     for surface in rebuilds {
-        let previous = forward(surface, ids, before_ids);
+        let previous = forward(surface, &names, before_ids);
         let pair = match surface {
             Surface::Default(column)
                 if desired
@@ -338,10 +344,10 @@ pub(super) fn changes(
                     .is_some_and(|t| t.partition_of.is_some())
                     || base
                         .tables
-                        .get(&ids.resolved_in(&column.table, before_ids))
+                        .get(&names.resolved_in(&column.table, before_ids))
                         .is_some_and(|t| t.partition_of.is_some()) =>
             {
-                match partition_default(surface, column, base, desired, ids, before_ids)? {
+                match partition_default(surface, column, base, desired, &names, before_ids)? {
                     Some(pair) => pair,
                     None => continue,
                 }
@@ -369,7 +375,7 @@ pub(super) fn changes(
                 if let (Some(old), Some(new)) =
                     (generated(base, before_column), generated(desired, column))
                 {
-                    let uid = ids
+                    let uid = names
                         .column_uid(column)
                         .ok_or_else(|| Error::Definition(surface.clone()))?
                         .clone();
@@ -391,7 +397,7 @@ pub(super) fn changes(
                     }
                     continue;
                 }
-                let uid = ids
+                let uid = names
                     .column_uid(column)
                     .ok_or_else(|| Error::Definition(surface.clone()))?
                     .clone();
@@ -613,7 +619,7 @@ fn partition_default(
     column: &pbps_model::ColumnRef,
     base: &Schema,
     desired: &Schema,
-    ids: &IdsFile,
+    ids: &IdsIndex<'_>,
     before_ids: &IdsFile,
 ) -> Result<Option<Vec<Change>>, Error> {
     let definition = || Error::Definition(surface.clone());

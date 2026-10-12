@@ -259,6 +259,13 @@ pub struct Side<'a> {
     pub ids: &'a IdsFile,
 }
 
+/// Both sides' identity files, indexed once per diff for the passes that look
+/// up per table or per column (#1870).
+struct Indexes<'a> {
+    base: pbps_model::IdsIndex<'a>,
+    declared: pbps_model::IdsIndex<'a>,
+}
+
 /// Compares the base against the declarations and produces a change set.
 ///
 /// `description` is **not compared** yet: it only affects data-catalogue prose,
@@ -486,6 +493,10 @@ fn diff_partial_rebuilding(
 
     let base_tables = &base.ids.tables;
     let declared_tables = &declared.ids.tables;
+    let index = Indexes {
+        base: base.ids.index(),
+        declared: declared.ids.index(),
+    };
 
     // Table present only in the base: dropped. Its foreign keys are dropped
     // first as separate changes — two dropped tables that reference each other
@@ -758,6 +769,7 @@ fn diff_partial_rebuilding(
                         declared_table,
                         base,
                         declared,
+                        &index,
                         &mut changes,
                     );
                     // A column without a default where its parent's has one:
@@ -799,8 +811,7 @@ fn diff_partial_rebuilding(
         }
 
         diff_columns(
-            base,
-            declared,
+            &index,
             base_name,
             declared_name,
             base_table,
@@ -831,13 +842,14 @@ fn diff_partial_rebuilding(
             declared_table,
             base,
             declared,
+            &index,
             &mut changes,
         );
         // Rows are compared by column *name* on each side, and a rename in
         // this same plan means the two sides know one column by two names.
         // The uid is what says they are the same column.
-        let base_cols = columns_of(base.ids, base_name);
-        let base_name_of: BTreeMap<String, String> = columns_of(declared.ids, declared_name)
+        let base_cols = columns_of(&index.base, base_name);
+        let base_name_of: BTreeMap<String, String> = columns_of(&index.declared, declared_name)
             .iter()
             .filter_map(|(uid, d)| base_cols.get(uid).map(|b| (d.name.clone(), b.name.clone())))
             .collect();
@@ -883,7 +895,7 @@ fn diff_partial_rebuilding(
         &mut errs,
     );
     refuse_temporal_changes(base, declared, &changes, &mut errs);
-    refuse_partition_changes(base, declared, hints, &changes, &mut errs);
+    refuse_partition_changes(base, declared, &index, hints, &changes, &mut errs);
     // A module declaration can stay byte-for-byte identical while a new
     // overload or shadow changes what it should bind to. Ask the dialect
     // before sorting, rather than appending unreviewed SQL at apply time.
@@ -1364,7 +1376,7 @@ fn diff_partial_rebuilding(
                     ValueSource::Generated(_) => true,
                     ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
                 })
-                .filter_map(move |(column, _)| base.ids.column_uid(&name.column(column)).cloned())
+                .filter_map(|(column, _)| index.base.column_uid(&name.column(column)).cloned())
         })
         .collect();
     let row_tables: BTreeSet<TableName> = planned
@@ -1693,8 +1705,7 @@ pub struct Diffed {
 /// Columns of a surviving table that exist on both sides: compare attributes.
 #[allow(clippy::too_many_arguments)]
 fn diff_columns(
-    base: Side<'_>,
-    declared: Side<'_>,
+    index: &Indexes<'_>,
     base_table_name: &TableName,
     declared_table_name: &TableName,
     base_table: &Table,
@@ -1703,8 +1714,8 @@ fn diff_columns(
     changes: &mut Vec<Change>,
     errs: &mut Vec<DiffError>,
 ) {
-    let base_cols = columns_of(base.ids, base_table_name);
-    let declared_cols = columns_of(declared.ids, declared_table_name);
+    let base_cols = columns_of(&index.base, base_table_name);
+    let declared_cols = columns_of(&index.declared, declared_table_name);
 
     for (uid, declared_ref) in &declared_cols {
         let Some(base_ref) = base_cols.get(uid) else {
@@ -1906,10 +1917,8 @@ fn diff_columns(
     }
 }
 
-fn columns_of(ids: &IdsFile, table: &TableName) -> BTreeMap<Uid, ColumnRef> {
-    ids.columns
-        .iter()
-        .filter(|(_, c)| &c.table == table)
+fn columns_of(ids: &pbps_model::IdsIndex<'_>, table: &TableName) -> BTreeMap<Uid, ColumnRef> {
+    ids.columns_of(table)
         .map(|(u, c)| (u.clone(), c.clone()))
         .collect()
 }
@@ -3305,6 +3314,7 @@ fn attached(
 fn refuse_partition_changes(
     base: Side<'_>,
     declared: Side<'_>,
+    index: &Indexes<'_>,
     hints: &Hints,
     changes: &[Change],
     errs: &mut Vec<DiffError>,
@@ -3461,7 +3471,7 @@ fn refuse_partition_changes(
                 continue;
             }
             let renamed = |by: &pbps_model::PartitionBy| {
-                let names = renamed_columns(base.ids, base_name, declared.ids, declared_name);
+                let names = renamed_columns(index, base_name, declared_name);
                 pbps_model::PartitionBy {
                     external: by.external,
                     columns: by
@@ -3947,13 +3957,12 @@ fn parent_column(change: &Change) -> Option<&String> {
 
 /// A table's columns this plan renames, base name to declared name, by uid.
 fn renamed_columns(
-    base: &IdsFile,
+    index: &Indexes<'_>,
     base_name: &TableName,
-    declared: &IdsFile,
     declared_name: &TableName,
 ) -> BTreeMap<String, String> {
-    let now = columns_of(declared, declared_name);
-    columns_of(base, base_name)
+    let now = columns_of(&index.declared, declared_name);
+    columns_of(&index.base, base_name)
         .into_iter()
         .filter_map(|(uid, was)| {
             now.get(&uid)
@@ -3986,6 +3995,7 @@ fn diff_partition_columns(
     declared_table: &Table,
     base: Side<'_>,
     declared: Side<'_>,
+    index: &Indexes<'_>,
     changes: &mut Vec<Change>,
 ) {
     let (Some(was), Some(now)) = (&base_table.partition_of, &declared_table.partition_of) else {
@@ -3997,8 +4007,8 @@ fn diff_partition_columns(
     // name, or `None` where the plan drops it. By uid and not by name, since
     // one plan can drop a column and rename another into its name (#1692
     // review). A column no identity names is taken as it stands.
-    let now_by_uid = columns_of(declared.ids, &now.parent);
-    let fate: BTreeMap<String, Option<String>> = columns_of(base.ids, &was.parent)
+    let now_by_uid = columns_of(&index.declared, &now.parent);
+    let fate: BTreeMap<String, Option<String>> = columns_of(&index.base, &was.parent)
         .into_iter()
         .map(|(uid, c)| (c.name, now_by_uid.get(&uid).map(|d| d.name.clone())))
         .collect();

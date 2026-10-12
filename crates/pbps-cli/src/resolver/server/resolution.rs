@@ -108,11 +108,12 @@ pub(super) fn from_sides(
     compiled: &[BindingRecord],
     assessment: &Assessment,
 ) -> Result<Vec<SurfaceResolution>, Error> {
+    let base_names = base.ids.index();
     resolve(
         base.schema,
         desired.schema,
         &|surface, before, after| {
-            pbps_diff::resolver::removal_spelling(surface, base, desired, before, after)
+            pbps_diff::resolver::removal_spelling(surface, &base_names, desired.ids, before, after)
         },
         opening,
         compiled,

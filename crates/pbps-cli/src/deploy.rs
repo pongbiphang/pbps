@@ -2470,8 +2470,10 @@ pub(crate) fn catalogued_as(
     live_ids: &IdsFile,
 ) -> pbps_db::catalog::CatalogNames {
     let mut out = pbps_db::catalog::CatalogNames::new();
+    // Once, not a scan per table and key (#1870).
+    let final_index = final_ids.index();
     for (name, table) in &schema.tables {
-        let live_table = final_ids.resolved_in(name, live_ids);
+        let live_table = final_index.resolved_in(name, live_ids);
         // Only the key column is named to the catalog; every other column
         // reaches it as a converted literal, under no name at all.
         let live_key = table
@@ -2479,8 +2481,8 @@ pub(crate) fn catalogued_as(
             .as_ref()
             .filter(|pk| pk.columns.len() == 1)
             .map(|pk| pbps_model::ColumnRef::new(name.clone(), pk.columns[0].clone()))
-            .and_then(|r| final_ids.column_uid(&r).cloned())
-            .and_then(|uid| live_ids.columns.get(&uid))
+            .and_then(|r| final_index.column_uid(&r))
+            .and_then(|uid| live_ids.columns.get(uid))
             .map(|r| r.name.clone());
         let at = pbps_db::catalog::Catalogued {
             table: (live_table != *name).then_some(live_table),

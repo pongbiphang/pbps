@@ -8,8 +8,8 @@ mod prepare;
 pub use assess::{Answer, Assessment, assess};
 
 use pbps_dialect::Dialect;
-use pbps_model::ChangeSet;
 use pbps_model::resolver::{OrderEdge, OrderingProof, Surface, SurfaceResolution};
+use pbps_model::{ChangeSet, IdsFile};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -31,14 +31,23 @@ pub enum Error {
 /// The spelling a resolution names a base surface by: its own where the plan
 /// keeps it, and the one its removal uses after the plan's renames where the
 /// plan removes it. The producer and [`plan`]'s coverage check share it.
+///
+/// `base_names` is the base identity file's index, built once by a caller
+/// that asks about every surface (#1870).
 pub fn removal_spelling(
     surface: &Surface,
-    base: crate::Side<'_>,
-    desired: crate::Side<'_>,
+    base_names: &pbps_model::IdsIndex<'_>,
+    desired_ids: &IdsFile,
     base_surfaces: &BTreeSet<Surface>,
     desired_surfaces: &BTreeSet<Surface>,
 ) -> Surface {
-    prepare::removal_spelling(surface, base, desired, base_surfaces, desired_surfaces)
+    prepare::removal_spelling(
+        surface,
+        base_names,
+        desired_ids,
+        base_surfaces,
+        desired_surfaces,
+    )
 }
 
 /// Output for the evidence seal. The final emitter receives `changes` exactly

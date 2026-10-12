@@ -423,9 +423,11 @@ pub fn changed_subjects(
     // The declarations themselves, matched through the uid so a rename does
     // not hide a change behind it: a table that kept its name and gained an
     // index, changed a type or grew its `data:` block is the object the
-    // revision touched, and identity alone never saw it.
+    // revision touched, and identity alone never saw it. Indexed once, not
+    // scanned per table and role (#1870).
+    let now_names = now.index();
     for (name, table) in &now_schema.tables {
-        let was = now
+        let was = now_names
             .table_uid(name)
             .and_then(|uid| before.tables.get(uid))
             .and_then(|old_name| before_schema.tables.get(old_name));
@@ -434,7 +436,7 @@ pub fn changed_subjects(
         }
     }
     for (name, role) in &now_schema.roles {
-        let was = now
+        let was = now_names
             .role_uid(name)
             .and_then(|uid| before.roles.get(uid))
             .and_then(|old_name| before_schema.roles.get(old_name));

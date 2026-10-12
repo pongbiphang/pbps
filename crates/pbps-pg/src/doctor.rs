@@ -728,10 +728,7 @@ pub async fn permissions(
             }
         }
     };
-    let identities = identity::Identity {
-        project: project_ids,
-        recorded: &recorded_ids,
-    };
+    let identities = identity::Identity::new(project_ids, &recorded_ids);
 
     // The ledger's schema is asked about alongside the managed ones and kept
     // apart in the answer: a project that manages `public` needs both answers,

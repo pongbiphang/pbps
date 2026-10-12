@@ -3122,12 +3122,16 @@ pub async fn prepare_data_writes(
             use pbps_model::Change;
             let mut writes = Vec::new();
             let mut dropped = pbps_pg::data_triggers::Dropped::default();
+            // Asked once per row change and updated column: indexed once,
+            // not scanned per question (#1870).
+            let planned_names = planned_ids.index();
+            let baseline_names = baseline.ids.index();
             // The plan's own name for a table, in the spelling the catalog
             // still holds: the guard runs before the renames (DECISIONS 445).
             let stored = |table: &pbps_model::TableName| {
-                planned_ids
+                planned_names
                     .table_uid(table)
-                    .or_else(|| baseline.ids.table_uid(table))
+                    .or_else(|| baseline_names.table_uid(table))
                     .and_then(|uid| baseline.ids.tables.get(uid))
                     .cloned()
             };
@@ -3177,9 +3181,9 @@ pub async fn prepare_data_writes(
                                     table: table.clone(),
                                     name: name.clone(),
                                 };
-                                planned_ids
+                                planned_names
                                     .column_uid(&column)
-                                    .or_else(|| baseline.ids.column_uid(&column))
+                                    .or_else(|| baseline_names.column_uid(&column))
                                     .and_then(|uid| baseline.ids.columns.get(uid))
                                     .map_or_else(|| name.clone(), |old| old.name.clone())
                             })

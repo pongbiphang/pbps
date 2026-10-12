@@ -212,7 +212,8 @@ impl IdsFile {
         kept
     }
 
-    /// Looks a UID up by name. Diffing does this constantly.
+    /// Looks a UID up by name, scanning the file. A caller that looks up per
+    /// table or per column builds an [`IdsIndex`] once instead (#1870).
     pub fn table_uid(&self, name: &TableName) -> Option<&Uid> {
         self.tables.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
     }
@@ -223,6 +224,11 @@ impl IdsFile {
 
     pub fn role_uid(&self, name: &str) -> Option<&Uid> {
         self.roles.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
+    }
+
+    /// Reverse lookups over this file, built once in one pass (#1870).
+    pub fn index(&self) -> IdsIndex<'_> {
+        IdsIndex::of(self)
     }
 
     /// Whether any live entry or tombstone already holds this uid.
@@ -359,6 +365,83 @@ impl IdsFile {
             }
         }
         Ok(())
+    }
+}
+
+/// Name-to-uid lookups over one [`IdsFile`], built in one pass, for the
+/// callers that look up once per table or per column (#1870).
+///
+/// [`IdsFile::table_uid`] and its siblings scan the whole file per call, so a
+/// diff asking once per table was quadratic in the schema: 13 s of a 5,000-table
+/// zero-change plan. The index borrows the file, so the file cannot change
+/// while an index of it exists, and no answer can be stale. Each lookup
+/// returns what the scan returns: the lowest uid holding the name, should two
+/// hold one.
+pub struct IdsIndex<'a> {
+    tables: BTreeMap<&'a TableName, &'a Uid>,
+    columns: BTreeMap<&'a ColumnRef, &'a Uid>,
+    roles: BTreeMap<&'a str, &'a Uid>,
+    columns_by_table: BTreeMap<&'a TableName, BTreeMap<&'a Uid, &'a ColumnRef>>,
+}
+
+impl<'a> IdsIndex<'a> {
+    fn of(ids: &'a IdsFile) -> Self {
+        // In uid order, keeping the first: the scans' `find` answer.
+        let mut tables = BTreeMap::new();
+        for (uid, name) in &ids.tables {
+            tables.entry(name).or_insert(uid);
+        }
+        let mut columns = BTreeMap::new();
+        let mut columns_by_table: BTreeMap<&TableName, BTreeMap<&Uid, &ColumnRef>> =
+            BTreeMap::new();
+        for (uid, column) in &ids.columns {
+            columns.entry(column).or_insert(uid);
+            columns_by_table
+                .entry(&column.table)
+                .or_default()
+                .insert(uid, column);
+        }
+        let mut roles = BTreeMap::new();
+        for (uid, name) in &ids.roles {
+            roles.entry(name.as_str()).or_insert(uid);
+        }
+        Self {
+            tables,
+            columns,
+            roles,
+            columns_by_table,
+        }
+    }
+
+    /// [`IdsFile::table_uid`], by lookup.
+    pub fn table_uid(&self, name: &TableName) -> Option<&'a Uid> {
+        self.tables.get(name).copied()
+    }
+
+    /// [`IdsFile::column_uid`], by lookup.
+    pub fn column_uid(&self, r: &ColumnRef) -> Option<&'a Uid> {
+        self.columns.get(r).copied()
+    }
+
+    /// [`IdsFile::role_uid`], by lookup.
+    pub fn role_uid(&self, name: &str) -> Option<&'a Uid> {
+        self.roles.get(name).copied()
+    }
+
+    /// [`IdsFile::resolved_in`], by lookup.
+    pub fn resolved_in(&self, wanted: &TableName, recorded: &IdsFile) -> TableName {
+        self.table_uid(wanted)
+            .and_then(|uid| recorded.tables.get(uid))
+            .cloned()
+            .unwrap_or_else(|| wanted.clone())
+    }
+
+    /// The file's columns under one table name, by uid.
+    pub fn columns_of(&self, table: &TableName) -> impl Iterator<Item = (&'a Uid, &'a ColumnRef)> {
+        self.columns_by_table
+            .get(table)
+            .into_iter()
+            .flat_map(|columns| columns.iter().map(|(u, c)| (*u, *c)))
     }
 }
 
@@ -831,5 +914,60 @@ mod tests {
         let f = sample();
         let back: IdsFile = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
         assert_eq!(f, back);
+    }
+
+    /// Every [`IdsIndex`] lookup answers what the scan it replaces answers
+    /// (#1870), over pseudo-random files where names repeat across uids (the
+    /// lowest uid holding one wins in both) and lookups miss: absent names,
+    /// a column under the wrong table, a table only a column names.
+    #[test]
+    fn the_index_answers_what_the_scans_answer() {
+        let mut seed: u64 = 0x1870;
+        let mut next = |bound: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % bound
+        };
+        let tables = ["a.t", "a.u", "b.t", "b.v"];
+        let columns = ["id", "name", "note"];
+        let roles = ["app", "reader", "writer"];
+        for round in 0..200 {
+            let mut f = IdsFile::default();
+            for i in 0..next(8) {
+                let name = tables[next(4) as usize].parse().unwrap();
+                f.tables.insert(uid(&format!("t_{i:06}")), name);
+            }
+            for i in 0..next(16) {
+                let table: TableName = tables[next(4) as usize].parse().unwrap();
+                let column = table.column(columns[next(3) as usize]);
+                f.columns.insert(uid(&format!("c_{i:06}")), column);
+            }
+            for i in 0..next(5) {
+                f.roles
+                    .insert(uid(&format!("r_{i:06}")), roles[next(3) as usize].into());
+            }
+            let index = f.index();
+            let other = sample();
+            for t in tables {
+                let t: TableName = t.parse().unwrap();
+                assert_eq!(index.table_uid(&t), f.table_uid(&t), "round {round}: {t}");
+                assert_eq!(index.resolved_in(&t, &other), f.resolved_in(&t, &other));
+                let scanned: Vec<(&Uid, &ColumnRef)> =
+                    f.columns.iter().filter(|(_, c)| c.table == t).collect();
+                assert_eq!(index.columns_of(&t).collect::<Vec<_>>(), scanned);
+                for c in columns {
+                    let c = t.column(c);
+                    assert_eq!(index.column_uid(&c), f.column_uid(&c), "round {round}: {c}");
+                }
+            }
+            for r in roles.iter().chain(&["absent"]) {
+                assert_eq!(index.role_uid(r), f.role_uid(r), "round {round}: {r}");
+            }
+            let absent: TableName = "z.absent".parse().unwrap();
+            assert_eq!(index.table_uid(&absent), None);
+            assert_eq!(index.columns_of(&absent).count(), 0);
+            assert_eq!(index.column_uid(&absent.column("id")), None);
+        }
     }
 }
