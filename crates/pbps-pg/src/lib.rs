@@ -64,6 +64,7 @@ pub mod generated;
 pub mod impact;
 pub mod introspect;
 pub mod modules;
+mod partition_series;
 pub mod partman;
 pub mod pins;
 mod preflight;
@@ -674,6 +675,16 @@ impl Dialect for Postgres {
 
     fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
         types::normalize(ty)
+    }
+
+    /// The partitions that carry a RANGE parent's series on (#1789,
+    /// DEC-1789.1). The tiling, the calendar and the spelling are all in
+    /// [`partition_series`].
+    fn range_series(
+        &self,
+        request: &pbps_dialect::RangeSeriesRequest<'_>,
+    ) -> Result<pbps_dialect::RangeSeries, DialectError> {
+        partition_series::series(request)
     }
 
     fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {

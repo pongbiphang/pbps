@@ -33,6 +33,7 @@ limitations and deferred findings. Two groups of commands:
 | `plan` (`--check` / `--since` / `--base` / `--out` / `--sql`) | Compare against a baseline and produce a change plan |
 | `plan --dev` | Rehearse the plan in a throwaway engine: does it compile, does it converge (optional) |
 | `validate` (`--since <rev>`), `fmt` (`--check`) | Static checks, the project's `policies:`, and canonical formatting |
+| `partitions extend` (`--every` / `--until` / `--from`) | Declare a partitioned table's next range partitions in its file, to an end you state |
 | `rename`, `rename-table`, `rename-role`, `drop`, `drop-table`, `drop-role`, `intent`, `move-rows` | Record the intent only a human can supply; `intent` records several rename/drop decisions together |
 | `docs` (`--format markdown\|html\|erd`) | Documentation and an ERD from the declarations |
 | `explain --plan` | What a saved plan does, why it needs approval, and the exact command that approves it |

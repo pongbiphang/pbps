@@ -19,6 +19,7 @@ mod intent_batch;
 mod key;
 mod object_order;
 mod output;
+mod partitions;
 mod pins;
 mod prompt;
 mod report;
@@ -295,6 +296,12 @@ enum Command {
         reason: String,
     },
 
+    /// Generate the declarations of a partitioned table's next partitions
+    Partitions {
+        #[command(subcommand)]
+        command: PartitionsCommand,
+    },
+
     /// Render documentation and an ERD from the declarations
     Docs {
         /// markdown, html or erd
@@ -463,6 +470,7 @@ impl Command {
             | Command::RenameRole { .. }
             | Command::DropRole { .. }
             | Command::MoveRows { .. }
+            | Command::Partitions { .. }
             | Command::Docs { .. }
             | Command::Ui
             | Command::Pull { .. }
@@ -483,6 +491,38 @@ impl Command {
         };
         (format == OutputFormat::Json).then_some(name)
     }
+}
+
+#[derive(Subcommand)]
+enum PartitionsCommand {
+    /// Declare the range partitions that carry a table's series on to a later
+    /// end (#1789)
+    ///
+    /// The series starts where the table's last declared range ends and runs
+    /// in whole steps to --until, every partition named for its lower bound
+    /// and its bound spelled as the engine prints it. Only the table's file
+    /// changes; nothing is created until `plan` and `apply`, and a run that
+    /// finds the series already there writes nothing.
+    Extend {
+        /// The partitioned table, e.g. app.events
+        table: String,
+
+        /// The step: `1month`, `7day`, `1week` or `1year` for a date or time
+        /// key, a plain count such as `1000` for an integer key
+        #[arg(long)]
+        every: String,
+
+        /// Where the series ends, exclusive, spelled as a full value of the
+        /// key as the engine prints it: `2028-01-01`, `2028-01-01 00:00:00`,
+        /// `2028-01-01 00:00:00+00` or `5000`
+        #[arg(long)]
+        until: String,
+
+        /// Where the first partition starts, spelled as --until is; only for
+        /// a table that declares no range yet
+        #[arg(long)]
+        from: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1055,6 +1095,15 @@ fn run() -> anyhow::Result<()> {
             }
             .into(),
         ),
+        Command::Partitions {
+            command:
+                PartitionsCommand::Extend {
+                    table,
+                    every,
+                    until,
+                    from,
+                },
+        } => partitions::cmd_extend(&project, &table, &every, &until, from.as_deref()),
         Command::Pull {
             target,
             force,
@@ -2236,6 +2285,64 @@ pub struct IdentityCounts {
     pub tombstones: usize,
 }
 
+/// The names `fmt` judges a `renamed_from` against: every table and role any
+/// readable file of the project declares. A file that cannot be read or parsed
+/// contributes nothing here.
+fn fmt_declared(files: &[PathBuf]) -> Schema {
+    let mut declared = Schema::default();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        match pbps_load::load_file_str(path, &text) {
+            Ok(pbps_load::LoadedFile::Table(t)) => {
+                declared.tables.insert(t.name, t.table);
+            }
+            Ok(pbps_load::LoadedFile::Role(r)) => {
+                declared.roles.insert(r.name, r.role);
+            }
+            Ok(pbps_load::LoadedFile::Module(_)) | Err(_) => {}
+        }
+    }
+    declared
+}
+
+/// A table's file as `fmt` writes it, and the one-shot annotations that
+/// writing drops because the ids file has absorbed them.
+///
+/// One function for `fmt` and for every command that rewrites a table's file
+/// (`partitions extend`, #1789): a command that rendered its own way would
+/// leave a file `fmt --check` then calls not canonical.
+fn canonical_table(
+    t: &pbps_load::LoadedTable,
+    ids: &IdsFile,
+    declared: &Schema,
+) -> (String, Vec<Intent>) {
+    // Judged against the declared names, because a `renamed_from`
+    // whose source is declared again records a rename that
+    // happened and a new object that has since taken the vacated
+    // name -- not a rename still waiting. A column source is in
+    // this file; a table source is in another, which is why the
+    // names are the project's (#404).
+    let (pending, absorbed): (Vec<Intent>, Vec<Intent>) = t
+        .intents
+        .iter()
+        .cloned()
+        .partition(|i| !pbps_diff::intent_is_absorbed(i, ids, RenameSource::of(i, declared)));
+    let partitions: Vec<(&TableName, &pbps_model::Table)> =
+        t.partitions.iter().map(|(n, p)| (n, p)).collect();
+    (
+        pbps_load::render_partitioned(
+            &t.name,
+            &t.table,
+            &partitions,
+            &pending,
+            t.strategy.as_ref(),
+        ),
+        absorbed,
+    )
+}
+
 /// Canonicalizes every declaration file.
 ///
 /// This rewrites each file in full, so ordinary YAML comments are lost —
@@ -2285,21 +2392,7 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
     // for a `fmt` that then changed nothing. A file that cannot be read or
     // parsed contributes nothing here, and the loop below still stops on it
     // exactly as it did.
-    let mut declared = Schema::default();
-    for path in &files {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        match pbps_load::load_file_str(path, &text) {
-            Ok(pbps_load::LoadedFile::Table(t)) => {
-                declared.tables.insert(t.name, t.table);
-            }
-            Ok(pbps_load::LoadedFile::Role(r)) => {
-                declared.roles.insert(r.name, r.role);
-            }
-            Ok(pbps_load::LoadedFile::Module(_)) | Err(_) => {}
-        }
-    }
+    let declared = fmt_declared(&files);
 
     let mut changed: Vec<(PathBuf, Vec<Intent>)> = Vec::new();
     for path in &files {
@@ -2335,30 +2428,7 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                 pbps_load::render_module(&m.id, &m.module, &m.depends_on, m.public_execute),
                 Vec::new(),
             ),
-            pbps_load::LoadedFile::Table(t) => {
-                // Judged against the declared names, because a `renamed_from`
-                // whose source is declared again records a rename that
-                // happened and a new object that has since taken the vacated
-                // name -- not a rename still waiting. A column source is in
-                // this file; a table source is in another, which is why the
-                // names are the project's (#404).
-                let (pending, absorbed): (Vec<Intent>, Vec<Intent>) =
-                    t.intents.iter().cloned().partition(|i| {
-                        !pbps_diff::intent_is_absorbed(i, &ids, RenameSource::of(i, &declared))
-                    });
-                let partitions: Vec<(&TableName, &pbps_model::Table)> =
-                    t.partitions.iter().map(|(n, p)| (n, p)).collect();
-                (
-                    pbps_load::render_partitioned(
-                        &t.name,
-                        &t.table,
-                        &partitions,
-                        &pending,
-                        t.strategy.as_ref(),
-                    ),
-                    absorbed,
-                )
-            }
+            pbps_load::LoadedFile::Table(t) => canonical_table(&t, &ids, &declared),
             pbps_load::LoadedFile::Role(r) => {
                 let (pending, absorbed): (Vec<Intent>, Vec<Intent>) =
                     r.intents.iter().cloned().partition(|i| {

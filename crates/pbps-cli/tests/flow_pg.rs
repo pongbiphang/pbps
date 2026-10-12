@@ -7773,6 +7773,223 @@ fn partitions_are_added_and_dropped_through_the_cli() {
     );
 }
 
+/// A series `partitions extend` generates is declared, planned, applied and
+/// verified like one written by hand (#1789, DEC-1789.1): four parents, keyed
+/// on a `date` (with a standing DEFAULT holding a row outside the new ranges),
+/// a `timestamptz`, a `timestamp` and a `bigint`, are bootstrapped, extended,
+/// planned against the target, applied through a saved plan, verified, and
+/// replan empty. The plan is the proof of the spelling: a bound the engine
+/// would print otherwise is refused by `plan --db` (DEC-1170.1), and one it
+/// could read two ways is refused by DEC-1756.1's check. The engine's stored
+/// bounds are the generated text, a rerun adds nothing, rows land in the
+/// partition their key names, and a project pulled back from the target
+/// declares the same partitions byte for byte.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_generated_series_is_planned_applied_and_verified_through_the_cli() {
+    generated_series_flow(&server(), "series-1789");
+}
+
+/// [`a_generated_series_is_planned_applied_and_verified_through_the_cli`] on
+/// the pre-17 server.
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn a_generated_series_is_planned_applied_and_verified_through_the_cli_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    generated_series_flow(&server, "series-1789-old");
+}
+
+fn generated_series_flow(server: &str, slug: &str) {
+    let own = OwnDatabase::new(server, slug);
+    let conn = own.connection().to_owned();
+    on_server(&conn, "CREATE SCHEMA app");
+    let d = Demo::new(slug);
+    let parent = |name: &str, key: &str, partitions: &str| {
+        std::fs::write(
+            d.dir.join(format!("schema/app.{name}.yml")),
+            format!(
+                "table: app.{name}\ncolumns:\n  id: {{type: bigint, nullable: false}}\n  \
+                 k: {{type: {key}, nullable: false}}\nprimary_key: [id, k]\n\
+                 partition_by: [k]\n{partitions}"
+            ),
+        )
+        .unwrap();
+    };
+    parent(
+        "d",
+        "date",
+        "partitions:\n  d_2026_11: {from: ['2026-11-01'], to: ['2026-12-01']}\n  d_rest: default\n",
+    );
+    parent(
+        "t",
+        "timestamptz",
+        "partitions:\n  t_2026_12_28: {from: ['2026-12-28 00:00:00+00'], \
+         to: ['2027-01-04 00:00:00+00']}\n",
+    );
+    parent(
+        "s",
+        "timestamp",
+        "partitions:\n  s_2025: {from: ['2025-01-01 00:00:00'], to: ['2026-01-01 00:00:00']}\n",
+    );
+    parent("b", "bigint", "");
+    succeeds(d.run(&["fmt"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &conn]));
+    succeeds(d.run(&["verify", "--db", &conn]));
+    let next = succeeds(d.run(&["plan", "--db", &conn]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    // A row the DEFAULT holds, outside every range about to be added.
+    on_server(&conn, "INSERT INTO app.d VALUES (9, '2030-01-01')");
+
+    let extend = |args: &[&str]| {
+        let mut all = vec!["partitions", "extend"];
+        all.extend_from_slice(args);
+        succeeds(d.run(&all))
+    };
+    let said = stdout(&extend(&[
+        "app.d",
+        "--every",
+        "1month",
+        "--until",
+        "2027-03-01",
+    ]));
+    assert!(said.contains("Added 3 partition(s) to app.d"), "{said}");
+    extend(&[
+        "app.t",
+        "--every",
+        "1week",
+        "--until",
+        "2027-01-25 00:00:00+00",
+    ]);
+    extend(&[
+        "app.s",
+        "--every",
+        "1year",
+        "--until",
+        "2028-01-01 00:00:00",
+    ]);
+    // From nothing: a parent that declares no range starts where --from says.
+    extend(&["app.b", "--from", "0", "--every", "1000", "--until", "3000"]);
+    succeeds(d.run(&["fmt", "--check"]));
+    succeeds(d.run(&["validate"]));
+    // Nothing is created by writing the declarations.
+    assert_eq!(
+        scalar(
+            &conn,
+            "SELECT count(*) FROM pg_class WHERE relname IN ('d_2026_12', 't_2027_01_04', \
+             's_2026', 'b_0')"
+        ),
+        0
+    );
+    // The file now written is what a second run finds in place.
+    let written = std::fs::read(d.dir.join("schema/app.d.yml")).unwrap();
+    let again = succeeds(d.run(&[
+        "partitions",
+        "extend",
+        "app.d",
+        "--every",
+        "1month",
+        "--until",
+        "2027-03-01",
+    ]));
+    assert!(
+        stdout(&again).contains("nothing to add"),
+        "{}",
+        stdout(&again)
+    );
+    assert_eq!(
+        std::fs::read(d.dir.join("schema/app.d.yml")).unwrap(),
+        written
+    );
+
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("series.json");
+    let o = succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+    let planned = stdout(&o);
+    for created in [
+        "+ create table app.d_2026_12, a partition of app.d for rows from (\"2026-12-01\") to \
+         (\"2027-01-01\")",
+        "+ create table app.d_2027_02, a partition of app.d for rows from (\"2027-02-01\") to \
+         (\"2027-03-01\")",
+        "+ create table app.t_2027_01_18, a partition of app.t for rows from \
+         (\"2027-01-18 00:00:00+00\") to (\"2027-01-25 00:00:00+00\")",
+        "+ create table app.s_2027, a partition of app.s for rows from \
+         (\"2027-01-01 00:00:00\") to (\"2028-01-01 00:00:00\")",
+        "+ create table app.b_2000, a partition of app.b for rows from (\"2000\") to (\"3000\")",
+    ] {
+        assert!(planned.contains(created), "{created}\n{planned}");
+    }
+    succeeds(approved_apply(&d, &conn, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", &conn]));
+    let next = succeeds(d.run(&["plan", "--db", &conn]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // The engine stores the text the generator wrote.
+    let bound = |table: &str| {
+        text_of(
+            &conn,
+            &format!(
+                "SELECT pg_get_expr(relpartbound, oid) FROM pg_class WHERE oid = '{table}'::regclass"
+            ),
+        )
+    };
+    assert_eq!(
+        bound("app.d_2027_01"),
+        "FOR VALUES FROM ('2027-01-01') TO ('2027-02-01')"
+    );
+    assert_eq!(
+        bound("app.t_2027_01_11"),
+        "FOR VALUES FROM ('2027-01-11 00:00:00+00') TO ('2027-01-18 00:00:00+00')"
+    );
+    assert_eq!(
+        bound("app.s_2026"),
+        "FOR VALUES FROM ('2026-01-01 00:00:00') TO ('2027-01-01 00:00:00')"
+    );
+    assert_eq!(bound("app.b_1000"), "FOR VALUES FROM ('1000') TO ('2000')");
+
+    // Rows land where their key says, the DEFAULT's row where it was.
+    on_server(
+        &conn,
+        "INSERT INTO app.d VALUES (1, '2026-12-15'), (2, '2027-02-28'); \
+         INSERT INTO app.t VALUES (1, '2027-01-04 00:00:00+00'), (2, '2027-01-24 23:59:59+00'); \
+         INSERT INTO app.s VALUES (1, '2026-06-01 12:00:00'), (2, '2027-12-31 23:59:59'); \
+         INSERT INTO app.b VALUES (1, 0), (2, 999), (3, 1000), (4, 2999)",
+    );
+    let routed = |table: &str| {
+        text_of(
+            &conn,
+            &format!(
+                "SELECT string_agg(replace(tableoid::regclass::text, 'app.', '') || ':' || id, \
+                 ',' ORDER BY id) FROM {table}"
+            ),
+        )
+    };
+    assert_eq!(routed("app.d"), "d_2026_12:1,d_2027_02:2,d_rest:9");
+    assert_eq!(routed("app.t"), "t_2027_01_04:1,t_2027_01_18:2");
+    assert_eq!(routed("app.s"), "s_2026:1,s_2027:2");
+    assert_eq!(routed("app.b"), "b_0:1,b_0:2,b_1000:3,b_2000:4");
+
+    // A project pulled back from the target declares the same partitions,
+    // byte for byte: the generator writes the spelling `pull` reads.
+    let pulled = Demo::new(&format!("{slug}-pulled"));
+    succeeds(pulled.run(&["pull", "--db", &conn]));
+    for parent in ["d", "t", "s", "b"] {
+        let partitions = |dir: &std::path::Path| {
+            let text =
+                std::fs::read_to_string(dir.join(format!("schema/app.{parent}.yml"))).unwrap();
+            let at = text.find("\npartitions:\n").expect("a partitions block");
+            text[at..].to_owned()
+        };
+        assert_eq!(partitions(&d.dir), partitions(&pulled.dir), "app.{parent}");
+    }
+}
+
 /// A partition moved out of `partitions:` into a file of its own, of its
 /// parent's shape under names of its own, is detached and kept through the
 /// CLI (#1544): behind `--allow destructive`, its rows kept and gone from the
