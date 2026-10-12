@@ -1784,9 +1784,11 @@ Measured on 16.15 and 18.6:
   the table's schema and persistence, with cache 1, no cycle and the
   type's positive bounds, a default exactly `nextval('<seq>'::regclass)`, and
   an `a` dependency of the sequence on the column. So the model's column is
-  `NOT NULL` unless `nullable: true` says otherwise, and the reader holds a
-  column as a `serial` only where every one of those holds, its sequence is
-  used by no other default, and the table is not partitioned (a partition
+  `NOT NULL`, with `nullable:` left out or `false`; `nullable: true` is
+  refused, since a NULL in it is a row the sequence was never asked for. The
+  reader holds a column as a `serial` only where every one of those holds,
+  its sequence is used by no other default, and the table is not
+  partitioned (a partition
   carries its own copy of the parent's default, so the parent's sequence is
   called twice; #1893). Anything else,
   a shared sequence, one the column does not own, a cache, bounds, a cycle or

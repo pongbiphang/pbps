@@ -368,8 +368,9 @@ indexes:
   later; a change to or from generated is refused (DEC-1168.1).
 - **A PostgreSQL `serial` column is `type: serial`**, `bigserial` or
   `smallserial`: an `integer`, `bigint` or `smallint` numbered by a sequence
-  the column owns, created with it and dropped with it. It is `NOT NULL`
-  unless `nullable: true` says otherwise. A start, an increment, or a
+  the column owns, created with it and dropped with it. It is always
+  `NOT NULL`: `nullable: false` may be written and need not be, and
+  `nullable: true` is refused. A start, an increment, or a
   sequence name other than the engine's `<table>_<column>_seq` goes in
   `sequence: {start, increment, name}`. `pull` writes a column back as
   `serial` only where it is exactly the shape `serial` makes; a sequence
