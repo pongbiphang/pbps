@@ -6368,10 +6368,9 @@ pub fn cmd_bootstrap(
         },
     )
     .map_err(|errs| {
-        for e in &errs {
-            eprintln!("  {e}");
-        }
-        anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
+        let errors = crate::Unexpressible(errs);
+        errors.print_human();
+        errors
     })?;
     // What a new table calls goes ahead of it, by the reordering passes
     // `plan --db` runs on PostgreSQL (#1585, DEC-942.1, DEC-1364.1): a
@@ -7166,12 +7165,7 @@ pub fn cmd_plan_db(
                 changes
             })
         };
-        let mut cs = diff_here(&std::collections::BTreeSet::new()).map_err(|errs| {
-            for e in &errs {
-                eprintln!("  {e}");
-            }
-            anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
-        })?;
+        let mut cs = diff_here(&std::collections::BTreeSet::new()).map_err(crate::Unexpressible)?;
 
         // DEC-1515.1's three cases, decided from this ordinary plan before any
         // pass asks the catalog about it: case 2 then opens nothing a
@@ -7278,8 +7272,7 @@ pub fn cmd_plan_db(
             // view this plan now drops and recreates takes `before_a_rebuild`
             // like one the declarations edit (#314, ADR-0009 §4).
             let rediff = |also: &std::collections::BTreeSet<pbps_model::ModuleId>| {
-                diff_here(also)
-                    .map_err(|errs| anyhow::anyhow!("{} change(s) cannot be expressed", errs.len()))
+                diff_here(also).map_err(|errors| crate::Unexpressible(errors).into())
             };
             let dependents = crate::engine::account_for_module_dependents(
                 &mut conn,

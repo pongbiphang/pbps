@@ -305,11 +305,18 @@ pub fn or_unanswerable_beside<T>(
     step: anyhow::Result<T>,
     warnings: Vec<Finding>,
 ) -> anyhow::Result<T> {
-    or_unanswerable_with(command, json, step, |e| {
-        let mut all = vec![Finding::error(id, format!("{e:#}"))];
-        all.extend(warnings);
-        all
-    })
+    or_unanswerable_with(command, json, step, |e| failure_findings(e, id, warnings))
+}
+
+fn failure_findings(error: &anyhow::Error, id: &str, warnings: Vec<Finding>) -> Vec<Finding> {
+    // Anyhow context keeps the typed cause: classify that cause, never its
+    // display text, and keep the warnings after every individual refusal.
+    let mut findings = match error.downcast_ref::<crate::Unexpressible>() {
+        Some(errors) => errors.findings(),
+        None => vec![Finding::error(id, format!("{error:#}"))],
+    };
+    findings.extend(warnings);
+    findings
 }
 
 /// [`or_unanswerable`] for a step that fails with many findings at once.
@@ -391,6 +398,69 @@ pub fn human(findings: &[Finding]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diff_refusals_keep_each_reason_before_warnings_through_context() {
+        let reasons = vec![
+            pbps_diff::DiffError::IdentityChangeUnsupported {
+                column: pbps_model::ColumnRef::new(
+                    pbps_model::TableName::new("app", "products"),
+                    "code",
+                ),
+            },
+            pbps_diff::DiffError::GenerationChangeUnsupported {
+                column: pbps_model::ColumnRef::new(
+                    pbps_model::TableName::new("app", "order_lines"),
+                    "total",
+                ),
+            },
+        ];
+        for context in [false, true] {
+            let mut error = anyhow::Error::new(crate::Unexpressible(reasons.clone()));
+            assert_eq!(error.to_string(), "2 change(s) cannot be expressed");
+            if context {
+                error = error.context("the declarations' bootstrap cannot be formed");
+            }
+            let findings = super::failure_findings(
+                &error,
+                "plan.failed",
+                vec![super::Finding::warning(
+                    "catalog.partial",
+                    "keep this warning",
+                )],
+            );
+            assert_eq!(findings.len(), 3);
+            for (finding, reason) in findings.iter().zip(&reasons) {
+                assert_eq!(finding.id, "change.unexpressible");
+                assert_eq!(finding.severity, super::Severity::Error);
+                assert_eq!(finding.message, reason.to_string());
+            }
+            assert_eq!(findings[2].id, "catalog.partial");
+            assert_eq!(findings[2].severity, super::Severity::Warning);
+            assert_eq!(findings[2].message, "keep this warning");
+        }
+    }
+
+    #[test]
+    fn operational_errors_keep_their_id_and_context_before_warnings() {
+        let error = anyhow::anyhow!("connection closed").context("catalog read failed");
+        let findings = super::failure_findings(
+            &error,
+            "plan.failed",
+            vec![super::Finding::warning(
+                "catalog.partial",
+                "keep this warning",
+            )],
+        );
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].id, "plan.failed");
+        assert_eq!(
+            findings[0].message,
+            "catalog read failed: connection closed"
+        );
+        assert_eq!(findings[1].id, "catalog.partial");
+        assert!(error.downcast_ref::<crate::Unexpressible>().is_none());
+    }
+
     use super::*;
 
     #[derive(Debug)]

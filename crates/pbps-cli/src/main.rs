@@ -61,6 +61,27 @@ impl Found {
     }
 }
 
+/// Keep the differ's reasons until the caller chooses human or JSON output.
+/// A count-only anyhow error loses both the affected objects and their remedies.
+#[derive(Debug, thiserror::Error)]
+#[error("{} change(s) cannot be expressed", .0.len())]
+pub struct Unexpressible(Vec<pbps_diff::DiffError>);
+
+impl Unexpressible {
+    fn findings(&self) -> Vec<output::Finding> {
+        self.0
+            .iter()
+            .map(|error| output::Finding::error("change.unexpressible", error.to_string()))
+            .collect()
+    }
+
+    fn print_human(&self) {
+        for error in &self.0 {
+            eprintln!("  {error}");
+        }
+    }
+}
+
 /// The exit code for [`Found`].
 const EXIT_FINDING: i32 = 2;
 
@@ -919,6 +940,12 @@ fn run() -> anyhow::Result<()> {
                 // operational failures need the unanswerable wrapper (DECISIONS 485).
                 if planned.as_ref().is_err_and(|e| e.is::<Found>()) {
                     return planned;
+                }
+                if !json
+                    && let Err(error) = &planned
+                    && let Some(errors) = error.downcast_ref::<Unexpressible>()
+                {
+                    errors.print_human();
                 }
                 // With what the plan had gathered beside the failure (#1703).
                 return output::or_unanswerable_beside(
@@ -2931,25 +2958,19 @@ fn cmd_plan(
         dialect.as_ref(),
         &hints,
     )
-    .map_err(|errs| {
+    .map_err(|errors| {
         // Structured, not wrapped through `or_unanswerable`: the differ hands
         // back one error per change it cannot express, and collapsing them into
         // a single message would throw away the column name that is the whole
         // remedy. Each becomes its own finding, carrying the id a future
         // `policies:` block can re-weight.
+        let errors = Unexpressible(errors);
         if json {
-            output::unanswerable(
-                "plan",
-                errs.iter()
-                    .map(|e| output::Finding::error("change.unexpressible", e.to_string()))
-                    .collect(),
-            );
+            output::unanswerable("plan", errors.findings());
         } else {
-            for e in &errs {
-                eprintln!("  {e}");
-            }
+            errors.print_human();
         }
-        anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
+        errors
     })?;
 
     // The plan rules (ADR-0008): attached to the changes they are about, so

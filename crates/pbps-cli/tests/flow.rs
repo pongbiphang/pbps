@@ -20,6 +20,66 @@ async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbErro
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/unexpressible.rs"]
+mod unexpressible;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn connected_diff_refusals_keep_temporal_reasons_and_existing_artifacts() {
+    let server = std::env::var("PBPS_TEST_DB").unwrap();
+    let own = OwnDatabase::new(&server, "diff_findings_1794");
+    for name in ["product_price", "supplier_price"] {
+        on_server(
+            own.connection(),
+            &format!(
+                "CREATE TABLE dbo.{name} (
+                stock_code nvarchar(32) NOT NULL PRIMARY KEY,
+                max_unit_price decimal(19,5) NOT NULL,
+                valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+                valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+                PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
+             ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.{name}_history));
+             INSERT dbo.{name} (stock_code, max_unit_price) VALUES (N'SKU-TEA-001', 129.50);
+             UPDATE dbo.{name} SET max_unit_price = 135.75;"
+            ),
+        );
+    }
+    let d = Demo::new("diff-findings-1794");
+    let ok =
+        |output: Output| assert_eq!(code(&output), 0, "{}{}", stdout(&output), stderr(&output));
+    ok(d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(d.run(&[
+        "baseline",
+        "--db",
+        own.connection(),
+        "--reason",
+        "adopt price history",
+    ]));
+    let mut changed = Vec::new();
+    for name in ["product_price", "supplier_price"] {
+        let path = d.dir.join(format!("schema/dbo.{name}.yml"));
+        let original = std::fs::read_to_string(&path).unwrap();
+        let edited = original.replace("nvarchar(32)", "nvarchar(64)");
+        assert_ne!(edited, original, "{original}");
+        std::fs::write(path, edited).unwrap();
+        changed.push(format!("dbo.{name}"));
+        let objects: Vec<_> = changed.iter().map(String::as_str).collect();
+        unexpressible::check(&d, own.connection(), &objects);
+    }
+    for name in ["product_price", "supplier_price"] {
+        on_server(
+            own.connection(),
+            &format!(
+                "IF (SELECT max_length FROM sys.columns WHERE object_id = OBJECT_ID('dbo.{name}')
+                 AND name = 'stock_code') <> 64 THROW 50000, 'refusal changed column', 1;
+             IF (SELECT COUNT(*) FROM dbo.{name}_history) <> 1
+                 THROW 50000, 'refusal changed history', 1;"
+            ),
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[path = "support/pty.rs"]
 mod pty;

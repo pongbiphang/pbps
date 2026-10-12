@@ -18,6 +18,60 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/unexpressible.rs"]
+mod unexpressible;
+
+#[test]
+#[ignore = "needs live pg"]
+fn connected_diff_refusals_keep_each_column_reason_and_existing_artifacts() {
+    let own = OwnDatabase::new(&server(), "diff_findings_1794");
+    on_server(own.connection(), "CREATE SCHEMA app;");
+    for name in ["products", "suppliers"] {
+        on_server(
+            own.connection(),
+            &format!(
+                "CREATE TABLE app.{name} (id bigint NOT NULL PRIMARY KEY, name text NOT NULL);
+             INSERT INTO app.{name} VALUES (101, 'Tea supplier');"
+            ),
+        );
+    }
+    let d = Demo::new("diff-findings-1794");
+    let ok =
+        |output: Output| assert_eq!(code(&output), 0, "{}{}", stdout(&output), stderr(&output));
+    ok(d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(d.run(&[
+        "baseline",
+        "--db",
+        own.connection(),
+        "--reason",
+        "adopt product catalog",
+    ]));
+    let mut changed = Vec::new();
+    for name in ["products", "suppliers"] {
+        let path = d.dir.join(format!("schema/app.{name}.yml"));
+        let original = std::fs::read_to_string(&path).unwrap();
+        let edited = original.replace(
+            "    type: bigint\n",
+            "    type: bigint\n    identity: [1, 1]\n",
+        );
+        assert_ne!(edited, original, "{original}");
+        std::fs::write(path, edited).unwrap();
+        changed.push(format!("app.{name}.id"));
+        let objects: Vec<_> = changed.iter().map(String::as_str).collect();
+        unexpressible::check(&d, own.connection(), &objects);
+    }
+    on_server(
+        own.connection(),
+        "DO $$ BEGIN
+        IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid IN ('app.products'::regclass,
+            'app.suppliers'::regclass) AND attname = 'id' AND attidentity <> '') THEN
+            RAISE EXCEPTION 'refusal changed identity';
+        END IF;
+    END $$;",
+    );
+}
+
 #[path = "support/envelope_archives.rs"]
 mod envelope_archives;
 

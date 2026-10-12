@@ -214,10 +214,10 @@ pub async fn resolve(request: &Request<'_>) -> Result<pbps_model::ChangeSet, Ref
         request.hints,
     )
     .map_err(|errors| {
-        Refused::Unanswerable(anyhow::anyhow!(
-            "the declarations' bootstrap cannot be formed: {} error(s)",
-            errors.len()
-        ))
+        Refused::Unanswerable(
+            anyhow::Error::new(crate::Unexpressible(errors))
+                .context("the declarations' bootstrap cannot be formed"),
+        )
     })?
     .changes
     .into_iter()
