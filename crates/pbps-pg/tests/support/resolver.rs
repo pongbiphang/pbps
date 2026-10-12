@@ -141,31 +141,9 @@ async fn resolver_discovery_observes_both_catalog_versions_without_writes_or_qua
 mod scope610 {
     use super::*;
     use pbps_db::resolver::Observation;
-    use pbps_db::resolver::environment::{
-        EnvironmentFacts, ExecutableIdentity, ExecutableRole, ExecutableSet, FactStatus,
-        Provenance, Side, Verdict,
-    };
-    use pbps_pg::resolver::compatibility::compare;
+    use pbps_db::resolver::environment::{FactStatus, Side, Verdict};
+    use pbps_pg::resolver::compatibility::compare_reported;
     use pbps_pg::resolver::environment::{Scope, read};
-
-    /// Executables are read from the kernel, not SQL; these tests give both
-    /// sides the same content so only the catalog facts decide.
-    fn with_executables(catalog: pbps_db::resolver::environment::CatalogFacts) -> EnvironmentFacts {
-        let engine = ExecutableIdentity {
-            role: ExecutableRole::Engine,
-            path: "/usr/lib/postgresql/bin/postgres".into(),
-            digest: Some("00".repeat(32)),
-            provenance: Provenance::LoadedContent,
-            disk_differs_from_loaded: Some(false),
-        };
-        EnvironmentFacts {
-            catalog,
-            executables: ExecutableSet {
-                engine,
-                libraries: vec![],
-            },
-        }
-    }
 
     async fn connect(server: &str) -> Conn {
         Conn::connect(Driver::Postgres, server).await.unwrap()
@@ -309,11 +287,7 @@ mod scope610 {
         // search configuration is unknown on the deployer's side, never a
         // match.
         let seen_by_admin = read(&mut setup, &scope).await.unwrap();
-        let report = compare(
-            &with_executables(seen_by_deployer.clone()),
-            &with_executables(seen_by_admin),
-            &[],
-        );
+        let report = compare_reported(&seen_by_deployer.clone(), &seen_by_admin);
         assert_eq!(
             report.facts["visibility:a"],
             FactStatus::Mismatch {
@@ -332,11 +306,7 @@ mod scope610 {
         assert!(matches!(report.verdict(), Verdict::Unknown(_)));
         // The same principal against itself: visibility matches, and only
         // the session-set setting keeps the scope from verifying.
-        let same = compare(
-            &with_executables(seen_by_deployer.clone()),
-            &with_executables(seen_by_deployer),
-            &[],
-        );
+        let same = compare_reported(&seen_by_deployer.clone(), &seen_by_deployer);
         assert_eq!(same.facts["visibility:a"], FactStatus::Match);
         // A least-privilege login cannot see the superuser-only settings at
         // all (pg_settings hides the rows), and the refusal names the grant.
@@ -376,11 +346,7 @@ mod scope610 {
             granted.settings["shared_preload_libraries"].context,
             "postmaster"
         );
-        let same = compare(
-            &with_executables(granted.clone()),
-            &with_executables(granted),
-            &[],
-        );
+        let same = compare_reported(&granted.clone(), &granted);
         assert_eq!(
             same.verdict(),
             Verdict::Unknown(vec!["setting:default_text_search_config".into()])
@@ -390,11 +356,7 @@ mod scope610 {
             .await
             .unwrap();
         let reset = read(&mut planning, &scope).await.unwrap();
-        let same = compare(
-            &with_executables(reset.clone()),
-            &with_executables(reset),
-            &[],
-        );
+        let same = compare_reported(&reset.clone(), &reset);
         assert_eq!(same.verdict(), Verdict::Verified, "{same:?}");
 
         drop(planning);
@@ -457,11 +419,7 @@ mod scope610 {
             Some("en-US")
         );
 
-        let report = compare(
-            &with_executables(target_facts.clone()),
-            &with_executables(resolver_facts.clone()),
-            &[],
-        );
+        let report = compare_reported(&target_facts.clone(), &resolver_facts.clone());
         let Verdict::Mismatch(keys) = report.verdict() else {
             panic!("18/ICU against 16/libc must mismatch: {report:?}");
         };
@@ -483,22 +441,13 @@ mod scope610 {
         let mut without = resolver_facts.clone();
         without.available_extensions.remove("hstore");
         assert!(matches!(
-            compare(
-                &with_executables(target_facts.clone()),
-                &with_executables(without),
-                &[]
-            )
-            .facts["extension:hstore"],
+            compare_reported(&target_facts, &without).facts["extension:hstore"],
             FactStatus::Mismatch { .. }
         ));
 
         // A side against itself is the positive control: every fact matches
         // and the scope verifies.
-        let same = compare(
-            &with_executables(target_facts.clone()),
-            &with_executables(target_facts),
-            &[],
-        );
+        let same = compare_reported(&target_facts, &target_facts);
         assert_eq!(same.verdict(), Verdict::Verified, "{same:?}");
 
         drop(target);

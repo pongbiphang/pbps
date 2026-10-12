@@ -192,7 +192,7 @@ say whether what the emitter sent is what comes back.
 
 ### Engine-assisted planning and resolver environments
 
-**Doctor discovery and named profile selection implemented; resolution remains planned.**
+**Doctor discovery, resolver selection and the resolver's scratch runs implemented; publication remains planned.**
 [SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
 and [ADR-0016](ADR-0016-engine-assisted-planning.md) retain offline previews and
 the existing SQL Server `--dev` rehearsal. Target planning accepts
@@ -211,78 +211,52 @@ has been verified and no binding evidence is produced. See
 [the staged delivery plan](RESOLVER-DELIVERY.md) for #595, completed discovery
 #597, and ordered implementation steps #606–#621.
 
-The library has a separate peer-verified TLS connection primitive (#607), tested
-against both engines with disposable trust and an intercepting relay. It does
-not enable resolver analysis or certify instance separation, proxy backend hops
-or local private channels; those require the runtime profiles in #608/#609.
+The peer-verified TLS connection type (#607) was removed with the measured
+profiles (#1636); the resolver uses whatever TLS each connection string asks
+for. The disposable TLS fixtures, with an intercepting relay, now pin the
+ordinary connection's verification on both engines.
 
-The internal Docker runtime (#608) now acquires explicit trusted images and
-qualifies native Linux target separation, effective kernel containment and a
-run-private database channel before exposing a source-free session. It owns
-bounded startup, continuity and cleanup for both engines. Analysis-scope
-compatibility and deployment-context qualification is wired into the run for
-PostgreSQL (#610) and SQL Server (#611): a run reproduces the target's database
-settings, executable content and deployer authorization on scratch and compares
-them under the engine's versioned rule before it can be used. It is not a
-binding adapter — SQL Server's is unimplemented (#619, #620) — and the
-subsequent source-handling and binding steps remain required. See [the runtime boundary and fixtures](RESOLVER-RUNTIME.md).
-
-A supplied **dedicated scratch server** (#609) is an operator-started container
-of a known layout: pbps reads the runtime's record of it, measures the kernel
-against the named profile — an empty network namespace, an unprivileged engine,
-bounded cgroup resources and a mount table every row of which the profile
-names — after proving from the actual processes that it is not the target's
-instance, and reaches it through a run-owned forwarder as the Docker profile
-does. Exclusivity combines namespace socket/holder observations with each
-engine's cumulative session counter, so a session that opened and closed
-between two checks still invalidates the run. Its run-owned database and login
-are removed on every exit path. Like the Docker runtime, this is not wired into
-binding planning and exposes no SQL surface. The #740–#743 runtime redesign
-uses a pinned namespace procfs view, verified launch privileges and positive
-target/backend/connection identities. Holder observations are explicitly
-non-exhaustive under concurrent descriptor transfer; trusted provisioning,
-containment and engine evidence remain separate premises (DECISIONS 533).
+The measured Docker (#608) and dedicated-server (#609) runtime profiles, with
+their containment, process and socket observation and executable identity,
+were removed by #1636 (DEC-1636.1). Analysis-scope compatibility and
+deployment-context qualification remains for PostgreSQL (#610) and SQL Server
+(#611): a run reproduces the target's database settings and deployer
+authorization on scratch and compares the facts both engines report under the
+engine's versioned rule before it can be used. SQL Server's binding adapter is
+unimplemented (#619, #620).
 
 The PostgreSQL target-input library (#612) captures actual historical bindings,
 recorded baseline, complete requested candidate sets and prerequisite properties
 on one owned snapshot. Fresh recapture compares private versioned fingerprints,
-keyed under a per-process key (DEC-952.1);
-native capture additionally qualifies executable content and expires canceled
-connections. Unknown required coverage refuses. This is a library boundary,
+keyed under a per-process key (DEC-952.1). Unknown required coverage refuses. This is a library boundary,
 not enabled CLI resolution or a saved-plan/apply path. Desired-namespace
 reconstruction and the managed-only binding comparison (#613) compile the
-declarations on a qualified run's scratch database and return, per surface,
+declarations on the resolver's scratch database and return, per surface,
 unaffected, rebuild or unresolved; sealing (#614) and planning integration
 (#615) remain required. See [the capture contract and fixtures](RESOLVER-CAPTURE.md)
 and [delivery tracking](RESOLVER-DELIVERY.md).
 
-**Re-planned by #1528 (DEC-1528.1).** A server resolver entry is the
-operator-vouched resolver for managed declarations (#1672, DEC-1672.1); its
+**Re-planned by #1528 and #1636 (DEC-1528.1, DEC-1636.1).** Selecting a
+resolver gives the one resolver, on every platform pbps supports. A server
+entry runs it on a scratch server the operator supplies (#1672, DEC-1672.1); a
+Docker entry on a container pbps starts from the entry's image and removes
+after the run (#1674, DEC-1674.1). Either kind's `baseline` stages external
+objects, compared with the target (#1673, DEC-1673.1), and may be allowed to
+write outside the scratch database. Before any scratch write the resolver
+proves its scratch is not the target and, on the target's cluster, that its
+account is confined; then it runs the shared compatibility qualification. Its
 answer is still refused as `resolver.publication-unavailable` until #1516.
-A server entry's `baseline` stages external objects, compared with the
-target (#1673, DEC-1673.1). A Docker entry is the same resolver on a
-container pbps starts from the entry's image and removes after the run, and
-either kind's baseline may be allowed to write outside the scratch database
-(#1674, DEC-1674.1).
-Selecting a resolver will give the operator-vouched resolver. It keeps two
-separation checks plus the shared compatibility qualification, and stages
-external objects from a reviewed baseline compared with the target. The
-measured profiles, whose stages are described below, are frozen; #1636
-removes them. In stage 1 below, instance separation, containment,
-source-handling controls and executable identity are measured-profile
-qualifications only. [Delivery tracking](RESOLVER-DELIVERY.md) has the new
-order.
+[Delivery tracking](RESOLVER-DELIVERY.md) has the remaining order: #1516,
+#1517, #1778 and #616, then SQL Server's #619, #620 and #621.
 
 Delivery is split into three stages:
 
 1. Environment discovery, trusted candidate suggestions and compatibility
    checks for **both PostgreSQL and SQL Server**, with explicit, policy-bound
    acquisition and support for local images or dedicated scratch servers.
-   Resolver qualification includes target instance/cluster separation and
-   pre-compilation execution containment, plus pre-transfer source-handling
-   controls for logging and disposable storage, and qualified actual executable
-   identities or tested build mappings rather than reported versions alone;
-   unknown safety prerequisites refuse the affected resolver operation.
+   Resolver qualification proves that scratch is not the target and compares
+   the facts both engines report; an unreadable prerequisite refuses the
+   affected resolver operation.
 2. PostgreSQL creation-time binding resolution, checksum-pinned evidence and
    transactional apply/result guards; uncertainty prevents deployable output
    unless resolved, while proven cases retain the lightweight path.

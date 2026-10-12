@@ -109,17 +109,12 @@ pub struct Request<'a> {
     pub assessment: &'a Assessment,
     pub target: &'a crate::db::Target,
     pub project: &'a pbps_config::Project,
-    /// Only a producer reads the target's side, and a host with none refuses
-    /// before it would.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub base: pbps_diff::Side<'a>,
     pub desired: pbps_diff::Side<'a>,
     pub hints: &'a pbps_model::Hints,
     /// The `system_identifier` of the cluster the planning read reached, for
     /// a PostgreSQL target. The resolver's own target connection must reach
-    /// the same one: a target name can reach several (#1685). Like `base`,
-    /// only a producer reads it.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// the same one: a target name can reach several (#1685).
     pub target_identity: Option<&'a str>,
 }
 
@@ -137,7 +132,7 @@ pub async fn planning_identity(
     if conn.driver() != pbps_db::Driver::Postgres {
         return Ok(None);
     }
-    pbps_pg::resolver::vouched::cluster_identity(conn)
+    pbps_pg::resolver::scratch::cluster_identity(conn)
         .await
         .map(Some)
         .map_err(identity_unread)
@@ -237,9 +232,7 @@ pub async fn resolve(request: &Request<'_>) -> Result<pbps_model::ChangeSet, Ref
 /// it is never a file elsewhere on the planning machine: an absolute path, a
 /// `..` or a symlink that leads outside the root is refused. Judged on the
 /// resolved path, not lexically, because a symlink inside the root can point
-/// anywhere. The file read is the one judged. Linux only, with the producer
-/// that reads it.
-#[cfg(target_os = "linux")]
+/// anywhere. The file read is the one judged.
 fn read_baseline(root: &std::path::Path, path: &std::path::Path) -> Result<String, String> {
     let unreadable = |error: std::io::Error| format!("could not be read: {error}");
     // Relative, as the configuration says: an absolute path would work from
@@ -259,11 +252,10 @@ fn read_baseline(root: &std::path::Path, path: &std::path::Path) -> Result<Strin
     std::fs::read_to_string(&file).map_err(unreadable)
 }
 
-/// The producers of the profiles pbps implements. Today every one is a
-/// measured profile (RESOLVER-RUNTIME): its run binds the target by observing
-/// the engine service that holds the connection (DEC-1514.1). That premise
-/// belongs to these profiles, not to resolution.
-#[cfg(target_os = "linux")]
+/// The resolver's producer: a scratch run on a supplied server or a Docker
+/// container, bound to the target by the cluster identity the planning read
+/// recorded (DEC-1685.1). It reaches its scratch with SQL alone, so it runs
+/// on every platform pbps supports (#1636).
 mod producer {
     use super::{Refused, Request, unresolved};
     use pbps_cli::resolver::server::{Error, ProduceError};
@@ -278,9 +270,9 @@ mod producer {
             desired: request.desired.schema,
             base: request.base.schema,
         };
-        // Both kinds are the operator-vouched resolver (DEC-1528.1): a
+        // Both kinds are the one resolver (DEC-1528.1): a
         // supplied server, or a container started for the run (#1674).
-        use pbps_cli::resolver::server::vouched::{self, Provenance};
+        use pbps_cli::resolver::server::scratch::{self, Provenance};
         use pbps_config::resolver::ResolverProfile;
         let Some(identity) = request.target_identity else {
             return Err(Refused::Unanswerable(anyhow::anyhow!(
@@ -322,7 +314,7 @@ mod producer {
         let run = async |scratch: &str,
                          standard: &pbps_pg::resolver::standard::Standard,
                          provenance: Provenance| {
-            vouched::produce(
+            scratch::produce(
                 driver,
                 scratch,
                 request.target.connection(),
@@ -348,31 +340,31 @@ mod producer {
             } => {
                 let scratch = scratch_connection(request, url_env)?;
                 let provenance = Provenance {
-                    scratch: pbps_model::resolver::VouchedScratch::Server {},
+                    scratch: pbps_model::resolver::ScratchSource::Server {},
                     outside_writes,
                 };
                 run(
                     &scratch,
-                    &vouched::declared_standard(standard.as_ref()),
+                    &scratch::declared_standard(standard.as_ref()),
                     provenance,
                 )
                 .await
             }
             ResolverProfile::Docker { image, pull, .. } => {
                 let provenance = Provenance {
-                    scratch: pbps_model::resolver::VouchedScratch::Docker {
+                    scratch: pbps_model::resolver::ScratchSource::Docker {
                         image: image.clone(),
                     },
                     outside_writes,
                 };
-                vouched::container::with_container(
+                scratch::container::with_container(
                     driver,
                     request.target.connection(),
                     identity,
                     image,
                     *pull,
                     async |scratch: &str| {
-                        run(scratch, &vouched::declared_standard(None), provenance).await
+                        run(scratch, &scratch::declared_standard(None), provenance).await
                     },
                 )
                 .await
@@ -387,10 +379,9 @@ mod producer {
         match failure {
             ProduceError::Run(error) if answered(&error) => unresolved(request, error),
             ProduceError::Run(error) => Refused::Unanswerable(error.into()),
-            ProduceError::Target(_)
-            | ProduceError::Recipe(_)
-            | ProduceError::Acquire(_)
-            | ProduceError::Cleanup(_) => Refused::Unanswerable(failure.into()),
+            ProduceError::Acquire(_) | ProduceError::Cleanup(_) => {
+                Refused::Unanswerable(failure.into())
+            }
         }
     }
 
@@ -426,57 +417,19 @@ mod producer {
     pub(super) fn answered(error: &Error) -> bool {
         match error {
             // A declared surface had no sound verdict, or the environment was
-            // measured and differs, or this run's profile cannot serve the
-            // engine.
-            Error::Binding(_) | Error::Incompatible(_) | Error::UnsupportedProfile { .. } => true,
-            // The supplied server was measured and does not meet the profile
-            // it claims: also an answer.
-            Error::Container(_)
-            | Error::Configuration(_)
-            | Error::EngineExecutable
-            | Error::Containment(_)
-            | Error::Mount(_)
-            | Error::TargetInstance => true,
+            // read and differs.
+            Error::Binding(_) | Error::Incompatible(_) => true,
             // Not answered: the run could not establish what it needed. A
             // catalog read that failed is one of these, however far into the
             // binding it came (#1575).
-            Error::Endpoint
-            | Error::Daemon(_)
-            | Error::Channel(_)
-            | Error::Exclusivity(_)
-            | Error::Unqualified(_)
-            | Error::Identity(_)
-            | Error::Deadline
-            | Error::Cancelled
-            | Error::Scratch
-            | Error::Cleanup
-            | Error::Consumed
+            Error::Scratch
             | Error::Scope(_)
             | Error::Read(_)
             // A scratch that cannot be used as configured answered nothing,
             // nor did one whose baseline is not the target's.
-            | Error::Vouched(_)
+            | Error::Unusable(_)
             | Error::Baseline(_) => false,
         }
-    }
-}
-
-/// The measured profiles run on a native Linux host (RESOLVER-RUNTIME), and
-/// no other profile exists yet; the question still needs an answer, so the
-/// plan is refused rather than guessed.
-#[cfg(not(target_os = "linux"))]
-mod producer {
-    use super::{Refused, Request, unresolved};
-
-    pub(super) async fn produce(
-        request: &Request<'_>,
-        _driver: pbps_db::Driver,
-        _bootstrap: &[pbps_model::Change],
-    ) -> Result<pbps_model::ChangeSet, Refused> {
-        Err(unresolved(
-            request,
-            "the selected profile's runtime needs a native Linux host (RESOLVER-RUNTIME)",
-        ))
     }
 }
 
@@ -485,10 +438,9 @@ mod tests {
     use super::*;
     use pbps_model::{Column, Hints, IdsFile, Module, ModuleKind, Schema, Table};
 
-    // Linux only: the reader lives with the Linux producer, and the fixture
-    // makes Unix symlinks.
+    // Unix only: the fixture makes Unix symlinks.
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn a_baseline_is_read_only_from_under_the_project_root() {
         use std::path::{Path, PathBuf};
         let dir = std::env::temp_dir().join(format!(
@@ -650,7 +602,6 @@ mod tests {
     /// #1575: a catalog read that failed part-way through the binding is
     /// `unanswerable`, exit 1; the binding's own verdict stays
     /// `resolver.unresolved`, exit 2 (SPEC 9.8).
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_failed_catalog_read_is_unanswerable_while_a_binding_verdict_is_answered() {
         use pbps_cli::resolver::server::Error;
@@ -741,6 +692,73 @@ mod tests {
             },
         );
         (base, desired)
+    }
+
+    /// #1636: the producer is not gated to one platform. A `kind: server`
+    /// resolver reaches its dispatch everywhere — CI's Windows job runs this
+    /// too — and is refused there for its own reason, the unset scratch
+    /// variable, never for the host it runs on.
+    #[test]
+    fn a_server_resolver_reaches_its_producer_on_every_platform() {
+        let selection = selection();
+        let (base, desired) = arrival();
+        let Case::Required { assessment, .. } = decide(Some(&selection), &base, &desired) else {
+            panic!("the arrival needs the resolver");
+        };
+        let base_ids = ids(&base, &IdsFile::default());
+        let desired_ids = ids(&desired, &base_ids);
+        let target = crate::db::target_from_connection(
+            "postgres://pbps@127.0.0.1:1/pbps",
+            pbps_db::Driver::Postgres,
+        );
+        let project = pbps_config::Project {
+            root: std::env::temp_dir(),
+            config: pbps_config::Config::parse(
+                "dialect: postgres\n",
+                std::path::Path::new("pbps.yml"),
+            )
+            .unwrap(),
+        };
+        let hints = Hints::default();
+        let request = |target_identity| Request {
+            selection: &selection,
+            assessment: &assessment,
+            target: &target,
+            project: &project,
+            base: pbps_diff::Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            desired: pbps_diff::Side {
+                schema: &desired,
+                ids: &desired_ids,
+            },
+            hints: &hints,
+            target_identity,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let refusal = |target_identity| match rt.block_on(producer::produce(
+            &request(target_identity),
+            pbps_db::Driver::Postgres,
+            &[],
+        )) {
+            Err(Refused::Unanswerable(error)) => error.to_string(),
+            Err(Refused::Finding(finding)) => panic!("not answered: {}", finding.id),
+            Ok(_) => panic!("a plan without a scratch server"),
+        };
+        let reached = refusal(Some("7"));
+        assert!(
+            reached.contains("PBPS_RESOLVER_UNSET_1515, which is not set"),
+            "{reached}"
+        );
+        assert!(!reached.contains("Linux"), "{reached}");
+        // Negative: without the planning read's cluster identity the
+        // producer stops first, before it reads any scratch variable.
+        let unbound = refusal(None);
+        assert!(unbound.contains("no cluster identity"), "{unbound}");
     }
 
     #[test]

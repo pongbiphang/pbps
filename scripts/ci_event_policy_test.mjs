@@ -152,7 +152,7 @@ test('a pull request omits exactly the declared jobs, and every other event runs
   const declared = workflow.match(/^          PR_OMITTED: (.+)$/m);
   assert.ok(declared, 'the gate declares the jobs a pull request omits');
   const omitted = declared[1].trim().split(/\s+/);
-  assert.deepEqual([...omitted].sort(), ['live', 'live-pg', 'release-windows', 'resolver']);
+  assert.deepEqual([...omitted].sort(), ['live', 'live-pg', 'release-windows']);
   const condition = "${{ github.event_name != 'pull_request' }}";
   const blocks = [...workflow.split('jobs:\n')[1].matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/gm)];
   const names = blocks.map(match => match[1]);

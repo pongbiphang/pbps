@@ -2411,3 +2411,67 @@ Recorded in SPEC §9.3.2. Pinned by the `vouched_docker_` live tests and
 `resolver::server::vouched`, and by
 `either_kind_takes_a_baseline_and_an_outside_write_choice` in
 `pbps-config`.
+
+<a id="dec-1636-1"></a>
+
+**DEC-1636.1. The measured resolver profiles are removed; the resolver the
+operator vouches for is the only one, is called plainly "resolver", and
+runs on every platform pbps supports (#1636).** #1528 froze the measured
+profiles (DEC-1528.1) after #1616 found that they answered nothing the
+other resolver could not, on three real schemas. The baseline (#1673)
+replaced their source transfer, and the Docker scratch (#1674) their Docker
+profile.
+
+- **What went.** The profiles `linux-amd64-v1`, `linux-dedicated-v1` and
+  `linux-dedicated-pg16-v1`, and everything only they used:
+  - containment and admission;
+  - process and socket observation;
+  - executable and library identity, including the rule
+    `pg-analysis-scope-v1` that compared them, SQL Server's executable step
+    and `doctor`'s requirements for them;
+  - the native target capture and its runtime-input capability;
+  - the stream transport into a private channel;
+  - the peer-verified connection type (#607), which refused any string not
+    asking for a verified handshake. The resolver uses whatever TLS each
+    connection string asks for, and the TLS fixtures now pin the ordinary
+    connection's verification instead;
+  - the root-only CI job and its fixtures.
+
+  `ResolverRuntime` keeps one variant. `Container` and `Supplied` are
+  deleted, not kept as variants that refuse on read: there is no release
+  and so no saved plan to protect, and a variant that no longer exists
+  fails to deserialize, which is itself a refusal.
+- **The distinction ends with them.** "Operator-vouched" named the resolver
+  against a measured one. With nothing measured beside it, the word only
+  suggests a second resolver. Code, tests, user text and living docs say
+  "resolver". The evidence's runtime tag is `scratch`, and `explain` prints
+  the scratch's kind. DEC entries keep their words.
+- **A removed profile is refused by name.** A `--resolve-with` naming one
+  that is not configured, or an entry carrying a `profile` field, is
+  refused with a message that says the profiles are gone and names the
+  resolver. An unknown-name or unknown-field message would leave the
+  operator guessing what replaced them. A resolver configured under one of
+  those names is still selected.
+- **SQL Server's compatibility rule** keeps its catalog comparison and drops
+  the executable step. It is renamed `mssql-reported-scope-v1`, because a
+  rule's coverage is part of its name. No evidence seals it yet (#620).
+- **Every platform.** The resolver reaches its scratch with SQL alone, and a
+  Docker scratch with whatever `docker` command the runner has, so nothing
+  in it is gated to Linux.
+
+**Why not the alternatives.**
+- **Keep the measured profiles frozen.** Frozen code still compiles, still
+  needs a root-only CI host, and is still read by every reviewer, while no
+  question needs it.
+- **Keep the `vouched` name in the code.** It contrasts with something that
+  no longer exists, and two names for one thing are what the rename
+  removes.
+
+Recorded in SPEC §9.3.2–9.3.3, ADR-0016's amendment and RESOLVER-DELIVERY.
+Pinned by `a_removed_measured_profile_is_refused_naming_the_resolver`
+(`pbps-config`), `a_server_resolver_reaches_its_producer_on_every_platform`
+(the CLI's dispatch, which CI's Windows job also runs),
+`discovery_names_only_the_requirements_the_resolver_checks` (`pbps-db`),
+`a_docker_scratch_is_recorded_by_its_configured_image` (`pbps-model`), the
+removed-runtime cases in `explain_resolver`, and the `resolver_` live tests
+in `resolver::server::scratch`.

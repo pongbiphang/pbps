@@ -4,21 +4,29 @@ Tracking parent: [#595](https://github.com/pongbiphang/pbps/issues/595).
 The requirements are [ADR-0016](ADR-0016-engine-assisted-planning.md) and
 [SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented).
 This plan divides their implementation without reducing the acceptance bar.
-The parent stays open until both engine adapters and the confidential-path
-prerequisite are delivered. Each bounded child follows the repository's full
-local verification, review and CI gates.
+The parent stays open until both engine adapters are delivered. Each bounded
+child follows the repository's full local verification, review and CI gates.
 
-**Re-planned by #1528 (DEC-1528.1).** The sections below deliver the measured
-profiles, which are now frozen; #1636 removes them. The order is now:
-1. this amendment;
-2. the operator-vouched resolver's producer, with its two checks and the
-   baseline comparison;
-3. #1516's, #1517's and #616's tier-neutral cores;
-4. the baseline draft command, then automatic fill;
-5. #1636.
+**Re-planned by #1528 and #1636 (DEC-1528.1, DEC-1636.1).** There is one
+resolver, on a server or Docker scratch the operator vouches for (#1672,
+#1674), with external objects from a reviewed baseline (#1673). The measured
+profiles (#608, #609) were removed by #1636, and the confidential source
+transfer (#617) is closed. The remaining order:
+1. [#1516](https://github.com/pongbiphang/pbps/issues/1516): the fresh
+   pre-publication recheck and publication from the sealed order;
+2. [#1517](https://github.com/pongbiphang/pbps/issues/1517): offline
+   `explain` of resolver evidence and the explicit gates;
+3. [#1778](https://github.com/pongbiphang/pbps/issues/1778): the baseline
+   draft command, then automatic fill;
+4. [#616](https://github.com/pongbiphang/pbps/issues/616): apply under the
+   deployment lock, with #618's approval-consumer checks;
+5. SQL Server: [#619](https://github.com/pongbiphang/pbps/issues/619),
+   then [#620](https://github.com/pongbiphang/pbps/issues/620), then
+   [#621](https://github.com/pongbiphang/pbps/issues/621).
 
-Read "resolver" in the sections below as the measured profiles where it
-describes containment, observation or verified channels.
+The sections below record each delivered step as it shipped. Where one
+describes containment, process observation, executable identity or verified
+channels, it describes the measured profiles #1636 removed.
 
 ## First implementation: read-only discovery (#597)
 
@@ -32,16 +40,15 @@ Connected `doctor`, in human and JSON output, now reports:
 - Known official image-family suggestions, explicitly unverified. Unknown
   versions and hosted SQL Server families get a reason instead of a guessed
   boxed image. No image is inspected, pulled or started.
-- Unknown requirements for actual executable/native-library builds,
-  analysis-specific environment compatibility, per-statement deployment
-  settings/authorization, authenticated transport, instance separation,
-  runtime containment, backend stability and binding coverage. Conditional
-  private-input handling retains its source-privacy controls (#617); its
-  fingerprints are keyed (DEC-952.1).
+- Unknown requirements for per-statement deployment settings/authorization,
+  the candidate's compatibility, scratch separation and binding coverage.
+  #1636 removed the measured profiles' requirements (executable builds,
+  verified transport, containment, run stability and private input
+  handling) from this list.
 
 `session_*` observations do not describe the future apply context. Persisted
-module settings, per-object collations, relevant native-library identities and
-complete authorization/prerequisite inventories remain later work. SQL NULL
+module settings, per-object collations and complete authorization/prerequisite
+inventories remain later work. SQL NULL
 is not a known absence; query failures are unanswerable rather than empty
 reports. This inventory is advisory and cannot be reused as a coherent sealed
 capture. Ordinary readiness does not require a resolver.
@@ -64,60 +71,24 @@ their no-acquisition behavior; existing planning protections remain in force.
 This delivers the policy portion of ADR case 6, not the lifecycle or binding
 path. See SPEC §9.3.2 for configuration and the current limitation.
 
-## Verified TLS foundation (#607)
+## Verified TLS foundation (#607; removed)
 
-`pbps-db::transport::PeerVerifiedConn` owns one connection whose TLS handshake
-verified the certificate chain and expected peer name. It requires PostgreSQL
-`sslmode=require`, which a string naming no `sslmode` gets as every connection
-does (DECISIONS 543), and SQL Server encryption with certificate validation.
-Failed trust setup, plaintext/opportunistic settings and disabled peer checks
-cannot construct it. Its opaque connection identity changes on reconnect;
-callers cannot replace the underlying connection while retaining that identity.
+#607 delivered `PeerVerifiedConn`, a connection type that refused any
+string not asking for a verified handshake. Its only users were the measured
+profiles, and #1636 removed it with them (DEC-1636.1). The resolver uses
+whatever TLS each connection string asks for, through the ordinary
+connection. The disposable TLS fixtures stay: they now pin that ordinary
+connection's chain and host-name verification and its rejection of altered
+or replayed records, in both local engine scripts and CI.
 
-Disposable PostgreSQL and SQL Server fixtures exercise trusted and untrusted
-roots, wrong peer names, reconnects, successful relay traffic and corruption of
-encrypted replies. These tests run in both local engine scripts and CI.
+## Measured runtime profiles (#608, #609; removed)
 
-This is a library primitive, not resolver admission or an enabled CLI analysis
-path. TLS verifies its peer; it cannot certify a backend hop behind a terminating
-proxy. The Docker/server profiles in #608/#609 must establish actual runtime-
-bound admission: every hop or qualified local private channel, read-only engine
-identity comparison and instance separation, run binding and invalidation before
-scratch DDL/source transfer. Full ADR cases 11, 19 and 20 remain with those
-profiles. Ordinary connection defaults and discovery qualification are unchanged.
-
-## Dedicated scratch servers (#609)
-
-A server pbps did not provision is admitted by measuring a **named** externally
-enforced profile, not by trusting its URL, its separate database or an
-operator's assertion. `linux-dedicated-v1` covers both engines on native Linux:
-an operator-started container of a known layout — an empty network namespace,
-an unprivileged engine, cgroup bounds within the profile's ceilings, a
-read-only image root and a mount table every row of which the profile names —
-reached through a run-owned forwarder the way the Docker profile reaches its
-own containers. Instance separation is decided from the actual processes
-before the containment measurement and before any database, DDL or
-declaration, so an alias of the target refuses as the target. Exclusivity is
-the observed socket rows and holders in the engine's namespace plus a cumulative
-engine session counter that only this run may have moved, so a session that opened
-and closed between two checks still ends the run. Run-owned resources are one
-uniquely named database and login, removed on every exit path, with
-unconfirmed removals reporting exactly those names.
-
-The additional PostgreSQL-only `linux-dedicated-pg16-v1` profile names one exact
-child storage tmpfs at `/var/lib/postgresql/data` and requires actual major 16
-on its already qualified administrative channel before admission or scratch
-DDL (DEC-1302.1). The existing PG18/MSSQL layouts and all continued runtime
-checks remain. The fixed fixture defaults to PG18 and selects PG16 explicitly
-with `--pg-major 16`; this prerequisite does not publish the held #1274 producer.
-
-This is the lifecycle and exclusivity portion of ADR cases 6, 11, 13, 14 and
-19–21 for supplied servers. It is not engine build or deployment-context
-qualification (#610/#611), source handling (#617) or binding evidence: no
-declaration is transferred and no SQL surface is exposed. See
-[the runtime boundary](RESOLVER-RUNTIME.md) for the measured premises, including
-#743's explicit trusted-provisioning assumption and non-exhaustive holder
-observations (DECISIONS 533).
+The measured Docker profile `linux-amd64-v1` (#608) and the dedicated-server
+profiles `linux-dedicated-v1` and `linux-dedicated-pg16-v1` (#609) measured
+containment, observed the engines' processes and sockets, and compared their
+executables. #1636 removed them with their code, CI job and fixtures
+(DEC-1636.1). The resolver's server scratch (#1672) and Docker scratch
+(#1674) replace them; see SPEC §9.3.2.
 
 ## PostgreSQL target input capture (#612)
 
@@ -136,12 +107,11 @@ enabled by this library.
 
 ## PostgreSQL desired namespace and binding comparison (#613)
 
-`ScratchRun::resolve` compiles the declarations on a qualified run's own
-scratch database, as the reproduced deployer, and compares what they bind with
-the target's observed bindings. Only a scope that qualified as verified can
-resolve; a full run check brackets the compile and both captures, any failure
-ends the analysis, and a run resolves once. SQL Server is refused by name until
-its adapter exists (#619, #620).
+The resolver compiles the declarations on its scratch database, as the
+reproduced deployer or as the scratch login (SPEC §9.3.2), and compares what
+they bind with the target's observed bindings. Only a scope that qualified as
+verified can resolve, and a run resolves once. SQL Server is refused by name
+until its adapter exists (#619, #620).
 
 The namespace is the differ's bootstrap through the ordinary emitter. Tables
 are created bare, foreign keys follow every table, modules keep the differ's
@@ -157,9 +127,8 @@ and in the schema it bound into, plus every cast. Each shared surface is then
 **unresolved** with a named condition: a target candidate scratch did not
 reproduce, an engine object whose properties differ, a role in a binding or a
 compile-order ambiguity (DEC-613.2). Runtime-bound bodies are compared by
-header and listed separately. The analysis is managed-only: retained external
-objects, including extension members, are not reconstructed until private
-source handling exists (#617), so surfaces that could reach them are
+header and listed separately. External objects come from the baseline
+(#1673); surfaces that could reach an object it does not stage are
 unresolved rather than guessed. The comparison is an in-memory report of
 logical identities; it publishes no plan, evidence or SQL (#614, #615).
 
@@ -168,21 +137,23 @@ with an unmanaged dependent, earlier-path candidates, other overloads,
 qualified references, historical binding against a fresh bootstrap, object
 number and rename controls, every expression surface, unmanaged and planted
 candidates, a changed built-in cast, a missing prerequisite, a creation cycle
-and a compile-order ambiguity. The dedicated-server fixture resolves through
-the qualified lifecycle.
+and a compile-order ambiguity. The resolver's own live suite runs the same
+comparison on its server and Docker scratch.
 
 ## Ordered implementation issues
 
 Each issue describes its scope, ADR acceptance cases, positive/negative tests
 and dependencies. The issue loop is sequential: the current PR must merge
-before the next issue is claimed. #597 is complete; #606 through #613 are delivered.
+before the next issue is claimed. #597 is complete; #606 through #614 are
+delivered, #608's and #609's profiles were removed by #1636, and #617 and
+#618 are closed. The remaining order is at the top of this page.
 
 | Step | Issue | Required outcome |
 |---|---|---|
 | 1 | [#606](https://github.com/pongbiphang/pbps/issues/606) | configure named profiles and lazy selection policy |
-| 2 | [#607](https://github.com/pongbiphang/pbps/issues/607) | add peer-verified TLS connection primitives |
-| 3 | [#608](https://github.com/pongbiphang/pbps/issues/608) | acquire and contain run-owned Docker environments |
-| 4 | [#609](https://github.com/pongbiphang/pbps/issues/609) | qualify dedicated scratch-server lifecycle and exclusivity |
+| 2 | [#607](https://github.com/pongbiphang/pbps/issues/607) | add peer-verified TLS connection primitives (removed by #1636) |
+| 3 | [#608](https://github.com/pongbiphang/pbps/issues/608) | acquire and contain run-owned Docker environments (removed by #1636) |
+| 4 | [#609](https://github.com/pongbiphang/pbps/issues/609) | qualify dedicated scratch-server lifecycle and exclusivity (removed by #1636) |
 | 5 | [#610](https://github.com/pongbiphang/pbps/issues/610) | qualify analysis environment builds and deployment context |
 | 6 | [#611](https://github.com/pongbiphang/pbps/issues/611) | qualify analysis environment builds and deployment context |
 | 7 | [#612](https://github.com/pongbiphang/pbps/issues/612) | capture coherent binding inputs and complete prerequisite manifests |
@@ -192,15 +163,16 @@ before the next issue is claimed. #597 is complete; #606 through #613 are delive
 | 10b | [#1274](https://github.com/pongbiphang/pbps/issues/1274) | construct qualified resolver evidence for the shared analysis run |
 | 10 | [#615](https://github.com/pongbiphang/pbps/issues/615) | integrate lazy target planning and pre-publication verification |
 | 11 | [#616](https://github.com/pongbiphang/pbps/issues/616) | verify sealed prerequisites and closing bindings during apply |
-| 12 | [#617](https://github.com/pongbiphang/pbps/issues/617) | qualify private source logging transport and disposable storage |
-| 13 | [#618](https://github.com/pongbiphang/pbps/issues/618) | integrate protected artifacts approval launch and history |
+| 12 | [#617](https://github.com/pongbiphang/pbps/issues/617) | closed: the baseline replaces a source transfer (#1673) |
+| 13 | [#618](https://github.com/pongbiphang/pbps/issues/618) | closed: its checks go to #616 and #621 |
 | 14 | [#619](https://github.com/pongbiphang/pbps/issues/619) | design creation binding coverage and catalog consistency |
 | 15 | [#620](https://github.com/pongbiphang/pbps/issues/620) | implement qualified binding planning and transactional apply |
 | 16 | [#621](https://github.com/pongbiphang/pbps/issues/621) | complete the cross-engine acceptance matrix and delivery documentation |
 
 #594's legacy-reader boundary is no longer a prerequisite: #952 keyed the
 fingerprints (DEC-952.1), so a resolver plan records no verifier to protect.
-#617 still qualifies private reconstruction controls for the source itself. The SQL Server binding design precedes
+No target source is transferred, so no private-source controls are needed
+(#617 is closed). The SQL Server binding design precedes
 its adapter, and final acceptance covers both engines independently. Every
 agreed stage needs successful supported cases; permanent refusal is not delivery.
 
@@ -264,9 +236,8 @@ These are internal foundations. Connected selection still does not publish a
 resolved plan: #615 must connect the qualified lifecycle, complete adapter
 ownership/binding inventory and fresh closing capture to artifact publication.
 #616 must implement transactional pre-/postcondition checks; this build refuses
-resolved apply before DDL until those checks exist. #617 owns private-source
-handling, #618 artifact/report integration, and #619/#620 the independently
-qualified SQL Server adapter. No protected verifier table or legacy-reader
+resolved apply before DDL until those checks exist. #619/#620 own the
+independently qualified SQL Server adapter. No protected verifier table or legacy-reader
 confidentiality proof is reintroduced.
 
 Indexes extracted from a newly created empty table use the ordinary creation

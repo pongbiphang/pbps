@@ -1,5 +1,5 @@
-//! The operator-vouched resolver on a server the operator supplies
-//! (DEC-1528.1; #1667, #1672).
+//! The resolver's scratch run, on a server the operator supplies or a
+//! container started for the run (DEC-1528.1; #1667, #1672, #1674).
 //!
 //! The operator vouches for the scratch server: its isolation, the
 //! confidentiality of what is compiled on it, and the channels to it. pbps
@@ -15,28 +15,28 @@
 //! - the database it compiles in holds nothing initdb did not create.
 //!
 //! The account decides how the run provisions scratch. A superuser on another
-//! cluster gets the measured run's layout: a
-//! run-owned login and database, the deployer's authorization reproduced, the
+//! cluster gets a run-owned login and database, the deployer's authorization reproduced, the
 //! declarations compiled as the reproduced deployer, all dropped afterwards.
 //! Any other account compiles as itself in the database its connection names,
-//! which it must own, and leaves it empty again with `DROP OWNED`. The rest is
-//! the measured run's analysis, with the compatibility rule that compares
-//! what each engine reports instead of what it executes.
+//! which it must own, and leaves it empty again with `DROP OWNED`. The scope
+//! is qualified under the compatibility rule that compares what each engine
+//! reports about itself.
 
 use super::producer::{Identity, Sealing, fingerprint, request, seal};
-use super::{BindingRequest, Error, ProduceError, ResolvedPlan, engine, resolution, scope};
+use super::{BindingRequest, Error, ProduceError, ResolvedPlan, engine, resolution};
+use crate::resolver::scope;
 use pbps_db::resolver::ScratchNames;
 use pbps_db::resolver::environment::{CatalogFacts, Verdict};
 use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
-use pbps_model::resolver::{OutsideWrites, ResolverRuntime, VouchedScratch};
+use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchSource};
 use pbps_pg::resolver::baseline;
 use pbps_pg::resolver::capture::{StageError, Staged};
+use pbps_pg::resolver::scratch::{self as sql, Placement};
 use pbps_pg::resolver::standard::{self, Standard};
-use pbps_pg::resolver::vouched::{self as sql, Placement};
 use std::collections::BTreeSet;
 
-/// One run of the operator-vouched resolver for a connected plan. `scratch`
+/// One run of the resolver for a connected plan. `scratch`
 /// is the connection string the selected resolver's `url_env` holds. The run
 /// releases everything it created before any result leaves, and a cleanup it
 /// could not confirm names exactly what may remain.
@@ -59,7 +59,7 @@ pub async fn produce(
 ) -> Result<ResolvedPlan, ProduceError> {
     if driver != Driver::Postgres {
         return Err(ProduceError::Run(Error::Binding(
-            "the operator-vouched resolver is implemented for PostgreSQL only".into(),
+            "the resolver is implemented for PostgreSQL only".into(),
         )));
     }
     if binding.base != base.schema || binding.desired != desired.schema {
@@ -72,7 +72,7 @@ pub async fn produce(
     let request = request(base, desired, hints, write_path_extras).map_err(ProduceError::Run)?;
     let mut target = Conn::connect(driver, target_connection)
         .await
-        .map_err(|error| vouched(format!("the target could not be connected: {error}")))?;
+        .map_err(|error| unusable(format!("the target could not be connected: {error}")))?;
     let mut admin = Conn::connect(driver, scratch)
         .await
         .map_err(|error| ProduceError::Acquire(format!("the scratch server: {error}")))?;
@@ -83,7 +83,7 @@ pub async fn produce(
     admin
         .execute("SET ROLE NONE")
         .await
-        .map_err(|error| vouched(format!("the scratch session's role: {error}")))?;
+        .map_err(|error| unusable(format!("the scratch session's role: {error}")))?;
     let tokens = Tokens::generate();
     let (placement, account, backend) =
         separation(&mut target, &mut admin, &tokens, planned_identity)
@@ -91,12 +91,12 @@ pub async fn produce(
             .map_err(ProduceError::Run)?;
     let provisioning = match placement {
         Placement::Target => {
-            return Err(vouched(
+            return Err(unusable(
                 "the scratch connection is the target's own database; name a database on another cluster, or a confined account's own database",
             ));
         }
         Placement::SameCluster if !account.confined() => {
-            return Err(vouched(format!(
+            return Err(unusable(format!(
                 "the scratch account shares the target's cluster and is not confined to its database \
                  ({}); remove them from it, or use a scratch server on another cluster",
                 account.excess().join(", ")
@@ -142,7 +142,7 @@ pub async fn produce(
 /// What the evidence records of the scratch a run used (#1674).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provenance {
-    pub scratch: VouchedScratch,
+    pub scratch: ScratchSource,
     pub outside_writes: OutsideWrites,
 }
 
@@ -150,14 +150,14 @@ impl Provenance {
     /// A supplied server, its baseline's outside writes refused.
     pub fn server() -> Self {
         Self {
-            scratch: VouchedScratch::Server {},
+            scratch: ScratchSource::Server {},
             outside_writes: OutsideWrites::Refused,
         }
     }
 }
 
-fn vouched(reason: impl Into<String>) -> ProduceError {
-    ProduceError::Run(Error::Vouched(reason.into()))
+fn unusable(reason: impl Into<String>) -> ProduceError {
+    ProduceError::Run(Error::Unusable(reason.into()))
 }
 
 /// The run's two session tokens: run-generated, so a token found in
@@ -236,7 +236,7 @@ async fn separation(
     // the planning read reached; a check made on another would vouch for
     // the wrong one (#1685).
     if target_identity != planned_identity {
-        return Err(Error::Vouched(format!(
+        return Err(Error::Unusable(format!(
             "the target connection reached another database cluster (system identifier \
              {target_identity}) than the one the plan was read from ({planned_identity}); \
              a target name that reaches more than one cluster, through DNS or a balancing \
@@ -249,7 +249,7 @@ async fn separation(
         &seen,
         scratch_identity == target_identity,
     )
-    .map_err(|reason| Error::Vouched(reason.into()))?;
+    .map_err(|reason| Error::Unusable(reason.into()))?;
     Ok((placement, account, backend))
 }
 
@@ -260,7 +260,7 @@ fn identity(read: Result<String, pbps_db::DbError>, side: &str) -> Result<String
     match read {
         Ok(identity) => Ok(identity),
         Err(error) if error.server_error_code().as_deref() == Some("42501") => {
-            Err(Error::Vouched(format!(
+            Err(Error::Unusable(format!(
                 "the {side} session may not read its cluster's identity ({error}); grant it \
                  with GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO the {side} login"
             )))
@@ -277,7 +277,7 @@ fn identity(read: Result<String, pbps_db::DbError>, side: &str) -> Result<String
 async fn pinned(conn: &mut Conn, checked: &sql::Backend) -> Result<(), Error> {
     match sql::on_backend(conn, checked).await {
         Ok(true) => Ok(()),
-        Ok(false) => Err(Error::Vouched(
+        Ok(false) => Err(Error::Unusable(
             "the scratch connection reached another server backend than the one the run \
              checked; connect to the scratch server directly or through session pooling, \
              not transaction pooling"
@@ -397,7 +397,7 @@ impl Run<'_> {
             Provisioning::Supplied => self.supplied(admin, &authorization, &scope_schemas).await?,
         };
         // The expected visibility is the deployer's after the plan's own
-        // grants, as the measured run compares it.
+        // grants.
         authorization.project_visibility(
             &request.planned,
             &request.schemas,
@@ -580,8 +580,8 @@ impl Run<'_> {
         let identity = Identity {
             rule: pbps_pg::resolver::compatibility::REPORTED_RULE,
             resolver_build: reported_build(self.key, &prepared.scratch_catalog)?,
-            channels: format!("vouched|{}|{}", self.tokens.target, self.tokens.scratch),
-            runtime: ResolverRuntime::Vouched {
+            channels: format!("scratch|{}|{}", self.tokens.target, self.tokens.scratch),
+            runtime: ResolverRuntime::Scratch {
                 scratch: self.provenance.scratch.clone(),
                 outside_writes: self.provenance.outside_writes,
             },
@@ -611,7 +611,7 @@ impl Run<'_> {
         )
     }
 
-    /// The measured run's layout for a superuser on another cluster: a
+    /// The layout for a superuser on another cluster: a
     /// run-owned login and database from `template0` with the target's
     /// recipe, the deployer's authorization reproduced in it, and a session
     /// as the reproduced deployer.
@@ -789,7 +789,7 @@ impl Run<'_> {
             .acl;
         let scope::Authorization::Postgres(context) = authorization else {
             return Err(Error::Scope(
-                "the operator-vouched resolver is implemented for PostgreSQL only".into(),
+                "the resolver is implemented for PostgreSQL only".into(),
             ));
         };
         let map =
@@ -847,7 +847,7 @@ impl Run<'_> {
         // instead (#1678 review). What was given up is granted back at
         // release, which puts public back into its standard state.
         if !usable.is_empty() {
-            return Err(Error::Vouched(format!(
+            return Err(Error::Unusable(format!(
                 "the scratch account keeps USAGE on what the plan takes from the deployer ({}); \
                  remove those privileges from the scratch account",
                 usable.join("; ")
@@ -891,7 +891,7 @@ impl Run<'_> {
             .await
             .map_err(db("the scratch database's owner"))?
         {
-            return Err(Error::Vouched(format!(
+            return Err(Error::Unusable(format!(
                 "the scratch account {} does not own the database its connection names; \
                  run ALTER DATABASE ... OWNER TO {0}, since the run empties it with DROP OWNED",
                 principal.login
@@ -916,7 +916,7 @@ impl Run<'_> {
         if reach.is_empty() {
             return Ok(());
         }
-        Err(Error::Vouched(format!(
+        Err(Error::Unusable(format!(
             "the scratch account {login} has objects or privileges that emptying its database \
              with DROP OWNED would also drop or revoke ({}); use an account with none outside \
              that database",
@@ -1048,7 +1048,7 @@ async fn put_into_standard(conn: &mut Conn, declared: &Standard) -> Result<(), E
         .await
         .map_err(db("the scratch database's declared standard"))?;
     if !unappliable.is_empty() {
-        return Err(Error::Vouched(format!(
+        return Err(Error::Unusable(format!(
             "the scratch account cannot apply the resolver's declared standard: {}",
             unappliable.join("; ")
         )));
@@ -1065,7 +1065,7 @@ async fn put_into_standard(conn: &mut Conn, declared: &Standard) -> Result<(), E
         .await
         .map_err(db("the scratch database's standard state"))?;
     if !refused.is_empty() {
-        return Err(Error::Vouched(format!(
+        return Err(Error::Unusable(format!(
             "the scratch database cannot be put into its declared standard state, so nothing \
              was written ({}); its operator must repair the database or the declaration",
             refused.join("; ")
@@ -1080,7 +1080,7 @@ async fn put_into_standard(conn: &mut Conn, declared: &Standard) -> Result<(), E
     if left.is_empty() {
         return Ok(());
     }
-    Err(Error::Vouched(format!(
+    Err(Error::Unusable(format!(
         "the scratch database is not in its standard state and the scratch account cannot \
          put it there ({}){}; its operator must repair it",
         left.join("; "),
@@ -1216,7 +1216,7 @@ impl Run<'_> {
                     .await
                     .map_err(db("the baseline's schemas the deployer cannot use"))?;
                 if !kept.is_empty() {
-                    return Err(Error::Vouched(format!(
+                    return Err(Error::Unusable(format!(
                         "the scratch account keeps USAGE on a schema the target's deployer \
                          cannot use ({}); remove those privileges from the scratch account",
                         kept.join("; ")
@@ -1408,7 +1408,7 @@ async fn refuse_foreign_objects(conn: &mut Conn) -> Result<(), Error> {
     if total == 0 {
         return Ok(());
     }
-    Err(Error::Vouched(format!(
+    Err(Error::Unusable(format!(
         "the scratch database is not empty: {total} object(s) initdb did not create, including {}",
         named.join(", ")
     )))
@@ -1467,6 +1467,9 @@ tokio::task_local! {
 }
 
 pub mod container;
+
+#[cfg(test)]
+pub(super) mod fixtures;
 
 #[cfg(test)]
 mod live_tests;

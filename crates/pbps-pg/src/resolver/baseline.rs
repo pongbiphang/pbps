@@ -323,7 +323,7 @@ pub async fn inventory(conn: &mut impl QueryConnection) -> Result<Inventory, DbE
                       WHERE d.classid = f.classid AND d.objid = f.objid \
                         AND d.deptype IN ('i', 'a', 'e')) AS carried \
                FROM ({}) f",
-            super::vouched::user_objects()
+            super::scratch::user_objects()
         ))
         .await
     }

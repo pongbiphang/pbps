@@ -1,4 +1,4 @@
-//! Live regressions for the operator-vouched resolver (#1672), on the pinned
+//! Live regressions for the resolver (#1672), on the pinned
 //! PostgreSQL servers with no root, no Docker and no process observation.
 //!
 //! Each test makes its own target and scratch databases and logins, named
@@ -6,9 +6,8 @@
 //! measured producer's motivating pair (`qualified_evidence_cases`): an
 //! arriving integer overload rebinds one view and leaves the other alone.
 
-use super::super::qualified_evidence_cases as cases;
-use super::super::qualified_evidence_tests::{ENVIRONMENT, Inputs, ProjectKey, view};
 use super::super::{Error, ProduceError, ResolvedPlan};
+use super::fixtures::{self as cases, ENVIRONMENT, Inputs, ProjectKey, view};
 use pbps_db::{Conn, Driver};
 use pbps_model::Change;
 use pbps_pg::resolver::standard::Standard;
@@ -158,7 +157,7 @@ impl Fixture {
         let mut conn = Conn::connect(Driver::Postgres, &self.on(database))
             .await
             .unwrap();
-        pbps_pg::resolver::vouched::foreign_objects(&mut conn)
+        pbps_pg::resolver::scratch::foreign_objects(&mut conn)
             .await
             .unwrap()
     }
@@ -204,7 +203,7 @@ async fn produce_with(
     // As the planning read records it: the identity of the cluster the
     // target string reached.
     let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
-    let identity = pbps_pg::resolver::vouched::cluster_identity(&mut planning)
+    let identity = pbps_pg::resolver::scratch::cluster_identity(&mut planning)
         .await
         .unwrap();
     produce_planned_on(scratch, target, &identity, inputs, key, standard).await
@@ -237,13 +236,13 @@ async fn produce_planned_on(
     .await
 }
 
-fn vouched_refusal(result: Result<ResolvedPlan, ProduceError>) -> String {
+fn resolver_refusal(result: Result<ResolvedPlan, ProduceError>) -> String {
     // Never panics: the caller drops its fixture first and asserts on this,
     // so a wrong outcome does not leave databases and roles behind.
     match result {
-        Err(ProduceError::Run(Error::Vouched(reason))) => reason,
-        Err(other) => format!("not a vouched refusal: {other}"),
-        Ok(_) => "not a vouched refusal: a plan".into(),
+        Err(ProduceError::Run(Error::Unusable(reason))) => reason,
+        Err(other) => format!("not a resolver refusal: {other}"),
+        Ok(_) => "not a resolver refusal: a plan".into(),
     }
 }
 
@@ -252,23 +251,23 @@ fn vouched_refusal(result: Result<ResolvedPlan, ProduceError>) -> String {
 /// stays, and the resolved plan leaves it alone although ADR-0013's
 /// candidate test would rebuild it.
 fn assert_answers_the_overload(plan: &ResolvedPlan) {
-    assert_answers_the_overload_from(plan, pbps_model::resolver::VouchedScratch::Server {});
+    assert_answers_the_overload_from(plan, pbps_model::resolver::ScratchSource::Server {});
 }
 
 fn assert_answers_the_overload_from(
     plan: &ResolvedPlan,
-    scratch: pbps_model::resolver::VouchedScratch,
+    scratch: pbps_model::resolver::ScratchSource,
 ) {
     plan.evidence.validate(&plan.changes).unwrap();
     pbps_pg::resolver::validate_evidence(&plan.evidence)
-        .expect("the vouched evidence passes the artifact reader");
+        .expect("the resolver's evidence passes the artifact reader");
     assert_eq!(
         plan.evidence.qualification().runtime,
-        pbps_model::resolver::ResolverRuntime::Vouched {
+        pbps_model::resolver::ResolverRuntime::Scratch {
             scratch,
             outside_writes: pbps_model::resolver::OutsideWrites::Refused,
         },
-        "the evidence names the operator-vouched resolver and its scratch"
+        "the evidence names the resolver's scratch"
     );
     assert_eq!(
         plan.evidence.qualification().rule,
@@ -298,7 +297,7 @@ fn assert_answers_the_overload_from(
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_answers_a_managed_question_without_root_or_observation() {
+async fn resolver_answers_a_managed_question_without_root_or_observation() {
     // A superuser scratch on another cluster: the run-owned layout.
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let scratch = Fixture::new(SCRATCH_SERVER);
@@ -319,7 +318,7 @@ async fn vouched_answers_a_managed_question_without_root_or_observation() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_runs_in_a_precreated_database_with_a_confined_account() {
+async fn resolver_runs_in_a_precreated_database_with_a_confined_account() {
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
         let target_db = fixture.target().await;
@@ -363,7 +362,7 @@ async fn vouched_runs_in_a_precreated_database_with_a_confined_account() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_the_target_as_scratch() {
+async fn resolver_refuses_the_target_as_scratch() {
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
         let target_db = fixture.target().await;
@@ -374,7 +373,7 @@ async fn vouched_refuses_the_target_as_scratch() {
         // an address can be: the engines, not the strings, decide.
         let spelled = format!("{} application_name=another", fixture.on(&target_db));
         let reason =
-            vouched_refusal(produce(&spelled, &fixture.on(&target_db), &inputs, &key).await);
+            resolver_refusal(produce(&spelled, &fixture.on(&target_db), &inputs, &key).await);
         let after = fixture.inventory().await;
         fixture.drop().await;
         assert!(
@@ -387,7 +386,7 @@ async fn vouched_refuses_the_target_as_scratch() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_target_connection_on_another_cluster_than_the_plan_was_read_from() {
+async fn resolver_refuses_a_target_connection_on_another_cluster_than_the_plan_was_read_from() {
     // A target name that reaches two clusters, through DNS or a balancing
     // proxy: the planning read reached the one the superuser scratch sits
     // on, and the resolver's own connection the other. The marks then read
@@ -399,13 +398,13 @@ async fn vouched_refuses_a_target_connection_on_another_cluster_than_the_plan_wa
     let mut planned = Conn::connect(Driver::Postgres, &scratch.server)
         .await
         .unwrap();
-    let planned = pbps_pg::resolver::vouched::cluster_identity(&mut planned)
+    let planned = pbps_pg::resolver::scratch::cluster_identity(&mut planned)
         .await
         .unwrap();
     let inputs = Inputs::overload();
     let key = ProjectKey::new(true);
     let before = scratch.inventory().await;
-    let reason = vouched_refusal(
+    let reason = resolver_refusal(
         produce_planned_on(
             &scratch.server,
             &target.on(&target_db),
@@ -424,7 +423,7 @@ async fn vouched_refuses_a_target_connection_on_another_cluster_than_the_plan_wa
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_scratch_that_may_not_read_its_cluster_identity() {
+async fn resolver_refuses_a_scratch_that_may_not_read_its_cluster_identity() {
     // Without the identity a scratch on the target's cluster could pass as
     // another one, so the run refuses instead of falling back to the marks,
     // and names the grant (#1685). A function's privileges belong to each
@@ -441,7 +440,7 @@ async fn vouched_refuses_a_scratch_that_may_not_read_its_cluster_identity() {
             .await;
         let inputs = Inputs::overload();
         let key = ProjectKey::new(true);
-        let reason = vouched_refusal(
+        let reason = resolver_refusal(
             produce(
                 &fixture.as_login(&scratch_db, &login),
                 &fixture.on(&target_db),
@@ -462,7 +461,7 @@ async fn vouched_refuses_a_scratch_that_may_not_read_its_cluster_identity() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
+async fn resolver_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
         let target_db = fixture.target().await;
@@ -535,10 +534,10 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
         fixture.roles.insert(0, admin_of.clone());
         let owned_elsewhere = fixture.database("w", Some(&owner)).await;
         let before = fixture.inventory().await;
-        let superuser = vouched_refusal(
+        let superuser = resolver_refusal(
             produce(&fixture.on(&other), &fixture.on(&target_db), &inputs, &key).await,
         );
-        let member = vouched_refusal(
+        let member = resolver_refusal(
             produce(
                 &fixture.as_login(&owned, &(creator.clone(), password.clone())),
                 &fixture.on(&target_db),
@@ -547,7 +546,7 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
             )
             .await,
         );
-        let reach = vouched_refusal(
+        let reach = resolver_refusal(
             produce(
                 &fixture.as_login(&reaching, &(reacher.clone(), reacher_password.clone())),
                 &fixture.on(&target_db),
@@ -591,7 +590,7 @@ async fn vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_scratch_that_is_not_empty() {
+async fn resolver_refuses_a_scratch_that_is_not_empty() {
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
         let target_db = fixture.target().await;
@@ -603,7 +602,7 @@ async fn vouched_refuses_a_scratch_that_is_not_empty() {
             login.0
         );
         fixture.run(&scratch_db, &[&leftover]).await;
-        let reason = vouched_refusal(
+        let reason = resolver_refusal(
             produce(
                 &fixture.as_login(&scratch_db, &login),
                 &fixture.on(&target_db),
@@ -631,7 +630,7 @@ async fn vouched_refuses_a_scratch_that_is_not_empty() {
                 ],
             )
             .await;
-        let subscription = vouched_refusal(
+        let subscription = resolver_refusal(
             produce(
                 &fixture.as_login(&subscribed, &login),
                 &fixture.on(&target_db),
@@ -646,7 +645,7 @@ async fn vouched_refuses_a_scratch_that_is_not_empty() {
         fixture.run(&target_db, &[&owner_back]).await;
         let lob = fixture.database("l", Some(&login.0)).await;
         fixture.run(&lob, &["SELECT pg_catalog.lo_create(1)"]).await;
-        let large_object = vouched_refusal(
+        let large_object = resolver_refusal(
             produce(
                 &fixture.as_login(&lob, &login),
                 &fixture.on(&target_db),
@@ -665,7 +664,7 @@ async fn vouched_refuses_a_scratch_that_is_not_empty() {
         // Negative: a database the login does not own is refused too, since
         // emptying it afterwards would revoke what was granted on it.
         let foreign = fixture.database("f", None).await;
-        let unowned = vouched_refusal(
+        let unowned = resolver_refusal(
             produce(
                 &fixture.as_login(&foreign, &login),
                 &fixture.on(&target_db),
@@ -701,7 +700,7 @@ async fn vouched_refuses_a_scratch_that_is_not_empty() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_empties_the_supplied_database_when_the_run_refuses() {
+async fn resolver_empties_the_supplied_database_when_the_run_refuses() {
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
         let target_db = fixture.target().await;
@@ -736,7 +735,7 @@ async fn vouched_empties_the_supplied_database_when_the_run_refuses() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_grants_elsewhere() {
+async fn resolver_refuses_a_supplied_login_whose_cleanup_would_revoke_grants_elsewhere() {
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
         let target_db = fixture.target().await;
@@ -778,7 +777,7 @@ async fn vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_grants_else
         let before = acl().await;
         let inputs = Inputs::overload();
         let key = ProjectKey::new(true);
-        let reason = vouched_refusal(
+        let reason = resolver_refusal(
             produce(
                 &fixture.as_login(&scratch_db, &login),
                 &fixture.on(&target_db),
@@ -801,7 +800,7 @@ async fn vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_grants_else
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_compiles_as_a_non_superuser_provisioner_in_its_own_database() {
+async fn resolver_compiles_as_a_non_superuser_provisioner_in_its_own_database() {
     // A `CREATEROLE CREATEDB` login on another cluster cannot act as the
     // roles it would create, so it takes the supplied layout, not run-owned.
     // Neither can a member of a superuser role: `SUPERUSER` is not
@@ -846,7 +845,7 @@ async fn vouched_compiles_as_a_non_superuser_provisioner_in_its_own_database() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_cleanup_runs_only_on_the_backend_the_run_checked() {
+async fn resolver_cleanup_runs_only_on_the_backend_the_run_checked() {
     // A transaction pooler can hand the cleanup another backend than the one
     // the run checked. Two connections stand in for it: the cleanup is
     // bound to the first one's backend and runs on the second.
@@ -864,12 +863,12 @@ async fn vouched_cleanup_runs_only_on_the_backend_the_run_checked() {
         let as_login = fixture.as_login(&scratch_db, &login);
         let mut checked = Conn::connect(Driver::Postgres, &as_login).await.unwrap();
         let mut other = Conn::connect(Driver::Postgres, &as_login).await.unwrap();
-        let backend = pbps_pg::resolver::vouched::backend(&mut checked)
+        let backend = pbps_pg::resolver::scratch::backend(&mut checked)
             .await
             .unwrap();
-        let moved = pbps_pg::resolver::vouched::drop_owned(&mut other, &backend).await;
+        let moved = pbps_pg::resolver::scratch::drop_owned(&mut other, &backend).await;
         let after_moved = fixture.foreign_objects(&scratch_db).await;
-        let same = pbps_pg::resolver::vouched::drop_owned(&mut checked, &backend).await;
+        let same = pbps_pg::resolver::scratch::drop_owned(&mut checked, &backend).await;
         let after_same = fixture.foreign_objects(&scratch_db).await;
         drop((checked, other));
         fixture.drop().await;
@@ -890,7 +889,7 @@ async fn vouched_cleanup_runs_only_on_the_backend_the_run_checked() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_compiles_as_the_login_whatever_its_session_defaults() {
+async fn resolver_compiles_as_the_login_whatever_its_session_defaults() {
     // The login's own defaults: a time zone, a date style and a string
     // mode the compile pins away, and a default role it is a member of. The run still binds
     // its backend, compiles as the login and empties the database.
@@ -947,7 +946,7 @@ async fn vouched_compiles_as_the_login_whatever_its_session_defaults() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_provisions_as_the_superuser_login_whatever_its_default_role() {
+async fn resolver_provisions_as_the_superuser_login_whatever_its_default_role() {
     // A superuser login whose default role cannot create roles: every
     // connection the run opens as it must act as the login itself, and so
     // must every step that switches role and back, such as replaying a
@@ -1008,7 +1007,7 @@ async fn vouched_provisions_as_the_superuser_login_whatever_its_default_role() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_memberships_it_granted() {
+async fn resolver_refuses_a_supplied_login_whose_cleanup_would_revoke_memberships_it_granted() {
     // The login holds `ADMIN OPTION` on a role and granted it to another
     // role. `DROP OWNED` would remove that membership, which lives outside
     // the scratch database (#1678 review). On the target's cluster the
@@ -1054,7 +1053,7 @@ async fn vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_memberships
     let before = granted().await;
     let inputs = Inputs::overload();
     let key = ProjectKey::new(true);
-    let reason = vouched_refusal(
+    let reason = resolver_refusal(
         produce(
             &fixture.as_login(&scratch_db, &login),
             &target.on(&target_db),
@@ -1101,7 +1100,7 @@ async fn not_standard(
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_repairs_a_supplied_scratch_an_interrupted_run_left_changed() {
+async fn resolver_repairs_a_supplied_scratch_an_interrupted_run_left_changed() {
     // What a run that died before its release can leave, changed by the
     // login itself: the next run puts it back into its standard state
     // first, and answers (#1708).
@@ -1147,7 +1146,7 @@ async fn vouched_repairs_a_supplied_scratch_an_interrupted_run_left_changed() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_applies_a_declared_standard_and_keeps_a_hardened_database_acl() {
+async fn resolver_applies_a_declared_standard_and_keeps_a_hardened_database_acl() {
     // The declared settings, comments, limit and grant are applied over a
     // scratch configured otherwise, and kept through the release; the
     // database's own hardened ACL is the operator's and stays (#1708).
@@ -1207,7 +1206,7 @@ async fn vouched_applies_a_declared_standard_and_keeps_a_hardened_database_acl()
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_declared_setting_the_scratch_account_may_not_set_before_writing() {
+async fn resolver_refuses_a_declared_setting_the_scratch_account_may_not_set_before_writing() {
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
         let target_db = fixture.target().await;
@@ -1225,7 +1224,7 @@ async fn vouched_refuses_a_declared_setting_the_scratch_account_may_not_set_befo
         };
         let inputs = Inputs::overload();
         let key = ProjectKey::new(true);
-        let reason = vouched_refusal(
+        let reason = resolver_refusal(
             produce_with(
                 &fixture.as_login(&scratch_db, &login),
                 &fixture.on(&target_db),
@@ -1252,7 +1251,7 @@ async fn vouched_refuses_a_declared_setting_the_scratch_account_may_not_set_befo
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_declared_value_the_engine_rejects_before_writing() {
+async fn resolver_refuses_a_declared_value_the_engine_rejects_before_writing() {
     // A permitted setting with a value the engine cannot parse: the
     // declared state is tried and rolled back first, so the run refuses
     // naming it, and the comment that would have been written first stays
@@ -1268,7 +1267,7 @@ async fn vouched_refuses_a_declared_value_the_engine_rejects_before_writing() {
         };
         let inputs = Inputs::overload();
         let key = ProjectKey::new(true);
-        let reason = vouched_refusal(
+        let reason = resolver_refusal(
             produce_with(
                 &fixture.as_login(&scratch_db, &login),
                 &fixture.on(&target_db),
@@ -1290,7 +1289,7 @@ async fn vouched_refuses_a_declared_value_the_engine_rejects_before_writing() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_public_grant_chain_it_cannot_revoke_and_leaves_the_acl() {
+async fn resolver_refuses_a_public_grant_chain_it_cannot_revoke_and_leaves_the_acl() {
     // A role granted USAGE on public with its grant option passed it on:
     // the onward entry is that role's to revoke, not the login's. The run
     // refuses naming it, and the ACL stays as it was (#1708, #1678 review).
@@ -1323,7 +1322,7 @@ async fn vouched_refuses_a_public_grant_chain_it_cannot_revoke_and_leaves_the_ac
         let before = acl().await;
         let inputs = Inputs::overload();
         let key = ProjectKey::new(true);
-        let reason = vouched_refusal(
+        let reason = resolver_refusal(
             produce(
                 &fixture.as_login(&scratch_db, &login),
                 &fixture.on(&target_db),
@@ -1344,7 +1343,7 @@ async fn vouched_refuses_a_public_grant_chain_it_cannot_revoke_and_leaves_the_ac
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_release_puts_a_supplied_scratch_back_and_names_what_it_cannot() {
+async fn resolver_release_puts_a_supplied_scratch_back_and_names_what_it_cannot() {
     // What a compiled definition may change during the run, put back by
     // the release on the run's own connection; and a setting the login may
     // not remove, named rather than reported as a clean release (#1708).
@@ -1356,10 +1355,10 @@ async fn vouched_release_puts_a_supplied_scratch_back_and_names_what_it_cannot()
         let mut conn = Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
             .await
             .unwrap();
-        let backend = pbps_pg::resolver::vouched::backend(&mut conn)
+        let backend = pbps_pg::resolver::scratch::backend(&mut conn)
             .await
             .unwrap();
-        let defaults = pbps_pg::resolver::vouched::login_defaults(&mut conn)
+        let defaults = pbps_pg::resolver::scratch::login_defaults(&mut conn)
             .await
             .unwrap();
         let acl = pbps_pg::resolver::standard::read_state(&mut conn)
@@ -1418,7 +1417,7 @@ async fn vouched_release_puts_a_supplied_scratch_back_and_names_what_it_cannot()
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_run_owned_keeps_what_the_reproduction_put_on_its_database() {
+async fn resolver_run_owned_keeps_what_the_reproduction_put_on_its_database() {
     // The declared limit goes on after the run login's session opens, and
     // only the limit: the reproduction has by then rebuilt an in-scope
     // `public` and stored the target's database defaults, which a second
@@ -1439,7 +1438,7 @@ async fn vouched_run_owned_keeps_what_the_reproduction_put_on_its_database() {
     let before = scratch.inventory().await;
     let target_url = target.on(&target_db);
     let mut planning = Conn::connect(Driver::Postgres, &target_url).await.unwrap();
-    let identity = pbps_pg::resolver::vouched::cluster_identity(&mut planning)
+    let identity = pbps_pg::resolver::scratch::cluster_identity(&mut planning)
         .await
         .unwrap();
     // `public` on the write path puts it in the reproduction's scope.
@@ -1488,7 +1487,7 @@ async fn vouched_run_owned_keeps_what_the_reproduction_put_on_its_database() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_run_owned_compiles_under_the_declared_standard() {
+async fn resolver_run_owned_compiles_under_the_declared_standard() {
     // The database a superuser scratch creates gets the same declared state
     // as a supplied one (#1708): a declared grant to a role the scratch
     // server lacks refuses before anything is compiled, and a declared
@@ -1501,7 +1500,7 @@ async fn vouched_run_owned_compiles_under_the_declared_standard() {
     let key = ProjectKey::new(true);
     let missing = format!("pbps_v1708_absent_{}", scratch.token);
     let before = scratch.inventory().await;
-    let refused = vouched_refusal(
+    let refused = resolver_refusal(
         produce_with(
             &scratch.server,
             &target.on(&target_db),
@@ -1590,7 +1589,7 @@ async fn produce_staged(
     baseline: &str,
 ) -> Result<ResolvedPlan, ProduceError> {
     let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
-    let identity = pbps_pg::resolver::vouched::cluster_identity(&mut planning)
+    let identity = pbps_pg::resolver::scratch::cluster_identity(&mut planning)
         .await
         .unwrap();
     super::produce(
@@ -1710,7 +1709,7 @@ fn reading(column: &str, relation: &str) -> String {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_compiles_a_managed_view_over_a_baseline_table() {
+async fn resolver_compiles_a_managed_view_over_a_baseline_table() {
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
     // Run-owned: a superuser scratch on another cluster.
@@ -1755,7 +1754,7 @@ async fn vouched_compiles_a_managed_view_over_a_baseline_table() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_compares_an_external_table_without_its_foreign_keys_and_triggers() {
+async fn resolver_compares_an_external_table_without_its_foreign_keys_and_triggers() {
     // The baseline leaves out the referenced table, the CHECK, the default,
     // the trigger and its function, and the plain index.
     for server in SERVERS {
@@ -1779,7 +1778,7 @@ async fn vouched_compares_an_external_table_without_its_foreign_keys_and_trigger
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_baseline_that_differs_from_the_target() {
+async fn resolver_refuses_a_baseline_that_differs_from_the_target() {
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
         let mut setup = guarded_target();
@@ -1831,7 +1830,7 @@ async fn vouched_refuses_a_baseline_that_differs_from_the_target() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_baseline_that_creates_a_managed_object() {
+async fn resolver_refuses_a_baseline_that_creates_a_managed_object() {
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let scratch = Fixture::new(SCRATCH_SERVER);
     let target_db = staging_target(&mut target, &guarded_target()).await;
@@ -1862,7 +1861,7 @@ async fn vouched_refuses_a_baseline_that_creates_a_managed_object() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_runs_the_baseline_before_any_managed_object() {
+async fn resolver_runs_the_baseline_before_any_managed_object() {
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
     // A statement naming a managed object fails: nothing managed exists yet.
@@ -1937,7 +1936,7 @@ async fn vouched_runs_the_baseline_before_any_managed_object() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_baseline_object_left_uncompared() {
+async fn resolver_refuses_a_baseline_object_left_uncompared() {
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let scratch = Fixture::new(SCRATCH_SERVER);
     let mut setup = guarded_target();
@@ -1974,7 +1973,7 @@ async fn vouched_refuses_a_baseline_object_left_uncompared() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_chain_through_an_external_object_naming_it() {
+async fn resolver_refuses_a_chain_through_an_external_object_naming_it() {
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let scratch = Fixture::new(SCRATCH_SERVER);
     let setup = vec![
@@ -2021,7 +2020,7 @@ fn view_target() -> Vec<String> {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view() {
+async fn resolver_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view() {
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let scratch = Fixture::new(SCRATCH_SERVER);
     let target_db = staging_target(&mut target, &view_target()).await;
@@ -2046,7 +2045,7 @@ async fn vouched_compiles_a_managed_view_over_an_external_view_staged_as_a_shape
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_an_external_view_staged_as_a_table() {
+async fn resolver_refuses_an_external_view_staged_as_a_table() {
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let scratch = Fixture::new(SCRATCH_SERVER);
     let target_db = staging_target(&mut target, &view_target()).await;
@@ -2075,7 +2074,7 @@ async fn vouched_refuses_an_external_view_staged_as_a_table() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_reports_a_write_through_a_shape_view_with_the_real_definition_remedy() {
+async fn resolver_reports_a_write_through_a_shape_view_with_the_real_definition_remedy() {
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let scratch = Fixture::new(SCRATCH_SERVER);
     let target_db = staging_target(&mut target, &view_target()).await;
@@ -2128,7 +2127,7 @@ async fn vouched_reports_a_write_through_a_shape_view_with_the_real_definition_r
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_question_that_needs_routine_source_the_baseline_lacks() {
+async fn resolver_refuses_a_question_that_needs_routine_source_the_baseline_lacks() {
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let scratch = Fixture::new(SCRATCH_SERVER);
     let setup = vec![
@@ -2176,7 +2175,7 @@ async fn vouched_refuses_a_question_that_needs_routine_source_the_baseline_lacks
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_compares_what_the_baseline_adds_to_an_extension_it_did_not_create() {
+async fn resolver_compares_what_the_baseline_adds_to_an_extension_it_did_not_create() {
     // `plpgsql` is there before the baseline runs, so a routine the
     // baseline adds to it is compared on its own, not skipped as covered by
     // an extension version nobody compared.
@@ -2218,7 +2217,7 @@ async fn vouched_compares_what_the_baseline_adds_to_an_extension_it_did_not_crea
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_stages_a_routine_in_a_system_schema_by_its_header() {
+async fn resolver_stages_a_routine_in_a_system_schema_by_its_header() {
     // A superuser may create a routine in `information_schema` (measured on
     // 16 and 18). Staged there, it is compared by its header like any staged
     // routine: the baseline need not repeat the target's body (SPEC §9.3.2).
@@ -2262,7 +2261,7 @@ async fn vouched_stages_a_routine_in_a_system_schema_by_its_header() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_stages_a_cast_and_an_operator_over_external_types_in_the_baseline() {
+async fn resolver_stages_a_cast_and_an_operator_over_external_types_in_the_baseline() {
     let external = [
         format!("CREATE SCHEMA {EXTERNAL}"),
         format!("CREATE TYPE {EXTERNAL}.pair AS (a integer, b integer)"),
@@ -2314,7 +2313,7 @@ async fn vouched_stages_a_cast_and_an_operator_over_external_types_in_the_baseli
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_compares_each_extension_member_with_the_target() {
+async fn resolver_compares_each_extension_member_with_the_target() {
     // The extension's version matches; one member the target altered in
     // place does not, and is named (#1766, #1783).
     let call = format!("SELECT {EXTERNAL}.soundex('pbps') AS r");
@@ -2362,7 +2361,7 @@ async fn vouched_compares_each_extension_member_with_the_target() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_an_extension_with_a_member_no_capture_identifies() {
+async fn resolver_refuses_an_extension_with_a_member_no_capture_identifies() {
     // `postgres_fdw` brings a foreign-data wrapper, a class the capture has
     // no identity for. Sealing a plan that reads the extension would need
     // it, so the comparison names it first.
@@ -2399,7 +2398,7 @@ async fn vouched_refuses_an_extension_with_a_member_no_capture_identifies() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_stages_an_extension_that_brings_text_search_objects() {
+async fn resolver_stages_an_extension_that_brings_text_search_objects() {
     // `unaccent` brings a text search dictionary and template, which the
     // capture identifies and the comparison reads like any member (#1786).
     let call = format!("SELECT {EXTERNAL}.unaccent('pbps') AS r");
@@ -2431,7 +2430,7 @@ async fn vouched_stages_an_extension_that_brings_text_search_objects() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_compares_a_text_search_dictionary_with_the_target() {
+async fn resolver_compares_a_text_search_dictionary_with_the_target() {
     // A dictionary's options are its shape; one that differs refuses,
     // naming it, and one that matches stages (#1786).
     // With a configuration mapped to it, whose mapping rows are its parts.
@@ -2483,7 +2482,7 @@ async fn vouched_compares_a_text_search_dictionary_with_the_target() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_compares_an_operator_familys_members_with_the_target() {
+async fn resolver_compares_an_operator_familys_members_with_the_target() {
     // A row comparison binds by the strategy its operator serves in a
     // btree family; the same family header with another strategy is a
     // different family to it (#1768, #1783).
@@ -2544,7 +2543,7 @@ async fn vouched_compares_an_operator_familys_members_with_the_target() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_takes_a_routine_over_a_staged_type_as_no_part_of_it() {
+async fn resolver_takes_a_routine_over_a_staged_type_as_no_part_of_it() {
     // A routine's signature names its argument types; that does not make it
     // a part of them. The target's view calls one the shape view need not
     // stage.
@@ -2592,7 +2591,7 @@ async fn vouched_takes_a_routine_over_a_staged_type_as_no_part_of_it() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_staged_shape_that_changes_before_the_opening_capture() {
+async fn resolver_refuses_a_staged_shape_that_changes_before_the_opening_capture() {
     // A writer between the baseline's comparison and the capture the plan
     // seals: scratch compiled `SELECT *` against the compared table, and
     // the evidence would seal the table with another column (#1755).
@@ -2639,7 +2638,7 @@ async fn vouched_refuses_a_staged_shape_that_changes_before_the_opening_capture(
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_compares_a_sequence_its_table_owns() {
+async fn resolver_compares_a_sequence_its_table_owns() {
     // An identity column's sequence is a part of its table by a dependency
     // that no list names; it is compared all the same (#1783).
     let table = [
@@ -2685,7 +2684,7 @@ async fn vouched_compares_a_sequence_its_table_owns() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_compares_an_operator_class_with_its_family() {
+async fn resolver_compares_an_operator_class_with_its_family() {
     // The class lives on its family automatically; whether it is its type's
     // default is in its own header, compared with the family (#1783).
     let class = |default: bool| {
@@ -2735,7 +2734,7 @@ async fn vouched_compares_an_operator_class_with_its_family() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_refuses_a_baseline_that_writes_outside_the_scratch_database() {
+async fn resolver_refuses_a_baseline_that_writes_outside_the_scratch_database() {
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
     // Run-owned: the baseline runs as the scratch superuser.
@@ -2835,7 +2834,7 @@ async fn vouched_refuses_a_baseline_that_writes_outside_the_scratch_database() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_runs_the_baseline_on_the_empty_path_every_session_pins() {
+async fn resolver_runs_the_baseline_on_the_empty_path_every_session_pins() {
     // Every pbps session pins an empty path (DEC-1564.1), the baseline's
     // too: a file written for `psql` names its schemas or sets the path, as
     // `pg_dump` output does, and one that does neither is told so.
@@ -2882,7 +2881,7 @@ async fn vouched_runs_the_baseline_on_the_empty_path_every_session_pins() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_checks_a_baseline_whose_path_shadows_a_built_in_type() {
+async fn resolver_checks_a_baseline_whose_path_shadows_a_built_in_type() {
     // The baseline's `SET`s last on its session until `DISCARD ALL`, and the
     // checks after it run there: a type it names `text`, first on its path,
     // must not change what they read.
@@ -2911,7 +2910,7 @@ async fn vouched_checks_a_baseline_whose_path_shadows_a_built_in_type() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_compares_every_attribute_of_another_database() {
+async fn resolver_compares_every_attribute_of_another_database() {
     // A collation version no list of columns named: refreshing another
     // database's is a write outside the scratch database like any other.
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
@@ -2962,7 +2961,7 @@ async fn vouched_compares_every_attribute_of_another_database() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_reads_the_shared_state_under_its_own_settings_not_the_baselines() {
+async fn resolver_reads_the_shared_state_under_its_own_settings_not_the_baselines() {
     // A baseline's `SET TimeZone` renders a role's expiry with another
     // offset; read under it, the second read of the shared state would
     // differ from the first and refuse a baseline that changed nothing.
@@ -3000,7 +2999,7 @@ async fn vouched_reads_the_shared_state_under_its_own_settings_not_the_baselines
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_ignores_another_sessions_cluster_writes_during_the_baseline() {
+async fn resolver_ignores_another_sessions_cluster_writes_during_the_baseline() {
     // Other runs share the scratch cluster: a role one creates while this
     // baseline runs is in neither of its reads, so nothing is refused.
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
@@ -3048,7 +3047,7 @@ async fn vouched_ignores_another_sessions_cluster_writes_during_the_baseline() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_compares_an_extension_member_in_a_system_schema_in_full() {
+async fn resolver_compares_an_extension_member_in_a_system_schema_in_full() {
     // An extension's member is compared on its own, here in a system
     // schema: one the target altered in place is refused by name, not
     // accepted for its extension's version (#1783).
@@ -3083,7 +3082,7 @@ async fn vouched_compares_an_extension_member_in_a_system_schema_in_full() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_stages_an_operator_over_built_in_types_in_the_baseline() {
+async fn resolver_stages_an_operator_over_built_in_types_in_the_baseline() {
     // An operator's identity hangs off its operand types; over built-in
     // types those are not staged, so the operator itself is.
     let external = [
@@ -3133,7 +3132,7 @@ async fn vouched_stages_an_operator_over_built_in_types_in_the_baseline() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates() {
+async fn resolver_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates() {
     // A deployer that is no superuser: without its USAGE on the external
     // schema reproduced, its views there would not compile on scratch.
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
@@ -3179,7 +3178,7 @@ async fn vouched_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_reproduces_the_deployers_usage_of_a_schema_an_extension_carries() {
+async fn resolver_reproduces_the_deployers_usage_of_a_schema_an_extension_carries() {
     // An extension can create its own schema (`pg_cron`'s `cron`); built
     // here with `ALTER EXTENSION ... ADD SCHEMA`. It is the extension's
     // member, not a root, yet the deployer's USAGE on it must be reproduced.
@@ -3240,7 +3239,7 @@ async fn vouched_reproduces_the_deployers_usage_of_a_schema_an_extension_carries
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_takes_an_unmanaged_overload_of_a_managed_routine_for_no_chain() {
+async fn resolver_takes_an_unmanaged_overload_of_a_managed_routine_for_no_chain() {
     // `f(integer)` is managed; `f(e)` shares its name and is not, and binds
     // an external table whose column is of a managed table's row type.
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
@@ -3292,7 +3291,7 @@ async fn vouched_takes_an_unmanaged_overload_of_a_managed_routine_for_no_chain()
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_answers_a_plan_that_takes_a_view_off_a_chain() {
+async fn resolver_answers_a_plan_that_takes_a_view_off_a_chain() {
     // The target's `a` reads through a chain; the desired `a` reads the
     // managed table itself, so the compile never needs the external table.
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
@@ -3390,7 +3389,7 @@ fn volume_exists(name: &str) -> bool {
 
 async fn identity_of(target: &str) -> String {
     let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
-    pbps_pg::resolver::vouched::cluster_identity(&mut planning)
+    pbps_pg::resolver::scratch::cluster_identity(&mut planning)
         .await
         .unwrap()
 }
@@ -3413,7 +3412,7 @@ async fn produce_in_docker(
         None => identity_of(target).await,
     };
     let provenance = super::Provenance {
-        scratch: pbps_model::resolver::VouchedScratch::Docker {
+        scratch: pbps_model::resolver::ScratchSource::Docker {
             image: image.to_owned(),
         },
         outside_writes,
@@ -3449,7 +3448,7 @@ async fn produce_in_docker(
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
-async fn vouched_docker_starts_and_removes_its_container_without_root() {
+async fn resolver_docker_starts_and_removes_its_container_without_root() {
     // Rootless Podman in the local gate, Docker's group in CI: the runner
     // is never root, and the run's container exists only during the run.
     let uid = std::process::Command::new("id").arg("-u").output().unwrap();
@@ -3490,7 +3489,7 @@ async fn vouched_docker_starts_and_removes_its_container_without_root() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
-async fn vouched_docker_removes_its_container_when_the_run_fails() {
+async fn resolver_docker_removes_its_container_when_the_run_fails() {
     for (target, image) in DOCKER_PAIRS {
         let (target, image) = (setting(target), setting(image));
         let identity = identity_of(&target).await;
@@ -3531,7 +3530,7 @@ async fn vouched_docker_removes_its_container_when_the_run_fails() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
-async fn vouched_docker_removes_its_container_when_the_run_is_cancelled() {
+async fn resolver_docker_removes_its_container_when_the_run_is_cancelled() {
     // A run dropped mid-way, as a cancelled future or a panic drops it,
     // still has its container and volumes removed, by the drop guard.
     let target = setting("PBPS_TEST_PG_DB");
@@ -3571,7 +3570,7 @@ async fn vouched_docker_removes_its_container_when_the_run_is_cancelled() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
-async fn vouched_docker_names_a_volume_its_removal_left() {
+async fn resolver_docker_names_a_volume_its_removal_left() {
     // A second container holding the scratch's data volume: `rm --volumes`
     // succeeds and the container is gone, but the volume stays (measured
     // under Podman; Docker only logs it). The run names the volume rather
@@ -3636,7 +3635,7 @@ async fn vouched_docker_names_a_volume_its_removal_left() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
-async fn vouched_docker_answers_a_managed_question() {
+async fn resolver_docker_answers_a_managed_question() {
     // The question a server scratch answers, answered the same way on a
     // container started for the run.
     for (target_var, image) in DOCKER_PAIRS {
@@ -3658,14 +3657,14 @@ async fn vouched_docker_answers_a_managed_question() {
         let plan = result.unwrap_or_else(|error| panic!("{target_var}: {error}"));
         assert_answers_the_overload_from(
             &plan,
-            pbps_model::resolver::VouchedScratch::Docker { image },
+            pbps_model::resolver::ScratchSource::Docker { image },
         );
     }
 }
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
-async fn vouched_docker_records_the_image_as_configured_and_unverified() {
+async fn resolver_docker_records_the_image_as_configured_and_unverified() {
     // A tag, as most configurations name an image: the evidence records the
     // reference as written and no digest, since nothing verified one.
     let source = setting("PBPS_TEST_PG_SCRATCH_IMAGE");
@@ -3698,8 +3697,8 @@ async fn vouched_docker_records_the_image_as_configured_and_unverified() {
     let plan = result.unwrap();
     assert_eq!(
         plan.evidence.qualification().runtime,
-        pbps_model::resolver::ResolverRuntime::Vouched {
-            scratch: pbps_model::resolver::VouchedScratch::Docker { image: tag.clone() },
+        pbps_model::resolver::ResolverRuntime::Scratch {
+            scratch: pbps_model::resolver::ScratchSource::Docker { image: tag.clone() },
             outside_writes: pbps_model::resolver::OutsideWrites::Refused,
         }
     );
@@ -3711,7 +3710,7 @@ async fn vouched_docker_records_the_image_as_configured_and_unverified() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
-async fn vouched_docker_binds_the_target_by_its_cluster_identity() {
+async fn resolver_docker_binds_the_target_by_its_cluster_identity() {
     // A target connection that reaches another cluster than the planning
     // read refuses before anything is started.
     let target = setting("PBPS_TEST_PG_DB");
@@ -3728,7 +3727,7 @@ async fn vouched_docker_binds_the_target_by_its_cluster_identity() {
         pbps_model::resolver::OutsideWrites::Refused,
     )
     .await;
-    let refused = vouched_refusal(result);
+    let refused = resolver_refusal(result);
     assert!(
         refused.contains("another database cluster") && refused.contains("nothing was started"),
         "{refused}"
@@ -3738,7 +3737,7 @@ async fn vouched_docker_binds_the_target_by_its_cluster_identity() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
-async fn vouched_docker_refuses_a_missing_image_it_may_not_pull() {
+async fn resolver_docker_refuses_a_missing_image_it_may_not_pull() {
     // `pull: never` with no such image: refused by name, nothing started.
     let target = setting("PBPS_TEST_PG_DB");
     let image = format!("localhost/pbps-absent-{:016x}:1", rand::random::<u64>());
@@ -3769,7 +3768,7 @@ async fn vouched_docker_refuses_a_missing_image_it_may_not_pull() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
-async fn vouched_docker_stages_its_baseline() {
+async fn resolver_docker_stages_its_baseline() {
     // A managed view over a baseline table compiles on a Docker scratch.
     // Negative: a baseline table that differs from the target refuses.
     for (target_var, image) in DOCKER_PAIRS {
@@ -3801,7 +3800,7 @@ async fn vouched_docker_stages_its_baseline() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
-async fn vouched_baseline_outside_writes_allow_keeps_a_created_role() {
+async fn resolver_baseline_outside_writes_allow_keeps_a_created_role() {
     // Under `outside_writes: allow` a baseline that creates a role stages,
     // and the evidence records the choice. Negative: under the default the
     // same baseline refuses, rolled back, so it leaves no role.
@@ -3856,7 +3855,7 @@ async fn vouched_baseline_outside_writes_allow_keeps_a_created_role() {
             &Standard::default(),
             Some(&baseline),
             &super::Provenance {
-                scratch: pbps_model::resolver::VouchedScratch::Server {},
+                scratch: pbps_model::resolver::ScratchSource::Server {},
                 outside_writes,
             },
         )
@@ -3887,7 +3886,7 @@ async fn vouched_baseline_outside_writes_allow_keeps_a_created_role() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn vouched_supplied_baseline_outside_writes_allow_keeps_the_logins_own_default() {
+async fn resolver_supplied_baseline_outside_writes_allow_keeps_the_logins_own_default() {
     // A supplied account's allowed baseline changes the login's own
     // default. It is kept, and the release compares the compile's changes
     // with what the baseline left, not with what was there before it.
@@ -3922,7 +3921,7 @@ async fn vouched_supplied_baseline_outside_writes_allow_keeps_the_logins_own_def
             &Standard::default(),
             Some(&baseline),
             &super::Provenance {
-                scratch: pbps_model::resolver::VouchedScratch::Server {},
+                scratch: pbps_model::resolver::ScratchSource::Server {},
                 outside_writes,
             },
         )
@@ -3942,7 +3941,7 @@ fn assert_outside_writes(
             let plan = result.unwrap_or_else(|error| panic!("allowed: {error}"));
             assert!(matches!(
                 plan.evidence.qualification().runtime,
-                pbps_model::resolver::ResolverRuntime::Vouched {
+                pbps_model::resolver::ResolverRuntime::Scratch {
                     outside_writes: pbps_model::resolver::OutsideWrites::Allowed,
                     ..
                 }

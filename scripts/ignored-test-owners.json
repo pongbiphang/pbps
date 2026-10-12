@@ -27,324 +27,6 @@
       "fixture": "Disposable Docker SQL Server; PBPS_TEST_DEV_IMAGE must be set.",
       "job": "dev-rehearsal"
     },
-    "rename-churn": {
-      "platform": "linux",
-      "fixture": "Linux procfs/sysfs and an owned temporary directory; no root or database.",
-      "job": "quick"
-    },
-    "docker": {
-      "platform": "linux",
-      "fixture": "Linux native Docker; both pinned engines; owned containers.",
-      "job": "resolver",
-      "script": "scripts/live-resolver.py",
-      "selection": {
-        "kind": "data",
-        "file": "scripts/live-resolver.py",
-        "expression": "TESTS",
-        "prefix": "resolver::"
-      },
-      "witnesses": [
-        {
-          "file": "scripts/live-resolver.py",
-          "language": "python",
-          "scope": "<module>",
-          "requires": [
-            "main()"
-          ]
-        },
-        {
-          "file": "scripts/live-resolver.py",
-          "language": "python",
-          "scope": "main",
-          "requires": [
-            "for test in TESTS:",
-            "\"--\", \"--ignored\", \"--exact\", \"resolver::\" + test",
-            "subprocess.run(command,"
-          ]
-        }
-      ]
-    },
-    "launch": {
-      "platform": "linux",
-      "fixture": "Root observer on disposable native Linux; both engines.",
-      "job": "resolver",
-      "script": "scripts/live-resolver-launch.py",
-      "selection": {
-        "kind": "data",
-        "file": "scripts/live-resolver-launch.py",
-        "expression": "TESTS",
-        "prefix": ""
-      },
-      "witnesses": [
-        {
-          "file": "scripts/live-resolver-launch.py",
-          "language": "python",
-          "scope": "<module>",
-          "requires": [
-            "main()"
-          ]
-        },
-        {
-          "file": "scripts/live-resolver-launch.py",
-          "language": "python",
-          "scope": "main",
-          "requires": [
-            "for name in TESTS:",
-            "command = [str(binary), \"--ignored\", \"--exact\", name",
-            "subprocess.run(command,"
-          ]
-        }
-      ]
-    },
-    "server": {
-      "platform": "linux",
-      "fixture": "Root observer and separate owned target/dedicated engines; both engine matrix entries.",
-      "job": "resolver",
-      "script": "scripts/live-resolver-server.py",
-      "selection": {
-        "kind": "data",
-        "file": "scripts/live-resolver-server.py",
-        "expression": "TESTS + PRODUCER_TESTS",
-        "prefix": ""
-      },
-      "witnesses": [
-        {
-          "file": "scripts/live-resolver-server.py",
-          "language": "python",
-          "scope": "<module>",
-          "requires": [
-            "main()"
-          ]
-        },
-        {
-          "file": "scripts/live-resolver-server.py",
-          "language": "python",
-          "scope": "main",
-          "requires": [
-            "fixture(args, binary, root, owned)"
-          ]
-        },
-        {
-          "file": "scripts/live-resolver-server.py",
-          "language": "python",
-          "scope": "fixture",
-          "requires": [
-            "for test in TESTS",
-            "cases.extend([(test, False) for test in PRODUCER_TESTS if engine == \"pg\"])",
-            "for test, empty in cases:",
-            "command = [binary, \"--ignored\", \"--exact\", test, \"--nocapture\"]",
-            "run(*command,"
-          ]
-        },
-        {
-          "file": "scripts/live-resolver-server.py",
-          "language": "python",
-          "scope": "run",
-          "requires": [
-            "subprocess.run(args,"
-          ]
-        }
-      ]
-    },
-    "target": {
-      "platform": "linux",
-      "fixture": "Root native Docker observer; explicitly prebuilt library test executable.",
-      "job": "resolver",
-      "script": "scripts/live-resolver-target.py",
-      "arguments": [
-        "--native-host",
-        "--test-binary"
-      ],
-      "selection": {
-        "kind": "data",
-        "file": "scripts/live-resolver-target.py",
-        "expression": "NATIVE_TESTS + PRODUCER_TESTS + GENERATION_TESTS",
-        "prefix": ""
-      },
-      "witnesses": [
-        {
-          "file": "scripts/live-resolver-target.py",
-          "language": "python",
-          "scope": "<module>",
-          "requires": [
-            "main()"
-          ]
-        },
-        {
-          "file": "scripts/live-resolver-target.py",
-          "language": "python",
-          "scope": "main",
-          "requires": [
-            "fixture(args, binary, Path(directory), owned)"
-          ]
-        },
-        {
-          "file": "scripts/live-resolver-target.py",
-          "language": "python",
-          "scope": "fixture",
-          "requires": [
-            "if args.native_host:",
-            "native_tests(binary, env, args.producer_only, args.generation_only)"
-          ]
-        },
-        {
-          "file": "scripts/live-resolver-target.py",
-          "language": "python",
-          "scope": "native_tests",
-          "requires": [
-            "selected = [test for test in GENERATION_TESTS]",
-            "selected = [test for test in PRODUCER_TESTS]",
-            "selected = [test for test in NATIVE_TESTS]",
-            "selected += [test for test in PRODUCER_TESTS]",
-            "selected += [test for test in GENERATION_TESTS]",
-            "for test in selected:",
-            "run(binary, \"--ignored\", \"--exact\", test,"
-          ]
-        },
-        {
-          "file": "scripts/live-resolver-target.py",
-          "language": "python",
-          "scope": "run",
-          "requires": [
-            "subprocess.run(args,"
-          ]
-        }
-      ]
-    },
-    "namespaces": {
-      "platform": "linux",
-      "fixture": "Root Linux observer; private mount/PID namespaces and owned mapping/group helpers.",
-      "job": "resolver",
-      "script": "scripts/live-resolver-namespace.py",
-      "selection": {
-        "kind": "calls",
-        "file": "scripts/live-resolver-namespace.py",
-        "scope": "main",
-        "callee": "test",
-        "argument": 1,
-        "ignored_keyword": true
-      },
-      "witnesses": [
-        {
-          "file": "scripts/live-resolver-namespace.py",
-          "language": "python",
-          "scope": "<module>",
-          "requires": [
-            "main()"
-          ]
-        },
-        {
-          "file": "scripts/live-resolver-namespace.py",
-          "language": "python",
-          "scope": "test",
-          "requires": [
-            "run(*prefix, str(binary), \"--exact\", name,",
-            "[\"--ignored\"] if ignored else []"
-          ]
-        },
-        {
-          "file": "scripts/live-resolver-namespace.py",
-          "language": "python",
-          "scope": "run",
-          "requires": [
-            "subprocess.run(args,"
-          ]
-        }
-      ]
-    },
-    "sockets": {
-      "platform": "linux",
-      "fixture": "Root Linux observer and disposable proc/PID socket-holder fixture.",
-      "job": "resolver",
-      "script": "scripts/live-resolver-sockets.py",
-      "prefix": "resolver::native::namespace::sockets::tests::",
-      "witnesses": [
-        {
-          "file": "scripts/live-resolver-sockets.py",
-          "language": "python",
-          "scope": "<module>",
-          "requires": [
-            "subprocess.run([",
-            "str(args.test_binary.resolve(strict=True)), \"--ignored\", \"--test-threads=1\", 'resolver::native::namespace::sockets::tests::'"
-          ]
-        }
-      ]
-    },
-    "daemon": {
-      "platform": "linux",
-      "fixture": "Nested owned Docker PID-1 socket-activation fixture; never execute on the host.",
-      "parent": "docker",
-      "selection": {
-        "kind": "data",
-        "file": "scripts/resolver-daemon-fixture.py",
-        "expression": "TEST",
-        "prefix": ""
-      },
-      "witnesses": [
-        {
-          "file": "scripts/live-resolver.py",
-          "language": "python",
-          "scope": "main",
-          "requires": [
-            "subprocess.run([sys.executable, \"scripts/resolver-daemon-fixture.py\"],"
-          ]
-        },
-        {
-          "file": "scripts/resolver-daemon-fixture.py",
-          "language": "python",
-          "scope": "<module>",
-          "requires": [
-            "main()"
-          ]
-        },
-        {
-          "file": "scripts/resolver-daemon-fixture.py",
-          "language": "python",
-          "scope": "main",
-          "requires": [
-            "IMAGE, \"--ignored\", \"--exact\", TEST,",
-            "subprocess.run([\"docker\", \"start\", \"--attach\", name]"
-          ]
-        }
-      ]
-    },
-    "pseudo": {
-      "platform": "linux",
-      "fixture": "Nested owned user/mount/IPC namespace; launched from the root launch fixture.",
-      "parent": "launch",
-      "selection": {
-        "kind": "data",
-        "file": "scripts/live-resolver-pseudo.py",
-        "expression": "TEST",
-        "prefix": ""
-      },
-      "witnesses": [
-        {
-          "file": "scripts/live-resolver-launch.py",
-          "language": "python",
-          "scope": "main",
-          "requires": [
-            "subprocess.run([sys.executable, str(Path(__file__).with_name(\"live-resolver-pseudo.py\"))"
-          ]
-        },
-        {
-          "file": "scripts/live-resolver-pseudo.py",
-          "language": "python",
-          "scope": "<module>",
-          "requires": [
-            "main()"
-          ]
-        },
-        {
-          "file": "scripts/live-resolver-pseudo.py",
-          "language": "python",
-          "scope": "main",
-          "requires": [
-            "subprocess.run([str(binary), \"--ignored\", \"--exact\", TEST,"
-          ]
-        }
-      ]
-    },
     "tls": {
       "platform": "linux",
       "fixture": "Owned TLS engine and PKI; verified round trip plus untrusted/invalid/missing trust variants.",
@@ -380,106 +62,6 @@
           "scope": "run_case",
           "requires": [
             "subprocess.run([*command, \"--ignored\", \"--exact\", test,"
-          ]
-        }
-      ]
-    },
-    "daemon-child": {
-      "platform": "linux",
-      "fixture": "Nested subprocess; only the named parent supplies its synchronization and private fixture.",
-      "parent": "daemon",
-      "case": "resolver::native::daemon::tests::fixture_acceptor_holds_only_its_accepted_sockets",
-      "parent_tests": [
-        {
-          "target": [
-            "pbps-cli",
-            "lib",
-            "pbps_cli"
-          ],
-          "case": "resolver::native::daemon::tests::socket_activation_requires_the_candidate_daemon_to_own_the_actual_peer"
-        }
-      ],
-      "witnesses": [
-        {
-          "file": "crates/pbps-cli/src/resolver/native/daemon/tests.rs",
-          "language": "rust",
-          "scope": "socket_activation_requires_the_candidate_daemon_to_own_the_actual_peer",
-          "requires": [
-            ".args([\"--ignored\", \"--exact\", \"resolver::native::daemon::tests::fixture_acceptor_holds_only_its_accepted_sockets\"",
-            "spawned_and_execed(&mut command, \"dockerd\")"
-          ]
-        }
-      ]
-    },
-    "execution-child": {
-      "platform": "linux",
-      "fixture": "Nested subprocess; only the named parent supplies its synchronization and private fixture.",
-      "parent": "docker",
-      "case": "resolver::native::execution::tests::actual_owned_root_limits_and_visible_mounts_match_the_profile",
-      "parent_tests": [
-        {
-          "target": [
-            "pbps-cli",
-            "lib",
-            "pbps_cli"
-          ],
-          "case": "resolver::native::execution::tests::owned_root_guard_controls_are_measured_on_the_native_kernel"
-        }
-      ],
-      "witnesses": [
-        {
-          "file": "crates/pbps-cli/src/resolver/native/execution/tests.rs",
-          "language": "rust",
-          "scope": "owned_root_guard_controls_are_measured_on_the_native_kernel",
-          "requires": [
-            "\"--ignored\", \"--exact\", \"resolver::native::execution::tests::actual_owned_root_limits_and_visible_mounts_match_the_profile\"",
-            ".output()"
-          ]
-        }
-      ]
-    },
-    "channel-child": {
-      "platform": "linux",
-      "fixture": "Nested subprocess; only the named parent supplies its synchronization and private fixture.",
-      "parent": "docker",
-      "case": "resolver::docker::session::kernel_tests::the_actual_private_backend_and_controls_remain_bound_during_compilation",
-      "parent_tests": [
-        {
-          "target": [
-            "pbps-cli",
-            "lib",
-            "pbps_cli"
-          ],
-          "case": "resolver::docker::session::kernel_tests::private_channel_kernel_pairing_uses_only_owned_process_mounts"
-        }
-      ],
-      "witnesses": [
-        {
-          "file": "crates/pbps-cli/src/resolver/docker/session/kernel_tests.rs",
-          "language": "rust",
-          "scope": "private_channel_kernel_pairing_uses_only_owned_process_mounts",
-          "requires": [
-            "inspect_pair("
-          ]
-        },
-        {
-          "file": "crates/pbps-cli/src/resolver/docker/session/kernel_tests.rs",
-          "language": "rust",
-          "scope": "inspect_pair",
-          "requires": [
-            "create.args([",
-            "create.output()"
-          ],
-          "literal_contains": [
-            "/pbps-kernel-tests --ignored --exact {INNER} --nocapture"
-          ]
-        },
-        {
-          "file": "crates/pbps-cli/src/resolver/docker/session/kernel_tests.rs",
-          "language": "rust",
-          "scope": "<module>",
-          "requires": [
-            "const INNER: &str = \"resolver::docker::session::kernel_tests::the_actual_private_backend_and_controls_remain_bound_during_compilation\""
           ]
         }
       ]
@@ -607,326 +189,6 @@
         "engine::tests::the_postgres_arms_answer_engine_only_questions_by_name",
         "engine::tests::the_role_questions_refuse_on_postgres_rather_than_answer_none",
         "resolution::tests::every_resolver_kind_demands_the_cluster_identity_grant"
-      ]
-    },
-    {
-      "target": [
-        "pbps-cli",
-        "lib",
-        "pbps_cli"
-      ],
-      "owner": "channel-child",
-      "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
-      "cases": [
-        "resolver::docker::session::kernel_tests::the_actual_private_backend_and_controls_remain_bound_during_compilation"
-      ]
-    },
-    {
-      "target": [
-        "pbps-cli",
-        "lib",
-        "pbps_cli"
-      ],
-      "owner": "daemon",
-      "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
-      "cases": [
-        "resolver::native::daemon::tests::socket_activation_requires_the_candidate_daemon_to_own_the_actual_peer"
-      ]
-    },
-    {
-      "target": [
-        "pbps-cli",
-        "lib",
-        "pbps_cli"
-      ],
-      "owner": "daemon-child",
-      "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
-      "cases": [
-        "resolver::native::daemon::tests::fixture_acceptor_holds_only_its_accepted_sockets"
-      ]
-    },
-    {
-      "target": [
-        "pbps-cli",
-        "lib",
-        "pbps_cli"
-      ],
-      "owner": "docker",
-      "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
-      "cases": [
-        "resolver::docker::lifecycle::tests::external_sentinels_are_unreachable_until_the_corresponding_boundary_is_removed",
-        "resolver::docker::lifecycle::tests::fixed_launch_survives_bootstrap_and_explicit_close_removes_the_live_candidate",
-        "resolver::docker::lifecycle::tests::the_root_deadline_removes_even_a_detached_descendant",
-        "resolver::docker::reserved::tests::a_reserved_runtime_has_no_database_until_its_fixed_bootstrap_gate_opens",
-        "resolver::docker::session::kernel_tests::private_channel_kernel_pairing_uses_only_owned_process_mounts",
-        "resolver::docker::session::tests::the_private_channel_compiles_declarations_and_control_loss_discards_the_run",
-        "resolver::docker::tests::local_image_acquisition_observes_immutable_content_without_pulling",
-        "resolver::native::execution::tests::owned_root_guard_controls_are_measured_on_the_native_kernel"
-      ]
-    },
-    {
-      "target": [
-        "pbps-cli",
-        "lib",
-        "pbps_cli"
-      ],
-      "owner": "execution-child",
-      "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
-      "cases": [
-        "resolver::native::execution::tests::actual_owned_root_limits_and_visible_mounts_match_the_profile"
-      ]
-    },
-    {
-      "target": [
-        "pbps-cli",
-        "lib",
-        "pbps_cli"
-      ],
-      "owner": "launch",
-      "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
-      "cases": [
-        "resolver::docker::profile::launch_tests::a_guard_without_termination_authority_is_refused_before_initialization",
-        "resolver::docker::profile::launch_tests::a_wrong_workload_identity_is_refused_before_initialization",
-        "resolver::docker::profile::launch_tests::effective_descriptor_limits_are_required_before_initialization",
-        "resolver::docker::profile::launch_tests::host_information_is_refused_before_engine_initialization",
-        "resolver::docker::profile::launch_tests::masks::every_existing_proc_interface_requires_its_effective_mask",
-        "resolver::docker::profile::launch_tests::pseudo::mqueue_origin_is_required_before_engine_initialization",
-        "resolver::docker::profile::launch_tests::seccomp::reported_policy_and_filter_mode_cannot_replace_effective_bootstrap_probes",
-        "resolver::docker::profile::launch_tests::seccomp::the_owned_forwarder_requires_its_effective_process_and_fastopen_restrictions",
-        "resolver::docker::profile::launch_tests::the_launch_cannot_omit_inherited_no_new_privileges",
-        "resolver::docker::profile::launch_tests::unreadable_effective_limits_are_not_a_bounded_answer",
-        "resolver::docker::profile::launch_tests::uts::kernel_names_are_required_before_engine_initialization",
-        "resolver::docker::session::tests::host_files::host_information_cannot_enter_either_private_runtime_view",
-        "resolver::docker::session::tests::uts::kernel_names_cannot_enter_either_private_runtime_view",
-        "resolver::native::uts::tests::a_uts_only_replacement_invalidates_the_lease_without_moving_the_observer"
-      ]
-    },
-    {
-      "target": [
-        "pbps-cli",
-        "lib",
-        "pbps_cli"
-      ],
-      "owner": "namespaces",
-      "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
-      "cases": [
-        "resolver::native::accounting_tests::known_pid_members_need_no_second_executable_qualification",
-        "resolver::native::executables::tests::a_departed_mapping_cannot_use_the_same_inode_on_another_device",
-        "resolver::native::executables::tests::a_surviving_mapping_keeps_loaded_content_after_the_first_range_exits",
-        "resolver::native::executables::tests::an_inode_collision_cannot_lend_mapped_content_to_a_required_candidate",
-        "resolver::native::namespace::tests::a_process_with_the_kernel_maximum_groups_can_be_captured"
-      ]
-    },
-    {
-      "target": [
-        "pbps-cli",
-        "lib",
-        "pbps_cli"
-      ],
-      "owner": "pseudo",
-      "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
-      "cases": [
-        "resolver::native::pseudo::tests::a_foreign_mqueue_mount_invalidates_admission_and_the_retained_lease"
-      ]
-    },
-    {
-      "target": [
-        "pbps-cli",
-        "lib",
-        "pbps_cli"
-      ],
-      "owner": "rename-churn",
-      "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
-      "cases": [
-        "resolver::native::confined_open_tests::unrelated_rename_churn_preserves_confined_objects"
-      ]
-    },
-    {
-      "target": [
-        "pbps-cli",
-        "lib",
-        "pbps_cli"
-      ],
-      "owner": "server",
-      "validate_on": "linux",
-      "ignored_on": ["linux", "win32", "darwin"],
-      "cases": [
-        "resolver::server::qualified_evidence_tests::the_supplied_producer_seals_the_overload_and_default_from_one_fresh_read",
-        "resolver::server::qualified_evidence_tests::the_supplied_empty_target_producer_orders_table_routines_and_expressions_before_sealing",
-        "resolver::server::qualified_evidence_tests::the_supplied_replaced_routine_rebuilds_cross_kind_dependents_in_the_final_plan",
-        "resolver::server::qualified_evidence_tests::the_supplied_recorded_table_and_column_uids_survive_rename_with_dependent_rebuilds",
-        "resolver::server::qualified_evidence_tests::the_supplied_rebuilt_routine_with_explicit_public_execution_matches_the_post_ddl_acl"
-      ]
-    },
-    {
-      "target": ["pbps-cli", "lib", "pbps_cli"],
-      "owner": "server",
-      "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
-      "cases": [
-        "resolver::server::live_tests::a_container_joined_to_the_engines_network_refuses_the_run",
-        "resolver::server::live_tests::a_process_the_engine_did_not_start_refuses_its_namespaces",
-        "resolver::server::live_tests::a_removed_statistics_row_cannot_pay_for_an_intruding_session",
-        "resolver::server::live_tests::a_retired_forwarder_still_in_the_engines_network_is_this_runs_own",
-        "resolver::server::live_tests::a_run_qualifies_its_analysis_scope_against_the_target",
-        "resolver::server::live_tests::a_server_inside_the_target_instance_is_refused_before_any_scratch_resource",
-        "resolver::server::live_tests::a_session_present_at_admission_is_refused_rather_than_counted",
-        "resolver::server::live_tests::a_session_this_run_did_not_open_invalidates_it_even_after_it_closed",
-        "resolver::server::live_tests::a_check_cancelled_inside_a_forwarders_request_is_still_cleaned_up",
-        "resolver::server::live_tests::a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources",
-        "resolver::server::live_tests::admission_recovery::a_cancelled_step_leaves_its_admin_session_to_cleanup",
-        "resolver::server::live_tests::admission_recovery::failed_admission_names_every_unconfirmed_forwarder",
-        "resolver::server::live_tests::an_unconfirmed_cleanup_reports_only_the_run_owned_names",
-        "resolver::server::live_tests::an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name",
-        "resolver::server::live_tests::bindings::a_qualified_run_resolves_desired_bindings_against_the_target",
-        "resolver::server::live_tests::forwarder_mqueue::a_foreign_forwarder_mqueue_discards_each_live_view_permanently",
-        "resolver::server::live_tests::forwarder_mqueue::every_session_qualifies_its_forwarders_mqueue_before_returning",
-        "resolver::server::live_tests::guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence",
-        "resolver::server::live_tests::guard_limits::guard_restoration_distinguishes_process_exit_from_live_cleanup_failure",
-        "resolver::server::live_tests::host_files::host_file_loss_refuses_admission_and_discards_live_analysis",
-        "resolver::server::live_tests::pg16_storage::the_supplied_storage_layout_admits_its_observed_major_and_survives_live_checks",
-        "resolver::server::live_tests::pseudo::foreign_pseudo_roots_refuse_admission_and_discard_live_analysis",
-        "resolver::server::live_tests::replacing_or_dropping_the_target_binding_discards_the_run",
-        "resolver::server::live_tests::uts::kernel_name_loss_refuses_admission_and_discards_each_live_view"
-      ]
-    },
-    {
-      "target": [
-        "pbps-cli",
-        "lib",
-        "pbps_cli"
-      ],
-      "owner": "sockets",
-      "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
-      "cases": [
-        "resolver::native::namespace::sockets::tests::a_singleton_observation_does_not_claim_exhaustive_socket_ownership",
-        "resolver::native::namespace::sockets::tests::an_empty_observation_gets_one_fresh_backend_observation",
-        "resolver::native::namespace::sockets::tests::an_intermediate_exit_cannot_preserve_a_stale_service_relation",
-        "resolver::native::namespace::sockets::tests::socket_observation_preserves_groups_reparented_holders_and_service_identity"
-      ]
-    },
-    {
-      "target": [
-        "pbps-cli",
-        "lib",
-        "pbps_cli"
-      ],
-      "owner": "target",
-      "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
-      "cases": [
-        "resolver::docker::session::native_factory_tests::native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_connections",
-        "resolver::docker::session::pg_recipe_tests::the_public_factory_runs_the_pinned_engine_on_bounded_private_storage",
-        "resolver::server::container_tests::the_owned_container_resolves_the_overload_pair_on_its_qualified_connections",
-        "resolver::server::container_tests::a_changed_owned_runtime_or_target_ends_container_analysis_permanently",
-        "resolver::server::container_tests::cancelled_container_analysis_removes_or_names_every_owned_resource",
-        "resolver::server::container_tests::delayed_container_analysis_expires_at_its_first_owner_bound",
-        "resolver::server::container_tests::relay_recovery::admin_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners",
-        "resolver::server::container_tests::relay_recovery::scratch_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners",
-        "resolver::server::container_tests::relay_recovery::janitor_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners",
-        "resolver::server::qualified_evidence_tests::the_container_producer_seals_the_overload_and_default_from_one_fresh_read",
-        "resolver::server::qualified_evidence_tests::an_irrelevant_arrival_leaves_an_unmanaged_dependent_plannable",
-        "resolver::server::qualified_evidence_tests::only_recorded_table_and_index_roots_own_their_catalog_columns",
-        "resolver::server::qualified_evidence_tests::a_same_named_view_cannot_own_the_declared_table_uid",
-        "resolver::server::qualified_evidence_tests::a_same_named_index_on_another_table_cannot_own_the_declared_index",
-        "resolver::server::qualified_evidence_tests::the_connected_producer_refuses_a_missing_environment_key_before_sealing",
-        "resolver::server::qualified_evidence_tests::a_rebuilt_view_with_old_target_grants_closes_on_the_actual_catalog",
-        "resolver::server::qualified_evidence_tests::an_empty_target_producer_orders_table_routines_and_expressions_before_sealing",
-        "resolver::server::qualified_evidence_tests::a_replaced_routine_rebuilds_cross_kind_dependents_in_the_final_plan",
-        "resolver::server::qualified_evidence_tests::recorded_table_and_column_uids_survive_rename_with_dependent_rebuilds",
-        "resolver::server::qualified_evidence_tests::recorded_rename_of_a_table_owned_by_another_role_closes_on_the_actual_catalog",
-        "resolver::server::qualified_evidence_tests::rebuilt_routine_with_explicit_public_execution_matches_the_post_ddl_acl",
-        "resolver::server::qualified_evidence_tests::rebuilt_routine_replays_declared_role_grants",
-        "resolver::server::qualified_evidence_tests::an_unaffected_routine_keeps_its_grant_option_through_connected_evidence",
-        "resolver::server::qualified_evidence_tests::a_dropped_routine_seals_its_closing_signature_lookup",
-        "resolver::server::qualified_evidence_tests::renaming_a_referenced_table_carries_the_foreign_key_that_names_it",
-        "resolver::server::qualified_evidence_tests::renaming_a_referenced_column_carries_the_foreign_key_that_names_it",
-        "resolver::server::qualified_evidence_tests::dropping_a_table_with_toast_storage_closes_on_the_actual_catalog",
-        "resolver::server::qualified_evidence_tests::adding_a_default_carries_the_columns_own_flag",
-        "resolver::server::qualified_evidence_tests::dropping_a_default_carries_the_columns_own_flag",
-        "resolver::server::qualified_evidence_tests::a_retype_carries_the_key_and_index_it_rebuilds",
-        "resolver::server::qualified_evidence_tests::newly_created_routines_under_target_default_privileges_close_on_the_actual_catalog",
-        "resolver::server::qualified_evidence_tests::a_new_routine_created_by_an_ordinary_deployer_closes_on_the_actual_catalog",
-        "resolver::server::qualified_evidence_tests::an_explicit_extra_schema_changes_only_the_unqualified_lookup_in_the_final_plan",
-        "resolver::server::qualified_evidence_tests::a_prequalified_matching_scope_seals_the_same_ordinary_plan",
-        "resolver::server::qualified_evidence_tests::a_prequalified_scope_rejects_reordered_write_path_extras_before_compilation",
-        "resolver::server::qualified_evidence_tests::a_prequalified_scope_rejects_changed_preliminary_grants_before_compilation",
-        "resolver::server::qualified_evidence_tests::recorded_renames_and_reused_old_spellings_keep_distinct_owned_inventories",
-        "resolver::server::qualified_evidence_tests::recorded_renames_with_type_and_nullability_edits_match_actual_child_catalog",
-        "resolver::server::qualified_evidence_tests::persisted_authorization_is_stable_across_processes_only_with_the_same_environment_key",
-        "resolver::server::qualified_evidence_tests::adding_named_key_and_check_keeps_existing_table_owner_and_grants",
-        "resolver::server::qualified_evidence_tests::adding_check_alone_keeps_existing_table_owner_and_grants",
-        "resolver::server::qualified_evidence_tests::granting_on_an_existing_table_keeps_old_acl_and_adds_the_declared_role",
-        "resolver::server::qualified_evidence_tests::unnamed_primary_key_on_existing_table_owns_only_its_exact_constraint_and_index",
-        "resolver::server::qualified_evidence_tests::unnamed_primary_key_on_created_table_owns_only_its_exact_constraint_and_index",
-        "resolver::server::qualified_evidence_tests::adding_index_keeps_existing_table_metadata_and_sets_the_engine_index_flag",
-        "resolver::server::qualified_evidence_tests::direct_schema_option_beats_inherited_owner_for_the_typed_grant",
-        "resolver::server::qualified_evidence_tests::combined_schema_grant_uses_one_inherited_grantor_for_its_whole_mask",
-        "resolver::docker::tests::direct_native_daemon_is_accepted_but_a_root_owned_proxy_is_not",
-        "resolver::native::target::tests::native_aliases_share_one_instance_and_backend_children_cannot_claim_another",
-        "resolver::server::container_tests::sql_recovery::confirmed_workload_removal_finishes_only_its_existing_sql_recovery",
-        "resolver::server::container_tests::sql_recovery::interrupted_open_discard_finishes_sql_recovery_only_after_workload_removal",
-        "resolver::server::container_tests::sql_recovery::cancelled_cleanup_keeps_uncertain_owned_sql_names_and_remains_terminal",
-        "resolver::server::qualified_evidence_tests::the_pg18_producer_projects_the_replaced_generated_attrdef_and_preserves_column_identity",
-        "resolver::server::qualified_evidence_tests::the_pg16_producer_adds_stored_generation_and_retains_existing_generated_bindings"
       ]
     },
     {
@@ -1486,7 +748,6 @@
         "darwin"
       ],
       "cases": [
-        "ado_options_cannot_disable_peer_verification",
         "invalid_trust_cannot_yield_a_verified_connection",
         "verified_round_trips_reject_wrong_peers_and_corrupted_replies"
       ]
@@ -1819,7 +1080,7 @@
         "resolver::capture::tests::a_tables_toast_storage_is_not_a_capture_input",
         "resolver::capture::tests::retained_roots_are_read_even_when_nothing_reaches_them",
         "resolver::capture::tests::coherent_inputs_pin_properties_membership_and_actual_bindings",
-        "resolver::vouched::tests::the_cleanup_names_what_another_role_owns_and_what_changed_on_the_login",
+        "resolver::scratch::tests::the_cleanup_names_what_another_role_owns_and_what_changed_on_the_login",
         "resolver::baseline::tests::a_baseline_runs_as_one_script_and_its_roots_are_found",
         "resolver::baseline::tests::the_target_records_each_link_through_a_row_type_or_a_parent",
         "resolver::standard::tests::a_declared_standard_in_the_engines_own_spelling_reads_back_as_declared",
@@ -2197,74 +1458,74 @@
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
-        "resolver::server::vouched::live_tests::vouched_answers_a_managed_question_without_root_or_observation",
-        "resolver::server::vouched::live_tests::vouched_cleanup_runs_only_on_the_backend_the_run_checked",
-        "resolver::server::vouched::live_tests::vouched_compiles_as_the_login_whatever_its_session_defaults",
-        "resolver::server::vouched::live_tests::vouched_provisions_as_the_superuser_login_whatever_its_default_role",
-        "resolver::server::vouched::live_tests::vouched_compiles_as_a_non_superuser_provisioner_in_its_own_database",
-        "resolver::server::vouched::live_tests::vouched_empties_the_supplied_database_when_the_run_refuses",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_grants_elsewhere",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_supplied_login_whose_cleanup_would_revoke_memberships_it_granted",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_scratch_that_is_not_empty",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_scratch_that_may_not_read_its_cluster_identity",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_target_connection_on_another_cluster_than_the_plan_was_read_from",
-        "resolver::server::vouched::live_tests::vouched_applies_a_declared_standard_and_keeps_a_hardened_database_acl",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_declared_setting_the_scratch_account_may_not_set_before_writing",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_declared_value_the_engine_rejects_before_writing",
-        "resolver::server::vouched::live_tests::vouched_compiles_a_managed_view_over_a_baseline_table",
-        "resolver::server::vouched::live_tests::vouched_docker_starts_and_removes_its_container_without_root",
-        "resolver::server::vouched::live_tests::vouched_docker_removes_its_container_when_the_run_fails",
-        "resolver::server::vouched::live_tests::vouched_docker_removes_its_container_when_the_run_is_cancelled",
-        "resolver::server::vouched::live_tests::vouched_docker_names_a_volume_its_removal_left",
-        "resolver::server::vouched::live_tests::vouched_docker_answers_a_managed_question",
-        "resolver::server::vouched::live_tests::vouched_docker_records_the_image_as_configured_and_unverified",
-        "resolver::server::vouched::live_tests::vouched_docker_binds_the_target_by_its_cluster_identity",
-        "resolver::server::vouched::live_tests::vouched_docker_refuses_a_missing_image_it_may_not_pull",
-        "resolver::server::vouched::live_tests::vouched_docker_stages_its_baseline",
-        "resolver::server::vouched::live_tests::vouched_baseline_outside_writes_allow_keeps_a_created_role",
-        "resolver::server::vouched::live_tests::vouched_supplied_baseline_outside_writes_allow_keeps_the_logins_own_default",
-        "resolver::server::vouched::live_tests::vouched_compares_an_external_table_without_its_foreign_keys_and_triggers",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_baseline_that_differs_from_the_target",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_baseline_that_creates_a_managed_object",
-        "resolver::server::vouched::live_tests::vouched_runs_the_baseline_before_any_managed_object",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_baseline_object_left_uncompared",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_chain_through_an_external_object_naming_it",
-        "resolver::server::vouched::live_tests::vouched_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view",
-        "resolver::server::vouched::live_tests::vouched_refuses_an_external_view_staged_as_a_table",
-        "resolver::server::vouched::live_tests::vouched_reports_a_write_through_a_shape_view_with_the_real_definition_remedy",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_question_that_needs_routine_source_the_baseline_lacks",
-        "resolver::server::vouched::live_tests::vouched_compares_what_the_baseline_adds_to_an_extension_it_did_not_create",
-        "resolver::server::vouched::live_tests::vouched_stages_a_routine_in_a_system_schema_by_its_header",
-        "resolver::server::vouched::live_tests::vouched_stages_a_cast_and_an_operator_over_external_types_in_the_baseline",
-        "resolver::server::vouched::live_tests::vouched_compares_each_extension_member_with_the_target",
-        "resolver::server::vouched::live_tests::vouched_refuses_an_extension_with_a_member_no_capture_identifies",
-        "resolver::server::vouched::live_tests::vouched_stages_an_extension_that_brings_text_search_objects",
-        "resolver::server::vouched::live_tests::vouched_compares_a_text_search_dictionary_with_the_target",
-        "resolver::server::vouched::live_tests::vouched_compares_an_operator_familys_members_with_the_target",
-        "resolver::server::vouched::live_tests::vouched_takes_a_routine_over_a_staged_type_as_no_part_of_it",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_staged_shape_that_changes_before_the_opening_capture",
-        "resolver::server::vouched::live_tests::vouched_compares_a_sequence_its_table_owns",
-        "resolver::server::vouched::live_tests::vouched_compares_an_operator_class_with_its_family",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_baseline_that_writes_outside_the_scratch_database",
-        "resolver::server::vouched::live_tests::vouched_runs_the_baseline_on_the_empty_path_every_session_pins",
-        "resolver::server::vouched::live_tests::vouched_checks_a_baseline_whose_path_shadows_a_built_in_type",
-        "resolver::server::vouched::live_tests::vouched_compares_every_attribute_of_another_database",
-        "resolver::server::vouched::live_tests::vouched_reads_the_shared_state_under_its_own_settings_not_the_baselines",
-        "resolver::server::vouched::live_tests::vouched_ignores_another_sessions_cluster_writes_during_the_baseline",
-        "resolver::server::vouched::live_tests::vouched_compares_an_extension_member_in_a_system_schema_in_full",
-        "resolver::server::vouched::live_tests::vouched_stages_an_operator_over_built_in_types_in_the_baseline",
-        "resolver::server::vouched::live_tests::vouched_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates",
-        "resolver::server::vouched::live_tests::vouched_reproduces_the_deployers_usage_of_a_schema_an_extension_carries",
-        "resolver::server::vouched::live_tests::vouched_takes_an_unmanaged_overload_of_a_managed_routine_for_no_chain",
-        "resolver::server::vouched::live_tests::vouched_answers_a_plan_that_takes_a_view_off_a_chain",
-        "resolver::server::vouched::live_tests::vouched_refuses_a_public_grant_chain_it_cannot_revoke_and_leaves_the_acl",
-        "resolver::server::vouched::live_tests::vouched_release_puts_a_supplied_scratch_back_and_names_what_it_cannot",
-        "resolver::server::vouched::live_tests::vouched_repairs_a_supplied_scratch_an_interrupted_run_left_changed",
-        "resolver::server::vouched::live_tests::vouched_run_owned_compiles_under_the_declared_standard",
-        "resolver::server::vouched::live_tests::vouched_run_owned_keeps_what_the_reproduction_put_on_its_database",
-        "resolver::server::vouched::live_tests::vouched_refuses_the_target_as_scratch",
-        "resolver::server::vouched::live_tests::vouched_runs_in_a_precreated_database_with_a_confined_account"
+        "resolver::server::scratch::live_tests::resolver_answers_a_managed_question_without_root_or_observation",
+        "resolver::server::scratch::live_tests::resolver_cleanup_runs_only_on_the_backend_the_run_checked",
+        "resolver::server::scratch::live_tests::resolver_compiles_as_the_login_whatever_its_session_defaults",
+        "resolver::server::scratch::live_tests::resolver_provisions_as_the_superuser_login_whatever_its_default_role",
+        "resolver::server::scratch::live_tests::resolver_compiles_as_a_non_superuser_provisioner_in_its_own_database",
+        "resolver::server::scratch::live_tests::resolver_empties_the_supplied_database_when_the_run_refuses",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_same_cluster_scratch_with_an_unconfined_account",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_supplied_login_whose_cleanup_would_revoke_grants_elsewhere",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_supplied_login_whose_cleanup_would_revoke_memberships_it_granted",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_scratch_that_is_not_empty",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_scratch_that_may_not_read_its_cluster_identity",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_target_connection_on_another_cluster_than_the_plan_was_read_from",
+        "resolver::server::scratch::live_tests::resolver_applies_a_declared_standard_and_keeps_a_hardened_database_acl",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_declared_setting_the_scratch_account_may_not_set_before_writing",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_declared_value_the_engine_rejects_before_writing",
+        "resolver::server::scratch::live_tests::resolver_compiles_a_managed_view_over_a_baseline_table",
+        "resolver::server::scratch::live_tests::resolver_docker_starts_and_removes_its_container_without_root",
+        "resolver::server::scratch::live_tests::resolver_docker_removes_its_container_when_the_run_fails",
+        "resolver::server::scratch::live_tests::resolver_docker_removes_its_container_when_the_run_is_cancelled",
+        "resolver::server::scratch::live_tests::resolver_docker_names_a_volume_its_removal_left",
+        "resolver::server::scratch::live_tests::resolver_docker_answers_a_managed_question",
+        "resolver::server::scratch::live_tests::resolver_docker_records_the_image_as_configured_and_unverified",
+        "resolver::server::scratch::live_tests::resolver_docker_binds_the_target_by_its_cluster_identity",
+        "resolver::server::scratch::live_tests::resolver_docker_refuses_a_missing_image_it_may_not_pull",
+        "resolver::server::scratch::live_tests::resolver_docker_stages_its_baseline",
+        "resolver::server::scratch::live_tests::resolver_baseline_outside_writes_allow_keeps_a_created_role",
+        "resolver::server::scratch::live_tests::resolver_supplied_baseline_outside_writes_allow_keeps_the_logins_own_default",
+        "resolver::server::scratch::live_tests::resolver_compares_an_external_table_without_its_foreign_keys_and_triggers",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_baseline_that_differs_from_the_target",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_baseline_that_creates_a_managed_object",
+        "resolver::server::scratch::live_tests::resolver_runs_the_baseline_before_any_managed_object",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_baseline_object_left_uncompared",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_chain_through_an_external_object_naming_it",
+        "resolver::server::scratch::live_tests::resolver_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view",
+        "resolver::server::scratch::live_tests::resolver_refuses_an_external_view_staged_as_a_table",
+        "resolver::server::scratch::live_tests::resolver_reports_a_write_through_a_shape_view_with_the_real_definition_remedy",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_question_that_needs_routine_source_the_baseline_lacks",
+        "resolver::server::scratch::live_tests::resolver_compares_what_the_baseline_adds_to_an_extension_it_did_not_create",
+        "resolver::server::scratch::live_tests::resolver_stages_a_routine_in_a_system_schema_by_its_header",
+        "resolver::server::scratch::live_tests::resolver_stages_a_cast_and_an_operator_over_external_types_in_the_baseline",
+        "resolver::server::scratch::live_tests::resolver_compares_each_extension_member_with_the_target",
+        "resolver::server::scratch::live_tests::resolver_refuses_an_extension_with_a_member_no_capture_identifies",
+        "resolver::server::scratch::live_tests::resolver_stages_an_extension_that_brings_text_search_objects",
+        "resolver::server::scratch::live_tests::resolver_compares_a_text_search_dictionary_with_the_target",
+        "resolver::server::scratch::live_tests::resolver_compares_an_operator_familys_members_with_the_target",
+        "resolver::server::scratch::live_tests::resolver_takes_a_routine_over_a_staged_type_as_no_part_of_it",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_staged_shape_that_changes_before_the_opening_capture",
+        "resolver::server::scratch::live_tests::resolver_compares_a_sequence_its_table_owns",
+        "resolver::server::scratch::live_tests::resolver_compares_an_operator_class_with_its_family",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_baseline_that_writes_outside_the_scratch_database",
+        "resolver::server::scratch::live_tests::resolver_runs_the_baseline_on_the_empty_path_every_session_pins",
+        "resolver::server::scratch::live_tests::resolver_checks_a_baseline_whose_path_shadows_a_built_in_type",
+        "resolver::server::scratch::live_tests::resolver_compares_every_attribute_of_another_database",
+        "resolver::server::scratch::live_tests::resolver_reads_the_shared_state_under_its_own_settings_not_the_baselines",
+        "resolver::server::scratch::live_tests::resolver_ignores_another_sessions_cluster_writes_during_the_baseline",
+        "resolver::server::scratch::live_tests::resolver_compares_an_extension_member_in_a_system_schema_in_full",
+        "resolver::server::scratch::live_tests::resolver_stages_an_operator_over_built_in_types_in_the_baseline",
+        "resolver::server::scratch::live_tests::resolver_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates",
+        "resolver::server::scratch::live_tests::resolver_reproduces_the_deployers_usage_of_a_schema_an_extension_carries",
+        "resolver::server::scratch::live_tests::resolver_takes_an_unmanaged_overload_of_a_managed_routine_for_no_chain",
+        "resolver::server::scratch::live_tests::resolver_answers_a_plan_that_takes_a_view_off_a_chain",
+        "resolver::server::scratch::live_tests::resolver_refuses_a_public_grant_chain_it_cannot_revoke_and_leaves_the_acl",
+        "resolver::server::scratch::live_tests::resolver_release_puts_a_supplied_scratch_back_and_names_what_it_cannot",
+        "resolver::server::scratch::live_tests::resolver_repairs_a_supplied_scratch_an_interrupted_run_left_changed",
+        "resolver::server::scratch::live_tests::resolver_run_owned_compiles_under_the_declared_standard",
+        "resolver::server::scratch::live_tests::resolver_run_owned_keeps_what_the_reproduction_put_on_its_database",
+        "resolver::server::scratch::live_tests::resolver_refuses_the_target_as_scratch",
+        "resolver::server::scratch::live_tests::resolver_runs_in_a_precreated_database_with_a_confined_account"
       ]
     },
     {

@@ -3231,8 +3231,6 @@ pub fn validate_plan_analysis(plan: &pbps_model::SavedPlan) -> anyhow::Result<()
             "postgres" => pbps_pg::resolver::validate_evidence(evidence)?,
             engine => anyhow::bail!("this build cannot enforce resolver evidence for {engine}"),
         }
-        pbps_cli::resolver::sealing::validate_runtime(&evidence.qualification().runtime)
-            .map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }

@@ -65,7 +65,7 @@ role rows. Configuration-reload observations and a closing session observation
 bound the non-snapshot setting read; a missing required setting or unqualified
 lifetime refuses. Actual provider versions are read for required collations
 and the current database, separately from recorded catalog versions. Executable
-content is qualified by the native boundary below, not by these SQL facts.
+content is not compared (#1636).
 
 ## Logical identities, complete properties and coverage
 
@@ -133,37 +133,12 @@ OID-alias constants and unsupported node/type surfaces refuse
 rather than invoke arbitrary output code or hide an input as absent. Unrelated
 unqualified objects are lookup rows, not certified or rendered prerequisites.
 
-## Native connection and build boundary
+## Native connection and build boundary (removed)
 
-`NativeTarget::capture_postgres` takes ownership of the whole bound connection
-before its first await. Failure or cancellation drops it and expires existing
-weak target witnesses. A canceled read cannot leave a transaction or cached
-qualification available to a later scratch operation.
-
-The initial coherent read uses `capture_with_runtime_inputs` to give its
-producer a separate, opaque `RuntimeInputs` source capability. Ordinary
-`capture`/`recapture` results and `CapturedTargetInputs::catalog()` cannot
-recover it. Only a fresh read through an actual query connection can issue
-another capability; that producer already has authority to query the source.
-The native owner retains it privately for its executable checks and drops it
-before returning ordinary evidence. It is not a native-admission certificate:
-process/root/mapping qualification remains mandatory (DEC-974.1).
-
-This initial read supplies native-file requirements only. These include
-C routines outside extension membership, extension libraries, preload settings
-and the library search path. The lifecycle observes actual loaded content and
-required late-load files, obtains a **fresh** coherent catalog capture, checks
-that the input requirements stayed the same, and repeats executable/process/
-socket checks. Unreadable loaded content, a disk copy substituted for a loaded
-library, changed input or changed executable content refuses the result. The
-returned capture is private and has no ordinary serialization.
-
-This uses the existing native runtime's trusted-provisioning boundary. It does
-not introduce a lifetime process census or claim to detect arbitrary hostile
-administrator activity between target freshness checks. Scratch exclusivity
-and reconstruction are separate obligations; target observations do not waive
-them. `recapture_postgres` performs the complete fresh read/build qualification
-again, without acquiring Docker resources.
+The measured profiles' native target capture (`NativeTarget::capture_postgres`),
+its source-bearing `RuntimeInputs` capability and the executable checks it fed
+were removed by #1636 (DEC-1636.1). The resolver captures the target over its
+ordinary connection, and compares no executable.
 
 ## Private comparison and delivery limits
 
@@ -187,13 +162,8 @@ and never compared with one made in another process.
 `CapturedInputs` and `CapturedTargetInputs` have no `Debug`, `Serialize`, public
 fingerprint getter or persistence constructor. Ordinary comparisons return only
 logical affected objects and failed conditions. These reports live outside
-semantic `Schema` equality. Native-file requirements transfer privately to the
-lifecycle; source-bearing data and fingerprints are not public output.
-A capability holder's loader operations necessarily observe source-dependent
-results. The API therefore prevents ordinary result recipients from acquiring
-that capability, rather than treating an opaque value or arbitrary root File
-as proof of authority. This boundary does not restrict a producer with its own
-database read access or a source capability deliberately delegated to it.
+semantic `Schema` equality. Source-bearing data and fingerprints are not public
+output.
 
 The capture closes before returning. A fresh recapture can invalidate it even
 when managed declarations and historical bindings remain unchanged. Producing
@@ -212,19 +182,13 @@ type, routine, operator and extension changes; role/session changes;
 baseline states; unsupported layouts/versions; output qualification; local
 setting restoration; and preservation of caller-owned transactions.
 
-Native lifecycle reads route through the CLI engine seam, with exhaustive
-actual-connection dispatch for both requirement discovery and the enclosed
-fresh capture. `pbps-db::resolver::capture::CaptureError` is the shared,
-source-free refusal shape, re-exported at the existing PostgreSQL API path.
-Private captured catalogs and native source capabilities stay in the engine;
-the route does not turn an ordinary report into source authority. SQL Server
-returns a named unsupported-capture refusal. A raw route leaves an existing
-caller transaction untouched; a refused native capture expires its binding
-and every weak witness, just like other capture failures.
+`pbps-db::resolver::capture::CaptureError` is the shared, source-free refusal
+shape, re-exported at the existing PostgreSQL API path. Private captured
+catalogs stay in the engine. SQL Server returns a named unsupported-capture
+refusal. A raw route leaves an existing caller transaction untouched.
 
-The disposable native TLS fixtures exercise loaded-content qualification,
-disk-only refusal, fresh recapture, a real configuration reload between
-component reads, and cancellation expiry. Protection-removal
+The live fixtures exercise fresh recapture, a real configuration reload
+between component reads, and cancellation. Protection-removal
 controls accompany the catalog field, rendering witness/selection, candidate,
 property, output, baseline-version, reload-epoch and connection-ownership
 guards. No failed control is counted

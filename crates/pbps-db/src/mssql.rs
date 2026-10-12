@@ -12,37 +12,13 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::{DbError, Param};
 
-/// Read effective policy keys without splitting on password semicolons.
-/// `connection-string` and tiberius 0.13 use separate ADO.NET parsers, so
-/// accepted and refused quoted/duplicate forms are pinned below and in the
-/// live TLS fixture (issue #861). The driver has no public trust/encryption
-/// getters; Config still validates every option it supports.
-fn verified_options(connection_string: &str) -> Result<(), DbError> {
-    let options: connection_string::AdoNetString = connection_string
-        .parse()
-        .map_err(|_| DbError::BadConnectionString("invalid ADO.NET syntax".into()))?;
-    if options
-        .get("encrypt")
-        .is_some_and(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "yes"))
-        || options.get("trustservercertificate").is_some_and(|value| {
-            !matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "no")
-        })
-    {
-        return Err(DbError::Refused(
-            "peer-verified SQL Server connections require Encrypt=true and certificate validation"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
 /// Gives the session this process's application name, unless the connection
 /// string names one under either key the driver reads (#1188).
 ///
 /// The driver's parsed `Config` does not say whether the name came from the
-/// string, so the string is read with the same ADO.NET parser the peer check
-/// above uses. One that does not parse is left to `from_ado_string`, which has
-/// already accepted it by the time this runs.
+/// string, so the string is read with an ADO.NET parser. One that does not
+/// parse is left to `from_ado_string`, which has already accepted it by the
+/// time this runs.
 fn name_session(config: &mut Config, connection_string: &str) {
     let named = connection_string
         .parse::<connection_string::AdoNetString>()
@@ -60,7 +36,6 @@ pub struct Row(tiberius::Row);
 /// An open SQL Server connection.
 pub struct Conn {
     client: Client<Compat<crate::transport::BoxedStream>>,
-    endpoints: Option<crate::transport::TcpEndpoints>,
 }
 
 impl From<tiberius::error::Error> for DbError {
@@ -98,17 +73,6 @@ impl Conn {
         Self::connect_config(config).await
     }
 
-    pub(crate) async fn connect_verified(connection_string: &str) -> Result<Self, DbError> {
-        verified_options(connection_string)?;
-        let mut config = Config::from_ado_string(connection_string)
-            .map_err(|e| DbError::BadConnectionString(e.to_string()))?;
-        name_session(&mut config, connection_string);
-        // Keep this explicit even if the driver's default changes. Trust is
-        // still its normal chain/name verifier; verified_options rejects bypasses.
-        config.encryption(tiberius::EncryptionLevel::Required);
-        Self::connect_config(config).await
-    }
-
     async fn connect_config(mut config: Config) -> Result<Self, DbError> {
         // A 30-second per-response timeout was added in tiberius 0.13. Long
         // DDL and lock waits were unbounded before this driver switch. Keep
@@ -136,40 +100,9 @@ impl Conn {
             addr: config.get_addr().to_owned(),
             reason,
         })?;
-        let endpoints =
-            crate::transport::TcpEndpoints::capture(&tcp).map_err(|reason| DbError::Connect {
-                addr: config.get_addr().to_owned(),
-                reason,
-            })?;
         let stream: crate::transport::BoxedStream = Box::new(tcp);
         let client = Client::connect(config, stream.compat_write()).await?;
-        Ok(Self {
-            client,
-            endpoints: Some(endpoints),
-        })
-    }
-
-    pub(crate) fn tcp_endpoints(&self) -> Option<crate::transport::TcpEndpoints> {
-        self.endpoints
-    }
-
-    pub(crate) async fn connect_stream(
-        stream: crate::transport::BoxedStream,
-        login: crate::transport::StreamLogin,
-    ) -> Result<Self, DbError> {
-        let mut config = Config::new();
-        config.database(&login.database);
-        config.authentication(tiberius::AuthMethod::sql_server(login.user, login.password));
-        config.encryption(tiberius::EncryptionLevel::NotSupported);
-        config.application_name(crate::session_application_name());
-        // This path also executes deployment work; the new driver default
-        // must not impose a deadline on a long statement here either.
-        config.command_timeout(None);
-        let client = Client::connect(config, stream.compat_write()).await?;
-        Ok(Self {
-            client,
-            endpoints: None,
-        })
+        Ok(Self { client })
     }
 
     pub(crate) async fn query(&mut self, sql: &str) -> Result<Vec<Row>, DbError> {
@@ -326,30 +259,41 @@ mod transport_tests {
         }
     }
 
-    #[test]
-    fn effective_trust_options_follow_driver_escaping_and_duplicate_precedence() {
-        for input in [
-            "Server=localhost;Password={marker;TrustServerCertificate=true};Encrypt=YES",
-            "Encrypt=false;Encrypt=true;TrustServerCertificate=true;TrustServerCertificate=no",
-            "Encrypt=NO;ENCRYPT=yes;TrustServerCertificate=yes;TRUSTSERVERCERTIFICATE=NO",
-            "Server=localhost;Password={marker;TrustServerCertificate=true};TrustServerCertificate=false;Encrypt=true",
-            "Password=\"marker;TrustServerCertificate=true\";Encrypt=true",
-            "Password='marker;TrustServerCertificate=true';Encrypt=true",
-            "ENCRYPT={ true };TRUSTSERVERCERTIFICATE={ false }",
-            "Server=localhost",
-        ] {
-            verified_options(input).unwrap();
-            Config::from_ado_string(input).unwrap();
-        }
-        // Last effective key wins on both parsers, including mixed case.
-        for input in [
-            "Encrypt=true;Encrypt=no",
-            "TrustServerCertificate=false;TRUSTSERVERCERTIFICATE=YES",
-            "Encrypt=maybe",
-            "TrustServerCertificate=maybe",
-            "Password={unterminated",
-        ] {
-            assert!(verified_options(input).is_err(), "{input}");
-        }
+    /// #861: a string naming no `Encrypt` requires encryption, and a server
+    /// that declines it in PRELOGIN never receives a plaintext LOGIN7.
+    #[tokio::test]
+    async fn tds_encryption_refusal_cannot_elicit_a_plaintext_login() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = [0; 8];
+            socket.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[0], 0x12); // PRELOGIN, never LOGIN7.
+            let mut payload = vec![0; usize::from(u16::from_be_bytes([header[2], header[3]])) - 8];
+            socket.read_exact(&mut payload).await.unwrap();
+            // A PRELOGIN reply with ENCRYPT_NOT_SUP. The client may reject
+            // immediately or insist on TLS, but must never send LOGIN7.
+            socket
+                .write_all(&[0x04, 1, 0, 15, 0, 0, 1, 0, 1, 0, 6, 0, 1, 0xff, 2])
+                .await
+                .unwrap();
+            let mut next = [0];
+            if socket.read(&mut next).await.unwrap() != 0 {
+                assert_eq!(
+                    next[0], 0x12,
+                    "plaintext authentication followed TLS refusal"
+                );
+            }
+        });
+        assert!(
+            Conn::connect(&format!(
+                "Server=localhost,{port};User Id=synthetic;Password=marker"
+            ),)
+            .await
+            .is_err()
+        );
+        server.await.unwrap();
     }
 }

@@ -9,10 +9,13 @@
   binding comparison through a qualified run (#613). Planning integration,
   source handling and the evidence a plan may rest on remain unimplemented,
   and no qualification yet changes what a plan is allowed to claim. See [delivery tracking](RESOLVER-DELIVERY.md).
-- Amended by #1528 (DEC-1528.1): an operator-vouched resolver becomes the
-  default selection. The measured profiles this record designs are frozen,
-  and their removal is tracked in #1636. See "Amendment: the operator-vouched
-  resolver" below.
+- Amended by #1528 (DEC-1528.1): a resolver the operator vouches for becomes
+  the default selection, and the measured profiles this record designs are
+  frozen.
+- Amended by #1636 (DEC-1636.1): the measured profiles, with the Docker
+  containment (#608) and dedicated-server exclusivity (#609) built for them,
+  are removed. The resolver is the only one, on every platform pbps
+  supports. See "Amendment: the resolver" below.
 - Date: 2026-09-15
 - Related: [SPEC §9.3](SPEC.md#93-the-dev-database-optional), §7.3, §7.6,
   §8.2, §9.8 and §11.5; [ARCHITECTURE.md](ARCHITECTURE.md);
@@ -687,17 +690,17 @@ delivery, not silently downgraded to weaker evidence.
 from the artifact without a project, credentials or a resolver. Approval stays
 file-based and the final emitter remains the only source of deployment SQL.
 
-## Amendment: the operator-vouched resolver (#1528)
+## Amendment: the resolver (#1528, #1636)
 
 This amends decisions 4 and 5. [SPEC §9.3.2](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
-carries the normative text, and DEC-1528.1 the reasons.
+carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
 
-- **Two environments.** The resolver environments designed above are the
-  *measured profiles*. They are frozen, and their removal is tracked in #1636.
-  Selecting a resolver without naming one gives the *operator-vouched
-  resolver* (`vouched`). The cases, the assessment, the fingerprint key, the
-  sealing and the refusal classes are shared. Only the producer differs.
-- **Decision 4, for the operator-vouched resolver.**
+- **One resolver.** The resolver environments designed above are the
+  *measured profiles*. #1528 froze them and #1636 removed them. Selecting a
+  resolver gives the resolver this amendment describes, whose scratch the
+  operator vouches for. The cases, the assessment, the fingerprint key, the
+  sealing and the refusal classes are those designed above.
+- **Decision 4, as amended.**
   - "Verify the chosen environment" keeps the shared compatibility
     qualification (version, with the build string recorded rather than
     compared per DEC-1672.1, extensions, encoding, collation, deployment
@@ -713,10 +716,10 @@ carries the normative text, and DEC-1528.1 the reasons.
       from `template0` with the target's encoding and locale, or any other
       account's own supplied one, emptied again with `DROP OWNED`
       afterwards.
-  - Isolation, containment, log handling and channel protection are vouched
-    for by the operator, not measured. The evidence names the profile, so a
-    reviewer can always tell a vouched answer from a measured one.
-- **Decision 5, for the operator-vouched resolver.**
+  - Isolation, log handling and channel protection are the operator's, who
+    vouches for the scratch; pbps enforces none of them and observes no
+    process. The evidence records the scratch's kind (DEC-1674.1).
+- **Decision 5, as amended.**
   - Objects outside the managed set come from a reviewed baseline in the
     repository, run on scratch only. It runs whole (#1664), as the setup
     role, after the deployer's authorization is reproduced and before pbps
@@ -743,52 +746,52 @@ carries the normative text, and DEC-1528.1 the reasons.
     three measured real schemas.
   - pbps sends no routine source of its own. A question needing routine
     source the baseline lacks refuses with the finding and two remedies.
-  - The private-source requirements apply only to the measured profiles'
-    retained definitions.
+  - No target source is retained or transferred, so the private-source
+    requirements designed above no longer apply (#617 is closed).
   - Two later steps reuse the same comparison: a reviewed baseline draft from
     the target, then automatic fill of missing shapes. Fill orders each
     generated object from the target's `pg_depend`, between managed
     objects, which lifts the chain refusal for what it fills.
-- **Reading this record.** Its "resolver" means the measured profiles wherever
-  it describes containment, process or socket observation, executable
-  identity or verified channels.
-  - Acceptance tests 10, 11, 12, 13, 19, 20, 21 and 23 are measured
-    profiles only: they test retained external source, instance separation,
+- **Reading this record.** Wherever the decisions above describe
+  containment, process or socket observation, executable identity, verified
+  channels or retained external source, they describe the measured profiles,
+  and none of it applies after #1636.
+  - Acceptance tests 10, 11, 12, 13, 19, 20, 21 and 23 are retired with the
+    measured profiles: they tested retained external source, instance separation,
     containment, verified channels, scratch exclusion against a concurrent
     session, and executable identity. All of these are scratch-side
     guarantees the operator vouches for instead.
-  - Test 14 holds for the operator-vouched resolver for its compatibility
-    inputs only.
-  - Test 11's same-cluster refusal is replaced, for the operator-vouched
-    resolver, by `vouched_refuses_the_target_as_scratch` and
-    `vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account`:
+  - Test 14 holds for the resolver's compatibility inputs only.
+  - Test 11's same-cluster refusal is replaced by
+    `resolver_refuses_the_target_as_scratch` and
+    `resolver_refuses_a_same_cluster_scratch_with_an_unconfined_account`:
     another database on the target's cluster passes there only with a
     confined account (#1667).
-- **Acceptance tests for the operator-vouched resolver (live, PostgreSQL):**
-  - `vouched_refuses_the_target_as_scratch`
-  - `vouched_refuses_a_scratch_that_is_not_empty`
-  - `vouched_answers_a_managed_question_without_root_or_observation`
-  - `vouched_refuses_a_same_cluster_scratch_with_an_unconfined_account`
-  - `vouched_runs_in_a_precreated_database_with_a_confined_account`
-  - `vouched_empties_the_supplied_database_when_the_run_refuses`
-  - `vouched_compiles_a_managed_view_over_a_baseline_table`
-  - `vouched_refuses_a_baseline_that_differs_from_the_target`
-  - `vouched_refuses_a_baseline_that_creates_a_managed_object`
-  - `vouched_runs_the_baseline_before_any_managed_object` (its `SET`s do
+- **Acceptance tests for the resolver (live, PostgreSQL):**
+  - `resolver_refuses_the_target_as_scratch`
+  - `resolver_refuses_a_scratch_that_is_not_empty`
+  - `resolver_answers_a_managed_question_without_root_or_observation`
+  - `resolver_refuses_a_same_cluster_scratch_with_an_unconfined_account`
+  - `resolver_runs_in_a_precreated_database_with_a_confined_account`
+  - `resolver_empties_the_supplied_database_when_the_run_refuses`
+  - `resolver_compiles_a_managed_view_over_a_baseline_table`
+  - `resolver_refuses_a_baseline_that_differs_from_the_target`
+  - `resolver_refuses_a_baseline_that_creates_a_managed_object`
+  - `resolver_runs_the_baseline_before_any_managed_object` (its `SET`s do
     not reach the compile; a setting it changes is read by the compatibility
     qualification)
-  - `vouched_refuses_a_baseline_object_left_uncompared`
-  - `vouched_compares_an_external_table_without_its_foreign_keys_and_triggers`
-  - `vouched_refuses_a_chain_through_an_external_object_naming_it`
-  - `vouched_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view`
-  - `vouched_refuses_an_external_view_staged_as_a_table` (the computed-field
+  - `resolver_refuses_a_baseline_object_left_uncompared`
+  - `resolver_compares_an_external_table_without_its_foreign_keys_and_triggers`
+  - `resolver_refuses_a_chain_through_an_external_object_naming_it`
+  - `resolver_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view`
+  - `resolver_refuses_an_external_view_staged_as_a_table` (the computed-field
     `xmin(ext.v)` case binds differently on a table)
-  - `vouched_refuses_a_question_that_needs_routine_source_the_baseline_lacks`
-  - `vouched_reports_a_write_through_a_shape_view_with_the_real_definition_remedy`
-  - `vouched_stages_a_cast_and_an_operator_over_external_types_in_the_baseline`
-  - `vouched_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates`
-  - `vouched_recheck_binds_the_target_by_engine_identity`
-  - `vouched_recheck_refuses_an_external_shape_changed_after_planning`
+  - `resolver_refuses_a_question_that_needs_routine_source_the_baseline_lacks`
+  - `resolver_reports_a_write_through_a_shape_view_with_the_real_definition_remedy`
+  - `resolver_stages_a_cast_and_an_operator_over_external_types_in_the_baseline`
+  - `resolver_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates`
+  - `resolver_recheck_binds_the_target_by_engine_identity`
+  - `resolver_recheck_refuses_an_external_shape_changed_after_planning`
 
 ## Architectural placement
 
@@ -898,7 +901,7 @@ protection under test is removed.
     negative control showing the sentinel is reachable when containment is
     removed in the test fixture. Compilation requiring a blocked effect is
     refused without stubs or a less restrictive retry.
-14. **`resolver_reconnect_requalifies_all_evidence` (planned; for the operator-vouched resolver, its compatibility inputs only):** replace a
+14. **`resolver_reconnect_requalifies_all_evidence` (planned; its compatibility inputs only):** replace a
     qualified resolver connection with a separate backend that still passes
     target-instance separation but differs in a required version, extension,
     collation or effective session setting. Each mismatch or unknown fact must

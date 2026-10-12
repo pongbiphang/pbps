@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Test the peer-verified TLS hop using an owned engine and disposable PKI.
+"""Test the ordinary connection's verified TLS using an owned engine and disposable PKI.
 
-This fixture is deliberately separate from runtime containment/admission. It
-never alters a shared test server's TLS configuration or the host trust store.
+It never alters a shared test server's TLS configuration or the host trust store.
 """
 
 import argparse
@@ -139,8 +138,6 @@ def main():
                 print(f"TLS trust variant: {trust}", flush=True)
                 env["SSL_CERT_FILE"] = str(root / trust)
                 run_case(cargo, "invalid_trust_cannot_yield_a_verified_connection", env)
-                if args.engine == "mssql" and trust == "untrusted.pem":
-                    run_case(cargo, "ado_options_cannot_disable_peer_verification", env)
         finally:
             # Do not silently ignore failed cleanup: no shared container is
             # named, and a failed removal leaves this fixture's resources live.

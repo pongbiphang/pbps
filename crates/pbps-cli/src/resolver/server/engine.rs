@@ -4,91 +4,16 @@
 //! answers. The binding calls below hand the PostgreSQL adapter the managed
 //! declarations and return its comparison; nothing here seals evidence.
 
-use pbps_db::resolver::environment::DatabaseRecipe;
-use pbps_db::resolver::{
-    InstanceObservation, OwnSession, ScratchNames, SessionCounter, SessionInventory,
-};
-use pbps_db::transport::StreamConn;
-use pbps_db::{DbError, Driver};
+use pbps_db::Driver;
 
 use super::Error;
-
-pub(crate) async fn identity(connection: &mut StreamConn) -> Result<InstanceObservation, DbError> {
-    match connection.driver() {
-        Driver::Postgres => pbps_pg::resolver::instance_identity(connection).await,
-        Driver::Mssql => pbps_mssql::resolver::instance_identity(connection).await,
-    }
-}
-
-/// Read only on an already qualified PostgreSQL administrative channel.
-pub(crate) async fn postgres_version_num(connection: &mut StreamConn) -> Result<i64, DbError> {
-    match connection.driver() {
-        Driver::Postgres => pbps_pg::roles::server_version_num(connection).await,
-        Driver::Mssql => Err(DbError::Refused(
-            "a PostgreSQL supplied-server profile cannot read a SQL Server version".into(),
-        )),
-    }
-}
-
-pub(crate) async fn own_session(connection: &mut StreamConn) -> Result<OwnSession, DbError> {
-    match connection.driver() {
-        Driver::Postgres => pbps_pg::resolver::own_session(connection).await,
-        Driver::Mssql => pbps_mssql::resolver::own_session(connection).await,
-    }
-}
-
-pub(crate) async fn client_sessions(
-    connection: &mut StreamConn,
-) -> Result<SessionInventory, DbError> {
-    match connection.driver() {
-        Driver::Postgres => pbps_pg::resolver::client_sessions(connection).await,
-        Driver::Mssql => pbps_mssql::resolver::client_sessions(connection).await,
-    }
-}
-
-pub(crate) async fn session_counter(
-    connection: &mut StreamConn,
-) -> Result<SessionCounter, DbError> {
-    match connection.driver() {
-        Driver::Postgres => pbps_pg::resolver::session_counter(connection).await,
-        Driver::Mssql => pbps_mssql::resolver::session_counter(connection).await,
-    }
-}
-
-pub(crate) async fn create_scratch(
-    connection: &mut StreamConn,
-    names: &ScratchNames,
-    recipe: &DatabaseRecipe,
-) -> Result<(), DbError> {
-    match connection.driver() {
-        Driver::Postgres => pbps_pg::resolver::create_scratch(connection, names, recipe).await,
-        Driver::Mssql => pbps_mssql::resolver::create_scratch(connection, names, recipe).await,
-    }
-}
-
-pub(crate) async fn drop_roles(connection: &mut StreamConn, roles: &[String]) -> Vec<String> {
-    match connection.driver() {
-        Driver::Postgres => pbps_pg::resolver::drop_roles(connection, roles).await,
-        Driver::Mssql => pbps_mssql::resolver::drop_roles(connection, roles).await,
-    }
-}
-
-pub(crate) async fn drop_scratch(
-    connection: &mut StreamConn,
-    names: &ScratchNames,
-) -> Result<(), DbError> {
-    match connection.driver() {
-        Driver::Postgres => pbps_pg::resolver::drop_scratch(connection, names).await,
-        Driver::Mssql => pbps_mssql::resolver::drop_scratch(connection, names).await,
-    }
-}
 
 // Binding resolution has one adapter, PostgreSQL's (#613); SQL Server's is
 // designed and built separately (#619, #620). The reconstruction, the
 // managed-name inventory and both captures are that adapter's private state,
 // as the target capture's are.
 pub(super) use pbps_pg::resolver::capture::{
-    CaptureScope, CapturedInputs, CompiledCapture, Managed, Paths, RecordedOwnership,
+    CaptureScope, CompiledCapture, Managed, Paths, RecordedOwnership,
 };
 pub(super) use pbps_pg::resolver::reconstruct::Reconstruction;
 
@@ -135,7 +60,7 @@ pub(super) fn reconstruction(
 }
 
 /// Compiles the reconstruction as whatever role the session is, over the
-/// measured run's stream or the operator-vouched run's ordinary connection.
+/// run's ordinary connection.
 pub(crate) async fn compile(
     reconstruction: &mut Reconstruction,
     extras: &[String],
@@ -168,69 +93,6 @@ pub(super) fn compile_failed(error: pbps_pg::resolver::reconstruct::ReconstructE
         | ReconstructError::Emit { .. }
         | ReconstructError::Compile { .. }
         | ReconstructError::Cycle(_) => Error::Binding(error.to_string()),
-    }
-}
-
-/// Captures scratch twice: its managed objects, and then the scope their
-/// bindings derive, which is the scope the target is captured under too.
-pub(crate) async fn capture_desired(
-    connection: &mut StreamConn,
-    base: &Managed,
-    desired: &Managed,
-    paths: &Paths,
-) -> Result<(CapturedInputs, CaptureScope), Error> {
-    use pbps_pg::resolver::capture;
-    match connection.driver() {
-        Driver::Postgres => {
-            let first = capture::capture(connection, &capture::managed_scope(desired))
-                .await
-                .map_err(catalog_read_failed)?;
-            let scope = capture::scope(&first, &[base, desired], paths);
-            let captured = capture::capture(connection, &scope)
-                .await
-                .map_err(catalog_read_failed)?;
-            Ok((captured, scope))
-        }
-        Driver::Mssql => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
-    }
-}
-
-/// The qualified run fixes the key and principal map before either fresh
-/// scratch capture. Only the second capture's facts support the verdict.
-pub(crate) async fn capture_desired_sealed(
-    connection: &mut StreamConn,
-    base: &Managed,
-    desired: &Managed,
-    paths: &Paths,
-    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
-    principals: &crate::resolver::scope::Principals,
-) -> Result<
-    (
-        CapturedInputs,
-        CaptureScope,
-        pbps_model::resolver::InputManifest,
-    ),
-    Error,
-> {
-    use pbps_pg::resolver::capture;
-    match (connection.driver(), principals) {
-        (Driver::Postgres, crate::resolver::scope::Principals::Postgres(roles)) => {
-            let first = capture::capture(connection, &capture::managed_scope(desired))
-                .await
-                .map_err(catalog_read_failed)?;
-            let scope = capture::scope(&first, &[base, desired], paths);
-            let (captured, manifest) = capture::capture_identifying_sealed_with_roles(
-                connection,
-                &scope,
-                &Default::default(),
-                key,
-                roles,
-            )
-            .await
-            .map_err(catalog_read_failed)?;
-            Ok((captured, scope, manifest))
-        }
-        _ => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
     }
 }
 
@@ -317,29 +179,6 @@ pub(super) fn catalog_read_failed(error: pbps_db::resolver::capture::CaptureErro
     }
 }
 
-/// What a failed target capture is, by the same rule as
-/// [`catalog_read_failed`]. A target without its qualified connection, or one
-/// whose inputs changed under the read, answered nothing either; executable
-/// content that is not qualified did.
-pub(super) fn target_capture_failed(failure: crate::resolver::native::CaptureFailure) -> Error {
-    use crate::resolver::native::CaptureFailure;
-    match failure {
-        CaptureFailure::Catalog(error) => catalog_read_failed(error),
-        CaptureFailure::Binding | CaptureFailure::Changed => Error::Read(failure.to_string()),
-        CaptureFailure::Executables => Error::Binding(failure.to_string()),
-    }
-}
-
-pub(super) fn assess(
-    target: &CapturedInputs,
-    desired: &CapturedInputs,
-    base: &Managed,
-    paths: &Paths,
-    reconstruction: &Reconstruction,
-) -> pbps_db::resolver::capture::Assessment {
-    pbps_pg::resolver::capture::assess(target, desired, base, paths, reconstruction)
-}
-
 /// Each in-scope schema's effective path as the qualified scope measured it,
 /// with the configured extras for any schema it did not. An unreadable
 /// measurement is left out, which falls back to the whole write path.
@@ -359,8 +198,7 @@ pub(super) fn paths(
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, catalog_read_failed, compile_failed, target_capture_failed};
-    use crate::resolver::native::CaptureFailure;
+    use super::{Error, catalog_read_failed, compile_failed};
     use pbps_db::resolver::capture::{CaptureError, Uncovered};
     use pbps_pg::resolver::reconstruct::ReconstructError;
 
@@ -426,23 +264,6 @@ mod tests {
             ReconstructError::Cycle("app.t".into()),
         ] {
             assert!(matches!(compile_failed(verdict), Error::Binding(_)));
-        }
-    }
-
-    #[test]
-    fn a_target_capture_that_lost_its_connection_or_input_is_a_read_failure() {
-        for read in [
-            CaptureFailure::Binding,
-            CaptureFailure::Changed,
-            CaptureFailure::Catalog(CaptureError::Close),
-        ] {
-            assert!(matches!(target_capture_failed(read), Error::Read(_)));
-        }
-        for verdict in [
-            CaptureFailure::Executables,
-            CaptureFailure::Catalog(CaptureError::Version),
-        ] {
-            assert!(matches!(target_capture_failed(verdict), Error::Binding(_)));
         }
     }
 }

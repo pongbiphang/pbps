@@ -270,39 +270,7 @@ async fn exercise_capture(connection: String) {
     )
     .await
     .unwrap();
-    let (before_extension, extension_runtime) =
-        capture_with_runtime_inputs(&mut conn, &scope, &Default::default())
-            .await
-            .unwrap();
-    assert!(
-        extension_runtime
-            .libraries
-            .iter()
-            .any(|library| library == "$libdir/hstore"),
-        "extension native code is a required runtime input"
-    );
-    conn.execute("CREATE FUNCTION app.extra_handler() RETURNS language_handler AS '$libdir/plpgsql','plpgsql_call_handler' LANGUAGE c").await.unwrap();
-    let standalone_scope = CaptureScope {
-        retained: BTreeSet::new(),
-        candidates: BTreeSet::from([CandidateSet {
-            class: CandidateClass::Routine,
-            namespace: Some("app".into()),
-            name: Some("extra_handler".into()),
-        }]),
-    };
-    let (standalone, standalone_runtime) =
-        capture_with_runtime_inputs(&mut conn, &standalone_scope, &Default::default())
-            .await
-            .unwrap();
-    let ordinary = capture(&mut conn, &standalone_scope).await.unwrap();
-    assert!(standalone.compare(&ordinary).is_empty());
-    assert!(
-        standalone_runtime
-            .libraries
-            .iter()
-            .any(|library| library == "$libdir/plpgsql"),
-        "native code outside extension membership cannot be omitted"
-    );
+    let before_extension = capture(&mut conn, &scope).await.unwrap();
 
     conn.execute("ALTER EXTENSION hstore SET SCHEMA ext_b")
         .await

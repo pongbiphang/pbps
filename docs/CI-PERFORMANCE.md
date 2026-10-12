@@ -1,7 +1,6 @@
 # Live-test performance
 
-CPU-heavy PostgreSQL capture and resolver fixtures use Cargo's `live-test`
-profile. It inherits `test` and enables basic optimization (`opt-level = 1`)
+CPU-heavy PostgreSQL capture fixtures use Cargo's `live-test` profile. It inherits `test` and enables basic optimization (`opt-level = 1`)
 while explicitly retaining debug assertions and overflow checks. Ordinary
 `cargo test`, the quick CI suite, and the release profile are unchanged.
 
@@ -17,9 +16,8 @@ explain the cost.
 The private regressions repeatedly capture target and scratch catalogs on both
 supported fixture versions. Each capture separately reads raw catalog data,
 qualified rendering and fresh witnesses. SQL Server scope qualification also
-hashes executable content, including large mapped engine packages, on both
-sides and at subsequent observations. These checks exercise different
-invariants and remain intact.
+hashed executable content, including large mapped engine packages, until
+#1636 removed the measured profiles that compared it.
 
 A representative PostgreSQL binding case generated 1,017 cursor FETCH
 operations across the two engine versions. A local SQL-duration observation
@@ -70,20 +68,6 @@ initial `--no-run` build separately, then run the warmed binaries in alternating
 order. Do not mix compilation into a reported test-execution speedup. Keep the
 same fixtures, engine versions, test selection and build-job limit.
 
-`scripts/live-resolver.py`, `scripts/live-resolver-target.py` and the nested
-`resolver-daemon-fixture.py` build with the same profile. On a disposable native Linux host, the root fixtures still use
-a prebuilt test executable discovered from Cargo's JSON artifacts:
-
-```bash
-cargo test --profile live-test -p pbps-cli --lib --no-run --message-format=json
-```
-
-Select the executable artifact whose target name is `pbps_cli`, as the CI
-workflow does, and pass its absolute path with `--test-binary`. Do not guess a
-path under `target/debug`: the custom profile has its own output directory.
-Required root permissions and owned fixture isolation remain the same as
-[resolver runtime verification](RESOLVER-RUNTIME.md#verification).
-
 The serial schedules, all positive and negative scenarios, both engine
 versions, catalog rereads, content hashes and cleanup assertions remain in
 place. A faster build mode does not authorize relaxing those checks. Further
@@ -105,7 +89,6 @@ The run is now shaped by DEC-1370.1:
 | --- | --- | --- |
 | `lint` | 1 | Python self-tests, fmt, clippy. Every other job waits for it |
 | `live-pg` | `dialect`, `capture`, `flow-programs`, `flow-rest` | its share of the PostgreSQL suites, against its own PG18 + PG16 |
-| `resolver` | `engine` × `half` | half of that engine's fixture scripts, in their original order |
 
 The splits are exact complements:
 
@@ -123,50 +106,3 @@ case unselected. To rebalance, move a word between the filter and its
 cargo test -p pbps-cli --test flow_pg -- --ignored --list --format terse \
   trigger routine function grant | grep -c ': test$'
 ```
-
-## Arrival-triggered cancellation
-
-The administrative-session cancellation regression (#1295) previously held
-each operation indefinitely, then dropped it at a 60-second deadline. That
-deadline included reaching the hook; only the subsequent wait was unnecessary.
-The test now signals arrival after the run stores its owned administrative
-session and the hook establishes the real forwarder/observer fault. It drops
-the exact boxed operation on arrival. The 60-second timeout bounds missing
-arrival only. Production code and all cleanup observations remain unchanged.
-
-Paired local runs used the same `live-test` profile, pinned SQL Server 2025
-and PostgreSQL 18.6 images, native Docker 29.8.1, and maintained dedicated-server
-fixture. The baseline added arrival instrumentation without changing the old
-deadline. Prebuilt baseline and replacement binaries were retained separately;
-compilation is excluded from the following measurements.
-
-| Workload | SQL Server before | SQL Server after | PostgreSQL before | PostgreSQL after |
-| --- | ---: | ---: | ---: | ---: |
-| Cancellation case, including retries and cleanup | 139.45s | 17.85s | 193.71s | 12.62s |
-| Complete dedicated-server segment, 22 fixture invocations | 612.46s | 367.53s | 449.74s | 252.66s |
-
-The baseline's measured post-arrival waits totaled 117.32s for SQL Server's
-two variants and 177.14s for PostgreSQL's three. After replacement, arrival
-to dropping the operation took 34–52 microseconds and 14–38 microseconds,
-respectively. These intervals distinguish a test-imposed wait from engine work.
-The shared host and other cases' variable runtimes prevent attributing every
-segment-level difference to this change. A segment is not the whole resolver
-CI job, and overlapping jobs' savings cannot be added as pipeline wall time.
-
-Reproduce each complete segment by discovering the compiled `pbps_cli` artifact
-as above, retaining each variant's executable outside the repository, and
-running the maintained fixture on a qualified native host:
-
-```bash
-sudo python3 scripts/live-resolver-server.py mssql --test-binary "$PBPS_FIXTURE_BINARY"
-sudo python3 scripts/live-resolver-server.py pg --test-binary "$PBPS_FIXTURE_BINARY"
-```
-
-Use `--socket` when the owned native daemon has a non-default socket. Keep the
-same fixture source and pinned images, and record build time, each variant's
-arrival/post-arrival interval, case runtime, complete segment runtime, and CI
-job runtime separately. The four ordinary controls require same-poll
-cancellation and refuse missing arrival, a closed channel, or an operation
-that completed instead of remaining held. The existing real-engine assertions
-still require retry refusal, unchanged roles, actual leftover detection,
-reported recovery names, exact owned-resource removal, and target integrity.

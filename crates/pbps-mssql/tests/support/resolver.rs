@@ -278,31 +278,10 @@ mod contained611 {
 
 mod scope611 {
     use super::*;
-    use pbps_db::resolver::environment::{
-        CatalogFacts, EnvironmentFacts, ExecutableIdentity, ExecutableRole, ExecutableSet,
-        FactStatus, Provenance, Verdict,
-    };
-    use pbps_mssql::resolver::compatibility::compare;
+    use pbps_db::resolver::environment::{FactStatus, Verdict};
+    use pbps_mssql::resolver::compatibility::compare_reported;
     use pbps_mssql::resolver::environment::{Scope, read};
     use pbps_mssql::resolver::scope_facts;
-
-    /// The catalog says nothing about processes; the rule needs an engine
-    /// identity on both sides, so the same one is attached to each.
-    fn with_executables(catalog: CatalogFacts) -> EnvironmentFacts {
-        EnvironmentFacts {
-            catalog,
-            executables: ExecutableSet {
-                engine: ExecutableIdentity {
-                    role: ExecutableRole::Engine,
-                    path: "/opt/mssql/bin/sqlservr".into(),
-                    digest: Some("e1".into()),
-                    provenance: Provenance::LoadedContent,
-                    disk_differs_from_loaded: Some(false),
-                },
-                libraries: Vec::new(),
-            },
-        }
-    }
 
     /// The facts are the reading session's own: a deployment login's default
     /// language decides the language, the date format and the first day of
@@ -377,11 +356,7 @@ mod scope611 {
         // server's language: a resolver compiled through it would read date
         // literals differently, and the rule says so by name.
         let admin = read(&mut db.conn, &scope).await.unwrap();
-        let report = compare(
-            &with_executables(seen.clone()),
-            &with_executables(admin),
-            &[],
-        );
+        let report = compare_reported(&seen.clone(), &admin);
         assert_eq!(
             report.verdict(),
             Verdict::Mismatch(vec![
@@ -398,11 +373,7 @@ mod scope611 {
                 resolver: "us_english".into()
             }
         );
-        let same = compare(
-            &with_executables(seen.clone()),
-            &with_executables(seen.clone()),
-            &[],
-        );
+        let same = compare_reported(&seen.clone(), &seen.clone());
         assert_eq!(same.verdict(), Verdict::Verified, "{same:?}");
 
         // Another database on the same server, created the ordinary way: its
@@ -418,11 +389,7 @@ mod scope611 {
             .await
             .unwrap();
         let plain = read(&mut elsewhere, &scope).await.unwrap();
-        let report = compare(
-            &with_executables(seen.clone()),
-            &with_executables(plain),
-            &[],
-        );
+        let report = compare_reported(&seen.clone(), &plain);
         assert_eq!(
             report.verdict(),
             Verdict::Mismatch(vec![
@@ -440,7 +407,7 @@ mod scope611 {
             .await
             .unwrap();
         let off = read(&mut deployer, &scope).await.unwrap();
-        let report = compare(&with_executables(off.clone()), &with_executables(off), &[]);
+        let report = compare_reported(&off.clone(), &off);
         assert_eq!(
             report.verdict(),
             Verdict::Mismatch(vec!["persisted-module-settings".into()]),
@@ -478,11 +445,8 @@ mod scope611 {
 
 mod editions611 {
     use super::*;
-    use pbps_db::resolver::environment::{
-        EnvironmentFacts, ExecutableIdentity, ExecutableRole, ExecutableSet, FactStatus,
-        Provenance, Verdict,
-    };
-    use pbps_mssql::resolver::compatibility::compare;
+    use pbps_db::resolver::environment::{FactStatus, Verdict};
+    use pbps_mssql::resolver::compatibility::compare_reported;
     use pbps_mssql::resolver::environment::{Scope, read};
 
     /// Two real servers of one build: an Express instance installed under
@@ -500,19 +464,6 @@ mod editions611 {
         let mut resolver = connect_live(&conn_str()).await.unwrap();
         let schemas = ["dbo".to_owned()];
         let scope = Scope { schemas: &schemas };
-        let side = |catalog| EnvironmentFacts {
-            catalog,
-            executables: ExecutableSet {
-                engine: ExecutableIdentity {
-                    role: ExecutableRole::Engine,
-                    path: "/opt/mssql/bin/sqlservr".into(),
-                    digest: Some("e1".into()),
-                    provenance: Provenance::LoadedContent,
-                    disk_differs_from_loaded: Some(false),
-                },
-                libraries: Vec::new(),
-            },
-        };
         let target_facts = read(&mut target, &scope).await.unwrap();
         let resolver_facts = read(&mut resolver, &scope).await.unwrap();
         assert_eq!(
@@ -528,7 +479,7 @@ mod editions611 {
             resolver_facts.observations["product_version"],
             "the two servers are one build"
         );
-        let report = compare(&side(target_facts), &side(resolver_facts), &[]);
+        let report = compare_reported(&target_facts, &resolver_facts);
         assert_eq!(report.facts["engine_edition"], FactStatus::Match);
         assert_eq!(report.facts["edition"], FactStatus::Match);
         let limitation = &report.limitations["edition"];

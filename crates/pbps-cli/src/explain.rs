@@ -596,34 +596,28 @@ fn findings(plan: &SavedPlan, e: &Explanation) -> Vec<output::Finding> {
     out
 }
 
-/// What produced a resolved plan's evidence, so a reviewer can tell an answer
-/// the operator vouched for from a measured one (DEC-1528.1).
+/// Where a resolved plan's scratch came from, and whether its baseline's
+/// outside writes went unchecked (DEC-1674.1). #1517 adds the entry's name
+/// and layout from the sealed provenance.
 fn resolver_runtime(runtime: &pbps_model::resolver::ResolverRuntime) -> String {
-    use pbps_model::resolver::{OutsideWrites, ResolverRuntime, VouchedScratch};
-    match runtime {
-        ResolverRuntime::Vouched {
-            scratch,
-            outside_writes,
-        } => {
-            let scratch = match scratch {
-                VouchedScratch::Server {} => "a supplied server".to_owned(),
-                VouchedScratch::Docker { image } => {
-                    format!("a container of {image}, the image as configured and not verified")
-                }
-            };
-            let writes = match outside_writes {
-                OutsideWrites::Refused => "",
-                OutsideWrites::Allowed => {
-                    "; the baseline's writes outside the scratch database were allowed, \
-                     not checked"
-                }
-            };
-            format!("operator-vouched scratch (not measured) on {scratch}{writes}")
+    use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchSource};
+    let ResolverRuntime::Scratch {
+        scratch,
+        outside_writes,
+    } = runtime;
+    let scratch = match scratch {
+        ScratchSource::Server {} => "server scratch".to_owned(),
+        ScratchSource::Docker { image } => {
+            format!("docker scratch from {image} (the image as configured, not verified)")
         }
-        ResolverRuntime::Container { profile, .. } | ResolverRuntime::Supplied { profile, .. } => {
-            format!("measured profile {profile}")
+    };
+    let writes = match outside_writes {
+        OutsideWrites::Refused => "",
+        OutsideWrites::Allowed => {
+            "; the baseline's writes outside the scratch database were allowed, not checked"
         }
-    }
+    };
+    format!("{scratch}{writes}")
 }
 
 fn render(plan: &SavedPlan, e: &Explanation) -> String {
@@ -779,9 +773,9 @@ mod tests {
     /// writes outside it went unchecked (#1674).
     #[test]
     fn the_runtime_line_names_the_scratch_and_an_allowed_outside_write() {
-        use pbps_model::resolver::{OutsideWrites, ResolverRuntime, VouchedScratch};
-        let docker = resolver_runtime(&ResolverRuntime::Vouched {
-            scratch: VouchedScratch::Docker {
+        use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchSource};
+        let docker = resolver_runtime(&ResolverRuntime::Scratch {
+            scratch: ScratchSource::Docker {
                 image: "postgres:18".into(),
             },
             outside_writes: OutsideWrites::Allowed,
@@ -790,14 +784,18 @@ mod tests {
         assert!(docker.contains("not verified"), "{docker}");
         assert!(docker.contains("allowed, not checked"), "{docker}");
         // Negative: the default says nothing of outside writes.
-        let server = resolver_runtime(&ResolverRuntime::Vouched {
-            scratch: VouchedScratch::Server {},
+        let server = resolver_runtime(&ResolverRuntime::Scratch {
+            scratch: ScratchSource::Server {},
             outside_writes: OutsideWrites::Refused,
         });
-        assert_eq!(
-            server,
-            "operator-vouched scratch (not measured) on a supplied server"
-        );
+        assert_eq!(server, "server scratch");
+        // Negative: neither says "vouched" or "measured" any more (#1636).
+        for line in [&docker, &server] {
+            assert!(
+                !line.contains("vouched") && !line.contains("measured"),
+                "{line}"
+            );
+        }
     }
 
     /// The line is advertised as copy-pastable, so a path a shell would take

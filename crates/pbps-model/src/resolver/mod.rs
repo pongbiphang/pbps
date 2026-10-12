@@ -25,5 +25,5 @@ pub use projection::ObjectTransition;
 mod evidence;
 pub use evidence::{
     AuthorizationCondition, BindingCoverage, EvidenceError, EvidenceHandling, OutsideWrites,
-    PlanAnalysis, Qualification, ResolverEvidence, ResolverRuntime, VouchedScratch,
+    PlanAnalysis, Qualification, ResolverEvidence, ResolverRuntime, ScratchSource,
 };

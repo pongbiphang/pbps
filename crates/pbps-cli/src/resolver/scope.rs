@@ -21,10 +21,9 @@
 //! as the reproduced deployer — no projection to keep in step with it
 //! (DECISIONS 520, 521).
 
-use pbps_db::fingerprint::FingerprintKey;
 use pbps_db::resolver::Observation;
 use pbps_db::resolver::environment::{
-    CatalogFacts, DatabaseRecipe, EnvironmentFacts, RecipeUnavailable, ScopeReport,
+    CatalogFacts, DatabaseRecipe, RecipeUnavailable, ScopeReport,
 };
 use pbps_db::transport::QueryConnection;
 use pbps_db::{DbError, Driver};
@@ -86,17 +85,6 @@ pub enum Authorization {
 pub enum Principals {
     Postgres(pg_auth::RoleMap),
     Mssql(mssql_auth::PrincipalMap),
-}
-
-/// The authorization context's digest, keyed (DEC-952.1). Held and compared
-/// within this run only, so the process key serves; sealing one into a plan
-/// (#614) must use the environment's key.
-fn digest(bytes: &[u8]) -> String {
-    FingerprintKey::process()
-        .fingerprint(AUTHORIZATION_RULE, "authorization", bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// The label authorization digests are keyed under; distinct from the capture
@@ -204,55 +192,7 @@ pub(crate) fn recipe(
     }
 }
 
-/// The native libraries a scope requires the engine to have loaded or be
-/// able to load, by the names the engine uses for them. SQL Server names
-/// none: its in-process code for a database is CLR assemblies, whose content
-/// lives in the catalog and is compared there, not files a loader resolves.
-pub(crate) fn required_libraries(driver: Driver, catalog: &CatalogFacts) -> Vec<String> {
-    match driver {
-        Driver::Postgres => super::native::executables::required_libraries(catalog),
-        Driver::Mssql => Vec::new(),
-    }
-}
-
-/// The directories a bare library name is searched along.
-pub(crate) fn library_path(driver: Driver, catalog: &CatalogFacts) -> String {
-    match driver {
-        Driver::Postgres => catalog
-            .settings
-            .get("dynamic_library_path")
-            .map(|fact| fact.value.clone())
-            .unwrap_or_else(|| "$libdir".to_owned()),
-        Driver::Mssql => String::new(),
-    }
-}
-
-/// File suffixes, beside shared objects, that are engine code when mapped.
-/// SQL Server for Linux runs its Windows binaries out of `.sfp` packages the
-/// platform layer maps into the process (measured on 17.0: `sqlservr.sfp`,
-/// `system.common.sfp` and others, thousands of ranges), so the ELF at
-/// `/proc/<pid>/exe` is only the loader and the packages are the engine: a
-/// different build with the same loader differs there and nowhere else.
-pub(crate) fn engine_packages(driver: Driver) -> &'static [&'static str] {
-    match driver {
-        Driver::Postgres => &[],
-        Driver::Mssql => &[".sfp"],
-    }
-}
-
-/// The versioned compatibility rule of the engine, over two sides' facts.
-pub(crate) fn compare(
-    driver: Driver,
-    target: &EnvironmentFacts,
-    resolver: &EnvironmentFacts,
-) -> ScopeReport {
-    match driver {
-        Driver::Postgres => pbps_pg::resolver::compatibility::compare(target, resolver, &[]),
-        Driver::Mssql => pbps_mssql::resolver::compatibility::compare(target, resolver, &[]),
-    }
-}
-
-/// [`compare`] without executables: the operator-vouched resolver's rule,
+/// [`compare`] without executables: the resolver's rule,
 /// which observes no process (#1672). SQL Server has no such rule yet.
 pub(crate) fn compare_reported(
     driver: Driver,
@@ -263,7 +203,7 @@ pub(crate) fn compare_reported(
         Driver::Postgres => Ok(pbps_pg::resolver::compatibility::compare_reported(
             target, resolver,
         )),
-        Driver::Mssql => Err("the operator-vouched resolver has no SQL Server rule".into()),
+        Driver::Mssql => Err("the resolver has no SQL Server rule".into()),
     }
 }
 
@@ -378,33 +318,6 @@ impl Authorization {
         match self {
             Self::Postgres(_) => pg_auth::RULE,
             Self::Mssql(_) => mssql_auth::RULE,
-        }
-    }
-
-    /// The digest of the context as read, before any planned grant.
-    pub(crate) fn digest(&self) -> String {
-        match self {
-            Self::Postgres(context) => digest(&context.canonical()),
-            Self::Mssql(context) => digest(&context.canonical()),
-        }
-    }
-
-    /// The digest the scope is sealed and fingerprinted under: the context
-    /// the deployment statements are meant to run in, after the plan's
-    /// preceding grants. PostgreSQL projects the grants onto the context; SQL
-    /// Server seals the context as read together with the grants themselves.
-    pub(crate) fn sealed_digest(&self, planned: &[PlannedGrant]) -> String {
-        match self {
-            Self::Postgres(context) => {
-                digest(&pg_auth::with_planned(context.clone(), &pg_planned(planned)).canonical())
-            }
-            Self::Mssql(context) => {
-                let mut bytes = context.canonical();
-                bytes.extend(
-                    serde_json::to_vec(&mssql_planned(planned)).expect("planned grants serialise"),
-                );
-                digest(&bytes)
-            }
         }
     }
 
@@ -659,49 +572,6 @@ pub(crate) async fn settle(
     }
 }
 
-/// The digest of the scratch side's own authorization context, as the
-/// reproduced deployer reads it once the scope has settled.
-pub(crate) async fn seal_scratch(
-    session: &mut impl QueryConnection,
-    driver: Driver,
-    schemas: &[String],
-) -> Result<String, DbError> {
-    Ok(match driver {
-        Driver::Postgres => digest(&pg_auth::read(session, schemas).await?.canonical()),
-        Driver::Mssql => digest(&mssql_auth::read(session, schemas).await?.canonical()),
-    })
-}
-
-/// A later check of the scratch side against a freshly read target context.
-/// PostgreSQL verifies the reproduction against the projection again. SQL
-/// Server's scratch has had the plan's grants run on it, so it no longer
-/// equals the target as read; it is compared with what was sealed when the
-/// scope settled instead, and any drift is named.
-pub(crate) async fn recheck(
-    session: &mut impl QueryConnection,
-    principals: &Principals,
-    authorization: &Authorization,
-    planned: &[PlannedGrant],
-    schemas: &[String],
-    sealed_scratch: &str,
-) -> Result<Vec<String>, DbError> {
-    match (principals, authorization) {
-        (Principals::Postgres(map), Authorization::Postgres(context)) => {
-            let expected = pg_auth::with_planned(context.clone(), &pg_planned(planned));
-            pg_auth::verify(session, map, &expected, schemas).await
-        }
-        (Principals::Mssql(_), Authorization::Mssql(_)) => {
-            let current = digest(&mssql_auth::read(session, schemas).await?.canonical());
-            Ok(if current == sealed_scratch {
-                Vec::new()
-            } else {
-                vec!["scratch".to_owned()]
-            })
-        }
-        _ => Err(DbError::BadRow(MIXED.into())),
-    }
-}
-
 /// The effective schema order a PostgreSQL deployer would see on each
 /// in-scope path, derived from the (post-plan) authorization: `pg_catalog`
 /// first, then each of the path's schemas the deployer has USAGE on, in
@@ -799,9 +669,6 @@ mod tests {
         );
         let refused = scope_schemas(Driver::Mssql, &schemas, &extras).unwrap_err();
         assert!(refused.contains("no write path"), "{refused}");
-        // The engine's code beside shared objects is the engine's to name.
-        assert!(engine_packages(Driver::Postgres).is_empty());
-        assert_eq!(engine_packages(Driver::Mssql), [".sfp"]);
     }
 
     #[test]
@@ -838,16 +705,10 @@ mod tests {
         assert_eq!(context.unusable_schemas(&revoke), ["app"]);
     }
 
-    /// The sealed digest moves with a planned grant on either engine, and
-    /// the raw digest does not: the two are different facts.
+    /// The persisted after-digest moves with a planned grant, and the
+    /// before-digest does not: the two are different facts.
     #[test]
-    fn a_planned_grant_moves_the_sealed_digest_and_not_the_raw_one() {
-        let planned = [PlannedGrant {
-            principal: "PUBLIC".into(),
-            schema: "app".into(),
-            privilege: "USAGE".into(),
-            revoke: false,
-        }];
+    fn a_planned_grant_moves_the_after_digest_and_not_the_before() {
         let postgres = Authorization::Postgres(pg_auth::AuthorizationContext {
             principal: pbps_db::resolver::environment::DeploymentPrincipal {
                 login: "d".into(),
@@ -867,11 +728,6 @@ mod tests {
             roles: BTreeMap::new(),
             settings: BTreeMap::new(),
         });
-        assert_ne!(
-            postgres.sealed_digest(&planned),
-            postgres.sealed_digest(&[])
-        );
-        assert_eq!(postgres.digest(), postgres.clone().digest());
         assert_eq!(postgres.rule(), "pg-auth-v1");
         #[cfg(unix)]
         {
@@ -904,7 +760,6 @@ mod tests {
             let projected = postgres.persisted(&key, &changes).unwrap();
             assert_eq!(projected.before, unchanged.before);
             assert_ne!(projected.before, projected.after);
-            assert_ne!(projected.before, postgres.digest());
             assert_eq!(projected.changes, std::collections::BTreeSet::from([0]));
             let unsupported = pbps_model::ChangeSet {
                 changes: vec![pbps_model::PlannedChange::new(

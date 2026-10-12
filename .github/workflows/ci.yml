@@ -35,9 +35,9 @@ name: CI
 #
 # The approved pull-request run is a reduced set; the merge group runs every
 # job (DEC-1835.1). `live` and `live-pg` repeat the suites the local full gate
-# already ran on that head, and `resolver` and `release-windows` are the long
-# jobs left. They carry `if: ${{ github.event_name != 'pull_request' }}` and
-# are named in the gate's PR_OMITTED. That cannot qualify an untested merge:
+# already ran on that head, and `release-windows` is the long job left. They
+# carry `if: ${{ github.event_name != 'pull_request' }}` and are named in the
+# gate's PR_OMITTED. That cannot qualify an untested merge:
 # the merge queue is required and cannot be bypassed, so every change reaches
 # `master` through a merge group whose gate demands `success` from every job.
 # The pull-request set stays a subset of the merge-group set, so no job can
@@ -139,9 +139,6 @@ jobs:
       - run: python3 scripts/check_gate_needs_test.py
       - run: python3 scripts/ci_gate_verdict_test.py
       - run: python3 scripts/ci_release_scope_test.py
-      # The dedicated-server fixture's retry decision runs only in the resolver
-      # job, as root; this is the one place its logic is tested (DEC-958.1).
-      - run: python3 scripts/live_resolver_server_test.py
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -182,8 +179,6 @@ jobs:
           INSTA_FORCE_PASS: "0"
       - run: python3 scripts/ignored_test_inventory_test.py
       - run: python3 scripts/ignored_test_inventory.py
-      # An owned Linux kernel measurement also needs an execution owner.
-      - run: cargo test -p pbps-cli --lib -- --ignored --exact resolver::native::confined_open_tests::unrelated_rename_churn_preserves_confined_objects
       # --all-targets excludes doctests. These compile-fail cases pin the
       # downstream opacity of source-bearing native capture inputs (#876).
       - run: cargo test -p pbps-pg --doc
@@ -366,7 +361,7 @@ jobs:
           fi
 
   # Two real instances of one build, as two editions under two server
-  # collations: the two facts of the resolver's analysis-scope rule that no
+  # collations: the two facts of the resolver's compatibility rule that no
   # database on one server can vary (#611).
   #
   # Its own job, and the engines are started by a step rather than as
@@ -497,10 +492,10 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
-      # A second PostgreSQL 18 cluster: the operator-vouched resolver's
-      # scratch on another cluster, the one placement where an account that
-      # may create roles and databases is allowed (DEC-1672.1). Same digest
-      # as `postgres`, so the compatibility rule compares equal builds.
+      # A second PostgreSQL 18 cluster: the resolver's scratch on another
+      # cluster, the one placement where an account that may create roles and
+      # databases is allowed (DEC-1672.1). Same digest as `postgres`, so the
+      # compatibility rule compares equal builds.
       postgres-scratch:
         image: postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
         env:
@@ -549,11 +544,11 @@ jobs:
       # `quick` builds it and does not run it: it is `#[ignore]`d.
       - run: cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1
         if: matrix.suite == 'dialect'
-      # The operator-vouched resolver end to end (#1672): no root, the three
-      # servers above, and the runner's own Docker for a Docker scratch
-      # (#1674). The filter must not end in `:`, which YAML reads as a
-      # mapping and rejects the whole file.
-      - run: cargo test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::vouched::live_tests
+      # The resolver end to end (#1672): no root, the three servers above,
+      # and the runner's own Docker for a Docker scratch (#1674). The filter
+      # must not end in `:`, which YAML reads as a mapping and rejects the
+      # whole file.
+      - run: cargo test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::scratch::live_tests
         if: matrix.suite == 'dialect'
       # Private capture internals have live snapshot/rendering regressions.
       # Split by module: the binding half rides with the short suites above.
@@ -649,92 +644,6 @@ jobs:
             echo "expected exactly one test to run and pass" >&2
             exit 1
           }
-
-  # Native admission needs one disposable Linux host per engine. Keep these
-  # away from the shared live services: the full factory owns both a target
-  # and scratch instance, and its root inspector reads their actual processes.
-  #
-  # Each engine's fixtures are split across three hosts (DEC-1370.1, #1837).
-  # Every script owns and removes its own containers and scratch root, so none
-  # relies on one before it; what they share is the test binary, which each
-  # shard builds for itself.
-  resolver:
-    needs: [approve, lint]
-    if: ${{ github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        engine: [pg, mssql]
-        half: [first, second, third]
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.approve.outputs.checkout_sha }}
-      - uses: dtolnay/rust-toolchain@stable
-      # Keyed by half: the first also builds the test profile its container
-      # fixtures run under, and the second and third do not.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-          key: ${{ matrix.half }}
-      - name: Preload explicitly trusted fixture images
-        run: |
-          docker pull postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
-          if [ "$FIXTURE_ENGINE" = pg ]; then
-            docker pull postgres@sha256:485935f94cc7165afa896978809c37b592dc07f0a37d2c8f645f12412d0212c8
-          fi
-          if [ "$FIXTURE_ENGINE" = mssql ]; then
-            docker pull mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
-          fi
-        env:
-          FIXTURE_ENGINE: ${{ matrix.engine }}
-      - name: Docker ownership, containment and private channel
-        if: matrix.half == 'first'
-        run: python3 scripts/live-resolver.py "$FIXTURE_ENGINE"
-        env:
-          FIXTURE_ENGINE: ${{ matrix.engine }}
-      - name: Native target aliases and unprotected proxy backend
-        if: matrix.half == 'first'
-        run: python3 scripts/live-resolver-target.py "$FIXTURE_ENGINE"
-        env:
-          FIXTURE_ENGINE: ${{ matrix.engine }}
-      - name: Build the native fixture test binary
-        run: |
-          cargo test --profile live-test -p pbps-cli --lib --no-run --message-format=json > /tmp/pbps-resolver-artifacts.jsonl
-          PBPS_FIXTURE_BINARY=$(python3 -c 'import json; rows = [json.loads(line) for line in open("/tmp/pbps-resolver-artifacts.jsonl")]; print(next(row["executable"] for row in rows if row.get("executable") and row.get("target", {}).get("name") == "pbps_cli"))')
-          echo "PBPS_FIXTURE_BINARY=$PBPS_FIXTURE_BINARY" >> "$GITHUB_ENV"
-      - name: Complete factory on the disposable native host
-        if: matrix.half == 'first'
-        run: sudo python3 scripts/live-resolver-target.py "$FIXTURE_ENGINE" --native-host --test-binary "$PBPS_FIXTURE_BINARY"
-        env:
-          FIXTURE_ENGINE: ${{ matrix.engine }}
-      # SQL Server runs this in its second shard, which the dedicated scratch
-      # server's move to the third left otherwise empty (#1837).
-      - name: Verified launch privileges before engine initialization
-        if: matrix.engine == 'pg' && matrix.half == 'first'
-        run: sudo python3 scripts/live-resolver-launch.py pg --test-binary "$PBPS_FIXTURE_BINARY"
-      - name: Verified launch privileges before engine initialization (SQL Server)
-        if: matrix.engine == 'mssql' && matrix.half == 'second'
-        run: sudo python3 scripts/live-resolver-launch.py mssql --test-binary "$PBPS_FIXTURE_BINARY"
-      - name: PG16 complete factory on the disposable native host
-        if: matrix.engine == 'pg' && matrix.half == 'second'
-        run: sudo python3 scripts/live-resolver-target.py pg --pg-major 16 --native-host --test-binary "$PBPS_FIXTURE_BINARY"
-      # A supplied server pbps did not provision. It runs a target and a
-      # dedicated server at once, so it keeps the same disposable host: a third
-      # one, because beside the PG16 factory it made the second PostgreSQL
-      # shard the longest job in the merge group (#1837).
-      - name: Dedicated scratch server lifecycle and exclusivity
-        if: matrix.half == 'third'
-        run: sudo python3 scripts/live-resolver-server.py "$FIXTURE_ENGINE" --test-binary "$PBPS_FIXTURE_BINARY"
-        env:
-          FIXTURE_ENGINE: ${{ matrix.engine }}
-      - name: Namespace procfs identity and task observation
-        if: matrix.engine == 'pg' && matrix.half == 'second'
-        run: sudo python3 scripts/live-resolver-namespace.py --test-binary "$PBPS_FIXTURE_BINARY"
-      - name: Socket observation limits and native service binding
-        if: matrix.engine == 'pg' && matrix.half == 'second'
-        run: sudo python3 scripts/live-resolver-sockets.py --test-binary "$PBPS_FIXTURE_BINARY"
 
   release-linux:
     needs: [approve, lint]
@@ -920,7 +829,7 @@ jobs:
 
   gate:
     name: ci-gate
-    needs: [approve, lint, quick, windows, live, live-transport-mssql, live-editions, live-pg, dev-rehearsal, resolver, release-linux, release-windows, msrv, compatibility]
+    needs: [approve, lint, quick, windows, live, live-transport-mssql, live-editions, live-pg, dev-rehearsal, release-linux, release-windows, msrv, compatibility]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -945,5 +854,5 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           EVENT: ${{ github.event_name }}
-          PR_OMITTED: live live-pg resolver release-windows
+          PR_OMITTED: live live-pg release-windows
         run: python3 scripts/ci_gate_verdict.py

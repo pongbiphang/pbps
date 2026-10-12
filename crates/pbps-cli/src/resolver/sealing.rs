@@ -2,7 +2,6 @@
 //! key does not acquire a resolver or qualify any database connection.
 
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
-use pbps_model::resolver::ResolverRuntime;
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -38,7 +37,6 @@ pub fn environment_key(
 /// The target-only closing checker (#616) uses this exact encoding for
 /// both phases. The phase selects which observed facts to compare, not a
 /// different HMAC domain that would make equal facts compare unequal.
-#[cfg(target_os = "linux")]
 pub(crate) fn target_catalog_fingerprint(
     key: &EnvironmentFingerprintKey,
     facts: &pbps_db::resolver::environment::CatalogFacts,
@@ -100,82 +98,14 @@ pub(crate) fn target_catalog_fingerprint(
     )))
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn hex(bytes: [u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Recognizing a saved profile version is independent of the reader's host:
-/// offline explanation of a Linux artifact must work on Windows too. This
-/// validates the recorded contract, not the runtime's present-day condition.
-pub fn validate_runtime(runtime: &ResolverRuntime) -> Result<(), &'static str> {
-    match runtime {
-        ResolverRuntime::Container {
-            platform, profile, ..
-        } if platform == "linux/amd64" && profile == "linux-amd64-v1" => Ok(()),
-        ResolverRuntime::Supplied { profile, .. }
-            if matches!(
-                profile.as_str(),
-                "linux-dedicated-v1" | "linux-dedicated-pg16-v1"
-            ) =>
-        {
-            Ok(())
-        }
-        // Nothing to enforce: the operator vouches for it, and the evidence
-        // says so (DEC-1528.1).
-        ResolverRuntime::Vouched { .. } => Ok(()),
-        ResolverRuntime::Container { .. } | ResolverRuntime::Supplied { .. } => {
-            Err("this build cannot enforce the recorded resolver runtime profile")
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn reader_support_is_versioned_and_never_accepts_an_unknown_runtime() {
-        assert!(
-            validate_runtime(&ResolverRuntime::Supplied {
-                profile: "linux-dedicated-v1".into(),
-                identity: "00".repeat(32)
-            })
-            .is_ok()
-        );
-        assert!(
-            validate_runtime(&ResolverRuntime::Supplied {
-                profile: "linux-dedicated-pg16-v1".into(),
-                identity: "00".repeat(32)
-            })
-            .is_ok()
-        );
-        for profile in ["linux-dedicated-pg16-v2", "linux-dedicated-pg16-v1-extra"] {
-            assert!(
-                validate_runtime(&ResolverRuntime::Supplied {
-                    profile: profile.into(),
-                    identity: "00".repeat(32)
-                })
-                .is_err(),
-                "saved runtimes require an exact implemented profile"
-            );
-        }
-        assert!(
-            validate_runtime(&ResolverRuntime::Supplied {
-                profile: "linux-dedicated-v2".into(),
-                identity: "00".repeat(32)
-            })
-            .is_err()
-        );
-        assert!(
-            validate_runtime(&ResolverRuntime::Container {
-                image_digest: format!("sha256:{}", "00".repeat(32)),
-                platform: "linux/arm64".into(),
-                profile: "linux-amd64-v1".into()
-            })
-            .is_err()
-        );
-    }
     #[test]
     fn missing_environment_keys_refuse_with_the_key_generation_remedy() {
         use std::io::Write;

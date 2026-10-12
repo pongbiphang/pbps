@@ -32,16 +32,16 @@ fn resolved_plan() -> SavedPlan {
     let evidence = ResolverEvidence::new(
         &changes,
         Qualification {
-            rule: pbps_pg::resolver::compatibility::RULE.into(),
+            rule: pbps_pg::resolver::compatibility::REPORTED_RULE.into(),
             target_environment: "04".repeat(32),
             target_environment_after: "04".repeat(32),
             resolver_environment: "05".repeat(32),
             target_build: "06".repeat(32),
             resolver_build: "07".repeat(32),
             channels: "08".repeat(32),
-            runtime: ResolverRuntime::Supplied {
-                profile: "linux-dedicated-v1".into(),
-                identity: "09".repeat(32),
+            runtime: ResolverRuntime::Scratch {
+                scratch: ScratchSource::Server {},
+                outside_writes: OutsideWrites::Refused,
             },
         },
         AuthorizationCondition {
@@ -58,7 +58,6 @@ fn resolved_plan() -> SavedPlan {
     )
     .unwrap();
     pbps_pg::resolver::validate_evidence(&evidence).unwrap();
-    pbps_cli::resolver::sealing::validate_runtime(&evidence.qualification().runtime).unwrap();
     SavedPlan::new(
         PlanOrigin::Database,
         "postgres",
@@ -195,9 +194,14 @@ fn malformed_or_unsupported_resolver_evidence_is_refused_before_presentation() {
             "/analysis/evidence/before/adapter",
             serde_json::json!("postgres-catalog-inputs-v99"),
         ),
+        // A runtime this build removed: the measured profiles (#1636).
         (
-            "/analysis/evidence/qualification/runtime/profile",
-            serde_json::json!("linux-dedicated-v99"),
+            "/analysis/evidence/qualification/runtime",
+            serde_json::json!({
+                "kind": "supplied",
+                "profile": "linux-dedicated-v1",
+                "identity": "09".repeat(32),
+            }),
         ),
     ] {
         let mut value = valid.clone();
@@ -236,9 +240,14 @@ fn current_resolver_artifacts_cannot_bypass_required_evidence_on_apply() {
             "/analysis/evidence/before/adapter",
             serde_json::json!("postgres-catalog-inputs-v99"),
         ),
+        // A runtime this build removed: the measured profiles (#1636).
         (
-            "/analysis/evidence/qualification/runtime/profile",
-            serde_json::json!("linux-dedicated-v99"),
+            "/analysis/evidence/qualification/runtime",
+            serde_json::json!({
+                "kind": "supplied",
+                "profile": "linux-dedicated-v1",
+                "identity": "09".repeat(32),
+            }),
         ),
     ] {
         let mut value = valid.clone();
