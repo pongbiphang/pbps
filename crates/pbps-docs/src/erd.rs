@@ -12,15 +12,46 @@ use std::fmt::Write as _;
 
 use pbps_model::{Schema, Table, TableName};
 
-/// Mermaid identifiers cannot contain a dot, so `dbo.customer` is written
-/// `dbo_customer`.
-///
-/// Two different names could in principle collide (`a.b_c` and `a_b.c`), which
-/// is why the readable name is always restated as the entity's quoted alias
-/// rather than left to the identifier.
+/// Aliases do not distinguish entities: Mermaid keys both attributes and edges
+/// on this token. Escape underscores and keep the segment boundary outside the
+/// character encoding so different qualified names cannot collapse (DEC-1799.1).
 fn entity(name: &TableName) -> String {
-    format!("{}_{}", name.schema, name.name)
-        .replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_")
+    let mut id = String::from("t_");
+    for (i, part) in [&name.schema, &name.name].into_iter().enumerate() {
+        if i != 0 {
+            id.push_str("_s_");
+        }
+        for c in part.chars() {
+            if c == '_' {
+                id.push_str("__");
+            } else if c.is_ascii_alphanumeric() {
+                id.push(c);
+            } else {
+                let _ = write!(id, "_{:x}_", u32::from(c));
+            }
+        }
+    }
+    id
+}
+
+/// Mermaid entity codes survive its lexer and HTML/Markdown label rendering.
+/// Escape `#` too, or a literal `#34;` in a name becomes a quote. The colon
+/// must not activate its global `style`/`classDef` preprocessing (DEC-1799.1).
+fn alias(name: &TableName) -> String {
+    let mut label = String::new();
+    for c in name.to_string().chars() {
+        if c.is_control()
+            || matches!(
+                c,
+                '"' | '%' | '\\' | '#' | '&' | '<' | '>' | ':' | '_' | '*'
+            )
+        {
+            let _ = write!(label, "#{};", u32::from(c));
+        } else {
+            label.push(c);
+        }
+    }
+    label
 }
 
 /// Mermaid attribute types must be single tokens: `decimal(18, 2)` would end
@@ -41,7 +72,7 @@ pub fn render(schema: &Schema) -> String {
     let mut s = String::from("erDiagram\n");
 
     for (name, table) in &schema.tables {
-        let _ = writeln!(s, "    {}[\"{}\"] {{", entity(name), name);
+        let _ = writeln!(s, "    {}[\"{}\"] {{", entity(name), alias(name));
         for (col_name, col) in &table.columns {
             // The key marker is what makes the diagram readable at a glance;
             // Mermaid only has PK and FK.
@@ -174,7 +205,7 @@ mod tests {
         assert!(out.contains("bigint id PK"), "{out}");
         assert!(out.contains("int region_id FK"), "{out}");
         assert!(
-            out.contains("dbo_customer }|--|| dbo_region : \"fk_customer_region\""),
+            out.contains("t_dbo_s_customer }|--|| t_dbo_s_region : \"fk_customer_region\""),
             "{out}"
         );
     }
@@ -185,6 +216,130 @@ mod tests {
     fn a_nullable_foreign_key_is_drawn_as_optional() {
         assert!(render(&two_table_schema(true)).contains("}o--||"));
         assert!(render(&two_table_schema(false)).contains("}|--||"));
+    }
+
+    #[test]
+    fn colliding_names_keep_separate_attributes_and_foreign_key_endpoints() {
+        let names = [
+            (
+                "sales",
+                "order_item",
+                "t_sales_s_order__item",
+                "sales.order#95;item",
+            ),
+            (
+                "sales_order",
+                "item",
+                "t_sales__order_s_item",
+                "sales#95;order.item",
+            ),
+            ("public", "客戶", "t_public_s__5ba2__6236_", "public.客戶"),
+            ("public", "訂單", "t_public_s__8a02__55ae_", "public.訂單"),
+        ];
+        let mut schema = Schema::default();
+        for (i, (namespace, name, _, _)) in names.iter().enumerate() {
+            let next = (i + 1) % names.len();
+            let mut table = Table::default();
+            table
+                .columns
+                .insert(format!("column_{i}"), Column::new(ty("bigint")).not_null());
+            table.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec![format!("column_{i}")],
+                storage_parameters: Default::default(),
+            });
+            table.foreign_keys.insert(
+                format!("fk_{i}"),
+                ForeignKey {
+                    columns: vec![format!("column_{i}")],
+                    references_table: TableName::new(names[next].0, names[next].1),
+                    references_columns: vec![format!("column_{next}")],
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+            schema
+                .tables
+                .insert(TableName::new(*namespace, *name), table);
+        }
+        let out = render(&schema);
+        assert_eq!(out.lines().filter(|line| line.ends_with(" {")).count(), 4);
+        for (i, (_, _, id, label)) in names.iter().enumerate() {
+            assert!(
+                out.contains(&format!(
+                    "{id}[\"{label}\"] {{\n        bigint column_{i} PK\n    }}"
+                )),
+                "{out}"
+            );
+            let next = names[(i + 1) % names.len()].2;
+            assert!(
+                out.contains(&format!("{id} }}|--|| {next} : \"fk_{i}\"")),
+                "{out}"
+            );
+        }
+        assert_eq!(out, render(&schema));
+    }
+
+    #[test]
+    fn short_segment_pairs_have_distinct_lexer_safe_identities() {
+        let alphabet = ['a', 'A', '_', 's', '5', 'f', '客', ' ', '-'];
+        let mut segments = vec![String::new()];
+        for a in alphabet {
+            segments.push(a.to_string());
+            for b in alphabet {
+                segments.push(format!("{a}{b}"));
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for namespace in &segments {
+            for name in &segments {
+                let id = entity(&TableName::new(namespace, name));
+                assert!(id.starts_with("t_"), "{id}");
+                assert!(
+                    id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                    "{id}"
+                );
+                assert!(seen.insert(id), "collision for {namespace:?}.{name:?}");
+            }
+        }
+        assert_eq!(seen.len(), segments.len().pow(2));
+    }
+
+    #[test]
+    fn keyword_and_numeric_names_keep_a_fixed_identifier_prefix() {
+        for namespace in ["u", "to", "one", "many", "class", "1"] {
+            assert_eq!(
+                entity(&TableName::new(namespace, "t")),
+                format!("t_{namespace}_s_t")
+            );
+        }
+        assert_ne!(
+            entity(&TableName::new("public", "A")),
+            entity(&TableName::new("public", "a"))
+        );
+    }
+
+    #[test]
+    fn alias_text_cannot_end_a_quote_or_become_a_mermaid_directive() {
+        let name = TableName::new("style", "a:\"%\\\n#34;&<>\r\t");
+        let expected = "style.a#58;#34;#37;#92;#10;#35;34;#38;#60;#62;#13;#9;";
+        assert_eq!(alias(&name), expected);
+        let mut schema = Schema::default();
+        schema.tables.insert(name.clone(), Table::default());
+        assert!(render(&schema).contains(&format!("{}[\"{expected}\"] {{", entity(&name))));
+        assert_eq!(alias(&TableName::new("public", "客戶")), "public.客戶");
+        assert_eq!(
+            alias(&TableName::new("sales", "customer")),
+            "sales.customer"
+        );
+        assert_eq!(
+            alias(&TableName::new("public", "_*name*_")),
+            "public.#95;#42;name#42;#95;"
+        );
+        assert_eq!(
+            alias(&TableName::new("sales", "order_item")),
+            "sales.order#95;item"
+        );
     }
 
     /// A parameterised type would end the Mermaid attribute early and break the

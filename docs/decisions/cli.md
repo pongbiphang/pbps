@@ -1011,3 +1011,36 @@ weekly, monthly, yearly, `timestamp`, `timestamptz` and `bigint` series, and eac
 above), by `tests/partitions_extend.rs` without a database (canonical output, a no-op rerun,
 other files untouched, a file not canonical, a taken name, a tree already invalid, SQL
 Server), and on 16 and 18 by `a_generated_series_is_planned_applied_and_verified_through_the_cli`.
+
+<a id="dec-1799-1"></a>
+
+**DEC-1799.1. Mermaid entity identity encodes both name segments without loss;
+the alias carries their readable spelling.** Replacing punctuation and Unicode
+with underscores merges distinct tables and their attributes even when their
+aliases differ: measured with Mermaid 11.12.0, the four names in #1799 become
+two entities. Headers and both FK endpoints therefore share a name-derived
+token with a fixed `t_` prefix. ASCII letters and digits stay literal, `_`
+becomes `__`, other Unicode scalar values become `_<lowercase hex>_`, and
+`_s_` separates schema from table. After `_`, the next character is `_`, a hex
+digit, or `s`, so each token has one decoding. Case is preserved: the real
+parser keeps case-differing IDs distinct. Ordinals would renumber unrelated
+tables on insertion; hashes would make identity only probabilistically distinct.
+
+The qualified display alias uses decimal Mermaid entity codes for quotes,
+percent signs, backslashes, controls, HTML and Markdown metacharacters, and
+`#` itself (otherwise a literal `#34;` changes meaning). Encode `:` too:
+Mermaid's global `style`/`classDef` preprocessing can remove an entity-code
+terminator from an ordinary alias containing that word and a colon. Chromium
+rendering with Mermaid 11.12.0 confirms the codes return to the original display
+characters, including newlines and literal entity-code-shaped names. In that
+same browser, raw `_name_` and `*name*` lost their delimiters to emphasis;
+encoding `_` and `*` keeps those characters visible. No lossy replacement is
+needed. Reserved-word-shaped prefixes already parsed in that version; they
+were a hypothesis, not a reproduced defect. The fixed prefix remains part of
+the stable token format.
+
+Pinned by the `erd.rs` tests for separate headers/attributes/FK endpoints,
+8,281 short segment pairs, fixed prefixes and case distinctions, and safe
+aliases; the issue's disposable real-parser and Chromium fixtures verify the
+emitted CLI output. No Mermaid dependency or script is added to the generated
+documentation (decision 18).
