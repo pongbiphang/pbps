@@ -10,9 +10,10 @@
 //! Markdown view, SPEC §9.4). Pretending to draw it by shipping a script tag
 //! that fails offline would be the worse trade.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use pbps_model::{IdsFile, Schema, Table, TableName};
+use pbps_model::{IdsFile, Module, ModuleId, Role, Schema, Table, TableName};
 
 use crate::erd;
 
@@ -60,6 +61,12 @@ fn code(s: &str) -> String {
 }
 
 pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
+    // A new schema family must be considered by every prose renderer.
+    let Schema {
+        tables,
+        modules,
+        roles,
+    } = schema;
     let mut s = String::new();
     let _ = write!(
         s,
@@ -72,13 +79,12 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
     let _ = writeln!(
         s,
         "<p class=\"muted\">{} table(s), {} column(s), {} module(s).</p>",
-        schema.tables.len(),
-        schema
-            .tables
+        tables.len(),
+        tables
             .values()
             .map(|t| t.columns.len() + t.computed.len())
             .sum::<usize>(),
-        schema.modules.len()
+        modules.len()
     );
 
     s.push_str("<h2>Diagram</h2>\n<p class=\"muted\">Mermaid source — paste it into a Markdown view that renders Mermaid (GitLab, GitHub). This file carries no scripts, so it renders identically offline.</p>\n<pre>");
@@ -86,11 +92,12 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
     s.push_str("</pre>\n");
 
     s.push_str("<h2>Tables</h2>\n");
-    for (name, table) in &schema.tables {
+    for (name, table) in tables {
         one_table(&mut s, name, table);
     }
 
-    modules_section(&mut s, schema);
+    modules_section(&mut s, modules);
+    roles_section(&mut s, roles);
     deprecated_section(&mut s, schema);
     graveyard(&mut s, ids);
 
@@ -100,12 +107,12 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
 
 /// Views, procedures, functions and triggers, with their definitions — which
 /// for this family of objects *is* the object (ADR-0002).
-fn modules_section(s: &mut String, schema: &Schema) {
-    if schema.modules.is_empty() {
+fn modules_section(s: &mut String, modules: &BTreeMap<ModuleId, Module>) {
+    if modules.is_empty() {
         return;
     }
     s.push_str("<h2>Views, procedures, functions and triggers</h2>\n");
-    for (name, m) in &schema.modules {
+    for (name, m) in modules {
         let _ = writeln!(
             s,
             "<h3 id=\"{}\">{}</h3>",
@@ -121,6 +128,36 @@ fn modules_section(s: &mut String, schema: &Schema) {
             let _ = writeln!(s, "<p>{}</p>", esc(d));
         }
         let _ = writeln!(s, "<pre>{}</pre>", esc(m.definition.trim_end()));
+    }
+}
+
+/// Roles share a name namespace with neither tables nor modules, so their
+/// headings carry no document id that could collide with those objects.
+fn roles_section(s: &mut String, roles: &BTreeMap<String, Role>) {
+    if roles.is_empty() {
+        return;
+    }
+    s.push_str("<h2>Roles</h2>\n");
+    for (name, role) in roles {
+        let _ = writeln!(s, "<h3>{}</h3>", code(name));
+        if let Some(description) = &role.description {
+            let _ = writeln!(s, "<p>{}</p>", esc(description));
+        }
+        if role.grants.is_empty() {
+            s.push_str("<p class=\"muted\">No grants.</p>\n");
+            continue;
+        }
+        s.push_str("<table>\n<tr><th>Granted on</th><th>Permissions</th></tr>\n");
+        for (target, permissions) in &role.grants {
+            let list: Vec<_> = permissions.iter().map(|p| p.as_str()).collect();
+            let _ = writeln!(
+                s,
+                "<tr><td>{}</td><td>{}</td></tr>",
+                code(&target.to_string()),
+                esc(&list.join(", "))
+            );
+        }
+        s.push_str("</table>\n");
     }
 }
 
@@ -315,6 +352,89 @@ mod tests {
 
     fn ty(s: &str) -> ColumnType {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn roles_keep_every_grant_kind_and_empty_roles_without_duplicate_ids() {
+        use pbps_model::Permission;
+        let mut schema = schema_with_description("Customers");
+        schema.roles.insert(
+            "dbo.t".into(),
+            Role {
+                description: Some("Read-only reporting".into()),
+                grants: [
+                    (
+                        "dbo.t".parse().unwrap(),
+                        [Permission::Select, Permission::References].into(),
+                    ),
+                    (
+                        "schema::public".parse().unwrap(),
+                        [Permission::Usage].into(),
+                    ),
+                    (
+                        "public.report(integer)".parse().unwrap(),
+                        [Permission::Execute].into(),
+                    ),
+                ]
+                .into(),
+            },
+        );
+        schema
+            .roles
+            .insert("pending_access".into(), Role::default());
+        let out = render(&schema, &IdsFile::default(), "Schema");
+        for expected in [
+            "<h2>Roles</h2>",
+            "<h3><code>dbo.t</code></h3>",
+            "<p>Read-only reporting</p>",
+            "<tr><td><code>dbo.t</code></td><td>select, references</td></tr>",
+            "<tr><td><code>schema::public</code></td><td>usage</td></tr>",
+            "<tr><td><code>public.report(integer)</code></td><td>execute</td></tr>",
+            "<h3><code>pending_access</code></h3>\n<p class=\"muted\">No grants.</p>",
+        ] {
+            assert!(out.contains(expected), "missing {expected}: {out}");
+        }
+        assert_eq!(out.matches("id=\"dbo.t\"").count(), 1);
+        assert_eq!(out, render(&schema, &IdsFile::default(), "Schema"));
+    }
+
+    #[test]
+    fn role_text_is_escaped_and_the_page_remains_self_contained() {
+        use pbps_model::{GrantTarget, Permission};
+        let name = "報表<&>\"'";
+        let mut schema = Schema::default();
+        schema.roles.insert(
+            name.into(),
+            Role {
+                description: Some("<script>\"R&D's\"</script>".into()),
+                grants: [(GrantTarget::Schema(name.into()), [Permission::Usage].into())].into(),
+            },
+        );
+        let out = render(&schema, &IdsFile::default(), "Schema");
+        assert!(
+            out.contains("<h3><code>報表&lt;&amp;&gt;&quot;&#39;</code></h3>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<p>&lt;script&gt;&quot;R&amp;D&#39;s&quot;&lt;/script&gt;</p>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<code>schema::報表&lt;&amp;&gt;&quot;&#39;</code>"),
+            "{out}"
+        );
+        for forbidden in ["http://", "https://", "<script", "<link", "src="] {
+            assert!(!out.contains(forbidden), "found {forbidden}: {out}");
+        }
+        assert!(out.contains(&format!("<style>{}</style>", style_contents())));
+    }
+
+    #[test]
+    fn no_roles_means_no_roles_heading_or_grants_table() {
+        let out = render(&Schema::default(), &IdsFile::default(), "Schema");
+        for absent in ["<h2>Roles</h2>", "Granted on", "No grants."] {
+            assert!(!out.contains(absent), "{out}");
+        }
     }
 
     fn schema_with_description(d: &str) -> Schema {

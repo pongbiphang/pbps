@@ -6112,6 +6112,63 @@ fn docs_html_is_one_self_contained_file() {
     assert!(stdout(&o).is_empty(), "stdout: {}", stdout(&o));
 }
 
+#[test]
+fn docs_html_keeps_roles_and_grants_for_both_dialects() {
+    for (dialect, schema, schema_permission) in
+        [("mssql", "dbo", "select"), ("postgres", "public", "usage")]
+    {
+        let d = Demo::new(&format!("docs-roles-{dialect}"));
+        std::fs::write(d.dir.join("pbps.yml"), format!("dialect: {dialect}\n")).unwrap();
+        d.table(&format!(
+            "table: {schema}.customer\ncolumns:\n  id: {{type: bigint, nullable: false}}\n"
+        ));
+        let role = d.dir.join("schema/reporter.yml");
+        std::fs::write(&role, format!(
+            "role: 報表_reader\ndescription: 'Read-only <retail> & reporting'\ngrants:\n  {schema}.customer: [select]\n  schema::{schema}: [{schema_permission}]\n"
+        )).unwrap();
+        let empty_role = d.dir.join("schema/pending.yml");
+        std::fs::write(&empty_role, "role: pending_access\ngrants: {}\n").unwrap();
+        let valid = d.run(&["validate"]);
+        assert_eq!(code(&valid), 0, "{}", stderr(&valid));
+        let output = d.run(&["docs", "--format", "html"]);
+        assert_eq!(code(&output), 0, "{}", stderr(&output));
+        let html = stdout(&output);
+        for expected in [
+            "<h2>Roles</h2>",
+            "報表_reader",
+            "Read-only &lt;retail&gt; &amp; reporting",
+            "pending_access",
+            "No grants.",
+        ] {
+            assert!(
+                html.contains(expected),
+                "{dialect} missing {expected}: {html}"
+            );
+        }
+        assert!(
+            html.contains(&format!("<code>{schema}.customer</code></td><td>select")),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "<code>schema::{schema}</code></td><td>{schema_permission}"
+            )),
+            "{html}"
+        );
+        let path = d.dir.join("schema.html");
+        let saved = d.run(&["docs", "--format", "html", "--out", path.to_str().unwrap()]);
+        assert_eq!(code(&saved), 0, "{}", stderr(&saved));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), html);
+        assert!(stdout(&saved).is_empty());
+        assert!(!d.ids_path().exists());
+        std::fs::remove_file(role).unwrap();
+        std::fs::remove_file(empty_role).unwrap();
+        let without_roles = d.run(&["docs", "--format", "html"]);
+        assert_eq!(code(&without_roles), 0, "{}", stderr(&without_roles));
+        assert!(!stdout(&without_roles).contains("<h2>Roles</h2>"));
+    }
+}
+
 /// Identical declarations must produce byte-identical files, or every docs run
 /// would show up as a diff.
 #[test]
