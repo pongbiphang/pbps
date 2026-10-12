@@ -337,17 +337,19 @@ pub(crate) fn temporal(base: &str) -> bool {
     )
 }
 
-/// The orders `SET DATEFORMAT` can name that a login's language sets: a
-/// temporal text is read under each, and one that reads differently under
-/// two is refused rather than taken as what this session reads (DEC-1883.1).
+/// Every order `SET DATEFORMAT` can name: a temporal text is read under each,
+/// and one that reads differently under two is refused rather than taken as
+/// what this session reads (DEC-1883.1).
 ///
 /// Measured on 2022: `'2026-02-01'` as a `datetime` is 2026-02-01 under
 /// `mdy` and 2026-01-02 under `dmy`, while as a `date` or `datetime2` it is
 /// 2026-02-01 under both, and `'2026-02-01T00:00:00'` and `'20260201'` are
-/// 2026-02-01 under every order for every type. The tool sets no
-/// `DATEFORMAT` of its own, so without asking, the meaning of such a text
-/// would be the login's language.
-pub const DATEFORMATS: [&str; 3] = ["mdy", "dmy", "ymd"];
+/// 2026-02-01 under every order for every type. `'01/2026/02'` is
+/// 2026-01-02 under `myd` and 2026-02-01 under `dym`: all six, not the three
+/// a language sets, because a session can name any of them. The tool sets
+/// no `DATEFORMAT` of its own, so without asking, the meaning of such a text
+/// would be the login's.
+pub const DATEFORMATS: [&str; 6] = ["mdy", "dmy", "ymd", "ydm", "myd", "dym"];
 
 /// `sql` run under `SET DATEFORMAT order`, for one batch only. Inside
 /// `sp_executesql` the setting reverts when it returns — measured, the
@@ -355,6 +357,27 @@ pub const DATEFORMATS: [&str; 3] = ["mdy", "dmy", "ymd"];
 /// session the rest of the command runs in is left as it came.
 pub fn under_dateformat(sql: &str, order: &str) -> String {
     let batch = format!("SET DATEFORMAT {order}; {sql}");
+    format!("EXEC sys.sp_executesql {};", literal(&batch))
+}
+
+/// Whether a temporal text names something only a language can read: a
+/// month or day name, an `AM` or `PM`. Its letters other than ISO 8601's `T`
+/// and `Z`, which every language reads alike. Measured on 2022,
+/// `'28 listopad 2018'` is November under `polski` and October under
+/// `hrvatski`, a difference no `DATEFORMAT` shows; a text of digits and
+/// separators is read by the order alone, which [`DATEFORMATS`] covers.
+pub fn names_by_language(text: &str) -> bool {
+    text.chars()
+        .any(|c| c.is_alphabetic() && !matches!(c, 'T' | 't' | 'Z' | 'z'))
+}
+
+/// The languages a session can be set to, as `sys.syslanguages` names them.
+pub const LANGUAGES: &str = "SELECT name FROM sys.syslanguages ORDER BY langid;";
+
+/// `sql` run under `SET LANGUAGE language`, for one batch only: the setting
+/// reverts with `sp_executesql` as `DATEFORMAT` does (measured).
+pub fn under_language(sql: &str, language: &str) -> String {
+    let batch = format!("SET LANGUAGE {}; {sql}", literal(language));
     format!("EXEC sys.sp_executesql {};", literal(&batch))
 }
 
@@ -1325,6 +1348,28 @@ mod tests {
             under_dateformat("SELECT N'2026-02-01' AS c;", "dmy"),
             "EXEC sys.sp_executesql N'SET DATEFORMAT dmy; SELECT N''2026-02-01'' AS c;';"
         );
+        assert_eq!(
+            under_language("SELECT 1;", "polski"),
+            "EXEC sys.sp_executesql N'SET LANGUAGE N''polski''; SELECT 1;';"
+        );
+        // A name is a language's to read; digits, separators and ISO 8601's
+        // own letters are not.
+        for text in [
+            "28 listopad 2018",
+            "Feb 1 2026",
+            "9:00 PM",
+            "1 février 2026",
+        ] {
+            assert!(names_by_language(text), "{text}");
+        }
+        for text in [
+            "2026-02-01",
+            "2026-02-01T00:00:00Z",
+            "20260201",
+            "01/02/2026",
+        ] {
+            assert!(!names_by_language(text), "{text}");
+        }
         // Only the six date and time types are read as values; a decimal and
         // a string keep their spelling (DECISIONS 101).
         for base in [

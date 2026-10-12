@@ -1773,8 +1773,9 @@ pub use pbps_db::catalog::Spellings;
 /// (DECISIONS 101, 106). Asked of the engine, not of the table: a table this
 /// plan creates can be asked too.
 ///
-/// A date or time is read under every `DATEFORMAT` as well, and one that
-/// reads two ways is reported in `ambiguous` instead (DEC-1883.1).
+/// A date or time is read under every `DATEFORMAT` as well, and under every
+/// language when it names a month or day, and one that reads two ways is
+/// reported in `ambiguous` instead (DEC-1883.1).
 ///
 /// `_at` is the names the catalog has now, which the PostgreSQL side needs.
 /// This one needs none since #1175: the only question it asked the catalog was
@@ -1785,6 +1786,8 @@ pub async fn misspelt(
     _at: &crate::rows::CatalogNames,
 ) -> Result<Spellings, crate::rows::RowsError> {
     let mut out = Spellings::default();
+    // Read once, the first time a text needs them.
+    let mut languages: Option<Vec<String>> = None;
     for (name, table) in &schema.tables {
         for q in crate::rows::spelling_queries(name, table)? {
             let read = |source| crate::rows::RowsError::Read {
@@ -1814,28 +1817,59 @@ pub async fn misspelt(
             // A date or time is read under every `DATEFORMAT` too: the
             // reading it is taken as must be the only one it has
             // (DEC-1883.1), or it is a guess at what the author meant.
-            let mut contrasts = Vec::new();
+            let mut contrasts: Vec<(String, Vec<Option<String>>)> = Vec::new();
             if q.temporal {
                 for order in crate::rows::DATEFORMATS {
                     let sql = crate::rows::under_dateformat(&q.sql, order);
                     contrasts.push((
-                        order,
+                        format!("DATEFORMAT {order}"),
                         read_spellings(conn, name, &sql, q.literals.len()).await?,
                     ));
+                }
+                // A month or day name is read by the language, which no
+                // order shows: asked under every one the server has, and only
+                // for a column that declares one, since a text of digits is
+                // the orders' alone.
+                if q.literals
+                    .iter()
+                    .any(|(_, text)| crate::rows::names_by_language(text))
+                {
+                    if languages.is_none() {
+                        let mut names = Vec::new();
+                        for row in &conn.query(crate::rows::LANGUAGES).await.map_err(read)? {
+                            let name: Option<&str> = row.try_get_at(0).map_err(read)?;
+                            names.extend(name.map(str::to_owned));
+                        }
+                        // None at all is a catalog this tool cannot read, not
+                        // a server with one language: refused, not passed.
+                        if names.is_empty() {
+                            return Err(read(DbError::BadRow(
+                                "sys.syslanguages returned no language".to_owned(),
+                            )));
+                        }
+                        languages = Some(names);
+                    }
+                    for language in languages.iter().flatten() {
+                        let sql = crate::rows::under_language(&q.sql, language);
+                        contrasts.push((
+                            format!("LANGUAGE {language}"),
+                            read_spellings(conn, name, &sql, q.literals.len()).await?,
+                        ));
+                    }
                 }
             }
             for (i, canonical) in readings.into_iter().enumerate() {
                 let (key, declared) = &q.literals[i];
                 if let Some(reading) = &canonical {
                     let mut otherwise: Vec<(String, String)> = Vec::new();
-                    for (order, other) in &contrasts {
+                    for (setting, other) in &contrasts {
                         let Some(other) = &other[i] else {
                             continue;
                         };
                         if other == reading || otherwise.iter().any(|(o, _)| o == other) {
                             continue;
                         }
-                        otherwise.push((other.clone(), format!("DATEFORMAT {order}")));
+                        otherwise.push((other.clone(), setting.clone()));
                     }
                     if !otherwise.is_empty() {
                         out.ambiguous.push(pbps_db::catalog::Ambiguous {
@@ -1849,7 +1883,7 @@ pub async fn misspelt(
                             pinned: Some(reading.clone()),
                             otherwise,
                             remedy: "write it in ISO 8601 with a `T`, \
-                                     `YYYY-MM-DDTHH:MM:SS`, which every DATEFORMAT reads alike"
+                                     `YYYY-MM-DDTHH:MM:SS`, which every DATEFORMAT and language reads alike"
                                 .to_owned(),
                         });
                         continue;

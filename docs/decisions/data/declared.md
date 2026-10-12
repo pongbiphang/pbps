@@ -724,14 +724,20 @@ the engine's spelling.
   PostgreSQL every literal of these types already goes through DEC-1756.1's
   probe, and one with two readings is dropped from the spelling list before
   this is reached. SQL Server sets no `DATEFORMAT` of its own and this tool
-  sets none, so the language of the login decides; each of its date and time
-  texts is read again under `mdy`, `dmy` and `ymd`, inside `sp_executesql`,
-  where the setting reverts when the batch returns. Measured on 2022:
-  `'2026-02-01'` as a `datetime` is 2026-02-01 under `mdy` and 2026-01-02
-  under `dmy`, as a `date` or `datetime2` 2026-02-01 under both, and
-  `'2026-02-01T00:00:00'` and `'20260201'` the same under every order. A text
-  that differs is refused as DEC-1756.1's are, with both readings and the ISO
-  form with a `T` as the remedy. Before this, such a text was refused for not
+  sets none, so the login decides; each of its date and time texts is read
+  again under all six `DATEFORMAT` orders, and one that names a month or day
+  (any letter but ISO 8601's `T` and `Z`) under every language in
+  `sys.syslanguages` too, each inside `sp_executesql`, where the setting
+  reverts when the batch returns. Measured on 2022: `'2026-02-01'` as a
+  `datetime` is 2026-02-01 under `mdy` and 2026-01-02 under `dmy`, as a `date`
+  or `datetime2` 2026-02-01 under both; `'01/2026/02'` differs between `myd`
+  and `dym`, orders no language sets but a session can; `'28 listopad 2018'`
+  is November under `polski` and October under `hrvatski`, which no order
+  shows; and `'2026-02-01T00:00:00'` and `'20260201'` are the same under
+  every setting. Three orders and no languages was the first version, and
+  review showed the last two cases through it. A text that differs is refused
+  as DEC-1756.1's are, with both readings and the ISO form with a `T` as the
+  remedy. Before this, such a text was refused for not
   being the engine's spelling, so the contrast was not needed; taking a
   reading without it would store whichever the login's language picked.
 - **Keys too, and two that read as one are still one row.** A key's spelling
@@ -755,7 +761,9 @@ the engine's spelling.
 Pinned by `a_date_or_time_is_taken_as_the_value_the_engine_reads` in
 `flow_pg` (PostgreSQL 16 and 18: plan, apply, bootstrap, verify and pull, and
 the four refusals) and in `flow` (SQL Server, the `DATEFORMAT` refusal among
-them); by `the_engines_reading_replaces_only_the_texts_it_was_read_for`; and,
+them); by `a_date_read_differently_by_another_language_or_order_is_ambiguous`
+(pbps-mssql, under a `polski` session); by
+`the_engines_reading_replaces_only_the_texts_it_was_read_for`; and,
 changed from a refusal, by the bound in
 `a_partition_tree_round_trips_through_the_cli` and the date in
 `a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is_written`.

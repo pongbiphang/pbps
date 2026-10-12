@@ -3286,6 +3286,97 @@ async fn a_value_is_spelled_under_its_columns_collation() {
     assert_eq!(legacy.misspelt.len(), 1, "{:?}", legacy.misspelt);
 }
 
+/// DEC-1883.1: a date is taken as the one value it reads only once every
+/// `DATEFORMAT` and, where it names a month, every language has been asked.
+/// Under a `polski` session `28 listopad 2018` reads as November, and as
+/// October under `hrvatski`, which no `DATEFORMAT` shows; `01/02/2026`
+/// differs between `mdy` and `dmy`. Both are reported with the other reading
+/// and left out of `misspelt`, while `20260201` reads one way everywhere and
+/// is handed back with its reading. The contrasts leave the session as it
+/// came.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_date_read_differently_by_another_language_or_order_is_ambiguous() {
+    use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+    let mut db = TestDb::create("temporal_lang").await;
+    let mut t = Table::default();
+    t.columns
+        .insert("code".to_owned(), Column::new(ty("varchar(10)")).not_null());
+    t.columns.insert("d".to_owned(), Column::new(ty("date")));
+    t.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".to_owned()],
+        storage_parameters: Default::default(),
+    });
+    let row = |d: &str| {
+        [("d".to_owned(), Value::Text(d.into()))]
+            .into_iter()
+            .collect::<Row>()
+    };
+    t.data = Some(TableData {
+        mode: DataMode::Exact,
+        rows: [
+            (RowKey::from("named"), row("28 listopad 2018")),
+            (RowKey::from("ordered"), row("01/02/2026")),
+            (RowKey::from("plain"), row("20260201")),
+        ]
+        .into_iter()
+        .collect(),
+    });
+    let mut schema = Schema::default();
+    schema.tables.insert(TableName::new("dbo", "t"), t);
+    db.conn
+        .execute("SET LANGUAGE N'polski';")
+        .await
+        .expect("set the session language");
+    let found = pbps_mssql::catalog::misspelt(&mut db.conn, &schema, &Default::default())
+        .await
+        .expect("ask the engine");
+    let left = db
+        .conn
+        .query("SELECT @@LANGUAGE;")
+        .await
+        .expect("read the session language");
+    let language: Option<&str> = left[0].try_get_at(0).expect("a language");
+    let language = language.map(str::to_owned);
+    db.drop().await;
+
+    let ambiguous = &found.ambiguous;
+    let read_also = |declared: &str, pinned: &str, other: &str, under: &str| {
+        ambiguous.iter().any(|a| {
+            a.declared == declared
+                && a.pinned.as_deref() == Some(pinned)
+                && a.otherwise.iter().any(|(r, u)| r == other && u == under)
+        })
+    };
+    assert!(
+        read_also(
+            "28 listopad 2018",
+            "2018-11-28",
+            "2018-10-28",
+            "LANGUAGE hrvatski"
+        ),
+        "{ambiguous:?}"
+    );
+    // `polski` reads day first.
+    assert!(
+        read_also("01/02/2026", "2026-02-01", "2026-01-02", "DATEFORMAT mdy"),
+        "{ambiguous:?}"
+    );
+    // Negative: one reading everywhere is not ambiguous, and is handed back.
+    assert!(
+        !ambiguous.iter().any(|a| a.declared == "20260201"),
+        "{ambiguous:?}"
+    );
+    let misspelt: Vec<(&str, Option<&str>, bool)> = found
+        .misspelt
+        .iter()
+        .map(|m| (m.declared.as_str(), m.canonical.as_deref(), m.temporal))
+        .collect();
+    assert_eq!(misspelt, [("20260201", Some("2026-02-01"), true)]);
+    assert_eq!(language.as_deref(), Some("polski"));
+}
+
 /// A collation the server lacks is named before any statement runs, and a
 /// known one in another case is not (#1175).
 #[tokio::test]

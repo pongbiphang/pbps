@@ -885,6 +885,7 @@
         "a_type_with_no_native_equality_is_read_back_against_its_default",
         "a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps",
         "a_value_is_spelled_under_its_columns_collation",
+        "a_date_read_differently_by_another_language_or_order_is_ambiguous",
         "a_variant_that_renders_like_its_default_is_still_drift",
         "a_view_named_by_a_reserved_word_is_created_after_the_view_it_selects_from",
         "an_absent_ledger_is_not_misspelt_when_null_concatenation_is_off",
