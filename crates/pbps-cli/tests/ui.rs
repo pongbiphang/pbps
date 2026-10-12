@@ -289,6 +289,9 @@ fn child_failures_remain_typed_answers_and_docs_use_the_exact_csp_stylesheet() {
     use base64::Engine as _;
     use sha2::Digest as _;
     let viewer = Viewer::start("responses");
+    std::fs::write(viewer.directory.join("schema/reporter.yml"),
+        "role: retail_reporter\ndescription: 'Read-only <retail> & reporting'\ngrants:\n  dbo.t: [select]\n",
+    ).unwrap();
     for (path, command) in [
         ("/api/drift?env=unconfigured", "verify"),
         ("/api/timeline?env=unconfigured", "state list"),
@@ -305,6 +308,10 @@ fn child_failures_remain_typed_answers_and_docs_use_the_exact_csp_stylesheet() {
     let (status, _, html) = viewer.read("/api/docs");
     assert_eq!(status, 200, "{html}");
     assert!(html.contains("dbo.t"));
+    assert!(html.contains("<h2>Roles</h2>"));
+    assert!(html.contains("<h3><code>retail_reporter</code></h3>"));
+    assert!(html.contains("Read-only &lt;retail&gt; &amp; reporting"));
+    assert!(html.contains("<code>dbo.t</code></td><td>select"));
     assert!(!html.contains("<script"));
     let style = html
         .split_once("<style>")

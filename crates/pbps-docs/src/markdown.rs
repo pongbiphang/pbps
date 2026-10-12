@@ -6,26 +6,32 @@
 //! column types, the keys — is available from introspection too, and is included
 //! only so the descriptions have something to hang on.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use pbps_model::{ComputedColumn, IdsFile, Schema, Table, TableName};
+use pbps_model::{ComputedColumn, IdsFile, Module, ModuleId, Role, Schema, Table, TableName};
 
 use crate::erd;
 
 /// Renders the whole project as one Markdown document.
 pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
+    // A new schema family must be considered by every prose renderer.
+    let Schema {
+        tables,
+        modules,
+        roles,
+    } = schema;
     let mut s = String::new();
     let _ = writeln!(s, "# {title}\n");
     let _ = writeln!(
         s,
         "{} table(s), {} column(s), {} module(s).\n",
-        schema.tables.len(),
-        schema
-            .tables
+        tables.len(),
+        tables
             .values()
             .map(|t| t.columns.len() + t.computed.len())
             .sum::<usize>(),
-        schema.modules.len()
+        modules.len()
     );
 
     s.push_str("## Diagram\n\n```mermaid\n");
@@ -33,12 +39,12 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
     s.push_str("```\n\n");
 
     s.push_str("## Tables\n");
-    for (name, table) in &schema.tables {
+    for (name, table) in tables {
         one_table(&mut s, name, table);
     }
 
-    modules_section(&mut s, schema);
-    roles_section(&mut s, schema);
+    modules_section(&mut s, modules);
+    roles_section(&mut s, roles);
     deprecated_section(&mut s, schema);
     graveyard(&mut s, ids);
     s
@@ -49,12 +55,12 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
 /// The definition is included in full rather than summarized: it *is* the
 /// object (ADR-0002), and a reader asking "what does this view do" is asking to
 /// read it.
-fn modules_section(s: &mut String, schema: &Schema) {
-    if schema.modules.is_empty() {
+fn modules_section(s: &mut String, modules: &BTreeMap<ModuleId, Module>) {
+    if modules.is_empty() {
         return;
     }
     s.push_str("\n## Views, procedures, functions and triggers\n");
-    for (name, m) in &schema.modules {
+    for (name, m) in modules {
         let _ = writeln!(s, "\n### `{name}`\n");
         let on = name
             .attached_to()
@@ -70,12 +76,12 @@ fn modules_section(s: &mut String, schema: &Schema) {
 
 /// Database roles and what each is granted (ADR-0005). Membership is not
 /// here: it is each environment's own, and pbps never reads it.
-fn roles_section(s: &mut String, schema: &Schema) {
-    if schema.roles.is_empty() {
+fn roles_section(s: &mut String, roles: &BTreeMap<String, Role>) {
+    if roles.is_empty() {
         return;
     }
     s.push_str("\n## Roles\n");
-    for (name, role) in &schema.roles {
+    for (name, role) in roles {
         let _ = writeln!(s, "\n### `{name}`\n");
         if let Some(d) = &role.description {
             let _ = writeln!(s, "{d}\n");

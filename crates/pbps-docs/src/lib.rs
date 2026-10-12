@@ -96,6 +96,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn roles_are_documented_in_every_prose_format() {
+        use pbps_model::{Permission, Role};
+        let mut schema = Schema::default();
+        schema.roles.insert(
+            "retail_reporter".into(),
+            Role {
+                description: Some("Read-only retail reporting".into()),
+                grants: [(
+                    "public.customer".parse().unwrap(),
+                    [Permission::Select].into(),
+                )]
+                .into(),
+            },
+        );
+        schema
+            .roles
+            .insert("pending_access".into(), Role::default());
+        for format in [Format::Markdown, Format::Html] {
+            let out = render(&schema, &IdsFile::default(), format, "Schema");
+            for expected in [
+                "Roles",
+                "retail_reporter",
+                "Read-only retail reporting",
+                "public.customer",
+                "select",
+                "pending_access",
+                "No grants.",
+            ] {
+                assert!(
+                    out.contains(expected),
+                    "{format:?} missing {expected}: {out}"
+                );
+            }
+            assert_eq!(out, render(&schema, &IdsFile::default(), format, "Schema"));
+        }
+    }
+
     /// A module's definition *is* the object (ADR-0002), so documentation that
     /// left it out would document the name and nothing else.
     #[test]
