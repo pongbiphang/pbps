@@ -7146,7 +7146,9 @@ pub fn cmd_plan_db(
         // against what was *declared* when each object was last written,
         // where the ledger recorded it (ADR-0009 §2.2, ADR-0013 §4,
         // DECISIONS 207–208).
-        let base = entry.snapshot.declared.overlay(&read_back);
+        let mut base = entry.snapshot.declared.overlay(&read_back);
+        // A read knows the sequence names it leaves out (#1631).
+        pbps_dialect::name_read_sequences(&mut base, dialect.as_ref());
         // A removed module no longer has a declaration carrying its
         // `depends_on:` edge. The newest snapshot keeps those baseline
         // annotations so connected planning can still drop dependents first.

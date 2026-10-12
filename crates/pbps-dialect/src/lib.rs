@@ -3125,6 +3125,26 @@ pub fn check_system_time_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec
     problems
 }
 
+/// `schema`, a read-back, with every `serial`'s sequence named (#1631).
+///
+/// A read leaves the name out where the engine generated it under the table
+/// and column it reads, so there it is known. A declaration that leaves it
+/// out does not know it: a rename keeps the sequence's name, so a git
+/// baseline's unnamed sequence may be one an earlier table generated. The
+/// differ compares a name only where both sides give one, so a base that is
+/// a read is named in full first, and one that is a declaration is not.
+pub fn name_read_sequences(schema: &mut Schema, dialect: &dyn Dialect) {
+    for (name, table) in &mut schema.tables {
+        for (column, spec) in &mut table.columns {
+            if let pbps_model::ValueSource::Sequence(sequence) = &mut spec.value_source
+                && sequence.name.is_none()
+            {
+                sequence.name = dialect.owned_sequence_name(name, column, sequence);
+            }
+        }
+    }
+}
+
 /// The whole-schema question of whether a declared index, or the index behind
 /// a named primary key or unique constraint, collides with another relation
 /// in its schema — a third case of the namespace-sharing rule 201 moved to

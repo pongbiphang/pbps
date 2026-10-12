@@ -2105,6 +2105,51 @@ fn a_new_column_calling_a_function_that_reads_it_is_refused_by_name() {
     }
 }
 
+/// A connected plan's base is a read, which knows the name the engine
+/// generated for a `serial`'s sequence: a declaration naming another one is
+/// a change pbps does not make, refused before the plan. The same name a
+/// git baseline leaves out is not known, so the offline plan accepts a
+/// later declaration naming it (#1631).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_connected_plan_knows_a_serials_generated_sequence_name() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "serial-name");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.t (id serial PRIMARY KEY)",
+    );
+    let d = Demo::new("serial-name");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let file = d.dir.join("schema/app.t.yml");
+    let pulled = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        pulled.replacen(
+            "    type: serial\n",
+            "    type: serial\n    sequence: {name: other_seq}\n",
+            1,
+        ),
+    )
+    .unwrap();
+    // Offline, against the pulled declaration, the name is not known.
+    succeeds(d.run(&["plan"]));
+    let refused = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("sequence"),
+        "{}",
+        stderr(&refused)
+    );
+    // The negative case: the declaration as pulled plans nothing.
+    std::fs::write(&file, &pulled).unwrap();
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 /// A staged apply checkpoints after every statement, and reads what it has
 /// done so far. A `serial` table, and a `serial` added to a table holding
 /// rows, are each one statement with their sequence and its ownership, so

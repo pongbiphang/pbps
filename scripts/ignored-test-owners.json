@@ -467,6 +467,7 @@
         "a_concurrent_replacement_is_seen_under_a_repeatable_read_default",
         "a_continued_escape_strings_spacing_is_a_change_to_the_view",
         "a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens_it",
+        "a_connected_plan_knows_a_serials_generated_sequence_name",
         "a_cross_schema_cli_rename_requires_approval_and_records_only_its_declared_destination",
         "a_data_block_beside_a_serial_leaves_it_to_the_sequence",
         "a_declaration_may_reopen_a_closed_routine_on_its_next_rebuild",

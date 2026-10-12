@@ -1831,17 +1831,18 @@ fn diff_columns(
                 });
                 (None, None)
             }
-            // A name is compared only where the declaration gives one: a
-            // rename keeps the sequence's, so the generated name stops
-            // matching (`OwnedSequence::declares`). The base's name is the
-            // one its own table and column generated where it holds none, so
-            // a renamed table may name the sequence it kept. Any other change
-            // to a `serial`'s sequence, or to or from one, is #1889's (#1631).
+            // A name is compared only where both sides give one. The
+            // declaration's may be left out (`OwnedSequence::declares`), and
+            // a base without one does not know it: a git baseline records
+            // the name an earlier declaration generated, under whatever table
+            // and column it was declared on then, and a rename keeps the
+            // sequence's. So a renamed table may name the sequence it kept,
+            // and a later pull's name for it is no change. The apply's own
+            // read compares the name the engine holds. Any other change to a
+            // `serial`'s sequence, or to or from one, is #1889's (#1631).
             (ValueSource::Sequence(from), ValueSource::Sequence(to)) => {
                 let from = pbps_model::OwnedSequence {
-                    name: dialect
-                        .owned_sequence_name(base_table_name, &base_ref.name, from)
-                        .or_else(|| from.name.clone()),
+                    name: from.name.clone().or_else(|| to.name.clone()),
                     ..from.clone()
                 };
                 if !to.declares(&from) {

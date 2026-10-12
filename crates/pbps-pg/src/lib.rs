@@ -2880,9 +2880,10 @@ mod tests {
     }
 
     /// A table's rename keeps its `serial`'s sequence under the name the old
-    /// table generated, so the renamed table may declare that name: the
-    /// base's generated name is resolved at its own table before the two are
-    /// compared. Another name is still a change (#1631).
+    /// table generated. Against a read, which knows that name, the renamed
+    /// table may declare it and no other. Against a git baseline, which is a
+    /// declaration and does not know it, a later pull's name for it is no
+    /// change; one the baseline does name is still compared (#1631).
     #[test]
     fn a_renamed_tables_serial_may_name_the_sequence_it_kept() {
         use pbps_model::{Column, Hints, IdsFile, Intent, Schema, Table, TableName};
@@ -2907,21 +2908,16 @@ mod tests {
             operator: "test".into(),
             today: "2026-10-12".into(),
         };
-        let base = schema("app.t", serial(None));
-        let base_ids = pbps_diff::resolve(&base, &IdsFile::default(), &[], &context)
-            .unwrap()
-            .ids;
-        let rename = [Intent::RenameTable {
-            from: "app.t".parse().unwrap(),
-            to: "app.u".parse().unwrap(),
-        }];
-        let diff = |declared: &Schema| {
-            let ids = pbps_diff::resolve(declared, &base_ids, &rename, &context)
+        let diff = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+            let base_ids = pbps_diff::resolve(base, &IdsFile::default(), &[], &context)
+                .unwrap()
+                .ids;
+            let ids = pbps_diff::resolve(declared, &base_ids, intents, &context)
                 .unwrap()
                 .ids;
             pbps_diff::diff(
                 pbps_diff::Side {
-                    schema: &base,
+                    schema: base,
                     ids: &base_ids,
                 },
                 pbps_diff::Side {
@@ -2932,7 +2928,22 @@ mod tests {
                 &Hints::default(),
             )
         };
-        let kept = diff(&schema("app.u", serial(Some("t_id_seq")))).expect("the kept name");
+        let refused = |result: Result<pbps_model::ChangeSet, Vec<pbps_diff::DiffError>>| {
+            matches!(
+                result.as_ref().map_err(Vec::as_slice),
+                Err([pbps_diff::DiffError::SequenceChangeUnsupported { .. }])
+            )
+        };
+
+        // Against a read of `app.t` before the rename.
+        let mut read = schema("app.t", serial(None));
+        pbps_dialect::name_read_sequences(&mut read, &super::Postgres::new());
+        let rename = [Intent::RenameTable {
+            from: "app.t".parse().unwrap(),
+            to: "app.u".parse().unwrap(),
+        }];
+        let kept = diff(&read, &schema("app.u", serial(Some("t_id_seq"))), &rename)
+            .expect("the kept name");
         assert!(
             matches!(
                 kept.changes.as_slice(),
@@ -2940,16 +2951,23 @@ mod tests {
             ),
             "{kept:#?}"
         );
-        diff(&schema("app.u", serial(None))).expect("no name declared");
-        // The negative case: a name the sequence does not have.
-        let errs = diff(&schema("app.u", serial(Some("other_seq")))).expect_err("another name");
-        assert!(
-            matches!(
-                errs.as_slice(),
-                [pbps_diff::DiffError::SequenceChangeUnsupported { .. }]
-            ),
-            "{errs:?}"
-        );
+        diff(&read, &schema("app.u", serial(None)), &rename).expect("no name declared");
+        assert!(refused(diff(
+            &read,
+            &schema("app.u", serial(Some("other_seq"))),
+            &rename
+        )));
+
+        // Against a git baseline declaring `app.u` after that rename, without
+        // the name, and the name a later pull wrote.
+        let declared = schema("app.u", serial(None));
+        diff(&declared, &schema("app.u", serial(Some("t_id_seq"))), &[])
+            .expect("a pulled name against an unnamed declaration");
+        assert!(refused(diff(
+            &schema("app.u", serial(Some("numbers"))),
+            &schema("app.u", serial(Some("t_id_seq"))),
+            &[]
+        )));
     }
 
     #[test]

@@ -1803,11 +1803,17 @@ Measured on 16.15 and 18.6:
   plan has nothing to drop.
 
 **The name** is held only where it is not the generated `<table>_<column>_seq`,
-and compared only where the declaration gives one. A rename keeps the
-sequence's name, so the generated one stops matching without anything having
-changed. A declared name equal to the generated one is refused as redundant,
-and the name the sequence will have is claimed in the plan's namespace like
-an identity's.
+and compared only where both sides give one. A rename keeps the sequence's
+name, so the generated one stops matching without anything having changed.
+That makes a missing name mean two things. In a read it is the name the
+engine generated under the table and column read, so it is known, and a base
+read from the database or a recorded snapshot is named in full before the
+differ compares it. In a declaration, and so in a git baseline, it is not
+known: the sequence may carry a name an earlier table generated, so a later
+pull's name for it is no change. A declared name equal to the generated one
+is refused as redundant, and the name the sequence will have is claimed in
+the plan's namespace like an identity's, after every claim the engine
+retries, since it never retries this one.
 
 **Refused**, each by name:
 

@@ -900,7 +900,9 @@ fn surviving_keys(
     // What was declared when each object was last written, as a connected plan
     // compares against (ADR-0013 §4), and the recorded `depends_on:` edges of
     // modules the declarations no longer hold.
-    let base = snapshot.declared.overlay(&snapshot.schema);
+    let mut base = snapshot.declared.overlay(&snapshot.schema);
+    // A read knows the sequence names it leaves out (#1631).
+    pbps_dialect::name_read_sequences(&mut base, crate::dialect_for(declared.dialect).as_ref());
     let mut hints = loaded.hints.clone();
     for (name, dependencies) in &snapshot.module_deps {
         if !loaded.schema.modules.contains_key(name) {
