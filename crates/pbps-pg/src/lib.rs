@@ -382,6 +382,12 @@ fn sequence_problems(
         )));
     }
     if let Some(named) = &sequence.name {
+        // Written into the plan's SQL as an identifier, so held to the rules
+        // every other name is: an empty one, or one holding NUL, is refused
+        // here, not by the emitter after the plan was made.
+        if let Err(e) = quote(named) {
+            found.push(e);
+        }
         if *named == generated_name(&table_name.name, Some(column), "seq") {
             found.push(invalid(format!(
                 "column `{column}`'s sequence is named `{named}`, the name the engine generates; \
@@ -4547,6 +4553,21 @@ mod tests {
             "{:?}",
             found(&parent)
         );
+
+        // A name the emitter could not write is refused here, before a plan.
+        for unwritable in ["", "a\0b"] {
+            let mut table = Table::default();
+            table
+                .columns
+                .insert("id".to_owned(), serial(Some(unwritable)));
+            let refused = found(&table);
+            assert!(
+                refused
+                    .iter()
+                    .any(|m| m.contains("cannot be written into SQL")),
+                "{unwritable:?}: {refused:?}"
+            );
+        }
     }
 
     /// A `serial`'s sequence is `AS` the column's type with an identity's
