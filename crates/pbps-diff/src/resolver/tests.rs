@@ -3021,6 +3021,66 @@ mod generated_surface_coverage {
         ordered.proof.validate(&ordered.changes).unwrap();
     }
 
+    /// #1610 review: the parent's default rebinds and its partition's own
+    /// keeps its binding. The parent's restoration is recursed by the engine
+    /// into the partition, over its own default, so that is set again after
+    /// it (DEC-1687.1). Negative: a partition holding only its parent's
+    /// default is not set again.
+    #[test]
+    fn a_partitions_standing_default_is_set_again_after_its_parents_rebuild() {
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let schema = partitioned(Some("app.f(0)"), Some("7"));
+        let before_ids = ids(&schema, &IdsFile::default());
+        let ordered = planned(
+            &schema,
+            &before_ids,
+            &schema,
+            &before_ids,
+            &[rebinds("app.t"), keeps("app.p")],
+        )
+        .unwrap_or_else(|error| panic!("a parent's rebuild is refused: {error:?}"));
+        let parent = at(
+            &ordered,
+            &|c| matches!(c, Change::AlterColumnDefault { column, to: Some(_), .. } if column.table == t),
+        );
+        let again = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, from: Some(from), to: Some(to), fallback: Some(fallback), .. }
+                if *table == p && from == "7" && to == "7" && fallback == "app.f(0)")
+        });
+        assert!(
+            ordered
+                .proof
+                .edges()
+                .iter()
+                .any(|e| e.before == parent && e.after == again),
+            "the order is an edge, not an accident of position: {:?}",
+            ordered.proof.edges()
+        );
+        names_resolve(&ordered, &before_ids);
+        ordered.proof.validate(&ordered.changes).unwrap();
+
+        let schema = partitioned(Some("app.f(0)"), None);
+        let before_ids = ids(&schema, &IdsFile::default());
+        let ordered = planned(
+            &schema,
+            &before_ids,
+            &schema,
+            &before_ids,
+            &[rebinds("app.t")],
+        )
+        .unwrap_or_else(|error| panic!("a parent's rebuild is refused: {error:?}"));
+        assert!(
+            !ordered
+                .changes
+                .changes
+                .iter()
+                .any(|c| matches!(c.change, Change::SetPartitionDefault { .. })),
+            "{:?}",
+            ordered.changes.changes
+        );
+    }
+
     /// #1610 review: a table replaced under its name, with new UIDs, whose
     /// generated column comes back as an ordinary one with a default. Only
     /// the plan's side has a default; the ordinary plan's `DropTable` and
@@ -3179,11 +3239,13 @@ mod generated_surface_coverage {
                 result.map(|(changes, _)| changes)
             );
         }
-        // Negative: the same surface with a default is rebuilt, not refused.
+        // Negative: the same surface with a default is rebuilt, not refused:
+        // its pair, and for the parent the partition's own set again after
+        // it.
         let schema = partitioned(Some("0"), Some("1"));
         let before_ids = ids(&schema, &IdsFile::default());
         let after_ids = ids(&schema, &before_ids);
-        for table in ["app.t", "app.p"] {
+        for (table, expected) in [("app.t", 3), ("app.p", 2)] {
             let name: pbps_model::TableName = table.parse().unwrap();
             let (changes, _) = super::super::prepare::changes(
                 &ChangeSet::default(),
@@ -3196,7 +3258,12 @@ mod generated_surface_coverage {
                 &pbps_dialect::MinimalDialect,
             )
             .unwrap_or_else(|error| panic!("{table}: {error:?}"));
-            assert_eq!(changes.changes.len(), 2, "{table}: {:?}", changes.changes);
+            assert_eq!(
+                changes.changes.len(),
+                expected,
+                "{table}: {:?}",
+                changes.changes
+            );
         }
     }
 }

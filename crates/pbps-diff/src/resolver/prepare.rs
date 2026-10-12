@@ -514,6 +514,58 @@ pub(super) fn changes(
             }
         }
     }
+    // A parent's default the rebuild sets again is recursed by the engine
+    // into every partition, over a partition's own default (DEC-1687.1). The
+    // differ sets a partition's own again after a parent's default it
+    // changes; a rebuild changes no text, so a partition's own that nothing
+    // else in the plan sets is set again here, after the parent's (#1610
+    // review).
+    let mut again = Vec::new();
+    for planned in &added {
+        let Change::AlterColumnDefault {
+            column,
+            to: Some(fallback),
+            ..
+        } = &planned.change
+        else {
+            continue;
+        };
+        for (partition, table) in &desired.tables {
+            let Some(own) = table
+                .partition_of
+                .as_ref()
+                .filter(|of| of.parent == column.table)
+                .and_then(|of| of.columns.get(&column.name))
+                .and_then(|own| own.default.clone())
+            else {
+                continue;
+            };
+            let set = |c: &Change| {
+                matches!(c, Change::SetPartitionDefault { table, column: name, to: Some(_), .. }
+                    if table == partition && *name == column.name)
+            };
+            if changes.iter().chain(&added).any(|p| set(&p.change)) {
+                continue;
+            }
+            let uid = ids
+                .table_uid(partition)
+                .ok_or_else(|| Error::Definition(Surface::Default(partition.column(&column.name))))?
+                .clone();
+            let mut planned = PlannedChange::new(Change::SetPartitionDefault {
+                uid,
+                table: partition.clone(),
+                parent: column.table.clone(),
+                column: column.name.clone(),
+                from: Some(own.clone()),
+                to: Some(own),
+                fallback: Some(fallback.clone()),
+            });
+            planned.risks = dialect.change_risks(&planned.change);
+            planned.strategy = hints.strategies.get(partition).copied().unwrap_or_default();
+            again.push(planned);
+        }
+    }
+    added.extend(again);
     let ordinary = changes.len();
     changes.extend(added);
     Ok((ChangeSet { changes }, ordinary))
