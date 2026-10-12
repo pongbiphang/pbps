@@ -45,6 +45,27 @@ fn broken_historical_objects_never_become_empty_schemas() {
     git_baselines::broken();
 }
 
+#[path = "support/data_takeovers.rs"]
+mod data_takeovers;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn matching_rows_still_record_the_first_data_takeover() {
+    data_takeovers::matching(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn first_data_takeovers_refuse_changed_rows_and_wrong_checksums() {
+    data_takeovers::refusals(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn renamed_data_takeovers_use_final_names_and_require_approval() {
+    data_takeovers::renamed(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
 #[path = "support/baseline_ids.rs"]
 mod baseline_ids;
 

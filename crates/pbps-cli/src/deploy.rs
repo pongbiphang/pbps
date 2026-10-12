@@ -7120,8 +7120,8 @@ pub fn cmd_plan_db(
         // A table whose rows the declarations cover for the first time is
         // measured against what it holds, not against nothing: the rows are
         // adopted, the ones that differ are updated, and — for `exact` — the
-        // ones nobody declared are deleted behind the gate. Said out loud,
-        // because the plan shows the consequences and not the takeover.
+        // ones nobody declared are deleted behind the gate. The note names
+        // the current row count beside the typed takeover below (DEC-1803.1).
         for (name, scope) in &declared_data {
             if recorded_data.contains_key(name) {
                 continue;
@@ -7174,6 +7174,24 @@ pub fn cmd_plan_db(
         } else {
             pbps_diff::Screen::Text
         };
+        // plan_base uses the declared mode to compare newly managed rows.
+        // Carry the takeover separately so matching rows still reach the
+        // checksum/approval gate and the ordinary ledger write (DEC-1803.1).
+        let takeovers: Vec<_> =
+            pbps_model::data::takeovers(&recorded_data, &declared_data, &scoped.schema)
+                .into_iter()
+                .map(|(name, mode)| {
+                    let change = pbps_model::Change::SetDataMode {
+                        table: recorded_ids.resolved_in(&name, &resolved.ids),
+                        from: None,
+                        to: Some(mode),
+                    };
+                    let risks = dialect.change_risks(&change);
+                    let mut planned = pbps_model::PlannedChange::new(change);
+                    planned.risks = risks;
+                    planned
+                })
+                .collect();
         // The read-back goes in beside the overlaid base, for the comparisons
         // the engine makes by parse tree (an attach's checks and generation
         // expressions, #1642 review).
@@ -7193,6 +7211,12 @@ pub fn cmd_plan_db(
                 screen,
                 &read_back,
             )
+            .map(|mut changes| {
+                // Re-derivations and resolver planning must retain the same
+                // zero-SQL changes as the initial connected plan.
+                changes.changes.extend(takeovers.iter().cloned());
+                changes
+            })
         };
         let mut cs = diff_here(&std::collections::BTreeSet::new()).map_err(|errs| {
             for e in &errs {
