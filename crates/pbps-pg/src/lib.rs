@@ -1373,7 +1373,7 @@ impl Dialect for Postgres {
         for (column, spec) in &table.columns {
             if sources.get(column, spec).iter().any(|source| match source {
                 pbps_model::ValueSource::Identity(_) => true,
-                // Claimed below, under the name it is created with.
+                // Claimed below, where the declaration names it.
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Default(_)
                 | pbps_model::ValueSource::Sequence(_)
@@ -1394,12 +1394,21 @@ impl Dialect for Postgres {
                     yields_to_constraints: false,
                 });
             }
-            if let pbps_model::ValueSource::Sequence(sequence) = &spec.value_source {
+            // A `serial`'s sequence only where the declaration names it. An
+            // unnamed one is not known: a rename keeps the sequence's name,
+            // so the name this table and column would generate may be no
+            // sequence's, and claiming it refused a valid declaration that
+            // used it. The name a plan creates one under is the connected
+            // plan's to claim (#1631, #1899).
+            if let pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                name: Some(sequence),
+                ..
+            }) = &spec.value_source
+            {
                 by_name.push(pbps_dialect::ImplicitRelation {
-                    name: emit::owned_sequence(name, column, sequence).name,
+                    name: sequence.clone(),
                     descriptor: format!("the sequence of `serial` column `{name}.{column}`"),
-                    remedy: "Rename the other object, or name the sequence with `sequence: \
-                             {name: ...}`.",
+                    remedy: "Rename the other object, or the sequence's `sequence: {name: ...}`.",
                     yields_to_constraints: false,
                 });
             }
@@ -2596,6 +2605,41 @@ mod tests {
             pbps_dialect::check_index_names(&schema(&at(100)), &pg).is_empty(),
             "a hundred claimants retry at most 99 times"
         );
+    }
+
+    /// A `serial` that leaves its sequence's name out claims none: a renamed
+    /// column keeps the sequence it had, so the name its table and column
+    /// would generate may belong to a table the declarations hold. A name it
+    /// does declare is claimed, and a table under it is refused (#1631).
+    #[test]
+    fn only_a_declared_serial_sequence_name_is_claimed() {
+        use pbps_model::{Column, Schema, Table};
+        let with = |sequence: Option<&str>, other_name: &str| {
+            let mut serial = Column::new("integer".parse().unwrap()).not_null();
+            serial.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                start: 1,
+                increment: 1,
+                name: sequence.map(str::to_owned),
+            });
+            let mut t = Table::default();
+            t.columns.insert("n".into(), serial);
+            let mut other = Table::default();
+            other
+                .columns
+                .insert("x".into(), Column::new("integer".parse().unwrap()));
+            let mut schema = Schema::default();
+            schema.tables.insert(TableName::new("app", "t"), t);
+            schema
+                .tables
+                .insert(TableName::new("app", other_name), other);
+            pbps_dialect::check_index_names(&schema, &super::Postgres::new())
+        };
+        let unnamed = with(None, "t_n_seq");
+        assert!(unnamed.is_empty(), "{unnamed:?}");
+        // The negative case: the declared name is claimed.
+        let found = with(Some("numbers"), "numbers");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("`serial` column `app.t.n`"), "{found:?}");
     }
 
     /// A `serial`'s sequence is created by name and never retried, so it

@@ -1811,9 +1811,12 @@ read from the database or a recorded snapshot is named in full before the
 differ compares it. In a declaration, and so in a git baseline, it is not
 known: the sequence may carry a name an earlier table generated, so a later
 pull's name for it is no change. A declared name equal to the generated one
-is refused as redundant, and the name the sequence will have is claimed in
-the plan's namespace like an identity's, after every claim the engine
-retries, since it never retries this one.
+is refused as redundant. A declared name is claimed in the declarations'
+namespace, after every claim the engine retries, since it never retries
+this one. An unnamed sequence claims nothing there: the name its table and
+column would generate may be no sequence's after a rename, and claiming it
+refused a table declared under it. The name a plan creates one under is the
+connected plan's to claim (#1899).
 
 **Refused**, each by name:
 
