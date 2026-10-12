@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::change::{Change, ChangeSet};
 use crate::module::ModuleId;
 use crate::name::TableName;
-use crate::schema::Schema;
+use crate::schema::{Schema, ValueSource};
 
 /// The three expressions the model holds verbatim, as declared (ADR-0013 §4).
 ///
@@ -34,7 +34,7 @@ use crate::schema::Schema;
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeclaredExpressions {
-    /// `Column::default`, by table and column.
+    /// `ValueSource::Default`, by table and column.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub defaults: BTreeMap<TableName, BTreeMap<String, String>>,
     /// `Generated::expression`, by table and column (DEC-1168.1).
@@ -213,19 +213,22 @@ impl Declared {
         }
         for (name, table) in &schema.tables {
             for (column, spec) in &table.columns {
-                if let Some(default) = &spec.default {
-                    d.expressions
-                        .defaults
-                        .entry(name.clone())
-                        .or_default()
-                        .insert(column.clone(), default.clone());
-                }
-                if let Some(generated) = &spec.generated {
-                    d.expressions
-                        .generated
-                        .entry(name.clone())
-                        .or_default()
-                        .insert(column.clone(), generated.expression.clone());
+                match &spec.value_source {
+                    ValueSource::Default(default) => {
+                        d.expressions
+                            .defaults
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(column.clone(), default.clone());
+                    }
+                    ValueSource::Generated(generated) => {
+                        d.expressions
+                            .generated
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(column.clone(), generated.expression.clone());
+                    }
+                    ValueSource::None | ValueSource::Identity(_) => {}
                 }
             }
             // A partition's own default, under the partition and the column, as
@@ -423,19 +426,22 @@ impl Declared {
                     remove_nested(&mut self.expressions.defaults, table, name);
                     remove_nested(&mut self.expressions.generated, table, name);
                     remove_nested(&mut self.bindings.defaults, table, name);
-                    if let Some(default) = &column.default {
-                        self.expressions
-                            .defaults
-                            .entry(table.clone())
-                            .or_default()
-                            .insert(name.clone(), default.clone());
-                    }
-                    if let Some(generated) = &column.generated {
-                        self.expressions
-                            .generated
-                            .entry(table.clone())
-                            .or_default()
-                            .insert(name.clone(), generated.expression.clone());
+                    match &column.value_source {
+                        ValueSource::Default(default) => {
+                            self.expressions
+                                .defaults
+                                .entry(table.clone())
+                                .or_default()
+                                .insert(name.clone(), default.clone());
+                        }
+                        ValueSource::Generated(generated) => {
+                            self.expressions
+                                .generated
+                                .entry(table.clone())
+                                .or_default()
+                                .insert(name.clone(), generated.expression.clone());
+                        }
+                        ValueSource::None | ValueSource::Identity(_) => {}
                     }
                 }
                 Change::DropColumn { column, .. } => {
@@ -611,31 +617,39 @@ impl Declared {
             }
         }
         for (name, table) in &mut base.tables {
-            if let Some(defaults) = self.expressions.defaults.get(name) {
-                for (column, spec) in &mut table.columns {
-                    if let Some(declared) = defaults.get(column)
-                        && spec.default.is_some()
-                    {
-                        spec.default = Some(declared.clone());
+            // Overlay only a matching physical source. Recorded SQL cannot
+            // turn an ordinary column into a generated one or resurrect a default.
+            for (column, spec) in &mut table.columns {
+                match &mut spec.value_source {
+                    ValueSource::Default(read) => {
+                        if let Some(declared) = self
+                            .expressions
+                            .defaults
+                            .get(name)
+                            .and_then(|d| d.get(column))
+                        {
+                            *read = declared.clone();
+                        }
                     }
+                    ValueSource::Generated(read) => {
+                        if let Some(declared) = self
+                            .expressions
+                            .generated
+                            .get(name)
+                            .and_then(|d| d.get(column))
+                        {
+                            read.expression = declared.clone();
+                        }
+                    }
+                    ValueSource::None | ValueSource::Identity(_) => {}
                 }
-                // And a partition's own, where the read-back has one (#1578).
+            }
+            if let Some(defaults) = self.expressions.defaults.get(name) {
                 for (column, own) in table.partition_of.iter_mut().flat_map(|of| &mut of.columns) {
                     if let Some(declared) = defaults.get(column)
                         && own.default.is_some()
                     {
                         own.default = Some(declared.clone());
-                    }
-                }
-            }
-            // Presence-compared, as a default is: only over a column the
-            // read-back holds as generated (DEC-1168.1).
-            if let Some(generated) = self.expressions.generated.get(name) {
-                for (column, spec) in &mut table.columns {
-                    if let Some(declared) = generated.get(column)
-                        && let Some(read) = &mut spec.generated
-                    {
-                        read.expression = declared.clone();
                     }
                 }
             }
@@ -743,7 +757,7 @@ mod tests {
     fn table() -> Table {
         let mut table = Table::default();
         let mut n = Column::new("int".parse().unwrap());
-        n.default = Some("0".to_owned());
+        n.value_source = crate::ValueSource::Default("0".to_owned());
         table.columns.insert("n".to_owned(), n);
         table
             .columns
@@ -1070,7 +1084,7 @@ mod tests {
         let with_generated = |expression: &str| {
             let mut s = schema();
             let mut b = Column::new("int".parse().unwrap());
-            b.generated = Some(crate::schema::Generated {
+            b.value_source = crate::ValueSource::Generated(crate::schema::Generated {
                 expression: expression.into(),
                 stored: true,
             });
@@ -1085,12 +1099,11 @@ mod tests {
         assert_eq!(d.expressions.generated[&t()]["b"], "n*2");
         let base = d.overlay(&with_generated("(n * 2)"));
         assert_eq!(
-            base.tables[&t()].columns["b"]
-                .generated
-                .as_ref()
-                .unwrap()
-                .expression,
-            "n*2"
+            base.tables[&t()].columns["b"].value_source,
+            ValueSource::Generated(crate::Generated {
+                expression: "n*2".into(),
+                stored: true
+            })
         );
         // Negative: nothing is conjured over a column read back ordinary.
         let plain = d.overlay(&schema());
@@ -1150,7 +1163,7 @@ mod tests {
                 name: "k".to_owned(),
                 column: Box::new({
                     let mut c = Column::new("int".parse().unwrap());
-                    c.default = Some("GETDATE()".to_owned());
+                    c.value_source = crate::ValueSource::Default("GETDATE()".to_owned());
                     c
                 }),
             },
@@ -1233,8 +1246,10 @@ mod tests {
         // What an engine reads back: respelled, and one object dropped by hand.
         let mut read_back = schema();
         let table = read_back.tables.get_mut(&t()).unwrap();
-        table.columns.get_mut("n").unwrap().default = Some("((0))".to_owned());
-        table.columns.get_mut("m").unwrap().default = Some("(1)".to_owned());
+        table.columns.get_mut("n").unwrap().value_source =
+            crate::ValueSource::Default("((0))".to_owned());
+        table.columns.get_mut("m").unwrap().value_source =
+            crate::ValueSource::Default("(1)".to_owned());
         table.checks.get_mut("ck_n").unwrap().expression = "([n]>(0))".to_owned();
         table.indexes.get_mut("ix_n").unwrap().filter = Some("([n]>(0))".to_owned());
         table.indexes.remove("ix_m");
@@ -1249,10 +1264,16 @@ mod tests {
 
         let base = declared.overlay(&read_back);
         let table = &base.tables[&t()];
-        assert_eq!(table.columns["n"].default.as_deref(), Some("0"));
+        assert_eq!(
+            table.columns["n"].value_source,
+            ValueSource::Default("0".into())
+        );
         // Not recorded: the read-back stands, and a default the record has
         // but the engine does not is not put back.
-        assert_eq!(table.columns["m"].default.as_deref(), Some("(1)"));
+        assert_eq!(
+            table.columns["m"].value_source,
+            ValueSource::Default("(1)".into())
+        );
         assert_eq!(table.checks["ck_n"].expression, "n > 0");
         assert_eq!(table.indexes["ix_n"].filter.as_deref(), Some("n > 0"));
         assert!(!table.indexes.contains_key("ix_m"));

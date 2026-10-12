@@ -2389,22 +2389,38 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
         }
     });
 
+    // A generated expression and a default share pg_attrdef, but only the
+    // former has attgenerated set. Classify that row before constructing the
+    // exclusive model; unreadable generation was already named above.
+    let default = raw
+        .generated
+        .is_none()
+        .then(|| raw.default.clone())
+        .flatten();
+    let value_source = match (identity, generated, default) {
+        (None, None, None) => pbps_model::ValueSource::None,
+        (Some(identity), None, None) => pbps_model::ValueSource::Identity(identity),
+        (None, Some(generated), None) => pbps_model::ValueSource::Generated(generated),
+        (None, None, Some(default)) => pbps_model::ValueSource::Default(default),
+        (Some(_), Some(_), _) | (Some(_), None, Some(_)) | (None, Some(_), Some(_)) => {
+            note(
+                pulled,
+                &parts.name,
+                format!(
+                    "column `{}.{}` has conflicting value sources in the catalog; no source can be represented faithfully",
+                    parts.name, raw.name
+                ),
+            );
+            pbps_model::ValueSource::None
+        }
+    };
     Column {
         ty,
         nullable: raw.nullable,
-        // Verbatim, cast and all: see this module's own documentation — except
-        // for a generated column, whose expression shares `pg_attrdef` with
-        // the defaults and is not one.
-        default: raw
-            .generated
-            .is_none()
-            .then(|| raw.default.clone())
-            .flatten(),
-        identity,
+        value_source,
         description: None,
         deprecated: None,
         collation: None,
-        generated,
     }
 }
 
@@ -5630,8 +5646,8 @@ mod tests {
         let pulled = assemble(&raw);
         let read = only(&pulled);
         assert_eq!(
-            read.columns["amount"].default.as_deref(),
-            Some("(0)::numeric")
+            read.columns["amount"].value_source,
+            pbps_model::ValueSource::Default("(0)::numeric".into())
         );
         assert_eq!(
             read.checks["t_ck"].expression, "(amount >= (0)::numeric)",
@@ -5711,8 +5727,8 @@ mod tests {
             let pulled = assemble(&raw);
             assert_eq!(!pulled.warnings.is_empty(), reported, "always={always}");
             assert_eq!(
-                only(&pulled).columns["id"].identity,
-                Some(Identity {
+                only(&pulled).columns["id"].value_source,
+                pbps_model::ValueSource::Identity(Identity {
                     seed: 5,
                     increment: 2
                 })
@@ -5746,7 +5762,10 @@ mod tests {
                 "{:?}",
                 pulled.warnings
             );
-            assert_eq!(only(&pulled).columns["total"].generated, None);
+            assert_eq!(
+                only(&pulled).columns["total"].value_source,
+                pbps_model::ValueSource::None
+            );
         }
     }
 
@@ -5769,10 +5788,9 @@ mod tests {
         let pulled = assemble(&raw);
         // Held as what it is, and never also as a default (DEC-1168.1).
         let total = &only(&pulled).columns["total"];
-        assert_eq!(total.default, None);
         assert_eq!(
-            total.generated,
-            Some(pbps_model::Generated {
+            total.value_source,
+            pbps_model::ValueSource::Generated(pbps_model::Generated {
                 expression: "(id * 2)".into(),
                 stored: true
             })
@@ -6004,8 +6022,8 @@ mod tests {
         };
         let pulled = assemble(&raw);
         assert_eq!(
-            only(&pulled).columns["id"].default.as_deref(),
-            Some("nextval('app.t_id_seq'::regclass)")
+            only(&pulled).columns["id"].value_source,
+            pbps_model::ValueSource::Default("nextval('app.t_id_seq'::regclass)".into())
         );
         assert_eq!(pulled.limitations.len(), 1);
         assert!(pulled.warnings[0].contains("t_id_seq"));
@@ -6071,7 +6089,10 @@ mod tests {
                 "{min}..={max} cycles={cycles} cache={cache}: {:?}",
                 pulled.warnings
             );
-            assert!(only(&pulled).columns["id"].identity.is_some());
+            assert!(matches!(
+                only(&pulled).columns["id"].value_source,
+                pbps_model::ValueSource::Identity(_)
+            ));
         }
     }
 
@@ -6361,8 +6382,8 @@ mod tests {
         // Carried: the default is exactly what the model says. Named: the
         // sequence it needs is not in the pull and cannot be created from it.
         assert_eq!(
-            only(&pulled).columns["id"].default.as_deref(),
-            Some("nextval('app.s'::regclass)")
+            only(&pulled).columns["id"].value_source,
+            pbps_model::ValueSource::Default("nextval('app.s'::regclass)".into())
         );
         assert!(
             pulled.warnings[0].contains("does not own"),

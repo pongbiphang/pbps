@@ -3904,11 +3904,13 @@ mod tests {
     #[test]
     fn a_table_whose_only_other_column_is_an_identity_is_not_asked_for_update() {
         let mut t = declared(pbps_model::DataMode::Exact, &["a"], &["seq"]);
-        t.columns.get_mut("seq").expect("the extra column").identity =
-            Some(pbps_model::schema::Identity {
-                seed: 1,
-                increment: 1,
-            });
+        t.columns
+            .get_mut("seq")
+            .expect("the extra column")
+            .value_source = pbps_model::ValueSource::Identity(pbps_model::schema::Identity {
+            seed: 1,
+            increment: 1,
+        });
         let mut held = everything_but_the_dml(&["app"]);
         held.data_tables.insert(
             table("app.t"),

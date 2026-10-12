@@ -188,6 +188,36 @@ where
 }
 
 pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadError>> {
+    let (table, conflicts) = convert_for_diagnostics(src, dto)?;
+    if conflicts.is_empty() {
+        Ok(table)
+    } else {
+        Err(conflicts
+            .into_keys()
+            .map(|column| LoadError::Yaml {
+                path: std::path::PathBuf::from(&src.name),
+                message: format!(
+                    "column `{}.{column}` can have only one of default, identity or generated",
+                    table.name
+                ),
+            })
+            .collect())
+    }
+}
+
+type TableInspection = (
+    LoadedTable,
+    std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>>,
+);
+
+/// Recovery is confined to diagnostics. The public converter never returns a
+/// declaration with a conflicting source; inspectors retain every supplied
+/// source beside the recovery tree so the dialect can report all problems.
+pub(crate) fn convert_for_diagnostics(
+    src: &SourceFile,
+    dto: TableDto,
+) -> Result<TableInspection, Vec<LoadError>> {
+    let mut source_conflicts = std::collections::BTreeMap::new();
     let mut errs = Vec::new();
     let mut intents = Vec::new();
 
@@ -253,22 +283,39 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
             });
         }
 
+        let mut sources = Vec::new();
+        if let Some(default) = c.default {
+            sources.push(pbps_model::ValueSource::Default(default));
+        }
+        if let Some([seed, increment]) = c.identity {
+            sources.push(pbps_model::ValueSource::Identity(Identity {
+                seed,
+                increment,
+            }));
+        }
+        if let Some(generated) = c.generated {
+            sources.push(pbps_model::ValueSource::Generated(pbps_model::Generated {
+                expression: generated.expression,
+                stored: generated.stored,
+            }));
+        }
+        let value_source = if sources.len() > 1 {
+            source_conflicts.insert(col_name.clone(), sources);
+            // This recovery column is never returned by the checked loader.
+            // The diagnostic visitor receives the full source list above.
+            pbps_model::ValueSource::None
+        } else {
+            sources.pop().unwrap_or(pbps_model::ValueSource::None)
+        };
         columns.insert(
             col_name,
             Column {
                 ty,
                 nullable: c.nullable,
-                default: c.default,
-                identity: c
-                    .identity
-                    .map(|[seed, increment]| Identity { seed, increment }),
+                value_source,
                 description: c.description,
                 deprecated: c.deprecated,
                 collation: c.collation.map(pbps_model::Collation::new),
-                generated: c.generated.map(|g| pbps_model::Generated {
-                    expression: g.expression,
-                    stored: g.stored,
-                }),
             },
         );
     }
@@ -601,53 +648,56 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
     }
 
     match (name, errs.is_empty()) {
-        (Some(name), true) => Ok(LoadedTable {
-            name,
-            table: Table {
-                description: dto.description,
-                columns,
-                computed: dto
-                    .computed
-                    .into_iter()
-                    .map(|(name, c)| {
-                        (
-                            name,
-                            pbps_model::ComputedColumn {
-                                expression: c.expression,
-                                persisted: c.persisted,
-                                not_null: c.not_null,
-                            },
-                        )
-                    })
-                    .collect(),
-                primary_key,
-                unique,
-                foreign_keys,
-                checks,
-                indexes,
-                data,
-                clustered: dto.clustered.map(|c| match c {
-                    ClusteredDto::Heap => Clustered::Heap,
-                    ClusteredDto::Unique(name) => Clustered::Unique(name),
-                    ClusteredDto::Index(name) => Clustered::Index(name),
-                }),
-                replica_identity: dto.replica_identity.map(|r| match r {
-                    ReplicaIdentityDto::Full => ReplicaIdentity::Full,
-                    ReplicaIdentityDto::Nothing => ReplicaIdentity::Nothing,
-                    ReplicaIdentityDto::PrimaryKey => ReplicaIdentity::PrimaryKey,
-                    ReplicaIdentityDto::Unique(name) => ReplicaIdentity::Unique(name),
-                    ReplicaIdentityDto::Index(name) => ReplicaIdentity::Index(name),
-                }),
-                storage_parameters,
-                unlogged: dto.unlogged,
-                system_time,
-                partition_by,
-                partition_of: None,
+        (Some(name), true) => Ok((
+            LoadedTable {
+                name,
+                table: Table {
+                    description: dto.description,
+                    columns,
+                    computed: dto
+                        .computed
+                        .into_iter()
+                        .map(|(name, c)| {
+                            (
+                                name,
+                                pbps_model::ComputedColumn {
+                                    expression: c.expression,
+                                    persisted: c.persisted,
+                                    not_null: c.not_null,
+                                },
+                            )
+                        })
+                        .collect(),
+                    primary_key,
+                    unique,
+                    foreign_keys,
+                    checks,
+                    indexes,
+                    data,
+                    clustered: dto.clustered.map(|c| match c {
+                        ClusteredDto::Heap => Clustered::Heap,
+                        ClusteredDto::Unique(name) => Clustered::Unique(name),
+                        ClusteredDto::Index(name) => Clustered::Index(name),
+                    }),
+                    replica_identity: dto.replica_identity.map(|r| match r {
+                        ReplicaIdentityDto::Full => ReplicaIdentity::Full,
+                        ReplicaIdentityDto::Nothing => ReplicaIdentity::Nothing,
+                        ReplicaIdentityDto::PrimaryKey => ReplicaIdentity::PrimaryKey,
+                        ReplicaIdentityDto::Unique(name) => ReplicaIdentity::Unique(name),
+                        ReplicaIdentityDto::Index(name) => ReplicaIdentity::Index(name),
+                    }),
+                    storage_parameters,
+                    unlogged: dto.unlogged,
+                    system_time,
+                    partition_by,
+                    partition_of: None,
+                },
+                intents,
+                strategy: dto.strategy.map(|s| Strategy { online: s.online }),
+                partitions,
             },
-            intents,
-            strategy: dto.strategy.map(|s| Strategy { online: s.online }),
-            partitions,
-        }),
+            source_conflicts,
+        )),
         _ => Err(errs),
     }
 }

@@ -1,0 +1,146 @@
+[
+  {
+    "case": "postgres-default-identity-none",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: postgres: column `v` has an `identity:` and a `default:`. The engine refuses both on one column, and the identity is the one that supplies the value.\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"postgres\",\n    \"tables\": 1,\n    \"columns\": 2,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "postgres-default-identity-dialect",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: postgres: column `v` has an `identity:` and a `default:`. The engine refuses both on one column, and the identity is the one that supplies the value.\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.z: postgres has no type `no_such_type`\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"postgres\",\n    \"tables\": 2,\n    \"columns\": 3,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "postgres-default-identity-loader",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"column `bad.name`: `bad.name` contains a `.`, which pbps uses to separate schema, table and column; it cannot be stored as part of a name\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    },\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"invalid type: unclosed parenthesis in type `decimal(2`\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"postgres\",\n    \"tables\": 0,\n    \"columns\": 0,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "postgres-default-generated-none",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: postgres: column `v` has both a default and a generation expression; a generated column is computed on every write, and a default would never apply\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"postgres\",\n    \"tables\": 1,\n    \"columns\": 2,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "postgres-default-generated-dialect",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: postgres: column `v` has both a default and a generation expression; a generated column is computed on every write, and a default would never apply\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.z: postgres has no type `no_such_type`\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"postgres\",\n    \"tables\": 2,\n    \"columns\": 3,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "postgres-default-generated-loader",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"column `bad.name`: `bad.name` contains a `.`, which pbps uses to separate schema, table and column; it cannot be stored as part of a name\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    },\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"invalid type: unclosed parenthesis in type `decimal(2`\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"postgres\",\n    \"tables\": 0,\n    \"columns\": 0,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "postgres-identity-generated-none",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: postgres: column `v` is both an identity and a generated column\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"postgres\",\n    \"tables\": 1,\n    \"columns\": 2,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "postgres-identity-generated-dialect",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: postgres: column `v` is both an identity and a generated column\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.z: postgres has no type `no_such_type`\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"postgres\",\n    \"tables\": 2,\n    \"columns\": 3,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "postgres-identity-generated-loader",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"column `bad.name`: `bad.name` contains a `.`, which pbps uses to separate schema, table and column; it cannot be stored as part of a name\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    },\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"invalid type: unclosed parenthesis in type `decimal(2`\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"postgres\",\n    \"tables\": 0,\n    \"columns\": 0,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "postgres-default-identity-generated-none",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: postgres: column `v` has an `identity:` and a `default:`. The engine refuses both on one column, and the identity is the one that supplies the value.\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: postgres: column `v` has both a default and a generation expression; a generated column is computed on every write, and a default would never apply\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: postgres: column `v` is both an identity and a generated column\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"postgres\",\n    \"tables\": 1,\n    \"columns\": 2,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "postgres-default-identity-generated-dialect",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: postgres: column `v` has an `identity:` and a `default:`. The engine refuses both on one column, and the identity is the one that supplies the value.\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: postgres: column `v` has both a default and a generation expression; a generated column is computed on every write, and a default would never apply\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: postgres: column `v` is both an identity and a generated column\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.z: postgres has no type `no_such_type`\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"postgres\",\n    \"tables\": 2,\n    \"columns\": 3,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "postgres-default-identity-generated-loader",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"column `bad.name`: `bad.name` contains a `.`, which pbps uses to separate schema, table and column; it cannot be stored as part of a name\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    },\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"invalid type: unclosed parenthesis in type `decimal(2`\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"postgres\",\n    \"tables\": 0,\n    \"columns\": 0,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "mssql-default-identity-none",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: mssql: column `v` is IDENTITY, so it cannot also have a default\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"mssql\",\n    \"tables\": 1,\n    \"columns\": 2,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "mssql-default-identity-dialect",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: mssql: column `v` is IDENTITY, so it cannot also have a default\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.z: mssql has no type `no_such_type`\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"mssql\",\n    \"tables\": 2,\n    \"columns\": 3,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "mssql-default-identity-loader",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"column `bad.name`: `bad.name` contains a `.`, which pbps uses to separate schema, table and column; it cannot be stored as part of a name\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    },\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"invalid type: unclosed parenthesis in type `decimal(2`\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"mssql\",\n    \"tables\": 0,\n    \"columns\": 0,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "mssql-default-generated-none",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: mssql: column `v` is a generated column, which this model holds for PostgreSQL only\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"mssql\",\n    \"tables\": 1,\n    \"columns\": 2,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "mssql-default-generated-dialect",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: mssql: column `v` is a generated column, which this model holds for PostgreSQL only\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.z: mssql has no type `no_such_type`\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"mssql\",\n    \"tables\": 2,\n    \"columns\": 3,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "mssql-default-generated-loader",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"column `bad.name`: `bad.name` contains a `.`, which pbps uses to separate schema, table and column; it cannot be stored as part of a name\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    },\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"invalid type: unclosed parenthesis in type `decimal(2`\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"mssql\",\n    \"tables\": 0,\n    \"columns\": 0,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "mssql-identity-generated-none",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: mssql: column `v` is a generated column, which this model holds for PostgreSQL only\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"mssql\",\n    \"tables\": 1,\n    \"columns\": 2,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "mssql-identity-generated-dialect",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: mssql: column `v` is a generated column, which this model holds for PostgreSQL only\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.z: mssql has no type `no_such_type`\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"mssql\",\n    \"tables\": 2,\n    \"columns\": 3,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "mssql-identity-generated-loader",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"column `bad.name`: `bad.name` contains a `.`, which pbps uses to separate schema, table and column; it cannot be stored as part of a name\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    },\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"invalid type: unclosed parenthesis in type `decimal(2`\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"mssql\",\n    \"tables\": 0,\n    \"columns\": 0,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "mssql-default-identity-generated-none",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: mssql: column `v` is a generated column, which this model holds for PostgreSQL only\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: mssql: column `v` is IDENTITY, so it cannot also have a default\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"mssql\",\n    \"tables\": 1,\n    \"columns\": 2,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "mssql-default-identity-generated-dialect",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: mssql: column `v` is a generated column, which this model holds for PostgreSQL only\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.t: mssql: column `v` is IDENTITY, so it cannot also have a default\"\n    },\n    {\n      \"id\": \"dialect.rejected\",\n      \"severity\": \"error\",\n      \"message\": \"app.z: mssql has no type `no_such_type`\"\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"mssql\",\n    \"tables\": 2,\n    \"columns\": 3,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  },
+  {
+    "case": "mssql-default-identity-generated-loader",
+    "status": 2,
+    "stdout": "{\n  \"schema_version\": 1,\n  \"tool_version\": \"0.0.0\",\n  \"command\": \"validate\",\n  \"result\": \"findings\",\n  \"findings\": [\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"column `bad.name`: `bad.name` contains a `.`, which pbps uses to separate schema, table and column; it cannot be stored as part of a name\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    },\n    {\n      \"id\": \"load.semantic\",\n      \"severity\": \"error\",\n      \"message\": \"invalid type: unclosed parenthesis in type `decimal(2`\",\n      \"location\": {\n        \"file\": \"./schema/z.yml\",\n        \"line\": 3\n      }\n    }\n  ],\n  \"data\": {\n    \"dialect\": \"mssql\",\n    \"tables\": 0,\n    \"columns\": 0,\n    \"modules\": 0\n  }\n}\n",
+    "stderr": ""
+  }
+]

@@ -671,3 +671,21 @@ null cells keep their typed writer; partition bounds remain always quoted and
 canonical storage tokens remain intentionally bare. Whole-declaration and
 both-dialect typed-plan tests pin string contents, type identity, numeric
 variants and unchanged non-text values, with a second format producing no diff.
+
+
+<a id="dec-1402-3"></a>
+
+**DEC-1402.3. A generated map key refuses supplied rows, not an empty data scope.**
+A reference row supplies its primary-key value through the map key even when its
+body is empty (#1286). The shared model validator diagnoses a generated key once
+per table with supplied rows, while continuing to report independent row errors.
+Ordinary and default keys remain valid; identity retains its separate
+engine-specific policy. No override can insert a generated value.
+
+Both empty Exact and empty Ensure scopes remain accepted by this check. Neither
+supplies a generated key; Exact may still request deletion of previously managed
+rows. Removing `data:` instead stops management and does not delete rows. A
+blanket prohibition would change those existing semantics without fixing any
+additional explicit-key insert. Tests cover the empty body, two rows with one
+key diagnostic, an independent invalid cell, both empty modes, no data, and
+ordinary/default/identity controls.

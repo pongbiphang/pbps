@@ -881,3 +881,24 @@ Pinned by `output`'s unit tests, which require the typed cause to downcast
 and `{:#}` to be undoubled through `or_unanswerable_beside` in both modes.
 The envelope behaviour stays pinned on 16 and 18 by DEC-1702.1's and
 DEC-1703.1's tests.
+
+
+<a id="dec-1402-2"></a>
+
+**DEC-1402.2. Conflicting YAML sources remain diagnosable without entering checked loading.**
+Before the exclusive model, the loader accepted multiple source keys and the
+dialects diagnosed them. Moving that refusal wholesale to YAML loading would
+hide independent dialect findings and change their codes, order and messages.
+The baseline CLI reports no source location for these conflicts; inventing a
+span on `type:` would not preserve a source-key span.
+
+Checked loader APIs now reject conflicting sources. A separate diagnostic
+inspection path retains their supplied values beside a recovery schema and
+passes them to the dialect's diagnostic validation method. The recovery column
+has no source; the complete supplied list supplies its source diagnostics.
+That path is for validation only, never plan or apply input. Existing loader
+errors still take precedence over dialect validation, while independent identity
+errors are collected as before. The CLI fixture matrix pins all source pairs
+and the triple, alone and beside unrelated type or loader errors, for both
+engines. Engine-specific validity stays in the dialect; YAML and its spans stay
+in the loader.

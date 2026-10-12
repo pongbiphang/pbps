@@ -13,6 +13,79 @@ const UNICODE: &str = "table: dbo.café\ndescription: Café régulier — client
 const INLINE: &str = "table: dbo.t\ncolumns: {café: {type: \"decimal(18, 2\"}}\n";
 const FK: &str = "table: dbo.t\ncolumns:\n  id:\n    type: int\nforeign_keys:\n  fk_a:\n    columns: [id]\n    references: dbo.region\n";
 
+#[test]
+fn conflicting_sources_preserve_dialect_findings_and_independent_errors() {
+    // Captured on 0c680ed1 before #1402: these errors had no source span.
+    // Preserve codes, wording, ordering, locations and declaration counts,
+    // including the existing precedence of unrelated structural load errors.
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("fixtures/value_source_diagnostics.json")).unwrap();
+    for case in cases {
+        let label = case["case"].as_str().unwrap();
+        let parts: Vec<_> = label.split('-').collect();
+        let p = Project::new();
+        p.write("pbps.yml", &format!("dialect: {}\n", parts[0]));
+        let mut declaration =
+            "table: app.t\ncolumns:\n  a: {type: int}\n  v:\n    type: int\n    nullable: false\n"
+                .to_owned();
+        for source in &parts[1..parts.len() - 1] {
+            declaration.push_str(match *source {
+                "default" => "    default: 7\n",
+                "identity" => "    identity: [1, 1]\n",
+                "generated" => "    generated: {expression: 'a * 2', stored: true}\n",
+                other => panic!("unknown fixture source {other}"),
+            });
+        }
+        p.write("schema/a.yml", &declaration);
+        match parts.last().copied().unwrap() {
+            "none" => {}
+            "dialect" => p.write(
+                "schema/z.yml",
+                "table: app.z\ncolumns:\n  v: {type: no_such_type}\n",
+            ),
+            "loader" => p.write(
+                "schema/z.yml",
+                "table: app.z\ncolumns:\n  bad.name: {type: \"decimal(2\"}\n",
+            ),
+            other => panic!("unknown fixture control {other}"),
+        }
+        let got = p.run(
+            &["validate", "--format", "json"],
+            case["status"].as_i64().unwrap() as i32,
+        );
+        assert_eq!(got.stderr, case["stderr"].as_str().unwrap(), "{label}");
+        let mut actual: serde_json::Value = serde_json::from_str(&got.stdout).unwrap();
+        for finding in actual["findings"].as_array_mut().unwrap() {
+            if let Some(file) = finding["location"]["file"].as_str() {
+                finding["location"]["file"] = file.replace('\\', "/").into();
+            }
+        }
+        let mut expected: serde_json::Value =
+            serde_json::from_str(case["stdout"].as_str().unwrap()).unwrap();
+        expected["tool_version"] = env!("CARGO_PKG_VERSION").into();
+        assert_eq!(actual, expected, "{label}");
+    }
+    for dialect in ["postgres", "mssql"] {
+        for source in ["", "    default: 7\n", "    identity: [1, 1]\n"] {
+            let p = Project::new();
+            p.write("pbps.yml", &format!("dialect: {dialect}\n"));
+            p.write(
+                "schema/a.yml",
+                &format!(
+                    "table: app.t\ncolumns:\n  v:\n    type: int\n    nullable: false\n{source}"
+                ),
+            );
+            let clean = p.run(&["validate", "--format", "json"], 0);
+            assert!(
+                clean.json("validate", "ok")["findings"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
 struct Project(PathBuf);
 
 impl Project {

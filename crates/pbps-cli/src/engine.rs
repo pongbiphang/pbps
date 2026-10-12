@@ -1789,13 +1789,20 @@ pub(crate) fn order_after_releases(
                     name,
                     column: added,
                     ..
-                } => match &added.generated {
-                    Some(generated) if matches!(p.change, Change::DropColumn { .. }) => (
-                        pbps_model::ColumnRef::new(t.clone(), name.clone()),
-                        &generated.expression,
-                        true,
-                    ),
-                    _ => continue,
+                } => match &added.value_source {
+                    pbps_model::ValueSource::Generated(generated)
+                        if matches!(p.change, Change::DropColumn { .. }) =>
+                    {
+                        (
+                            pbps_model::ColumnRef::new(t.clone(), name.clone()),
+                            &generated.expression,
+                            true,
+                        )
+                    }
+                    pbps_model::ValueSource::None
+                    | pbps_model::ValueSource::Default(_)
+                    | pbps_model::ValueSource::Identity(_)
+                    | pbps_model::ValueSource::Generated(_) => continue,
                 },
                 _ => continue,
             };
@@ -3691,7 +3698,7 @@ mod tests {
             table: t.clone(),
             name: "h".into(),
             column: Box::new(pbps_model::Column {
-                generated: Some(pbps_model::Generated {
+                value_source: pbps_model::ValueSource::Generated(pbps_model::Generated {
                     expression: expression.into(),
                     stored: true,
                 }),

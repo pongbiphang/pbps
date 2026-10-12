@@ -229,7 +229,7 @@ async fn throwing_signed_defaults_do_not_break_explicit_row_reads() {
         let mut column = Column::new(column_type.parse().unwrap());
         // The catalog deparse is the spelling that broke actual row reads.
         let defaults = db.conn.query(&format!("SELECT definition FROM sys.default_constraints WHERE parent_object_id=OBJECT_ID('dbo.t{i}')")).await.unwrap();
-        column.default = Some(
+        column.value_source = pbps_model::ValueSource::Default(
             defaults[0]
                 .try_get::<&str>("definition")
                 .unwrap()
@@ -320,7 +320,7 @@ async fn signed_defaults_are_compared_as_the_column_stores_them() {
             .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
         let mut column = Column::new(ty.parse().unwrap());
         let defaults = db.conn.query(&format!("SELECT definition FROM sys.default_constraints WHERE parent_object_id=OBJECT_ID('dbo.t{i}')")).await.unwrap();
-        column.default = Some(
+        column.value_source = pbps_model::ValueSource::Default(
             defaults[0]
                 .try_get::<&str>("definition")
                 .unwrap()
@@ -419,7 +419,7 @@ async fn a_cell_the_columns_collation_calls_equal_to_its_default_is_still_drift(
         .insert("code".into(), Column::new(ty("varchar(10)")).not_null());
     let mut label = Column::new(ty("varchar(20)"));
     // The engine's own rendering of the default, which is what `pull` writes.
-    label.default = Some("('new')".into());
+    label.value_source = pbps_model::ValueSource::Default("('new')".into());
     table.columns.insert("label".into(), label);
     table.primary_key = Some(PrimaryKey {
         name: None,
@@ -499,7 +499,7 @@ async fn a_variant_that_renders_like_its_default_is_still_drift() {
         .columns
         .insert("id".into(), Column::new(ty("int")).not_null());
     let mut column = Column::new(ty("sql_variant"));
-    column.default = Some("(1)".into());
+    column.value_source = pbps_model::ValueSource::Default("(1)".into());
     table.columns.insert("v".into(), column);
     table.primary_key = Some(PrimaryKey {
         name: None,
@@ -572,7 +572,7 @@ async fn a_spatial_cell_whose_srid_alone_differs_from_its_default_is_still_drift
             .columns
             .insert("id".into(), Column::new(ty("int")).not_null());
         let mut column = Column::new(ty(base));
-        column.default = Some(default.clone());
+        column.value_source = pbps_model::ValueSource::Default(default.clone());
         table.columns.insert("g".into(), column);
         table.primary_key = Some(PrimaryKey {
             name: None,
@@ -662,7 +662,7 @@ async fn a_type_with_no_native_equality_is_read_back_against_its_default() {
             .columns
             .insert("id".into(), Column::new(ty("int")).not_null());
         let mut column = Column::new(ty(sql_ty));
-        column.default = Some(default.to_owned());
+        column.value_source = pbps_model::ValueSource::Default(default.to_owned());
         table.columns.insert("n".into(), column);
         table.primary_key = Some(PrimaryKey {
             name: None,
@@ -753,7 +753,7 @@ async fn an_unassignable_signed_default_is_unknown_not_null() {
             .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
         let mut column = Column::new(ty.parse().unwrap());
         let defaults = db.conn.query(&format!("SELECT definition FROM sys.default_constraints WHERE parent_object_id=OBJECT_ID('dbo.t{i}')")).await.unwrap();
-        column.default = Some(
+        column.value_source = pbps_model::ValueSource::Default(
             defaults[0]
                 .try_get::<&str>("definition")
                 .unwrap()
@@ -927,7 +927,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
             .unwrap();
         for (expression, count) in [(default, 0), ("-CAST('99' AS int)", 1)] {
             let mut column = Column::new(kind.parse().unwrap()).not_null();
-            column.default = Some(expression.into());
+            column.value_source = pbps_model::ValueSource::Default(expression.into());
             let cs = ChangeSet {
                 changes: vec![
                     PlannedChange::new(Change::AddColumn {
@@ -1181,7 +1181,7 @@ fn rich_schema() -> Schema {
 
     let mut customer = Table::default();
     let mut id = Column::new(ty("bigint")).not_null();
-    id.identity = Some(Identity {
+    id.value_source = pbps_model::ValueSource::Identity(Identity {
         seed: 1,
         increment: 1,
     });
@@ -1190,10 +1190,10 @@ fn rich_schema() -> Schema {
         .columns
         .insert("email".into(), Column::new(ty("nvarchar(255)")));
     let mut status = Column::new(ty("tinyint")).not_null();
-    status.default = Some("0".into());
+    status.value_source = pbps_model::ValueSource::Default("0".into());
     customer.columns.insert("status".into(), status);
     let mut amount = Column::new(ty("decimal(18,2)")).not_null();
-    amount.default = Some("0.00".into());
+    amount.value_source = pbps_model::ValueSource::Default("0.00".into());
     customer.columns.insert("amount".into(), amount);
     customer
         .columns
@@ -2112,7 +2112,10 @@ async fn system_versioned_tables_round_trip_through_an_empty_database() {
             }),
         }
     );
-    assert!(table("named").columns["vf"].default.is_some());
+    assert!(matches!(
+        table("named").columns["vf"].value_source,
+        pbps_model::ValueSource::Default(_)
+    ));
     assert!(!table("named").columns["vf"].nullable);
     assert!(st("anon").hidden);
     assert_eq!(
@@ -2936,7 +2939,7 @@ async fn a_literal_is_converted_under_the_utf8_column_it_is_compared_with() {
             .insert("note".to_owned(), Column::new(ty("nvarchar(50)")));
         let mut tag = Column::new(ty("varchar(10)"));
         tag.collation = Some(pbps_model::Collation::new(UTF8));
-        tag.default = Some("(N'中')".into());
+        tag.value_source = pbps_model::ValueSource::Default("(N'中')".into());
         t.columns.insert("tag".to_owned(), tag);
         t.primary_key = Some(PrimaryKey {
             name: None,
@@ -3199,7 +3202,7 @@ async fn an_added_column_s_default_is_assigned_under_its_collation() {
             .unwrap();
         let mut reference = Column::new(ty("varchar(10)")).not_null();
         reference.collation = Some(pbps_model::Collation::new(UTF8));
-        reference.default = Some("(N'中')".into());
+        reference.value_source = pbps_model::ValueSource::Default("(N'中')".into());
         child.columns.insert("code".to_owned(), reference);
         child.foreign_keys.insert(
             "fk_c_p".into(),
@@ -3736,10 +3739,9 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
             .checks
             .is_empty()
     );
-    assert!(
-        pulled.schema.tables[&TableName::new("dbo", "plain")].columns["versioned_id"]
-            .default
-            .is_none()
+    assert_eq!(
+        pulled.schema.tables[&TableName::new("dbo", "plain")].columns["versioned_id"].value_source,
+        pbps_model::ValueSource::None
     );
 }
 
@@ -4511,7 +4513,7 @@ async fn two_columns_whose_names_join_to_one_string_both_get_their_defaults() {
     let with_default = |column: &str| {
         let mut t = Table::default();
         let mut c = Column::new(ty("int")).not_null();
-        c.default = Some("0".into());
+        c.value_source = pbps_model::ValueSource::Default("0".into());
         t.columns.insert(column.to_owned(), c);
         t
     };
@@ -4571,7 +4573,7 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
         let mut t = Table::default();
         for column in columns {
             let mut c = Column::new(ty("int")).not_null();
-            c.default = Some("0".into());
+            c.value_source = pbps_model::ValueSource::Default("0".into());
             t.columns.insert((*column).to_owned(), c);
         }
         t
@@ -4624,7 +4626,7 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
     )
     .await;
     let mut c = Column::new(ty("int")).not_null();
-    c.default = Some("0".into());
+    c.value_source = pbps_model::ValueSource::Default("0".into());
     apply(
         &mut db.conn,
         &ChangeSet {
@@ -4772,7 +4774,7 @@ async fn a_default_whose_new_name_is_taken_frees_its_old_one() {
         let name: pbps_model::TableName = table.parse().unwrap();
         let mut t = Table::default();
         let mut c = Column::new(ty("int")).not_null();
-        c.default = Some("0".into());
+        c.value_source = pbps_model::ValueSource::Default("0".into());
         t.columns.insert("c".to_owned(), c.clone());
         apply(
             &mut db.conn,
@@ -6036,7 +6038,9 @@ async fn a_default_this_engine_fills_every_row_from_is_not_counted_as_missing() 
         before.columns.insert("id".into(), Column::new(ty("int")));
         let mut after = before.clone();
         let mut added = Column::new(ty("int")).not_null();
-        added.default = default.map(std::borrow::ToOwned::to_owned);
+        added.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+            pbps_model::ValueSource::Default(text.into())
+        });
         after.columns.insert("c".into(), added);
 
         let mut base = Schema::default();
@@ -6715,7 +6719,9 @@ async fn probes_over_a_column_this_plan_adds_run_and_count_what_the_engine_refus
     let add = |nullable: bool, default: Option<&str>| {
         let mut column = pbps_model::Column::new(ty("varchar(10)"));
         column.nullable = nullable;
-        column.default = default.map(str::to_owned);
+        column.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+            pbps_model::ValueSource::Default(text.into())
+        });
         PlannedChange::new(Change::AddColumn {
             uid: "c_cccccc".parse().unwrap(),
             table: TableName::new("dbo", "customer"),
@@ -10212,7 +10218,7 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
         .columns
         .insert("code".to_owned(), Column::new(ty("varchar(20)")).not_null());
     let mut label = Column::new(ty("nvarchar(50)")).not_null();
-    label.default = Some("'Unlabelled'".to_owned());
+    label.value_source = pbps_model::ValueSource::Default("'Unlabelled'".to_owned());
     status.columns.insert("label".to_owned(), label);
     status.primary_key = Some(PrimaryKey {
         name: None,
@@ -10230,7 +10236,7 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
     // `kind`: an IDENTITY key, and a foreign key to `status`.
     let mut kind = Table::default();
     let mut id = Column::new(ty("int")).not_null();
-    id.identity = Some(pbps_model::Identity {
+    id.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
         seed: 1,
         increment: 1,
     });
@@ -10448,7 +10454,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         .columns
         .insert("code".to_owned(), Column::new(ty("varchar(20)")).not_null());
     let mut label = Column::new(ty("nvarchar(50)")).not_null();
-    label.default = Some("'Unlabelled'".to_owned());
+    label.value_source = pbps_model::ValueSource::Default("'Unlabelled'".to_owned());
     status.columns.insert("label".to_owned(), label);
     status
         .columns
@@ -10482,7 +10488,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     // `kind`: an IDENTITY key, a foreign key to `status`, under `ensure`.
     let mut kind = Table::default();
     let mut id = Column::new(ty("int")).not_null();
-    id.identity = Some(Identity {
+    id.value_source = pbps_model::ValueSource::Identity(Identity {
         seed: 1,
         increment: 1,
     });
@@ -12610,15 +12616,15 @@ async fn an_explicit_default_stays_explicit_and_a_volatile_default_is_never_run(
     t.columns
         .insert("id".to_owned(), Column::new(ty("int")).not_null());
     let mut label = Column::new(ty("nvarchar(50)")).not_null();
-    label.default = Some("'Unlabelled'".to_owned());
+    label.value_source = pbps_model::ValueSource::Default("'Unlabelled'".to_owned());
     t.columns.insert("label".to_owned(), label);
     let mut seq = Column::new(ty("int")).not_null();
     // In the engine's spelling, as every default has to be (§8.2): the
     // catalog stores `NEXT VALUE FOR [dbo].[seq]` whatever was written.
-    seq.default = Some("NEXT VALUE FOR [dbo].[seq]".to_owned());
+    seq.value_source = pbps_model::ValueSource::Default("NEXT VALUE FOR [dbo].[seq]".to_owned());
     t.columns.insert("seq".to_owned(), seq);
     let mut stamp = Column::new(ty("datetime2")).not_null();
-    stamp.default = Some("sysutcdatetime()".to_owned());
+    stamp.value_source = pbps_model::ValueSource::Default("sysutcdatetime()".to_owned());
     t.columns.insert("stamp".to_owned(), stamp);
     t.primary_key = Some(PrimaryKey {
         name: Some("pk_t".to_owned()),
@@ -14604,7 +14610,7 @@ async fn the_pull_hides_this_tools_two_tables_and_not_a_projects_own() {
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_retyped_column_gives_up_its_old_default_before_the_type_moves() {
     let with = |t: &str, d: &str| Column {
-        default: Some(d.to_owned()),
+        value_source: pbps_model::ValueSource::Default(d.to_owned()),
         ..Column::new(ty(t))
     };
     let table_of = |c: Column| {
@@ -14648,7 +14654,7 @@ async fn trailing_default_comments_preserve_row_default_answers() {
         .insert("id".into(), Column::new(ty("int")).not_null());
     let mut column = Column::new(ty("int"));
     // Use declaration text: catalog normalization discards the comment.
-    column.default = Some("1 -- why".into());
+    column.value_source = pbps_model::ValueSource::Default("1 -- why".into());
     table.columns.insert("n".into(), column);
     table.primary_key = Some(PrimaryKey {
         name: None,
@@ -14735,7 +14741,7 @@ async fn an_expression_ending_in_a_line_comment_still_applies() {
     t.columns
         .insert("id".into(), Column::new(ty("int")).not_null());
     let mut status = Column::new(ty("tinyint")).not_null();
-    status.default = Some("0 -- the default status".into());
+    status.value_source = pbps_model::ValueSource::Default("0 -- the default status".into());
     t.columns.insert("status".into(), status);
     t.columns
         .insert("amount".into(), Column::new(ty("int")).not_null());
@@ -14778,8 +14784,11 @@ async fn an_expression_ending_in_a_line_comment_still_applies() {
         .tables
         .get_mut(&TableName::new("dbo", "commented"))
         .expect("table");
-    table.columns.get_mut("amount").expect("column").default =
-        Some("1 -- and this one is added later".into());
+    table
+        .columns
+        .get_mut("amount")
+        .expect("column")
+        .value_source = pbps_model::ValueSource::Default("1 -- and this one is added later".into());
     table.checks.insert(
         "ck_commented_status".into(),
         pbps_model::CheckConstraint {
@@ -14810,13 +14819,13 @@ async fn an_expression_ending_in_a_line_comment_still_applies() {
         .get(&TableName::new("dbo", "commented"))
         .expect("the table was created");
     assert_eq!(
-        pulled.columns["status"].default.as_deref(),
-        Some("0"),
+        pulled.columns["status"].value_source,
+        pbps_model::ValueSource::Default("0".into()),
         "the column default arrived"
     );
     assert_eq!(
-        pulled.columns["amount"].default.as_deref(),
-        Some("1"),
+        pulled.columns["amount"].value_source,
+        pbps_model::ValueSource::Default("1".into()),
         "the default added later arrived"
     );
     assert_eq!(

@@ -2516,6 +2516,27 @@ pub trait Dialect {
     /// everything that needs fixing in one pass.
     fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError>;
 
+    /// Diagnose rejected source combinations without admitting them to a
+    /// `Column`. The loader's recovery tree keeps these sources beside the
+    /// column metadata; ordinary planning always uses `validate_table`.
+    fn validate_table_sources(
+        &self,
+        name: &TableName,
+        table: &Table,
+        sources: &std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>>,
+    ) -> Vec<DialectError> {
+        let mut found = self.validate_table(name, table);
+        for column in sources.keys() {
+            found.push(DialectError::Invalid {
+                dialect: self.name(),
+                message: format!(
+                    "column `{column}` can have only one of default, identity or generated"
+                ),
+            });
+        }
+        found
+    }
+
     /// Checks what a partition declares of its own against its parent's
     /// columns, which it has and does not declare (#1577): an index or a check
     /// on a partition names the parent's columns. [`validate_table`] sees the

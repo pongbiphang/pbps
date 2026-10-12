@@ -143,7 +143,10 @@ impl Table {
     pub fn expression_columns(&self) -> impl Iterator<Item = &str> {
         self.columns
             .iter()
-            .filter(|(_, c)| c.default.is_some() || c.generated.is_some())
+            .filter(|(_, c)| match c.value_source {
+                ValueSource::Default(_) | ValueSource::Generated(_) => true,
+                ValueSource::None | ValueSource::Identity(_) => false,
+            })
             .map(|(name, _)| name.as_str())
             .chain(
                 self.partition_of
@@ -371,7 +374,13 @@ impl Table {
     ) -> impl Iterator<Item = (&'a String, &'a Column)> {
         self.columns
             .iter()
-            .filter(move |(c, spec)| c.as_str() != key_column && !spec.engine_assigned())
+            .filter(move |(c, spec)| {
+                c.as_str() != key_column
+                    && !(match spec.value_source {
+                        crate::ValueSource::Identity(_) | crate::ValueSource::Generated(_) => true,
+                        crate::ValueSource::None | crate::ValueSource::Default(_) => false,
+                    })
+            })
             // The engine writes a period's columns on every change (#1176).
             .filter(move |(c, _)| {
                 !self
@@ -765,32 +774,26 @@ impl std::fmt::Display for ReplicaIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Exactly one source supplies a column's value. Consumers match the complete
+/// enum so a new source cannot silently inherit an ordinary column's policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueSource {
+    None,
+    /// Verbatim SQL, evaluated when an insert omits the column.
+    Default(String),
+    Identity(Identity),
+    /// Verbatim SQL, evaluated from the row on every write.
+    Generated(Generated),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
-    #[serde(rename = "type")]
     pub ty: ColumnType,
 
     /// Defaults to `true`, matching SQL's own default.
     pub nullable: bool,
 
-    /// The default-value expression, kept verbatim (`0`, `SYSUTCDATETIME()`).
-    ///
-    /// It is not parsed into a structure: expression syntax is dialect knowledge,
-    /// and all we ever need from it is to hand it to the database untouched and
-    /// to compare whether it changed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<Identity>,
-
-    /// A generation expression (DEC-1168.1): the column's value is computed
-    /// from the row's other columns on every write, where a default is
-    /// computed once, when a row that omits it is inserted. Never both: the
-    /// engine refuses a default beside a generation expression.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generated: Option<Generated>,
+    pub value_source: ValueSource,
 
     /// An explicit collation (#1175). `None` is the database's default
     /// collation — whichever database the column is created in — which is
@@ -798,10 +801,8 @@ pub struct Column {
     /// for a column whose collation is the connected database's own default:
     /// the catalog cannot tell an inherited default from the same name spelled
     /// out (DECISIONS 443).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collation: Option<Collation>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
     /// Present means deprecated; the value is the reason.
@@ -809,7 +810,6 @@ pub struct Column {
     /// No date is stored — git already records it, so asking the user to write
     /// one by hand is redundant and guaranteed to drift from the real time
     /// (SPEC §4.2).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<String>,
 }
 
@@ -819,20 +819,11 @@ impl Column {
         Self {
             ty,
             nullable: true,
-            default: None,
-            identity: None,
-            generated: None,
+            value_source: ValueSource::None,
             collation: None,
             description: None,
             deprecated: None,
         }
-    }
-
-    /// Whether the engine assigns this column's value and a row may not: an
-    /// IDENTITY outside the key, or a generated column, which is computed on
-    /// every write (DEC-1168.1).
-    pub fn engine_assigned(&self) -> bool {
-        self.identity.is_some() || self.generated.is_some()
     }
 
     pub fn not_null(mut self) -> Self {
@@ -875,11 +866,13 @@ impl Column {
     /// rule into the bare word `null`, and a function call is misread as an
     /// explicit `NULL`.
     pub fn has_required_add_value_source_with(&self, continues_ident: fn(char) -> bool) -> bool {
-        self.identity.is_some()
-            || self
-                .default
-                .as_deref()
-                .is_some_and(|default| !has_explicit_null_semantics(default, continues_ident))
+        match &self.value_source {
+            ValueSource::Identity(_) => true,
+            ValueSource::Default(default) => !has_explicit_null_semantics(default, continues_ident),
+            // A generated expression can produce NULL; evaluating it here
+            // would execute the operator's SQL before approval.
+            ValueSource::None | ValueSource::Generated(_) => false,
+        }
     }
 }
 
@@ -1387,7 +1380,7 @@ mod tests {
     fn a_generated_column_is_not_a_row_column() {
         let mut t = sample();
         let mut total = Column::new(ty("int"));
-        total.generated = Some(Generated {
+        total.value_source = crate::ValueSource::Generated(Generated {
             expression: "customer_id * 2".into(),
             stored: true,
         });
@@ -1399,8 +1392,6 @@ mod tests {
         );
         // Negative: an ordinary column is one.
         assert!(columns.iter().any(|c| c.as_str() == "email"), "{columns:?}");
-        assert!(t.columns["total"].engine_assigned());
-        assert!(!t.columns["email"].engine_assigned());
     }
 
     #[test]
@@ -1430,7 +1421,7 @@ mod tests {
             "-- carried over\r\nNULL",
             "-- carried over\nNULL",
         ] {
-            column.default = Some(default.into());
+            column.value_source = crate::ValueSource::Default(default.into());
             assert!(!column.has_required_add_value_source(), "{default:?}");
         }
 
@@ -1455,7 +1446,7 @@ mod tests {
             "1 -- note\u{0c}NULL",
             "1 -- note\u{0b}NULL",
         ] {
-            column.default = Some(default.into());
+            column.value_source = crate::ValueSource::Default(default.into());
             assert!(column.has_required_add_value_source(), "{default}");
         }
     }
@@ -1483,7 +1474,7 @@ mod tests {
         }
 
         let mut column = Column::new(ty("int"));
-        column.default = Some("zz.null\u{301}x()".into());
+        column.value_source = crate::ValueSource::Default("zz.null\u{301}x()".into());
 
         assert!(
             column.has_required_add_value_source_with(postgresql_boundary),
@@ -1870,10 +1861,10 @@ mod tests {
     fn expression_columns_include_a_partitions_own_defaults() {
         let mut table = Table::default();
         let mut d = Column::new("int".parse().unwrap());
-        d.default = Some("0".into());
+        d.value_source = crate::ValueSource::Default("0".into());
         table.columns.insert("d".into(), d);
         let mut g = Column::new("int".parse().unwrap());
-        g.generated = Some(Generated {
+        g.value_source = crate::ValueSource::Generated(Generated {
             expression: "d * 2".into(),
             stored: true,
         });

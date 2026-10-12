@@ -152,7 +152,12 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
             "<tr><td>{label}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             code(&c.ty.to_string()),
             if c.nullable { "yes" } else { "no" },
-            c.default.as_deref().map(code).unwrap_or_else(dash),
+            match &c.value_source {
+                pbps_model::ValueSource::Default(text) => code(text),
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Generated(_) => dash(),
+            },
             c.description.as_deref().map(esc).unwrap_or_else(dash)
         );
     }

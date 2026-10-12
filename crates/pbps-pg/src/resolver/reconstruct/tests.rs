@@ -8,7 +8,7 @@ use pbps_model::{
 fn table() -> Table {
     let mut table = Table::default();
     let mut column = Column::new("numeric".parse().unwrap());
-    column.default = Some("app.f(1)".into());
+    column.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
     table.columns.insert("c".into(), column);
     table.checks.insert(
         "ck".into(),
@@ -307,7 +307,7 @@ fn a_table_generating_from_a_declared_function_compiles_after_it() {
     use pbps_model::{Column, ForeignKey, Generated, Index, IndexColumn, IndexKey, Module, Schema};
     let generated = |expression: &str| {
         let mut column = Column::new("integer".parse().unwrap());
-        column.generated = Some(Generated {
+        column.value_source = pbps_model::ValueSource::Generated(Generated {
             expression: expression.into(),
             stored: true,
         });
@@ -471,7 +471,7 @@ fn a_partitions_own_default_is_set_after_its_parents_and_its_functions() {
     let mut schema = Schema::default();
     let mut parent = Table::default();
     let mut v = Column::new("integer".parse().unwrap());
-    v.default = Some("0".into());
+    v.value_source = pbps_model::ValueSource::Default("0".into());
     parent.columns.insert("v".into(), v);
     parent.partition_by = Some(PartitionBy {
         external: false,
@@ -651,7 +651,7 @@ fn a_held_table_naming_another_held_table_follows_it() {
     use pbps_model::{Column, Generated, Module, Schema};
     let generated = |expression: &str| {
         let mut column = Column::new("integer".parse().unwrap());
-        column.generated = Some(Generated {
+        column.value_source = pbps_model::ValueSource::Generated(Generated {
             expression: expression.into(),
             stored: true,
         });

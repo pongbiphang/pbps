@@ -1,7 +1,7 @@
 use super::Error;
 use pbps_dialect::Dialect;
 use pbps_model::resolver::{Surface, SurfaceResolution};
-use pbps_model::{Change, ChangeSet, IdsFile, PlannedChange, Schema};
+use pbps_model::{Change, ChangeSet, IdsFile, PlannedChange, Schema, ValueSource};
 use std::collections::BTreeSet;
 
 pub(super) fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
@@ -222,20 +222,23 @@ pub(super) fn changes(
                 .flatten();
                 let mut defaults = Vec::new();
                 for (column, spec) in &mut bare.columns {
-                    if let Some(default) = spec.default.take() {
-                        let reference = name.column(column);
-                        defaults.push(Change::AlterColumnDefault {
-                            uid: ids
-                                .column_uid(&reference)
-                                .ok_or_else(|| {
-                                    Error::Definition(Surface::Default(reference.clone()))
-                                })?
-                                .clone(),
-                            column: reference,
-                            from: None,
-                            to: Some(default),
-                        });
-                    }
+                    let default = match &mut spec.value_source {
+                        ValueSource::Default(default) => std::mem::take(default),
+                        ValueSource::None
+                        | ValueSource::Identity(_)
+                        | ValueSource::Generated(_) => continue,
+                    };
+                    spec.value_source = ValueSource::None;
+                    let reference = name.column(column);
+                    defaults.push(Change::AlterColumnDefault {
+                        uid: ids
+                            .column_uid(&reference)
+                            .ok_or_else(|| Error::Definition(Surface::Default(reference.clone())))?
+                            .clone(),
+                        column: reference,
+                        from: None,
+                        to: Some(default),
+                    });
                 }
                 let mut parts = vec![Change::CreateTable {
                     uid: uid.clone(),
@@ -337,7 +340,12 @@ pub(super) fn changes(
                         .tables
                         .get(&at.table)
                         .and_then(|t| t.columns.get(&at.name))
-                        .and_then(|c| c.generated.clone())
+                        .and_then(|c| match &c.value_source {
+                            ValueSource::Generated(value) => Some(value.clone()),
+                            ValueSource::None
+                            | ValueSource::Identity(_)
+                            | ValueSource::Default(_) => None,
+                        })
                 };
                 // A generation expression is rewritten in place with its own
                 // text, keeping the column and its place in the column order,
@@ -372,7 +380,12 @@ pub(super) fn changes(
                     .tables
                     .get(&before_column.table)
                     .and_then(|t| t.columns.get(&before_column.name))
-                    .and_then(|c| c.default.clone())
+                    .and_then(|c| match &c.value_source {
+                        ValueSource::Default(value) => Some(value.clone()),
+                        ValueSource::None
+                        | ValueSource::Identity(_)
+                        | ValueSource::Generated(_) => None,
+                    })
                 else {
                     continue;
                 };
@@ -380,7 +393,12 @@ pub(super) fn changes(
                     .tables
                     .get(&column.table)
                     .and_then(|t| t.columns.get(&column.name))
-                    .and_then(|c| c.default.clone())
+                    .and_then(|c| match &c.value_source {
+                        ValueSource::Default(value) => Some(value.clone()),
+                        ValueSource::None
+                        | ValueSource::Identity(_)
+                        | ValueSource::Generated(_) => None,
+                    })
                     .ok_or_else(|| Error::Definition(surface.clone()))?;
                 let uid = ids
                     .column_uid(column)

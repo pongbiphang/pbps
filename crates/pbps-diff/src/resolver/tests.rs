@@ -123,7 +123,7 @@ fn independent_table_changes_can_cross_the_old_name_order_without_a_false_cycle(
     let input: pbps_model::ColumnRef = "app.z.x".parse().unwrap();
     let routine: pbps_model::ModuleId = "app.f".parse().unwrap();
     let mut spec = Column::new("int".parse().unwrap());
-    spec.default = Some("app.f()".into());
+    spec.value_source = pbps_model::ValueSource::Default("app.f()".into());
     desired
         .tables
         .get_mut(&column.table)
@@ -189,7 +189,7 @@ fn independent_table_changes_can_cross_the_old_name_order_without_a_false_cycle(
     assert!(input_at < routine_at && routine_at < default_at);
     assert_eq!(steps[default_at].strategy, Strategy { online: true });
     assert!(
-        matches!(&steps[default_at].change, Change::AddColumn { column, .. } if column.default.as_deref() == Some("app.f()"))
+        matches!(&steps[default_at].change, Change::AddColumn { column, .. } if column.value_source == pbps_model::ValueSource::Default("app.f()".into()))
     );
     // ADD COLUMN's default backfills existing rows; it stays one typed step.
     assert!(
@@ -852,7 +852,7 @@ mod generated_surface_coverage {
 
     fn generated(expression: &str) -> Column {
         let mut column = Column::new("int".parse().unwrap());
-        column.generated = Some(Generated {
+        column.value_source = pbps_model::ValueSource::Generated(Generated {
             expression: expression.into(),
             stored: true,
         });
@@ -903,7 +903,7 @@ mod generated_surface_coverage {
             .insert("a".into(), Column::new("int".parse().unwrap()));
         table.columns.insert("g".into(), generated("a * 2 + 1"));
         let mut ordinary = Column::new("int".parse().unwrap());
-        ordinary.default = Some("7".into());
+        ordinary.value_source = pbps_model::ValueSource::Default("7".into());
         table.columns.insert("d".into(), ordinary);
         let mut base = Schema::default();
         base.tables.insert(table_name, table);
@@ -1068,7 +1068,7 @@ mod generated_surface_coverage {
                 .columns
                 .get_mut("d")
                 .unwrap()
-                .default = None;
+                .value_source = pbps_model::ValueSource::None;
             assert!(matches!(
                 absent_desired_default.plan(&absent_desired_default.resolution),
                 Err(Error::Coverage(surface))
@@ -1842,7 +1842,9 @@ mod generated_surface_coverage {
         let u: pbps_model::TableName = "app.u".parse().unwrap();
         let column = |default: Option<&str>| {
             let mut c = Column::new("int".parse().unwrap());
-            c.default = default.map(Into::into);
+            c.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+                pbps_model::ValueSource::Default(text.into())
+            });
             c
         };
         let schema = |table: &pbps_model::TableName, name: &str, default: Option<&str>| {
@@ -1955,7 +1957,9 @@ mod generated_surface_coverage {
         let t: pbps_model::TableName = "app.t".parse().unwrap();
         let column = |default: Option<&str>| {
             let mut c = Column::new("int".parse().unwrap());
-            c.default = default.map(Into::into);
+            c.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+                pbps_model::ValueSource::Default(text.into())
+            });
             c
         };
         let schema = |columns: &[(&str, Option<&str>)]| {

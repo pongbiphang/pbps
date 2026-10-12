@@ -407,7 +407,12 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
                     .tables
                     .get(&column.table)
                     .and_then(|t| t.columns.get(&column.name))
-                    .and_then(|c| c.default.as_deref())
+                    .and_then(|c| match &c.value_source {
+                        pbps_model::ValueSource::Default(default) => Some(default.as_str()),
+                        pbps_model::ValueSource::None
+                        | pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Generated(_) => None,
+                    })
                     .unwrap_or("(none)")
             )),
             // A module whose stored body still differs is not layout: the

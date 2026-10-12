@@ -662,7 +662,7 @@ fn table_creation_requires_the_owner_even_with_a_child_transition() {
     ] {
         let mut definition = definition.clone();
         if matches!(&child, Surface::Column(_)) {
-            definition.columns.get_mut("n").unwrap().default = None;
+            definition.columns.get_mut("n").unwrap().value_source = crate::ValueSource::None;
         }
         owner_coverage(
             Change::CreateTable {
@@ -1884,13 +1884,12 @@ mod inline_binding_floor {
         for generated in [false, true] {
             let mut column = Column::new("integer".parse().unwrap());
             if generated {
-                column.generated = Some(Generated {
+                column.value_source = crate::ValueSource::Generated(Generated {
                     expression: "1 + 4".into(),
                     stored: true,
                 });
-                assert!(column.default.is_none());
             } else {
-                column.default = Some("7".into());
+                column.value_source = crate::ValueSource::Default("7".into());
             }
             let (changes, evidence, compiled) = added_column(column);
             require_each(
@@ -1929,9 +1928,9 @@ mod inline_binding_floor {
         let Change::CreateTable { table, .. } = &mut changes.changes[0].change else {
             panic!("create table fixture")
         };
-        table.columns.get_mut("n").unwrap().default = Some("7".into());
+        table.columns.get_mut("n").unwrap().value_source = crate::ValueSource::Default("7".into());
         let mut generated = Column::new("integer".parse().unwrap());
-        generated.generated = Some(Generated {
+        generated.value_source = crate::ValueSource::Generated(Generated {
             expression: "1 + 4".into(),
             stored: true,
         });
@@ -2056,7 +2055,7 @@ mod inline_binding_floor {
         roundtrip(&changes, &evidence, &compiled);
 
         let mut column = Column::new("integer".parse().unwrap());
-        column.default = Some("7".into());
+        column.value_source = crate::ValueSource::Default("7".into());
         let (mut changes, mut evidence, compiled) = added_column(column);
         let seed = super::super::tests::plan();
         let ordinary = SavedPlan::new(
@@ -2088,7 +2087,7 @@ mod inline_binding_floor {
             panic!("add column fixture")
         };
         let owner = Surface::Column(table.column(name.as_str()));
-        column.default = None;
+        column.value_source = crate::ValueSource::None;
         let mut compiled = serde_json::to_value(&compiled).unwrap();
         compiled["prerequisites"]
             .as_array_mut()
@@ -2124,9 +2123,9 @@ mod column_vector_parent {
                 Surface::Column(table.column("n"))
             } else {
                 if kind == "default" {
-                    column.default = Some("7".into());
+                    column.value_source = crate::ValueSource::Default("7".into());
                 } else {
-                    column.generated = Some(Generated {
+                    column.value_source = crate::ValueSource::Generated(Generated {
                         expression: "1 + 4".into(),
                         stored: true,
                     });

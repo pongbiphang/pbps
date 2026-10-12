@@ -61,6 +61,7 @@
 //! dependency helpers are exercised by this crate's live suite; their CLI
 //! integration is tracked separately.
 
+use pbps_model::ValueSource;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
@@ -1573,14 +1574,26 @@ impl Dependent {
                     // declares one, and otherwise the copy of its parent's
                     // the engine gave it (#1588).
                     Part::Default(column) => {
-                        t.columns.get(column).is_some_and(|c| c.default.is_some())
+                        t.columns
+                            .get(column)
+                            .is_some_and(|c| match &c.value_source {
+                                ValueSource::Default(_) => true,
+                                ValueSource::None
+                                | ValueSource::Identity(_)
+                                | ValueSource::Generated(_) => false,
+                            })
                             || t.partition_of.as_ref().is_some_and(|of| {
                                 of.columns.get(column).is_some_and(|o| o.default.is_some())
                                     || declared
                                         .tables
                                         .get(&of.parent)
                                         .and_then(|parent| parent.columns.get(column))
-                                        .is_some_and(|c| c.default.is_some())
+                                        .is_some_and(|c| match &c.value_source {
+                                            ValueSource::Default(_) => true,
+                                            ValueSource::None
+                                            | ValueSource::Identity(_)
+                                            | ValueSource::Generated(_) => false,
+                                        })
                             })
                     }
                     // Nothing can put it back, so it is never kept across a
@@ -2615,7 +2628,7 @@ mod tests {
         t.columns.insert(
             "d".into(),
             Column {
-                default: Some("app.g(1)".into()),
+                value_source: pbps_model::ValueSource::Default("app.g(1)".into()),
                 ..Column::new("integer".parse().expect("a type"))
             },
         );

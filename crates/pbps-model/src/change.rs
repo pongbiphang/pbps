@@ -3049,11 +3049,16 @@ mod tests {
         let make = |nullable, default: Option<&str>, identity: bool| {
             let mut column = Column::new(ty("int"));
             column.nullable = nullable;
-            column.default = default.map(str::to_owned);
-            column.identity = identity.then_some(crate::schema::Identity {
-                seed: 1,
-                increment: 1,
-            });
+            column.value_source = if identity {
+                crate::ValueSource::Identity(crate::schema::Identity {
+                    seed: 1,
+                    increment: 1,
+                })
+            } else {
+                default.map_or(crate::ValueSource::None, |text| {
+                    crate::ValueSource::Default(text.into())
+                })
+            };
             Change::AddColumn {
                 uid: uid("c_k7x2mq"),
                 table: "dbo.customer".parse().unwrap(),

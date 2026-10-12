@@ -1208,7 +1208,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let mut column = Column::new(ty);
         column.collation = collation;
         column.nullable = c.is_nullable;
-        column.identity = c
+        let identity = c
             .identity
             .map(|(seed, increment)| Identity { seed, increment });
         let unavailable_default =
@@ -1234,12 +1234,28 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     c.name
                 ),
             );
-        } else {
-            column.default = c
-                .default
-                .as_deref()
-                .map(|d| strip_stored_parens(d).to_owned());
         }
+        let default = (!unavailable_default)
+            .then_some(c.default.as_deref())
+            .flatten()
+            .map(|d| strip_stored_parens(d).to_owned());
+        column.value_source = match (identity, default) {
+            (None, None) => pbps_model::ValueSource::None,
+            (Some(identity), None) => pbps_model::ValueSource::Identity(identity),
+            (None, Some(default)) => pbps_model::ValueSource::Default(default),
+            (Some(_), Some(_)) => {
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&c.object_id),
+                    format!(
+                        "{table_name}.{}: catalog reports both identity and default; no source can be represented faithfully",
+                        c.name
+                    ),
+                );
+                pbps_model::ValueSource::None
+            }
+        };
         table.columns.insert(c.name.clone(), column);
     }
 
@@ -3079,14 +3095,17 @@ mod tests {
             .get(&TableName::new("dbo", "customer"))
             .unwrap();
         assert_eq!(
-            t.columns["id"].identity,
-            Some(Identity {
+            t.columns["id"].value_source,
+            pbps_model::ValueSource::Identity(Identity {
                 seed: 1,
                 increment: 1
             })
         );
         assert_eq!(t.columns["email"].ty.to_string(), "nvarchar(255)");
-        assert_eq!(t.columns["status"].default.as_deref(), Some("0"));
+        assert_eq!(
+            t.columns["status"].value_source,
+            pbps_model::ValueSource::Default("0".into())
+        );
         assert_eq!(
             t.primary_key.as_ref().unwrap().columns,
             vec!["id".to_owned()]
@@ -4380,10 +4399,9 @@ mod module_tests {
 
         let pulled = assemble(&raw);
 
-        assert!(
-            pulled.schema.tables[&TableName::new("dbo", "plain")].columns["id"]
-                .default
-                .is_none()
+        assert_eq!(
+            pulled.schema.tables[&TableName::new("dbo", "plain")].columns["id"].value_source,
+            pbps_model::ValueSource::None
         );
         assert!(pulled.limitations.iter().any(|limitation| {
             limitation.target.object_name() == TableName::new("dbo", "plain")

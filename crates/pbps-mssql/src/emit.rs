@@ -1570,16 +1570,29 @@ fn generated_column_definition(
         types::normalize(&column.ty)?,
         collate_clause(column.collation.as_ref())?
     );
-    if let Some(id) = column.identity {
-        s.push_str(&format!(" IDENTITY({},{})", id.seed, id.increment));
-    }
+    let default = match &column.value_source {
+        pbps_model::ValueSource::None => None,
+        pbps_model::ValueSource::Default(expr) => Some(expr),
+        pbps_model::ValueSource::Identity(id) => {
+            s.push_str(&format!(" IDENTITY({},{})", id.seed, id.increment));
+            None
+        }
+        pbps_model::ValueSource::Generated(_) => {
+            return Err(DialectError::Invalid {
+                dialect: "mssql",
+                message: format!(
+                    "column `{name}` is a generated column, which this model holds for PostgreSQL only"
+                ),
+            });
+        }
+    };
     if let Some(generated) = generated {
         s.push(' ');
         s.push_str(generated);
     }
     s.push(' ');
     s.push_str(null_clause(column.nullable));
-    if let Some(expr) = &column.default {
+    if let Some(expr) = default {
         s.push_str(&format!(
             " CONSTRAINT {} DEFAULT ({})",
             quote(&default_constraint_name(table, name))?,
@@ -2282,7 +2295,8 @@ mod tests {
             t.columns
                 .insert(c.into(), Column::new(ty("datetime2(3)")).not_null());
         }
-        t.columns.get_mut("vf").unwrap().default = Some("SYSUTCDATETIME()".into());
+        t.columns.get_mut("vf").unwrap().value_source =
+            pbps_model::ValueSource::Default("SYSUTCDATETIME()".into());
         let create = |t: &Table| {
             sql_of(&Change::CreateTable {
                 uid: uid("t_k7x2mq"),
@@ -2664,14 +2678,14 @@ mod tests {
     #[test]
     fn identity_and_default_are_rendered_in_the_column() {
         let mut c = Column::new(ty("bigint")).not_null();
-        c.identity = Some(Identity {
+        c.value_source = pbps_model::ValueSource::Identity(Identity {
             seed: 1,
             increment: 1,
         });
         let mut t = Table::default();
         t.columns.insert("id".into(), c);
         let mut status = Column::new(ty("tinyint")).not_null();
-        status.default = Some("0".into());
+        status.value_source = pbps_model::ValueSource::Default("0".into());
         t.columns.insert("status".into(), status);
         let sql = sql_of(&Change::CreateTable {
             uid: uid("t_k7x2mq"),
@@ -3013,7 +3027,7 @@ mod tests {
         // Both call sites reach it: the column list of a `CREATE TABLE`, and
         // the `ADD CONSTRAINT` of a default change.
         let mut column = Column::new(ty("int")).not_null();
-        column.default = Some("0".into());
+        column.value_source = pbps_model::ValueSource::Default("0".into());
         let mut t = Table::default();
         t.columns.insert(long_column.clone(), column);
         let created = sql_of(&Change::CreateTable {
@@ -3281,7 +3295,7 @@ mod tests {
     fn a_line_comment_at_the_end_of_an_expression_keeps_the_syntax_behind_it() {
         // A column default, in a column list: `,` or `)` follows it.
         let mut status = Column::new(ty("tinyint")).not_null();
-        status.default = Some("0 -- why".into());
+        status.value_source = pbps_model::ValueSource::Default("0 -- why".into());
         let mut t = Table::default();
         t.columns.insert("status".into(), status);
         t.checks.insert(
@@ -3599,7 +3613,7 @@ mod tests {
     #[test]
     fn an_expression_that_mentions_online_is_not_an_online_statement() {
         let mut column = Column::new(ty("nvarchar(20)"));
-        column.default = Some("'ONLINE = ON'".into());
+        column.value_source = pbps_model::ValueSource::Default("'ONLINE = ON'".into());
         assert!(!takes_online(&Change::AddColumn {
             uid: uid("c_k7x2mq"),
             table: tname("dbo.order_line"),

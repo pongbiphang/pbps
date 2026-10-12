@@ -88,19 +88,22 @@ pub fn render_partitioned(
         if !c.nullable {
             s.push_str("    nullable: false\n");
         }
-        if let Some(d) = &c.default {
-            let _ = writeln!(s, "    default: {}", scalar(d));
-        }
-        if let Some(id) = &c.identity {
-            let _ = writeln!(s, "    identity: [{}, {}]", id.seed, id.increment);
-        }
-        if let Some(g) = &c.generated {
-            let _ = writeln!(
-                s,
-                "    generated: {{expression: {}, stored: {}}}",
-                scalar(&g.expression),
-                g.stored
-            );
+        match &c.value_source {
+            pbps_model::ValueSource::None => {}
+            pbps_model::ValueSource::Default(d) => {
+                let _ = writeln!(s, "    default: {}", scalar(d));
+            }
+            pbps_model::ValueSource::Identity(id) => {
+                let _ = writeln!(s, "    identity: [{}, {}]", id.seed, id.increment);
+            }
+            pbps_model::ValueSource::Generated(g) => {
+                let _ = writeln!(
+                    s,
+                    "    generated: {{expression: {}, stored: {}}}",
+                    scalar(&g.expression),
+                    g.stored
+                );
+            }
         }
         if let Some(collation) = &c.collation {
             let _ = writeln!(s, "    collation: {}", scalar(collation.as_str()));
@@ -831,7 +834,7 @@ mod tests {
                 t.columns["v"].description = Some(s.into())
             }),
             ("default", |t: &mut Table, s: &str| {
-                t.columns["v"].default = Some(s.into())
+                t.columns["v"].value_source = pbps_model::ValueSource::Default(s.into())
             }),
             ("deprecated", |t: &mut Table, s: &str| {
                 t.columns["v"].deprecated = Some(s.into())
@@ -843,7 +846,14 @@ mod tests {
                 t.indexes.get_mut("ix").unwrap().filter = Some(s.into())
             }),
             ("generated", |t: &mut Table, s: &str| {
-                t.columns["g"].generated.as_mut().unwrap().expression = s.into()
+                match &mut t.columns["g"].value_source {
+                    pbps_model::ValueSource::Generated(generated) => {
+                        generated.expression = s.into()
+                    }
+                    pbps_model::ValueSource::None
+                    | pbps_model::ValueSource::Default(_)
+                    | pbps_model::ValueSource::Identity(_) => panic!("generated fixture"),
+                }
             }),
             ("computed", |t: &mut Table, s: &str| {
                 t.computed.get_mut("c").unwrap().expression = s.into()
@@ -1337,14 +1347,16 @@ indexes:
         round_trip(yaml);
         let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
         assert_eq!(
-            t.table.columns["b"].generated,
-            Some(pbps_model::Generated {
+            t.table.columns["b"].value_source,
+            pbps_model::ValueSource::Generated(pbps_model::Generated {
                 expression: "a * 2".into(),
                 stored: true
             })
         );
-        assert_eq!(t.table.columns["b"].default, None);
-        assert_eq!(t.table.columns["a"].generated, None);
+        assert_eq!(
+            t.table.columns["a"].value_source,
+            pbps_model::ValueSource::None
+        );
         let unstated = "table: app.t\ncolumns:\n  a: {type: integer}\n  b:\n    type: integer\n    generated: {expression: 'a * 2'}\n";
         assert!(crate::load_table_str(Path::new("t.yml"), unstated).is_err());
     }

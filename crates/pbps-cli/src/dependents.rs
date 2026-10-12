@@ -21,6 +21,7 @@
 //! Pure over the dependents already read, so the ordering is testable without
 //! an engine; the reads are `engine::module_dependents`'.
 
+use pbps_model::ValueSource;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
@@ -541,13 +542,16 @@ fn partition_of<'a>(
 /// without one of its own.
 fn parent_default(declared: &Schema, table: &TableName, column: &str) -> Option<String> {
     let of = partition_of(declared, table)?;
-    declared
+    match &declared
         .tables
         .get(&of.parent)?
         .columns
         .get(column)?
-        .default
-        .clone()
+        .value_source
+    {
+        ValueSource::Default(default) => Some(default.clone()),
+        ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+    }
 }
 
 /// The change that removes a dependent the plan does not remove yet.
@@ -608,7 +612,12 @@ fn removal_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Result<Chan
                         .tables
                         .get(table)
                         .and_then(|t| t.columns.get(&column.name))
-                        .and_then(|c| c.default.clone()),
+                        .and_then(|c| match &c.value_source {
+                            ValueSource::Default(default) => Some(default.clone()),
+                            ValueSource::None
+                            | ValueSource::Identity(_)
+                            | ValueSource::Generated(_) => None,
+                        }),
                     column,
                     to: None,
                 }
@@ -669,7 +678,12 @@ fn restoration_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Option<
                     })
                 }
                 Part::Default(column) => {
-                    let to = t.columns.get(column)?.default.clone()?;
+                    let to = match &t.columns.get(column)?.value_source {
+                        ValueSource::Default(default) => default.clone(),
+                        ValueSource::None
+                        | ValueSource::Identity(_)
+                        | ValueSource::Generated(_) => return None,
+                    };
                     let column = ColumnRef::new(table.clone(), column.clone());
                     let uid = ids.iter().find_map(|ids| ids.column_uid(&column))?.clone();
                     Some(Change::AlterColumnDefault {
@@ -1151,10 +1165,11 @@ fn index_text(index: &pbps_model::Index) -> String {
 /// The expression an added column carries: its default or its generation
 /// expression. The engine refuses both together (DEC-1168.1).
 fn column_expression(column: &pbps_model::Column) -> Option<&str> {
-    column
-        .default
-        .as_deref()
-        .or_else(|| column.generated.as_ref().map(|g| g.expression.as_str()))
+    match &column.value_source {
+        ValueSource::Default(default) => Some(default),
+        ValueSource::Generated(generated) => Some(&generated.expression),
+        ValueSource::None | ValueSource::Identity(_) => None,
+    }
 }
 
 /// Splits a table this plan creates, ahead of a function it creates or
@@ -1251,15 +1266,21 @@ pub(crate) fn split_new_tables(
             let Some(uid) = ids.iter().find_map(|ids| ids.column_uid(&column_ref)) else {
                 continue;
             };
-            if spec.default.as_deref().is_some_and(calls)
-                && let Some(to) = spec.default.take()
-            {
-                parts.push(Change::AlterColumnDefault {
-                    uid: uid.clone(),
-                    column: column_ref,
-                    from: None,
-                    to: Some(to),
-                });
+            match &mut spec.value_source {
+                ValueSource::Default(default) if calls(default) => {
+                    let to = std::mem::take(default);
+                    spec.value_source = ValueSource::None;
+                    parts.push(Change::AlterColumnDefault {
+                        uid: uid.clone(),
+                        column: column_ref,
+                        from: None,
+                        to: Some(to),
+                    });
+                }
+                ValueSource::None
+                | ValueSource::Default(_)
+                | ValueSource::Identity(_)
+                | ValueSource::Generated(_) => {}
             }
         }
         if parts.is_empty() {
@@ -3007,7 +3028,10 @@ fn after_their_functions(
             Change::CreateTable { table, .. } => table
                 .columns
                 .values()
-                .filter_map(|c| c.generated.as_ref().map(|g| g.expression.as_str()))
+                .filter_map(|c| match &c.value_source {
+                    ValueSource::Generated(generated) => Some(generated.expression.as_str()),
+                    ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => None,
+                })
                 .chain(
                     table
                         .partition_of
@@ -3136,7 +3160,10 @@ fn cycle(
         Change::CreateTable { name, table, .. } => table
             .columns
             .iter()
-            .find(|(_, c)| c.generated.is_some())
+            .find(|(_, c)| match c.value_source {
+                ValueSource::Generated(_) => true,
+                ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
+            })
             .map_or_else(
                 || name.to_string(),
                 |(column, _)| format!("{name}.{column}"),
@@ -3266,11 +3293,11 @@ fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
     let typed = |base: &str| base == made.name || base == made.to_string();
     table.columns.values().any(|column| {
         typed(&column.ty.base)
-            || column.default.as_deref().is_some_and(named)
-            || column
-                .generated
-                .as_ref()
-                .is_some_and(|g| named(&g.expression))
+            || match &column.value_source {
+                ValueSource::Default(default) => named(default),
+                ValueSource::Generated(generated) => named(&generated.expression),
+                ValueSource::None | ValueSource::Identity(_) => false,
+            }
     }) || table
         .foreign_keys
         .values()
@@ -3530,7 +3557,7 @@ mod tests {
             Column::new("integer".parse().unwrap()).not_null(),
         );
         let mut n = Column::new("integer".parse().unwrap());
-        n.default = Some("app.f(1)".into());
+        n.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
         t.columns.insert("n".into(), n);
         t.checks.insert(
             "ck".into(),
@@ -3779,7 +3806,7 @@ mod tests {
         let (s, _) = declared();
         let t = TableName::new("app", "t");
         let mut generated = pbps_model::Column::new("integer".parse().unwrap());
-        generated.generated = Some(pbps_model::Generated {
+        generated.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
             expression: "app.f(id)".into(),
             stored: true,
         });
@@ -3983,7 +4010,7 @@ mod tests {
             Column::new("integer".parse().unwrap()).not_null(),
         );
         let mut v = Column::new("integer".parse().unwrap());
-        v.default = Some("app.f(1)".into());
+        v.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
         t.columns.insert("v".into(), v);
         t.checks.insert(
             "ck_n".into(),
@@ -4031,7 +4058,10 @@ mod tests {
         let left = table_of(&cs);
         assert!(left.checks.is_empty());
         assert_eq!(left.indexes.keys().collect::<Vec<_>>(), ["ix_u"]);
-        assert_eq!(left.columns["v"].default, None);
+        assert_eq!(
+            left.columns["v"].value_source,
+            pbps_model::ValueSource::None
+        );
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 3);
         assert_eq!(
             names(&cs)[1..],
@@ -4127,8 +4157,8 @@ mod tests {
         let mut cs = plan(vec![create.clone(), insert, alter(&s, "app.f(integer)")]);
         assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), Ok(2));
         assert_eq!(
-            table_of(&cs).columns["v"].default.as_deref(),
-            Some("app.f(1)")
+            table_of(&cs).columns["v"].value_source,
+            pbps_model::ValueSource::Default("app.f(1)".into())
         );
 
         // No function rebuilt: the table is left as the differ wrote it.
@@ -4159,7 +4189,7 @@ mod tests {
             to: "app.h(id)".into(),
         };
         let mut generated = pbps_model::Column::new("integer".parse().unwrap());
-        generated.generated = Some(pbps_model::Generated {
+        generated.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
             expression: "id * 2".into(),
             stored: true,
         });
@@ -4214,12 +4244,12 @@ mod tests {
     fn add_column(name: &str, expression: &str, generated: bool) -> Change {
         let mut column = Column::new("integer".parse().unwrap());
         if generated {
-            column.generated = Some(pbps_model::Generated {
+            column.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
                 expression: expression.into(),
                 stored: true,
             });
         } else {
-            column.default = Some(expression.into());
+            column.value_source = pbps_model::ValueSource::Default(expression.into());
         }
         Change::AddColumn {
             uid: Uid::derived(UidKind::Column, &format!("app.t.{name}"), 0),
@@ -4337,7 +4367,7 @@ mod tests {
                 Column::new("integer".parse().unwrap()).not_null(),
             );
             let mut g = Column::new("integer".parse().unwrap());
-            g.generated = Some(pbps_model::Generated {
+            g.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
                 expression: expression.into(),
                 stored: true,
             });
@@ -4628,7 +4658,7 @@ mod tests {
                 );
             }
             let mut extra = Column::new("integer".parse().unwrap());
-            extra.default = Some("app.f(1)".into());
+            extra.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
             plan(vec![
                 Change::AddColumn {
                     uid: Uid::derived(UidKind::Column, "app.ev.extra", 0),
@@ -4712,7 +4742,7 @@ mod tests {
                 .insert("k".into(), Column::new("integer".parse().unwrap()));
             if let Some(expression) = generated {
                 let mut g = Column::new("integer".parse().unwrap());
-                g.generated = Some(pbps_model::Generated {
+                g.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
                     expression: expression.into(),
                     stored: true,
                 });
@@ -4839,7 +4869,7 @@ mod tests {
             fallback: None,
         };
         let mut extra = Column::new("integer".parse().unwrap());
-        extra.default = Some("app.f()".into());
+        extra.value_source = pbps_model::ValueSource::Default("app.f()".into());
         let mut cs = plan(vec![
             Change::AddColumn {
                 uid: "c_a1b2c3".parse().unwrap(),
@@ -4941,9 +4971,11 @@ mod tests {
             let mut t = Table::default();
             for (column, expression) in columns {
                 let mut c = Column::new("integer".parse().unwrap());
-                c.generated = expression.map(|expression| pbps_model::Generated {
-                    expression: expression.into(),
-                    stored: true,
+                c.value_source = expression.map_or(pbps_model::ValueSource::None, |expression| {
+                    pbps_model::ValueSource::Generated(pbps_model::Generated {
+                        expression: expression.into(),
+                        stored: true,
+                    })
                 });
                 t.columns.insert((*column).into(), c);
             }
@@ -4971,7 +5003,7 @@ mod tests {
         let literal_table = || {
             let mut t = Table::default();
             let mut r = Column::new("regclass".parse().unwrap());
-            r.default = Some("'app.n'::regclass".into());
+            r.value_source = pbps_model::ValueSource::Default("'app.n'::regclass".into());
             t.columns.insert("r".into(), r);
             Change::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.literal", 0),
@@ -5062,7 +5094,8 @@ mod tests {
         // app.__a and is read by the function app.a calls.
         let mut other = Table::default();
         let mut r = Column::new("integer".parse().unwrap());
-        r.default = Some("'app.__a'::regtype::oid::integer".into());
+        r.value_source =
+            pbps_model::ValueSource::Default("'app.__a'::regtype::oid::integer".into());
         other.columns.insert("r".into(), r);
         let mut cs = plan(vec![
             new_table("app.a", &[("id", None), ("g", Some("app.f(id)"))], None),
@@ -6127,7 +6160,7 @@ mod tests {
         let p_1 = TableName::new("app", "p_1");
         let mut parent = Table::default();
         let mut n = Column::new("integer".parse().unwrap());
-        n.default = Some("app.f(1)".into());
+        n.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
         parent.columns.insert("n".into(), n);
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
@@ -7283,7 +7316,9 @@ mod tests {
             Column::new("integer".parse().unwrap()).not_null(),
         );
         let mut label = Column::new("text".parse().unwrap());
-        label.default = default.map(Into::into);
+        label.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+            pbps_model::ValueSource::Default(text.into())
+        });
         t.columns.insert("label".into(), label);
         if let Some(check) = check {
             t.checks.insert(

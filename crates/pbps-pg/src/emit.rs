@@ -731,39 +731,38 @@ fn column_definition(name: &str, column: &Column) -> Result<String, DialectError
         return Err(no_column_collation(name, collation));
     }
     let mut s = format!("{} {}", quote(name)?, types::normalize(&column.ty)?);
-    if let Some(id) = column.identity {
-        // `GENERATED ALWAYS`, never `BY DEFAULT`: the model holds a seed and an
-        // increment and nothing that could tell the two apart, and
-        // introspection says so in as many words — read back, a `BY DEFAULT`
-        // identity is indistinguishable from the one a plan would emit. The
-        // sequence's bounds and its cache are left to the engine for the same
-        // reason: those are the values `types::identity_seed_range` and the
-        // pull's default-cache check expect to see.
-        s.push_str(&format!(
-            " GENERATED ALWAYS AS IDENTITY (START WITH {} INCREMENT BY {})",
-            id.seed, id.increment
-        ));
-    }
-    // Always `STORED`: measured on 18.6, a generation expression with no kind
-    // is `VIRTUAL`, and on 16 and 17 it is a syntax error. A virtual column is
-    // refused by validation (DEC-1168.1).
-    if let Some(generated) = &column.generated {
-        if !generated.stored {
-            return Err(DialectError::Invalid {
-                dialect: DIALECT,
-                message: format!(
-                    "column `{name}` is a virtual generated column, which this model does not hold"
-                ),
-            });
+    let default = match &column.value_source {
+        pbps_model::ValueSource::None => None,
+        pbps_model::ValueSource::Identity(id) => {
+            // ALWAYS and default sequence bounds/cache are the only identity
+            // semantics the model records and the reader can reproduce.
+            s.push_str(&format!(
+                " GENERATED ALWAYS AS IDENTITY (START WITH {} INCREMENT BY {})",
+                id.seed, id.increment
+            ));
+            None
         }
-        s.push_str(&format!(
-            " GENERATED ALWAYS AS ({}) STORED",
-            verbatim(&generated.expression)
-        ));
-    }
+        pbps_model::ValueSource::Generated(generated) => {
+            // Omitting STORED means VIRTUAL on PG18 and a syntax error on PG16.
+            if !generated.stored {
+                return Err(DialectError::Invalid {
+                    dialect: DIALECT,
+                    message: format!(
+                        "column `{name}` is a virtual generated column, which this model does not hold"
+                    ),
+                });
+            }
+            s.push_str(&format!(
+                " GENERATED ALWAYS AS ({}) STORED",
+                verbatim(&generated.expression)
+            ));
+            None
+        }
+        pbps_model::ValueSource::Default(expr) => Some(expr),
+    };
     s.push(' ');
     s.push_str(null_clause(column.nullable));
-    if let Some(expr) = &column.default {
+    if let Some(expr) = default {
         if let Some(e) = refuse_an_unresolved_default(name, &types::normalize(&column.ty)?, expr) {
             return Err(e);
         }
@@ -7338,7 +7337,7 @@ mod tests {
     fn an_identity_is_generated_always_and_leaves_the_sequence_at_its_defaults() {
         let mut table = Table::default();
         let mut id = Column::new(ty("bigint")).not_null();
-        id.identity = Some(Identity {
+        id.value_source = pbps_model::ValueSource::Identity(Identity {
             seed: 7,
             increment: 3,
         });
@@ -7543,7 +7542,7 @@ mod tests {
     #[test]
     fn a_generated_column_is_created_stored_and_changed_in_place() {
         let mut b = pbps_model::Column::new("integer".parse().unwrap());
-        b.generated = Some(pbps_model::Generated {
+        b.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
             expression: "a * 2".into(),
             stored: true,
         });
@@ -7703,7 +7702,7 @@ mod tests {
         // The same for the other two expressions this dialect writes
         // verbatim, at every site each of them reaches.
         let mut column = Column::new(ty("integer"));
-        column.default = Some("1 -- why".into());
+        column.value_source = pbps_model::ValueSource::Default("1 -- why".into());
         let mut table = Table::default();
         table.columns.insert("n".into(), column.clone());
         let created = sql_of(

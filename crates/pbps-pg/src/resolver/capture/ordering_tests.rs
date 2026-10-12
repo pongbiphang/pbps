@@ -12,7 +12,7 @@ fn declared(body: &str) -> Schema {
     let mut schema = Schema::default();
     let mut table = Table::default();
     let mut column = Column::new("integer".parse().unwrap());
-    column.default = Some("app.f()".into());
+    column.value_source = pbps_model::ValueSource::Default("app.f()".into());
     table.columns.insert("id".into(), column);
     table.checks.insert(
         "positive".into(),
@@ -430,7 +430,7 @@ async fn exercise(target_connection: String, scratch_connection: String, worker:
     target.execute(&format!("TRUNCATE app.t; ALTER TABLE app.t ALTER COLUMN id DROP DEFAULT; ALTER TABLE app.t DROP CONSTRAINT positive; DROP INDEX app.ix; ALTER TABLE app.t ADD PRIMARY KEY(id); GRANT USAGE ON SCHEMA app TO {worker}; GRANT EXECUTE ON FUNCTION app.f() TO {worker}; CREATE FUNCTION app.guard() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS 'BEGIN PERFORM app.f(); RETURN NEW; END'; ALTER FUNCTION app.guard() OWNER TO {worker}; CREATE TRIGGER check_execution BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.guard()" )).await.unwrap();
     let mut data_base = replacement.clone();
     let table = data_base.tables.get_mut(&"app.t".parse().unwrap()).unwrap();
-    table.columns.get_mut("id").unwrap().default = None;
+    table.columns.get_mut("id").unwrap().value_source = pbps_model::ValueSource::None;
     table.checks.clear();
     table.indexes.clear();
     table.primary_key = Some(pbps_model::PrimaryKey {
@@ -601,7 +601,9 @@ async fn a_final_address_default_removal_executes_after_the_column_rename() {
     let u: pbps_model::TableName = "app.u".parse().unwrap();
     let schema = |table: &pbps_model::TableName, name: &str, default: Option<&str>| {
         let mut column = Column::new("integer".parse().unwrap());
-        column.default = default.map(Into::into);
+        column.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+            pbps_model::ValueSource::Default(text.into())
+        });
         let mut declared = Table::default();
         declared.columns.insert(name.into(), column);
         let mut schema = Schema::default();

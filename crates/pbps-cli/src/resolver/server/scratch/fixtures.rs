@@ -66,7 +66,7 @@ pub(crate) fn pair_with_cross_kind_surfaces() -> (Schema, Schema) {
     );
     let mut table = Table::default();
     let mut column = Column::new("numeric".parse().unwrap());
-    column.default = Some("f(1)".into());
+    column.value_source = pbps_model::ValueSource::Default("f(1)".into());
     table.columns.insert("c".into(), column);
     table.checks.insert(
         "ck".into(),

@@ -328,7 +328,7 @@ async fn a_check_does_not_read_the_column_giving_up_its_name() {
                     column: Box::new(Column {
                         ty: ty("int"),
                         nullable: false,
-                        default: Some("1".into()),
+                        value_source: pbps_model::ValueSource::Default("1".into()),
                         ..Column::new(ty("int"))
                     }),
                 },

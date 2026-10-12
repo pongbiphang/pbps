@@ -1,5 +1,5 @@
 use pbps_model::resolver::{OrderEdge, OrderReason, Surface, SurfaceResolution};
-use pbps_model::{Change, ChangeSet, GrantTarget, TableName};
+use pbps_model::{Change, ChangeSet, GrantTarget, TableName, ValueSource};
 use std::collections::BTreeSet;
 
 // This is a projection onto the binding-bearing effects, not an alternative
@@ -33,8 +33,11 @@ pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
             ..
         } => {
             let mut set = BTreeSet::from([Surface::Column(table.column(name))]);
-            if column.default.is_some() || column.generated.is_some() {
-                set.insert(Surface::Default(table.column(name)));
+            match column.value_source {
+                ValueSource::Default(_) | ValueSource::Generated(_) => {
+                    set.insert(Surface::Default(table.column(name)));
+                }
+                ValueSource::None | ValueSource::Identity(_) => {}
             }
             set
         }
@@ -92,8 +95,14 @@ fn release(c: &Change, surface: &Surface) -> bool {
 #[allow(clippy::wildcard_enum_match_arm)]
 fn writes_attrdef(c: &Change) -> bool {
     match c {
-        Change::AddColumn { column, .. } => column.default.is_some() || column.generated.is_some(),
-        Change::CreateTable { table, .. } => table.columns.values().any(|c| c.generated.is_some()),
+        Change::AddColumn { column, .. } => match column.value_source {
+            ValueSource::Default(_) | ValueSource::Generated(_) => true,
+            ValueSource::None | ValueSource::Identity(_) => false,
+        },
+        Change::CreateTable { table, .. } => table.columns.values().any(|c| match c.value_source {
+            ValueSource::Generated(_) => true,
+            ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
+        }),
         Change::AlterColumnExpression { .. } => true,
         _ => false,
     }

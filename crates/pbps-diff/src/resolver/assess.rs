@@ -294,7 +294,7 @@ mod tests {
             .columns
             .insert("id".into(), Column::new("int".parse().unwrap()));
         let mut n = Column::new("int".parse().unwrap());
-        n.default = Some("0".into());
+        n.value_source = pbps_model::ValueSource::Default("0".into());
         table.columns.insert("n".into(), n);
         table.checks.insert(
             "ck_n".into(),
@@ -526,7 +526,8 @@ mod tests {
         let base = bound();
         let mut desired = base.clone();
         let table = desired.tables.get_mut(&"app.t".parse().unwrap()).unwrap();
-        table.columns.get_mut("n").unwrap().default = Some("1".into());
+        table.columns.get_mut("n").unwrap().value_source =
+            pbps_model::ValueSource::Default("1".into());
         table
             .columns
             .insert("label".into(), Column::new("text".parse().unwrap()));

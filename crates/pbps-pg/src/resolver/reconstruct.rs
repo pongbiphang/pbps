@@ -26,6 +26,7 @@
 
 use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_dialect::Dialect;
+use pbps_model::ValueSource;
 use pbps_model::{Change, ModuleId, ModuleKind, Strategy};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -159,7 +160,15 @@ impl Reconstruction {
                     let generated: Vec<String> = table
                         .columns
                         .values()
-                        .filter_map(|c| c.generated.as_ref().map(|g| g.expression.clone()))
+                        .filter_map(|c| {
+                            (match &c.value_source {
+                                ValueSource::Generated(value) => Some(value),
+                                ValueSource::None
+                                | ValueSource::Default(_)
+                                | ValueSource::Identity(_) => None,
+                            })
+                            .map(|g| g.expression.clone())
+                        })
                         .collect();
                     let mut bare = (**table).clone();
                     let checks = std::mem::take(&mut bare.checks);
@@ -175,8 +184,14 @@ impl Reconstruction {
                     .flatten();
                     let mut defaults = Vec::new();
                     for (column, spec) in &mut bare.columns {
-                        if let Some(default) = spec.default.take() {
-                            defaults.push((column.clone(), default));
+                        match &mut spec.value_source {
+                            ValueSource::Default(default) => {
+                                defaults.push((column.clone(), std::mem::take(default)));
+                                spec.value_source = ValueSource::None;
+                            }
+                            ValueSource::None
+                            | ValueSource::Identity(_)
+                            | ValueSource::Generated(_) => {}
                         }
                     }
                     // A partition's own default too (#1578). Its parent's,

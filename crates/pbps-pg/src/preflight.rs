@@ -134,6 +134,7 @@
 //! table is the disaster the `data-delete` gate exists for, so those rows are
 //! counted and the apply stops the same way.
 
+use pbps_model::ValueSource;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{DialectError, Preflight, Probe, Unchecked};
@@ -810,12 +811,17 @@ impl<'a> AsStored<'a> {
                     column,
                     ..
                 } => {
+                    let (default, identity) = match &column.value_source {
+                        ValueSource::None => (None, false),
+                        ValueSource::Default(default) => (Some(default.clone()), false),
+                        ValueSource::Identity(_) | ValueSource::Generated(_) => (None, true),
+                    };
                     this.columns_added.insert(
                         table.column(name),
                         AddedColumn {
-                            default: column.default.clone(),
+                            default,
                             ty: column.ty.clone(),
-                            identity: column.engine_assigned(),
+                            identity,
                         },
                     );
                 }
@@ -3223,14 +3229,14 @@ fn build(
             // as the whole table: its inputs may never be null, and the engine
             // refuses `contains null values` at `ADD` when they are
             // (DEC-1168.1).
-            if column.generated.is_some() {
+            if match &column.value_source { ValueSource::Generated(_) => true, ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false } {
                 return Ok(skip(
                     change,
                     "a generated column's values cannot be evaluated before apply",
                     unchecked,
                 ));
             }
-            if let Some(default) = column.default.as_deref() {
+            if let Some(default) = match &column.value_source { ValueSource::Default(value) => Some(value.as_str()), ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None } {
                 let Some(literal) = constant_default(default) else {
                     return Ok(skip(change, "the default cannot be evaluated before apply", unchecked));
                 };
@@ -6200,7 +6206,7 @@ mod tests {
         let child: TableName = "app.child".parse().expect("a table name");
         let parent: TableName = "app.status".parse().expect("a table name");
         let mut column = pbps_model::Column::new("text".parse().expect("a type"));
-        column.default = Some("'old'".to_owned());
+        column.value_source = pbps_model::ValueSource::Default("'old'".to_owned());
         let key = pbps_model::ForeignKey {
             columns: vec!["status".to_owned()],
             references_table: parent.clone(),
@@ -6278,7 +6284,7 @@ mod tests {
         );
         // A default no probe can evaluate is refused, counted as the rows it
         // reaches.
-        column.default = Some("lower('OLD')".to_owned());
+        column.value_source = pbps_model::ValueSource::Default("lower('OLD')".to_owned());
         let asked = probes(&plan(column.clone()));
         assert_eq!(asked.len(), 5, "{asked:#?}");
         assert!(
@@ -6291,7 +6297,7 @@ mod tests {
         // And with no default every stored row holds NULL there, which the
         // engine is left to say references nothing: the count is still asked,
         // the refusal is not.
-        column.default = None;
+        column.value_source = pbps_model::ValueSource::None;
         let asked = probes(&plan(column));
         assert_eq!(asked.len(), 5, "{asked:#?}");
         assert!(
@@ -6630,7 +6636,7 @@ mod tests {
     #[test]
     fn the_required_add_guard_reads_a_combining_mark_by_this_engines_own_boundary() {
         let mut column = pbps_model::Column::new("int".parse().expect("a type")).not_null();
-        column.default = Some("zz.null\u{301}x()".to_owned());
+        column.value_source = pbps_model::ValueSource::Default("zz.null\u{301}x()".to_owned());
         assert!(
             column.has_required_add_value_source_with(crate::LEXICON.identifier_continues),
             "a plain call PostgreSQL reads as one name is a trustworthy value source"
