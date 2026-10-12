@@ -5942,10 +5942,8 @@ pub fn cmd_plan_db(
                 // A resolved plan is sealed transactional: its evidence
                 // describes one atomic change (`SavedPlan::with_resolution`).
                 if staged {
-                    bail!(
-                        "--staged cannot carry the resolver's answer: a resolver-backed plan \
-                         applies in one transaction. Plan this change without --staged."
-                    );
+                    let finding = crate::resolution::staged(&request);
+                    return Ok(Connected::Refused { finding, findings });
                 }
                 let asked = crate::resolution::named(&assessment);
                 match crate::resolution::resolve(&request).await {

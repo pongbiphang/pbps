@@ -2185,8 +2185,10 @@ async fn resolver_refuses_a_question_that_needs_routine_source_the_baseline_lack
         ),
     };
     assert!(
-        reason.contains("a same-named routine on the target is not in the resolver's baseline")
-            && reason.contains("select no resolver"),
+        reason.contains(&format!(
+            "routine {EXTERNAL}.f on the target is not in the resolver's baseline, and \
+             relation {MANAGED}.a could bind it; add it to the baseline"
+        )) && reason.contains("select no resolver"),
         "{reason}"
     );
 }

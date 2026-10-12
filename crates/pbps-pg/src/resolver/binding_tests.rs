@@ -825,12 +825,7 @@ async fn every_covered_expression_surface_gets_the_engines_answer() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
 async fn a_candidate_scratch_did_not_reproduce_leaves_the_surface_unresolved() {
-    let unresolved = |assessment: &Assessment| {
-        matches!(
-            only(assessment, "app", "v"),
-            Verdict::Unresolved { condition } if condition.contains("not reconstructed")
-        )
-    };
+    let unresolved = |assessment: &Assessment| unreproduced(&only(assessment, "app", "v"));
     for variable in SERVERS {
         let server = std::env::var(variable).unwrap();
         let declared = |tag: &str| {
@@ -951,10 +946,7 @@ async fn a_created_surface_is_unresolved_by_a_candidate_scratch_did_not_reproduc
             let found = only(&assessment, "app", "v");
             match verdict {
                 Some(expected) => assert_eq!(found, expected, "{variable} {tag}"),
-                None => assert!(
-                    matches!(&found, Verdict::Unresolved { condition } if condition.contains("not reconstructed")),
-                    "{variable} {tag}: {found:?}"
-                ),
+                None => assert!(unreproduced(&found), "{variable} {tag}: {found:?}"),
             }
         }
     }
@@ -1009,10 +1001,7 @@ async fn a_dropped_overload_is_held_by_its_declared_identity_not_by_a_count() {
             .unwrap();
             let verdict = only(&assessment, "app", "v");
             if unresolved {
-                assert!(
-                    matches!(verdict, Verdict::Unresolved { condition } if condition.contains("not reconstructed")),
-                    "{variable} {tag}: {assessment:#?}"
-                );
+                assert!(unreproduced(&verdict), "{variable} {tag}: {assessment:#?}");
             } else {
                 assert_eq!(verdict, Verdict::Unaffected, "{variable} {tag}");
             }
@@ -1141,10 +1130,7 @@ async fn a_dropped_overload_is_held_by_its_declared_identity_not_by_a_count() {
         .await
         .unwrap();
         assert!(
-            matches!(
-                only(&assessment, "app", "v"),
-                Verdict::Unresolved { condition } if condition.contains("not reconstructed")
-            ),
+            unreproduced(&only(&assessment, "app", "v")),
             "{variable} aggregate: {assessment:#?}"
         );
         // A plan that turns the function into a procedure drops the function:
@@ -1193,10 +1179,7 @@ async fn a_dropped_overload_is_held_by_its_declared_identity_not_by_a_count() {
             .unwrap();
             let verdict = only(&assessment, "app", "v");
             if unresolved {
-                assert!(
-                    matches!(verdict, Verdict::Unresolved { condition } if condition.contains("not reconstructed")),
-                    "{variable} {tag}: {assessment:#?}"
-                );
+                assert!(unreproduced(&verdict), "{variable} {tag}: {assessment:#?}");
             } else {
                 assert_eq!(verdict, Verdict::Unaffected, "{variable} {tag}");
             }
@@ -1764,14 +1747,23 @@ async fn a_shared_identity_the_target_did_not_get_from_a_managed_object_is_unres
             .await
             .unwrap();
             assert!(
-                matches!(
-                    only(&assessment, "app", "v"),
-                    Verdict::Unresolved { condition } if condition.contains("not reconstructed")
-                ),
+                unreproduced(&only(&assessment, "app", "v")),
                 "{variable} {tag}: {assessment:#?}"
             );
         }
     }
+}
+
+/// Unresolved because the target holds a candidate scratch did not: by
+/// name when it is an external object the baseline does not stage (#1517),
+/// generically when scratch reproduced it differently.
+fn unreproduced(verdict: &Verdict) -> bool {
+    matches!(
+        verdict,
+        Verdict::Unresolved { condition }
+            if condition.contains("not reconstructed")
+                || condition.contains("is not in the resolver's baseline")
+    )
 }
 
 /// A configured extra the deployer has no USAGE on is not on its measured
@@ -2689,5 +2681,89 @@ async fn the_scratch_compiles_in_the_targets_zone_or_not_at_all() {
             ),
             "{variable}: {refused:?}"
         );
+    }
+}
+
+/// A retained external object on the target that scratch did not hold is
+/// refused by name, whatever its candidate class, and with no baseline at
+/// all: the object, the declaration that could bind it, and the remedy
+/// (#1517). The resolver sends no target source, so only the operator can
+/// stage it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn an_unstaged_external_object_of_any_class_is_refused_by_name() {
+    let column = || {
+        let mut table = pbps_model::Table::default();
+        table.columns.insert(
+            "x".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+        table
+    };
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        for (tag, target, desired, named) in [
+            (
+                "routine",
+                "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                 CREATE FUNCTION util.f(integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;",
+                numeric_f().view("app.v", "SELECT f(1) AS x"),
+                Some("routine util.f"),
+            ),
+            (
+                "relation",
+                "CREATE TABLE util.t (x integer);
+                 CREATE TABLE app.owner (x integer);
+                 CREATE INDEX t ON app.owner (x);",
+                Declared::default()
+                    .table("util.t", column())
+                    .table("app.owner", column())
+                    .view("app.v", "SELECT x FROM t"),
+                Some("relation app.t"),
+            ),
+            // Negative: nothing retained beside the declarations.
+            (
+                "faithful",
+                "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;",
+                numeric_f().view("app.v", "SELECT f(1) AS x"),
+                None,
+            ),
+        ] {
+            let base = match tag {
+                "routine" | "faithful" => numeric_f(),
+                _ => Declared::default()
+                    .table("util.t", column())
+                    .table("app.owner", column()),
+            };
+            let assessment = analyze(
+                &server,
+                tag,
+                Case {
+                    schemas: &["app", "util"],
+                    extras: &["util"],
+                    target,
+                    base,
+                    desired,
+                },
+            )
+            .await
+            .unwrap();
+            let found = only(&assessment, "app", "v");
+            match named {
+                Some(named) => {
+                    let Verdict::Unresolved { condition } = &found else {
+                        panic!("{variable} {tag}: {found:?}");
+                    };
+                    assert!(
+                        condition.starts_with(&format!(
+                            "{named} on the target is not in the resolver's baseline, and \
+                             relation app.v could bind it; add it to the baseline"
+                        )),
+                        "{variable} {tag}: {condition}"
+                    );
+                }
+                None => assert_eq!(found, Verdict::Created, "{variable} {tag}"),
+            }
+        }
     }
 }

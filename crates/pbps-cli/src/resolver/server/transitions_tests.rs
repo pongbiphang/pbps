@@ -1381,7 +1381,7 @@ fn existing_generated_surfaces_require_both_records_and_a_resolved_binding_verdi
     for verdict in [
         no_verdict,
         assessment(Verdict::Unresolved {
-            condition: "test binding is unqualified",
+            condition: "test binding is unqualified".into(),
         }),
     ] {
         let bound = with_binding(&records, &generated);
@@ -1452,7 +1452,8 @@ fn a_created_surface_requires_its_candidate_verdict() {
     for verdict in [
         None,
         Some(Verdict::Unresolved {
-            condition: "a same-named candidate on the target was not reconstructed on scratch",
+            condition: "a same-named candidate on the target was not reconstructed on scratch"
+                .into(),
         }),
     ] {
         let bound = with_binding(&records, &generated);

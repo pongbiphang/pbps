@@ -41,8 +41,9 @@ pub enum Verdict {
     /// it a new identity, and scratch reproduced every candidate its
     /// creation could bind.
     Created,
-    /// No sound answer: the condition names what is missing.
-    Unresolved { condition: &'static str },
+    /// No sound answer: the condition names what is missing, and the
+    /// object when one is known (#1517).
+    Unresolved { condition: String },
 }
 
 /// The comparison of every managed surface both captures hold, and the

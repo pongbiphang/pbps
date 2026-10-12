@@ -532,20 +532,18 @@ pub(super) fn assess_with(
                     && staged.is_some_and(|staged| carries(&target.inputs, staged, member))
         })
     };
-    // Unfaithful because the target has a routine that is neither managed
-    // nor staged: only the operator can stage it, since pbps sends no
-    // routine source of its own (SPEC §9.3.2).
-    let unstaged_routine = |(set, _): (&CandidateSet, &bool)| {
-        set.class == CandidateClass::Routine
-            && target.candidates.get(set).is_some_and(|members| {
-                members.iter().any(|member| {
-                    !own(set.class, member)
-                        && !desired
-                            .candidates
-                            .get(set)
-                            .is_some_and(|scratch| scratch.contains(member))
-                })
-            })
+    // Unfaithful because the target retains an object, of any candidate
+    // class, that is neither managed nor on scratch: only the operator can
+    // stage it, since pbps sends no target source of its own (SPEC §9.3.2).
+    // The first such member names the refusal (#1517).
+    let unstaged = |(set, _): (&CandidateSet, &bool)| {
+        target.candidates.get(set)?.iter().find(|member| {
+            !own(set.class, member)
+                && !desired
+                    .candidates
+                    .get(set)
+                    .is_some_and(|scratch| scratch.contains(member))
+        })
     };
     let mut assessment = Assessment::default();
     for (object, input) in surfaces(desired) {
@@ -561,26 +559,37 @@ pub(super) fn assess_with(
             .any(|binding| binding.target.class == "pg_authid")
         {
             Verdict::Unresolved {
-                condition: "a binding names a role, which scratch reproduces under another name",
+                condition: "a binding names a role, which scratch reproduces under another name"
+                    .into(),
             }
-        } else if let Some(unfaithful) = derived(object, input, paths, &desired.inputs)
+        } else if let Some(unstaged) = derived(object, input, paths, &desired.inputs)
             .iter()
             .filter(|set| !faithful(*set))
-            .map(&unstaged_routine)
-            .reduce(|any, routine| any || routine)
+            .map(&unstaged)
+            .reduce(Option::or)
         {
             Verdict::Unresolved {
-                condition: if unfaithful && staged.is_some() {
-                    "a same-named routine on the target is not in the resolver's baseline; \
-                     add it to the baseline, or select no resolver and keep ADR-0013's \
-                     conservative rebuild"
-                } else {
-                    "a same-named candidate on the target was not reconstructed on scratch"
+                condition: match unstaged {
+                    // A retained external object, whatever its class and
+                    // whether or not the entry has a baseline (#1517).
+                    Some(member) => format!(
+                        "{} on the target is not in the resolver's baseline, and {} could \
+                         bind it; add it to the baseline, or select no resolver and keep \
+                         ADR-0013's conservative rebuild",
+                        super::staged::named(member),
+                        // The declaration, not its part: a view's rule, a
+                        // default's record.
+                        super::staged::named(owner(object))
+                    ),
+                    None => "a same-named candidate on the target was not reconstructed on \
+                             scratch"
+                        .into(),
                 },
             }
         } else if compiled_early(object, input, order, &desired.inputs, paths) {
             Verdict::Unresolved {
-                condition: "the declaration was compiled before an object sharing a name it bound",
+                condition: "the declaration was compiled before an object sharing a name it bound"
+                    .into(),
             }
         } else if let Some(current) = current {
             if input.bindings == current.bindings {

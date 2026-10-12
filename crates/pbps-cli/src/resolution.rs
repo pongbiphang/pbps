@@ -183,7 +183,36 @@ fn unresolved(request: &Request<'_>, why: impl std::fmt::Display) -> Refused {
                 named(request.assessment)
             ),
         )
-        .remedy("Repair the declaration so its bindings are unambiguous, or select a resolver profile that can reproduce what it binds."),
+        .remedy(
+            "Repair the declaration so its bindings are unambiguous, add what the target \
+             retains to the resolver's baseline, or select no resolver and keep the existing \
+             protection.",
+        ),
+    )
+}
+
+/// A case the resolver does not answer, refused by name before it runs
+/// (#1517): the gate and what to do instead, as `resolver.unresolved`.
+fn gated(request: &Request<'_>, gate: &str, remedy: &str) -> crate::output::Finding {
+    crate::output::Finding::error(
+        "resolver.unresolved",
+        format!(
+            "the selected resolver `{}` cannot answer the binding questions of {}: {gate}.",
+            request.selection.name,
+            named(request.assessment)
+        ),
+    )
+    .remedy(remedy)
+}
+
+/// `--staged` with a plan that needs the resolver: its evidence describes
+/// one transaction (#1516), so the gate refuses before the resolver runs.
+pub fn staged(request: &Request<'_>) -> crate::output::Finding {
+    gated(
+        request,
+        "--staged cannot carry its answer, because a resolver-backed plan applies in one \
+         transaction",
+        "Plan this change without --staged.",
     )
 }
 
@@ -203,10 +232,13 @@ pub async fn resolve(
 ) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
     let driver = request.target.driver();
     if driver != pbps_db::Driver::Postgres {
-        return Err(unresolved(
+        return Err(Refused::Finding(gated(
             request,
-            "binding resolution is implemented for PostgreSQL only",
-        ));
+            "the resolver answers for PostgreSQL only; SQL Server resolution is not built yet \
+             (#619, #620)",
+            "Select no resolver for this environment: without one, the existing protection \
+             keeps deciding (DEC-1515.1).",
+        )));
     }
     if let Err(missing) =
         pbps_cli::resolver::sealing::environment_key(request.project, request.target.environment())
@@ -777,6 +809,83 @@ mod tests {
         // producer stops first, before it reads any scratch variable.
         let unbound = refusal(None);
         assert!(unbound.contains("no cluster identity"), "{unbound}");
+    }
+
+    /// SQL Server resolution is a gate that refuses by name before the
+    /// resolver runs (#1517). Negative: a PostgreSQL target passes it, and
+    /// stops at the next step, the missing fingerprint key.
+    #[test]
+    fn sql_server_resolution_is_refused_by_name() {
+        let selection = selection();
+        let (base, desired) = arrival();
+        let Case::Required { assessment, .. } = decide(Some(&selection), &base, &desired) else {
+            panic!("the arrival needs the resolver");
+        };
+        let base_ids = ids(&base, &IdsFile::default());
+        let desired_ids = ids(&desired, &base_ids);
+        let project = pbps_config::Project {
+            root: std::env::temp_dir(),
+            config: pbps_config::Config::parse(
+                "dialect: postgres\n",
+                std::path::Path::new("pbps.yml"),
+            )
+            .unwrap(),
+        };
+        let hints = Hints::default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let refusal = |connection: &str, driver| {
+            let target = crate::db::target_from_connection(connection, driver);
+            let request = Request {
+                selection: &selection,
+                assessment: &assessment,
+                target: &target,
+                project: &project,
+                base: pbps_diff::Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                desired: pbps_diff::Side {
+                    schema: &desired,
+                    ids: &desired_ids,
+                },
+                hints: &hints,
+                target_identity: None,
+            };
+            match rt.block_on(resolve(&request)) {
+                Err(Refused::Finding(finding)) => finding,
+                Err(Refused::Unanswerable(error)) => panic!("unanswerable: {error}"),
+                Ok(_) => panic!("answered"),
+            }
+        };
+        let mssql = refusal(
+            "sqlserver://127.0.0.1:1;database=pbps",
+            pbps_db::Driver::Mssql,
+        );
+        assert_eq!(mssql.id, "resolver.unresolved");
+        assert!(
+            mssql.message.contains("PostgreSQL only")
+                && mssql
+                    .message
+                    .contains("SQL Server resolution is not built yet"),
+            "{}",
+            mssql.message
+        );
+        assert!(
+            mssql
+                .remedy
+                .as_deref()
+                .is_some_and(|r| r.contains("Select no resolver")),
+            "{:?}",
+            mssql.remedy
+        );
+        let postgres = refusal(
+            "postgres://pbps@127.0.0.1:1/pbps",
+            pbps_db::Driver::Postgres,
+        );
+        assert_eq!(postgres.id, "resolver.key", "{}", postgres.message);
     }
 
     #[test]

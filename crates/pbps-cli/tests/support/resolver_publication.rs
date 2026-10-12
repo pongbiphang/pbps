@@ -83,7 +83,25 @@ pub fn published(server: &str) {
     );
     assert_prior(&artifact, &sql);
 
-    // Without it, the plan is published.
+    // `--staged` is a gate: its evidence describes one transaction, so it is
+    // refused by name before the resolver runs, and nothing is written
+    // (#1517).
+    let mut args = plan_args(&artifact, &sql);
+    args.push("--staged");
+    let staged = run(&d, &args, Some(&targets));
+    assert_eq!(code(&staged), 2, "{}{}", stdout(&staged), stderr(&staged));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&staged)).unwrap();
+    let finding = &value["findings"][0];
+    assert_eq!(finding["id"], "resolver.unresolved", "{value}");
+    assert!(
+        finding["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("--staged cannot carry its answer")),
+        "{value}"
+    );
+    assert_prior(&artifact, &sql);
+
+    // Without either, the plan is published.
     let output = successful(run(&d, &plan_args(&artifact, &sql), Some(&targets)));
     let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
     assert_eq!(
