@@ -226,8 +226,10 @@ fn normalize_value(
 
 impl CapturedInputs {
     /// [`Self::seal_with_roles`] without a role map or ownership, for the
-    /// capture tests.
-    #[cfg(test)]
+    /// capture tests. Unix only, like its one caller (it writes a key file
+    /// with Unix permissions); elsewhere it would be dead code, which
+    /// `-D warnings` refuses on Windows.
+    #[cfg(all(test, unix))]
     pub(super) fn seal(
         &self,
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
