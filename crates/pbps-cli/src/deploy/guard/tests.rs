@@ -1048,3 +1048,280 @@ fn a_retired_columns_promise_cannot_answer_for_the_next_holder_of_its_name() {
     let error = check(&after).expect_err("the surviving UID keeps its own default text");
     assert!(format!("{error:#}").contains("different default"));
 }
+
+fn parent_with_distinct_own_columns() -> Schema {
+    use pbps_model::{PartitionColumn, ValueSource};
+    let parent = TableName::new("app", "events");
+    let mut p = table();
+    p.partition_by = Some(pbps_model::PartitionBy {
+        columns: vec!["id".into()],
+        external: false,
+    });
+    for (name, value) in [("a", "1"), ("b", "2")] {
+        let mut c = Column::new("integer".parse().unwrap());
+        c.value_source = ValueSource::Default(value.into());
+        p.columns.insert(name.into(), c);
+    }
+    let mut c = partition(None, false);
+    let of = c.partition_of.as_mut().unwrap();
+    of.bound = pbps_model::PartitionBound::Range {
+        from: vec![pbps_model::BoundDatum::Value("0".into())],
+        to: vec![pbps_model::BoundDatum::Value("10".into())],
+    };
+    of.columns = [
+        (
+            "a".into(),
+            PartitionColumn {
+                default: Some("4".into()),
+                not_null: false,
+            },
+        ),
+        (
+            "b".into(),
+            PartitionColumn {
+                default: Some("3".into()),
+                not_null: true,
+            },
+        ),
+    ]
+    .into();
+    let mut before = schema(c);
+    before.tables.insert(parent.clone(), p);
+    before
+}
+
+#[test]
+fn retired_parent_fields_do_not_change_the_next_columns_own_entries() {
+    let parent = TableName::new("app", "events");
+    let child = TableName::new("app", "t");
+    let before = parent_with_distinct_own_columns();
+    let fields = [
+        Change::AlterColumnDefault {
+            uid: "c_000001".parse().unwrap(),
+            column: parent.column("a"),
+            from: Some("1".into()),
+            to: None,
+        },
+        Change::AlterColumnNullability {
+            uid: "c_000001".parse().unwrap(),
+            column: parent.column("a"),
+            ty: "integer".parse().unwrap(),
+            to_nullable: false,
+            collation: None,
+            through_external_partitions: false,
+        },
+    ];
+    for field in fields {
+        let changes = plan(vec![
+            field,
+            Change::DropColumn {
+                uid: "c_000001".parse().unwrap(),
+                column: parent.column("a"),
+            },
+            Change::RenameColumn {
+                uid: "c_000002".parse().unwrap(),
+                table_was: None,
+                table: parent.clone(),
+                from: "b".into(),
+                to: "a".into(),
+            },
+        ]);
+        let mut after = before.clone();
+        let p = after.tables.get_mut(&parent).unwrap();
+        p.columns.shift_remove("a");
+        let b = p.columns.shift_remove("b").unwrap();
+        p.columns.insert("a".into(), b);
+        let own = &mut after
+            .tables
+            .get_mut(&child)
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .columns;
+        own.remove("a");
+        let b = own.remove("b").unwrap();
+        own.insert("a".into(), b);
+        refuse_unplanned_movement(
+            &pbps_pg::Postgres::new(),
+            &changes,
+            &before,
+            &after,
+            "test",
+            Settled::Whole,
+        )
+        .expect("the retired column cannot erase the surviving partition override");
+        for field in ["default", "not_null"] {
+            let mut wrong = after.clone();
+            let own = wrong
+                .tables
+                .get_mut(&child)
+                .unwrap()
+                .partition_of
+                .as_mut()
+                .unwrap()
+                .columns
+                .get_mut("a")
+                .unwrap();
+            match field {
+                "default" => own.default = None,
+                "not_null" => own.not_null = false,
+                _ => unreachable!(),
+            }
+            let error = refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                &changes,
+                &before,
+                &wrong,
+                "test",
+                Settled::Whole,
+            )
+            .expect_err("the retired column owns neither field of its replacement");
+            assert!(
+                format!("{error:#}").contains("own column defaults or NOT NULLs"),
+                "{field}: {error:#}"
+            );
+        }
+    }
+}
+
+#[test]
+fn own_field_requirements_follow_the_column_through_a_name_swap() {
+    use pbps_model::ValueSource;
+    let parent = TableName::new("app", "events");
+    let child = TableName::new("app", "t");
+    let before = parent_with_distinct_own_columns();
+    let fields = [
+        (
+            Change::AlterColumnDefault {
+                uid: "c_000002".parse().unwrap(),
+                column: parent.column("b"),
+                from: Some("2".into()),
+                to: None,
+            },
+            None,
+            true,
+            None,
+            true,
+        ),
+        (
+            Change::SetPartitionDefault {
+                uid: "t_000001".parse().unwrap(),
+                table: child.clone(),
+                parent: parent.clone(),
+                column: "b".into(),
+                from: Some("3".into()),
+                to: None,
+                fallback: Some("2".into()),
+            },
+            Some("2"),
+            true,
+            None,
+            true,
+        ),
+        (
+            Change::AlterColumnNullability {
+                uid: "c_000002".parse().unwrap(),
+                column: parent.column("b"),
+                ty: "integer".parse().unwrap(),
+                to_nullable: false,
+                collation: None,
+                through_external_partitions: false,
+            },
+            Some("2"),
+            false,
+            Some("3"),
+            false,
+        ),
+        (
+            Change::SetPartitionNotNull {
+                uid: "t_000001".parse().unwrap(),
+                table: child.clone(),
+                column: "b".into(),
+                not_null: false,
+            },
+            Some("2"),
+            true,
+            Some("3"),
+            false,
+        ),
+    ];
+    let rename = |uid: &str, from: &str, to: &str| Change::RenameColumn {
+        uid: uid.parse().unwrap(),
+        table: parent.clone(),
+        from: from.into(),
+        to: to.into(),
+        table_was: None,
+    };
+    for (field, parent_default, parent_nullable, own_default, own_not_null) in fields {
+        let changes = plan(vec![
+            field,
+            rename("c_000001", "a", "temporary"),
+            rename("c_000002", "b", "a"),
+            rename("c_000001", "temporary", "b"),
+        ]);
+        let mut after = before.clone();
+        let p = after.tables.get_mut(&parent).unwrap();
+        let a = p.columns.shift_remove("a").unwrap();
+        let mut b = p.columns.shift_remove("b").unwrap();
+        b.value_source =
+            parent_default.map_or(ValueSource::None, |v: &str| ValueSource::Default(v.into()));
+        b.nullable = parent_nullable;
+        p.columns.insert("a".into(), b);
+        p.columns.insert("b".into(), a);
+        let own = &mut after
+            .tables
+            .get_mut(&child)
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .columns;
+        let a = own.remove("a").unwrap();
+        let mut b = own.remove("b").unwrap();
+        b.default = own_default.map(str::to_owned);
+        b.not_null = own_not_null;
+        own.insert("a".into(), b);
+        own.insert("b".into(), a);
+        refuse_unplanned_movement(
+            &pbps_pg::Postgres::new(),
+            &changes,
+            &before,
+            &after,
+            "test",
+            Settled::Whole,
+        )
+        .expect("the field setting follows b's UID to a");
+        for field in ["default", "not_null"] {
+            let mut wrong = after.clone();
+            let untouched = wrong
+                .tables
+                .get_mut(&child)
+                .unwrap()
+                .partition_of
+                .as_mut()
+                .unwrap()
+                .columns
+                .get_mut("b")
+                .unwrap();
+            match field {
+                "default" => untouched.default = None,
+                "not_null" => untouched.not_null = true,
+                _ => unreachable!(),
+            }
+            let error = refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                &changes,
+                &before,
+                &wrong,
+                "test",
+                Settled::Whole,
+            )
+            .expect_err("the field setting cannot move a's UID, now called b");
+            assert!(
+                format!("{error:#}").contains("own column defaults or NOT NULLs"),
+                "{field}: {error:#}"
+            );
+        }
+    }
+}

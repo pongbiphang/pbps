@@ -105,14 +105,6 @@ enum OwnEffect<'a> {
     NotNull(&'a str, Option<bool>),
 }
 
-impl OwnEffect<'_> {
-    fn column(&self) -> &str {
-        match self {
-            Self::Drop(column) | Self::Default(column, _) | Self::NotNull(column, _) => column,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(super) struct Own<'a> {
     pub(super) default: Expr<'a>,
@@ -130,10 +122,11 @@ impl Default for Own<'_> {
 
 pub(crate) struct OwnExpected<'a>(pub(super) BTreeMap<String, Own<'a>>);
 
-pub(crate) struct OwnNames<'a> {
+pub(crate) struct OwnNames<'a, 'p> {
     pub(crate) parent: Option<&'a TableName>,
     pub(crate) handoff: Option<&'a BTreeMap<String, Option<String>>>,
     pub(crate) undo: &'a Renames,
+    pub(crate) index: &'a pbps_model::plan_names::PlanNames<'p>,
 }
 
 pub(crate) struct Implied<'a>(pub(super) BTreeMap<&'a TableName, Req<bool>>);
@@ -382,12 +375,13 @@ impl<'a> TableChanges<'a> {
         name: &TableName,
         was: &'b Table,
         whole: bool,
-        names: OwnNames<'_>,
+        names: OwnNames<'_, '_>,
     ) -> OwnExpected<'b> {
         let OwnNames {
             parent,
             handoff,
             undo,
+            index,
         } = names;
         let mut kept: BTreeMap<String, Own<'b>> = was
             .partition_of
@@ -431,10 +425,40 @@ impl<'a> TableChanges<'a> {
             )
             .collect();
         effects.sort_by_key(|(at, _)| *at);
-        for (_, effect) in effects {
+        let final_column = |column: &str, at| {
+            use pbps_model::plan_names::{At, Holder};
+            let Some(parent) = parent else {
+                return Some(column.to_owned());
+            };
+            let owner = match index.holder(parent, At::End) {
+                Holder::Tracked(owner) => owner,
+                Holder::Unmanaged => return Some(column.to_owned()),
+                Holder::Vacant => return None,
+            };
+            let before = index.table_at(owner, At::Before(at))?;
+            match index.column_holder(&before.column(column), At::Before(at)) {
+                Holder::Tracked(uid) => index.column_at(uid, At::End).map(|(_, n)| n.to_owned()),
+                Holder::Unmanaged => Some(column.to_owned()),
+                Holder::Vacant => None,
+            }
+        };
+        for (at, effect) in effects {
+            // Field effects belong to the column held when the step runs.
+            // Project before undoing observation names: a retired column's
+            // default must not erase its replacement's kept own default.
+            // DROP still removes a baseline slot; a handoff already did that.
+            let column = match effect {
+                OwnEffect::Drop(column) => (*column).to_owned(),
+                OwnEffect::Default(column, _) | OwnEffect::NotNull(column, _) => {
+                    let Some(column) = final_column(column, *at) else {
+                        continue;
+                    };
+                    column
+                }
+            };
             let column = match (handoff, parent) {
-                (None, Some(parent)) => undo.column(parent, effect.column()),
-                _ => effect.column().to_owned(),
+                (None, Some(parent)) => undo.column(parent, &column),
+                _ => column,
             };
             match effect {
                 OwnEffect::Drop(_) if whole => {

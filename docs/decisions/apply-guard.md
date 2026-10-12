@@ -1329,6 +1329,17 @@ so dropping a column before renaming its parent also removes the partition's
 corresponding own entry. Kept columns, own entries and constraint references
 continue to use their respective observation policies.
 
+Parent and partition-own field effects also resolve the column held at their
+execution boundary before being applied to the final own-entry map. A dropped
+column contributes no final default or NOT NULL requirement to the UID that
+takes its name; a surviving column carries those requirements through a name
+swap. Applying raw spellings after forwarding the baseline refused the valid
+sequence "drop a's default; drop a; rename b to a" when the partition retained
+b's own default. PostgreSQL 16 and 18 both preserve that default and b's own
+NOT NULL. The same projection handles parent and own settings; it is not a
+drop/rename exception. Unmanaged parent columns retain their existing spelling
+policy, without inventing managed identities.
+
 `Column` is destructured without `..` both when deriving kept requirements and
 when comparing held or declared columns. Kept type, nullability, collation,
 expression text, source metadata and annotations compare exactly; a field the
@@ -1351,7 +1362,8 @@ only in tests; explicit fixture UIDs remain subject to `PlanNames` validation.
 Regression cases cover intermediate column spellings with a replaced default,
 a parent drop before rename, a retired UID whose name gets a new holder, every
 held column field across the rename and
-at close, and column diagnostic order. Existing name handoffs, impostors,
+at close, column diagnostic order, and parent/own field settings through
+retirement and executable name swaps. Existing name handoffs, impostors,
 partition reach, sequence names and staged deployment tests remain in force.
 The remaining parts, clustered holder, created-table families and table
 presence/rename policy stay with #1774's later slices. Managed spelling history

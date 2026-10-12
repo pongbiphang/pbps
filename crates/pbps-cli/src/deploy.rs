@@ -4574,10 +4574,14 @@ fn refuse_pinned_movement(
                 now
             };
             guard::table(&scalar_expected, now, placed, now_name, &mut moved);
-            let parent = was
-                .partition_of
-                .as_ref()
-                .map(|of| *renamed.get(&of.parent).unwrap_or(&&of.parent));
+            let parent = was.partition_of.as_ref().and_then(|of| {
+                use pbps_model::plan_names::{At, Holder};
+                match names.holder(&of.parent, At::Start) {
+                    Holder::Tracked(uid) => names.table_at(uid, At::End),
+                    Holder::Unmanaged => Some(&of.parent),
+                    Holder::Vacant => None,
+                }
+            });
             let own_handoff = parent.and_then(|parent| partition_hands.get(parent));
             let own_expected = table_changes.own(
                 now_name,
@@ -4587,6 +4591,7 @@ fn refuse_pinned_movement(
                     parent,
                     handoff: own_handoff,
                     undo: &undo_after,
+                    index: &names,
                 },
             );
             let own_now = if own_handoff.is_some() {
