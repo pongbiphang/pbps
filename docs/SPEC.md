@@ -2525,6 +2525,8 @@ and writes neither a plan nor SQL artifact for those refusals. Warning-only
 policy/edition findings remain in the single JSON report with exit `0`, without
 duplicate human prose on stderr. Operational failures remain `unanswerable`
 and exit `1`. Human output keeps its existing diagnostics.
+Changes the differ cannot express retain one `change.unexpressible` finding per
+reason in both offline and connected JSON, remaining `unanswerable` with exit `1`.
 
 For a selected resolver (§9.3.2), a required question it leaves unresolved,
 an observed incompatibility or a known unsupported resolution case
