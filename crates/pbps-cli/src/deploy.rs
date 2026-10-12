@@ -3747,45 +3747,9 @@ fn refuse_unplanned_movement(
         touched_modules.extend(p.change.module_id());
         roles.extend(p.change.roles());
     }
-    // A parent's column dropped or made NOT NULL reaches every partition,
-    // whose own default and NOT NULL on it go with no change of the plan
-    // naming the partition (#1687): each is held field by field below, to
-    // what the parent's change leaves it. So is each partition of a parent
-    // whose column is renamed, which a name changing hands would otherwise
-    // fold two own entries of into one key of the whole-table comparison
-    // (#1692 review). Those no change names are still held to being there,
-    // below, which the whole-table comparison would otherwise have done.
-    let mut implied: BTreeSet<&TableName> = BTreeSet::new();
-    for p in &changes.changes {
-        let parent = if let pbps_model::Change::RenameColumn { table, .. } = &p.change {
-            table
-        } else if let pbps_model::Change::DropColumn { column, .. }
-        | pbps_model::Change::AlterColumnNullability {
-            column,
-            to_nullable: false,
-            ..
-        }
-        | pbps_model::Change::AlterColumnType {
-            column,
-            from_nullable: true,
-            to_nullable: false,
-            ..
-        } = &p.change
-        {
-            &column.table
-        } else {
-            continue;
-        };
-        for (name, _) in before.tables.iter().chain(&after.tables).filter(|(_, t)| {
-            t.partition_of
-                .as_ref()
-                .is_some_and(|of| &of.parent == parent)
-        }) {
-            if objects.insert(name) {
-                implied.insert(name);
-            }
-        }
-    }
+    let table_changes = guard::TableChanges::of(changes);
+    let implied = table_changes.implied(before, after, &objects);
+    objects.extend(implied.names());
 
     // The rows this plan writes, under the name it gives their table, and the
     // old name too where it renames one — the two states are keyed by
@@ -3862,7 +3826,6 @@ fn refuse_unplanned_movement(
     // the other from every comparison (DECISIONS 168).
     let mut constraints: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut keys: BTreeSet<&TableName> = BTreeSet::new();
-    let scalar_changes = guard::TableChanges::of(changes);
     // Index parameters the plan sets in place: the table, under its final
     // name, which part, and what it sets and resets (#1442).
     type IndexSetting<'a> = (
@@ -4218,23 +4181,7 @@ fn refuse_unplanned_movement(
         },
         &mut moved,
     );
-    // A partition touched only through its parent's column change, gone or
-    // arrived: the field-wise comparison below reads it on both sides, and
-    // passes over one that is not (#1692 review).
-    for name in &implied {
-        match (
-            before.tables.contains_key(*name),
-            after.tables.contains_key(*name),
-        ) {
-            (true, false) => moved.push(format!(
-                "{name} is gone, and no change of this plan drops it"
-            )),
-            (false, true) => moved.push(format!(
-                "{name} is there, and no change of this plan creates it"
-            )),
-            _ => {}
-        }
-    }
+    guard::implied(&implied, after, &mut moved);
     // Every touched table, under the name it ends with — including the ones
     // this plan creates, which have no `before` entry to be found under. A
     // loop over the baseline alone never visited a new table, so an
@@ -4428,6 +4375,9 @@ fn refuse_unplanned_movement(
                     ));
                 }
             }
+            if created_uids.contains_key(now_name) {
+                guard::created_place(declared, now, now_name, &mut moved);
+            }
             // A partition's own defaults and NOT NULLs (#1578), as a column's:
             // NOT NULL exactly, a default by presence, the engine respelling
             // its text. One read back that the plan does not declare is
@@ -4568,7 +4518,7 @@ fn refuse_unplanned_movement(
             // split setting is that one (#1467 review).
             let target = created_uids
                 .get(now_name)
-                .and_then(|uid| scalar_changes.created_identity(uid))
+                .and_then(|uid| table_changes.created_identity(uid))
                 .unwrap_or(declared.replica_identity.as_ref());
             if (settled.whole() || now.replica_identity.is_some())
                 && target != now.replica_identity.as_ref()
@@ -4800,171 +4750,34 @@ fn refuse_unplanned_movement(
             );
             let key_handoff = partition_hands.get(now_name);
             let scalar_expected =
-                scalar_changes.expect(name, now_name, was, settled.whole(), key_handoff);
+                table_changes.expect(name, now_name, was, settled.whole(), key_handoff);
             let placed = if key_handoff.is_some() {
                 after.tables.get(now_name).unwrap_or(now)
             } else {
                 now
             };
             guard::table(&scalar_expected, now, placed, now_name, &mut moved);
-            // A partition's own defaults and NOT NULLs (#1581), as a created
-            // one's above: a default by presence, the engine respelling its
-            // text. Once the run is whole, the before-read with this plan's
-            // settings applied in order. Mid-run, a field the plan sets may
-            // hold either: a column's default where the plan sets it on the
-            // partition or on the parent, which reaches every partition
-            // (DEC-1581.1), and its NOT NULL where the plan sets that. Every
-            // other field is held to the before-read, the other field of a
-            // column the plan touches included (#1607 review).
-            let own = |t: &pbps_model::Table| -> BTreeMap<String, (bool, bool)> {
-                t.partition_of
-                    .iter()
-                    .flat_map(|of| &of.columns)
-                    .map(|(n, c)| (n.clone(), (c.default.is_some(), c.not_null)))
-                    .filter(|(_, held)| *held != (false, false))
-                    .collect()
-            };
-            // The parent under the name the plan leaves it, which its changes
-            // name: both reads are brought back before this plan's renames,
-            // the partition's parent included (#1690 review).
-            let parent = now
+            let parent = was
                 .partition_of
                 .as_ref()
                 .map(|of| *renamed.get(&of.parent).unwrap_or(&&of.parent));
-            // A parent whose column names change hands in this plan
-            // (DEC-541.1): undone, two of its columns would share a name, and
-            // a partition's own entries on them one key. Both reads are then
-            // compared under the names the plan leaves, as the parent's own
-            // columns are above (#1692 review).
-            let hands = after
-                .tables
-                .get(now_name)
-                .and_then(|t| t.partition_of.as_ref())
-                .and_then(|of| partition_hands.get(&of.parent));
-            let forward = |own: BTreeMap<String, (bool, bool)>| match hands {
-                None => own,
-                Some(net) => {
-                    let mut out: BTreeMap<String, (bool, bool)> = own
-                        .iter()
-                        .filter(|(c, _)| !net.contains_key(c.as_str()))
-                        .map(|(c, held)| (c.clone(), *held))
-                        .collect();
-                    for (now, was) in net {
-                        if let Some(held) = was.as_ref().and_then(|was| own.get(was)) {
-                            out.insert(now.clone(), *held);
-                        }
-                    }
-                    out
-                }
-            };
-            // Otherwise both reads are under the names before this plan's
-            // column renames, so a change's column is too (#1687).
-            let undone = |c: &str| match (hands, parent) {
-                (None, Some(p)) => undo_after.column(p, c),
-                _ => c.to_owned(),
-            };
-            let mut expected = forward(own(was));
-            let mut planned_defaults: BTreeSet<String> = BTreeSet::new();
-            let mut planned_not_nulls: BTreeSet<String> = BTreeSet::new();
-            // The parent's own column changes reach every partition (#1687):
-            // a drop takes the partition's own, and a NOT NULL set on the
-            // parent leaves none of the partition's own on that column.
-            // Mid-run, either side of each is the plan in progress.
-            for p in &changes.changes {
-                if let pbps_model::Change::DropColumn { column, .. } = &p.change
-                    && Some(&column.table) == parent
-                {
-                    // Under the names the plan leaves, `forward` has left the
-                    // dropped column out, and its name may be another's now.
-                    if hands.is_none() {
-                        expected.remove(&column.name);
-                    }
-                    planned_defaults.insert(column.name.clone());
-                    planned_not_nulls.insert(column.name.clone());
-                }
-                // A NOT NULL the parent sets or drops, alone or with a retype.
-                let nullability = if let pbps_model::Change::AlterColumnNullability {
-                    column,
-                    to_nullable,
-                    ..
-                } = &p.change
-                {
-                    Some((column, *to_nullable))
-                } else if let pbps_model::Change::AlterColumnType {
-                    column,
-                    from_nullable,
-                    to_nullable,
-                    ..
-                } = &p.change
-                    && from_nullable != to_nullable
-                {
-                    Some((column, *to_nullable))
-                } else {
-                    None
-                };
-                if let Some((column, to_nullable)) = nullability
-                    && Some(&column.table) == parent
-                {
-                    let c = undone(&column.name);
-                    if !to_nullable && let Some(held) = expected.get_mut(&c) {
-                        held.1 = false;
-                    }
-                    planned_not_nulls.insert(c);
-                }
-            }
-            for p in &changes.changes {
-                if let pbps_model::Change::SetPartitionDefault {
-                    table, column, to, ..
-                } = &p.change
-                    && table == now_name
-                {
-                    let c = undone(column);
-                    expected.entry(c.clone()).or_default().0 = to.is_some();
-                    planned_defaults.insert(c);
-                }
-                if let pbps_model::Change::SetPartitionNotNull {
-                    table,
-                    column,
-                    not_null,
-                    ..
-                } = &p.change
-                    && table == now_name
-                {
-                    let c = undone(column);
-                    expected.entry(c.clone()).or_default().1 = *not_null;
-                    planned_not_nulls.insert(c);
-                }
-                if let pbps_model::Change::AlterColumnDefault { column, .. } = &p.change
-                    && Some(&column.table) == parent
-                {
-                    planned_defaults.insert(undone(&column.name));
-                }
-            }
-            expected.retain(|_, held| *held != (false, false));
-            let (was_own, now_own) = match hands {
-                None => (own(was), own(now)),
-                Some(_) => (
-                    forward(own(was)),
-                    after.tables.get(now_name).map(own).unwrap_or_default(),
-                ),
-            };
-            let own_moved = if settled.whole() {
-                expected != now_own
+            let own_handoff = parent.and_then(|parent| partition_hands.get(parent));
+            let own_expected = table_changes.own(
+                now_name,
+                was,
+                settled.whole(),
+                guard::OwnNames {
+                    parent,
+                    handoff: own_handoff,
+                    undo: &undo_after,
+                },
+            );
+            let own_now = if own_handoff.is_some() {
+                after.tables.get(now_name).unwrap_or(now)
             } else {
-                let held = |own: &BTreeMap<String, (bool, bool)>, c: &str| {
-                    own.get(c).copied().unwrap_or_default()
-                };
-                was_own.keys().chain(now_own.keys()).any(|c| {
-                    let (was_held, now_held) = (held(&was_own, c), held(&now_own, c));
-                    (was_held.0 != now_held.0 && !planned_defaults.contains(c))
-                        || (was_held.1 != now_held.1 && !planned_not_nulls.contains(c))
-                })
+                now
             };
-            if own_moved {
-                moved.push(format!(
-                    "{now_name}'s own column defaults or NOT NULLs are not the ones this plan leaves"
-                ));
-            }
+            guard::own(&own_expected, own_now, now_name, &mut moved);
             guard::system_time(&scalar_expected, now, now_name, &mut moved);
             // An index whose parameters the plan sets in place, held once
             // the run is whole to the before-read with only that change

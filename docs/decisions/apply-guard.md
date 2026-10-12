@@ -1258,3 +1258,53 @@ The scalar tests cover kept fields at every read, planned checkpoint policies,
 a reset to default replica identity, and settings across a table-name handoff.
 The temporary old/new comparison checked full diagnostic strings and ordering
 through the deployment tests, then the old implementation was removed.
+
+
+<a id="dec-1910-1"></a>
+
+**DEC-1910.1. Partition own entries and implied presence have explicit
+requirements, and a created partition answers for its place from its first
+read (#1774 slice 2, #1608).** The table-change index classifies the relevant
+parent and partition effects once. Expected own entries start with exact
+kept defaults and NOT NULLs, follow the existing column-name normalization,
+and fold the indexed effects in execution order. The comparator reads those
+requirements; it does not walk changes or infer which field a change excuses.
+The old per-partition change scans and implied-presence predicates are removed.
+
+A parent's default statement overwrites its partitions' defaults; a later own
+setting restores the override (DEC-1581.1, #1610). Parent and own effects must
+therefore share one ordered fold. Measured on PostgreSQL 16.15 and 18.6, setting
+an own text default and then the parent's leaves the child's `pg_attrdef` text
+equal to the parent's. Reversing that order leaves the child's own text. The
+mid-run footprint remains unpromised; the final read holds the resulting
+presence. A parent drop or NOT NULL keeps every unrelated own field exact.
+
+`Expr::Keep` compares two catalog texts exactly, including on a partition
+whose other field the plan changes (DECISIONS 166). Projecting every default to
+a Boolean had excused an unrelated text rewrite whenever the table was
+compared field by field. `Expr::Planned` compares presence because declaration
+text is rewritten by the engine; the two policies are not interchangeable.
+Partitions touched only through a parent's column change also have explicit
+kept presence, so field-wise comparison never excuses an arrival or removal.
+
+A real `CreateTable` now holds `(partition parent, bound, partition key)` to
+its payload at every read. A wrong first staged checkpoint must not become
+the next read's accepted baseline. Attach and detach retain their existing
+checkpoint policies and diagnostics; they are not treated as new creations.
+The remaining created-table field families stay for #1774 slice 4.
+
+The bound comparison needs no new SQL or apply-time rewriting. Connected
+planning checks spelling before producing the checksum-pinned plan, including
+staged plans; `apply` refuses offline previews before connecting. Connected
+bootstrap checks before DDL and writes `--sql` output only after its successful
+build. Offline SQL output executes nothing and enters no apply guard. Dev
+rehearsal checks before executing its build and plan. The live CLI regression
+on both supported PostgreSQL versions pins noncanonical numeric-bound refusal
+before plan/output/DDL, canonical bootstrap and staged creation, and offline
+preview refusal. Numeric values avoid tying this precondition to the separate
+temporal normalization work in #1883.
+
+The parent still owns column expectations, the remaining created-table and
+part comparisons, table presence/renames, and the production-only staged
+single-change restriction. Existing synthetic intermediate-read tests remain
+supported through this slice.

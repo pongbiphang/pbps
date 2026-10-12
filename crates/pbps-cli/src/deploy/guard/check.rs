@@ -1,10 +1,68 @@
-use pbps_model::{Table, TableName};
+use pbps_model::{PartitionColumn, Schema, Table, TableName};
 use std::borrow::Cow;
 
 use super::{
     Req,
-    expect::{Expected, place},
+    expect::{Expected, Implied, Own, OwnExpected, place},
 };
+
+pub(crate) fn implied(expected: &Implied<'_>, now: &Schema, moved: &mut Vec<String>) {
+    for (name, presence) in &expected.0 {
+        let present = now.tables.contains_key(*name);
+        if !presence.accepts(&present) {
+            moved.push(if present {
+                format!("{name} is there, and no change of this plan creates it")
+            } else {
+                format!("{name} is gone, and no change of this plan drops it")
+            });
+        }
+    }
+}
+
+pub(crate) fn own(
+    expected: &OwnExpected<'_>,
+    now: &Table,
+    name: &TableName,
+    moved: &mut Vec<String>,
+) {
+    let empty = Default::default();
+    let columns = now
+        .partition_of
+        .as_ref()
+        .map(|of| &of.columns)
+        .unwrap_or(&empty);
+    let absent = Own::default();
+    let changed = expected.0.keys().chain(columns.keys()).any(|name| {
+        let required = expected.0.get(name).unwrap_or(&absent);
+        let (default, not_null) = columns
+            .get(name)
+            .map_or((None, false), |PartitionColumn { default, not_null }| {
+                (default.as_deref(), *not_null)
+            });
+        !required.default.accepts(default) || !required.not_null.accepts(&not_null)
+    });
+    if changed {
+        moved.push(format!(
+            "{name}'s own column defaults or NOT NULLs are not the ones this plan leaves"
+        ));
+    }
+}
+
+pub(crate) fn created_place(
+    declared: &Table,
+    now: &Table,
+    name: &TableName,
+    moved: &mut Vec<String>,
+) {
+    // Connected planning and bootstrap check bound spellings before DDL;
+    // an offline preview cannot be applied. Hold the pinned declaration
+    // even at the first staged read, before it could become a baseline.
+    if !Req::Planned(place(declared)).accepts(&place(now)) {
+        moved.push(format!(
+            "{name}'s partition parent, bound or key is not the one this plan creates"
+        ));
+    }
+}
 
 pub(crate) fn table(
     expected: &Expected<'_>,
