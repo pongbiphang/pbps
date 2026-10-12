@@ -2475,3 +2475,96 @@ Pinned by `a_removed_measured_profile_is_refused_naming_the_resolver`
 `a_docker_scratch_is_recorded_by_its_configured_image` (`pbps-model`), the
 removed-runtime cases in `explain_resolver`, and the `resolver_` live tests
 in `resolver::server::scratch`.
+
+<a id="dec-1516-1"></a>
+
+**DEC-1516.1. A resolver's plan is published after the ordinary connected
+checks and a fresh recheck of the target, sealed in the order those checks
+leave, with the target's cluster identity and the run's accepted limitations
+(#1516, #1700).** Until #1516 a plan the resolver answered was refused as
+`resolver.publication-unavailable`: nothing confirmed that the target was
+still what the run read, and none of the ordinary connected checks had seen
+the resolver's plan.
+
+**What was decided.**
+- **The order is: run, release, ordinary passes, recheck, seal, write.**
+  The resolver's plan goes through every connected pass an ordinary plan
+  does. A pass that adds or moves changes, such as the module-dependents
+  pass or the ordering of role drops, runs before sealing, on the
+  resolver's plan, so the sealed order holds its result (decided with the
+  maintainer, 2026-10-11). The resolver's order edges are carried to the
+  positions the passes leave, matched change by change: a change is what
+  it does, except the facts the connected plan reads from the target and
+  writes into it, of which a dropped role's members are the one. A pass that
+  removes a change the resolver ordered, or puts one of its edges the
+  other way round, is a defect in pbps: the plan is refused, never sealed
+  in an order its proof does not hold.
+- **The recheck runs on a new session**, as the run's own did, because a
+  target name can reach another cluster on a new connection. It must
+  report the `system_identifier` the planning read recorded (DEC-1685.1).
+  The reported facts under `pg-reported-scope-v1` and the deployer's
+  authorization are read again and must equal the run's opening read. The
+  opening capture's scope, which holds the objects the baseline staged,
+  and its dropped signatures are captured again and must equal it. Each
+  read is coherent in its own right, as the run's were (ADR-0016). A
+  difference is the finding `resolver.recheck`, exit 2, naming each change;
+  a failed read is `unanswerable`.
+- **A skipped recheck cannot be sealed.** Only `Rechecked::seal` seals,
+  and only a passed recheck makes a `Rechecked`. It holds the run it
+  rechecked, so one run's recheck cannot seal another. The library's
+  `produce` rechecks too, so every sealed answer has passed one.
+- **An index the evidence rebuilds takes over its parameter change.** The
+  resolver's rebuilds get the normalization the differ's and the
+  dependents pass's get (`drop_parameter_changes_of_rebuilt_indexes`): a
+  `SetIndexStorageParameters` on an index the plan drops and adds again
+  would run against the dropped index, and the add carries the declared
+  parameters.
+- **The evidence seals two more facts.** The target's `system_identifier`
+  is keyed under the project key (`pbps/pg-cluster-identity/v1`), never
+  written in clear (decided with the maintainer, 2026-10-11); #616 keys
+  the apply session's identifier the same way and compares. Every
+  limitation the compatibility rule accepted is sealed by name and
+  description (#1700). The evidence version moves to 3. The plan format
+  version does not: no build before this one ever wrote a resolved plan,
+  and an ordinary plan is unchanged.
+- **No new plan beside an old script.** Both files are rendered before
+  either is written, and the SQL is written first, so a failed write never
+  leaves a new plan behind; a plan whose own write fails leaves an old plan
+  beside a new script, which `apply` never reads without its plan. Each is
+  written in place, so it keeps its owner, group, permissions and ACL. This
+  holds for every connected plan, not only a resolved one.
+- **A dependent the evidence does not cover refuses.** When the
+  module-dependents pass finds a declared module the plan leaves alone over
+  one it drops, an ordinary plan is planned again with that module rebuilt.
+  Planning again without the resolver would drop its answer, so a resolved
+  plan refuses by name instead. The resolver itself rebuilds a module whose
+  managed input it replaces (DEC-1515.1), which is the common case.
+- **`--staged` refuses a plan that needs the resolver**, before the run:
+  the evidence describes one transaction.
+- **The connected summary reports `need: resolved`.** The published schema
+  set moves to 42.
+
+**Why not the alternatives.**
+- **Seal the run's answer and only check it afterwards.** Then a pass that
+  must add a change, such as a dependent view's rebuild, would have no way
+  to reach the sealed plan except as a refusal, and a valid plan would be
+  refused.
+- **Recheck on the planning session.** It has already proved its cluster;
+  the point of the binding is a session that might not reach the same one.
+- **Write the plan, then the SQL, as before.** A failed SQL write then
+  left a new plan beside an old script.
+- **Write each beside its path and rename it into place.** A rename
+  replaces the file: it takes the writer's group and default mode, drops
+  an ACL, and needs room for a longer name. Keeping all of that is more
+  code than the property is worth, and in place it holds already.
+
+Recorded in SPEC §9.3.2 and §9.8, README, STATUS and RESOLVER-DELIVERY.
+Pinned by the live tests `resolver_recheck_binds_the_target_by_engine_identity`,
+`resolver_recheck_refuses_a_target_changed_after_the_run`,
+`resolver_recheck_refuses_an_external_shape_changed_after_planning` and
+`resolver_seals_an_accepted_build_limitation_and_rechecks_it`
+(`resolver::server::scratch`), `resolver_publishes_its_rechecked_plan_in_the_exact_order`
+and `resolver_plans_pass_the_ordinary_connected_checks` (`flow_pg`), the
+`remap_tests` in `resolver::server::producer`, and
+`an_accepted_limitation_is_sealed_and_its_removal_changes_the_checksum`
+(`pbps-model`).

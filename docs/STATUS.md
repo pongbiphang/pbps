@@ -210,8 +210,9 @@ the existing SQL Server `--dev` rehearsal. Target planning accepts
 Profiles carry a trusted Docker image and pull policy (default `never`), or a
 separate scratch credential-variable reference. Selection looks up no credentials
 and acquires no resources; connected summaries report `not_acquired` outside
-the saved artifact. A plan that needs the selected resolver runs it (#1515);
-its resolver-backed plan is not yet published (#1516). Existing planning
+the saved artifact. A plan that needs the selected resolver runs it (#1515)
+and publishes its plan after the ordinary connected checks and a fresh
+recheck of the target, sealed in its final order (#1516). Existing planning
 checks remain in force.
 Connected `doctor` reports an advisory target
 environment inventory and known official image-family suggestions for both
@@ -255,9 +256,11 @@ objects, compared with the target (#1673, DEC-1673.1), and may be allowed to
 write outside the scratch database. Before any scratch write the resolver
 proves its scratch is not the target and, on the target's cluster, that its
 account is confined; then it runs the shared compatibility qualification. Its
-answer is still refused as `resolver.publication-unavailable` until #1516.
-[Delivery tracking](RESOLVER-DELIVERY.md) has the remaining order: #1516,
-#1517, #1778 and #616, then SQL Server's #619, #620 and #621.
+plan is published after the ordinary connected checks and a fresh recheck of
+the target, with the target's cluster identity and the accepted limitations
+sealed in its evidence (#1516, DEC-1516.1).
+[Delivery tracking](RESOLVER-DELIVERY.md) has the remaining order: #1517,
+#1778 and #616, then SQL Server's #619, #620 and #621.
 
 Delivery is split into three stages:
 

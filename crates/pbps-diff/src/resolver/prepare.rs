@@ -574,8 +574,19 @@ pub(super) fn changes(
         }
     }
     added.extend(again);
-    let ordinary = changes.len();
-    changes.extend(added);
+    // An index the evidence rebuilds is created with its declared storage
+    // parameters, so a change to them would `ALTER` an index this plan has
+    // dropped: the same normalization the differ's and the dependents
+    // pass's rebuilds get (#1516 review). Only ordinary changes go, so the
+    // ordinary ones still come first.
+    let mut all: Vec<(bool, PlannedChange)> = changes
+        .into_iter()
+        .map(|p| (false, p))
+        .chain(added.into_iter().map(|p| (true, p)))
+        .collect();
+    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut all, |(_, p)| &p.change);
+    let ordinary = all.iter().filter(|(added, _)| !added).count();
+    let changes = all.into_iter().map(|(_, p)| p).collect();
     Ok((ChangeSet { changes }, ordinary))
 }
 

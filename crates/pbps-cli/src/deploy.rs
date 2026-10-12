@@ -7138,6 +7138,11 @@ pub fn cmd_plan_db(
             planned
         })
         .collect();
+        // The zero-SQL changes the diff cannot see, carried by every plan this
+        // read makes: the initial one, each re-derivation, and the resolver's
+        // (#1516 review). One list, so a plan cannot carry one and not the
+        // other.
+        let zero_sql: Vec<_> = takeovers.into_iter().chain(ensure_keys).collect();
         // The read-back goes in beside the overlaid base, for the comparisons
         // the engine makes by parse tree (an attach's checks and generation
         // expressions, #1642 review).
@@ -7160,8 +7165,7 @@ pub fn cmd_plan_db(
             .map(|mut changes| {
                 // Re-derivations and resolver planning must retain the same
                 // zero-SQL changes as the initial connected plan.
-                changes.changes.extend(takeovers.iter().cloned());
-                changes.changes.extend(ensure_keys.iter().cloned());
+                changes.changes.extend(zero_sql.iter().cloned());
                 changes
             })
         };
@@ -7179,6 +7183,10 @@ pub fn cmd_plan_db(
             ids: &resolved.ids,
         };
         let mut resolver_assessment = None;
+        // Case 3's answer, unsealed: the resolver's order goes through every
+        // pass and check below, as an ordinary plan does, and is sealed in
+        // the order they leave (#1516).
+        let mut resolution = None;
         match crate::resolution::case(
             resolver_selection.as_ref(),
             base_side,
@@ -7216,19 +7224,31 @@ pub fn cmd_plan_db(
                     hints: &hints,
                     target_identity: identity.as_deref(),
                 };
+                // A resolved plan is sealed transactional: its evidence
+                // describes one atomic change (`SavedPlan::with_resolution`).
+                if staged {
+                    bail!(
+                        "--staged cannot carry the resolver's answer: a resolver-backed plan \
+                         applies in one transaction. Plan this change without --staged."
+                    );
+                }
                 let asked = crate::resolution::named(&assessment);
-                return match crate::resolution::resolve(&request).await {
-                    Ok(changes) => Ok(Connected::Resolved {
-                        changes,
-                        baseline: format!("{} as queried (entry #{})", target.label, entry.id),
-                        asked,
-                        findings,
-                    }),
-                    Err(crate::resolution::Refused::Finding(finding)) => {
-                        Ok(Connected::Refused { finding, findings })
+                match crate::resolution::resolve(&request).await {
+                    Ok(unsealed) => {
+                        resolver_assessment =
+                            Some(crate::resolution::ResolverAssessment::resolved(&assessment));
+                        // The resolver's order, with the connected plan's
+                        // zero-SQL changes after it, where `diff_here`
+                        // keeps them.
+                        cs = unsealed.changes().clone();
+                        cs.changes.extend(zero_sql.iter().cloned());
+                        resolution = Some((selection.name.clone(), unsealed, asked));
                     }
-                    Err(crate::resolution::Refused::Unanswerable(error)) => Err(error),
-                };
+                    Err(crate::resolution::Refused::Finding(finding)) => {
+                        return Ok(Connected::Refused { finding, findings });
+                    }
+                    Err(crate::resolution::Refused::Unanswerable(error)) => return Err(error),
+                }
             }
         }
 
@@ -7272,6 +7292,20 @@ pub fn cmd_plan_db(
             // view this plan now drops and recreates takes `before_a_rebuild`
             // like one the declarations edit (#314, ADR-0009 §4).
             let rediff = |also: &std::collections::BTreeSet<pbps_model::ModuleId>| {
+                // The resolver rebuilds what its evidence shows reaching a
+                // replaced input. A module it did not rebuild that still
+                // depends on one the plan drops is outside that evidence, and
+                // planning again without the resolver would drop its answer
+                // (#1516).
+                if resolution.is_some() {
+                    let names: Vec<String> = also.iter().map(ToString::to_string).collect();
+                    bail!(
+                        "the resolver's plan drops a module that {} depend(s) on, and its \
+                         evidence does not cover rebuilding them; declare the dependency, or \
+                         change the module in a plan of its own",
+                        names.join(", ")
+                    );
+                }
                 diff_here(also).map_err(|errors| crate::Unexpressible(errors).into())
             };
             let dependents = crate::engine::account_for_module_dependents(
@@ -7527,6 +7561,46 @@ pub fn cmd_plan_db(
             &managed_modules(Some(&entry.snapshot), Some(&loaded.schema)),
         )
         .await?;
+        // Case 3, last: the target is read again, after every read above,
+        // and must still be what the resolver's run read; then the plan is
+        // sealed in the order the passes above left (DEC-1516.1).
+        let resolution = match resolution {
+            None => None,
+            Some((name, unsealed, asked)) => {
+                // A session of its own, as the run's was: one target name
+                // can reach another cluster on a new connection, which the
+                // recheck must see and refuse (DEC-1685.1).
+                let mut fresh = pbps_db::Conn::connect(conn.driver(), target.connection())
+                    .await
+                    .with_context(|| format!("cannot reach `{}` for the recheck", target.label))?;
+                let rechecked = match unsealed.recheck(&mut fresh).await {
+                    Ok(rechecked) => rechecked,
+                    Err(refused) => {
+                        let error = refused.error;
+                        if !matches!(error, pbps_cli::resolver::server::Error::Changed(_)) {
+                            return Err(error.into());
+                        }
+                        let finding =
+                            crate::output::Finding::error("resolver.recheck", error.to_string())
+                                .remedy("plan again");
+                        return Ok(Connected::Refused { finding, findings });
+                    }
+                };
+                let sealed = rechecked
+                    .seal(cs.clone(), base_side, desired_side)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "the resolver's evidence could not be sealed over the final plan: {e}; \
+                         this is a bug in pbps, please report it"
+                        )
+                    })?;
+                Some(Resolution {
+                    name,
+                    asked,
+                    evidence: sealed.evidence,
+                })
+            }
+        };
         Ok(Connected::Ordinary(Box::new((
             cs,
             (baseline, managed.database_collation.clone()),
@@ -7547,6 +7621,7 @@ pub fn cmd_plan_db(
             cost,
             routine_pins,
             resolver_assessment,
+            resolution,
         ))))
     })?;
     let (
@@ -7558,47 +7633,9 @@ pub fn cmd_plan_db(
         cost,
         routine_pins,
         resolver_assessment,
+        resolution,
     ) = match connected {
         Connected::Ordinary(planned) => *planned,
-        Connected::Resolved {
-            changes,
-            baseline,
-            asked,
-            mut findings,
-        } => {
-            // Case 3 answered. Withheld, not written: publication waits for
-            // the recheck that confirms the target still holds what the
-            // evidence describes (#1516, DEC-1515.1).
-            let name = resolver_selection
-                .as_ref()
-                .map_or("", |selection| selection.name.as_str());
-            let finding = crate::output::Finding::error(
-                "resolver.publication-unavailable",
-                format!(
-                    "the selected resolver `{name}` answered the binding questions of {asked}; \
-                     its plan has {} change(s).\n\
-                     Publishing a resolver-backed plan needs the fresh pre-publication recheck, \
-                     which is not implemented yet (#1516), so neither a plan nor SQL was written.",
-                    changes.changes.len()
-                ),
-            );
-            if json {
-                findings.push(finding);
-                return crate::output::Report::plain("plan", findings).emit_json();
-            }
-            println!("Baseline: {baseline}");
-            println!("Resolver profile: {name}; it answered the binding questions of {asked}.");
-            print!(
-                "{}",
-                crate::report::plan(
-                    &changes,
-                    &pbps_model::plan_names::PlanNames::of(&changes.changes, &resolved.ids)?
-                )
-            );
-            let report = crate::output::Report::plain("plan", vec![finding]);
-            eprint!("{}", crate::output::human(&report.findings));
-            return report.outcome();
-        }
         Connected::Refused {
             finding,
             mut findings,
@@ -7653,9 +7690,14 @@ pub fn cmd_plan_db(
     };
     if !json {
         println!("Baseline: {baseline_description}");
-        // Only case 2 reaches here with a selection: case 3 returned above,
-        // and case 1 has none to report and claims no verification.
-        if let (Some(selection), Some(assessment)) =
+        // Case 1 has no resolver to report and claims no verification.
+        if let Some(resolution) = &resolution {
+            println!(
+                "Resolver profile: {}; it answered the binding questions of {}, and the \
+                 target was rechecked after its run.",
+                resolution.name, resolution.asked
+            );
+        } else if let (Some(selection), Some(assessment)) =
             (&data.resolver_selection, &data.resolver_assessment)
         {
             println!(
@@ -7690,6 +7732,14 @@ pub fn cmd_plan_db(
     // declarations' scope, carried so that `apply` needs no checkout.
     plan.data = loaded.schema.data_scopes();
     plan.routine_pins = routine_pins;
+    if let Some(resolution) = resolution {
+        plan = plan.with_resolution(resolution.evidence).map_err(|e| {
+            anyhow::anyhow!(
+                "the resolver's evidence does not describe this plan: {e}; this is a bug in pbps, \
+                 please report it"
+            )
+        })?;
+    }
     if staged {
         plan = plan.staged();
         if !json {
@@ -7704,23 +7754,35 @@ pub fn cmd_plan_db(
         }
     }
 
-    if let Some(path) = out {
-        crate::write_plan(path, &plan)?;
-        if !json {
-            println!("\nwrote {} (checksum {})", path.display(), plan.checksum());
-        }
-    }
-    if let Some(path) = sql_out {
-        let script = format!(
+    let script = sql_out.map(|_| {
+        format!(
             "-- Generated by pbps against {}\n-- Applyable only through `pbps apply --plan`; never hand-edit this file.\n\n{}",
             plan.baseline.description,
             pbps_dialect::render_script(&statements, dialect.as_ref())
-        );
+        )
+    });
+    let rendered = out.map(|_| crate::rendered_plan(&plan)).transpose()?;
+    // Both rendered before either is written, and the SQL written first
+    // (DEC-1516.1): a failed write never leaves a new plan beside an old
+    // script. Each is written in place, so the file keeps its owner, group
+    // and permissions, as it always has.
+    if let (Some(path), Some(script)) = (sql_out, &script) {
         std::fs::write(path, script)
             .with_context(|| format!("cannot write `{}`", path.display()))?;
-        if !json {
-            println!("wrote {}", path.display());
-        }
+    }
+    if let (Some(path), Some(rendered)) = (out, &rendered) {
+        std::fs::write(path, rendered)
+            .with_context(|| format!("cannot write `{}`", path.display()))?;
+    }
+    if let Some(path) = out
+        && !json
+    {
+        println!("\nwrote {} (checksum {})", path.display(), plan.checksum());
+    }
+    if let Some(path) = sql_out
+        && !json
+    {
+        println!("wrote {}", path.display());
     }
     if out.is_none() && !json {
         println!(
@@ -7735,20 +7797,22 @@ pub fn cmd_plan_db(
 
 /// What the connected half of `plan` ended with (DEC-1515.1).
 enum Connected<T> {
-    /// Cases 1 and 2: the ordinary plan and everything checked against it.
+    /// The plan and everything checked against it: the ordinary plan
+    /// (cases 1 and 2), or the resolver's, rechecked and sealed (case 3).
     Ordinary(Box<T>),
-    /// Case 3, answered: the resolver's plan, withheld from publication.
-    Resolved {
-        changes: pbps_model::ChangeSet,
-        baseline: String,
-        asked: String,
-        findings: Vec<crate::output::Finding>,
-    },
     /// Case 3, refused by an answer: unresolved, or measured incompatible.
     Refused {
         finding: crate::output::Finding,
         findings: Vec<crate::output::Finding>,
     },
+}
+
+/// Case 3's sealed answer: the resolver that gave it, the binding questions
+/// it answered, and the evidence the plan carries (#1516).
+struct Resolution {
+    name: String,
+    asked: String,
+    evidence: pbps_model::resolver::ResolverEvidence,
 }
 
 /// What the operator asked `apply` to do, as typed.

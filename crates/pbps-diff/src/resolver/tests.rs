@@ -1286,6 +1286,99 @@ mod generated_surface_coverage {
         ordered.proof.validate(&ordered.changes).unwrap();
     }
 
+    /// An index the evidence rebuilds is created with its declared storage
+    /// parameters, so the plan's own change to them goes, as the differ's
+    /// and the dependents pass's rebuilds drop it (#1516 review). Negative:
+    /// the same change on an index the evidence leaves alone stays.
+    #[test]
+    fn a_rebuilt_index_takes_over_its_storage_parameter_change() {
+        let (id, module) = routine();
+        let indexed = |fillfactor: &str| {
+            let mut table = table(None);
+            table.indexes.insert(
+                "ix".into(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        key: pbps_model::IndexKey::Column("a".into()),
+                        descending: false,
+                        opclass: None,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: Some("a > app.f(1)".into()),
+                    method: Default::default(),
+                    storage_parameters: [("fillfactor".to_owned(), fillfactor.to_owned())].into(),
+                },
+            );
+            table
+        };
+        let mut base = Schema::default();
+        base.modules.insert(id.clone(), module);
+        base.tables.insert("app.t".parse().unwrap(), indexed("90"));
+        let mut desired = base.clone();
+        desired
+            .tables
+            .insert("app.t".parse().unwrap(), indexed("80"));
+        let function = Surface::Module(id.clone());
+        let index = Surface::Index {
+            table: "app.t".parse().unwrap(),
+            name: "ix".into(),
+        };
+        let parameters = |c: &Change| matches!(c, Change::SetIndexStorageParameters { .. });
+        for rebinds in [true, false] {
+            let ordered = sided(
+                &base,
+                &desired,
+                &[
+                    SurfaceResolution {
+                        surface: index.clone(),
+                        current: Some(bound(
+                            "pg_index",
+                            "app.ix",
+                            std::slice::from_ref(&function),
+                            "f",
+                        )),
+                        desired: Some(bound(
+                            "pg_index",
+                            "app.ix",
+                            std::slice::from_ref(&function),
+                            if rebinds { "g" } else { "f" },
+                        )),
+                    },
+                    SurfaceResolution {
+                        surface: function.clone(),
+                        current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                        desired: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                    },
+                ],
+            );
+            ordered.proof.validate(&ordered.changes).unwrap();
+            let kept = ordered
+                .changes
+                .changes
+                .iter()
+                .any(|p| parameters(&p.change));
+            if rebinds {
+                assert!(!kept, "{:?}", ordered.changes.changes);
+                let added = ordered.changes.changes.iter().find_map(|p| {
+                    if let Change::AddIndex { index, .. } = &p.change {
+                        Some(index.storage_parameters.clone())
+                    } else {
+                        None
+                    }
+                });
+                assert_eq!(
+                    added,
+                    Some([("fillfactor".to_owned(), "80".to_owned())].into()),
+                    "{:?}",
+                    ordered.changes.changes
+                );
+            } else {
+                assert!(kept, "{:?}", ordered.changes.changes);
+            }
+        }
+    }
+
     /// A generated column computes its rows as it is added, so an execute
     /// grant on the routine it calls goes first.
     #[test]

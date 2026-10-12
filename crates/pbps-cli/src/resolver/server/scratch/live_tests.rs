@@ -3956,3 +3956,316 @@ fn assert_outside_writes(
         }
     }
 }
+
+/// A run's answer before it is sealed, as the publishing `plan` holds it
+/// (#1516), with the cluster identity its planning read recorded.
+async fn produce_unsealed(
+    scratch: &str,
+    target: &str,
+    inputs: &Inputs,
+    key: &ProjectKey,
+    baseline: Option<&str>,
+) -> (Result<super::super::Unsealed, ProduceError>, String) {
+    let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
+    let identity = pbps_pg::resolver::scratch::cluster_identity(&mut planning)
+        .await
+        .unwrap();
+    let result = super::produce_unsealed(
+        Driver::Postgres,
+        scratch,
+        target,
+        &identity,
+        &inputs.binding(),
+        inputs.base(),
+        inputs.desired(),
+        &inputs.hints,
+        &[],
+        &key.project,
+        Some(ENVIRONMENT),
+        &Standard::default(),
+        baseline,
+        &super::Provenance::server(),
+    )
+    .await;
+    (result, identity)
+}
+
+/// The recheck on a new session to `target`, as `plan` opens one. What it
+/// refused names, with the run handed back, or its proof when it passed.
+/// Never panics on the recheck's own answer, so the caller can drop its
+/// fixture first.
+async fn recheck(
+    unsealed: super::super::Unsealed,
+    target: &str,
+) -> Result<super::super::Rechecked, (String, Box<super::super::Unsealed>)> {
+    let mut session = Conn::connect(Driver::Postgres, target).await.unwrap();
+    unsealed.recheck(&mut session).await.map_err(|refused| {
+        let super::super::Refused { error, unsealed } = *refused;
+        let said = if let Error::Changed(changed) = &error {
+            changed.join("; ")
+        } else {
+            format!("not a recheck refusal: {error}")
+        };
+        (said, Box::new(unsealed))
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_recheck_binds_the_target_by_engine_identity() {
+    // Each server's target, rechecked through a session that reaches the
+    // other server: one target name resolving to two clusters (#1516,
+    // DEC-1685.1).
+    for (server, other) in [(SERVERS[0], SERVERS[1]), (SERVERS[1], SERVERS[0])] {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        let inputs = Inputs::overload();
+        let key = ProjectKey::new(true);
+        let (result, identity) = produce_unsealed(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+            None,
+        )
+        .await;
+        let unsealed = result.unwrap_or_else(|error| panic!("{server}: {error}"));
+        let (elsewhere, same) = match recheck(unsealed, &setting(other)).await {
+            Ok(_) => (None, None),
+            Err((refused, unsealed)) => (
+                Some(refused),
+                Some(recheck(*unsealed, &fixture.on(&target_db)).await),
+            ),
+        };
+        fixture.drop().await;
+        let elsewhere =
+            elsewhere.unwrap_or_else(|| panic!("{server}: a recheck on another cluster refuses"));
+        assert!(
+            elsewhere.contains("another cluster"),
+            "{server}: {elsewhere}"
+        );
+        let rechecked = same
+            .unwrap()
+            .unwrap_or_else(|(refused, _)| panic!("{server}: the same cluster passes: {refused}"));
+        // The sealed evidence carries the planning read's identity, keyed.
+        let environment =
+            crate::resolver::sealing::environment_key(&key.project, Some(ENVIRONMENT)).unwrap();
+        let changes = rechecked.changes().clone();
+        let plan = rechecked
+            .seal(changes, inputs.base(), inputs.desired())
+            .unwrap();
+        assert_eq!(
+            plan.evidence.qualification().target_cluster,
+            super::super::producer::fingerprint(
+                &environment,
+                super::super::producer::CLUSTER_RULE,
+                "system-identifier",
+                identity.as_bytes(),
+            ),
+            "{server}"
+        );
+        assert_answers_the_overload(&plan);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_recheck_refuses_a_target_changed_after_the_run() {
+    // Each written from a second connection after the run released its
+    // scratch and before the recheck. The changed object or fact is named.
+    let cases: &[(&str, &str, &str)] = &[
+        // A prerequisite arrives: the overload the plan creates, created
+        // out of band.
+        (
+            "a prerequisite",
+            "CREATE FUNCTION pbps_evidence1274.f(integer) RETURNS numeric \
+             LANGUAGE sql IMMUTABLE RETURN $1",
+            "pbps_evidence1274.f",
+        ),
+        // An in-place mutation of a captured routine.
+        (
+            "an in-place mutation",
+            "CREATE OR REPLACE FUNCTION pbps_evidence1274.f(numeric) RETURNS numeric \
+             LANGUAGE sql IMMUTABLE RETURN $1 + 0",
+            "pbps_evidence1274.f",
+        ),
+        // A setting the rule compares, for every new session.
+        (
+            "a compared setting",
+            "ALTER DATABASE {db} SET array_nulls = off",
+            "reported facts",
+        ),
+        // An extension the rule compares.
+        (
+            "an extension",
+            "CREATE SCHEMA pbps_trgm_1516; CREATE EXTENSION pg_trgm SCHEMA pbps_trgm_1516",
+            "reported facts",
+        ),
+        // The deployer's authorization: who owns a schema the plan writes.
+        (
+            "an authorization",
+            "ALTER SCHEMA pbps_evidence1274 OWNER TO {role}",
+            "deployer's authorization",
+        ),
+    ];
+    for server in SERVERS {
+        for (case, sql, named) in cases {
+            let mut fixture = Fixture::new(server);
+            let target_db = fixture.target().await;
+            let (login, scratch_db) = fixture.confined().await;
+            let inputs = Inputs::overload();
+            let key = ProjectKey::new(true);
+            let (result, _) = produce_unsealed(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+                None,
+            )
+            .await;
+            let target = fixture.on(&target_db);
+            let role = fixture.role("o").await;
+            let outcome = match result {
+                Ok(unsealed) => {
+                    let sql = sql.replace("{db}", &target_db).replace("{role}", &role);
+                    fixture.run(&target_db, &[&sql]).await;
+                    Ok(recheck(unsealed, &target).await)
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            fixture.drop().await;
+            let Err((refused, _)) =
+                outcome.unwrap_or_else(|error| panic!("{server} {case}: the run: {error}"))
+            else {
+                panic!("{server} {case}: a changed target refuses");
+            };
+            assert!(refused.contains(named), "{server} {case}: {refused}");
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_recheck_refuses_an_external_shape_changed_after_planning() {
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    for server in SERVERS {
+        for changed in [false, true] {
+            let mut fixture = Fixture::new(server);
+            let key = ProjectKey::new(true);
+            let target_db = staging_target(&mut fixture, &guarded_target()).await;
+            let (login, scratch_db) = fixture.confined().await;
+            let baseline = plain_baseline("integer");
+            let (result, _) = produce_unsealed(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+                Some(&baseline),
+            )
+            .await;
+            let outcome = match result {
+                Ok(unsealed) => {
+                    if changed {
+                        fixture
+                            .run(
+                                &target_db,
+                                &[&format!(
+                                    "ALTER TABLE {EXTERNAL}.t ADD COLUMN extra integer"
+                                )],
+                            )
+                            .await;
+                    }
+                    Ok(recheck(unsealed, &fixture.on(&target_db)).await)
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            fixture.drop().await;
+            let outcome = outcome.unwrap_or_else(|error| panic!("{server}: the run: {error}"));
+            if changed {
+                let Err((refused, _)) = outcome else {
+                    panic!("{server}: a changed external shape refuses");
+                };
+                assert!(
+                    refused.contains(&format!("{EXTERNAL}.t")),
+                    "{server}: {refused}"
+                );
+            } else {
+                outcome.unwrap_or_else(|(refused, _)| {
+                    panic!("{server}: the unchanged shape publishes: {refused}")
+                });
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_seals_an_accepted_build_limitation_and_rechecks_it() {
+    // A scratch packaged differently from the target reports another build
+    // string of the same version: accepted, named, sealed (DEC-1672.1,
+    // #1700). A target whose string then changes is refused by the recheck.
+    for server in SERVERS {
+        for scratch_build in [None, Some("pbps test packaging")] {
+            let mut fixture = Fixture::new(server);
+            let target_db = fixture.target().await;
+            let (login, scratch_db) = fixture.confined().await;
+            let inputs = Inputs::overload();
+            let key = ProjectKey::new(true);
+            let (result, _) = super::SCRATCH_BUILD
+                .scope(
+                    scratch_build.map(str::to_owned),
+                    produce_unsealed(
+                        &fixture.as_login(&scratch_db, &login),
+                        &fixture.on(&target_db),
+                        &inputs,
+                        &key,
+                        None,
+                    ),
+                )
+                .await;
+            let target = fixture.on(&target_db);
+            let outcome = match result {
+                Ok(unsealed) => {
+                    let upgraded = super::super::producer::RECHECK_BUILD
+                        .scope(
+                            Some("pbps test upgrade".to_owned()),
+                            recheck(unsealed, &target),
+                        )
+                        .await;
+                    Ok(match upgraded {
+                        Ok(rechecked) => (None, Ok(rechecked)),
+                        Err((refused, unsealed)) => {
+                            (Some(refused), recheck(*unsealed, &target).await)
+                        }
+                    })
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            fixture.drop().await;
+            let (upgraded, unchanged) =
+                outcome.unwrap_or_else(|error| panic!("{server}: the run: {error}"));
+            let refused = upgraded
+                .unwrap_or_else(|| panic!("{server}: a target whose build changed refuses"));
+            assert!(refused.contains("reported facts"), "{server}: {refused}");
+            let rechecked = unchanged.unwrap_or_else(|(refused, _)| panic!("{server}: {refused}"));
+            let changes = rechecked.changes().clone();
+            let plan = rechecked
+                .seal(changes, inputs.base(), inputs.desired())
+                .unwrap();
+            let limitations = &plan.evidence.qualification().limitations;
+            match scratch_build {
+                Some(build) => {
+                    let named = limitations
+                        .get("build:server_version")
+                        .unwrap_or_else(|| panic!("{server}: {limitations:?}"));
+                    assert!(named.contains(build), "{server}: {named}");
+                }
+                None => assert!(
+                    limitations.is_empty(),
+                    "{server}: identical strings seal no limitation: {limitations:?}"
+                ),
+            }
+        }
+    }
+}

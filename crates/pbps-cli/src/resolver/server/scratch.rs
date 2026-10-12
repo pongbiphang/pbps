@@ -22,7 +22,7 @@
 //! is qualified under the compatibility rule that compares what each engine
 //! reports about itself.
 
-use super::producer::{Identity, Sealing, fingerprint, request, seal};
+use super::producer::{Identity, Opening, Sealing, Unsealed, fingerprint, request};
 use super::{BindingRequest, Error, ProduceError, ResolvedPlan, engine, resolution};
 use crate::resolver::scope;
 use pbps_db::resolver::ScratchNames;
@@ -57,6 +57,59 @@ pub async fn produce(
     baseline: Option<&str>,
     provenance: &Provenance,
 ) -> Result<ResolvedPlan, ProduceError> {
+    let unsealed = produce_unsealed(
+        driver,
+        scratch,
+        target_connection,
+        planned_identity,
+        binding,
+        base,
+        desired,
+        hints,
+        write_path_extras,
+        project,
+        environment,
+        standard,
+        baseline,
+        provenance,
+    )
+    .await?;
+    // Rechecked as `plan` rechecks it, so every answer this returns has
+    // passed the recheck too.
+    let mut session = Conn::connect(driver, target_connection)
+        .await
+        .map_err(|error| {
+            ProduceError::Run(Error::Read(format!("the recheck's session: {error}")))
+        })?;
+    let rechecked = unsealed
+        .recheck(&mut session)
+        .await
+        .map_err(|refused| ProduceError::Run(refused.error))?;
+    let changes = rechecked.changes().clone();
+    rechecked
+        .seal(changes, base, desired)
+        .map_err(ProduceError::Run)
+}
+
+/// [`produce`]'s run, its plan returned before the evidence is sealed: the
+/// publishing caller runs its ordinary passes and the recheck first (#1516).
+#[allow(clippy::too_many_arguments)]
+pub async fn produce_unsealed(
+    driver: Driver,
+    scratch: &str,
+    target_connection: &str,
+    planned_identity: &str,
+    binding: &BindingRequest<'_>,
+    base: pbps_diff::Side<'_>,
+    desired: pbps_diff::Side<'_>,
+    hints: &Hints,
+    write_path_extras: &[String],
+    project: &pbps_config::Project,
+    environment: Option<&str>,
+    standard: &Standard,
+    baseline: Option<&str>,
+    provenance: &Provenance,
+) -> Result<Unsealed, ProduceError> {
     if driver != Driver::Postgres {
         return Err(ProduceError::Run(Error::Binding(
             "the resolver is implemented for PostgreSQL only".into(),
@@ -110,6 +163,7 @@ pub async fn produce(
     };
     let mut run = Run {
         driver,
+        planned_identity,
         scratch,
         key: &key,
         request: &request,
@@ -132,10 +186,16 @@ pub async fn produce(
         )
         .await;
     let cleanup = run.release(&mut admin).await;
+    drop(run);
     match (result, cleanup) {
         (_, Err(names)) => Err(ProduceError::Cleanup(names)),
         (Err(refused), Ok(())) => Err(ProduceError::Run(refused)),
-        (Ok(plan), Ok(())) => Ok(plan),
+        (Ok((ordered, sealing, opening)), Ok(())) => Ok(Unsealed {
+            key,
+            ordered,
+            sealing,
+            opening,
+        }),
     }
 }
 
@@ -315,6 +375,8 @@ enum Created {
 
 struct Run<'a> {
     driver: Driver,
+    /// The `system_identifier` the planning read recorded (DEC-1685.1).
+    planned_identity: &'a str,
     scratch: &'a str,
     key: &'a pbps_db::fingerprint::EnvironmentFingerprintKey,
     request: &'a super::ScopeRequest,
@@ -361,7 +423,7 @@ impl Run<'_> {
         base: pbps_diff::Side<'_>,
         desired: pbps_diff::Side<'_>,
         hints: &Hints,
-    ) -> Result<ResolvedPlan, Error> {
+    ) -> Result<(pbps_diff::resolver::Ordered, Sealing, Opening), Error> {
         let driver = self.driver;
         let request = self.request;
         let db = |what: &'static str| {
@@ -404,6 +466,13 @@ impl Run<'_> {
             &request.write_path_extras,
             &mut target_catalog,
         );
+        #[cfg(test)]
+        if let Ok(Some(build)) = SCRATCH_BUILD.try_with(Clone::clone) {
+            prepared.scratch_catalog.observations.insert(
+                "server_version".into(),
+                pbps_db::resolver::Observation::Observed { value: build },
+            );
+        }
         let mut report =
             scope::compare_reported(driver, &target_catalog, &prepared.scratch_catalog)
                 .map_err(Error::Scope)?;
@@ -416,6 +485,7 @@ impl Run<'_> {
                 },
             );
         }
+        let limitations = report.limitations.clone();
         match report.verdict() {
             Verdict::Verified => {}
             Verdict::Mismatch(facts) => return Err(Error::Incompatible(facts)),
@@ -585,30 +655,34 @@ impl Run<'_> {
                 scratch: self.provenance.scratch.clone(),
                 outside_writes: self.provenance.outside_writes,
             },
+            target_cluster: self.planned_identity.to_owned(),
+            limitations,
         };
         let producer = super::ProducerOutcome {
             compiled,
             opening_build: reported_build(self.key, &opening_catalog)?,
             surfaces,
         };
-        seal(
-            self.key,
-            &Sealing {
-                planned: &request.planned,
-                opening_catalog: &opening_catalog,
-                target_catalog: &target_catalog,
-                scratch_catalog: &prepared.scratch_catalog,
-                authorization: &authorization,
-                schemas: &request.schemas,
-                write_path_extras: &request.write_path_extras,
-            },
+        let sealing = Sealing {
+            planned: request.planned.clone(),
+            opening_catalog,
+            target_catalog,
+            scratch_catalog: prepared.scratch_catalog,
+            authorization,
+            schemas: request.schemas.clone(),
+            write_path_extras: request.write_path_extras.clone(),
             identity,
             producer,
             opening,
-            ordered,
-            base,
-            desired,
-        )
+        };
+        let recheck = Opening {
+            driver,
+            request: request.clone(),
+            scope_schemas,
+            current,
+            planned_identity: self.planned_identity.to_owned(),
+        };
+        Ok((ordered, sealing, recheck))
     }
 
     /// The layout for a superuser on another cluster: a
@@ -1464,6 +1538,10 @@ tokio::task_local! {
     /// the opening capture: a writer the run cannot otherwise be timed
     /// against (#1755).
     static AFTER_STAGING: Option<String>;
+    /// The build string a test's scratch reports instead of its own: the
+    /// pinned servers run one image, and `server_version` is read-only, so
+    /// a differently packaged scratch is otherwise out of reach (#1700).
+    pub(super) static SCRATCH_BUILD: Option<String>;
 }
 
 pub mod container;

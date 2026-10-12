@@ -30,6 +30,8 @@ fn evidence() -> ResolverEvidence {
             target_build: "06".repeat(32),
             resolver_build: "07".repeat(32),
             channels: "08".repeat(32),
+            target_cluster: "09".repeat(32),
+            limitations: Default::default(),
             runtime: ResolverRuntime::Scratch {
                 scratch: ScratchSource::Server {},
                 outside_writes: OutsideWrites::Refused,
