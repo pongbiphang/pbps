@@ -167,6 +167,9 @@ mod resolver_discovery;
 #[path = "support/rename_order_pg.rs"]
 mod rename_order_pg;
 
+#[path = "support/partition_runway.rs"]
+mod partition_runway;
+
 #[test]
 #[ignore = "needs live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn doctor_resolver_discovery_is_advisory_and_never_acquires_an_engine() {
@@ -8158,6 +8161,50 @@ fn a_generated_series_is_planned_applied_and_verified_through_the_cli_before_pos
         "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
     );
     generated_series_flow(&server, "series-1789-old");
+}
+
+/// `doctor` reports a partitioned table whose series is about to run out, and
+/// one whose DEFAULT holds rows of a partition not created yet, and nothing
+/// for a series that reaches its horizon (#1789, DEC-1789.2). The whole
+/// scenario is `support/partition_runway.rs`'s.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn doctor_warns_when_a_partition_series_is_about_to_run_out() {
+    partition_runway::check(&server(), "runway-1789");
+}
+
+/// [`doctor_warns_when_a_partition_series_is_about_to_run_out`] on the pre-17
+/// server.
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn doctor_warns_when_a_partition_series_is_about_to_run_out_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    partition_runway::check(&server, "runway-1789-old");
+}
+
+/// A parent a rebuild holds `ACCESS EXCLUSIVE` is not waited for: both of
+/// `doctor`'s questions about it give up after a lock timeout and say so.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn doctor_does_not_queue_behind_a_locked_partitioned_table() {
+    partition_runway::locked(&server(), "runway-lock-1789");
+}
+
+/// [`doctor_does_not_queue_behind_a_locked_partitioned_table`] on the pre-17
+/// server.
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn doctor_does_not_queue_behind_a_locked_partitioned_table_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    partition_runway::locked(&server, "runway-lock-1789-old");
 }
 
 fn generated_series_flow(server: &str, slug: &str) {

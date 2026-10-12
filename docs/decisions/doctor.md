@@ -1162,3 +1162,111 @@ Pinned by:
 - `a_denied_dependency_function_is_named_at_that_function` and
   `only_the_functions_a_servers_reads_ask_are_required`
   (`crates/pbps-mssql/src/doctor.rs`).
+
+<a id="dec-1789-2"></a>
+
+**DEC-1789.2. `doctor` warns that a RANGE series is running out, measured from the
+newest partition that holds a row, and that a DEFAULT holds rows of a partition the
+declarations give and the database lacks; the plan says neither (#1789).**
+DEC-1789.1 wrote the generator that keeps a series ahead. Whether it is ahead is a
+question about a live database, and the maintainer settled where it is asked
+(2026-10-12): in `doctor`, against occupancy, with the horizon in `pbps.yml`.
+
+- **Why `doctor` and not `plan --db`.** A plan reads no data (SPEC 7.2), and its
+  checksum pins what it was shown. A finding that depends on which rows exist today
+  has no place in either. `doctor` already reads the live database to say whether
+  deploying is ready, its output is not checksummed, and a warning there changes no
+  plan. SPEC 7.2 stays true as written.
+- **The runway.** The catalog's frontier, the highest finite upper end among a
+  parent's range partitions, against the lower end of **the newest range partition
+  that holds a row**. The newest is found by `SELECT EXISTS` through the parent over
+  one partition's range, newest first, stopping at the first yes. Measured on 16.15
+  and 18.6, a range predicate on constants prunes the read to that one partition: the
+  plan names it alone, and `pg_locks` shows `ACCESS SHARE` on the parent and on it,
+  nothing else. A series with a long empty tail costs one empty read per partition,
+  and a table with rows in its newest partition costs one.
+- **Occupancy, not a clock.** It works for an integer key, which has no date to
+  compare to, and asks the same of the same database on every day it is run, which a
+  check run from CI needs. It measures what matters: a table loaded from an archive
+  has all the runway it needs however long ago its series stopped, and one whose rows
+  reach this month has none left when its series ends this month. The partition the
+  newest rows are in counts toward the runway, since a series that ends where it ends
+  has no room for the next period.
+- **Nothing to say.** A table with no row in any range partition has nothing to be
+  ahead of, and a series with a `MAXVALUE` partition has nothing to run out of. A
+  parent whose newest rows are in a partition with no lower end (`MINVALUE`) is
+  measured from that partition's upper end instead: its lower end is nowhere to
+  measure from, and the upper end is where its rows could be closest to the frontier.
+- **The horizon.** `partition_runway:` in `pbps.yml`, a single setting for the
+  project. A plain number is a count of partitions, for every key type: a number alone
+  cannot say whether it counts key values or partitions, and a count means the same
+  on a `date` key and on a `bigint`. A date or time key may instead be given a width
+  in `--every`'s grammar (`2month`), read by the generator's own parser
+  (`parse_step_as`), so the two cannot disagree on what a month is. It is counted on
+  the calendar from the lower end of the newest partition that holds a row, as the
+  generator counts its steps, with a day the target month lacks becoming its last day,
+  as the engine adds an interval. Absent, it is twice the newest partition's width. A
+  width of time on a number is not guessed at: that parent gets an `…-unknown` finding
+  saying to write a count.
+- **The DEFAULT's rows.** `EXISTS` of a row in the DEFAULT inside the range of any
+  declared partition the database does not have. A range the database has cannot have
+  a row there, so only the declared ranges it lacks are asked about, compared by their
+  bounds so that a rename does not matter. It is one statement over all of them, so the
+  DEFAULT is read once however many ranges are declared. When it answers yes, one
+  more read says which declared partitions hold rows, so the remedy names a partition
+  that does; if that read cannot be had, the finding stands and names those it might
+  be. **A row outside every declared range is not a finding.** Whether the series is
+  long enough is the runway's question, and a DEFAULT is allowed to hold what no
+  partition is meant to take.
+- **Privileges are the parent's.** Both questions read through the parent and filter
+  the DEFAULT by `tableoid`, over the leaves of its partition tree, since a row's
+  `tableoid` is the leaf's. Measured with a login holding `SELECT` on the parent alone:
+  the pruned read of a range and the read of the DEFAULT's rows both answer, and
+  `pg_partition_tree` answers for a DEFAULT the login may not read. A login without it
+  gets `permission denied for table`, which is an `…-unknown` finding.
+- **It reads rows' existence and writes nothing.** `SELECT EXISTS` returns a flag, and
+  every read is `READ ONLY`, in the canonical session (DEC-1170.1), so a `timestamptz`
+  bound prints in UTC. Each question is a transaction of its own, because an error
+  aborts a transaction and the next question would say only that. Each runs under a
+  `lock_timeout` of 5 s, so a parent a rebuild holds `ACCESS EXCLUSIVE` is not waited
+  for, and a `statement_timeout` of 30 s, since the DEFAULT is read whole when it holds
+  nothing of the range asked.
+- **Findings.** All warnings, and none counts toward `ready` or an unanswerable
+  environment: a series about to run out stops no deployment.
+  - `doctor.partition-runway` names the frontier, where the newest rows are, what the
+    horizon asks the series to reach, and where rows past it go (the DEFAULT, or
+    nowhere: the engine refuses them). Its remedy is `pbps partitions extend` with the
+    newest partition's width as `--every` where the generator can spell it. When the
+    declarations already reach the horizon, what is missing is a plan applied here, and
+    the remedy is `pbps plan`.
+  - `doctor.partition-default-rows` names the DEFAULT and the declared partitions
+    whose rows it holds. Its remedy is `pbps move-rows`, since creating the partition
+    moves them (DEC-1547.1) only as far as a human allowed (DEC-1788.1).
+  - `doctor.partition-runway-unknown` and `doctor.partition-default-rows-unknown`
+    carry a question that could not be answered, with the reason: a denied `SELECT`, a
+    lock or statement timeout, a bound this reader does not know, a horizon it cannot
+    read. The recorded identities being unreadable is one finding for the environment.
+    Absent, empty and unreadable are three different things: a parent the database
+    does not have, a table with no rows and a read that failed are a skipped parent,
+    no finding and a finding.
+- **Where it does not apply, nothing is said.** A parent of several key columns (no
+  single frontier), a key the generator does not step (`text`, `numeric`, an
+  expression), a LIST or HASH parent, a parent declared `partitions: external` (its
+  partitions are another tool's), and every table on SQL Server, which has no RANGE
+  partitions. A declared parent is found in the database through the recorded
+  identities, as the permission question finds it, so a pending rename is followed.
+- **Rejected.**
+  - **`now()`.** It makes the answer depend on when it is asked and needs a date key;
+    occupancy needs neither.
+  - **A plan finding.** It would put a data read in a plan (SPEC 7.2).
+  - **A setting per table.** The maintainer chose one key in `pbps.yml`. A table that
+    needs another horizon is a case for a design of its own.
+  - **An error severity.** Exit 2 on a series with three months left would teach
+    people to pipe `doctor` through `|| true`.
+
+Pinned by the arithmetic tests in `partition_runway.rs`, the query tests in
+`doctor/partitions.rs`, the finding tests in `doctor.rs`,
+`config_schema_and_loader_agree_on_partition_runway` and
+`partition_runway_is_a_count_or_a_width_and_absent_by_default`, and the live
+`doctor_warns_when_a_partition_series_is_about_to_run_out` and
+`doctor_does_not_queue_behind_a_locked_partitioned_table` on 18 and 16.

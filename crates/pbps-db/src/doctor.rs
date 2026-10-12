@@ -1,5 +1,5 @@
 //! What `doctor` asks a database about the connected account's permissions,
-//! on every engine.
+//! on every engine, and about the runway of its RANGE-partitioned tables.
 //!
 //! The question is read off the declarations, which is all `doctor` can see —
 //! it never looks at a plan — and the reading is engine-free: which tables
@@ -296,4 +296,165 @@ pub enum LockReadGap {
     /// or the question itself could not be asked. Never a reason to invent a
     /// grant.
     Unexplained,
+}
+
+// ---------------------------------------------------------------------------
+// The runway of a RANGE-partitioned table (#1789, DEC-1789.2)
+// ---------------------------------------------------------------------------
+
+/// A parent the declarations hold that the runway question can be asked of:
+/// a RANGE-partitioned table of one key column whose partitions pbps declares.
+///
+/// Read off the declarations like the rest of [`Ask`], and engine-free: which
+/// parents there are and which ranges the declarations give them. What the
+/// engine holds, where the newest rows are and how far the series reaches is
+/// each engine's (`pbps_pg::doctor::runway`). A parent of several key columns
+/// has no single frontier, and one declared `partitions: external` has its
+/// partitions made by another tool, so neither is here (DEC-1789.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionedParent {
+    /// The parent, as declared. A pending rename is followed by the engine,
+    /// through the recorded identities, as the permission question is.
+    pub name: ObjectName,
+    /// The ranges its declared partitions take, in name order. A DEFAULT
+    /// partition takes none.
+    pub ranges: Vec<DeclaredRange>,
+}
+
+/// One declared range partition: the key's single column from one datum
+/// (inclusive) to another (exclusive).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredRange {
+    pub partition: ObjectName,
+    pub from: pbps_model::BoundDatum,
+    pub to: pbps_model::BoundDatum,
+}
+
+impl PartitionedParent {
+    /// Every declared parent the question applies to.
+    #[must_use]
+    pub fn all(schema: &pbps_model::Schema) -> Vec<Self> {
+        use pbps_model::PartitionBound;
+        let mut ranges: BTreeMap<&ObjectName, Vec<DeclaredRange>> = BTreeMap::new();
+        for (name, table) in &schema.tables {
+            let Some(of) = &table.partition_of else {
+                continue;
+            };
+            // A bound of any other arity is the declarations' fault, which
+            // `validate` reports; it is no range for this question.
+            if let PartitionBound::Range { from, to } = &of.bound
+                && let ([from], [to]) = (from.as_slice(), to.as_slice())
+            {
+                ranges.entry(&of.parent).or_default().push(DeclaredRange {
+                    partition: name.clone(),
+                    from: from.clone(),
+                    to: to.clone(),
+                });
+            }
+        }
+        schema
+            .tables
+            .iter()
+            .filter(|(_, table)| {
+                table.partition_of.is_none()
+                    && table
+                        .partition_by
+                        .as_ref()
+                        .is_some_and(|by| !by.external && by.columns.len() == 1)
+            })
+            .map(|(name, _)| Self {
+                name: name.clone(),
+                ranges: ranges.remove(name).unwrap_or_default(),
+            })
+            .collect()
+    }
+}
+
+/// What `doctor` asks about the partitioned parents (DEC-1789.2).
+#[derive(Debug, Clone, Copy)]
+pub struct RunwayAsk<'a> {
+    pub parents: &'a [PartitionedParent],
+    /// `partition_runway:` as written, or `None` for the default: twice the
+    /// newest partition's width. The engine reads the text, since only it
+    /// knows what the key's values are.
+    pub horizon: Option<&'a str>,
+}
+
+/// What the engine found, for the parents it has something to say about.
+///
+/// A parent with nothing here is one with nothing to report: a series that
+/// reaches the horizon, a table with no rows, a DEFAULT holding no row of a
+/// range the declarations hold and the database lacks, a parent this
+/// database does not have yet, or one the question does not apply to (an
+/// engine without RANGE partitions answers with an empty report).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunwayReport {
+    pub parents: Vec<ParentRunway>,
+}
+
+/// The two findings one parent can carry, each present or absent on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentRunway {
+    /// The parent as declared.
+    pub parent: ObjectName,
+    pub runway: Option<Runway>,
+    pub default_rows: Option<DefaultRows>,
+}
+
+/// Whether a parent's partitions reach far enough past its rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Runway {
+    Short(ShortRunway),
+    /// The question could not be answered, for this reason. Never read as a
+    /// series that is long enough.
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShortRunway {
+    /// Where the database's partitions end.
+    pub frontier: String,
+    /// Where the partition holding the newest rows starts (or, for one with
+    /// no lower end, where it ends).
+    pub held_from: String,
+    /// What the horizon asks the series to reach.
+    pub reach: Reach,
+    /// How the horizon is stated: the configured text, or the default's words.
+    pub horizon: String,
+    /// The newest partition's width as `--every` spells it, when it can be.
+    pub every: Option<String>,
+    /// Whether the declarations already reach as far as the horizon asks, so
+    /// that what is missing is a plan applied and not a partition declared.
+    pub declared_covers: bool,
+    /// The parent's DEFAULT partition, where the rows past the frontier land.
+    pub default: Option<ObjectName>,
+}
+
+/// What a horizon asks of a series, worked out against the partition that
+/// holds the newest rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    /// The series should end at or after this key value, as the engine
+    /// prints it.
+    Until(String),
+    /// This many partitions should end after where the newest rows start, the
+    /// one holding them the first.
+    Partitions(u32),
+}
+
+/// Rows in a parent's DEFAULT partition that belong to partitions the
+/// declarations hold and the database does not yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultRows {
+    Held {
+        /// The DEFAULT partition, under the name the database has.
+        default: ObjectName,
+        /// The declared partitions the database lacks, in name order.
+        missing: Vec<ObjectName>,
+        /// Those of them whose range the DEFAULT holds a row of. Empty when
+        /// which could not be read, and then it is one of `missing`.
+        holding: Vec<ObjectName>,
+    },
+    /// The DEFAULT could not be read, for this reason.
+    Unknown(String),
 }

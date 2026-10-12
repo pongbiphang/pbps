@@ -96,8 +96,12 @@ own, and `pull` declares it on pg_partman's parents and on each
 `pbps partitions extend` declares a range series's next partitions in the
 parent's file, from the last declared range to an exclusive end the user states,
 in the engine's own bound spelling; it reads no clock and creates nothing (#1789,
-DEC-1789.1). Open: the `doctor` warning that the series is running short (#1789,
-second part), and non-UTC `timestamptz` bounds (#1757).
+DEC-1789.1). `doctor` warns when a range series ends within a horizon of the
+newest partition that holds a row (`partition_runway:` in `pbps.yml`, twice the
+newest partition's width by default), and when the DEFAULT holds rows of a
+declared partition the database lacks; a question it could not answer is its own
+`-unknown` finding (#1789, DEC-1789.2). Open: non-UTC `timestamptz` bounds
+(#1757).
 
 A SQL Server column may name its collation (`collation:`); `pull` declares one
 that differs from the database's default, and a collation change is a planned

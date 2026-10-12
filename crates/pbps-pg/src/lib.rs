@@ -64,6 +64,7 @@ pub mod generated;
 pub mod impact;
 pub mod introspect;
 pub mod modules;
+mod partition_runway;
 mod partition_series;
 pub mod partman;
 pub mod pins;
