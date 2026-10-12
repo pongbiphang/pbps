@@ -929,3 +929,38 @@ step replays and apply-guard migration are separate slices of #1772.
 Pinned by the index's boundary, handoff, owner, lifetime and generated-sequence
 tests; a compile-fail example for stale use across mutation; consumer rename
 chain tests; and both engines' existing live removal-handoff regression.
+
+<a id="dec-1868-1"></a>
+
+**DEC-1868.1. Cost and key consumers select an identity at the statement
+boundary before asking for its catalog name.** Both cost estimators and SQL
+Server's retyped-key reader use `Before(i)`. An identity removed earlier is
+absent, not the new object that takes its address. Unmanaged catalog names
+remain readable where the consumer previously read them; a table created by
+the plan has no starting catalog instance. A new SQL Server column is excluded
+from the old-column key probe, while a missing old column still refuses.
+
+PostgreSQL estimates retain the column UID's first managed spelling, which
+can begin after `Start`, instead of treating the start of managed scope as
+physical creation. `column_first` reports spelling history; it does not give
+a detached column a UID before detach or prove a stored catalog source. This
+preserves the estimator's existing CHECK/statistics lookup after detach then
+rename. Cost classification, per-statement strategy, prefix-sensitive removed
+CHECK facts, emitted SQL and saved-plan encoding stay with their existing
+owners. Cost-index failure is advisory unavailable output, as catalog-read
+failure already is (ADR-0012 §3).
+
+This index does not cover unscheduled logical changes or physical column
+lineage across scope changes. Resolver's ordinary prefix can contain a logical
+table-name swap before catalog allocation has made it executable; its
+ownership migration remains #1871, coordinated with #1776. Attach/detach
+retire/introduce managed column UIDs while keeping physical columns. The
+PostgreSQL drop reader and dependent weaving retain their existing lookups
+until #1875 supplies that projection. Weakening the index or treating a
+missing UID as proof of physical absence would change existing behavior.
+
+Pinned by real-engine cost-name handoffs, SQL Server new/old column controls,
+and the detach/rename CHECK-cost case. Restoring each removed replay body
+while retaining its new API wiring makes its boundary regression fail at
+runtime. First-spelling tests also pin absent and unknown UID controls without
+extending the managed lifetime.

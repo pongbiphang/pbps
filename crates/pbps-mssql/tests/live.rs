@@ -32,6 +32,9 @@ use pbps_model::{
 };
 use pbps_mssql::Mssql;
 
+#[path = "support/plan_names.rs"]
+mod plan_names_tests;
+
 #[path = "support/estimate.rs"]
 mod estimate_tests;
 

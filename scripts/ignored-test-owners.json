@@ -1687,6 +1687,8 @@
         "referenced_column_subsets_match_the_foreign_key_and_its_probe",
         "referenced_key_guards_use_actual_bindings_and_prior_removals",
         "rename_impact_finds_the_dependencies_that_block",
+        "plan_names_tests::a_new_columns_retype_has_no_stored_key_to_probe_but_a_missing_old_one_refuses",
+        "plan_names_tests::layout_estimates_measure_each_occupant_before_and_after_name_reuse",
         "rename_chains_report_each_identity_once_without_changing_dependency_decisions",
         "removal_names_tests::a_removal_keeps_its_stored_table_when_names_change_hands",
         "resolver_tests::contained611::a_partially_contained_target_needs_a_server_that_allows_contained_databases",
@@ -2187,7 +2189,9 @@
         "unlogged_tables_round_trip_and_switch_in_foreign_key_order",
         "views_with_nondefault_options_are_named_and_default_options_stay_plain",
         "what_the_model_cannot_hold_is_named_and_never_silently_dropped",
-        "a_date_or_time_literal_read_two_ways_is_found_on_both_versions"
+        "a_date_or_time_literal_read_two_ways_is_found_on_both_versions",
+        "plan_names_tests::estimates_measure_each_occupant_before_and_after_name_reuse",
+        "plan_names_tests::a_detached_columns_estimate_keeps_its_catalog_spelling_after_rename"
       ]
     },
     {

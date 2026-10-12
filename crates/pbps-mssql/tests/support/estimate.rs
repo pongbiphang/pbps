@@ -4,6 +4,13 @@ use pbps_mssql::estimate::{self, Reads, Rewrite, RowStorage};
 
 include!("estimate_types.rs");
 
+fn fixture_planned_estimates(changes: &ChangeSet) -> Vec<(usize, estimate::Estimate)> {
+    let ids = super::plan_fixture::ids(changes);
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids)
+        .expect("consistent estimate fixture identities");
+    estimate::planned_estimates(&names)
+}
+
 fn retype(table: &str, column: &str, from: &str, to: &str) -> PlannedChange {
     PlannedChange::new(Change::AlterColumnType {
         uid: pbps_model::Uid::generate(UidKind::Column),
@@ -249,7 +256,7 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
     let cs = ChangeSet {
         changes: vec![retype("dbo.t", "v", "int", "bigint")],
     };
-    let mut e = estimate::planned_estimates(&cs).pop().unwrap().1;
+    let mut e = fixture_planned_estimates(&cs).pop().unwrap().1;
     estimate::against(&mut db.conn, &mut e).await.unwrap();
     assert_eq!(
         (e.rewrite, e.reads, e.rows),
@@ -259,7 +266,7 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
         .execute("ALTER TABLE dbo.t REBUILD WITH(DATA_COMPRESSION=ROW)")
         .await
         .unwrap();
-    let mut e = estimate::planned_estimates(&cs).pop().unwrap().1;
+    let mut e = fixture_planned_estimates(&cs).pop().unwrap().1;
     estimate::against(&mut db.conn, &mut e).await.unwrap();
     assert_eq!((e.rewrite, e.reads), (Rewrite::No, Reads::Nothing));
 
@@ -268,7 +275,7 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
         unreachable!()
     };
     let uid = uid.clone();
-    let renamed = ChangeSet {
+    let mut renamed = ChangeSet {
         changes: vec![
             column.clone(),
             PlannedChange::new(Change::RenameColumn {
@@ -286,7 +293,8 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
             }),
         ],
     };
-    let mut e = estimate::planned_estimates(&renamed).pop().unwrap().1;
+    renamed.changes.reverse();
+    let mut e = fixture_planned_estimates(&renamed).pop().unwrap().1;
     estimate::against(&mut db.conn, &mut e).await.unwrap();
     assert_eq!(
         (e.table.to_string(), e.rewrite, e.rows),
@@ -298,7 +306,7 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
     let online = ChangeSet {
         changes: vec![column],
     };
-    let mut e = estimate::planned_estimates(&online).pop().unwrap().1;
+    let mut e = fixture_planned_estimates(&online).pop().unwrap().1;
     estimate::against(&mut db.conn, &mut e).await.unwrap();
     assert!(matches!(e.rewrite, Rewrite::Unknown(_)));
     assert!(e.lock.contains("unknown"));
@@ -310,14 +318,17 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
             PlannedChange::new(Change::CreateTable {
                 uid: pbps_model::Uid::generate(UidKind::Table),
                 name: "dbo.t".parse().unwrap(),
-                table: Box::default(),
+                table: Box::new(pbps_model::Table {
+                    columns: [("v".into(), pbps_model::Column::new("int".parse().unwrap()))].into(),
+                    ..Default::default()
+                }),
                 beside_default: None,
                 moves_at_most: None,
             }),
             cs.changes[0].clone(),
         ],
     };
-    let mut e = estimate::planned_estimates(&created).pop().unwrap().1;
+    let mut e = fixture_planned_estimates(&created).pop().unwrap().1;
     estimate::against(&mut db.conn, &mut e).await.unwrap();
     assert!(matches!(e.rewrite, Rewrite::Unknown(_)));
     assert!(e.rows.is_none() && e.rows_unknown.is_some());
@@ -328,7 +339,7 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
         "DROP TABLE dbo.t",
     ] {
         db.conn.execute(context).await.unwrap();
-        let mut e = estimate::planned_estimates(&cs).pop().unwrap().1;
+        let mut e = fixture_planned_estimates(&cs).pop().unwrap().1;
         estimate::against(&mut db.conn, &mut e).await.unwrap();
         assert!(matches!(e.rewrite, Rewrite::Unknown(_)), "{context}");
         assert!(matches!(e.reads, Reads::Unknown(_)), "{context}");
@@ -357,7 +368,7 @@ async fn sparse_columns_keep_column_work_unknown_beside_a_measured_control() {
         let cs = ChangeSet {
             changes: vec![retype("dbo.t", column, "int", "bigint")],
         };
-        let mut e = estimate::planned_estimates(&cs).pop().unwrap().1;
+        let mut e = fixture_planned_estimates(&cs).pop().unwrap().1;
         estimate::against(&mut db.conn, &mut e).await.unwrap();
         assert_eq!(
             !matches!(e.rewrite, Rewrite::Unknown(_)),
@@ -411,7 +422,7 @@ async fn predicate_only_filtered_indexes_keep_column_work_unknown() {
         if !context.is_empty() {
             db.conn.execute(context).await.unwrap();
         }
-        let mut e = estimate::planned_estimates(&cs).pop().unwrap().1;
+        let mut e = fixture_planned_estimates(&cs).pop().unwrap().1;
         estimate::against(&mut db.conn, &mut e).await.unwrap();
         if measured {
             assert_eq!(
@@ -495,7 +506,7 @@ async fn a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so() 
             }),
         ],
     };
-    let mut estimates = estimate::planned_estimates(&cs);
+    let mut estimates = fixture_planned_estimates(&cs);
     // The nonclustered key's build is not one of them: nothing is measured
     // for it, and it does not move the rows.
     assert_eq!(
@@ -520,7 +531,7 @@ async fn a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so() 
     // no rows to rewrite yet.
     let mut online = cs.changes[2].clone();
     online.strategy.online = true;
-    let mut e = estimate::planned_estimates(&ChangeSet {
+    let mut e = fixture_planned_estimates(&ChangeSet {
         changes: vec![online],
     })
     .pop()
@@ -541,7 +552,7 @@ async fn a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so() 
             cs.changes[2].clone(),
         ],
     };
-    let mut e = estimate::planned_estimates(&created).pop().unwrap().1;
+    let mut e = fixture_planned_estimates(&created).pop().unwrap().1;
     estimate::against(&mut db.conn, &mut e).await.unwrap();
     assert!(matches!(e.rewrite, Rewrite::Unknown(_)));
     assert!(e.rows.is_none() && e.rows_unknown.is_some());

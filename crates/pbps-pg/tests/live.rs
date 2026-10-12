@@ -25,6 +25,9 @@ use pbps_dialect::{Dialect, TypeChangeRisk};
 use pbps_model::ColumnType;
 use pbps_pg::Postgres;
 
+#[path = "support/plan_names.rs"]
+mod plan_names_tests;
+
 #[path = "support/resolver.rs"]
 mod resolver_tests;
 
@@ -27700,7 +27703,7 @@ fn one_estimate(
     change: &pbps_model::Change,
     strategy: pbps_model::Strategy,
 ) -> Option<pbps_pg::estimate::Estimate> {
-    pbps_pg::estimate::estimates(
+    fixture_estimates(
         &pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(change.clone())],
         },
@@ -28996,7 +28999,7 @@ async fn nullability_folded_into_widening_keeps_unparsed_check_uncertainty() {
 #[ignore = "needs live PostgreSQL"]
 async fn nullability_estimates_use_only_checks_surviving_to_the_statement() {
     use pbps_model::{Change, ChangeSet, PlannedChange};
-    use pbps_pg::estimate::{Lock, Reads, Rewrite, against, planned_estimates};
+    use pbps_pg::estimate::{Lock, Reads, Rewrite, against};
     let check = "a_removed\"check";
     for case in [
         "removed",
@@ -29108,7 +29111,7 @@ async fn nullability_estimates_use_only_checks_surviving_to_the_statement() {
                     > tighten
             );
         }
-        let mut es = planned_estimates(&cs);
+        let mut es = fixture_planned_estimates(&cs);
         for (_, e) in &mut es {
             against(&mut db, e).await.unwrap();
         }
@@ -29513,7 +29516,7 @@ async fn a_table_this_plan_creates_is_not_reported_as_missing() {
         Change, ChangeSet, Column, ForeignKey, IdsFile, PlannedChange, PrimaryKey,
         ReferentialAction, Schema, Table,
     };
-    use pbps_pg::estimate::{Lock, Reads, Rewrite, against, estimates};
+    use pbps_pg::estimate::{Lock, Reads, Rewrite, against};
 
     let mut conn = connect().await;
     let s = probe_schema_9("created_estimate");
@@ -29566,7 +29569,7 @@ async fn a_table_this_plan_creates_is_not_reported_as_missing() {
         "the plan creates the table whose key is estimated: {cs:#?}"
     );
 
-    let mut es = estimates(&cs, Strategy::default());
+    let mut es = fixture_estimates(&cs, Strategy::default());
     let key = es
         .iter_mut()
         .find(|e| e.about == "adding the foreign key child_parent")
@@ -29597,7 +29600,7 @@ async fn a_table_this_plan_creates_is_not_reported_as_missing() {
             }),
         })],
     };
-    let mut absent = estimates(&missing, Strategy::default())
+    let mut absent = fixture_estimates(&missing, Strategy::default())
         .pop()
         .expect("the key has an estimate");
     against(&mut conn, &mut absent)
@@ -29759,7 +29762,7 @@ async fn a_length_probe_is_measured_in_the_session_the_statement_will_run_in() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
     use pbps_model::{Change, ChangeSet, PlannedChange};
-    use pbps_pg::estimate::{Reads, Rewrite, Rows, against, planned_estimates};
+    use pbps_pg::estimate::{Reads, Rewrite, Rows, against};
     let mut db = TestDb::create("estimate_rename267").await;
     db.conn.execute("CREATE SCHEMA app; CREATE TABLE app.t (v integer, n integer, plain integer, CONSTRAINT ck_n CHECK (n IS NOT NULL)); CREATE INDEX ix_v ON app.t(v); INSERT INTO app.t SELECT g,g,g FROM generate_series(1,20) g; ANALYZE app.t").await.unwrap();
     let index_before = number(
@@ -29823,7 +29826,7 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
             }),
         ],
     };
-    let mut es = planned_estimates(&cs);
+    let mut es = fixture_planned_estimates(&cs);
     for (_, e) in &mut es {
         against(&mut db.conn, e).await.unwrap();
     }
@@ -29870,7 +29873,7 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn estimate_provenance_does_not_measure_a_vacated_names_old_identity() {
     use pbps_model::Change;
-    use pbps_pg::estimate::{Reads, Rewrite, Rows, against, planned_estimates};
+    use pbps_pg::estimate::{Reads, Rewrite, Rows, against};
     let mut db = TestDb::create("estimate_created296").await;
     db.conn.execute("CREATE SCHEMA app").await.unwrap();
     let old = TableName::new("app", "t");
@@ -29932,7 +29935,7 @@ async fn estimate_provenance_does_not_measure_a_vacated_names_old_identity() {
             .any(|p| matches!(&p.change,Change::CreateTable{name,..} if name==&old)),
         "{cs:#?}"
     );
-    let mut es = planned_estimates(&cs);
+    let mut es = fixture_planned_estimates(&cs);
     for (_, e) in &mut es {
         against(&mut db.conn, e).await.unwrap();
     }
@@ -29982,7 +29985,7 @@ async fn estimate_provenance_does_not_measure_a_vacated_names_old_identity() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists() {
     use pbps_model::{Change, ChangeSet, PlannedChange};
-    use pbps_pg::estimate::{Rewrite, Rows, against, estimates};
+    use pbps_pg::estimate::{Rewrite, Rows, against};
 
     let mut conn = connect().await;
     let s = probe_schema_9("renamed");
@@ -30018,7 +30021,7 @@ async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists
             }),
         ],
     };
-    let mut es = estimates(&cs, Strategy::default());
+    let mut es = fixture_estimates(&cs, Strategy::default());
     assert_eq!(es.len(), 2, "{es:#?}");
     let alter = &mut es[1];
     assert_eq!(
@@ -34569,4 +34572,21 @@ async fn rename_chains_report_each_identity_once_without_changing_dependency_dec
         }
     }
     db.drop().await;
+}
+
+fn fixture_planned_estimates(
+    changes: &pbps_model::ChangeSet,
+) -> Vec<(usize, pbps_pg::estimate::Estimate)> {
+    let ids = plan_fixture::ids(changes);
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
+    pbps_pg::estimate::planned_estimates(&names)
+}
+
+fn fixture_estimates(
+    changes: &pbps_model::ChangeSet,
+    strategy: pbps_model::Strategy,
+) -> Vec<pbps_pg::estimate::Estimate> {
+    let ids = plan_fixture::ids(changes);
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
+    pbps_pg::estimate::estimates(&names, strategy)
 }

@@ -7551,7 +7551,7 @@ pub fn cmd_plan_db(
             &entry.snapshot.schema,
         )?;
         let baseline = pbps_model::state_checksum(&pinned, &recorded_ids);
-        let cost = crate::engine::operational_cost(&mut conn, &cs).await;
+        let cost = crate::engine::operational_cost(&mut conn, &cs, &resolved.ids).await;
         // Last, so that the routines are sealed as close to the gate as the
         // plan can get them. The managed set is the one `apply` rebuilds from
         // the ledger and the plan: what was recorded, and what is declared.

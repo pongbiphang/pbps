@@ -59,7 +59,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::{Conn, DbError};
-use pbps_model::{Change, ChangeSet, ColumnType, Strategy, TableName};
+use pbps_model::{Change, ColumnType, Strategy, TableName};
 
 // Preserve this engine's public entry points while sharing only the questions
 // both measured implementations answer. PostgreSQL's Yes still replaces the
@@ -329,8 +329,11 @@ fn arg(ty: &ColumnType, i: usize) -> Option<i64> {
 /// Changes with no estimate are dropped rather than carried as `None`: a
 /// module, a role, a grant and a row change are not about a table's stored
 /// rows, and `estimate` says which.
-pub fn estimates(changes: &ChangeSet, strategy: Strategy) -> Vec<Estimate> {
-    estimates_with(changes, |_| strategy)
+pub fn estimates(
+    names: &pbps_model::plan_names::PlanNames<'_>,
+    strategy: Strategy,
+) -> Vec<Estimate> {
+    estimates_with(names, |_| strategy)
         .into_iter()
         .map(|(_, estimate)| estimate)
         .collect()
@@ -339,48 +342,18 @@ pub fn estimates(changes: &ChangeSet, strategy: Strategy) -> Vec<Estimate> {
 /// Estimate the strategy each planned statement will actually use. Indices
 /// refer to the original change set: unmeasured changes must not shift the
 /// reported cost onto another statement (DECISIONS 430).
-pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
-    estimates_with(changes, |p| p.strategy)
+pub fn planned_estimates(names: &pbps_model::plan_names::PlanNames<'_>) -> Vec<(usize, Estimate)> {
+    estimates_with(names, |p| p.strategy)
 }
 
 fn estimates_with(
-    changes: &ChangeSet,
+    names: &pbps_model::plan_names::PlanNames<'_>,
     strategy: impl Fn(&pbps_model::PlannedChange) -> Strategy,
 ) -> Vec<(usize, Estimate)> {
-    // Names describe the final plan; UIDs distinguish an existing table's
-    // rename from a new table reusing its source name. Collect the whole plan
-    // first because these facts may follow the statement being estimated.
-    let mut identities = BTreeMap::new();
-    for p in &changes.changes {
-        if let Change::CreateTable { uid, .. } = &p.change {
-            identities.insert(uid, CatalogSource::Created);
-        }
-    }
-    let mut columns = BTreeMap::new();
-    for p in &changes.changes {
-        if let Change::RenameTable { uid, from, .. } = &p.change {
-            identities
-                .entry(uid)
-                .or_insert_with(|| CatalogSource::Stored {
-                    table: from.clone(),
-                    column: None,
-                });
-        }
-        if let Change::RenameColumn { uid, from, .. } = &p.change {
-            columns.entry(uid).or_insert(from);
-        }
-    }
-    let mut tables = BTreeMap::new();
-    for p in &changes.changes {
-        if let Change::CreateTable { uid, name, .. } | Change::RenameTable { uid, to: name, .. } =
-            &p.change
-        {
-            tables.insert(name, &identities[uid]);
-        }
-    }
+    use pbps_model::plan_names::{At, Holder};
     let mut removed_checks: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
-    changes
-        .changes
+    names
+        .changes()
         .iter()
         .enumerate()
         .filter_map(|(index, p)| {
@@ -403,22 +376,18 @@ fn estimates_with(
             }
             let mut e = estimate(&p.change, strategy(p))?;
             e.removed_checks = removed_checks.get(&e.table).cloned().unwrap_or_default();
-            let source = if let Change::RenameTable { uid, .. } = &p.change {
-                // Its label is the old name, which may now name a different
-                // planned table. Only its own UID selects the right source.
-                identities.get(uid)
-            } else if let Change::SetReplicaIdentity { uid, .. } = &p.change {
-                // Planned at (0, 1) it runs under the name before any rename,
-                // which the final-name map may give to another table (#1620
-                // review). Its UID is right in either position; a UID no
-                // rename or creation names keeps its own, stable name.
-                identities.get(uid)
-            } else {
-                tables.get(&e.table).copied()
+            e.source = match names.holder(&e.table, At::Before(index)) {
+                Holder::Tracked(uid) => {
+                    names
+                        .table_at(uid, At::Start)
+                        .map_or(CatalogSource::Created, |table| CatalogSource::Stored {
+                            table: table.clone(),
+                            column: None,
+                        })
+                }
+                Holder::Unmanaged => e.source,
+                Holder::Vacant => CatalogSource::Created,
             };
-            if let Some(source) = source {
-                e.source = source.clone();
-            }
             // A partition created under a parent this plan creates locks
             // nothing anyone holds (#1171).
             if matches!(p.change, Change::CreateTable { .. }) && e.source == CatalogSource::Created
@@ -432,7 +401,13 @@ fn estimates_with(
                 && let Change::AlterColumnType { uid, column, .. }
                 | Change::AlterColumnNullability { uid, column, .. } = &p.change
             {
-                *stored_column = Some(columns.get(uid).copied().unwrap_or(&column.name).clone());
+                // Preserve the first spelling even when ordinary ownership
+                // begins at DETACH. Managed scope starting later does not
+                // mean the physical column was created by this plan.
+                *stored_column = names
+                    .column_first(uid)
+                    .map(|(_, name)| name.to_owned())
+                    .or_else(|| Some(column.name.clone()));
             }
             Some((index, e))
         })
@@ -1046,6 +1021,28 @@ pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ChangeSet;
+
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pbps-dialect/tests/support/plan_ids.rs"
+        ));
+    }
+
+    fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
+        let ids = fixture::ids(changes);
+        let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids)
+            .expect("consistent estimate fixture identities");
+        super::planned_estimates(&names)
+    }
+
+    fn estimates(changes: &ChangeSet, strategy: Strategy) -> Vec<Estimate> {
+        let ids = fixture::ids(changes);
+        let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids)
+            .expect("consistent estimate fixture identities");
+        super::estimates(&names, strategy)
+    }
 
     fn ty(s: &str) -> ColumnType {
         s.parse().expect("a type parses")
@@ -1306,7 +1303,7 @@ mod tests {
                     to_collation: None,
                 }),
                 PlannedChange::new(Change::RenameColumn {
-                    uid: "c_bbbbbb".parse().expect("a uid"),
+                    uid: "c_aaaaaa".parse().expect("a uid"),
                     table: tname("app.customer"),
                     from: "v".into(),
                     to: "amount".into(),
@@ -1429,7 +1426,7 @@ mod tests {
                 to_collation: None,
             })
         };
-        let cs = ChangeSet {
+        let mut cs = ChangeSet {
             changes: vec![
                 alter("c_aaaaaa", "app.customer.amount"),
                 alter("c_bbbbbb", "app.other.amount"),
@@ -1463,11 +1460,14 @@ mod tests {
                 }),
             ],
         };
+        // Statement spellings describe the point after their renames.
+        cs.changes.rotate_right(3);
+        cs.changes[..3].rotate_right(1);
         let es = estimates(&cs, Strategy::default());
         for (index, table, column) in [
-            (0, "app.client", "v"),
-            (1, "app.other", "amount"),
-            (2, "app.client", "n"),
+            (3, "app.client", "v"),
+            (4, "app.other", "amount"),
+            (5, "app.client", "n"),
         ] {
             assert_eq!(
                 es[index].source,
@@ -1477,9 +1477,9 @@ mod tests {
                 }
             );
         }
-        assert_eq!(es[0].table, tname("app.customer"));
-        assert!(es[0].about.contains("amount"));
-        assert!(es[2].about.contains("required"));
+        assert_eq!(es[3].table, tname("app.customer"));
+        assert!(es[3].about.contains("amount"));
+        assert!(es[5].about.contains("required"));
     }
 
     #[test]
@@ -1746,9 +1746,9 @@ mod tests {
     #[test]
     fn nullability_check_removals_follow_only_the_executed_prefix_and_identity() {
         use pbps_model::PlannedChange;
-        let tighten = |table| {
+        let tighten = |uid: &str, table| {
             PlannedChange::new(Change::AlterColumnNullability {
-                uid: "c_aaaaaa".parse().unwrap(),
+                uid: uid.parse().unwrap(),
                 column: tname(table).column("v"),
                 ty: ty("integer"),
                 to_nullable: false,
@@ -1764,7 +1764,7 @@ mod tests {
         };
         let cs = ChangeSet {
             changes: vec![
-                tighten("app.t"),
+                tighten("c_aaaaaa", "app.t"),
                 drop("app.t", "gone\"check"),
                 drop("app.other", "unrelated"),
                 PlannedChange::new(Change::RenameTable {
@@ -1773,17 +1773,20 @@ mod tests {
                     to: tname("app.kept"),
                     defaults: Vec::new(),
                 }),
-                tighten("app.kept"),
+                tighten("c_aaaaaa", "app.kept"),
                 drop("app.kept", "later"),
-                tighten("app.kept"),
+                tighten("c_aaaaaa", "app.kept"),
                 PlannedChange::new(Change::CreateTable {
                     uid: "t_bbbbbb".parse().unwrap(),
                     name: tname("app.t"),
-                    table: Box::default(),
+                    table: Box::new(pbps_model::Table {
+                        columns: [("v".into(), pbps_model::Column::new(ty("integer")))].into(),
+                        ..Default::default()
+                    }),
                     beside_default: None,
                     moves_at_most: None,
                 }),
-                tighten("app.t"),
+                tighten("c_bbbbbb", "app.t"),
             ],
         };
         let es = planned_estimates(&cs);
@@ -1977,5 +1980,60 @@ mod tests {
     #[test]
     fn never_analyzed_is_its_own_answer() {
         assert_ne!(Rows::NeverAnalyzed, Rows::Estimated(0));
+    }
+    #[test]
+    fn a_columns_first_managed_spelling_survives_a_scope_entry_then_rename() {
+        use pbps_model::{Column, IdsFile, PlannedChange, Table, plan_names::PlanNames};
+        let table = tname("app.child");
+        let mut shape = Table::default();
+        shape.columns.insert("v".into(), Column::new(ty("integer")));
+        let changes = [
+            Change::DetachPartition {
+                uid: "t_aaaaaa".parse().unwrap(),
+                table: table.clone(),
+                parent: tname("app.parent"),
+                names: vec![],
+                shape: Box::new(shape),
+            },
+            Change::RenameColumn {
+                uid: "c_aaaaaa".parse().unwrap(),
+                table: table.clone(),
+                from: "v".into(),
+                to: "amount".into(),
+                table_was: None,
+            },
+            Change::AlterColumnNullability {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: table.column("amount"),
+                ty: ty("integer"),
+                to_nullable: false,
+                through_external_partitions: false,
+                collation: None,
+            },
+        ]
+        .map(PlannedChange::new);
+        let ids = IdsFile {
+            tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
+            columns: [("c_aaaaaa".parse().unwrap(), table.column("amount"))].into(),
+            ..Default::default()
+        };
+        let names = PlanNames::of(&changes, &ids).unwrap();
+        assert!(
+            names
+                .column_at(
+                    &"c_aaaaaa".parse().unwrap(),
+                    pbps_model::plan_names::At::Start
+                )
+                .is_none()
+        );
+        let estimates = super::planned_estimates(&names);
+        let (_, estimate) = estimates.iter().find(|(i, _)| *i == 2).unwrap();
+        assert_eq!(
+            estimate.source,
+            CatalogSource::Stored {
+                table,
+                column: Some("v".into())
+            }
+        );
     }
 }
