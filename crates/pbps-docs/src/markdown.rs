@@ -8,7 +8,7 @@
 
 use std::fmt::Write as _;
 
-use pbps_model::{IdsFile, Schema, Table, TableName};
+use pbps_model::{ComputedColumn, IdsFile, Schema, Table, TableName};
 
 use crate::erd;
 
@@ -23,7 +23,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         schema
             .tables
             .values()
-            .map(|t| t.columns.len())
+            .map(|t| t.columns.len() + t.computed.len())
             .sum::<usize>(),
         schema.modules.len()
     );
@@ -125,6 +125,8 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
         );
     }
 
+    computed_table(s, table);
+
     if let Some(pk) = &table.primary_key {
         let _ = writeln!(
             s,
@@ -179,6 +181,34 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
     }
 }
 
+/// SQL Server computed columns (#1174), which the model holds beside the
+/// columns rather than among them. They get their own table because they have
+/// no type to show: the engine infers it and the model holds none
+/// (DEC-1174.1), and the expression is not a default.
+fn computed_table(s: &mut String, table: &Table) {
+    if table.computed.is_empty() {
+        return;
+    }
+    s.push_str("\n| Computed column | Expression | Stored |\n|---|---|---|\n");
+    for (col_name, c) in &table.computed {
+        let mut label = format!("`{col_name}`");
+        if table
+            .primary_key
+            .as_ref()
+            .is_some_and(|pk| pk.columns.iter().any(|p| p == col_name))
+        {
+            label.push_str(" **PK**");
+        }
+        let stored = computed_flags(c).unwrap_or_else(|| "—".into());
+        // An expression may hold a bitwise `|`, which would end the cell.
+        let _ = writeln!(
+            s,
+            "| {label} | `{}` | {stored} |",
+            c.expression.replace('|', "\\|")
+        );
+    }
+}
+
 /// Everything marked deprecated, in one place — the section a developer checks
 /// before using a column they have not seen before.
 fn deprecated_section(s: &mut String, schema: &Schema) {
@@ -224,6 +254,16 @@ fn graveyard(s: &mut String, ids: &IdsFile) {
     }
 }
 
+/// `persisted` and `not null` where declared, or `None` for a column
+/// computed on read with an inferred nullability.
+pub(crate) fn computed_flags(c: &ComputedColumn) -> Option<String> {
+    let flags: Vec<&str> = [(c.persisted, "persisted"), (c.not_null, "not null")]
+        .into_iter()
+        .filter_map(|(set, flag)| set.then_some(flag))
+        .collect();
+    (!flags.is_empty()).then(|| flags.join(", "))
+}
+
 fn columns(cols: &[String]) -> String {
     cols.iter()
         .map(|c| format!("`{c}`"))
@@ -242,7 +282,7 @@ fn cell(v: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pbps_model::{Column, ColumnType, PrimaryKey, Tombstone, Uid};
+    use pbps_model::{Column, ColumnType, Index, IndexColumn, PrimaryKey, Tombstone, Uid};
 
     fn ty(s: &str) -> ColumnType {
         s.parse().unwrap()
@@ -337,6 +377,68 @@ mod tests {
             .columns["id"]
             .description = Some("a | b".into());
         assert!(render(&s, &IdsFile::default(), "Schema").contains(r"a \| b"));
+    }
+
+    /// `documented()` plus two SQL Server computed columns (#1174), one
+    /// persisted and one computed on read, and an index over the persisted
+    /// one.
+    fn with_computed() -> Schema {
+        let mut s = documented();
+        let t = s
+            .tables
+            .get_mut(&TableName::new("dbo", "customer"))
+            .unwrap();
+        t.computed.insert(
+            "total".into(),
+            ComputedColumn {
+                expression: "[qty] * [price]".into(),
+                persisted: true,
+                not_null: true,
+            },
+        );
+        t.computed.insert(
+            "flags".into(),
+            ComputedColumn {
+                expression: "[a] | 4".into(),
+                persisted: false,
+                not_null: false,
+            },
+        );
+        t.indexes.insert(
+            "ix_total".into(),
+            Index {
+                columns: vec![IndexColumn::column("total")],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            },
+        );
+        s
+    }
+
+    /// The model holds computed columns beside the columns (#1174); a
+    /// renderer reading only `columns` drops them while the index over one
+    /// still names it.
+    #[test]
+    fn computed_columns_are_rendered_beside_the_columns() {
+        let out = render(&with_computed(), &IdsFile::default(), "Schema");
+        assert!(
+            out.contains("| `total` | `[qty] * [price]` | persisted, not null |"),
+            "{out}"
+        );
+        // Computed on read: no flags, and the `|` cannot end the cell.
+        assert!(out.contains(r"| `flags` | `[a] \| 4` | — |"), "{out}");
+        assert!(out.contains("- **Index** `ix_total`: `total`"), "{out}");
+        assert!(out.contains("4 column(s)"), "{out}");
+    }
+
+    #[test]
+    fn a_table_without_computed_columns_has_no_computed_table() {
+        let out = render(&documented(), &IdsFile::default(), "Schema");
+        assert!(!out.contains("Computed column"), "{out}");
+        assert!(out.contains("2 column(s)"), "{out}");
     }
 
     #[test]

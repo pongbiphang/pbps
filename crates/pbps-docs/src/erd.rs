@@ -58,6 +58,12 @@ pub fn render(schema: &Schema) -> String {
                 col_name
             );
         }
+        // A SQL Server computed column has no type in the model: the engine
+        // infers it (DEC-1174.1). `computed` stands in its place.
+        for col_name in table.computed.keys() {
+            let key = key_marker(table, col_name);
+            let _ = writeln!(s, "        computed {col_name}{key}");
+        }
         s.push_str("    }\n");
     }
 
@@ -71,10 +77,13 @@ pub fn render(schema: &Schema) -> String {
             }
             // A nullable referencing column means the relationship is optional,
             // which Mermaid spells `|o` rather than `||`.
-            let optional = fk
-                .columns
-                .iter()
-                .any(|c| table.columns.get(c).is_some_and(|c| c.nullable));
+            // Unless declared `not_null`, a computed column's nullability is
+            // the engine's inference, which the model does not hold: optional
+            // is the drawing that holds either way.
+            let optional = fk.columns.iter().any(|c| {
+                table.columns.get(c).is_some_and(|c| c.nullable)
+                    || table.computed.get(c).is_some_and(|c| !c.not_null)
+            });
             let left = if optional { "}o" } else { "}|" };
             let _ = writeln!(
                 s,
@@ -109,7 +118,7 @@ fn key_marker(table: &Table, column: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pbps_model::{Column, ColumnType, ForeignKey, PrimaryKey};
+    use pbps_model::{Column, ColumnType, ComputedColumn, ForeignKey, PrimaryKey};
 
     fn ty(s: &str) -> ColumnType {
         s.parse().unwrap()
@@ -201,6 +210,53 @@ mod tests {
         s.tables.remove(&TableName::new("dbo", "region"));
         let out = render(&s);
         assert!(!out.contains("--||"), "{out}");
+    }
+
+    /// A SQL Server computed column (#1174) has no type in the model; it is
+    /// drawn with `computed` in its place, and keyed like any column.
+    #[test]
+    fn computed_columns_are_drawn_with_a_computed_marker() {
+        let mut s = two_table_schema(false);
+        let customer = s
+            .tables
+            .get_mut(&TableName::new("dbo", "customer"))
+            .unwrap();
+        customer.computed.insert(
+            "total".into(),
+            ComputedColumn {
+                expression: "[qty] * [price]".into(),
+                persisted: false,
+                not_null: false,
+            },
+        );
+        let out = render(&s);
+        assert!(out.contains("        computed total\n"), "{out}");
+    }
+
+    /// An edge over a computed column is optional unless the column is
+    /// declared `not_null`; its absence from `columns` must not read as
+    /// mandatory.
+    #[test]
+    fn a_foreign_key_over_a_computed_column_is_optional_unless_not_null() {
+        for (not_null, edge) in [(false, "}o--||"), (true, "}|--||")] {
+            let mut s = two_table_schema(false);
+            let customer = s
+                .tables
+                .get_mut(&TableName::new("dbo", "customer"))
+                .unwrap();
+            customer.columns.shift_remove("region_id");
+            customer.computed.insert(
+                "region_id".into(),
+                ComputedColumn {
+                    expression: "[id] % 10".into(),
+                    persisted: true,
+                    not_null,
+                },
+            );
+            let out = render(&s);
+            assert!(out.contains(edge), "not_null {not_null}: {out}");
+            assert!(out.contains("computed region_id FK"), "{out}");
+        }
     }
 
     #[test]
