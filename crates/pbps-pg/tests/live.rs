@@ -2929,8 +2929,63 @@ async fn a_generated_columns_inputs_leave_out_its_own_column() {
         [Dependence {
             base: "a".into(),
             generated: "b".into(),
+            base_required: false,
         }]
     );
+    // Which inputs a row cannot be inserted without (#1397): `NOT NULL` with
+    // no default only. A default or an identity fills the column, and a
+    // nullable one takes NULL.
+    db.execute(&format!(
+        "CREATE TABLE {s}.r (id integer PRIMARY KEY, req integer NOT NULL,
+                             dflt integer NOT NULL DEFAULT 0,
+                             ident integer NOT NULL GENERATED ALWAYS AS IDENTITY,
+                             opt integer,
+                             g bigint GENERATED ALWAYS AS (req + dflt + ident + opt) STORED);"
+    ))
+    .await
+    .expect("the table");
+    let found = dependences(&mut db.conn, &TableName::new(&s, "r"))
+        .await
+        .expect("the catalog answers");
+    assert_eq!(
+        found
+            .iter()
+            .map(|d| (d.base.as_str(), d.base_required))
+            .collect::<Vec<_>>(),
+        [
+            ("dflt", false),
+            ("ident", false),
+            ("opt", false),
+            ("req", true)
+        ]
+    );
+    // A row-level `BEFORE INSERT` trigger may fill any of them, so none is
+    // required while one is enabled; a disabled one fills nothing.
+    db.execute(&format!(
+        "CREATE FUNCTION {s}.fill() RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN NEW.req := 0; RETURN NEW; END $$;
+         CREATE TRIGGER fill BEFORE INSERT ON {s}.r FOR EACH ROW EXECUTE FUNCTION {s}.fill();"
+    ))
+    .await
+    .expect("the trigger");
+    let required = |found: &[Dependence]| {
+        found
+            .iter()
+            .filter(|d| d.base_required)
+            .map(|d| d.base.clone())
+            .collect::<Vec<_>>()
+    };
+    let found = dependences(&mut db.conn, &TableName::new(&s, "r"))
+        .await
+        .expect("the catalog answers");
+    assert!(required(&found).is_empty(), "{found:?}");
+    db.execute(&format!("ALTER TABLE {s}.r DISABLE TRIGGER fill;"))
+        .await
+        .expect("disabled");
+    let found = dependences(&mut db.conn, &TableName::new(&s, "r"))
+        .await
+        .expect("the catalog answers");
+    assert_eq!(required(&found), ["req"], "{found:?}");
     db.execute(&format!("ALTER TABLE {s}.t ALTER COLUMN b TYPE bigint;"))
         .await
         .expect("the generated column itself retypes");
