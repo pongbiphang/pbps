@@ -1225,3 +1225,36 @@ checkpoint would already be gone from the next comparison's baseline, and the
 closing read would have nothing to miss (#1692 review). A table the plan
 creates, drops, renames, attaches or detaches is left to the closing read's
 checks of those changes, since it may rightly be absent part way through.
+
+<a id="dec-1901-1"></a>
+
+**DEC-1901.1. Table scalar requirements are derived before their read-back
+comparison.** The first slice of #1774 replaces separate replica-identity,
+storage and persistence collectors and three copies of their UID lookup with
+one table-settings index. A setting retains its execution name beside its UID:
+settings on either side of a rename can spell one table differently, and two
+tables handing off a name must not inherit each other's settings. The same
+index supplies a created table's split replica-identity setting; its remaining
+created-table checks stay for the later slice.
+
+`deploy::guard::expect` produces explicit kept, planned, planned-or-kept and
+unpromised requirements. `check` compares those requirements without deciding
+which changes exempt a field. The existing checkpoint policies remain visible:
+replica identity and persistence are unpromised mid-run, storage is held to
+either side, and period/versioning and partition placement remain kept. This
+preserves SPEC §7.6 rather than broadening one family's checkpoint exemption
+to the others. A kept read-back is exact; the expression-bearing fields are
+not part of this slice.
+
+The existing name normalization remains its own input. Where a partition key's
+column names change hands, its kept baseline is brought forward and compared
+with the unrewound later read, as in #1692. System-time findings retain their
+position after the partition-own findings until that family's slice moves too.
+The table-settings match is exhaustive, so a new change must explicitly say
+whether this family handles it. Other field families and the production-only
+single-change staged contract remain #1774's later slices.
+
+The scalar tests cover kept fields at every read, planned checkpoint policies,
+a reset to default replica identity, and settings across a table-name handoff.
+The temporary old/new comparison checked full diagnostic strings and ordering
+through the deployment tests, then the old implementation was removed.

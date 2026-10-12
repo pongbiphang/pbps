@@ -29,6 +29,8 @@ use pbps_model::{
 
 use crate::db::{self, Target};
 
+mod guard;
+
 /// A scoped live state, plus the declared modules the read could not express.
 ///
 /// The second list cannot live in [`pbps_diff::Scoped`] — "pbps cannot read
@@ -3858,28 +3860,7 @@ fn refuse_unplanned_movement(
     // the other from every comparison (DECISIONS 168).
     let mut constraints: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut keys: BTreeSet<&TableName> = BTreeSet::new();
-    // The tables whose replica identity this plan sets, by uid, with the
-    // last value it sets and a name a setting ran under: the old one ahead of
-    // the renames, the new one after the additions (DEC-1444.1). By uid, not
-    // by that name, which in a handoff (`a` to `b` while `b` goes to `c`) two
-    // tables' settings share (#1467 review).
-    let mut identities: BTreeMap<
-        &pbps_model::Uid,
-        (Option<&pbps_model::ReplicaIdentity>, &TableName),
-    > = BTreeMap::new();
-    // The tables whose storage parameters this plan sets, by uid: what it
-    // sets and resets, and the name it runs under, which is the table's
-    // final one (#1441).
-    // What it sets, what it resets, and the name it runs under.
-    type StorageSetting<'a> = (
-        &'a BTreeMap<String, String>,
-        &'a BTreeSet<String>,
-        &'a TableName,
-    );
-    let mut storage_changes: BTreeMap<&pbps_model::Uid, StorageSetting<'_>> = BTreeMap::new();
-    // The tables whose persistence this plan switches, by uid: to what, and
-    // the name it runs under, which is the table's final one (#1443).
-    let mut persistence_changes: BTreeMap<&pbps_model::Uid, (bool, &TableName)> = BTreeMap::new();
+    let scalar_changes = guard::TableChanges::of(changes);
     // Index parameters the plan sets in place: the table, under its final
     // name, which part, and what it sets and resets (#1442).
     type IndexSetting<'a> = (
@@ -3889,8 +3870,6 @@ fn refuse_unplanned_movement(
         &'a BTreeSet<String>,
     );
     let mut index_storage_changes: Vec<IndexSetting<'_>> = Vec::new();
-    // Each renamed table's uid, by its old and new names.
-    let mut renamed_uids: BTreeMap<&pbps_model::Uid, (&TableName, &TableName)> = BTreeMap::new();
     // The defaults a change of this plan's own sets, by column. A created
     // table's column may have its default taken out of the `CREATE` and set
     // after a function the plan rebuilds (#1027, DEC-942.1), so the payload
@@ -3920,9 +3899,8 @@ fn refuse_unplanned_movement(
         table
     }
     for (index, p) in changes.changes.iter().enumerate() {
-        if let pbps_model::Change::RenameTable { uid, from, to, .. } = &p.change {
+        if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
             renamed.insert(from, to);
-            renamed_uids.insert(uid, (from, to));
         }
         if let pbps_model::Change::RenameRole { from, to, .. } = &p.change {
             renamed_roles.insert(from, to);
@@ -4008,26 +3986,6 @@ fn refuse_unplanned_movement(
         if let pbps_model::Change::AttachPartition { table, shape, .. } = &p.change {
             created.insert(table, shape.as_ref());
             attached.insert(table);
-        }
-        if let pbps_model::Change::SetReplicaIdentity { uid, table, to } = &p.change {
-            identities.insert(uid, (to.as_ref(), table));
-        }
-        if let pbps_model::Change::SetStorageParameters {
-            uid,
-            table,
-            set,
-            reset,
-        } = &p.change
-        {
-            storage_changes.insert(uid, (set, reset, table));
-        }
-        if let pbps_model::Change::SetTablePersistence {
-            uid,
-            table,
-            unlogged,
-        } = &p.change
-        {
-            persistence_changes.insert(uid, (*unlogged, table));
         }
         // An index's parameters set in place change its part as an index
         // change does, so the part is this plan's (#1442); what it leaves is
@@ -4608,8 +4566,8 @@ fn refuse_unplanned_movement(
             // split setting is that one (#1467 review).
             let target = created_uids
                 .get(now_name)
-                .and_then(|uid| identities.get(uid))
-                .map_or(declared.replica_identity.as_ref(), |(to, _)| *to);
+                .and_then(|uid| scalar_changes.created_identity(uid))
+                .unwrap_or(declared.replica_identity.as_ref());
             if (settled.whole() || now.replica_identity.is_some())
                 && target != now.replica_identity.as_ref()
             {
@@ -4838,130 +4796,15 @@ fn refuse_unplanned_movement(
                 s,
                 m,
             );
-            // The replica identity, which every part can read back unchanged
-            // around (#1444). Where this plan sets it, any value is the plan in
-            // progress until the run is whole, and then it must be the last one
-            // the plan sets: another session's after the plan's is movement
-            // (#1467 review). The table's uid is the one whose rename runs from
-            // this name to that, or, unrenamed, whose settings ran under it.
-            let planned = identities.iter().find_map(|(uid, (to, ran_under))| {
-                let ours = match renamed_uids.get(uid) {
-                    Some((from, to)) => *from == name && *to == now_name,
-                    None => *ran_under == name && name == now_name,
-                };
-                ours.then_some(*to)
-            });
-            match planned {
-                None if was.replica_identity != now.replica_identity => {
-                    moved.push(format!(
-                        "{now_name} replica identity changed, and no change of this plan sets it"
-                    ));
-                }
-                Some(planned) if settled.whole() && now.replica_identity.as_ref() != planned => {
-                    moved.push(format!(
-                        "{now_name} replica identity is not the one this plan sets"
-                    ));
-                }
-                None | Some(_) => {}
-            }
-            // Storage parameters, the same way (#1441): the plan's own setting
-            // is the before-read with its `set` applied and its `reset`
-            // removed, held once the run is whole; mid-run the table may hold
-            // either. Found by uid, through the rename that runs from this
-            // name to that, as the identity is.
-            let planned_storage = storage_changes.iter().find_map(|(uid, (set, reset, ran))| {
-                let ours = match renamed_uids.get(uid) {
-                    Some((from, to)) => *from == name && *to == now_name,
-                    None => *ran == name && name == now_name,
-                };
-                ours.then(|| {
-                    let mut expected = was.storage_parameters.clone();
-                    expected.retain(|k, _| !reset.contains(k));
-                    expected.extend(set.iter().map(|(k, v)| (k.clone(), v.clone())));
-                    expected
-                })
-            });
-            let storage_moved = match &planned_storage {
-                None => was.storage_parameters != now.storage_parameters,
-                Some(expected) if settled.whole() => *expected != now.storage_parameters,
-                Some(expected) => {
-                    now.storage_parameters != *expected
-                        && now.storage_parameters != was.storage_parameters
-                }
+            let key_handoff = partition_hands.get(now_name);
+            let scalar_expected =
+                scalar_changes.expect(name, now_name, was, settled.whole(), key_handoff);
+            let placed = if key_handoff.is_some() {
+                after.tables.get(now_name).unwrap_or(now)
+            } else {
+                now
             };
-            if storage_moved {
-                moved.push(format!(
-                    "{now_name} storage parameters are not the ones this plan leaves"
-                ));
-            }
-            // Its persistence, the same way (#1443): unswitched, it is held
-            // to the before-read; switched, to the plan's value once the run
-            // is whole, either side being the plan in progress before then.
-            let planned_persistence =
-                persistence_changes
-                    .iter()
-                    .find_map(|(uid, (unlogged, ran))| {
-                        let ours = match renamed_uids.get(uid) {
-                            Some((from, to)) => *from == name && *to == now_name,
-                            None => *ran == name && name == now_name,
-                        };
-                        ours.then_some(*unlogged)
-                    });
-            let persistence_moved = match planned_persistence {
-                None => was.unlogged != now.unlogged,
-                Some(unlogged) => settled.whole() && now.unlogged != unlogged,
-            };
-            if persistence_moved {
-                moved.push(format!(
-                    "{now_name} is {} and this plan does not leave it so",
-                    if now.unlogged { "unlogged" } else { "logged" }
-                ));
-            }
-            // Its place in the tree: a partition's parent and bound, and a
-            // parent's partition key. No change of this plan moves either on
-            // a table it keeps (a detach is held to its declaration above),
-            // so the two reads back compare outright. A standing partition
-            // the plan touches is not compared whole, and another session
-            // detaching it and attaching it again under a wider range would
-            // have routed rows by a bound nobody approved (#1607 review).
-            //
-            // Both reads are brought back to the names before this plan's
-            // column renames, a parent's key and a partition's own columns
-            // included (#1687), so a renamed key column compares outright.
-            let place = |t: &pbps_model::Table| {
-                (
-                    t.partition_of
-                        .as_ref()
-                        .map(|of| (of.parent.clone(), of.bound.clone())),
-                    t.partition_by.clone(),
-                )
-            };
-            // A parent whose column names pass to other columns in this plan
-            // has no undo for its key either (#1692 review): its key is
-            // compared under the names the plan leaves, the before-read's
-            // brought forward and the later read's as it is.
-            let (was_place, now_place) = match partition_hands.get(now_name) {
-                None => (place(was), place(now)),
-                Some(net) => {
-                    let (of, by) = place(was);
-                    let forward = |c: String| {
-                        net.iter()
-                            .find(|(_, was)| was.as_deref() == Some(c.as_str()))
-                            .map_or(c, |(now, _)| now.clone())
-                    };
-                    let by = by.map(|by| pbps_model::PartitionBy {
-                        external: by.external,
-                        columns: by.columns.into_iter().map(forward).collect(),
-                    });
-                    ((of, by), place(after.tables.get(now_name).unwrap_or(now)))
-                }
-            };
-            if was_place != now_place {
-                moved.push(format!(
-                    "{now_name}'s partition parent, bound or key is not the one the plan was \
-                     approved over"
-                ));
-            }
+            guard::table(&scalar_expected, now, placed, now_name, &mut moved);
             // A partition's own defaults and NOT NULLs (#1581), as a created
             // one's above: a default by presence, the engine respelling its
             // text. Once the run is whole, the before-read with this plan's
@@ -5120,14 +4963,7 @@ fn refuse_unplanned_movement(
                     "{now_name}'s own column defaults or NOT NULLs are not the ones this plan leaves"
                 ));
             }
-            // No change of a plan sets it on a table that exists (#1176), so
-            // it is held to the before-read throughout.
-            if was.system_time != now.system_time {
-                moved.push(format!(
-                    "{now_name} period or system versioning changed, and this plan does not \
-                     change it"
-                ));
-            }
+            guard::system_time(&scalar_expected, now, now_name, &mut moved);
             // An index whose parameters the plan sets in place, held once
             // the run is whole to the before-read with only that change
             // applied, the whole part and not its parameters alone: its part
