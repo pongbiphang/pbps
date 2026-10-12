@@ -624,7 +624,9 @@ impl crate::schema::Schema {
 /// The **mode** is the recorded one where there is one, so that a switch
 /// between `exact` and `ensure` shows at the gate as `SetDataMode`; a table the
 /// declarations take over for the first time carries the declared mode, since
-/// nothing was recorded to differ from. The **rows** are everything the union
+/// nothing was recorded to differ from. [`takeovers`] separately identifies
+/// the scope that must be recorded even when every row matches (DEC-1803.1).
+/// The **rows** are everything the union
 /// read fetched, unfiltered: the differ must see every row the declaration
 /// will be measured against — including, for an `exact` declaration, the rows
 /// that are about to be deleted because nobody declared them.
@@ -678,6 +680,24 @@ pub fn plan_base(
         };
     }
     Ok(base)
+}
+
+/// First-time reference-data scopes on tables that already exist live.
+///
+/// All inputs use the live table names; callers resolve the result to the
+/// plan's final identities. Table presence comes from the scoped schema,
+/// never from a nonempty row read: taking over an empty exact table still
+/// changes what later drift checks must observe (DEC-1803.1).
+pub fn takeovers(
+    recorded: &DataScopes,
+    declared: &DataScopes,
+    live: &crate::schema::Schema,
+) -> Vec<(TableName, DataMode)> {
+    declared
+        .iter()
+        .filter(|(name, _)| !recorded.contains_key(*name) && live.tables.contains_key(*name))
+        .map(|(name, scope)| (name.clone(), scope.mode))
+        .collect()
 }
 
 /// The order declared rows must be inserted in: a referenced table before the
@@ -1664,5 +1684,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(base.tables[&name()].data, None);
+    }
+
+    #[test]
+    fn first_takeovers_include_empty_live_tables_but_not_other_scope_transitions() {
+        let mut live = crate::schema::Schema::default();
+        let mut t = table(Some(vec!["code"]), vec![]);
+        t.data = None;
+        live.tables.insert(name(), t);
+        for mode in [DataMode::Exact, DataMode::Ensure] {
+            let declared: DataScopes = [(
+                name(),
+                DataScope {
+                    mode,
+                    keys: BTreeSet::new(),
+                },
+            )]
+            .into_iter()
+            .collect();
+            assert_eq!(
+                takeovers(&BTreeMap::new(), &declared, &live),
+                vec![(name(), mode)]
+            );
+            assert!(takeovers(&declared, &declared, &live).is_empty());
+            assert!(takeovers(&declared, &BTreeMap::new(), &live).is_empty());
+            assert!(
+                takeovers(
+                    &BTreeMap::new(),
+                    &declared,
+                    &crate::schema::Schema::default()
+                )
+                .is_empty()
+            );
+            for recorded_mode in [DataMode::Exact, DataMode::Ensure] {
+                let recorded = [(
+                    name(),
+                    DataScope {
+                        mode: recorded_mode,
+                        keys: [RowKey::from("old")].into_iter().collect(),
+                    },
+                )]
+                .into_iter()
+                .collect();
+                assert!(
+                    takeovers(&recorded, &declared, &live).is_empty(),
+                    "mode and ensure-key changes are not first takeovers"
+                );
+            }
+        }
     }
 }

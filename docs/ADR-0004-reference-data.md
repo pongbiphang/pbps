@@ -216,9 +216,12 @@ Decisions taken during implementation that this document did not anticipate:
    The first connected plan for a table with a new `data:` block reads its
    rows, updates the ones that differ, inserts the ones missing, and — for
    `exact` — deletes the ones nobody declared, behind the gate. `plan --db`
-   says so on stdout, because the plan shows the consequences and not the
-   takeover. The baseline is pinned under the union of the recorded scope
-   and the plan's, table by table, so a key added to an `ensure` block or
+   reports the current row count and carries the first takeover as a zero-SQL
+   `SetDataMode { from: None, to: Some(mode) }` change (DEC-1803.1). Even
+   when every row already matches, applying it records the new scope, and
+   subsequent verification checks those rows. The baseline is pinned under
+   the union of the recorded scope and the plan's, table by table, so a key
+   added to an `ensure` block or
    an `ensure` -> `exact` switch is checked again before apply (DECISIONS
    98). A row key has to be spellable in its key column's type (99, 103),
    and every connected command asks the engine, before anything is written,

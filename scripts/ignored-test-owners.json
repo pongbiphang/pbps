@@ -399,7 +399,10 @@
         "verify_calls_an_unexpressible_live_difference_drift_not_unreachable",
         "verify_keeps_the_expressible_drift_beside_an_unexpressible_one",
         "blank_baseline_reasons_leave_the_live_ledger_unchanged",
-        "forced_pull_with_multiple_decisions_provides_a_complete_batch_remedy"
+        "forced_pull_with_multiple_decisions_provides_a_complete_batch_remedy",
+        "matching_rows_still_record_the_first_data_takeover",
+        "first_data_takeovers_refuse_changed_rows_and_wrong_checksums",
+        "renamed_data_takeovers_use_final_names_and_require_approval"
       ]
     },
     {
@@ -688,7 +691,10 @@
         "an_unlogged_partition_under_an_undeclared_permanent_key_is_refused",
         "an_ambiguous_date_or_time_literal_is_refused_with_both_readings",
         "blank_baseline_reasons_leave_the_live_ledger_unchanged",
-        "forced_pull_with_multiple_decisions_provides_a_complete_batch_remedy"
+        "forced_pull_with_multiple_decisions_provides_a_complete_batch_remedy",
+        "matching_rows_still_record_the_first_data_takeover",
+        "first_data_takeovers_refuse_changed_rows_and_wrong_checksums",
+        "renamed_data_takeovers_use_final_names_and_require_approval"
       ]
     },
     {

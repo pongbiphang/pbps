@@ -557,3 +557,27 @@ and cleanup cases, constant Git-process counts for both `plan` and
 objects. Release measurements at 1,000 and 4,000 files record no-op results,
 wall time, RSS and Git invocation counts; elapsed time is evidence, not a
 timing assertion in CI. Git read failures treated as absent remain #1814.
+
+<a id="dec-1803-1"></a>
+
+**DEC-1803.1. A first data takeover is a typed change even when its rows
+already match (#1803; ADR-0004).** The connected plan base borrows the
+new declaration's mode to compare the live rows. That prevents unnecessary
+inserts, but also hides the first transition into row management from the
+differ. A matching table then had an empty plan, and apply recorded nothing;
+subsequent verification still ignored its rows.
+
+Select declared scopes absent from the recorded scopes whose tables exist
+in the live schema, then carry `SetDataMode { from: None, to: Some(mode) }`
+through every connected diff derivation. It is the existing zero-SQL change,
+with dialect risk classification and the final table name resolved by
+identity. The ordinary saved-plan checksum, approval, union-scope baseline
+check, transactional read-back and ledger write apply without an empty-plan
+exception. Table presence, not a nonempty row set, makes empty exact tables
+eligible too. Already recorded scopes, mode switches, removed blocks and
+new tables are not first takeovers; ensure-key additions and removals remain
+#1808. Both live engines pin matching exact/ensure and key-only rows, empty
+exact tables, subsequent no-ops and drift, checksum/baseline refusals, and a
+rename combined with takeover and its approval gate.
+An intervening row edit is refused without adopting the scope; the ordinary
+failed-attempt audit entry remains, as SPEC §7.5 requires.

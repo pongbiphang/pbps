@@ -21,6 +21,27 @@ const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 #[path = "support/envelope_archives.rs"]
 mod envelope_archives;
 
+#[path = "support/data_takeovers.rs"]
+mod data_takeovers;
+
+#[test]
+#[ignore = "needs live pg"]
+fn matching_rows_still_record_the_first_data_takeover() {
+    data_takeovers::matching(&server(), true);
+}
+
+#[test]
+#[ignore = "needs live pg"]
+fn first_data_takeovers_refuse_changed_rows_and_wrong_checksums() {
+    data_takeovers::refusals(&server(), true);
+}
+
+#[test]
+#[ignore = "needs live pg"]
+fn renamed_data_takeovers_use_final_names_and_require_approval() {
+    data_takeovers::renamed(&server(), true);
+}
+
 #[path = "support/baseline_ids.rs"]
 mod baseline_ids;
 
@@ -14128,7 +14149,8 @@ fn unapproved_data_triggers_cannot_use_the_deployers_privileges() {
     for (operation, before, after, allow) in [
         (
             "INSERT",
-            "",
+            // Stage only the insert; first takeover is its own change (DEC-1803.1).
+            "data:\n  mode: exact\n  rows: {}\n",
             "data:\n  mode: exact\n  rows:\n    new: {label: New}\n",
             "",
         ),
@@ -18848,7 +18870,9 @@ fn a_trigger_function_replaced_between_the_check_and_the_row_write_is_rolled_bac
         )
         .unwrap();
         d.keyed(&deployment);
-        d.table(declared);
+        // Keep row management in the baseline: this experiment stages only
+        // the insert, not a separate first takeover (DEC-1803.1).
+        d.table(&format!("{declared}data:\n  mode: exact\n  rows: {{}}\n"));
         succeeds(d.run(&["plan"]));
         d.commit();
         succeeds(d.run(&["bootstrap", "--db", &deployment]));
