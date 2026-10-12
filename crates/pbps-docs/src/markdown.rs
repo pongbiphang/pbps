@@ -200,12 +200,7 @@ fn computed_table(s: &mut String, table: &Table) {
             label.push_str(" **PK**");
         }
         let stored = computed_flags(c).unwrap_or_else(|| "—".into());
-        // An expression may hold a bitwise `|`, which would end the cell.
-        let _ = writeln!(
-            s,
-            "| {label} | `{}` | {stored} |",
-            c.expression.replace('|', "\\|")
-        );
+        let _ = writeln!(s, "| {label} | {} | {stored} |", code_cell(&c.expression));
     }
 }
 
@@ -269,6 +264,24 @@ fn columns(cols: &[String]) -> String {
         .map(|c| format!("`{c}`"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// `text` as a code span that stays inside one table cell. A line ending
+/// would end the row, so it becomes the space a code span renders it as
+/// anyway; a backtick run in the text is outfenced by a longer one; and a
+/// `|`, which ends a cell even inside a code span, is escaped.
+fn code_cell(text: &str) -> String {
+    let text = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    let run = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(run + 1);
+    // A span that starts or ends with a backtick needs a space between it
+    // and the fence, which the renderer strips again.
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{}{pad}{fence}", text.replace('|', "\\|"))
 }
 
 fn cell(v: Option<&str>) -> String {
@@ -432,6 +445,34 @@ mod tests {
         assert!(out.contains(r"| `flags` | `[a] \| 4` | — |"), "{out}");
         assert!(out.contains("- **Index** `ix_total`: `total`"), "{out}");
         assert!(out.contains("4 column(s)"), "{out}");
+    }
+
+    /// A multiline expression (a YAML block keeps its line breaks) would end
+    /// the table row, and a backtick in a string literal would end a
+    /// one-backtick span.
+    #[test]
+    fn a_computed_expression_stays_in_its_cell() {
+        let mut s = documented();
+        s.tables
+            .get_mut(&TableName::new("dbo", "customer"))
+            .unwrap()
+            .computed
+            .insert(
+                "kind".into(),
+                ComputedColumn {
+                    expression: "CASE WHEN [a] = 'x`y'\nTHEN 1\r\nEND".into(),
+                    persisted: true,
+                    not_null: false,
+                },
+            );
+        let out = render(&s, &IdsFile::default(), "Schema");
+        assert!(
+            out.contains("| `kind` | ``CASE WHEN [a] = 'x`y' THEN 1 END`` | persisted |\n"),
+            "{out}"
+        );
+        assert_eq!(code_cell("`a`"), "`` `a` ``");
+        assert_eq!(code_cell("a ``b"), "```a ``b```");
+        assert_eq!(code_cell("a"), "`a`");
     }
 
     #[test]
