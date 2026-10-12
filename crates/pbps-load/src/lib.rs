@@ -36,10 +36,7 @@ pub struct Loaded {
 
 /// Rejected source declarations, retained only for the diagnostic visitor.
 /// The checked load APIs never return these beside a usable schema.
-pub type SourceConflicts = std::collections::BTreeMap<
-    TableName,
-    std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>>,
->;
+pub use pbps_model::diagnostic::SourceConflicts;
 
 /// A recovery tree is exposed through a diagnostic visitor; checked loading
 /// still rejects its conflicting sources. This keeps a refusal from hiding independent

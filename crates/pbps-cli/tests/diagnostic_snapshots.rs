@@ -8,6 +8,8 @@ use std::{
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
+#[path = "support/diagnostic_sources.rs"]
+mod source_context;
 const GOOD: &str = "table: dbo.t\ncolumns:\n  id:\n    type: int\n";
 const UNICODE: &str = "table: dbo.café\ndescription: Café régulier — clients français\ncolumns:\n  identifiant:\n    type: bigint\n  solde:\n    type: \"decimal(18, 2\"\n    nullable: false\n";
 const INLINE: &str = "table: dbo.t\ncolumns: {café: {type: \"decimal(18, 2\"}}\n";

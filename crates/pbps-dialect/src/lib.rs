@@ -2355,6 +2355,16 @@ pub trait Dialect {
         Vec::new()
     }
 
+    /// Diagnostic names include the sources retained beside rejected columns.
+    fn implicit_relation_names_with_sources(
+        &self,
+        name: &TableName,
+        table: &Table,
+        _sources: pbps_model::diagnostic::ColumnSources<'_>,
+    ) -> Vec<ImplicitRelation> {
+        self.implicit_relation_names(name, table)
+    }
+
     /// Whether a module is also a constraint under its own name in its
     /// schema, which a retry that yields to constraints finds taken (#1112):
     /// PostgreSQL's constraint trigger has a `pg_constraint` row. The default,
@@ -2377,6 +2387,17 @@ pub trait Dialect {
         _suffix: u32,
     ) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Keep retries aligned with the diagnostic first-choice claimant list.
+    fn implicit_relation_fallbacks_with_sources(
+        &self,
+        name: &TableName,
+        table: &Table,
+        suffix: u32,
+        _sources: pbps_model::diagnostic::ColumnSources<'_>,
+    ) -> Vec<String> {
+        self.implicit_relation_fallbacks(name, table, suffix)
     }
 
     /// Where `to` sits on the path a bare name in a definition in `from` is
@@ -2523,10 +2544,10 @@ pub trait Dialect {
         &self,
         name: &TableName,
         table: &Table,
-        sources: &std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>>,
+        sources: pbps_model::diagnostic::ColumnSources<'_>,
     ) -> Vec<DialectError> {
         let mut found = self.validate_table(name, table);
-        for column in sources.keys() {
+        for column in sources.conflicted_columns() {
             found.push(DialectError::Invalid {
                 dialect: self.name(),
                 message: format!(
@@ -2551,6 +2572,17 @@ pub trait Dialect {
         _parent: &Table,
     ) -> Vec<DialectError> {
         Vec::new()
+    }
+
+    /// A partition's own declarations may depend on rejected parent sources.
+    fn validate_partition_with_sources(
+        &self,
+        name: &TableName,
+        partition: &Table,
+        parent: &Table,
+        _parent_sources: pbps_model::diagnostic::ColumnSources<'_>,
+    ) -> Vec<DialectError> {
+        self.validate_partition(name, partition, parent)
     }
 
     /// Renders one change as statements.
@@ -3055,6 +3087,16 @@ pub fn check_system_time_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec
 /// table-local rule can see across tables — and a check or foreign key sharing
 /// a name is still the table-local rule's alone.
 pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+    check_index_names_with_sources(schema, dialect, &Default::default())
+}
+
+/// The same namespace check for a diagnostic recovery schema, retaining its
+/// supplied sources through both initial name claims and fallback simulation.
+pub fn check_index_names_with_sources(
+    schema: &Schema,
+    dialect: &dyn Dialect,
+    conflicts: &pbps_model::diagnostic::SourceConflicts,
+) -> Vec<String> {
     if !dialect.indexes_share_namespace_with_tables() {
         return Vec::new();
     }
@@ -3143,8 +3185,9 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
     let declared_names: BTreeSet<ObjectName> = claimed.keys().cloned().collect();
     let mut claimants = Vec::new();
     for (table_name, table) in &schema.tables {
+        let sources = pbps_model::diagnostic::ColumnSources::new(conflicts.get(table_name));
         for (i, relation) in dialect
-            .implicit_relation_names(table_name, table)
+            .implicit_relation_names_with_sources(table_name, table, sources)
             .into_iter()
             .enumerate()
         {
@@ -3164,6 +3207,7 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
             claimants.push(Claimant {
                 table_name,
                 table,
+                sources,
                 i,
                 relation,
                 first: claim_name,
@@ -3247,6 +3291,7 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
 struct Claimant<'a> {
     table_name: &'a TableName,
     table: &'a Table,
+    sources: pbps_model::diagnostic::ColumnSources<'a>,
     /// Its position in [`Dialect::implicit_relation_names`], which is also
     /// its position in [`Dialect::implicit_relation_fallbacks`].
     i: usize,
@@ -3332,7 +3377,12 @@ fn fallback_reach(
             let claimant = &claimants[k];
             let Some(fallback) = u32::try_from(retry).ok().and_then(|suffix| {
                 dialect
-                    .implicit_relation_fallbacks(claimant.table_name, claimant.table, suffix)
+                    .implicit_relation_fallbacks_with_sources(
+                        claimant.table_name,
+                        claimant.table,
+                        suffix,
+                        claimant.sources,
+                    )
                     .into_iter()
                     .nth(claimant.i)
             }) else {

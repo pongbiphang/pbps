@@ -902,3 +902,35 @@ errors are collected as before. The CLI fixture matrix pins all source pairs
 and the triple, alone and beside unrelated type or loader errors, for both
 engines. Engine-specific validity stays in the dialect; YAML and its spans stay
 in the loader.
+
+<a id="dec-1885-1"></a>
+
+**DEC-1885.1. Every source-dependent diagnostic reads supplied sources through the same recovery view.**
+The exclusive column is still the checked model. Diagnostic recovery retains
+conflicting sources beside it (DEC-1402.2), but passing that information only
+to per-column validation loses it in later checks. A NOT NULL column with both
+a default and identity then falsely reports that an omitted row value has no
+default. The same loss hides generated/identity row writes, temporal period
+identity, partition-parent restrictions and implicit sequence-name collisions.
+
+`ColumnSources` borrows the retained sources, falling back to the checked
+column's single source when no conflict was recorded. It does not select a
+winner, construct an invalid column, evaluate expressions or answer semantic
+questions through optional/boolean source accessors. Consumers still match
+`ValueSource` exhaustively. Common row validation, dialect table and partition
+validation, and relation-name claims and retries use that view. The context
+stays beside `Schema`; equality, serialized bytes and checked loading do not
+change. Ordinary callers use the same checks with an empty recovery context.
+
+`validate --since` also includes tables with retained source conflicts in its
+changed subjects after successfully reading the checked baseline: that baseline
+cannot contain a conflict, even if recovery's source-less column compares equal
+to its formerly ordinary column. An unreadable baseline remains an error.
+Unchanged ordinary declarations still receive gradual-adoption policy filtering.
+
+Actual CLI tests pin both data modes, omission versus explicit NULL, source
+pairs and triples, ordinary and single-source controls, key/body restrictions,
+independent errors, period checks, partition diagnostic precedence, generated
+names and reachable retries, and the policy filter. The existing 24 conflict
+fixtures retain their messages and order. Removing only context forwarding
+while retaining the exclusive model makes the regressions fail at runtime.

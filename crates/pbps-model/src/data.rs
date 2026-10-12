@@ -809,6 +809,15 @@ pub const DEFAULT_MAX_ROWS: usize = 1000;
 ///
 /// Returns one message per problem, all of them, in a stable order.
 pub fn check(name: &TableName, table: &Table) -> Vec<String> {
+    check_with_sources(name, table, Default::default())
+}
+
+/// Diagnose rows against supplied sources, including rejected combinations.
+pub fn check_with_sources(
+    name: &TableName,
+    table: &Table,
+    sources: crate::diagnostic::ColumnSources<'_>,
+) -> Vec<String> {
     use crate::ValueSource;
     let Some(data) = &table.data else {
         return Vec::new();
@@ -846,11 +855,13 @@ pub fn check(name: &TableName, table: &Table) -> Vec<String> {
         && let Some(column) = key_column.as_ref()
         && let Some(spec) = table.columns.get(column)
     {
-        match spec.value_source {
-            ValueSource::Generated(_) => problems.push(format!(
-                "{name}: declared rows set `{column}` through their primary-key values, but it is a generated column the engine computes — use an ordinary declared key or leave the rows outside reference-data management"
-            )),
-            ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => {}
+        for source in sources.get(column, spec) {
+            match source {
+                ValueSource::Generated(_) => problems.push(format!(
+                    "{name}: declared rows set `{column}` through their primary-key values, but it is a generated column the engine computes — use an ordinary declared key or leave the rows outside reference-data management"
+                )),
+                ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => {}
+            }
         }
     }
     for (key, row) in &data.rows {
@@ -866,20 +877,22 @@ pub fn check(name: &TableName, table: &Table) -> Vec<String> {
             // a value for it would be refused at apply time, after `validate`
             // had said the declaration was fine.
             if let Some(spec) = table.columns.get(column) {
-                match spec.value_source {
-                    ValueSource::Identity(_) => {
-                        if key_column.as_deref() != Some(column.as_str()) {
-                            problems.push(format!(
-                                "{name}: row `{key}` sets `{column}`, which is an IDENTITY column the engine \
-                                 assigns — leave it out"
-                            ));
+                for source in sources.get(column, spec) {
+                    match source {
+                        ValueSource::Identity(_) => {
+                            if key_column.as_deref() != Some(column.as_str()) {
+                                problems.push(format!(
+                                    "{name}: row `{key}` sets `{column}`, which is an IDENTITY column the engine \
+                                     assigns — leave it out"
+                                ));
+                            }
                         }
+                        ValueSource::Generated(_) => problems.push(format!(
+                            "{name}: row `{key}` sets `{column}`, which is a generated column the engine \
+                             computes — leave it out"
+                        )),
+                        ValueSource::None | ValueSource::Default(_) => {}
                     }
-                    ValueSource::Generated(_) => problems.push(format!(
-                        "{name}: row `{key}` sets `{column}`, which is a generated column the engine \
-                         computes — leave it out"
-                    )),
-                    ValueSource::None | ValueSource::Default(_) => {}
                 }
             }
             if key_column.as_deref() == Some(column.as_str()) {
@@ -906,17 +919,28 @@ pub fn check(name: &TableName, table: &Table) -> Vec<String> {
             match row.0.get(column) {
                 Some(Value::Null) => problems.push(format!(
                     "{name}: row `{key}` sets `{column}` to null, but it is NOT NULL{}",
-                    match spec.value_source {
-                        ValueSource::Default(_) => " — leave it out to get the default",
-                        ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => "",
+                    if sources.get(column, spec).iter().any(|source| match source {
+                        ValueSource::Default(_) => true,
+                        ValueSource::None
+                        | ValueSource::Identity(_)
+                        | ValueSource::Generated(_) => false,
+                    }) {
+                        " — leave it out to get the default"
+                    } else {
+                        ""
                     }
                 )),
-                None => match spec.value_source {
-                    ValueSource::None => problems.push(format!(
+                None if sources.get(column, spec).iter().all(|source| match source {
+                    ValueSource::None => true,
+                    ValueSource::Default(_)
+                    | ValueSource::Identity(_)
+                    | ValueSource::Generated(_) => false,
+                }) =>
+                {
+                    problems.push(format!(
                         "{name}: row `{key}` leaves `{column}` unset, but it is NOT NULL with no default"
-                    )),
-                    ValueSource::Default(_) | ValueSource::Identity(_) | ValueSource::Generated(_) => {}
-                },
+                    ));
+                }
                 _ => {}
             }
         }

@@ -632,6 +632,7 @@ other numbers before landing. Some records still mention them as proposals.
 | DEC-1274.2 | [modules](decisions/modules.md#dec-1274-2) | A new table whose generated column calls a function the plan creates follows that create whole, in the plan and on scratch. |
 | DEC-1402.1 | [diff](decisions/diff.md#dec-1402-1) | A column has one exhaustive value source while valid persisted bytes and checksums stay unchanged. |
 | DEC-1402.2 | [cli](decisions/cli.md#dec-1402-2) | Diagnostic recovery retains conflicting YAML sources without admitting them through checked loading. |
+| DEC-1885.1 | [cli](decisions/cli.md#dec-1885-1) | Every source-dependent diagnostic reads supplied sources through one recovery view. |
 | DEC-1402.3 | [data/declared](decisions/data/declared.md#dec-1402-3) | Generated map keys refuse supplied rows while empty reference-data scopes retain their existing meaning. |
 | DEC-1576.1 | [modules](decisions/modules.md#dec-1576-1) | A connected PostgreSQL plan whose expression names, in a literal, a relation the plan creates later is refused with a two-plan remedy, not reordered. |
 | DEC-1528.1 | [resolver](decisions/resolver.md#dec-1528-1) | Selecting a resolver gives the operator-vouched resolver: two separation checks plus the shared compatibility qualification, and a reviewed baseline, run first and compared with the target; the measured profiles are frozen. |

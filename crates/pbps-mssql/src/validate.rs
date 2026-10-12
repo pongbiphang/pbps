@@ -461,13 +461,13 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
 /// Stopping at the first would turn fixing a table into as many round trips as
 /// it has mistakes.
 pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
-    table_sources(name, table, &Default::default())
+    table_sources(name, table, Default::default())
 }
 
 pub(crate) fn table_sources(
     name: &TableName,
     table: &Table,
-    sources: &std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>>,
+    sources: pbps_model::diagnostic::ColumnSources<'_>,
 ) -> Vec<DialectError> {
     let mut errs = Vec::new();
     errs.extend(table.constraint_name_conflicts().into_iter().map(invalid));
@@ -528,7 +528,7 @@ pub(crate) fn table_sources(
         ));
     }
     if let Some(st) = &table.system_time {
-        errs.extend(system_time(name, table, st));
+        errs.extend(system_time(name, table, st, sources));
     }
 
     let mut identity_columns = Vec::new();
@@ -538,10 +538,7 @@ pub(crate) fn table_sources(
         }
         // PostgreSQL's (DEC-1168.1): SQL Server's computed columns are a
         // different object, with no declared type, and #1174's to model.
-        let supplied = sources
-            .get(col_name)
-            .map(Vec::as_slice)
-            .unwrap_or_else(|| std::slice::from_ref(&col.value_source));
+        let supplied = sources.get(col_name, col);
         for source in supplied {
             match source {
                 pbps_model::ValueSource::Generated(_) => errs.push(invalid(format!(
@@ -983,7 +980,12 @@ enum Computed {
 /// What the engine takes for `PERIOD FOR SYSTEM_TIME` and its history
 /// (#1176, measured on 17.0): two distinct `datetime2` columns, not nullable,
 /// the engine's to write. A default is accepted, and kept.
-fn system_time(name: &TableName, table: &Table, st: &pbps_model::SystemTime) -> Vec<DialectError> {
+fn system_time(
+    name: &TableName,
+    table: &Table,
+    st: &pbps_model::SystemTime,
+    sources: pbps_model::diagnostic::ColumnSources<'_>,
+) -> Vec<DialectError> {
     let mut errs = Vec::new();
     if st.start == st.end {
         errs.push(invalid(format!(
@@ -1014,12 +1016,12 @@ fn system_time(name: &TableName, table: &Table, st: &pbps_model::SystemTime) -> 
                  `nullable: false`"
             )));
         }
-        if match col.value_source {
+        if sources.get(column, col).iter().any(|source| match source {
             pbps_model::ValueSource::Identity(_) => true,
             pbps_model::ValueSource::None
             | pbps_model::ValueSource::Default(_)
             | pbps_model::ValueSource::Generated(_) => false,
-        } {
+        }) {
             errs.push(invalid(format!(
                 "column `{column}` is the period's {role}, which the engine writes, so it \
                  cannot also be an identity"
