@@ -1332,10 +1332,13 @@ accepts, and a function body may be checked against it. The retype cannot both
 follow its release and precede them. A drop of another input, moved after its
 own release, needs nothing of this column's type and does not hold it back.
 A drop moved past a row the plan inserts into its table is refused the same
-way when the input is `NOT NULL` with no default and no identity, which the
-catalog reads beside the generated column's edges: the row cannot write a
-column the declaration drops, and the column refuses it while it stands. A
-nullable or defaulted input lets the row in, and that plan applies (#1397).
+way when the input is `NOT NULL` with no default and no identity, and no
+enabled row-level `BEFORE INSERT` trigger on its table could fill it. The
+catalog reads this beside the generated column's edges. The row cannot write
+a column the declaration drops, and the column refuses it while it stands. A
+nullable or defaulted input lets the row in, and that plan applies. Where a
+trigger may fill it, whether it does is left to the engine, inside the
+apply's transaction (#1397).
 
 Pinned by `a_released_input_is_retyped_or_dropped_after_its_release`
 (`crates/pbps-cli/src/engine.rs`), `a_replaced_internal_member_keeps_its_owner`

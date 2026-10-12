@@ -21,8 +21,10 @@ pub struct Dependence {
     pub base: String,
     /// The generated column computed from it.
     pub generated: String,
-    /// The input is `NOT NULL` with no default and no identity: while it
-    /// stands, a row inserted without it is refused (#1397).
+    /// The input is `NOT NULL` with no default and no identity, and no
+    /// enabled row-level `BEFORE INSERT` trigger on the table could fill it:
+    /// while it stands, a row inserted without it is refused (#1397). Where a
+    /// trigger may supply it, whether it does is the engine's to say.
     pub base_required: bool,
 }
 
@@ -44,6 +46,11 @@ pub async fn dependences(conn: &mut Conn, table: &TableName) -> Result<Vec<Depen
     let sql = format!(
         "SELECT base.attname AS base, gen.attname AS generated,
                 base.attnotnull AND NOT base.atthasdef AND base.attidentity = ''
+                  AND NOT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_trigger tg
+                     WHERE tg.tgrelid = c.oid AND NOT tg.tgisinternal
+                       AND tg.tgenabled <> 'D'
+                       AND (tg.tgtype::integer & 7) = 7)
                   AS base_required
            FROM pg_catalog.pg_attrdef ad
            JOIN pg_catalog.pg_attribute gen
