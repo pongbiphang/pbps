@@ -3988,6 +3988,7 @@ fn renamed_columns(
 ///   it;
 /// - a NOT NULL set on the parent holds every partition, so the partition's
 ///   own, which the declarations then leave out, is left to it.
+#[allow(clippy::too_many_arguments)]
 fn diff_partition_columns(
     uid: &Uid,
     name: &TableName,
