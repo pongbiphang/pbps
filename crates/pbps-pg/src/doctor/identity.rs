@@ -1,10 +1,13 @@
 //! Permission questions follow recorded identities, not a rename destination's occupant.
 
-use pbps_model::{ColumnRef, IdsFile, ObjectName};
+use pbps_model::{ColumnRef, IdsFile, IdsIndex, ObjectName};
 
+/// Asked once per declared table and column, so both files are indexed once
+/// rather than scanned per question (#1870).
 pub(super) struct Identity<'a> {
-    pub project: &'a IdsFile,
-    pub recorded: &'a IdsFile,
+    project: IdsIndex<'a>,
+    recorded: &'a IdsFile,
+    recorded_names: IdsIndex<'a>,
 }
 
 pub(super) enum Table {
@@ -25,7 +28,15 @@ impl Table {
     }
 }
 
-impl Identity<'_> {
+impl<'a> Identity<'a> {
+    pub fn new(project: &'a IdsFile, recorded: &'a IdsFile) -> Self {
+        Self {
+            project: project.index(),
+            recorded,
+            recorded_names: recorded.index(),
+        }
+    }
+
     pub fn table(&self, declared: &ObjectName) -> Table {
         if let Some(recorded) = self
             .project
@@ -34,7 +45,7 @@ impl Identity<'_> {
         {
             return Table::Recorded(recorded.clone());
         }
-        if self.recorded.tables.values().any(|name| name == declared) {
+        if self.recorded_names.table_uid(declared).is_some() {
             Table::Future
         } else {
             Table::Unrecorded(declared.clone())
@@ -61,10 +72,9 @@ impl Identity<'_> {
         // A newly declared identity cannot borrow the old column's ACL just
         // because the old identity is about to vacate its name.
         if self
-            .recorded
-            .columns
-            .values()
-            .any(|column| &column.table == current && column.name == name)
+            .recorded_names
+            .column_uid(&current.column(name))
+            .is_some()
         {
             None
         } else {

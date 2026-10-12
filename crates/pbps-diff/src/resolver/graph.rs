@@ -166,6 +166,9 @@ pub(super) fn constraints(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
 ) -> BTreeSet<OrderEdge> {
+    // Asked once per step and observation: indexed once (#1870).
+    let base_names = base.ids.index();
+    let desired_names = desired.ids.index();
     let steps: Vec<_> = changes.changes.iter().map(|p| &p.change).collect();
     let made: Vec<_> = steps
         .iter()
@@ -208,9 +211,9 @@ pub(super) fn constraints(
                 if expression(other) == Some(false)
                     || matches!(other, Change::AlterColumnDefault { to: None, .. })
                 {
-                    base.ids.table_uid(t)
+                    base_names.table_uid(t)
                 } else {
-                    desired.ids.table_uid(t)
+                    desired_names.table_uid(t)
                 }
             }),
             other => other.table().and_then(|t| {
@@ -222,8 +225,8 @@ pub(super) fn constraints(
                         Change::CreateTable { uid, name, .. } if name == t => Some(uid),
                         _ => None,
                     })
-                    .or_else(|| base.ids.table_uid(t))
-                    .or_else(|| desired.ids.table_uid(t))
+                    .or_else(|| base_names.table_uid(t))
+                    .or_else(|| desired_names.table_uid(t))
             }),
         })
         .collect();
@@ -281,13 +284,13 @@ pub(super) fn constraints(
             Change::DropForeignKey { table, name } => base
                 .schema
                 .tables
-                .get(&desired.ids.resolved_in(table, base.ids))
+                .get(&desired_names.resolved_in(table, base.ids))
                 .and_then(|t| t.foreign_keys.get(name))
                 .map(|f| (f.references_table.clone(), false)),
             _ => None,
         };
         if let Some((table, adding)) = reference {
-            let final_name = base.ids.resolved_in(&table, desired.ids);
+            let final_name = base_names.resolved_in(&table, desired.ids);
             for (j, other) in steps.iter().enumerate() {
                 if i != j
                     && other
@@ -386,12 +389,11 @@ pub(super) fn constraints(
         };
         let base_spelled = i >= ordinary && to.is_none() && fallback.is_none();
         let parent_uid = if base_spelled {
-            base.ids.table_uid(parent)
+            base_names.table_uid(parent)
         } else {
-            desired
-                .ids
+            desired_names
                 .table_uid(parent)
-                .or_else(|| base.ids.table_uid(parent))
+                .or_else(|| base_names.table_uid(parent))
         };
         if parent_uid.is_none() {
             continue;
@@ -591,12 +593,12 @@ pub(super) fn constraints(
         let table = table_of(surface);
         let base_owner = table.and_then(|t| {
             if opening.contains(surface) {
-                base.ids.table_uid(t)
+                base_names.table_uid(t)
             } else {
-                desired.ids.table_uid(t)
+                desired_names.table_uid(t)
             }
         });
-        let final_spelling = super::prepare::forward(surface, base.ids, desired.ids);
+        let final_spelling = super::prepare::forward(surface, &base_names, desired.ids);
         let removes: Vec<_> = steps
             .iter()
             .enumerate()
@@ -610,7 +612,7 @@ pub(super) fn constraints(
             })
             .map(|(i, _)| i)
             .collect();
-        let desired_owner = table.and_then(|t| desired.ids.table_uid(t));
+        let desired_owner = table.and_then(|t| desired_names.table_uid(t));
         let creates: Vec<_> = made
             .iter()
             .enumerate()

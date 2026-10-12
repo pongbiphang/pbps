@@ -1399,14 +1399,13 @@ async fn object_permissions(
 /// that answer keeps `app.Old` and `app.old` apart, as the server does.
 fn resolve_for_query<'a>(
     wanted: impl Iterator<Item = &'a ObjectName>,
-    project_ids: &pbps_model::IdsFile,
-    recorded_ids: &pbps_model::IdsFile,
+    ids: &Ids<'_>,
     colliding: &BTreeSet<ObjectName>,
 ) -> (BTreeMap<ObjectName, ObjectName>, BTreeSet<ObjectName>) {
     let mut safe: BTreeMap<ObjectName, ObjectName> = BTreeMap::new();
     let mut unresolvable: BTreeSet<ObjectName> = BTreeSet::new();
     for declared in wanted {
-        let (query, confirmed) = resolution(declared, project_ids, recorded_ids);
+        let (query, confirmed) = resolution(declared, ids);
         if confirmed || !colliding.contains(&query) {
             safe.insert(declared.clone(), query);
         } else {
@@ -1428,8 +1427,7 @@ fn resolve_for_query<'a>(
 fn resolve_columns(
     declared: &ObjectName,
     columns: &[String],
-    project_ids: &pbps_model::IdsFile,
-    recorded_ids: &pbps_model::IdsFile,
+    ids: &Ids<'_>,
 ) -> Vec<(String, bool)> {
     columns
         .iter()
@@ -1438,9 +1436,9 @@ fn resolve_columns(
                 table: declared.clone(),
                 name: column.clone(),
             };
-            project_ids
+            ids.project_names
                 .column_uid(&wanted)
-                .and_then(|uid| recorded_ids.columns.get(uid))
+                .and_then(|uid| ids.recorded.columns.get(uid))
                 .map_or_else(|| (column.clone(), false), |r| (r.name.clone(), true))
         })
         .collect()
@@ -1464,8 +1462,7 @@ async fn resolved_column_lists(
     conn: &mut Conn,
     data_securable: &BTreeMap<ObjectName, ObjectName>,
     data: &BTreeMap<ObjectName, pbps_db::doctor::DataDemand>,
-    project_ids: &pbps_model::IdsFile,
-    recorded_ids: &pbps_model::IdsFile,
+    ids: &Ids<'_>,
 ) -> Result<
     (
         BTreeMap<ObjectName, Vec<String>>,
@@ -1480,8 +1477,8 @@ async fn resolved_column_lists(
         let Some(demand) = data.get(declared) else {
             continue;
         };
-        let row = resolve_columns(declared, demand.row_columns(), project_ids, recorded_ids);
-        let read = resolve_columns(declared, demand.data_columns(), project_ids, recorded_ids);
+        let row = resolve_columns(declared, demand.row_columns(), ids);
+        let read = resolve_columns(declared, demand.data_columns(), ids);
         for (name, known) in row.iter().chain(&read) {
             if !*known {
                 added.push((i, name.clone()));
@@ -1492,11 +1489,9 @@ async fn resolved_column_lists(
         // plan drops still holds its name, and its grants, until the plan
         // runs.
         recorded.extend(
-            recorded_ids
-                .columns
-                .values()
-                .filter(|c| &c.table == query)
-                .map(|c| (i, c.name.clone())),
+            ids.recorded_names
+                .columns_of(query)
+                .map(|(_, c)| (i, c.name.clone())),
         );
         rows.push((i, query.clone(), row, read));
     }
@@ -1517,6 +1512,27 @@ async fn resolved_column_lists(
     Ok((row_lists, read_lists))
 }
 
+/// The project's identity mapping and this environment's recorded one, each
+/// indexed once: doctor asks of them once per table and per column, and a
+/// scan per question was quadratic in the schema (#1870).
+struct Ids<'a> {
+    project: &'a pbps_model::IdsFile,
+    project_names: pbps_model::IdsIndex<'a>,
+    recorded: &'a pbps_model::IdsFile,
+    recorded_names: pbps_model::IdsIndex<'a>,
+}
+
+impl<'a> Ids<'a> {
+    fn new(project: &'a pbps_model::IdsFile, recorded: &'a pbps_model::IdsFile) -> Self {
+        Self {
+            project,
+            project_names: project.index(),
+            recorded,
+            recorded_names: recorded.index(),
+        }
+    }
+}
+
 /// Where the project now declares a recorded table, when that is in another
 /// schema: an identity-preserving move rather than a drop (#352).
 ///
@@ -1531,13 +1547,9 @@ async fn resolved_column_lists(
 /// recorded-management rule. So does a table whose uid the recorded ids do not
 /// name: without the identity there is no move to recognise, and the answer
 /// errs towards asking.
-fn moved_to<'a>(
-    recorded: &ObjectName,
-    project_ids: &'a pbps_model::IdsFile,
-    recorded_ids: &pbps_model::IdsFile,
-) -> Option<&'a ObjectName> {
-    let uid = recorded_ids.table_uid(recorded)?;
-    project_ids
+fn moved_to<'a>(recorded: &ObjectName, ids: &Ids<'a>) -> Option<&'a ObjectName> {
+    let uid = ids.recorded_names.table_uid(recorded)?;
+    ids.project
         .tables
         .get(uid)
         .filter(|declared| declared.schema != recorded.schema)
@@ -1545,15 +1557,12 @@ fn moved_to<'a>(
 
 /// The name `declared` has in this environment, and whether the environment's
 /// own recorded ids confirm it.
-fn resolution(
-    declared: &ObjectName,
-    project_ids: &pbps_model::IdsFile,
-    recorded_ids: &pbps_model::IdsFile,
-) -> (ObjectName, bool) {
-    let query = project_ids.resolved_in(declared, recorded_ids);
-    let confirmed = project_ids
+fn resolution(declared: &ObjectName, ids: &Ids<'_>) -> (ObjectName, bool) {
+    let query = ids.project_names.resolved_in(declared, ids.recorded);
+    let confirmed = ids
+        .project_names
         .table_uid(declared)
-        .and_then(|uid| recorded_ids.tables.get(uid))
+        .and_then(|uid| ids.recorded.tables.get(uid))
         == Some(&query);
     (query, confirmed)
 }
@@ -1565,15 +1574,14 @@ fn resolution(
 async fn claimed_elsewhere<'a>(
     conn: &mut Conn,
     wanted: impl Iterator<Item = &'a ObjectName>,
-    project_ids: &pbps_model::IdsFile,
-    recorded_ids: &pbps_model::IdsFile,
+    ids: &Ids<'_>,
 ) -> Result<BTreeSet<ObjectName>, DbError> {
     let candidates: Vec<ObjectName> = wanted
-        .map(|declared| resolution(declared, project_ids, recorded_ids))
+        .map(|declared| resolution(declared, ids))
         .filter(|(_, confirmed)| !confirmed)
         .map(|(query, _)| query)
         .collect();
-    let claimed: Vec<ObjectName> = recorded_ids.tables.values().cloned().collect();
+    let claimed: Vec<ObjectName> = ids.recorded.tables.values().cloned().collect();
     Ok(
         crate::catalog::matching_table_names(conn, &candidates, &claimed)
             .await?
@@ -1688,12 +1696,13 @@ pub async fn permissions(
             pbps_model::IdsFile::default(),
         ),
     };
+    let ids = Ids::new(project_ids, &recorded_ids);
     let mut managed: BTreeSet<&str> = schemas.iter().map(String::as_str).collect();
     managed.extend(
         recorded
             .tables
             .keys()
-            .filter(|table| moved_to(table, project_ids, &recorded_ids).is_none())
+            .filter(|table| moved_to(table, &ids).is_none())
             .map(|table| table.schema.as_str()),
     );
     // Recorded modules too (#355, DEC-356.1): a view, procedure or function
@@ -1778,14 +1787,8 @@ pub async fn permissions(
     let ledger_migration_needed = ledger_objects.contains_key(&ledger_tables()[0])
         && !crate::state::timeline_columns_present(conn).await?;
 
-    let colliding =
-        claimed_elsewhere(conn, managed_tables.iter(), project_ids, &recorded_ids).await?;
-    let (managed_securable, _) = resolve_for_query(
-        managed_tables.iter(),
-        project_ids,
-        &recorded_ids,
-        &colliding,
-    );
+    let colliding = claimed_elsewhere(conn, managed_tables.iter(), &ids).await?;
+    let (managed_securable, _) = resolve_for_query(managed_tables.iter(), &ids, &colliding);
     // Recorded names already belong to this environment. Resolve only the
     // declarations: a departing table and a new declaration reusing its name
     // must retain both the existing-object and future-schema questions.
@@ -1841,9 +1844,8 @@ pub async fn permissions(
     // absent from `data_securable` — no object is asked about, and
     // `data_gaps` falls back to the schema answer, exactly like a table this
     // deployment has still to create.
-    let colliding = claimed_elsewhere(conn, data.keys(), project_ids, &recorded_ids).await?;
-    let (data_securable, _) =
-        resolve_for_query(data.keys(), project_ids, &recorded_ids, &colliding);
+    let colliding = claimed_elsewhere(conn, data.keys(), &ids).await?;
+    let (data_securable, _) = resolve_for_query(data.keys(), &ids, &colliding);
     let data_names: Vec<ObjectName> = data_securable.values().cloned().collect();
     // The declared row columns, not the catalog's: see `Columns::Declared`.
     // `UPDATE` is the only one of the three the engine takes at column scope,
@@ -1855,7 +1857,7 @@ pub async fn permissions(
     // than overwriting another's.
     // And each column under the name this environment has for it (#676).
     let (data_columns, read_columns) =
-        resolved_column_lists(conn, &data_securable, data, project_ids, &recorded_ids).await?;
+        resolved_column_lists(conn, &data_securable, data, &ids).await?;
     let mut data_objects = object_permissions(
         conn,
         &data_names,
@@ -2084,14 +2086,9 @@ pub async fn permissions(
         // `resolve_for_query` judges unsafe to resolve is not asked about at
         // all — see `granted_unresolvable`'s doc comment — rather than risk
         // reading a different identity's object under its name.
-        let colliding =
-            claimed_elsewhere(conn, targets.objects.iter(), project_ids, &recorded_ids).await?;
-        let (safe_targets, unresolvable_targets) = resolve_for_query(
-            targets.objects.iter(),
-            project_ids,
-            &recorded_ids,
-            &colliding,
-        );
+        let colliding = claimed_elsewhere(conn, targets.objects.iter(), &ids).await?;
+        let (safe_targets, unresolvable_targets) =
+            resolve_for_query(targets.objects.iter(), &ids, &colliding);
         granted_unresolvable.extend(unresolvable_targets);
         let mut objects: BTreeSet<ObjectName> = safe_targets.into_values().collect();
         let mut schemas_wanted: BTreeSet<String> = targets.schemas.iter().cloned().collect();
@@ -3372,7 +3369,7 @@ mod tests {
             if let Some(name) = declared {
                 project_ids.tables.insert(uid.clone(), table(name));
             }
-            moved_to(&table("legacy.t"), &project_ids, &recorded_ids).cloned()
+            moved_to(&table("legacy.t"), &Ids::new(&project_ids, &recorded_ids)).cloned()
         };
         assert_eq!(moved(Some("modern.t")), Some(table("modern.t")));
         // Renamed within its schema: the schema is still the table's.
@@ -3383,7 +3380,10 @@ mod tests {
         let mut project_ids = pbps_model::IdsFile::default();
         project_ids.tables.insert(uid, table("modern.t"));
         assert_eq!(
-            moved_to(&table("legacy.other"), &project_ids, &recorded_ids),
+            moved_to(
+                &table("legacy.other"),
+                &Ids::new(&project_ids, &recorded_ids)
+            ),
             None
         );
     }
@@ -3407,8 +3407,11 @@ mod tests {
         // What the engine answers for this pair: the unconfirmed `app.old`
         // names the object the recorded ids give uid1.
         let colliding = [table("app.old")].into_iter().collect();
-        let (safe, unresolvable) =
-            resolve_for_query(wanted.iter(), &project_ids, &recorded_ids, &colliding);
+        let (safe, unresolvable) = resolve_for_query(
+            wanted.iter(),
+            &Ids::new(&project_ids, &recorded_ids),
+            &colliding,
+        );
 
         assert_eq!(
             safe.get(&table("app.new")),
@@ -3461,7 +3464,7 @@ mod tests {
             .map(|c| (*c).to_owned())
             .collect();
         assert_eq!(
-            resolve_columns(&table, &declared, &project, &recorded),
+            resolve_columns(&table, &declared, &Ids::new(&project, &recorded)),
             [
                 ("code".to_owned(), true),
                 ("label".to_owned(), true),
@@ -3473,8 +3476,7 @@ mod tests {
             resolve_columns(
                 &table,
                 &["code".to_owned()],
-                &IdsFile::default(),
-                &IdsFile::default()
+                &Ids::new(&IdsFile::default(), &IdsFile::default())
             ),
             [("code".to_owned(), false)]
         );
@@ -3485,8 +3487,11 @@ mod tests {
         let project_ids = pbps_model::IdsFile::default();
         let recorded_ids = pbps_model::IdsFile::default();
         let wanted = [table("app.a"), table("app.b")];
-        let (safe, unresolvable) =
-            resolve_for_query(wanted.iter(), &project_ids, &recorded_ids, &BTreeSet::new());
+        let (safe, unresolvable) = resolve_for_query(
+            wanted.iter(),
+            &Ids::new(&project_ids, &recorded_ids),
+            &BTreeSet::new(),
+        );
         assert_eq!(safe.get(&table("app.a")), Some(&table("app.a")));
         assert_eq!(safe.get(&table("app.b")), Some(&table("app.b")));
         assert!(unresolvable.is_empty(), "{unresolvable:?}");
@@ -3510,8 +3515,11 @@ mod tests {
         let wanted = [table("app.new"), table("app.old")];
 
         let collides = [table("app.old")].into_iter().collect();
-        let (safe, unresolvable) =
-            resolve_for_query(wanted.iter(), &project_ids, &recorded_ids, &collides);
+        let (safe, unresolvable) = resolve_for_query(
+            wanted.iter(),
+            &Ids::new(&project_ids, &recorded_ids),
+            &collides,
+        );
         assert_eq!(
             safe.get(&table("app.new")),
             Some(&table("app.Old")),
@@ -3528,8 +3536,11 @@ mod tests {
             "{unresolvable:?}"
         );
 
-        let (safe, unresolvable) =
-            resolve_for_query(wanted.iter(), &project_ids, &recorded_ids, &BTreeSet::new());
+        let (safe, unresolvable) = resolve_for_query(
+            wanted.iter(),
+            &Ids::new(&project_ids, &recorded_ids),
+            &BTreeSet::new(),
+        );
         assert_eq!(
             safe.get(&table("app.old")),
             Some(&table("app.old")),

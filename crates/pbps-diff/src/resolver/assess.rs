@@ -4,7 +4,7 @@
 
 use super::prepare::{forward, invalidates, surfaces};
 use pbps_model::resolver::Surface;
-use pbps_model::{Change, ChangeSet, GrantTarget, IdsFile};
+use pbps_model::{Change, ChangeSet, GrantTarget, IdsIndex};
 use std::collections::BTreeMap;
 
 /// One question's answer.
@@ -98,12 +98,15 @@ fn assessed_with(
         .iter()
         .any(|p| moves_bindings(&p.change, base, desired, engine));
     let mut questions = BTreeMap::new();
+    // Asked once per base surface: indexed once (#1870).
+    let base_names = base.ids.index();
+    let desired_names = desired.ids.index();
     for surface in surfaces(base.schema) {
-        let kept = forward(&surface, base.ids, desired.ids);
+        let kept = forward(&surface, &base_names, desired.ids);
         if !after.contains(&kept) {
             continue;
         }
-        let answer = if replaced(&surface, &kept, base.ids, desired.ids)
+        let answer = if replaced(&surface, &kept, &base_names, &desired_names)
             || ordinary
                 .changes
                 .iter()
@@ -126,7 +129,7 @@ fn assessed_with(
 /// surface is created from the declaration, so it is a rebuild, not a kept
 /// surface (#1526 review). Only recorded UIDs that differ prove it; a UID
 /// either side lacks proves nothing, and the surface stays a question.
-fn replaced(surface: &Surface, kept: &Surface, from: &IdsFile, to: &IdsFile) -> bool {
+fn replaced(surface: &Surface, kept: &Surface, from: &IdsIndex<'_>, to: &IdsIndex<'_>) -> bool {
     let differ = |a: Option<&pbps_model::Uid>, b: Option<&pbps_model::Uid>| matches!((a, b), (Some(a), Some(b)) if a != b);
     match (surface, kept) {
         (Surface::Default(before), Surface::Default(after)) => {

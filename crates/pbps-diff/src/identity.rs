@@ -991,17 +991,22 @@ fn resolve_columns(
     // Only tables still present in the declarations are handled here. Columns of
     // a newly created table are all additions, and for a dropped table the
     // tombstones for its columns are handled in drop_table_in_ids.
+    //
+    // Table resolution has already moved column owners to their new names;
+    // this stage deliberately reads that output, before changing columns.
+    // Grouped by table once, not scanned once per table (#1870): each pass
+    // below changes only its own table's columns, so a table's group is what
+    // a scan would read when its pass begins.
+    let mut known_by_table: BTreeMap<TableName, BTreeMap<String, Uid>> = BTreeMap::new();
+    for (u, c) in &r.ids.columns {
+        known_by_table
+            .entry(c.table.clone())
+            .or_default()
+            .insert(c.name.clone(), u.clone());
+    }
     for (table_name, table) in &declared.tables {
         let declared_cols: BTreeSet<&String> = table.columns.keys().collect();
-        // Table resolution has already moved column owners to their new names;
-        // this stage deliberately reads that output, before changing columns.
-        let known: BTreeMap<String, Uid> = r
-            .ids
-            .columns
-            .iter()
-            .filter(|(_, c)| &c.table == table_name)
-            .map(|(u, c)| (c.name.clone(), u.clone()))
-            .collect();
+        let known = known_by_table.remove(table_name).unwrap_or_default();
         // A partition's columns are its parent's, and it declares none, so a
         // table that holds column uids and is declared as a partition is one
         // being attached (#1545, DEC-1545.1): its columns become the
@@ -1425,6 +1430,96 @@ mod tests {
         Context {
             operator: "test".into(),
             today: "2026-09-11".into(),
+        }
+    }
+
+    /// Each table's columns are resolved against its own recorded columns,
+    /// when column names repeat across tables and across schemas, and a table
+    /// renamed in the same run carries its columns to the new name before
+    /// their own renames are read (#1870, grouped once rather than scanned
+    /// per table).
+    #[test]
+    fn column_identities_stay_per_table_when_names_repeat_across_tables() {
+        let tables = |spec: &[(&str, &[&str])]| {
+            let mut schema = Schema::default();
+            for (name, columns) in spec {
+                let mut table = Table::default();
+                for c in *columns {
+                    table
+                        .columns
+                        .insert((*c).into(), Column::new("int".parse().unwrap()));
+                }
+                schema.tables.insert(name.parse().unwrap(), table);
+            }
+            schema
+        };
+        let t = |s: &str| -> TableName { s.parse().unwrap() };
+        let before = resolve(
+            &tables(&[
+                ("a.t", &["id", "code"]),
+                ("b.t", &["id", "code"]),
+                ("a.u", &["id", "code"]),
+            ]),
+            &IdsFile::default(),
+            &[],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let intents = [
+            Intent::RenameColumn {
+                table: t("a.t"),
+                from: "code".into(),
+                to: "code_v2".into(),
+            },
+            Intent::RenameTable {
+                from: t("b.t"),
+                to: t("b.w"),
+            },
+            Intent::RenameColumn {
+                table: t("b.w"),
+                from: "code".into(),
+                to: "code_w".into(),
+            },
+            Intent::DropColumn {
+                column: t("a.u").column("code"),
+                reason: "no longer in use".parse().unwrap(),
+            },
+        ];
+        let r = resolve(
+            &tables(&[
+                ("a.t", &["id", "code_v2"]),
+                ("b.w", &["id", "code_w"]),
+                ("a.u", &["id", "note"]),
+            ]),
+            &before,
+            &intents,
+            &ctx(),
+        )
+        .unwrap();
+        let was = |table: &str, column: &str| before.column_uid(&t(table).column(column)).unwrap();
+        let now = |table: &str, column: &str| r.ids.column_uid(&t(table).column(column));
+        assert_eq!(now("a.t", "code_v2"), Some(was("a.t", "code")));
+        assert_eq!(now("b.w", "code_w"), Some(was("b.t", "code")));
+        for (old, new) in [("a.t", "a.t"), ("b.t", "b.w"), ("a.u", "a.u")] {
+            assert_eq!(now(new, "id"), Some(was(old, "id")), "{old}.id");
+        }
+        assert_eq!(r.renamed_columns.len(), 2, "{:?}", r.renamed_columns);
+        assert_eq!(
+            r.dropped_columns,
+            [(was("a.u", "code").clone(), t("a.u").column("code"))]
+        );
+        assert!(r.ids.tombstones.contains_key(was("a.u", "code")));
+        assert_eq!(r.added_columns.len(), 1);
+        assert_eq!(r.added_columns[0].1, t("a.u").column("note"));
+        // Negative: no column is left under a name the declarations dropped.
+        for (table, column) in [
+            ("a.t", "code"),
+            ("b.t", "code"),
+            ("b.w", "code"),
+            ("a.u", "code"),
+        ] {
+            assert_eq!(now(table, column), None, "{table}.{column}");
         }
     }
 
