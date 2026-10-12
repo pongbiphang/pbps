@@ -331,6 +331,15 @@ pub(super) fn changes(
     for surface in rebuilds {
         let previous = forward(surface, ids, before_ids);
         let pair = match surface {
+            Surface::Default(column)
+                if desired
+                    .tables
+                    .get(&column.table)
+                    .is_some_and(|t| t.partition_of.is_some()) =>
+            {
+                partition_default(column, base, desired, ids, before_ids)
+                    .ok_or_else(|| Error::Definition(surface.clone()))?
+            }
             Surface::Default(column) => {
                 let Surface::Default(before_column) = &previous else {
                     unreachable!("surface kind is preserved")
@@ -376,19 +385,15 @@ pub(super) fn changes(
                     }
                     continue;
                 }
-                let Some(old) = base
+                // A surface the plan rebuilds had a default to bind: one that
+                // is gone is a definition the rebuild cannot spell, not
+                // nothing to rebuild (#1610).
+                let old = base
                     .tables
                     .get(&before_column.table)
                     .and_then(|t| t.columns.get(&before_column.name))
-                    .and_then(|c| match &c.value_source {
-                        ValueSource::Default(value) => Some(value.clone()),
-                        ValueSource::None
-                        | ValueSource::Identity(_)
-                        | ValueSource::Generated(_) => None,
-                    })
-                else {
-                    continue;
-                };
+                    .and_then(|c| c.default.clone())
+                    .ok_or_else(|| Error::Definition(surface.clone()))?;
                 let new = desired
                     .tables
                     .get(&column.table)
@@ -509,9 +514,62 @@ pub(super) fn changes(
     Ok((ChangeSet { changes }, ordinary))
 }
 
+/// The release and restoration of a partition's own default, the pair the
+/// ordinary path builds for a module rebuild (DEC-1581.1). A partition
+/// declares no column, so its default lives in `partition_of.columns`
+/// (#1578) and the column is keyed by the partition's table UID; the name it
+/// had before the plan is its parent column's, found by that column's UID
+/// (#1610). `None` when either side has no default of the partition's own.
+fn partition_default(
+    column: &pbps_model::ColumnRef,
+    base: &Schema,
+    desired: &Schema,
+    ids: &IdsFile,
+    before_ids: &IdsFile,
+) -> Option<Vec<Change>> {
+    let of = desired.tables.get(&column.table)?.partition_of.as_ref()?;
+    let uid = ids.table_uid(&column.table)?.clone();
+    let before_table = ids.resolved_in(&column.table, before_ids);
+    let before_of = base.tables.get(&before_table)?.partition_of.as_ref()?;
+    let before_name = ids
+        .column_uid(&of.parent.column(&column.name))
+        .and_then(|parent| before_ids.columns.get(parent))
+        .map_or_else(|| column.name.clone(), |c| c.name.clone());
+    let old = before_of.columns.get(&before_name)?.default.clone()?;
+    let new = of.columns.get(&column.name)?.default.clone()?;
+    let fallback = desired
+        .tables
+        .get(&of.parent)
+        .and_then(|parent| parent.columns.get(&column.name))
+        .and_then(|c| c.default.clone());
+    Some(vec![
+        Change::SetPartitionDefault {
+            uid: uid.clone(),
+            table: before_table,
+            parent: before_of.parent.clone(),
+            column: before_name,
+            from: Some(old),
+            to: None,
+            fallback: None,
+        },
+        Change::SetPartitionDefault {
+            uid,
+            table: column.table.clone(),
+            parent: of.parent.clone(),
+            column: column.name.clone(),
+            from: None,
+            to: Some(new),
+            fallback,
+        },
+    ])
+}
+
 fn tears_down(change: &Change, surface: &Surface) -> bool {
     matches!((change, surface),
         (Change::AlterColumnDefault { column: a, to: None, .. }, Surface::Default(b)) if a == b)
+        || matches!((change, surface),
+        (Change::SetPartitionDefault { table, column, to: None, fallback: None, .. }, Surface::Default(b))
+            if *table == b.table && *column == b.name)
         || matches!((change, surface),
         (Change::DropCheck { table: a, name: n }, Surface::Check { table: b, name: m })
         | (Change::DropIndex { table: a, name: n }, Surface::Index { table: b, name: m }) if a == b && n == m)
