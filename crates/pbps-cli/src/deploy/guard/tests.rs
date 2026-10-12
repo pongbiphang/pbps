@@ -1091,6 +1091,119 @@ fn parent_with_distinct_own_columns() -> Schema {
 }
 
 #[test]
+fn retired_parent_columns_remove_their_original_own_entries() {
+    let parent = TableName::new("app", "events");
+    let child = TableName::new("app", "t");
+    let mut before = parent_with_distinct_own_columns();
+    before
+        .tables
+        .get_mut(&child)
+        .unwrap()
+        .partition_of
+        .as_mut()
+        .unwrap()
+        .columns
+        .get_mut("a")
+        .unwrap()
+        .not_null = true;
+    for (spellings, move_parent) in [
+        (vec!["renamed"], false),
+        (vec!["intermediate", "renamed"], false),
+        (vec!["intermediate", "renamed"], true),
+    ] {
+        let mut from = "a";
+        let mut changes = Vec::new();
+        for to in spellings {
+            changes.push(Change::RenameColumn {
+                uid: "c_000001".parse().unwrap(),
+                table_was: None,
+                table: parent.clone(),
+                from: from.into(),
+                to: to.into(),
+            });
+            from = to;
+        }
+        let final_parent = if move_parent {
+            let moved = TableName::new("app", "history");
+            changes.push(Change::RenameTable {
+                uid: "t_000002".parse().unwrap(),
+                from: parent.clone(),
+                to: moved.clone(),
+                defaults: Vec::new(),
+            });
+            moved
+        } else {
+            parent.clone()
+        };
+        changes.push(Change::DropColumn {
+            uid: "c_000001".parse().unwrap(),
+            column: final_parent.column(from),
+        });
+        let changes = plan(changes);
+        let mut after = before.clone();
+        let mut parent_table = after.tables.remove(&parent).unwrap();
+        parent_table.columns.shift_remove("a");
+        after.tables.insert(final_parent.clone(), parent_table);
+        let own = after
+            .tables
+            .get_mut(&child)
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap();
+        own.parent = final_parent;
+        let retired = own.columns.remove("a").unwrap();
+        let check = |now: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                &changes,
+                &before,
+                now,
+                "test",
+                Settled::Whole,
+            )
+        };
+        check(&after).expect("dropping the renamed UID removes its original own entry");
+        for spelling in ["a", from] {
+            let mut wrong = after.clone();
+            wrong
+                .tables
+                .get_mut(&child)
+                .unwrap()
+                .partition_of
+                .as_mut()
+                .unwrap()
+                .columns
+                .insert(spelling.into(), retired.clone());
+            let error =
+                check(&wrong).expect_err("the retired UID leaves no own entry under either name");
+            assert!(format!("{error:#}").contains("own column defaults or NOT NULLs"));
+        }
+        for field in ["default", "not_null"] {
+            let mut wrong = after.clone();
+            let kept = wrong
+                .tables
+                .get_mut(&child)
+                .unwrap()
+                .partition_of
+                .as_mut()
+                .unwrap()
+                .columns
+                .get_mut("b")
+                .unwrap();
+            match field {
+                "default" => kept.default = None,
+                "not_null" => kept.not_null = false,
+                _ => unreachable!(),
+            }
+            let error =
+                check(&wrong).expect_err("retirement does not excuse another UID's own fields");
+            assert!(format!("{error:#}").contains("own column defaults or NOT NULLs"));
+        }
+    }
+}
+
+#[test]
 fn retired_parent_fields_do_not_change_the_next_columns_own_entries() {
     let parent = TableName::new("app", "events");
     let child = TableName::new("app", "t");

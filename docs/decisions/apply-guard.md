@@ -1340,6 +1340,15 @@ NOT NULL. The same projection handles parent and own settings; it is not a
 drop/rename exception. Unmanaged parent columns retain their existing spelling
 policy, without inventing managed identities.
 
+Removal addresses the same UID at the other boundary: its baseline name,
+not its final name, which no longer exists. A parent column renamed before
+being dropped still removes the partition's original own entry. Resolve the
+drop's UID at the execution step and its column name at `Start`, while field
+requirements resolve surviving columns at `End`. The baseline address is
+already aligned and must not be undone again. This also preserves the other
+column's own fields through a rename chain and a parent-table rename; no
+retired spelling is added to a name-only rename map.
+
 `Column` is destructured without `..` both when deriving kept requirements and
 when comparing held or declared columns. Kept type, nullability, collation,
 expression text, source metadata and annotations compare exactly; a field the

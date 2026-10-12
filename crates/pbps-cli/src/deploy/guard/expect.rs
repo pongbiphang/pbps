@@ -425,7 +425,7 @@ impl<'a> TableChanges<'a> {
             )
             .collect();
         effects.sort_by_key(|(at, _)| *at);
-        let final_column = |column: &str, at| {
+        let column_at = |column: &str, at, boundary| {
             use pbps_model::plan_names::{At, Holder};
             let Some(parent) = parent else {
                 return Some(column.to_owned());
@@ -437,7 +437,7 @@ impl<'a> TableChanges<'a> {
             };
             let before = index.table_at(owner, At::Before(at))?;
             match index.column_holder(&before.column(column), At::Before(at)) {
-                Holder::Tracked(uid) => index.column_at(uid, At::End).map(|(_, n)| n.to_owned()),
+                Holder::Tracked(uid) => index.column_at(uid, boundary).map(|(_, n)| n.to_owned()),
                 Holder::Unmanaged => Some(column.to_owned()),
                 Holder::Vacant => None,
             }
@@ -446,19 +446,27 @@ impl<'a> TableChanges<'a> {
             // Field effects belong to the column held when the step runs.
             // Project before undoing observation names: a retired column's
             // default must not erase its replacement's kept own default.
-            // DROP still removes a baseline slot; a handoff already did that.
+            // DROP removes the UID's baseline slot even when it was renamed
+            // before retirement. Its end address no longer exists, and its
+            // execution spelling need not be the baseline spelling.
             let column = match effect {
-                OwnEffect::Drop(column) => (*column).to_owned(),
-                OwnEffect::Default(column, _) | OwnEffect::NotNull(column, _) => {
-                    let Some(column) = final_column(column, *at) else {
+                OwnEffect::Drop(column) => {
+                    let Some(column) = column_at(column, *at, pbps_model::plan_names::At::Start)
+                    else {
                         continue;
                     };
                     column
                 }
-            };
-            let column = match (handoff, parent) {
-                (None, Some(parent)) => undo.column(parent, &column),
-                _ => column,
+                OwnEffect::Default(column, _) | OwnEffect::NotNull(column, _) => {
+                    let Some(column) = column_at(column, *at, pbps_model::plan_names::At::End)
+                    else {
+                        continue;
+                    };
+                    match (handoff, parent) {
+                        (None, Some(parent)) => undo.column(parent, &column),
+                        _ => column,
+                    }
+                }
             };
             match effect {
                 OwnEffect::Drop(_) if whole => {
