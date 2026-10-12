@@ -7512,6 +7512,147 @@ fn a_partition_tree_round_trips_through_the_cli() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+/// Created-placement checks compare a pinned canonical bound (#1608).
+/// Numeric spelling remains a refusal independently of temporal value
+/// normalization, so this pins both executable paths without choosing a
+/// date/time policy for them.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn created_partition_bounds_are_checked_before_writes_and_survive_staging() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PostgreSQL 16 fixture");
+    for (i, server) in [server(), old].iter().enumerate() {
+        let own = OwnDatabase::new(server, &format!("bounds1910-{i}"));
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new(&format!("bounds1910-{i}"));
+        let path = d.dir.join("schema/app.events.yml");
+        let canonical = "table: app.events\ncolumns:\n  amount: {type: 'numeric(5,2)'}\n\
+            partition_by: [amount]\npartitions:\n  events_a: {from: ['1.50'], to: ['2.50']}\n";
+        let script = d.dir.join("bootstrap.sql");
+        std::fs::write(&path, canonical.replace("'1.50'", "'1.5'")).unwrap();
+        std::fs::write(&script, "previous output").unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let refused = d.run(&[
+            "bootstrap",
+            "--db",
+            connection,
+            "--sql",
+            script.to_str().unwrap(),
+        ]);
+        assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+        assert!(
+            stderr(&refused).contains("bound on `amount`") && stderr(&refused).contains("1.50"),
+            "{}",
+            stderr(&refused)
+        );
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), "previous output");
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_tables WHERE schemaname='app'"
+            ),
+            0
+        );
+
+        std::fs::write(&path, canonical).unwrap();
+        d.commit();
+        succeeds(d.run(&[
+            "bootstrap",
+            "--db",
+            connection,
+            "--sql",
+            script.to_str().unwrap(),
+        ]));
+        succeeds(d.run(&["verify", "--db", connection]));
+
+        let added = format!("{canonical}  events_b: {{from: ['2.50'], to: ['3.50']}}\n");
+        std::fs::write(&path, added.replace("from: ['2.50']", "from: ['2.5']")).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let output = d.dir.join("refused-plan.json");
+        for staged in [false, true] {
+            let mut args = vec![
+                "plan",
+                "--db",
+                connection,
+                "--out",
+                output.to_str().unwrap(),
+            ];
+            if staged {
+                args.push("--staged");
+            }
+            let refused = d.run(&args);
+            assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+            assert!(
+                stderr(&refused).contains("bound on `amount`") && stderr(&refused).contains("2.50"),
+                "{}",
+                stderr(&refused)
+            );
+            assert!(!output.exists());
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM pg_class WHERE oid=to_regclass('app.events_b')"
+                ),
+                0
+            );
+        }
+
+        std::fs::write(&path, &added).unwrap();
+        // The prior git revision deliberately carried a misspelt bound.
+        // Replace that declaration before asking for an offline preview,
+        // which otherwise correctly refuses a partition-bound alteration.
+        d.commit();
+        let preview = d.dir.join("preview.json");
+        succeeds(d.run(&["plan", "--out", preview.to_str().unwrap()]));
+        let refused = approved_apply(&d, connection, &preview, &[]);
+        assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+        assert!(
+            stderr(&refused).contains("offline preview"),
+            "{}",
+            stderr(&refused)
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_class WHERE oid=to_regclass('app.events_b')"
+            ),
+            0
+        );
+
+        let artifact = connected_artifact(&d, connection, true);
+        let plan: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
+        assert_eq!(plan.changes.changes.len(), 1);
+        let pbps_model::Change::CreateTable { table, .. } = &plan.changes.changes[0].change else {
+            panic!("the staged plan creates one partition");
+        };
+        assert_eq!(
+            table.partition_of.as_ref().unwrap().bound,
+            pbps_model::PartitionBound::Range {
+                from: vec![pbps_model::BoundDatum::Value("2.50".into())],
+                to: vec![pbps_model::BoundDatum::Value("3.50".into())],
+            }
+        );
+        let allow = plan
+            .changes
+            .gated_risks()
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut flags = vec!["--staged"];
+        if !allow.is_empty() {
+            flags.extend(["--allow", &allow]);
+        }
+        succeeds(approved_apply(&d, connection, &artifact, &flags));
+        succeeds(d.run(&["verify", "--db", connection]));
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    }
+}
+
 /// A managed partition tree gains and loses partitions through the CLI
 /// (#1171): a partition added in the parent's file applies through a saved
 /// plan, verifies and replans empty; one dropped with `drop-table`, its grant

@@ -651,6 +651,7 @@
         "an_unlogged_table_switches_through_the_cli_behind_its_risk",
         "an_array_column_widens_through_the_cli",
         "a_partition_tree_round_trips_through_the_cli",
+        "created_partition_bounds_are_checked_before_writes_and_survive_staging",
         "pg_partman_parents_are_pulled_with_external_partitions",
         "pull_declares_a_named_parents_partitions_external",
         "partitions_are_added_and_dropped_through_the_cli",
