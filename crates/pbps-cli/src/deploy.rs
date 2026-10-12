@@ -7807,6 +7807,12 @@ enum Connected<T> {
 /// `contents`, written to a new file beside `path`, to be put in place by
 /// renaming it over `path`: a failed write leaves `path` as it was, and a
 /// file never put in place is removed.
+///
+/// The staged name is short and fixed in length, whatever `path`'s is, so
+/// any name `path` may take leaves room for it. A `path` that exists keeps
+/// its permissions: the staged file is created private and given them
+/// before anything is written to it, so a plan kept owner-only is never
+/// readable by others, while staged or after.
 fn stage_file(path: &std::path::Path, contents: &str) -> anyhow::Result<StagedFile> {
     use std::io::Write;
     let cannot = || format!("cannot write `{}`", path.display());
@@ -7814,14 +7820,22 @@ fn stage_file(path: &std::path::Path, contents: &str) -> anyhow::Result<StagedFi
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => std::path::Path::new("."),
     };
-    let name = path.file_name().with_context(cannot)?.to_string_lossy();
-    let at = dir.join(format!(".{name}.{:032x}.tmp", rand::random::<u128>()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&at)
-        .with_context(cannot)?;
+    let at = dir.join(format!(".pbps-{:032x}.tmp", rand::random::<u128>()));
+    let existing = std::fs::metadata(path).ok().map(|m| m.permissions());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if existing.is_some() {
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    }
+    let mut file = options.open(&at).with_context(cannot)?;
     let staged = StagedFile(Some(at));
+    #[cfg(unix)]
+    if let Some(permissions) = existing {
+        file.set_permissions(permissions).with_context(cannot)?;
+    }
+    #[cfg(not(unix))]
+    let _ = existing;
     file.write_all(contents.as_bytes())
         .and_then(|()| file.sync_all())
         .with_context(cannot)?;
@@ -9946,6 +9960,46 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+    /// #1516 review: an output replaced through `stage_file` keeps the
+    /// permissions it had. Negative: a wider one stays as wide.
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_output_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pbps-stage-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir(&dir).unwrap();
+        for mode in [0o600, 0o644] {
+            let path = dir.join(format!("plan-{mode:o}.json"));
+            std::fs::write(&path, "prior").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            super::stage_file(&path, "new")
+                .unwrap()
+                .persist(&path)
+                .unwrap();
+            let replaced = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(replaced, mode, "{}", path.display());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #1516 review: the staged name does not grow with the output's, so an
+    /// output name at the filesystem's limit is still written.
+    #[test]
+    fn an_output_name_at_the_limit_is_still_written() {
+        let dir = std::env::temp_dir().join(format!("pbps-stage-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join(format!("{}.sql", "p".repeat(240)));
+        super::stage_file(&path, "new")
+            .unwrap()
+            .persist(&path)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let left = std::fs::read_dir(&dir).unwrap().count();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(left, 1, "only the output remains");
+    }
+
     fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<TableName>) {
         let ids = crate::plan_fixture::ids(cs);
         let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();
