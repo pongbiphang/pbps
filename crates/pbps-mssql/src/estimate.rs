@@ -15,7 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::{Conn, DbError};
 pub use pbps_dialect::estimate::{Reads, Rewrite};
-use pbps_model::{Change, ChangeSet, ColumnType, TableName, TypeArg};
+use pbps_model::plan_names::{At, Holder, PlanNames};
+use pbps_model::{Change, ColumnType, TableName, TypeArg};
 
 /// The two measured row-storage encodings; PAGE uses the row encoding too.
 #[derive(Debug, Clone, Copy)]
@@ -143,43 +144,14 @@ impl Estimate {
 }
 
 /// Keep original change indices, catalog names and each statement's strategy.
-pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
-    let mut identities = BTreeMap::new();
-    let mut columns = BTreeMap::new();
-    for p in &changes.changes {
-        if let Change::CreateTable { uid, .. } = &p.change {
-            identities.insert(uid, None);
-        }
-        if let Change::AddColumn { uid, .. } = &p.change {
-            columns.insert(uid, None);
-        }
-    }
-    for p in &changes.changes {
-        if let Change::RenameTable { uid, from, .. } = &p.change {
-            identities.entry(uid).or_insert_with(|| Some(from.clone()));
-        }
-        if let Change::RenameColumn { uid, from, .. } = &p.change {
-            columns.entry(uid).or_insert_with(|| Some(from.clone()));
-        }
-    }
-    let mut tables = BTreeMap::new();
-    for p in &changes.changes {
-        if let Change::CreateTable { uid, name, .. } | Change::RenameTable { uid, to: name, .. } =
-            &p.change
-        {
-            tables.insert(name, identities[uid].clone());
-        }
-    }
-    // A table the plan creates has no stored rows to rewrite; a renamed one is
-    // found in the catalog under its old name.
-    let stored = |table: &TableName| {
-        tables
-            .get(table)
-            .cloned()
-            .unwrap_or_else(|| Some(table.clone()))
+pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
+    let changes = names.changes();
+    let stored = |table: &TableName, index| match names.holder(table, At::Before(index)) {
+        Holder::Tracked(uid) => names.table_at(uid, At::Start).cloned(),
+        Holder::Unmanaged => Some(table.clone()),
+        Holder::Vacant => None,
     };
     let layout = changes
-        .changes
         .iter()
         .enumerate()
         .filter_map(|(index, p)| {
@@ -287,7 +259,7 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                     },
                     rows: None,
                     rows_unknown: None,
-                    source: stored(table).map(|t| (t, None)),
+                    source: stored(table, index).map(|t| (t, None)),
                     work,
                     online: p.strategy.online,
                 },
@@ -297,7 +269,6 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
     let mut retyped = BTreeSet::new();
     let mut recollated = BTreeMap::new();
     let mut out: Vec<(usize, Estimate)> = changes
-        .changes
         .iter()
         .enumerate()
         .filter_map(|(index, p)| {
@@ -365,15 +336,15 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                 | Change::SetPartitionNotNull { .. }
                 | Change::PublicExecution { .. } => return None,
             };
-            let source = stored(&column.table)
-                .zip(
-                    columns
-                        .get(uid)
-                        .cloned()
-                        .unwrap_or_else(|| Some(column.name.clone())),
-                )
-                .filter(|_| retyped.insert(uid))
-                .map(|(table, column)| (table, Some(column)));
+            let source = match names.column_holder(column, At::Before(index)) {
+                Holder::Tracked(_) => names.stored_column(column, At::Before(index)),
+                Holder::Unmanaged => {
+                    stored(&column.table, index).map(|table| table.column(&column.name))
+                }
+                Holder::Vacant => None,
+            }
+            .filter(|_| retyped.insert(uid))
+            .map(|column| (column.table, Some(column.name)));
             let (rewrite, reads) =
                 unknown("the table's stored row encoding has not been measured yet");
             Some((

@@ -542,6 +542,19 @@ impl<'p> PlanNames<'p> {
         Some((owner, name))
     }
 
+    /// First managed address of this UID, even when its scope starts after
+    /// `Start`. This is a spelling history, not evidence of a stored catalog
+    /// column: scope changes and physical creation have different lifetimes.
+    pub fn column_first(&self, column: &Uid) -> Option<(&Uid, &str)> {
+        let (owner, name) = self
+            .columns
+            .names
+            .get(column)?
+            .iter()
+            .find_map(|(_, address)| address.as_ref())?;
+        Some((owner, name))
+    }
+
     pub fn column_holder(&self, column: &ColumnRef, at: At) -> Holder<'_> {
         match self.holder(&column.table, at) {
             Holder::Tracked(owner) => self

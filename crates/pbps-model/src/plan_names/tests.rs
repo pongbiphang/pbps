@@ -567,3 +567,41 @@ fn a_final_detachs_column_identity_does_not_leak_into_an_earlier_ownership_scope
         assert_eq!(names.stored_column(&t("leaf").column("c"), At::End), None);
     }
 }
+
+#[test]
+fn a_first_column_address_does_not_extend_its_managed_lifetime() {
+    let (owner, fresh) = (table("leaf"), column("fresh"));
+    let mut shape = Table::default();
+    shape
+        .columns
+        .insert("v".into(), Column::new("int".parse().unwrap()));
+    let changes = vec![
+        p(Change::DetachPartition {
+            uid: owner.clone(),
+            table: t("leaf"),
+            parent: t("parent"),
+            names: vec![],
+            shape: Box::new(shape),
+        }),
+        p(Change::RenameColumn {
+            uid: fresh.clone(),
+            table: t("leaf"),
+            from: "v".into(),
+            to: "amount".into(),
+            table_was: None,
+        }),
+    ];
+    let after = ids(
+        &[(&owner, t("leaf"))],
+        &[(&fresh, t("leaf").column("amount"))],
+    );
+    let names = PlanNames::of(&changes, &after).unwrap();
+    assert_eq!(names.column_first(&fresh), Some((&owner, "v")));
+    assert_eq!(names.column_first(&column("unknown")), None);
+    assert_eq!(names.column_at(&fresh, At::Start), None);
+    assert_eq!(names.column_at(&fresh, At::End), Some((&owner, "amount")));
+    assert_eq!(
+        names.stored_column(&t("leaf").column("amount"), At::End),
+        None
+    );
+}

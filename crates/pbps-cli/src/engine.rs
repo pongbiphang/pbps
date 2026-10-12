@@ -52,12 +52,28 @@ pub async fn execute_staged_statement(
 
 /// Catalog estimates are advisory. Failure to measure is an unavailable
 /// answer, not a reason to refuse a valid plan (ADR-0012 §3, DECISIONS 430).
-pub async fn operational_cost(conn: &mut Conn, cs: &ChangeSet) -> crate::cost::CostReport {
+pub async fn operational_cost(
+    conn: &mut Conn,
+    cs: &ChangeSet,
+    ids: &IdsFile,
+) -> crate::cost::CostReport {
     use crate::cost::{ChangeCost, CostReport, Rows};
+    let names = match pbps_model::plan_names::PlanNames::of(&cs.changes, ids) {
+        Ok(names) => names,
+        Err(error) => {
+            return CostReport::Unavailable {
+                engine: match conn.driver() {
+                    Driver::Mssql => "sqlserver",
+                    Driver::Postgres => "postgres",
+                },
+                reason: format!("operational_cost could not establish plan identities: {error}"),
+            };
+        }
+    };
     match conn.driver() {
         Driver::Mssql => {
             use pbps_mssql::estimate as ms;
-            let mut estimates = ms::planned_estimates(cs).into_iter().peekable();
+            let mut estimates = ms::planned_estimates(&names).into_iter().peekable();
             if estimates.peek().is_none() && !cs.changes.is_empty() {
                 return CostReport::Unavailable {
                     engine: "sqlserver",
@@ -110,7 +126,7 @@ pub async fn operational_cost(conn: &mut Conn, cs: &ChangeSet) -> crate::cost::C
         }
         Driver::Postgres => {
             use pbps_pg::estimate as pg;
-            let mut estimates = pg::planned_estimates(cs).into_iter().peekable();
+            let mut estimates = pg::planned_estimates(&names).into_iter().peekable();
             let mut changes = Vec::with_capacity(cs.changes.len());
             for change_index in 0..cs.changes.len() {
                 let Some((_, mut e)) = estimates.next_if(|(index, _)| *index == change_index)
@@ -4285,7 +4301,12 @@ mod tests {
                     },
                 )],
             };
-            let report = operational_cost(&mut conn, &cs).await;
+            let ids = IdsFile {
+                tables: [("t_aaaaaa".parse().unwrap(), "public.t".parse().unwrap())].into(),
+                columns: [("c_aaaaaa".parse().unwrap(), "public.t.v".parse().unwrap())].into(),
+                ..Default::default()
+            };
+            let report = operational_cost(&mut conn, &cs, &ids).await;
             conn.execute("ROLLBACK").await.unwrap();
             let value = serde_json::to_value(&report).unwrap();
             assert_eq!(value["status"], "available");

@@ -51,33 +51,6 @@ fn stored_key_table(names: &PlanNames<'_>, index: usize, table: &TableName) -> O
     }
 }
 
-/// The original column at one statement's position, by identity rather than by
-/// name. A `RenameColumn` runs at rank 3 and an `AlterColumnType` at 9, so by
-/// the time the `ALTER` runs the column has its declared name — but this check
-/// runs before any statement, against a catalog that still has the old one.
-///
-/// Matched on the column's uid, which both changes carry: a plan may rename
-/// two columns into each other's names, and walking the chain backwards by uid
-/// cannot follow the wrong one.
-fn stored_key_column(
-    changes: &[pbps_model::PlannedChange],
-    index: usize,
-    uid: &pbps_model::Uid,
-    declared: &str,
-) -> String {
-    let mut name = declared.to_owned();
-    for p in changes[..index].iter().rev() {
-        if let Change::RenameColumn {
-            uid: renamed, from, ..
-        } = &p.change
-            && renamed == uid
-        {
-            name = from.clone();
-        }
-    }
-    name
-}
-
 /// Existing inbound FK dependencies of constraint or standalone unique keys.
 /// Called in the planning/preflight transaction; it never tries DDL to learn
 /// whether a drop is legal. The engine's key_index_id, not a column-set match,
@@ -208,11 +181,7 @@ pub async fn key_drop_blockers(
     let mut retypes = Vec::new();
     for (index, p) in names.changes().iter().enumerate() {
         let Change::AlterColumnType {
-            uid,
-            column,
-            from,
-            to,
-            ..
+            column, from, to, ..
         } = &p.change
         else {
             continue;
@@ -220,13 +189,13 @@ pub async fn key_drop_blockers(
         if !crate::types::retype_dependents(from, to).foreign_keys {
             continue;
         }
-        let Some(table) = stored_key_table(names, index, &column.table) else {
+        let Some(stored) = names.stored_column(column, At::Before(index)) else {
             continue;
         };
         retypes.push(Retyped {
             change_index: index,
-            table,
-            column: stored_key_column(names.changes(), index, uid, &column.name),
+            table: stored.table,
+            column: stored.name,
         });
     }
     if keys.is_empty() && retypes.is_empty() {
@@ -367,9 +336,9 @@ pub async fn key_drop_blockers(
         let qualified = qualified(&table)?;
         let mut blocking = BTreeSet::new();
         // A column the catalog does not have is a failed read, not a report of
-        // no dependencies (decision 460). A table this plan creates has
-        // already left `retypes` at `stored_key_table`, so an absent column
-        // here means the name this check reversed is not the one the
+        // no dependencies (decision 460). A table or column this plan creates
+        // has already left `retypes` at the identity projection, so an absent
+        // column here means the stored identity is not the one the
         // environment has, and answering "nothing blocks it" would be a guess.
         let located = conn
             .query_with(
