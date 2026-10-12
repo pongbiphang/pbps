@@ -27,6 +27,24 @@ mod pty;
 #[path = "support/envelope_archives.rs"]
 mod envelope_archives;
 
+#[path = "support/git_baselines.rs"]
+mod git_baselines;
+
+#[test]
+fn historical_declaration_process_counts_do_not_grow_with_file_count() {
+    git_baselines::process_count();
+}
+
+#[test]
+fn batched_baselines_keep_special_paths_and_historical_config_moves() {
+    git_baselines::paths();
+}
+
+#[test]
+fn broken_historical_objects_never_become_empty_schemas() {
+    git_baselines::broken();
+}
+
 #[path = "support/baseline_ids.rs"]
 mod baseline_ids;
 
