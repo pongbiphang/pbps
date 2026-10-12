@@ -1403,42 +1403,13 @@ fn diff_partial_rebuilding(
     // engine refuses either the other way round (measured on 16 and 18,
     // #1443). Self-references do not count, nor the keys inside a cycle,
     // which are dropped around the switches (#1488 review).
-    let components = foreign_key_components(declared.schema);
-    let depth_of = {
-        fn depth(
-            t: &TableName,
-            schema: &Schema,
-            components: &BTreeMap<TableName, TableName>,
-            memo: &mut BTreeMap<TableName, usize>,
-        ) -> usize {
-            if let Some(d) = memo.get(t) {
-                return *d;
-            }
-            let d = schema.tables.get(t).map_or(0, |table| {
-                table
-                    .foreign_keys
-                    .values()
-                    // Not within its own cycle, whose keys are dropped
-                    // around the switches: what is left is acyclic.
-                    .filter(|fk| {
-                        fk.references_table != *t
-                            && components.get(&fk.references_table) != components.get(t)
-                    })
-                    .map(|fk| 1 + depth(&fk.references_table, schema, components, memo))
-                    .max()
-                    .unwrap_or(0)
-            });
-            memo.insert(t.clone(), d);
-            d
-        }
-        let mut memo = BTreeMap::new();
-        let mut depths = BTreeMap::new();
-        for t in declared.schema.tables.keys() {
-            depths.insert(t.clone(), depth(t, declared.schema, &components, &mut memo));
-        }
-        depths
-    };
-    let deepest = depth_of.values().copied().max().unwrap_or(0);
+    // Only a persistence switch reads it, so a plan without one does not
+    // build it (#1792).
+    let fk_graph = planned
+        .iter()
+        .any(|p| matches!(p.change, Change::SetTablePersistence { .. }))
+        .then(|| ForeignKeyGraph::of(declared.schema));
+    let deepest = fk_graph.as_ref().map_or(0, ForeignKeyGraph::deepest);
     // A parent's column default or NULL-ness this plan changes, which the
     // engine recurses into every partition: a partition's own on that
     // column is set after it, or the parent's would overwrite it (#1687).
@@ -1537,7 +1508,7 @@ fn diff_partial_rebuilding(
             table, unlogged, ..
         } = c
         {
-            let depth = depth_of.get(table).copied().unwrap_or(0);
+            let depth = fk_graph.as_ref().map_or(0, |g| g.depth(table));
             return (
                 COLUMN_ALTERATIONS,
                 10 + if *unlogged { deepest - depth } else { depth },
@@ -4197,45 +4168,135 @@ fn diff_computed(name: &TableName, base: &Table, declared: &Table, changes: &mut
     }
 }
 
-/// Each declared table's strongly connected component in the foreign-key
-/// graph, by the component's least member: tables that reach each other
-/// through foreign keys share one. Self-references do not count.
-fn foreign_key_components(schema: &Schema) -> BTreeMap<TableName, TableName> {
-    let edges = |t: &TableName| -> Vec<TableName> {
-        schema.tables.get(t).map_or_else(Vec::new, |table| {
-            table
-                .foreign_keys
-                .values()
-                .map(|fk| fk.references_table.clone())
-                .filter(|to| to != t && schema.tables.contains_key(to))
-                .collect()
-        })
-    };
-    // Which tables each table reaches; two share a component where each
-    // reaches the other. Quadratic, over a schema's tables, once a plan.
-    let mut reach: BTreeMap<TableName, BTreeSet<TableName>> = BTreeMap::new();
-    for t in schema.tables.keys() {
-        let mut seen = BTreeSet::new();
-        let mut stack = edges(t);
-        while let Some(next) = stack.pop() {
-            if seen.insert(next.clone()) {
-                stack.extend(edges(&next));
+/// The declared foreign-key graph's strongly connected components, and how
+/// deep each table sits over them: 0 for a table that references no other,
+/// else one more than the deepest table it references outside its own
+/// component. A table outside the schema counts as depth 0, so a key to one
+/// makes its table 1. Self-references do not count.
+///
+/// Found in one iterative Tarjan pass, linear in tables and keys (#1792). The
+/// earlier version kept every table's full reachable set to answer the same
+/// question, which was quadratic in memory on a chain of keys, and found each
+/// depth by recursion, one stack frame per link. Tarjan completes a component
+/// only after every component it reaches, so each member's depth is final
+/// when its component is popped.
+struct ForeignKeyGraph<'a> {
+    index: BTreeMap<&'a TableName, usize>,
+    component: Vec<usize>,
+    depth: Vec<usize>,
+}
+
+impl<'a> ForeignKeyGraph<'a> {
+    fn of(schema: &'a Schema) -> Self {
+        let names: Vec<&TableName> = schema.tables.keys().collect();
+        let index: BTreeMap<&TableName, usize> =
+            names.iter().enumerate().map(|(i, t)| (*t, i)).collect();
+        let n = names.len();
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+        // A key to a table the schema does not declare: no edge, but depth 1.
+        let mut external = vec![false; n];
+        for (i, (name, table)) in schema.tables.iter().enumerate() {
+            for fk in table.foreign_keys.values() {
+                let to = &fk.references_table;
+                if to == name {
+                    continue;
+                }
+                match index.get(to) {
+                    Some(&j) => edges[i].push(j),
+                    None => external[i] = true,
+                }
             }
         }
-        reach.insert(t.clone(), seen);
+
+        const UNSEEN: usize = usize::MAX;
+        let mut order = vec![UNSEEN; n];
+        let mut low = vec![0; n];
+        let mut on_stack = vec![false; n];
+        let mut stack = Vec::new();
+        let mut component = vec![UNSEEN; n];
+        let mut depth = vec![0; n];
+        let mut visited = 0;
+        let mut components = 0;
+        // The recursion, made explicit: each frame is a table and the index
+        // of the next of its edges to follow.
+        let mut frames: Vec<(usize, usize)> = Vec::new();
+        for root in 0..n {
+            if order[root] != UNSEEN {
+                continue;
+            }
+            order[root] = visited;
+            low[root] = visited;
+            visited += 1;
+            stack.push(root);
+            on_stack[root] = true;
+            frames.push((root, 0));
+            while let Some(&(v, e)) = frames.last() {
+                if let Some(&w) = edges[v].get(e) {
+                    if let Some(frame) = frames.last_mut() {
+                        frame.1 += 1;
+                    }
+                    if order[w] == UNSEEN {
+                        order[w] = visited;
+                        low[w] = visited;
+                        visited += 1;
+                        stack.push(w);
+                        on_stack[w] = true;
+                        frames.push((w, 0));
+                    } else if on_stack[w] {
+                        low[v] = low[v].min(order[w]);
+                    }
+                    continue;
+                }
+                frames.pop();
+                if let Some(&(u, _)) = frames.last() {
+                    low[u] = low[u].min(low[v]);
+                }
+                if low[v] != order[v] {
+                    continue;
+                }
+                // `v` roots a component: it and everything above it on the
+                // stack. Every component its members reach is complete.
+                let at = stack.iter().rposition(|&x| x == v).unwrap_or(0);
+                let members: Vec<usize> = stack.drain(at..).collect();
+                for &m in &members {
+                    on_stack[m] = false;
+                    component[m] = components;
+                }
+                for &m in &members {
+                    depth[m] = edges[m]
+                        .iter()
+                        .filter(|&&w| component[w] != components)
+                        .map(|&w| 1 + depth[w])
+                        .max()
+                        .unwrap_or(0)
+                        .max(usize::from(external[m]));
+                }
+                components += 1;
+            }
+        }
+        Self {
+            index,
+            component,
+            depth,
+        }
     }
-    schema
-        .tables
-        .keys()
-        .map(|t| {
-            let least = schema
-                .tables
-                .keys()
-                .find(|u| *u == t || (reach[t].contains(*u) && reach[*u].contains(t)))
-                .unwrap_or(t);
-            (t.clone(), least.clone())
-        })
-        .collect()
+
+    /// Whether both are declared and reach each other through foreign keys.
+    fn same_component(&self, a: &TableName, b: &TableName) -> bool {
+        match (self.index.get(a), self.index.get(b)) {
+            (Some(&i), Some(&j)) => self.component[i] == self.component[j],
+            _ => false,
+        }
+    }
+
+    /// 0 for a table the schema does not declare.
+    fn depth(&self, table: &TableName) -> usize {
+        self.index.get(table).map_or(0, |&i| self.depth[i])
+    }
+
+    fn deepest(&self) -> usize {
+        self.depth.iter().copied().max().unwrap_or(0)
+    }
 }
 
 /// Foreign keys inside a cycle of tables the plan switches between permanent
@@ -4260,7 +4321,7 @@ fn unlink_cycles_around_persistence_switches(declared: &Schema, changes: &mut Ve
     if switching.len() < 2 {
         return;
     }
-    let components = foreign_key_components(declared);
+    let graph = ForeignKeyGraph::of(declared);
     let mut unlinked = Vec::new();
     for (name, table) in &declared.tables {
         if !switching.contains(name) {
@@ -4268,10 +4329,7 @@ fn unlink_cycles_around_persistence_switches(declared: &Schema, changes: &mut Ve
         }
         for (key, fk) in &table.foreign_keys {
             let to = &fk.references_table;
-            let in_cycle = to != name
-                && switching.contains(to)
-                && components.contains_key(name)
-                && components.get(name) == components.get(to);
+            let in_cycle = to != name && switching.contains(to) && graph.same_component(name, to);
             let added = changes.iter().any(|c| {
                 matches!(c, Change::AddForeignKey { table: t, name: n, .. } if t == name && n == key)
             });
@@ -6755,6 +6813,280 @@ mod tests {
         );
         // Negative: the same parameters plan nothing.
         assert!(run(&base, &base, &[]).changes.is_empty());
+    }
+
+    /// Tables `public.<name>`, each with an `id` key, and a foreign key per
+    /// edge from the first to the second, which need not be declared.
+    fn fk_schema(tables: &[&str], edges: &[(&str, &str)]) -> Schema {
+        let mut s = Schema::default();
+        for t in tables {
+            let mut table = table(&[("id", Column::new(ty("int")).not_null())]);
+            table.primary_key = Some(PrimaryKey {
+                name: Some(format!("{t}_pkey")),
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            });
+            s.tables
+                .insert(format!("public.{t}").parse().unwrap(), table);
+        }
+        for (k, (from, to)) in edges.iter().enumerate() {
+            let column = format!("r{k}");
+            let table = s
+                .tables
+                .get_mut(&format!("public.{from}").parse::<TableName>().unwrap())
+                .unwrap();
+            table.columns.insert(column.clone(), Column::new(ty("int")));
+            table.foreign_keys.insert(
+                format!("fk{k}"),
+                pbps_model::ForeignKey {
+                    columns: vec![column],
+                    references_table: format!("public.{to}").parse().unwrap(),
+                    references_columns: vec!["id".into()],
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+        }
+        s
+    }
+
+    fn t(name: &str) -> TableName {
+        format!("public.{name}").parse().unwrap()
+    }
+
+    /// The closure-and-recursion answer [`ForeignKeyGraph`] replaced (#1792),
+    /// kept as the reference it must agree with: each table's component by
+    /// mutual reachability, and its depth over the keys that leave it.
+    fn reference_graph(
+        schema: &Schema,
+    ) -> (
+        BTreeMap<TableName, BTreeSet<TableName>>,
+        BTreeMap<TableName, usize>,
+    ) {
+        let edges = |t: &TableName| -> Vec<TableName> {
+            schema.tables.get(t).map_or_else(Vec::new, |table| {
+                table
+                    .foreign_keys
+                    .values()
+                    .map(|fk| fk.references_table.clone())
+                    .filter(|to| to != t && schema.tables.contains_key(to))
+                    .collect()
+            })
+        };
+        let mut reach: BTreeMap<TableName, BTreeSet<TableName>> = BTreeMap::new();
+        for t in schema.tables.keys() {
+            let mut seen = BTreeSet::new();
+            let mut stack = edges(t);
+            while let Some(next) = stack.pop() {
+                if seen.insert(next.clone()) {
+                    stack.extend(edges(&next));
+                }
+            }
+            reach.insert(t.clone(), seen);
+        }
+        let same =
+            |a: &TableName, b: &TableName| a == b || (reach[a].contains(b) && reach[b].contains(a));
+        fn depth(
+            t: &TableName,
+            schema: &Schema,
+            same: &dyn Fn(&TableName, &TableName) -> bool,
+            memo: &mut BTreeMap<TableName, usize>,
+        ) -> usize {
+            if let Some(d) = memo.get(t) {
+                return *d;
+            }
+            let d = schema.tables.get(t).map_or(0, |table| {
+                table
+                    .foreign_keys
+                    .values()
+                    .filter(|fk| {
+                        fk.references_table != *t
+                            && !(schema.tables.contains_key(&fk.references_table)
+                                && same(&fk.references_table, t))
+                    })
+                    .map(|fk| 1 + depth(&fk.references_table, schema, same, memo))
+                    .max()
+                    .unwrap_or(0)
+            });
+            memo.insert(t.clone(), d);
+            d
+        }
+        let mut memo = BTreeMap::new();
+        let mut members = BTreeMap::new();
+        let mut depths = BTreeMap::new();
+        for a in schema.tables.keys() {
+            members.insert(
+                a.clone(),
+                schema
+                    .tables
+                    .keys()
+                    .filter(|b| same(a, b))
+                    .cloned()
+                    .collect(),
+            );
+            depths.insert(a.clone(), depth(a, schema, &same, &mut memo));
+        }
+        (members, depths)
+    }
+
+    /// The single pass answers what the closure did, on every graph shape a
+    /// few hundred small pseudo-random schemas reach: cycles, self-references,
+    /// keys to undeclared tables, several components.
+    #[test]
+    fn the_linear_foreign_key_graph_agrees_with_the_closure_it_replaced() {
+        let mut seed: u64 = 0x1792;
+        let mut next = |bound: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % bound
+        };
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
+        for round in 0..400 {
+            let n = 1 + next(names.len() as u64) as usize;
+            let tables = &names[..n];
+            let mut edges = Vec::new();
+            for _ in 0..next(2 * n as u64 + 1) {
+                let from = tables[next(n as u64) as usize];
+                // One key in eight leaves the schema.
+                let to = if next(8) == 0 {
+                    "outside"
+                } else {
+                    tables[next(n as u64) as usize]
+                };
+                edges.push((from, to));
+            }
+            let schema = fk_schema(tables, &edges);
+            let graph = ForeignKeyGraph::of(&schema);
+            let (members, depths) = reference_graph(&schema);
+            for a in schema.tables.keys() {
+                assert_eq!(graph.depth(a), depths[a], "round {round}, {a}: {edges:?}");
+                for b in schema.tables.keys() {
+                    assert_eq!(
+                        graph.same_component(a, b),
+                        members[a].contains(b),
+                        "round {round}, {a} and {b}: {edges:?}"
+                    );
+                }
+            }
+            assert_eq!(graph.deepest(), depths.values().copied().max().unwrap_or(0));
+        }
+    }
+
+    #[test]
+    fn foreign_key_components_and_depths_by_shape() {
+        // A self-reference alone: its own component, depth 0.
+        let g = fk_schema(&["s"], &[("s", "s")]);
+        let graph = ForeignKeyGraph::of(&g);
+        assert!(graph.same_component(&t("s"), &t("s")));
+        assert_eq!(graph.depth(&t("s")), 0);
+
+        // A two-table cycle with a tail into it, and a pair beside it.
+        let g = fk_schema(
+            &["a", "b", "c", "d", "e"],
+            &[("a", "b"), ("b", "a"), ("c", "a"), ("d", "e")],
+        );
+        let graph = ForeignKeyGraph::of(&g);
+        assert!(graph.same_component(&t("a"), &t("b")));
+        assert!(!graph.same_component(&t("a"), &t("c")));
+        assert!(!graph.same_component(&t("d"), &t("e")));
+        assert!(!graph.same_component(&t("a"), &t("d")));
+        // Keys inside the cycle do not count; the tail is one past it.
+        assert_eq!(graph.depth(&t("a")), 0);
+        assert_eq!(graph.depth(&t("b")), 0);
+        assert_eq!(graph.depth(&t("c")), 1);
+        assert_eq!(graph.depth(&t("d")), 1);
+        assert_eq!(graph.deepest(), 1);
+
+        // A key to a table the schema does not declare makes its table 1,
+        // and the undeclared table shares no component, not even its own.
+        let g = fk_schema(&["x"], &[("x", "gone")]);
+        let graph = ForeignKeyGraph::of(&g);
+        assert_eq!(graph.depth(&t("x")), 1);
+        assert_eq!(graph.depth(&t("gone")), 0);
+        assert!(!graph.same_component(&t("gone"), &t("gone")));
+        assert!(!graph.same_component(&t("x"), &t("gone")));
+    }
+
+    /// A chain of keys as long as a large schema's: every depth, with no
+    /// recursion to run out of stack on, and no table's reachable set kept.
+    #[test]
+    fn a_long_chain_of_keys_gets_every_depth_without_recursing() {
+        let n = 5000;
+        let names: Vec<String> = (0..n).map(|i| format!("t{i:05}")).collect();
+        let tables: Vec<&str> = names.iter().map(String::as_str).collect();
+        let edges: Vec<(&str, &str)> = (1..n).map(|i| (tables[i], tables[i - 1])).collect();
+        let schema = fk_schema(&tables, &edges);
+        let graph = ForeignKeyGraph::of(&schema);
+        for (i, name) in tables.iter().enumerate() {
+            assert_eq!(graph.depth(&t(name)), i);
+        }
+        assert_eq!(graph.deepest(), n - 1);
+        assert!(!graph.same_component(&t(tables[0]), &t(tables[1])));
+    }
+
+    /// Persistence switches over a cycle with a tail and a separate pair, both
+    /// ways: the deeper tables switch first to unlogged and last to logged,
+    /// the cycle's keys are dropped around the switches, and a plan with no
+    /// switch over the same cyclic schema changes nothing (#1792).
+    #[test]
+    fn persistence_switches_order_a_cycle_with_a_tail_and_a_separate_pair() {
+        let shape = |unlogged: bool| {
+            let mut s = fk_schema(
+                &["a", "b", "c", "d", "e"],
+                &[("a", "b"), ("b", "a"), ("c", "a"), ("d", "e")],
+            );
+            for table in s.tables.values_mut() {
+                table.unlogged = unlogged;
+            }
+            s
+        };
+        assert!(run(&shape(false), &shape(false), &[]).changes.is_empty());
+        for to_unlogged in [true, false] {
+            let cs = run(&shape(!to_unlogged), &shape(to_unlogged), &[]);
+            let at = |name: &str| {
+                cs.changes
+                    .iter()
+                    .position(|p| {
+                        matches!(&p.change, Change::SetTablePersistence { table, .. } if *table == t(name))
+                    })
+                    .unwrap_or_else(|| panic!("no switch for {name}: {:?}", cs.changes))
+            };
+            for deep in ["c", "d"] {
+                for shallow in ["a", "b", "e"] {
+                    assert_eq!(
+                        at(deep) < at(shallow),
+                        to_unlogged,
+                        "{deep} against {shallow}, to unlogged: {to_unlogged}"
+                    );
+                }
+            }
+            let first_switch = ["a", "b", "c", "d", "e"].map(at).into_iter().min().unwrap();
+            let last_switch = ["a", "b", "c", "d", "e"].map(at).into_iter().max().unwrap();
+            for (table, key) in [("a", "fk0"), ("b", "fk1")] {
+                let drop = cs.changes.iter().position(|p| {
+                    matches!(&p.change, Change::DropForeignKey { table: tb, name } if *tb == t(table) && name == key)
+                });
+                let add = cs.changes.iter().position(|p| {
+                    matches!(&p.change, Change::AddForeignKey { table: tb, name, .. } if *tb == t(table) && name == key)
+                });
+                assert!(
+                    drop.is_some_and(|d| d < first_switch),
+                    "{table}.{key}: {:?}",
+                    cs.changes
+                );
+                assert!(
+                    add.is_some_and(|a| a > last_switch),
+                    "{table}.{key}: {:?}",
+                    cs.changes
+                );
+            }
+            // The keys outside the cycle stand through the switches.
+            assert!(!cs.changes.iter().any(|p| matches!(
+                &p.change,
+                Change::DropForeignKey { name, .. } if name == "fk2" || name == "fk3"
+            )));
+        }
     }
 
     /// A persistence switch is one change, `destructive` to unlogged and
