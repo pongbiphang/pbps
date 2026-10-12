@@ -192,8 +192,9 @@
           "type": "string"
         },
         "nullable": {
+          "description": "Absent is `true`, except on a `serial`, which PostgreSQL makes NOT NULL.",
           "type": "boolean",
-          "default": true
+          "default": null
         },
         "default": {
           "description": "The default-value expression, kept verbatim.",
@@ -216,6 +217,17 @@
           "minItems": 2,
           "maxItems": 2,
           "default": null
+        },
+        "sequence": {
+          "description": "What a `serial` column's sequence says other than `serial`'s own: its\n`start`, its `increment`, and a `name` other than the engine's\n`<table>_<column>_seq` (PostgreSQL). Only beside a `type: serial`,\n`bigserial` or `smallserial`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SequenceDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "generated": {
           "description": "A generation expression (PostgreSQL): `{expression: \"a * 2\", stored:\ntrue}`. The value is computed from the row on every write, where a\ndefault is computed once; never both. `stored` is required, because a\ngeneration expression with no kind is a virtual one on PostgreSQL 18.",
@@ -264,6 +276,38 @@
       "required": [
         "type"
       ]
+    },
+    "SequenceDto": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "description": "The first value. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "increment": {
+          "description": "The step. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "name": {
+          "description": "The sequence's name in the table's schema, where it is not the one the\nengine generates.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
     },
     "GeneratedDto": {
       "type": "object",
@@ -1141,6 +1185,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 39,
+  "x-pbps-schema-version": 40,
   "x-pbps-tool-version": "0.0.0"
 }

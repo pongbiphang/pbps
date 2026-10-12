@@ -244,10 +244,15 @@ pub fn cell(row: &Row, column: &str, spec: Option<&crate::schema::Column>) -> Ce
         Some(v) => Cell::Value(v.clone()),
         None => match spec.map(|c| &c.value_source) {
             Some(crate::ValueSource::Default(default)) => Cell::Default(default.clone()),
+            // A `serial`'s omission is not compared: the read-back takes its
+            // value as of unknown provenance and omits it where this side's
+            // row does (`ObservedRow::as_seen_by`), so both sides say NULL
+            // (#1631).
             None
             | Some(
                 crate::ValueSource::None
                 | crate::ValueSource::Identity(_)
+                | crate::ValueSource::Sequence(_)
                 | crate::ValueSource::Generated(_),
             ) => Cell::Value(Value::Null),
         },
@@ -892,7 +897,11 @@ pub fn check_with_sources(
                 ValueSource::Generated(_) => problems.push(format!(
                     "{name}: declared rows set `{column}` through their primary-key values, but it is a generated column the engine computes — use an ordinary declared key or leave the rows outside reference-data management"
                 )),
-                ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => {}
+                // A `serial` key is refused by the dialect that holds one (#1631).
+                ValueSource::None
+                | ValueSource::Default(_)
+                | ValueSource::Identity(_)
+                | ValueSource::Sequence(_) => {}
             }
         }
     }
@@ -923,6 +932,17 @@ pub fn check_with_sources(
                             "{name}: row `{key}` sets `{column}`, which is a generated column the engine \
                              computes — leave it out"
                         )),
+                        // The engine's to number, as an identity is, and never
+                        // read back (#1631, DECISIONS 94). A `serial` key is
+                        // refused by its dialect.
+                        ValueSource::Sequence(_) => {
+                            if key_column.as_deref() != Some(column.as_str()) {
+                                problems.push(format!(
+                                    "{name}: row `{key}` sets `{column}`, which is a `serial` column \
+                                     its sequence numbers — leave it out"
+                                ));
+                            }
+                        }
                         ValueSource::None | ValueSource::Default(_) => {}
                     }
                 }
@@ -951,8 +971,9 @@ pub fn check_with_sources(
             match row.0.get(column) {
                 Some(Value::Null) => problems.push(format!(
                     "{name}: row `{key}` sets `{column}` to null, but it is NOT NULL{}",
+                    // A `serial`'s sequence fills it as a default would (#1631).
                     if sources.get(column, spec).iter().any(|source| match source {
-                        ValueSource::Default(_) => true,
+                        ValueSource::Default(_) | ValueSource::Sequence(_) => true,
                         ValueSource::None
                         | ValueSource::Identity(_)
                         | ValueSource::Generated(_) => false,
@@ -966,6 +987,7 @@ pub fn check_with_sources(
                     ValueSource::None => true,
                     ValueSource::Default(_)
                     | ValueSource::Identity(_)
+                    | ValueSource::Sequence(_)
                     | ValueSource::Generated(_) => false,
                 }) =>
                 {
@@ -1266,6 +1288,50 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(check(&name(), &t), Vec::<String>::new());
+    }
+
+    /// A row may leave a NOT NULL `serial` column out, and must: its sequence
+    /// numbers it, as an identity's does (#1631, DECISIONS 94). A row that
+    /// sets it is refused, and a NOT NULL column with no source at all is
+    /// still refused when left out.
+    #[test]
+    fn a_row_may_leave_out_a_serial_column() {
+        let mut t = table(
+            Some(vec!["code"]),
+            vec![("new", vec![("label", Value::Text("New".into()))])],
+        );
+        let mut n = Column::new(ColumnType::from_str("int").unwrap()).not_null();
+        n.value_source = crate::ValueSource::Sequence(crate::schema::OwnedSequence::serial());
+        t.columns.insert("n".to_owned(), n);
+        assert_eq!(check(&name(), &t), Vec::<String>::new());
+        // Its sequence's to number: a row that sets it is refused.
+        t.data.as_mut().unwrap().rows = [(
+            RowKey::from("new"),
+            [
+                ("label".to_owned(), Value::Text("New".into())),
+                ("n".to_owned(), Value::Int(5)),
+            ]
+            .into_iter()
+            .collect(),
+        )]
+        .into_iter()
+        .collect();
+        let p = check(&name(), &t);
+        assert!(p.iter().any(|m| m.contains("`serial` column")), "{p:?}");
+        t.data.as_mut().unwrap().rows = [(
+            RowKey::from("new"),
+            [("label".to_owned(), Value::Text("New".into()))]
+                .into_iter()
+                .collect(),
+        )]
+        .into_iter()
+        .collect();
+        t.columns.get_mut("n").unwrap().value_source = crate::ValueSource::None;
+        let p = check(&name(), &t);
+        assert!(
+            p.iter().any(|m| m.contains("NOT NULL with no default")),
+            "{p:?}"
+        );
     }
 
     /// The fourth review's shape, one step over: only the key may pin an

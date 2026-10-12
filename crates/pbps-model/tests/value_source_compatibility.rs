@@ -185,7 +185,7 @@ fn conflicting_or_repeated_sources_cannot_enter_a_saved_artifact() {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("only one of default, identity or generated"),
+            error.contains("only one of default, identity, sequence or generated"),
             "{error}"
         );
         // The same boundary applies below changes and recorded schemas.
@@ -223,4 +223,27 @@ fn conflicting_or_repeated_sources_cannot_enter_a_saved_artifact() {
         let input = format!(r#"{{"type":"integer","nullable":true,{selected}}}"#);
         assert!(serde_json::from_str::<Column>(&input).is_ok(), "{input}");
     }
+}
+
+/// A `serial` is written in its own `sequence` field, where the other three
+/// sources are absent, and reads back as the source it was; a name the
+/// engine generated is not written (#1631, DEC-1631.1).
+#[test]
+fn a_serial_source_round_trips_in_its_own_field() {
+    let mut column = Column::new("integer".parse().unwrap()).not_null();
+    column.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+        start: 100,
+        increment: 5,
+        name: None,
+    });
+    let text = serde_json::to_string(&column).unwrap();
+    assert_eq!(
+        text,
+        r#"{"type":"integer","nullable":false,"sequence":{"start":100,"increment":5}}"#
+    );
+    assert_eq!(serde_json::from_str::<Column>(&text).unwrap(), column);
+    // The negative case: beside a default it is a second source.
+    let twice =
+        r#"{"type":"integer","nullable":false,"default":"1","sequence":{"start":1,"increment":1}}"#;
+    assert!(serde_json::from_str::<Column>(twice).is_err());
 }

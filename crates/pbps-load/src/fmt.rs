@@ -84,9 +84,28 @@ pub fn render_partitioned(
     s.push_str("\ncolumns:\n");
     for (col_name, c) in &table.columns {
         let _ = writeln!(s, "  {}:", scalar(col_name));
-        let _ = writeln!(s, "    type: {}", scalar(&c.ty.to_string()));
-        if !c.nullable {
-            s.push_str("    nullable: false\n");
+        // A column with an owned sequence is written as the `serial` it was
+        // declared as, which also says NOT NULL (DEC-1631.1).
+        let serial = match &c.value_source {
+            pbps_model::ValueSource::Sequence(_) => serial_spelling(&c.ty),
+            pbps_model::ValueSource::None
+            | pbps_model::ValueSource::Default(_)
+            | pbps_model::ValueSource::Identity(_)
+            | pbps_model::ValueSource::Generated(_) => None,
+        };
+        match serial {
+            Some(serial) => {
+                let _ = writeln!(s, "    type: {serial}");
+                if c.nullable {
+                    s.push_str("    nullable: true\n");
+                }
+            }
+            None => {
+                let _ = writeln!(s, "    type: {}", scalar(&c.ty.to_string()));
+                if !c.nullable {
+                    s.push_str("    nullable: false\n");
+                }
+            }
         }
         match &c.value_source {
             pbps_model::ValueSource::None => {}
@@ -95,6 +114,22 @@ pub fn render_partitioned(
             }
             pbps_model::ValueSource::Identity(id) => {
                 let _ = writeln!(s, "    identity: [{}, {}]", id.seed, id.increment);
+            }
+            // Only what `serial` does not say (DEC-1631.1).
+            pbps_model::ValueSource::Sequence(seq) => {
+                let mut fields = Vec::new();
+                if seq.start != 1 {
+                    fields.push(format!("start: {}", seq.start));
+                }
+                if seq.increment != 1 {
+                    fields.push(format!("increment: {}", seq.increment));
+                }
+                if let Some(n) = &seq.name {
+                    fields.push(format!("name: {}", scalar(n)));
+                }
+                if !fields.is_empty() {
+                    let _ = writeln!(s, "    sequence: {{{}}}", fields.join(", "));
+                }
             }
             pbps_model::ValueSource::Generated(g) => {
                 let _ = writeln!(
@@ -684,6 +719,21 @@ fn render_checks_and_indexes(s: &mut String, table: &Table, pad: &str, lead: &st
     }
 }
 
+/// The `serial` spelling of an owned sequence's integer type, or `None` for a
+/// type no serial stands for, which validation refuses and which is then
+/// written as it is held.
+fn serial_spelling(ty: &pbps_model::ColumnType) -> Option<&'static str> {
+    if ty.is_array() || !ty.args.is_empty() {
+        return None;
+    }
+    match ty.base.as_str() {
+        "smallint" | "int2" => Some("smallserial"),
+        "integer" | "int" | "int4" => Some("serial"),
+        "bigint" | "int8" => Some("bigserial"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,7 +902,8 @@ mod tests {
                     }
                     pbps_model::ValueSource::None
                     | pbps_model::ValueSource::Default(_)
-                    | pbps_model::ValueSource::Identity(_) => panic!("generated fixture"),
+                    | pbps_model::ValueSource::Identity(_)
+                    | pbps_model::ValueSource::Sequence(_) => panic!("generated fixture"),
                 }
             }),
             ("computed", |t: &mut Table, s: &str| {
@@ -1359,6 +1410,51 @@ indexes:
         );
         let unstated = "table: app.t\ncolumns:\n  a: {type: integer}\n  b:\n    type: integer\n    generated: {expression: 'a * 2'}\n";
         assert!(crate::load_table_str(Path::new("t.yml"), unstated).is_err());
+    }
+
+    /// A `serial` loads as its integer type and an owned sequence, NOT NULL
+    /// as the engine makes it, and renders back as the `serial` it was, with
+    /// `sequence:` only for what `serial` does not say (#1631, DEC-1631.1).
+    #[test]
+    fn a_serial_column_round_trips_as_serial() {
+        let yaml = "table: app.t\ncolumns:\n  id: {type: serial}\n  big:\n    type: bigserial\n    sequence: {start: 100, increment: 5, name: legacy_seq}\n  small: {type: smallserial, nullable: true}\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        let id = &t.table.columns["id"];
+        assert_eq!(id.ty.to_string(), "integer");
+        assert!(
+            !id.nullable,
+            "a serial is NOT NULL unless it says otherwise"
+        );
+        assert_eq!(
+            id.value_source,
+            pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial())
+        );
+        let big = &t.table.columns["big"];
+        assert_eq!(big.ty.to_string(), "bigint");
+        assert_eq!(
+            big.value_source,
+            pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                start: 100,
+                increment: 5,
+                name: Some("legacy_seq".into()),
+            })
+        );
+        // Said, the nullability is kept, for validation to refuse.
+        assert!(t.table.columns["small"].nullable);
+        let out = render(&t.name, &t.table, &t.intents, None);
+        assert!(out.contains("  id:\n    type: serial\n  big:"), "{out}");
+        assert!(
+            out.contains(
+                "    type: bigserial\n    sequence: {start: 100, increment: 5, name: legacy_seq}\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("    type: smallserial\n    nullable: true\n"),
+            "{out}"
+        );
+        assert!(!out.contains("nullable: false"), "{out}");
     }
 
     /// A computed column reads back with its expression and persisted state

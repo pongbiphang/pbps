@@ -145,7 +145,9 @@ impl Table {
             .iter()
             .filter(|(_, c)| match c.value_source {
                 ValueSource::Default(_) | ValueSource::Generated(_) => true,
-                ValueSource::None | ValueSource::Identity(_) => false,
+                // A `serial`'s `nextval` is the engine's text, not one this
+                // declaration holds (#1631).
+                ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => false,
             })
             .map(|(name, _)| name.as_str())
             .chain(
@@ -377,7 +379,11 @@ impl Table {
             .filter(move |(c, spec)| {
                 c.as_str() != key_column
                     && !(match spec.value_source {
-                        crate::ValueSource::Identity(_) | crate::ValueSource::Generated(_) => true,
+                        // A `serial` is the engine's to number, as an
+                        // identity is (#1631).
+                        crate::ValueSource::Identity(_)
+                        | crate::ValueSource::Sequence(_)
+                        | crate::ValueSource::Generated(_) => true,
                         crate::ValueSource::None | crate::ValueSource::Default(_) => false,
                     })
             })
@@ -782,6 +788,12 @@ pub enum ValueSource {
     /// Verbatim SQL, evaluated when an insert omits the column.
     Default(String),
     Identity(Identity),
+    /// A sequence the column owns and defaults from: the shape PostgreSQL's
+    /// `serial` creates (#1631, DEC-1631.1). Its own source, never an
+    /// identity: a role that may insert into the table may not use the
+    /// sequence, and a column with a default cannot take an identity in
+    /// place. Declared as `type: serial` and its kin.
+    Sequence(OwnedSequence),
     /// Verbatim SQL, evaluated from the row on every write.
     Generated(Generated),
 }
@@ -867,7 +879,7 @@ impl Column {
     /// explicit `NULL`.
     pub fn has_required_add_value_source_with(&self, continues_ident: fn(char) -> bool) -> bool {
         match &self.value_source {
-            ValueSource::Identity(_) => true,
+            ValueSource::Identity(_) | ValueSource::Sequence(_) => true,
             ValueSource::Default(default) => !has_explicit_null_semantics(default, continues_ident),
             // A generated expression can produce NULL; evaluating it here
             // would execute the operator's SQL before approval.
@@ -961,6 +973,46 @@ impl std::fmt::Display for Collation {
 pub struct Identity {
     pub seed: i64,
     pub increment: i64,
+}
+
+/// A sequence a column owns and defaults from (#1631, DEC-1631.1): created
+/// with the column, as `AS` the column's type, and dropped with it.
+///
+/// Its start and increment are held, as an identity's are. Its name is held
+/// only where it is not the engine's generated `<table>_<column>_seq`, and is
+/// then the sequence's bare name in the table's schema. `None` is whatever
+/// name the engine gave it, and is not compared: a column or table rename
+/// keeps the sequence's name, so the generated one stops matching the
+/// declaration the first time either is renamed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedSequence {
+    pub start: i64,
+    pub increment: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl OwnedSequence {
+    /// What `serial` creates: a sequence that starts at one and counts up.
+    pub fn serial() -> Self {
+        Self {
+            start: 1,
+            increment: 1,
+            name: None,
+        }
+    }
+
+    /// Whether a sequence read back as `read` is what this declares: the same
+    /// start and increment, and the same name where this one names it.
+    pub fn declares(&self, read: &OwnedSequence) -> bool {
+        self.start == read.start
+            && self.increment == read.increment
+            && self
+                .name
+                .as_ref()
+                .is_none_or(|n| read.name.as_ref() == Some(n))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

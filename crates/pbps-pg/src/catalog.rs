@@ -37,7 +37,7 @@ pub use pbps_db::catalog::Spellings;
 use crate::introspect::{
     GrantedKind, Limitation, LimitationTarget, Pulled, RawCatalog, RawColumn, RawConstraint,
     RawDefaultAcl, RawEmptyRoutineAcl, RawGrant, RawIdentity, RawIndex, RawModule, RawModuleArg,
-    RawOtherGrant, RawOwner, RawRole, RawSharedDependency, RawTable, assemble,
+    RawOtherGrant, RawOwner, RawRole, RawSerial, RawSharedDependency, RawTable, assemble,
 };
 
 /// The emitter quotes both parts of every table name. PostgreSQL compares
@@ -677,7 +677,10 @@ fn columns_query() -> String {
             CASE WHEN a.attcollation <> ty.typcollation
                  THEN (SELECT co.collname FROM pg_catalog.pg_collation co
                         WHERE co.oid = a.attcollation)
-            END AS collation
+            END AS collation,
+            ser.ser_count, ser.ser_name, ser.ser_exact, ser.ser_same_schema, ser.ser_same_type,
+            ser.ser_same_persistence, ser.ser_start, ser.ser_increment, ser.ser_min, ser.ser_max,
+            ser.ser_cache, ser.ser_cycle, ser.ser_users
        FROM pg_catalog.pg_attribute a
        JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -694,6 +697,37 @@ fn columns_query() -> String {
                     ON iseq.oid = idep.objid AND iseq.relkind = 'S')
               ON idep.refobjid = a.attrelid AND idep.refobjsubid = a.attnum
              AND idep.classid = 'pg_class'::regclass AND idep.deptype = 'i'
+       -- The `serial` shape (#1631): the sequences this column owns that its
+       -- default uses. An aggregate, so a column owning two keeps one row, and
+       -- every fact below is the one sequence's where `ser_count` is 1.
+       LEFT JOIN LATERAL (
+            SELECT pg_catalog.count(*)::int8 AS ser_count,
+                   pg_catalog.min(sq.relname) AS ser_name,
+                   pg_catalog.bool_and(pg_catalog.pg_get_expr(d.adbin, d.adrelid)
+                       = pg_catalog.format('nextval(%L::regclass)', sq.oid::regclass))
+                       AS ser_exact,
+                   pg_catalog.bool_and(sq.relnamespace = c.relnamespace) AS ser_same_schema,
+                   pg_catalog.bool_and(ss.seqtypid = a.atttypid) AS ser_same_type,
+                   pg_catalog.bool_and(sq.relpersistence = c.relpersistence)
+                       AS ser_same_persistence,
+                   pg_catalog.min(ss.seqstart)::int8 AS ser_start,
+                   pg_catalog.min(ss.seqincrement)::int8 AS ser_increment,
+                   pg_catalog.min(ss.seqmin)::int8 AS ser_min,
+                   pg_catalog.min(ss.seqmax)::int8 AS ser_max,
+                   pg_catalog.min(ss.seqcache)::int8 AS ser_cache,
+                   pg_catalog.bool_or(ss.seqcycle) AS ser_cycle,
+                   pg_catalog.max((SELECT pg_catalog.count(*) FROM pg_catalog.pg_depend ud
+                                    WHERE ud.classid = 'pg_attrdef'::regclass
+                                      AND ud.refobjid = sq.oid))::int8 AS ser_users
+              FROM pg_catalog.pg_depend od
+              JOIN pg_catalog.pg_class sq ON sq.oid = od.objid AND sq.relkind = 'S'
+              JOIN pg_catalog.pg_sequence ss ON ss.seqrelid = sq.oid
+             WHERE od.classid = 'pg_class'::regclass AND od.deptype = 'a'
+               AND od.refobjid = a.attrelid AND od.refobjsubid = a.attnum
+               AND EXISTS (SELECT 1 FROM pg_catalog.pg_depend dd
+                            WHERE dd.classid = 'pg_attrdef'::regclass
+                              AND dd.objid = d.oid AND dd.refobjid = sq.oid)
+       ) ser ON true
       WHERE c.relkind IN ('r', 'p')
         AND {NOT_A_PROJECTS_SCHEMA}
         AND a.attnum > 0
@@ -1226,6 +1260,27 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         // contain. The identity's own sequence is the other join and never
         // reaches here.
         let owned_sequence = optional_text(row, "sequence_name")?;
+        // One owned sequence the default uses, with what decides whether the
+        // column is held as a `serial` (#1631). The aggregate is over no rows
+        // for every other column, and its count is then 0.
+        let serial = if number(row, "ser_count")? == 1 {
+            Some(RawSerial {
+                name: text(row, "ser_name")?,
+                exact: flag(row, "ser_exact")?,
+                same_schema: flag(row, "ser_same_schema")?,
+                same_type: flag(row, "ser_same_type")?,
+                same_persistence: flag(row, "ser_same_persistence")?,
+                start: number(row, "ser_start")?,
+                increment: number(row, "ser_increment")?,
+                min: number(row, "ser_min")?,
+                max: number(row, "ser_max")?,
+                cache: number(row, "ser_cache")?,
+                cycles: flag(row, "ser_cycle")?,
+                users: number(row, "ser_users")?,
+            })
+        } else {
+            None
+        };
         raw.columns.push(RawColumn {
             table_oid: number(row, "table_oid")?,
             attnum: small(row, "attnum")?,
@@ -1236,6 +1291,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             identity,
             generated: first_char(&text(row, "generated")?),
             owned_sequence,
+            serial,
             default_sequences: optional_text(row, "default_sequences")?,
             collation: optional_text(row, "collation")?,
         });
@@ -2599,7 +2655,11 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
             };
             let Some(parents) = (match &theirs.value_source {
                 ValueSource::Default(value) => Some(value.as_str()),
-                ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+                // A `serial` is refused on a partitioned parent (#1893).
+                ValueSource::None
+                | ValueSource::Identity(_)
+                | ValueSource::Sequence(_)
+                | ValueSource::Generated(_) => None,
             }) else {
                 continue;
             };

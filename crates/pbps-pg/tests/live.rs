@@ -517,9 +517,11 @@ async fn the_engine_and_the_scanner_agree_on_what_is_data_in_a_definition() {
 }
 
 /// The measurement behind ADR-0011 Amendment 3: `serial` is a macro, and what
-/// comes back is not what was written. That is why it is refused rather than
+/// comes back is not what was written. That is why the type is never
 /// normalized — no normalization could make the two equal, and a schema that
-/// differs from itself on every run is the permanent phantom change.
+/// differs from itself on every run is the permanent phantom change. The
+/// loader holds a bare `type: serial` as the integer and its owned sequence
+/// instead (#1631); a `serial` reaching the dialect as a type is refused.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_serial_column_reads_back_as_an_integer_with_a_sequence_it_owns() {
@@ -2061,6 +2063,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              ALTER TABLE {s}.unchecked ADD CONSTRAINT unchecked_fk
                  FOREIGN KEY (oid_) REFERENCES {s}.odd (id) NOT VALID;
              CREATE TABLE {s}.serialised (id serial PRIMARY KEY, note text);
+             ALTER SEQUENCE {s}.serialised_id_seq CACHE 20;
              CREATE TABLE {s}.full_match (a integer, b integer, UNIQUE (a, b));
              CREATE TABLE {s}.partly (a integer, b integer,
                  CONSTRAINT partly_fk FOREIGN KEY (a, b)
@@ -2312,7 +2315,8 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         // foreign key that has nothing to point at once it is gone.
         "INCLUDE",
         "`leaning_fk` on",
-        // The sequence a `serial` owns and this model cannot hold.
+        // A sequence a column owns in a shape `serial` does not make (a
+        // cache), which this model cannot hold (#1631).
         "serialised`.`id` defaults from the sequence",
         // A check the rows already there were never checked against, and a
         // foreign key likewise — the constraint's own name, because `NOT
@@ -2515,8 +2519,8 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             .to_string(),
         "text"
     );
-    // A `serial`'s column is carried — an `integer` with a `nextval` default,
-    // which is exactly what the model says — and the sequence beside it named.
+    // That column is carried — an `integer` with a `nextval` default, which
+    // is exactly what the model says — and the sequence beside it named.
     let serialised = &pulled.schema.tables[&pbps_model::TableName::new(&s, "serialised")];
     assert_eq!(serialised.columns["id"].ty.to_string(), "integer");
     assert!(
@@ -3091,6 +3095,260 @@ async fn a_stored_generated_column_round_trips_and_changes_its_expression() {
     assert_eq!(value, Some(15));
     assert_eq!(after, changed);
     assert!(plan(&after, &ids, &changed, &ids).is_empty());
+}
+
+/// A `serial` added to a table another role owns, applied by a superuser:
+/// `CREATE SEQUENCE` gives the sequence to the superuser, and `OWNED BY`
+/// refuses a sequence whose owner is not the table's. Measured on 16 and 18,
+/// "sequence must have same owner as table it is linked to". The plan gives
+/// the sequence to the table's owner first, as the engine's own `serial`
+/// does, and the rows are numbered (#1631). The owner is found on the
+/// table's write path, where an `=(oid, regclass)` a schema user added would
+/// match a bare `=` more exactly than the catalog's: it is never called
+/// (DEC-1564.1).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_serial_added_to_another_roles_table_is_that_roles() {
+    use pbps_model::OwnedSequence;
+    let s = emit_schema("ser1631o");
+    let t = TableName::new(&s, "t");
+    let owner = format!("ser1631_owner_{}", std::process::id());
+    let mut db = TestDb::create("ser1631_own").await;
+    fresh(&mut db, &s).await;
+    db.execute(&format!(
+        "DROP ROLE IF EXISTS {owner};
+         CREATE ROLE {owner};
+         CREATE TABLE {s}.t (id integer PRIMARY KEY);
+         INSERT INTO {s}.t VALUES (1), (2);
+         ALTER TABLE {s}.t OWNER TO {owner};
+         CREATE TABLE {s}.called (op text);
+         CREATE FUNCTION {s}.eq(oid, regclass) RETURNS boolean LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO {s}.called VALUES ('='); RETURN $1 = $2::oid; END $$;
+         CREATE OPERATOR {s}.= (leftarg = oid, rightarg = regclass, function = {s}.eq);"
+    ))
+    .await
+    .expect("a table another role owns, and an operator a schema user added");
+    let read = ours_only(&pull(&mut db).await, &s);
+    let ids = mint_ids(&read, &IdsFile::default(), &[]);
+    let mut changed = read.clone();
+    let mut added = pbps_model::Column::new(ty("integer")).not_null();
+    added.value_source = pbps_model::ValueSource::Sequence(OwnedSequence::serial());
+    changed
+        .tables
+        .get_mut(&t)
+        .unwrap()
+        .columns
+        .insert("n".into(), added);
+    let changed_ids = mint_ids(&changed, &ids, &[]);
+    apply(
+        &mut db,
+        &Postgres::new(),
+        &plan(&read, &ids, &changed, &changed_ids),
+    )
+    .await;
+    let sequence_owner = text(
+        &mut db,
+        &format!(
+            "SELECT pg_get_userbyid(relowner)::text FROM pg_class \
+             WHERE oid = pg_get_serial_sequence('{s}.t', 'n')::regclass"
+        ),
+    )
+    .await;
+    let numbered = text(
+        &mut db,
+        &format!("SELECT string_agg(n::text, ',' ORDER BY n) FROM {s}.t"),
+    )
+    .await;
+    let called = number(&mut db, &format!("SELECT count(*)::int4 FROM {s}.called")).await;
+    let after = ours_only(&pull(&mut db).await, &s);
+    drop_schema(&mut db, &s).await;
+    db.drop().await;
+    connect()
+        .await
+        .execute(&format!("DROP ROLE {owner}"))
+        .await
+        .expect("drop the role");
+    assert_eq!(called, 0, "the schema user's operator ran");
+    assert_eq!(sequence_owner, owner);
+    assert_eq!(numbered, "1,2");
+    assert!(plan(&after, &changed_ids, &changed, &changed_ids).is_empty());
+}
+
+/// A `serial`, `bigserial` and `smallserial` written by hand, one under a
+/// renamed sequence with its own start and increment, and one on an
+/// `UNLOGGED` table, are read as the `serial` columns they are, rebuilt from
+/// that read in another database, and read back the same. A `serial` added
+/// to a table holding rows numbers them from its declared start, and the
+/// next plan is empty (#1631, DEC-1631.1). A sequence another column also
+/// calls, and one no column owns, are still named rather than held, and so
+/// is a second sequence a held `serial` owns and its default does not use.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_serial_round_trips_and_numbers_the_rows_it_is_added_to() {
+    use pbps_model::{Change, OwnedSequence};
+    let s = emit_schema("ser1631");
+    let t = TableName::new(&s, "t");
+    let r = TableName::new(&s, "r");
+    let u = TableName::new(&s, "u");
+
+    let mut source = TestDb::create("ser1631_src").await;
+    fresh(&mut source, &s).await;
+    source
+        .execute(&format!(
+            "CREATE TABLE {s}.t (id serial PRIMARY KEY, big bigserial, small smallserial, v text);
+             CREATE TABLE {s}.r (n serial);
+             ALTER SEQUENCE {s}.r_n_seq RENAME TO numbers;
+             ALTER SEQUENCE {s}.numbers START WITH 100 INCREMENT BY 5 RESTART;
+             CREATE UNLOGGED TABLE {s}.u (id serial);
+             CREATE TABLE {s}.shared (id serial);
+             CREATE TABLE {s}.sharer (id integer NOT NULL DEFAULT nextval('{s}.shared_id_seq'));
+             CREATE SEQUENCE {s}.loose;
+             CREATE TABLE {s}.loose_t (id integer NOT NULL DEFAULT nextval('{s}.loose'));
+             CREATE TABLE {s}.extra (id serial);
+             CREATE SEQUENCE {s}.extra_more OWNED BY {s}.extra.id;"
+        ))
+        .await
+        .expect("the source tables");
+    let read = pull(&mut source).await;
+    let mut named: Vec<String> = ours_limitations(&read, &s)
+        .iter()
+        .map(|l| l.target.object_name().name.clone())
+        .collect();
+    named.sort();
+    named.dedup();
+    let mut pulled = ours_only(&read, &s);
+    drop_schema(&mut source, &s).await;
+    source.drop().await;
+
+    // The negative cases: a shared sequence, the column sharing it, and a
+    // sequence nobody owns stay defaults, each named.
+    assert_eq!(
+        named,
+        ["extra", "loose_t", "shared", "sharer"],
+        "{:?}",
+        read.warnings
+    );
+    let extra: Vec<&String> = ours_limitations(&read, &s)
+        .iter()
+        .filter(|l| l.target.object_name().name == "extra")
+        .map(|l| &l.detail)
+        .collect();
+    assert!(
+        matches!(extra.as_slice(), [d] if d.contains("extra_more")),
+        "{extra:?}"
+    );
+    assert_eq!(
+        read.schema.tables[&TableName::new(&s, "extra")].columns["id"].value_source,
+        pbps_model::ValueSource::Sequence(OwnedSequence::serial())
+    );
+    pulled.tables.remove(&TableName::new(&s, "extra"));
+    for off in ["shared", "sharer", "loose_t"] {
+        let column = &pulled.tables[&TableName::new(&s, off)].columns["id"];
+        assert!(
+            matches!(
+                &column.value_source,
+                pbps_model::ValueSource::Default(d) if d.starts_with("nextval(")
+            ),
+            "{off}: {:?}",
+            column.value_source
+        );
+        pulled.tables.remove(&TableName::new(&s, off));
+    }
+
+    let columns = &pulled.tables[&t].columns;
+    for (column, integer) in [("id", "integer"), ("big", "bigint"), ("small", "smallint")] {
+        assert_eq!(columns[column].ty.to_string(), integer, "{column}");
+        assert_eq!(
+            columns[column].value_source,
+            pbps_model::ValueSource::Sequence(OwnedSequence::serial()),
+            "{column}"
+        );
+        assert!(!columns[column].nullable, "{column}");
+    }
+    assert_eq!(columns["v"].value_source, pbps_model::ValueSource::None);
+    assert_eq!(
+        pulled.tables[&r].columns["n"].value_source,
+        pbps_model::ValueSource::Sequence(OwnedSequence {
+            start: 100,
+            increment: 5,
+            name: Some("numbers".into()),
+        })
+    );
+    assert!(pulled.tables[&u].unlogged);
+    assert_eq!(
+        pulled.tables[&u].columns["id"].value_source,
+        pbps_model::ValueSource::Sequence(OwnedSequence::serial())
+    );
+
+    let ids = mint_ids(&pulled, &IdsFile::default(), &[]);
+    let mut target = TestDb::create("ser1631_dst").await;
+    fresh(&mut target, &s).await;
+    apply(
+        &mut target,
+        &Postgres::new(),
+        &plan(&Schema::default(), &IdsFile::default(), &pulled, &ids),
+    )
+    .await;
+    target
+        .execute(&format!(
+            "INSERT INTO {s}.t (v) VALUES ('a'), ('b'), ('c');
+             INSERT INTO {s}.r DEFAULT VALUES;"
+        ))
+        .await
+        .expect("rows");
+    assert_eq!(
+        text(
+            &mut target,
+            &format!("SELECT pg_get_serial_sequence('{s}.r', 'n')")
+        )
+        .await,
+        format!("{s}.numbers")
+    );
+    assert_eq!(
+        number(&mut target, &format!("SELECT n FROM {s}.r")).await,
+        100,
+        "the rebuilt sequence starts where the declaration says"
+    );
+    let rebuilt = ours_only(&pull(&mut target).await, &s);
+    assert_eq!(rebuilt, pulled);
+    assert!(plan(&rebuilt, &ids, &pulled, &ids).is_empty());
+
+    // A `serial` added to a table holding three rows numbers them from its
+    // start, by its increment.
+    let mut changed = pulled.clone();
+    let mut added = pbps_model::Column::new(ty("integer")).not_null();
+    added.value_source = pbps_model::ValueSource::Sequence(OwnedSequence {
+        start: 7,
+        increment: 2,
+        name: None,
+    });
+    changed
+        .tables
+        .get_mut(&t)
+        .unwrap()
+        .columns
+        .insert("n".into(), added);
+    let changed_ids = mint_ids(&changed, &ids, &[]);
+    let step = plan(&rebuilt, &ids, &changed, &changed_ids);
+    assert!(
+        matches!(
+            step.changes.as_slice(),
+            [p] if matches!(&p.change, Change::AddColumn { name, .. } if name == "n")
+        ),
+        "{step:#?}"
+    );
+    apply(&mut target, &Postgres::new(), &step).await;
+    let numbered = text(
+        &mut target,
+        &format!("SELECT string_agg(n::text, ',' ORDER BY n) FROM {s}.t"),
+    )
+    .await;
+    let after = ours_only(&pull(&mut target).await, &s);
+    drop_schema(&mut target, &s).await;
+    target.drop().await;
+    assert_eq!(numbered, "7,9,11");
+    assert_eq!(after, changed);
+    assert!(plan(&after, &changed_ids, &changed, &changed_ids).is_empty());
 }
 
 /// Every replica identity is read back as declared, recreated in an empty
@@ -21439,7 +21697,8 @@ async fn a_backfilled_literal_is_compared_through_its_columns_type() {
 /// hands every stored row a value — `1`, `2`, … — and a key from it into a
 /// parent whose row `1` this plan deletes fails validation after the delete
 /// (23503). Read as "no default, so NULL", the probe counted nothing; it is
-/// a backfill the probe cannot evaluate, and refused as one.
+/// a backfill the probe cannot evaluate, and refused as one. A `serial`'s
+/// sequence numbers them the same way (#1631).
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_identity_column_this_plan_adds_is_a_backfill_no_probe_can_evaluate() {
@@ -21472,82 +21731,93 @@ async fn an_identity_column_this_plan_adds_is_a_backfill_no_probe_can_evaluate()
     assert_eq!(sqlstate(&broken), "23503", "{broken:?}");
     conn.execute("ROLLBACK").await.expect("rollback");
 
-    let parent_name = TableName::new(&s, "parent");
-    let mut parent = Table::default();
-    parent
-        .columns
-        .insert("code".into(), Column::new(ty("integer")).not_null());
-    parent
-        .columns
-        .insert("label".into(), Column::new(ty("text")));
-    parent.primary_key = Some(PrimaryKey {
-        name: None,
-        columns: vec!["code".into()],
-        storage_parameters: Default::default(),
-    });
-    with_data(
-        &mut parent,
-        DataMode::Exact,
-        &[("2", row(&[("label", Value::Text("Two".into()))]))],
-    );
-    let child_name = TableName::new(&s, "child");
-    let mut child = Table::default();
-    child
-        .columns
-        .insert("code".into(), Column::new(ty("text")).not_null());
-    let mut pid = Column::new(ty("integer"));
-    pid.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
-        seed: 1,
-        increment: 1,
-    });
-    child.columns.insert("pid".into(), pid);
-    child.primary_key = Some(PrimaryKey {
-        name: None,
-        columns: vec!["code".into()],
-        storage_parameters: Default::default(),
-    });
-    child.foreign_keys.insert(
-        "child_pid".into(),
-        ForeignKey {
-            columns: vec!["pid".into()],
-            references_table: parent_name.clone(),
-            references_columns: vec!["code".into()],
-            on_delete: ReferentialAction::NoAction,
-            on_update: ReferentialAction::NoAction,
-        },
-    );
-    let mut declared = Schema::default();
-    declared.tables.insert(parent_name.clone(), parent);
-    declared.tables.insert(child_name, child);
-    let pg = Postgres::new();
-    let base = connected_base(&mut conn, &declared, &s).await;
-    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
-    let ids = mint_ids(&declared, &base_ids, &[]);
-    let cs = plan(&base, &base_ids, &declared, &ids);
-    assert!(
-        cs.changes
+    for serial in [false, true] {
+        let parent_name = TableName::new(&s, "parent");
+        let mut parent = Table::default();
+        parent
+            .columns
+            .insert("code".into(), Column::new(ty("integer")).not_null());
+        parent
+            .columns
+            .insert("label".into(), Column::new(ty("text")));
+        parent.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["code".into()],
+            storage_parameters: Default::default(),
+        });
+        with_data(
+            &mut parent,
+            DataMode::Exact,
+            &[("2", row(&[("label", Value::Text("Two".into()))]))],
+        );
+        let child_name = TableName::new(&s, "child");
+        let mut child = Table::default();
+        child
+            .columns
+            .insert("code".into(), Column::new(ty("text")).not_null());
+        // And the same backfill from a `serial`'s sequence (#1631).
+        let mut pid = Column::new(ty("integer"));
+        if serial {
+            pid.nullable = false;
+            pid.value_source =
+                pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        } else {
+            pid.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
+                seed: 1,
+                increment: 1,
+            });
+        }
+        child.columns.insert("pid".into(), pid);
+        child.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["code".into()],
+            storage_parameters: Default::default(),
+        });
+        child.foreign_keys.insert(
+            "child_pid".into(),
+            ForeignKey {
+                columns: vec!["pid".into()],
+                references_table: parent_name.clone(),
+                references_columns: vec!["code".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            },
+        );
+        let mut declared = Schema::default();
+        declared.tables.insert(parent_name.clone(), parent);
+        declared.tables.insert(child_name, child);
+        let pg = Postgres::new();
+        let base = connected_base(&mut conn, &declared, &s).await;
+        let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+        let ids = mint_ids(&declared, &base_ids, &[]);
+        let cs = plan(&base, &base_ids, &declared, &ids);
+        assert!(
+            cs.changes
+                .iter()
+                .any(|c| matches!(c.change, pbps_model::Change::AddColumn { .. })),
+            "the identity column is added: {cs:#?}"
+        );
+        let probes = pg.fixture_preflight(&cs).probes;
+        let refusal = probes
             .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::AddColumn { .. })),
-        "the identity column is added: {cs:#?}"
-    );
-    let probes = pg.fixture_preflight(&cs).probes;
-    let refusal = probes
-        .iter()
-        .find(|p| p.description.contains("cannot evaluate"))
-        .expect("the identity backfill is refused");
-    assert!(
-        refusal
-            .description
-            .contains("its identity, assigned to every stored row"),
-        "{}",
-        refusal.description
-    );
-    assert_eq!(
-        counted(&mut conn, &refusal.sql).await,
-        2,
-        "every stored row is handed a value: {}",
-        refusal.sql
-    );
+            .find(|p| p.description.contains("cannot evaluate"))
+            .expect("the identity backfill is refused");
+        assert!(
+            refusal.description.contains(if serial {
+                "its `serial` sequence, assigned to every stored row"
+            } else {
+                "its identity, assigned to every stored row"
+            }),
+            "{}",
+            refusal.description
+        );
+        assert_eq!(
+            counted(&mut conn, &refusal.sql).await,
+            2,
+            "every stored row is handed a value: {}",
+            refusal.sql
+        );
+    }
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
@@ -28588,6 +28858,10 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
                 pbps_model::ValueSource::Identity(identity) => {
                     i64::from(count) * identity.seed
                         + i64::from(count * (count - 1) / 2) * identity.increment
+                }
+                pbps_model::ValueSource::Sequence(sequence) => {
+                    i64::from(count) * sequence.start
+                        + i64::from(count * (count - 1) / 2) * sequence.increment
                 }
                 pbps_model::ValueSource::Default(_) => i64::from(count * 7),
                 pbps_model::ValueSource::None => 0,

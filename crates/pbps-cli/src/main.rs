@@ -2913,7 +2913,12 @@ fn cmd_plan(
     // stores; where the snapshot recorded what was declared, that is what the
     // declarations are compared against (ADR-0013 §4). A git baseline records
     // nothing and the overlay leaves it as it is.
-    let base_schema = base.declared.overlay(&base.schema);
+    let mut base_schema = base.declared.overlay(&base.schema);
+    // A snapshot is a read, which knows the sequence names it leaves out; a
+    // git baseline is declarations, which do not (#1631).
+    if let baseline::Source::File(_) = source {
+        pbps_dialect::name_read_sequences(&mut base_schema, dialect.as_ref());
+    }
     let mut cs = pbps_diff::diff(
         Side {
             schema: &base_schema,

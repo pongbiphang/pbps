@@ -37,7 +37,7 @@ pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
                 ValueSource::Default(_) | ValueSource::Generated(_) => {
                     set.insert(Surface::Default(table.column(name)));
                 }
-                ValueSource::None | ValueSource::Identity(_) => {}
+                ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => {}
             }
             set
         }
@@ -121,11 +121,14 @@ fn writes_attrdef(c: &Change) -> bool {
     match c {
         Change::AddColumn { column, .. } => match column.value_source {
             ValueSource::Default(_) | ValueSource::Generated(_) => true,
-            ValueSource::None | ValueSource::Identity(_) => false,
+            ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => false,
         },
         Change::CreateTable { table, .. } => table.columns.values().any(|c| match c.value_source {
             ValueSource::Generated(_) => true,
-            ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
+            ValueSource::None
+            | ValueSource::Default(_)
+            | ValueSource::Identity(_)
+            | ValueSource::Sequence(_) => false,
         }),
         Change::AlterColumnExpression { .. } => true,
         _ => false,

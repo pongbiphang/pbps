@@ -1115,6 +1115,7 @@ pub(crate) fn object_reads(
                 pbps_model::ValueSource::Default(_) => true,
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_) => false,
             }) =>
             {
@@ -1126,6 +1127,7 @@ pub(crate) fn object_reads(
                         pbps_model::ValueSource::Default(_) => true,
                         pbps_model::ValueSource::None
                         | pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Sequence(_)
                         | pbps_model::ValueSource::Generated(_) => false,
                     } {
                         names.push(in_schema(name, generated(name, column)));
@@ -1730,6 +1732,7 @@ impl<'f> Walk<'f> {
                 pbps_model::ValueSource::Default(_) => true,
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_) => false,
             }) =>
             {
@@ -1786,6 +1789,7 @@ impl<'f> Walk<'f> {
                         pbps_model::ValueSource::Default(_) => true,
                         pbps_model::ValueSource::None
                         | pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Sequence(_)
                         | pbps_model::ValueSource::Generated(_) => false,
                     } {
                         self.claim(step, default_of(name, column));
@@ -3547,6 +3551,11 @@ fn column_as_declared(
             (pbps_model::ValueSource::None, pbps_model::ValueSource::None)
             | (pbps_model::ValueSource::Default(_), pbps_model::ValueSource::Default(_)) => true,
             (pbps_model::ValueSource::Identity(a), pbps_model::ValueSource::Identity(b)) => a == b,
+            // An owned sequence's name only where the declaration gives one
+            // (#1631, `OwnedSequence::declares`).
+            (pbps_model::ValueSource::Sequence(a), pbps_model::ValueSource::Sequence(b)) => {
+                a.declares(b)
+            }
             // The engine respells generated SQL, but preserves its kind.
             (pbps_model::ValueSource::Generated(a), pbps_model::ValueSource::Generated(b)) => {
                 a.stored == b.stored
@@ -3555,25 +3564,36 @@ fn column_as_declared(
                 pbps_model::ValueSource::None,
                 pbps_model::ValueSource::Default(_)
                 | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_),
             )
             | (
                 pbps_model::ValueSource::Default(_),
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_),
             )
             | (
                 pbps_model::ValueSource::Identity(_),
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Sequence(_)
+                | pbps_model::ValueSource::Generated(_),
+            )
+            | (
+                pbps_model::ValueSource::Sequence(_),
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Identity(_)
                 | pbps_model::ValueSource::Generated(_),
             )
             | (
                 pbps_model::ValueSource::Generated(_),
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Default(_)
-                | pbps_model::ValueSource::Identity(_),
+                | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Sequence(_),
             ) => false,
         }
         && declared.collation == now.collation
@@ -3676,6 +3696,32 @@ fn part_as_planned(
     })
 }
 
+/// `schema` with each owned sequence's name set to the one it has
+/// ([`pbps_dialect::Dialect::owned_sequence_name`]), so that two reads compare
+/// the sequence and not the name its column's or table's name would generate.
+fn sequences_named<'a>(
+    dialect: &dyn pbps_dialect::Dialect,
+    schema: &'a Schema,
+) -> std::borrow::Cow<'a, Schema> {
+    let any = schema.tables.values().any(|t| {
+        t.columns
+            .values()
+            .any(|c| matches!(c.value_source, pbps_model::ValueSource::Sequence(_)))
+    });
+    if !any {
+        return std::borrow::Cow::Borrowed(schema);
+    }
+    let mut out = schema.clone();
+    for (name, table) in &mut out.tables {
+        for (column, spec) in &mut table.columns {
+            if let pbps_model::ValueSource::Sequence(sequence) = &mut spec.value_source {
+                sequence.name = dialect.owned_sequence_name(name, column, sequence);
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Every field of a column two reads disagree on, with the word to call it.
 ///
 /// Field by field because the exclusion above is: a plan that retypes a column
@@ -3696,13 +3742,14 @@ fn differing(
     // report more than one moved field. Derive all three from the exclusive
     // source in one exhaustive policy, never from independent model options.
     let [
-        (was_default, was_identity, was_generated),
-        (now_default, now_identity, now_generated),
+        (was_default, was_identity, was_sequence, was_generated),
+        (now_default, now_identity, now_sequence, now_generated),
     ] = [&was.value_source, &now.value_source].map(|source| match source {
-        ValueSource::None => (None, None, None),
-        ValueSource::Default(default) => (Some(default), None, None),
-        ValueSource::Identity(identity) => (None, Some(identity), None),
-        ValueSource::Generated(generated) => (None, None, Some(generated)),
+        ValueSource::None => (None, None, None, None),
+        ValueSource::Default(default) => (Some(default), None, None, None),
+        ValueSource::Identity(identity) => (None, Some(identity), None, None),
+        ValueSource::Sequence(sequence) => (None, None, Some(sequence), None),
+        ValueSource::Generated(generated) => (None, None, None, Some(generated)),
     });
     let mut out = Vec::new();
     if was.ty != now.ty {
@@ -3738,6 +3785,10 @@ fn differing(
     // somebody else's work, and the whole-column exclusion used to hide it.
     if was_identity != now_identity {
         out.push((None, "identity"));
+    }
+    // No change of this model moves a `serial`'s sequence either (#1631).
+    if was_sequence != now_sequence {
+        out.push((None, "sequence"));
     }
     if was.description != now.description {
         out.push((None, "description"));
@@ -3836,6 +3887,14 @@ fn refuse_unplanned_movement(
     label: &str,
     settled: Settled,
 ) -> anyhow::Result<()> {
+    // Each owned sequence under the name it has, before anything below maps
+    // a column or table across a rename: a held name is `None` where it is
+    // the generated one, and a rename changes that without touching the
+    // sequence (#1631).
+    let (before, after) = (
+        &sequences_named(dialect, before),
+        &sequences_named(dialect, after),
+    );
     let mut objects: BTreeSet<&TableName> = BTreeSet::new();
     // Modules are counted in their own set, under their own identity: a
     // module is no longer a name in the tables namespace (ADR-0009 §1), and
@@ -4462,6 +4521,7 @@ fn refuse_unplanned_movement(
                                 true
                             }
                             pbps_model::ValueSource::Identity(_)
+                            | pbps_model::ValueSource::Sequence(_)
                             | pbps_model::ValueSource::Generated(_) => to.is_none(),
                         };
                         (compatible && column_as_declared(dialect, &finished, now))
@@ -5386,6 +5446,7 @@ fn refuse_unplanned_movement(
                         pbps_model::ValueSource::Default(_) => true,
                         pbps_model::ValueSource::None
                         | pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Sequence(_)
                         | pbps_model::ValueSource::Generated(_) => false,
                     }) == has,
                     "default",
@@ -5395,7 +5456,8 @@ fn refuse_unplanned_movement(
                         pbps_model::ValueSource::Generated(_) => true,
                         pbps_model::ValueSource::None
                         | pbps_model::ValueSource::Default(_)
-                        | pbps_model::ValueSource::Identity(_) => false,
+                        | pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Sequence(_) => false,
                     }) == has,
                     "generation expression",
                 ),
@@ -5806,13 +5868,21 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         // one table's altered `IDENTITY` silently deleted every expressible
         // difference the same comparison had found — an undercount in the
         // report, in the finding count, and in the hook's payload.
+        // Both sides are reads, which know the sequence names they leave
+        // out; compared unnamed, a renamed sequence would take the other
+        // side's name and read as no change (#1631). The checksums below are
+        // the reads' own.
+        let mut recorded_read = baseline.snapshot.schema.clone();
+        pbps_dialect::name_read_sequences(&mut recorded_read, dialect.as_ref());
+        let mut live_read = scoped.schema.clone();
+        pbps_dialect::name_read_sequences(&mut live_read, dialect.as_ref());
         let diffed = pbps_diff::diff_partial(
             pbps_diff::Side {
-                schema: &baseline.snapshot.schema,
+                schema: &recorded_read,
                 ids: &recorded_ids,
             },
             pbps_diff::Side {
-                schema: &scoped.schema,
+                schema: &live_read,
                 ids: &observed,
             },
             dialect.as_ref(),
@@ -7014,7 +7084,9 @@ pub fn cmd_plan_db(
         // against what was *declared* when each object was last written,
         // where the ledger recorded it (ADR-0009 §2.2, ADR-0013 §4,
         // DECISIONS 207–208).
-        let base = entry.snapshot.declared.overlay(&read_back);
+        let mut base = entry.snapshot.declared.overlay(&read_back);
+        // A read knows the sequence names it leaves out (#1631).
+        pbps_dialect::name_read_sequences(&mut base, dialect.as_ref());
         // A removed module no longer has a declaration carrying its
         // `depends_on:` edge. The newest snapshot keeps those baseline
         // annotations so connected planning can still drop dependents first.
@@ -14184,6 +14256,70 @@ mod tests {
         )
         .expect_err("the module is still there");
         assert!(format!("{e:#}").contains("is still there"), "{e:#}");
+    }
+
+    /// A `serial`'s sequence keeps its name across a rename of its column or
+    /// table, where the name either would generate changes: the two reads
+    /// compare the sequence, not the generated name, so the plan's own
+    /// rename is not somebody else's change. A sequence another session
+    /// renamed, or restarted elsewhere, still is (#1631).
+    #[test]
+    fn a_renamed_serial_keeps_its_sequence_across_the_apply() {
+        let serial = |name: Option<&str>, start: i64| {
+            let mut c = pbps_model::Column::new("integer".parse().unwrap()).not_null();
+            c.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                start,
+                increment: 1,
+                name: name.map(str::to_owned),
+            });
+            c
+        };
+        let schema = |table: &str, column: &str, spec: pbps_model::Column| {
+            let mut t = pbps_model::Table::default();
+            t.columns.insert(column.to_owned(), spec);
+            let mut s = Schema::default();
+            s.tables.insert(table.parse().unwrap(), t);
+            s
+        };
+        let check = |change: pbps_model::Change, after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                &pbps_model::ChangeSet {
+                    changes: vec![pbps_model::PlannedChange::new(change)],
+                },
+                &schema("app.t", "id", serial(None, 1)),
+                after,
+                "prod",
+                Settled::Whole,
+            )
+        };
+        let column = || pbps_model::Change::RenameColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            table: "app.t".parse().unwrap(),
+            from: "id".to_owned(),
+            to: "n".to_owned(),
+            table_was: None,
+        };
+        let table = || pbps_model::Change::RenameTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            from: "app.t".parse().unwrap(),
+            to: "app.u".parse().unwrap(),
+            defaults: Vec::new(),
+        };
+        check(column(), &schema("app.t", "n", serial(Some("t_id_seq"), 1)))
+            .expect("the column's rename leaves its sequence's name");
+        check(table(), &schema("app.u", "id", serial(Some("t_id_seq"), 1)))
+            .expect("the table's rename leaves its sequence's name");
+
+        // The negative cases: a sequence renamed, or started elsewhere, by
+        // somebody else.
+        for after in [
+            schema("app.t", "n", serial(Some("other_seq"), 1)),
+            schema("app.t", "n", serial(Some("t_id_seq"), 5)),
+        ] {
+            let e = check(column(), &after).expect_err("not this plan's");
+            assert!(format!("{e:#}").contains("sequence"), "{e:#}");
+        }
     }
 
     /// #541: a name that changes hands within the plan. Both reads hold it,

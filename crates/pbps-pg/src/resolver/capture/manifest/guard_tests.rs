@@ -373,3 +373,78 @@ fn generated_attrdef_ownership_refuses_missing_or_invalid_recorded_roots() {
         .insert("relkind".into(), json!("v"));
     assert!(classify_attrdefs(&wrong_root, &schema, &ids).is_err());
 }
+
+/// A declared `serial`'s sequence and default go with its column (#1631):
+/// dropping or renaming the column moves both, so a resolver plan that does
+/// either finds them qualified, not unchanged. Only the sequence the
+/// declaration names conveys it: another sequence the column owns, and the
+/// same objects under a column declared without a `serial`, stay unqualified.
+#[test]
+fn a_serials_sequence_and_default_belong_to_its_column() {
+    for major in [16, 18] {
+        let (mut captured, schema, mut ids) = generated_attrdef_fixture(major);
+        let table = TableName::new("app", "t");
+        let relation = relation_identity(&table);
+        let column = identity("column", &["s"], vec![relation.clone()]);
+        captured.attribute_numbers.insert(column.clone(), 5);
+        captured.inputs.insert(
+            column.clone(),
+            input(BTreeMap::from([
+                ("attrelid".into(), json!(&relation)),
+                ("attname".into(), json!("s")),
+                ("attisdropped".into(), json!(false)),
+            ])),
+        );
+        ids.columns
+            .insert("c_000004".parse().unwrap(), table.column("s"));
+        let sequence = identity("pg_class", &["app", "t_s_seq"], vec![]);
+        let extra = identity("pg_class", &["app", "extra_seq"], vec![]);
+        for owned_by in [&sequence, &extra] {
+            captured.inputs.insert(
+                owned_by.clone(),
+                input(BTreeMap::from([("relkind".into(), json!("S"))])),
+            );
+            captured.inputs.insert(
+                identity("pg_depend", &["a"], vec![owned_by.clone(), column.clone()]),
+                input(BTreeMap::new()),
+            );
+        }
+        let attrdef = identity("pg_attrdef", &[], vec![column.clone()]);
+        captured
+            .inputs
+            .insert(attrdef.clone(), input(BTreeMap::new()));
+        captured.inputs.insert(
+            identity("pg_depend", &["n"], vec![attrdef.clone(), sequence.clone()]),
+            input(BTreeMap::new()),
+        );
+
+        let declared = |source: pbps_model::ValueSource| {
+            let mut schema = schema.clone();
+            let mut c = pbps_model::Column::new("integer".parse().unwrap()).not_null();
+            c.value_source = source;
+            schema
+                .tables
+                .get_mut(&table)
+                .unwrap()
+                .columns
+                .insert("s".into(), c);
+            classify_attrdefs(&captured, &schema, &ids).unwrap()
+        };
+        let owners = declared(pbps_model::ValueSource::Sequence(
+            pbps_model::OwnedSequence::serial(),
+        ));
+        let owner = ObjectOwnership::Surface(Surface::Column(table.column("s")));
+        assert_eq!(owners[&sequence], owner, "PG{major} sequence");
+        assert_eq!(owners[&attrdef], owner, "PG{major} default");
+        assert_eq!(
+            owners[&identity("pg_depend", &["n"], vec![attrdef.clone(), sequence.clone()])],
+            owner,
+            "PG{major} the default's edge to its sequence"
+        );
+        // The negative cases.
+        assert_eq!(owners[&extra], ObjectOwnership::Unqualified, "PG{major}");
+        let plain = declared(pbps_model::ValueSource::None);
+        assert_eq!(plain[&sequence], ObjectOwnership::Unqualified, "PG{major}");
+        assert_eq!(plain[&attrdef], ObjectOwnership::Unqualified, "PG{major}");
+    }
+}

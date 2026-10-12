@@ -366,6 +366,20 @@ indexes:
   true}`** (PostgreSQL): computed on every write, never a default, and its
   kind always said. Its expression changes in place on PostgreSQL 17 and
   later; a change to or from generated is refused (DEC-1168.1).
+- **A PostgreSQL `serial` column is `type: serial`**, `bigserial` or
+  `smallserial`: an `integer`, `bigint` or `smallint` numbered by a sequence
+  the column owns, created with it and dropped with it. It is always
+  `NOT NULL`: `nullable: false` may be written and need not be, and
+  `nullable: true` is refused. A start, an increment, or a
+  sequence name other than the engine's `<table>_<column>_seq` goes in
+  `sequence: {start, increment, name}`. `pull` writes a column back as
+  `serial` only where it is exactly the shape `serial` makes; a sequence
+  that is shared, not owned, cached, bounded or cycling stays a named
+  limitation, as does one on a partitioned table (#1893). A role inserting
+  into it needs a grant on the sequence, which is not declared yet (#1892).
+  Adding, removing or changing a kept column's sequence is refused (#1889),
+  as is a `data:` block keyed by one. SQL Server refuses it: its form is
+  `identity:` (DEC-1631.1).
 - **A SQL Server computed column is declared under `computed:`**, beside
   `columns:` and not among them: `{expression: "a * 2"}`, with `persisted:
   true` for a stored value and `not_null: true` for `PERSISTED NOT NULL`. It

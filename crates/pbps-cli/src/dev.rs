@@ -413,6 +413,7 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
                         pbps_model::ValueSource::Default(default) => Some(default.as_str()),
                         pbps_model::ValueSource::None
                         | pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Sequence(_)
                         | pbps_model::ValueSource::Generated(_) => None,
                     })
                     .unwrap_or("(none)")

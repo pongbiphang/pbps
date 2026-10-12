@@ -197,7 +197,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
             .map(|column| LoadError::Yaml {
                 path: std::path::PathBuf::from(&src.name),
                 message: format!(
-                    "column `{}.{column}` can have only one of default, identity or generated",
+                    "column `{}.{column}` can have only one of default, identity, a `serial` type or generated",
                     table.name
                 ),
             })
@@ -274,6 +274,44 @@ pub(crate) fn convert_for_diagnostics(
         let (Ok(()), Ok(ty)) = (named, ty) else {
             continue;
         };
+        // `serial` and its kin are an integer type and a sequence the column
+        // owns and defaults from, which is what the engine makes of them and
+        // reads back (#1631, DEC-1631.1). Held as the two, so the model never
+        // holds a type the engine does not.
+        let (ty, sequence) = match serial_type(&ty) {
+            Some(integer) => {
+                let given = c.sequence.as_ref();
+                (
+                    integer,
+                    Some(pbps_model::OwnedSequence {
+                        start: given.and_then(|s| s.start).unwrap_or(1),
+                        increment: given.and_then(|s| s.increment).unwrap_or(1),
+                        name: given.and_then(|s| s.name.clone()),
+                    }),
+                )
+            }
+            None if c.sequence.is_some() => {
+                errs.push(
+                    LoadError::semantic(
+                        src,
+                        to_span(&c.ty.defined),
+                        format!(
+                            "column `{col_name}` has a `sequence:` on `{ty}`, which is not a \
+                             serial type"
+                        ),
+                        "`sequence:` beside a type that is not serial".to_owned(),
+                    )
+                    .with_help(
+                        "declare `type: serial`, `bigserial` or `smallserial`, or leave out \
+                         `sequence:`",
+                    ),
+                );
+                continue;
+            }
+            None => (ty, None),
+        };
+        // A `serial` is NOT NULL, as the engine makes it.
+        let nullable = c.nullable.unwrap_or(sequence.is_none());
 
         if let (Some(table), Some(from)) = (&name, &c.renamed_from) {
             intents.push(Intent::RenameColumn {
@@ -293,6 +331,9 @@ pub(crate) fn convert_for_diagnostics(
                 increment,
             }));
         }
+        if let Some(sequence) = sequence {
+            sources.push(pbps_model::ValueSource::Sequence(sequence));
+        }
         if let Some(generated) = c.generated {
             sources.push(pbps_model::ValueSource::Generated(pbps_model::Generated {
                 expression: generated.expression,
@@ -311,7 +352,7 @@ pub(crate) fn convert_for_diagnostics(
             col_name,
             Column {
                 ty,
-                nullable: c.nullable,
+                nullable,
                 value_source,
                 description: c.description,
                 deprecated: c.deprecated,
@@ -1216,4 +1257,19 @@ pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, 
         }),
         _ => Err(errs),
     }
+}
+
+/// The integer type a `serial` spelling stands for, or `None` for any other
+/// type: PostgreSQL's three and their numbered aliases, bare.
+fn serial_type(ty: &ColumnType) -> Option<ColumnType> {
+    if ty.is_array() || !ty.args.is_empty() {
+        return None;
+    }
+    let integer = match ty.base.to_ascii_lowercase().as_str() {
+        "smallserial" | "serial2" => "smallint",
+        "serial" | "serial4" => "integer",
+        "bigserial" | "serial8" => "bigint",
+        _ => return None,
+    };
+    Some(ColumnType::new(integer, Vec::new()))
 }

@@ -41,7 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 39;
+pub const SCHEMA_VERSION: u32 = 40;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
@@ -53,6 +53,7 @@ pub const SCHEMA_VERSION: u32 = 39;
 // 37: a server resolver's `baseline:` file (issue #1673).
 // 38: a parent's `partitions: external` (issue #1533).
 // 39: a Docker resolver's `baseline:`, and either's `outside_writes:` (issue #1674).
+// 40: a column's `serial` types, `sequence:` and optional `nullable:` (issue #1631).
 // 26: index, key and unique-constraint `storage_parameters` (issue #1442).
 // 25: a table's `storage_parameters:` (issue #1441).
 // 24: a table's `replica_identity:` (issue #1444).

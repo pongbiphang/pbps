@@ -147,6 +147,10 @@ pub(super) fn classify(
     let mut owned = BTreeMap::new();
     // Asked once per declared table and column (#1870).
     let recorded_names = recorded.ids.index();
+    // Each declared `serial`'s exact sequence, by the column that owns it
+    // (#1631): the automatic edge from that sequence to that column, and no
+    // other, conveys the column's surface.
+    let mut serials: BTreeMap<ObjectIdentity, ObjectIdentity> = BTreeMap::new();
     for schema in recorded.namespaces {
         let namespace = identity("pg_namespace", vec![schema.clone()], Vec::new());
         if capture.inputs.contains_key(&namespace) {
@@ -197,21 +201,39 @@ pub(super) fn classify(
                     Surface::Column(reference.clone()),
                 )?;
             }
+            if let ValueSource::Sequence(sequence) = &declaration.value_source {
+                serials.insert(
+                    relation(&crate::emit::owned_sequence(name, column, sequence)),
+                    column_id.clone(),
+                );
+            }
             let default_id = identity("pg_attrdef", Vec::new(), vec![column_id]);
             // A generated attrdef is an explicit root too (DEC-1168.1).
             // Its internal column edge must not broaden its exact owner.
             if capture.inputs.contains_key(&default_id)
+                // A `serial`'s attrdef is the engine's `nextval`, not text the
+                // declaration holds, as before the sources were one (#1631).
                 && ((match &declaration.value_source {
                     ValueSource::Default(_) => true,
-                    ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => {
-                        false
-                    }
+                    ValueSource::None
+                    | ValueSource::Identity(_)
+                    | ValueSource::Sequence(_)
+                    | ValueSource::Generated(_) => false,
                 }) || (match &declaration.value_source {
                     ValueSource::Generated(_) => true,
-                    ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
+                    ValueSource::None
+                    | ValueSource::Default(_)
+                    | ValueSource::Identity(_)
+                    | ValueSource::Sequence(_) => false,
                 }))
             {
                 assign(&mut owned, default_id, Surface::Default(reference))?;
+            } else if capture.inputs.contains_key(&default_id)
+                && let ValueSource::Sequence(_) = &declaration.value_source
+            {
+                // The column's own: it goes with the column and its sequence,
+                // and holds no text a declaration binds (#1631).
+                assign(&mut owned, default_id, Surface::Column(reference))?;
             }
         }
         for check in table.checks.keys() {
@@ -468,13 +490,18 @@ pub(super) fn classify(
             };
             let allowed = if kind == "a" {
                 // PostgreSQL 18's not-null constraint has an automatic edge
-                // to the exact column. Other automatic edges, including
-                // ordinary indexes and triggers, never convey ownership.
-                made.class == "pg_constraint"
+                // to the exact column, and a declared `serial`'s sequence one
+                // to the column it is declared on. Other automatic edges,
+                // including ordinary indexes and triggers, never convey
+                // ownership.
+                (made.class == "pg_constraint"
                     && maker.class == "column"
                     && matches!(owner, Surface::Column(_))
                     && property(capture, made, "contype")? == Some("n")
-                    && made.signature.get(1) == maker.signature.first()
+                    && made.signature.get(1) == maker.signature.first())
+                    || (serials.get(made) == Some(maker)
+                        && matches!(owner, Surface::Column(_))
+                        && property(capture, made, "relkind")? == Some("S"))
             } else {
                 match (made.class.as_str(), maker.class.as_str(), &owner) {
                     (

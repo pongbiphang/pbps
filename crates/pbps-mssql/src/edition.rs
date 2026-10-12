@@ -138,7 +138,10 @@ pub fn size_of_data_warnings(changes: &ChangeSet, edition: &Edition) -> Vec<Stri
             && !column.nullable
             && (match &column.value_source {
                 ValueSource::Default(_) => true,
-                ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => false,
+                ValueSource::None
+                | ValueSource::Identity(_)
+                | ValueSource::Sequence(_)
+                | ValueSource::Generated(_) => false,
             })
         {
             out.push(format!(

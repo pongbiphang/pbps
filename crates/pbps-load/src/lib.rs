@@ -396,7 +396,7 @@ mod tests {
                 assert!(
                     errors[0]
                         .to_string()
-                        .contains("only one of default, identity or generated")
+                        .contains("only one of default, identity, a `serial` type or generated")
                 );
             }
         }
@@ -505,6 +505,73 @@ indexes:
                 "legacy_code"
             ]
         );
+    }
+
+    /// `serial` and its numbered aliases stand for an integer type and an
+    /// owned sequence; a `sequence:` beside any other type is an error, and a
+    /// `serial` that is not the whole bare type is left for the dialect to
+    /// refuse (#1631).
+    #[test]
+    fn a_serial_spelling_is_an_integer_with_an_owned_sequence() {
+        for (spelled, integer) in [
+            ("serial", "integer"),
+            ("SERIAL4", "integer"),
+            ("bigserial", "bigint"),
+            ("serial8", "bigint"),
+            ("smallserial", "smallint"),
+            ("serial2", "smallint"),
+        ] {
+            let t = load(&format!(
+                "table: app.t\ncolumns:\n  id: {{type: {spelled}}}\n"
+            ));
+            let id = &t.table.columns["id"];
+            assert_eq!(id.ty.to_string(), integer, "{spelled}");
+            assert_eq!(
+                id.value_source,
+                pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
+                "{spelled}"
+            );
+            assert!(!id.nullable, "{spelled}");
+        }
+        let refused =
+            errors("table: app.t\ncolumns:\n  id: {type: integer, sequence: {start: 5}}\n");
+        assert_eq!(refused.len(), 1, "{}", render(&refused));
+        assert!(
+            render(&refused).contains("not a serial type"),
+            "{}",
+            render(&refused)
+        );
+        // `nullable:` that is there is a boolean, on a serial and off one:
+        // an explicit null is not the key left out.
+        for spelled in ["null", "~", ""] {
+            for ty in ["serial", "integer"] {
+                let doc =
+                    format!("table: app.t\ncolumns:\n  id: {{type: {ty}, nullable: {spelled}}}\n");
+                let refused = errors(&doc);
+                assert!(!refused.is_empty(), "{ty}, `nullable: {spelled}` was read");
+            }
+        }
+        // Its default is its sequence's: a `default:` beside it is a second
+        // value source.
+        let twice = errors("table: app.t\ncolumns:\n  id: {type: serial, default: '1'}\n");
+        assert!(
+            render(&twice).contains("only one of default, identity, a `serial` type or generated"),
+            "{}",
+            render(&twice)
+        );
+        let array = load("table: app.t\ncolumns:\n  ids: {type: 'serial[]'}\n");
+        assert_eq!(
+            array.table.columns["ids"].value_source,
+            pbps_model::ValueSource::None
+        );
+        assert_eq!(array.table.columns["ids"].ty.to_string(), "serial[]");
+        // The negative case: an ordinary integer is not given a sequence.
+        let plain = load("table: app.t\ncolumns:\n  id: {type: integer}\n");
+        assert_eq!(
+            plain.table.columns["id"].value_source,
+            pbps_model::ValueSource::None
+        );
+        assert!(plain.table.columns["id"].nullable);
     }
 
     #[test]

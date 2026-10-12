@@ -542,8 +542,12 @@ struct AddedColumn {
     /// from the sequence during the `ADD COLUMN` — measured, `1`, `2`, … —
     /// which no probe can evaluate and which may be a key of the parent. A
     /// generated column's values are the engine's in the same way, computed
-    /// from each row during the `ADD COLUMN` (DEC-1168.1).
+    /// from each row during the `ADD COLUMN` (DEC-1168.1). A `serial`'s
+    /// sequence hands them out the same way (#1631).
     identity: bool,
+    /// Which of the two it is, for the refusal to name: a `serial`'s
+    /// sequence (#1631).
+    serial: bool,
 }
 
 /// A foreign key this plan adds, in the plan's own names.
@@ -811,10 +815,13 @@ impl<'a> AsStored<'a> {
                     column,
                     ..
                 } => {
-                    let (default, identity) = match &column.value_source {
-                        ValueSource::None => (None, false),
-                        ValueSource::Default(default) => (Some(default.clone()), false),
-                        ValueSource::Identity(_) | ValueSource::Generated(_) => (None, true),
+                    let (default, identity, serial) = match &column.value_source {
+                        ValueSource::None => (None, false, false),
+                        ValueSource::Default(default) => (Some(default.clone()), false, false),
+                        ValueSource::Identity(_) | ValueSource::Generated(_) => (None, true, false),
+                        // A `serial`'s sequence numbers every stored row as an
+                        // identity's does (#1631).
+                        ValueSource::Sequence(_) => (None, true, true),
                     };
                     this.columns_added.insert(
                         table.column(name),
@@ -822,6 +829,7 @@ impl<'a> AsStored<'a> {
                             default,
                             ty: column.ty.clone(),
                             identity,
+                            serial,
                         },
                     );
                 }
@@ -2719,7 +2727,9 @@ fn planned_key_probes(
 /// How a backfill no probe can evaluate is named in the refusal: the value
 /// the identity sequence hands every stored row, or the default expression.
 fn described_backfill(column: &str, table: &TableName, added: Option<&AddedColumn>) -> String {
-    if added.is_some_and(|a| a.identity) {
+    if added.is_some_and(|a| a.serial) {
+        format!("{column} of {table} (its `serial` sequence, assigned to every stored row)")
+    } else if added.is_some_and(|a| a.identity) {
         format!("{column} of {table} (its identity, assigned to every stored row)")
     } else {
         format!("{column} of {table} (its default, backfilled into every stored row)")
@@ -3230,14 +3240,14 @@ fn build(
             // as the whole table: its inputs may never be null, and the engine
             // refuses `contains null values` at `ADD` when they are
             // (DEC-1168.1).
-            if match &column.value_source { ValueSource::Generated(_) => true, ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false } {
+            if match &column.value_source { ValueSource::Generated(_) => true, ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) | ValueSource::Sequence(_) => false } {
                 return Ok(skip(
                     change,
                     "a generated column's values cannot be evaluated before apply",
                     unchecked,
                 ));
             }
-            if let Some(default) = match &column.value_source { ValueSource::Default(value) => Some(value.as_str()), ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None } {
+            if let Some(default) = match &column.value_source { ValueSource::Default(value) => Some(value.as_str()), ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) | ValueSource::Generated(_) => None } {
                 let Some(literal) = constant_default(default) else {
                     return Ok(skip(change, "the default cannot be evaluated before apply", unchecked));
                 };

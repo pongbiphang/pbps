@@ -228,7 +228,9 @@ impl Declared {
                             .or_default()
                             .insert(column.clone(), generated.expression.clone());
                     }
-                    ValueSource::None | ValueSource::Identity(_) => {}
+                    // No text a declaration holds: the engine writes a
+                    // `serial`'s `nextval` (#1631).
+                    ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => {}
                 }
             }
             // A partition's own default, under the partition and the column, as
@@ -441,7 +443,8 @@ impl Declared {
                                 .or_default()
                                 .insert(name.clone(), generated.expression.clone());
                         }
-                        ValueSource::None | ValueSource::Identity(_) => {}
+                        ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => {
+                        }
                     }
                 }
                 Change::DropColumn { column, .. } => {
@@ -642,7 +645,7 @@ impl Declared {
                             read.expression = declared.clone();
                         }
                     }
-                    ValueSource::None | ValueSource::Identity(_) => {}
+                    ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => {}
                 }
             }
             if let Some(defaults) = self.expressions.defaults.get(name) {

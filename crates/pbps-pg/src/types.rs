@@ -270,10 +270,12 @@ fn arity(ty: &ColumnType, detail: impl Into<String>) -> DialectError {
 /// comes back. Left alone it is a schema that differs from itself on every run:
 /// the permanent phantom change.
 ///
-/// The replacement is named in the refusal, because ADR-0010 §7 measured that
-/// it also disposes of a second problem: an identity column needs no sequence
-/// privilege, and a `serial` one does (`ERROR: permission denied for sequence
-/// ser_id_seq`). Measured on PostgreSQL 18.6 by the live suite in this crate,
+/// A bare `type: serial` never reaches here: the loader holds it as the
+/// integer type and an owned sequence, which is what comes back (#1631,
+/// DEC-1631.1, amending DECISIONS 227). What does reach here is a spelling
+/// the engine has no column for either — an array of one, or one with
+/// arguments — and a type held as `serial` by something other than the
+/// loader. Measured on PostgreSQL 18.6 by the live suite in this crate,
 /// which is where the read-back spellings below come from (DECISIONS 227).
 pub fn refuse_serial(ty: &ColumnType, column: Option<&str>) -> Option<DialectError> {
     let base = ty.base.to_ascii_lowercase();
@@ -289,11 +291,10 @@ pub fn refuse_serial(ty: &ColumnType, column: Option<&str>) -> Option<DialectErr
     Some(DialectError::Invalid {
         dialect: DIALECT,
         message: format!(
-            "{at}`{declared}` is a macro, not a type. The column is created as `{reads_back}` \
-             with an owned sequence, and `{reads_back}` is what introspection reads back, so a \
-             declared `{declared}` would differ from itself on every run. Declare \
-             `{reads_back}` with an `identity:` instead, which this engine emits as \
-             GENERATED ... AS IDENTITY and which needs no sequence privilege.",
+            "{at}`{declared}` is a macro, not a type: it makes a `{reads_back}` column with an \
+             owned sequence, and is held only as a column's whole, bare type (`type: \
+             {declared}`). Here it is `{ty}`, which the engine has no column for. Declare \
+             `type: {declared}`, or `{reads_back}` with an `identity:`.",
             declared = ty.base,
         ),
     })

@@ -2407,6 +2407,21 @@ pub trait Dialect {
         self.implicit_relation_names(name, table)
     }
 
+    /// The name of the sequence `table`'s `column` owns (#1631, DEC-1631.1):
+    /// the one `sequence` holds, or the one this engine generates where it
+    /// holds none. Two reads of one sequence compare by it, because a rename
+    /// of the column or the table changes the generated name and not the
+    /// sequence's. The default, the held name, is right for an engine that
+    /// generates none: no other engine holds an owned sequence.
+    fn owned_sequence_name(
+        &self,
+        _table: &TableName,
+        _column: &str,
+        sequence: &pbps_model::OwnedSequence,
+    ) -> Option<String> {
+        sequence.name.clone()
+    }
+
     /// Whether a module is also a constraint under its own name in its
     /// schema, which a retry that yields to constraints finds taken (#1112):
     /// PostgreSQL's constraint trigger has a `pg_constraint` row. The default,
@@ -2421,7 +2436,9 @@ pub trait Dialect {
     /// whose generated names meet do not fail: the engine suffixes the later
     /// one, and which one is later is the plan's order. A declared name equal
     /// to a fallback is the same order dependence as one equal to the first
-    /// choice. The default is none, like the first choices.
+    /// choice. The default is none, like the first choices. A first choice
+    /// the engine never retries, one created by name, is listed after every
+    /// one that has a fallback, so it has none at its position.
     fn implicit_relation_fallbacks(
         &self,
         _name: &TableName,
@@ -2593,7 +2610,7 @@ pub trait Dialect {
             found.push(DialectError::Invalid {
                 dialect: self.name(),
                 message: format!(
-                    "column `{column}` can have only one of default, identity or generated"
+                    "column `{column}` can have only one of default, identity, a `serial` type or generated"
                 ),
             });
         }
@@ -3107,6 +3124,26 @@ pub fn check_system_time_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec
         }
     }
     problems
+}
+
+/// `schema`, a read-back, with every `serial`'s sequence named (#1631).
+///
+/// A read leaves the name out where the engine generated it under the table
+/// and column it reads, so there it is known. A declaration that leaves it
+/// out does not know it: a rename keeps the sequence's name, so a git
+/// baseline's unnamed sequence may be one an earlier table generated. The
+/// differ compares a name only where both sides give one, so a base that is
+/// a read is named in full first, and one that is a declaration is not.
+pub fn name_read_sequences(schema: &mut Schema, dialect: &dyn Dialect) {
+    for (name, table) in &mut schema.tables {
+        for (column, spec) in &mut table.columns {
+            if let pbps_model::ValueSource::Sequence(sequence) = &mut spec.value_source
+                && sequence.name.is_none()
+            {
+                sequence.name = dialect.owned_sequence_name(name, column, sequence);
+            }
+        }
+    }
 }
 
 /// The whole-schema question of whether a declared index, or the index behind

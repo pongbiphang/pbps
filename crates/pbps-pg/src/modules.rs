@@ -1580,6 +1580,7 @@ impl Dependent {
                                 ValueSource::Default(_) => true,
                                 ValueSource::None
                                 | ValueSource::Identity(_)
+                                | ValueSource::Sequence(_)
                                 | ValueSource::Generated(_) => false,
                             })
                             || t.partition_of.as_ref().is_some_and(|of| {
@@ -1592,6 +1593,7 @@ impl Dependent {
                                             ValueSource::Default(_) => true,
                                             ValueSource::None
                                             | ValueSource::Identity(_)
+                                            | ValueSource::Sequence(_)
                                             | ValueSource::Generated(_) => false,
                                         })
                             })

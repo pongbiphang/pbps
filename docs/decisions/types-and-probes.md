@@ -183,6 +183,10 @@ to add an entry here.
     which per ADR-0010 §7 also disposes of the sequence-grant problem, since an
     identity column needs no sequence privilege and a `serial` one does.
 
+    *Amended by [DEC-1631.1](#dec-1631-1): the loader holds a bare `type:
+    serial` as its integer type and an owned sequence, which is what reads
+    back; the refusal stays for a `serial` that reaches the dialect as a type.*
+
 <a id="decision-240"></a>
 
 240. **The PostgreSQL catalogue is closed, and every bound in it is the
@@ -1756,3 +1760,99 @@ is scalar, and an array's equality includes its bounds (`'[0:1]={1,2}'` is not
 - Every other check is behind an array test already: the estimate, the risk
   classification and the probe.
 
+<a id="dec-1631-1"></a>
+
+**DEC-1631.1. A PostgreSQL `serial` is held as its integer type and a
+sequence the column owns, declared `type: serial`, and read back as one only
+where it is exactly the shape `serial` makes (#1631).**
+
+Amends DECISIONS 227. `serial` is still not a type: what changed is that the
+loader no longer passes it to the dialect as one. In the model it is one more
+exclusive value source, `ValueSource::Sequence`, beside a default, an identity
+and a generation expression, so a `serial` with any of those is a second
+source, refused by name. `type: serial`, `serial4`,
+`bigserial`, `serial8`, `smallserial` and `serial2`, as the column's whole
+bare type, load as `integer`, `bigint` or `smallint` with an `OwnedSequence
+{start, increment, name}`, and that is what the reader builds from the
+catalog. So the declared column and the read-back one are the same value, and
+DECISIONS 227's phantom change cannot arise. A `serial` reaching the dialect
+as a type (`serial[]`) is still refused.
+
+Measured on 16.15 and 18.6:
+
+- `serial` makes the column `NOT NULL`, a sequence `AS` the column's type in
+  the table's schema and persistence, with cache 1, no cycle and the
+  type's positive bounds, a default exactly `nextval('<seq>'::regclass)`, and
+  an `a` dependency of the sequence on the column. So the model's column is
+  `NOT NULL`, with `nullable:` left out or `false`; `nullable: true` is
+  refused, since a NULL in it is a row the sequence was never asked for. The
+  reader holds a column as a `serial` only where every one of those holds,
+  its sequence is used by no other default, and the table is not
+  partitioned (a partition
+  carries its own copy of the parent's default, so the parent's sequence is
+  called twice; #1893). Anything else,
+  a shared sequence, one the column does not own, a cache, bounds, a cycle or
+  another schema, stays the raw default it is, with the sequence named, as
+  before.
+- `ADD COLUMN` with a `nextval` default rewrites the table and numbers the
+  stored rows from the sequence's start by its increment. The emitter creates
+  the sequence by name with `START WITH` and `INCREMENT BY` first, then the
+  column with that default, then `ALTER SEQUENCE … OWNED BY`, all in one
+  statement. Writing `serial` in the DDL could not carry the start, which an
+  added column numbers its rows from. `OWNED BY` needs the sequence and the
+  table to have one owner, and `CREATE SEQUENCE` gives the sequence to the
+  running role, so for a table that already exists the sequence is given to
+  the table's owner first, read from the catalog at apply time, as the
+  engine's own `serial` does. Measured on 16 and 18: without it, a superuser
+  or a member of the owning role was refused. The estimate is a rewrite, and the pre-flight treats the
+  backfill as the identity's: a value no probe can evaluate.
+- Dropping the table or the column drops an owned sequence with it, so the
+  plan has nothing to drop.
+
+**The name** is held only where it is not the generated `<table>_<column>_seq`,
+and compared only where both sides give one. A rename keeps the sequence's
+name, so the generated one stops matching without anything having changed.
+That makes a missing name mean two things. In a read it is the name the
+engine generated under the table and column read, so it is known, and a base
+read from the database or a recorded snapshot is named in full before the
+differ compares it. In a declaration, and so in a git baseline, it is not
+known: the sequence may carry a name an earlier table generated, so a later
+pull's name for it is no change. A declared name equal to the generated one
+is refused as redundant. A declared name is claimed in the declarations'
+namespace, after every claim the engine retries, since it never retries
+this one. An unnamed sequence claims nothing there: the name its table and
+column would generate may be no sequence's after a rename, and claiming it
+refused a table declared under it. The name a plan creates one under is the
+connected plan's to claim (#1899).
+
+**Refused**, each by name:
+
+- A start or increment outside an identity's bounds for the type, a nullable
+  `serial`, one beside a `default:`, `identity:` or `generated:`, one on a
+  partitioned table or partition, and a type no `serial` stands for.
+- Adding, removing or changing the sequence of a kept column, and retyping a
+  kept `serial`. These are #1889's: a sequence added to a column that holds
+  values starts where it may meet them, and one left behind by a retype keeps
+  its old type's bounds. Creating a table and adding a column are supported.
+- A `serial` added to an `UNLOGGED` table, whose persistence the change does
+  not carry.
+- A `data:` block keyed by a `serial`, for DECISIONS 321's reason: a pinned
+  key leaves the sequence behind, and the application's next insert fails.
+  A `serial` beside the key is the engine's to number, as an identity is
+  (DECISIONS 94): a row that sets it is refused, every row leaves it out, and
+  the row reader never reads it. Read and held to an omission instead, an
+  inserted row is held to NULL where the sequence wrote a number, and the
+  apply rolls back (`a_data_block_beside_a_serial_leaves_it_to_the_sequence`).
+- A `serial` on SQL Server, whose form is `identity:`.
+
+**Kept distinct from identity.** A role with `INSERT` alone cannot insert
+into a `serial` column (ADR-0010 §7), and a column with a default cannot be
+given an identity in place, so a pulled `serial` is never rewritten as an
+identity. A role's `INSERT` on the table does not yet carry the sequence
+grant it needs, and a pulled sequence grant is still reported (#1892). The
+CDC effect of numbering a populated table's rows, which logical decoding does
+not see, is #1890.
+
+The live `a_serial_round_trips_and_numbers_the_rows_it_is_added_to` pins the
+round trip on both versions, the numbering of an added column, and the
+shared and unowned sequences as negative cases.

@@ -2124,6 +2124,199 @@ fn a_new_column_calling_a_function_that_reads_it_is_refused_by_name() {
     }
 }
 
+/// A connected plan's base is a read, which knows the name the engine
+/// generated for a `serial`'s sequence: a declaration naming another one is
+/// a change pbps does not make, refused before the plan. The same name a
+/// git baseline leaves out is not known, so the offline plan accepts a
+/// later declaration naming it (#1631).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_connected_plan_knows_a_serials_generated_sequence_name() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "serial-name");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.t (id serial PRIMARY KEY)",
+    );
+    let d = Demo::new("serial-name");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let file = d.dir.join("schema/app.t.yml");
+    let pulled = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        pulled.replacen(
+            "    type: serial\n",
+            "    type: serial\n    sequence: {name: other_seq}\n",
+            1,
+        ),
+    )
+    .unwrap();
+    // Offline, against the pulled declaration, the name is not known.
+    succeeds(d.run(&["plan"]));
+    let refused = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("sequence"),
+        "{}",
+        stderr(&refused)
+    );
+    // The negative case: the declaration as pulled plans nothing.
+    std::fs::write(&file, &pulled).unwrap();
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+/// `verify` compares two reads, and each knows the sequence name it leaves
+/// out: a `serial`'s sequence renamed by hand since the baseline is drift
+/// that names its column, not one the model cannot see. The negative case:
+/// with nothing renamed there is no drift (#1631).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn verify_names_a_serials_renamed_sequence() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "serial-verify");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.t (id serial PRIMARY KEY)",
+    );
+    let d = Demo::new("serial-verify");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    succeeds(d.run(&["verify", "--db", connection]));
+    on_server(
+        connection,
+        "ALTER SEQUENCE app.t_id_seq RENAME TO renamed_seq",
+    );
+    let drifted = d.run(&["verify", "--db", connection, "--format", "json"]);
+    assert_ne!(code(&drifted), 0, "{}", stdout(&drifted));
+    let report = stdout(&drifted);
+    assert!(
+        report.contains("state.drift-unexpressible") && report.contains("column app.t.id"),
+        "{report}"
+    );
+}
+
+/// A staged apply checkpoints after every statement, and reads what it has
+/// done so far. A `serial` table, and a `serial` added to a table holding
+/// rows, are each one statement with their sequence and its ownership, so
+/// no checkpoint reads a default on a sequence nobody owns (#1631).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_staged_apply_creates_serials_whole() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "serial-staged");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.base (id integer PRIMARY KEY); \
+         INSERT INTO app.base VALUES (1), (2)",
+    );
+    let d = Demo::new("serial-staged");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    // `--staged` takes one logical change at a time.
+    let stage = || {
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--staged",
+            "--out",
+            plan.to_str().unwrap(),
+        ]));
+        succeeds(approved_apply(&d, connection, &plan, &["--staged"]));
+        succeeds(d.run(&["verify", "--db", connection]));
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    };
+    let base = d.dir.join("schema/app.base.yml");
+    let text = std::fs::read_to_string(&base).unwrap();
+    std::fs::write(
+        &base,
+        text.replacen(
+            "columns:\n",
+            "columns:\n  num:\n    type: serial\n    sequence: {start: 10}\n",
+            1,
+        ),
+    )
+    .unwrap();
+    stage();
+    assert_eq!(
+        scalar(connection, "SELECT sum(num)::bigint FROM app.base"),
+        21
+    );
+    std::fs::write(
+        d.dir.join("schema/app.made.yml"),
+        "table: app.made\ncolumns:\n  id: {type: bigserial}\n  note: {type: text}\n\
+         primary_key: {name: made_pkey, columns: [id]}\n",
+    )
+    .unwrap();
+    stage();
+    on_server(connection, "INSERT INTO app.made (note) VALUES ('x')");
+    assert_eq!(
+        scalar(connection, "SELECT max(id)::bigint FROM app.made"),
+        1
+    );
+}
+
+/// A `data:` block beside a `serial` leaves the column to its sequence, as
+/// beside an identity (DECISIONS 94): its rows are inserted and numbered,
+/// the apply holds them as declared, and the next plan is empty. A row
+/// added later is numbered after them (#1631).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_data_block_beside_a_serial_leaves_it_to_the_sequence() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "serial-data");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.s (code text PRIMARY KEY, num serial, label text)",
+    );
+    let d = Demo::new("serial-data");
+    succeeds(d.run(&["pull", "--db", connection]));
+    let pulled = std::fs::read_to_string(d.dir.join("schema/app.s.yml")).unwrap();
+    assert!(pulled.contains("  num:\n    type: serial\n"), "{pulled}");
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let declare = |rows: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.s.yml"),
+            format!(
+                "{pulled}\ndata:\n  mode: exact\n  rows:\n{rows}",
+                pulled = pulled.trim_end()
+            ),
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(&d, connection, &plan, &[]));
+        succeeds(d.run(&["verify", "--db", connection]));
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    };
+    declare("    a: {label: A}\n    b: {label: B}\n");
+    assert_eq!(scalar(connection, "SELECT sum(num)::bigint FROM app.s"), 3);
+    declare("    a: {label: A}\n    b: {label: B}\n    c: {label: C}\n");
+    assert_eq!(
+        scalar(connection, "SELECT num::bigint FROM app.s WHERE code = 'c'"),
+        3
+    );
+}
+
 /// A new default calling a function the revision rebuilds, on a table whose
 /// row the same plan updates in another column: the update takes nothing from
 /// the default, so the default follows `CREATE FUNCTION` and the plan applies

@@ -471,7 +471,9 @@
         "a_concurrent_replacement_is_seen_under_a_repeatable_read_default",
         "a_continued_escape_strings_spacing_is_a_change_to_the_view",
         "a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens_it",
+        "a_connected_plan_knows_a_serials_generated_sequence_name",
         "a_cross_schema_cli_rename_requires_approval_and_records_only_its_declared_destination",
+        "a_data_block_beside_a_serial_leaves_it_to_the_sequence",
         "a_declaration_may_reopen_a_closed_routine_on_its_next_rebuild",
         "a_declaration_opens_a_routine_even_where_default_privileges_close_it",
         "a_declared_expression_index_is_dropped_and_restored_around_a_function_rebuild",
@@ -517,6 +519,7 @@
         "a_second_statement_failure_rolls_back_the_first_and_records_only_a_failed_attempt",
         "a_sequence_a_schema_transfer_carries_refuses_a_table_at_its_name",
         "a_sequence_or_index_at_a_new_tables_name_refuses_the_plan",
+        "a_staged_apply_creates_serials_whole",
         "a_staged_cli_checkpoint_survives_state_json_and_resume_checks_its_intermediate_name",
         "a_staged_create_never_closes_over_a_replaced_pending_part",
         "a_staged_or_bootstrapped_definer_routine_without_a_pinned_path_is_refused_before_it_commits",
@@ -705,7 +708,8 @@
         "ensure_scope_changes_refuse_edited_plans_and_changed_union_rows",
         "ensure_scope_changes_compose_with_row_writes_and_table_renames",
         "first_data_takeovers_refuse_changed_rows_and_wrong_checksums",
-        "renamed_data_takeovers_use_final_names_and_require_approval"
+        "renamed_data_takeovers_use_final_names_and_require_approval",
+        "verify_names_a_serials_renamed_sequence"
       ]
     },
     {
@@ -1287,6 +1291,8 @@
         "a_rule_on_the_view_is_named_and_refused_because_the_rebuild_would_lose_it",
         "a_schema_a_broken_pattern_would_swallow_is_in_the_pull",
         "a_serial_column_reads_back_as_an_integer_with_a_sequence_it_owns",
+        "a_serial_added_to_another_roles_table_is_that_roles",
+        "a_serial_round_trips_and_numbers_the_rows_it_is_added_to",
         "a_session_setting_left_behind_cannot_answer_the_transaction_probe",
         "a_session_the_connection_string_excludes_is_refused",
         "a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan",

@@ -283,7 +283,11 @@ impl ResolverEvidence {
                     crate::ValueSource::Default(_) | crate::ValueSource::Generated(_) => {
                         vec![super::Surface::Default(table.column(name))]
                     }
-                    crate::ValueSource::None | crate::ValueSource::Identity(_) => Vec::new(),
+                    // A `serial`'s `nextval` binds nothing a declaration
+                    // wrote (#1631).
+                    crate::ValueSource::None
+                    | crate::ValueSource::Identity(_)
+                    | crate::ValueSource::Sequence(_) => Vec::new(),
                 },
                 Change::AddCheck { table, name, .. } | Change::DropCheck { table, name } => {
                     vec![super::Surface::Check {

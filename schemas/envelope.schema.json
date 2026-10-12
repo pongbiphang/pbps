@@ -2068,6 +2068,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 39,
+  "x-pbps-schema-version": 40,
   "x-pbps-tool-version": "0.0.0"
 }

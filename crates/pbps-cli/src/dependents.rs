@@ -550,7 +550,10 @@ fn parent_default(declared: &Schema, table: &TableName, column: &str) -> Option<
         .value_source
     {
         ValueSource::Default(default) => Some(default.clone()),
-        ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+        ValueSource::None
+        | ValueSource::Identity(_)
+        | ValueSource::Sequence(_)
+        | ValueSource::Generated(_) => None,
     }
 }
 
@@ -616,6 +619,7 @@ fn removal_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Result<Chan
                             ValueSource::Default(default) => Some(default.clone()),
                             ValueSource::None
                             | ValueSource::Identity(_)
+                            | ValueSource::Sequence(_)
                             | ValueSource::Generated(_) => None,
                         }),
                     column,
@@ -682,6 +686,7 @@ fn restoration_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Option<
                         ValueSource::Default(default) => default.clone(),
                         ValueSource::None
                         | ValueSource::Identity(_)
+                        | ValueSource::Sequence(_)
                         | ValueSource::Generated(_) => return None,
                     };
                     let column = ColumnRef::new(table.clone(), column.clone());
@@ -1168,7 +1173,7 @@ fn column_expression(column: &pbps_model::Column) -> Option<&str> {
     match &column.value_source {
         ValueSource::Default(default) => Some(default),
         ValueSource::Generated(generated) => Some(&generated.expression),
-        ValueSource::None | ValueSource::Identity(_) => None,
+        ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => None,
     }
 }
 
@@ -1280,6 +1285,7 @@ pub(crate) fn split_new_tables(
                 ValueSource::None
                 | ValueSource::Default(_)
                 | ValueSource::Identity(_)
+                | ValueSource::Sequence(_)
                 | ValueSource::Generated(_) => {}
             }
         }
@@ -3031,7 +3037,10 @@ fn after_their_functions(
                 .values()
                 .filter_map(|c| match &c.value_source {
                     ValueSource::Generated(generated) => Some(generated.expression.as_str()),
-                    ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => None,
+                    ValueSource::None
+                    | ValueSource::Default(_)
+                    | ValueSource::Identity(_)
+                    | ValueSource::Sequence(_) => None,
                 })
                 .chain(
                     table
@@ -3163,7 +3172,10 @@ fn cycle(
             .iter()
             .find(|(_, c)| match c.value_source {
                 ValueSource::Generated(_) => true,
-                ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
+                ValueSource::None
+                | ValueSource::Default(_)
+                | ValueSource::Identity(_)
+                | ValueSource::Sequence(_) => false,
             })
             .map_or_else(
                 || name.to_string(),
@@ -3297,7 +3309,7 @@ fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
             || match &column.value_source {
                 ValueSource::Default(default) => named(default),
                 ValueSource::Generated(generated) => named(&generated.expression),
-                ValueSource::None | ValueSource::Identity(_) => false,
+                ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => false,
             }
     }) || table
         .foreign_keys

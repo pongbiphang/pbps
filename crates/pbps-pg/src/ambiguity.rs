@@ -222,6 +222,8 @@ fn declared_literals(schema: &Schema) -> Result<Vec<Literal>, DbError> {
                 if match spec.value_source {
                     pbps_model::ValueSource::Identity(_)
                     | pbps_model::ValueSource::Generated(_) => true,
+                    // Never set by a row (#1631).
+                    pbps_model::ValueSource::Sequence(_) => true,
                     pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) => false,
                 } {
                     continue;
@@ -267,6 +269,7 @@ fn declared_literals(schema: &Schema) -> Result<Vec<Literal>, DbError> {
                         ValueSource::Default(value) => Some(value.as_str()),
                         ValueSource::None
                         | ValueSource::Identity(_)
+                        | ValueSource::Sequence(_)
                         | ValueSource::Generated(_) => None,
                     })
                     .map(|d| (c, d))

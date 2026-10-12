@@ -461,6 +461,12 @@ pub struct StrategyDto {
     pub online: bool,
 }
 
+/// A key that is there holds a boolean; only a key that is not is `None`.
+/// `Option<bool>` alone reads an explicit null as the key left out.
+fn a_boolean<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<bool>, D::Error> {
+    <bool as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ColumnDto {
@@ -468,8 +474,12 @@ pub struct ColumnDto {
     #[schemars(with = "String")]
     pub ty: Spanned<String>,
 
-    #[serde(default = "yes")]
-    pub nullable: bool,
+    /// Absent is `true`, except on a `serial`, which PostgreSQL makes NOT NULL.
+    // Present, it is a boolean: `nullable: null` is refused, as it was while
+    // the field was a plain `bool`, not read as absent (#1631).
+    #[serde(default, deserialize_with = "a_boolean")]
+    #[schemars(with = "bool")]
+    pub nullable: Option<bool>,
 
     /// The default-value expression, kept verbatim.
     #[serde(default)]
@@ -478,6 +488,13 @@ pub struct ColumnDto {
     /// `[seed, increment]`
     #[serde(default)]
     pub identity: Option<[i64; 2]>,
+
+    /// What a `serial` column's sequence says other than `serial`'s own: its
+    /// `start`, its `increment`, and a `name` other than the engine's
+    /// `<table>_<column>_seq` (PostgreSQL). Only beside a `type: serial`,
+    /// `bigserial` or `smallserial`.
+    #[serde(default)]
+    pub sequence: Option<SequenceDto>,
 
     /// A generation expression (PostgreSQL): `{expression: "a * 2", stored:
     /// true}`. The value is computed from the row on every write, where a
@@ -503,10 +520,6 @@ pub struct ColumnDto {
     #[serde(default)]
     #[schemars(with = "Option<String>")]
     pub renamed_from: Option<Spanned<String>>,
-}
-
-const fn yes() -> bool {
-    true
 }
 
 /// A primary key may be written as a bare column list, leaving the name to the
@@ -886,6 +899,21 @@ pub struct ComputedDto {
     /// `true` for `PERSISTED NOT NULL`. Requires `persisted`.
     #[serde(default)]
     pub not_null: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SequenceDto {
+    /// The first value. Absent is 1.
+    #[serde(default)]
+    pub start: Option<i64>,
+    /// The step. Absent is 1.
+    #[serde(default)]
+    pub increment: Option<i64>,
+    /// The sequence's name in the table's schema, where it is not the one the
+    /// engine generates.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

@@ -63,6 +63,7 @@ impl Dialect for Mssql {
                 pbps_model::ValueSource::Default(_) => true,
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_) => false,
             })
             .flat_map(|(column, _)| emit::generated_default_names(name, column))
