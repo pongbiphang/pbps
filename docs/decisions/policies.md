@@ -245,3 +245,11 @@ column's drop is still a contraction, as before, since its values do not come
 back by recomputing. The conversion to a computed column passes because its
 computed add is not counted as an add; with another column added to the same
 table, the rule fires on that drop as it always did.
+
+A table is one table across the plan's renames. A drop is addressed by the name
+its table has where it runs, so a drop that `object_order` or `rename_order`
+moves ahead of its table's rename names the source, while the add after it
+names the destination. The rule walks the plan in order, and a rename hands its
+source's identity to its destination. A computed rebuild across a rename is
+then still a rebuild, and a table that takes the source name afterwards is
+another table.

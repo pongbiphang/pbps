@@ -207,42 +207,77 @@ enum Naming {
     Constraint,
 }
 
+/// Each change's table as one identity across the plan's table renames, or
+/// `None` for a change to no table. A change is addressed by the name its
+/// table has where it runs: a drop moved ahead of its table's rename names
+/// the source, and the add after it the destination (`object_order`,
+/// `rename_order`). Walking the plan in order, a rename hands its source's
+/// identity to its destination, and a table that takes the source name
+/// afterwards is a new one.
+fn table_identities(cs: &ChangeSet) -> Vec<Option<usize>> {
+    let mut current: BTreeMap<&TableName, usize> = BTreeMap::new();
+    let mut next = 0;
+    cs.changes
+        .iter()
+        .map(|p| {
+            let name = p.change.table()?;
+            let id = *current.entry(name).or_insert_with(|| {
+                next += 1;
+                next - 1
+            });
+            if let Change::RenameTable { from, to, .. } = &p.change {
+                current.remove(from);
+                current.insert(to, id);
+            }
+            Some(id)
+        })
+        .collect()
+}
+
 /// The plan rules over a change set (the `plan` point). Each finding names
 /// the index of the change it attaches to.
 pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, Finding)> {
     let mut out = Vec::new();
 
     if let Some(live) = Live::of(policies, rules::CHANGE_EXPAND_CONTRACT, ctx) {
-        // Per table: the first add, and the first drop or narrowing.
-        let mut adds: BTreeMap<&TableName, usize> = BTreeMap::new();
-        let mut contracts: BTreeMap<&TableName, usize> = BTreeMap::new();
+        // Per table: the first add, and the first drop or narrowing, with
+        // the name the table has there. A table is one identity across the
+        // plan's renames, since a drop is addressed by the name its table
+        // has where it runs (DEC-1433.1).
+        let tables = table_identities(cs);
+        let mut adds: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut contracts: BTreeMap<usize, (usize, &TableName)> = BTreeMap::new();
         // The column names this change set adds and drops, per table, of
         // either kind. A computed column dropped and added back under one
         // name is an expression rebuild, and one converted to or from a
         // stored column keeps its name too: readers find it there
         // throughout, so neither half counts (DEC-1433.1).
-        let mut added: BTreeSet<(&TableName, &str)> = BTreeSet::new();
-        let mut dropped: BTreeSet<(&TableName, &str)> = BTreeSet::new();
-        for p in &cs.changes {
-            if let Change::AddColumn { table, name, .. }
-            | Change::AddComputedColumn { table, name, .. } = &p.change
+        let mut added: BTreeSet<(usize, &str)> = BTreeSet::new();
+        let mut dropped: BTreeSet<(usize, &str)> = BTreeSet::new();
+        for (p, table) in cs.changes.iter().zip(&tables) {
+            let Some(table) = *table else { continue };
+            if let Change::AddColumn { name, .. } | Change::AddComputedColumn { name, .. } =
+                &p.change
             {
                 added.insert((table, name));
             }
             if let Change::DropColumn { column, .. } = &p.change {
-                dropped.insert((&column.table, &column.name));
+                dropped.insert((table, &column.name));
             }
-            if let Change::DropComputedColumn { table, name, .. } = &p.change {
+            if let Change::DropComputedColumn { name, .. } = &p.change {
                 dropped.insert((table, name));
             }
         }
         for (i, p) in cs.changes.iter().enumerate() {
+            let id = tables[i];
             // Named arms, not a wildcard: every other kind of change is
             // neither side of the pattern, and a new kind that is (a column
             // drop spelled differently, say) should have to be placed here.
             let contract = match &p.change {
-                Change::AddColumn { table, .. } => {
-                    adds.entry(table).or_insert(i);
+                Change::AddColumn { .. } => {
+                    if let Some(id) = id {
+                        adds.entry(id).or_insert(i);
+                    }
                     None
                 }
                 Change::DropColumn { column, .. } => Some(&column.table),
@@ -284,15 +319,17 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 // dropping one and adding another moves readers (DEC-1433.1).
                 // Under one name it is a rebuild, which `added`/`dropped`
                 // leave out.
-                Change::AddComputedColumn { table, name, .. } => {
-                    if !dropped.contains(&(table, name.as_str())) {
-                        adds.entry(table).or_insert(i);
+                Change::AddComputedColumn { name, .. } => {
+                    if let Some(id) = id
+                        && !dropped.contains(&(id, name.as_str()))
+                    {
+                        adds.entry(id).or_insert(i);
                     }
                     None
                 }
-                Change::DropComputedColumn { table, name, .. } => {
-                    (!added.contains(&(table, name.as_str()))).then_some(table)
-                }
+                Change::DropComputedColumn { table, name, .. } => id
+                    .is_none_or(|id| !added.contains(&(id, name.as_str())))
+                    .then_some(table),
                 Change::AlterColumnType { .. }
                 | Change::CreateTable { .. }
                 | Change::DetachPartition { .. }
@@ -333,12 +370,12 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::Revoke { .. }
                 | Change::PublicExecution { .. } => None,
             };
-            if let Some(table) = contract {
-                contracts.entry(table).or_insert(i);
+            if let (Some(table), Some(id)) = (contract, id) {
+                contracts.entry(id).or_insert((i, table));
             }
         }
-        for (table, at) in contracts {
-            if adds.contains_key(table) {
+        for (id, (at, table)) in contracts {
+            if adds.contains_key(&id) {
                 let subject = table.to_string();
                 out.extend(
                     live.finding(
@@ -819,6 +856,71 @@ mod tests {
         // Neither half alone is the pattern.
         assert!(fires(vec![add_computed("net")]).is_empty());
         assert!(fires(vec![drop_computed("gross")]).is_empty());
+    }
+
+    /// A drop moved ahead of its table's rename is addressed by the source
+    /// name, and the add after it by the destination (`object_order`). One
+    /// table under two names is still one table: a computed rebuild across
+    /// the rename is not an add beside another drop, and a computed swap
+    /// across it is the pattern (DEC-1433.1 review).
+    #[test]
+    fn a_table_is_one_table_across_its_rename() {
+        let old: TableName = "dbo.customer_old".parse().unwrap();
+        let rename = |from: &TableName, to: &TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: "t_cccccc".parse().unwrap(),
+                from: from.clone(),
+                to: to.clone(),
+                defaults: Vec::new(),
+            })
+        };
+        let at = |mut p: PlannedChange, t: &TableName| {
+            if let Change::DropComputedColumn { table, .. } = &mut p.change {
+                *table = t.clone();
+            } else if let Change::DropColumn { column, .. } = &mut p.change {
+                column.table = t.clone();
+            } else {
+                panic!("not a drop: {:?}", p.change);
+            }
+            p
+        };
+        let fires = |changes: Vec<PlannedChange>| {
+            plan(&cs(changes), &Policies::default(), &ctx())
+                .iter()
+                .map(|(at, _)| *at)
+                .collect::<Vec<_>>()
+        };
+
+        // A rebuild across the rename, beside a stored drop and no add.
+        assert!(
+            fires(vec![
+                at(drop_computed("total"), &old),
+                rename(&old, &table()),
+                add_computed("total"),
+                drop_column("legacy"),
+            ])
+            .is_empty()
+        );
+        // A computed name swapped across the rename: the drop under the
+        // source name is the contraction.
+        assert_eq!(
+            fires(vec![
+                at(drop_computed("gross"), &old),
+                rename(&old, &table()),
+                add_computed("net"),
+            ]),
+            [0]
+        );
+        // A table that takes the source name after the rename is another
+        // table: its drop does not pair with the renamed table's add.
+        assert!(
+            fires(vec![
+                rename(&old, &table()),
+                add_column("net"),
+                at(drop_column("gross"), &old),
+            ])
+            .is_empty()
+        );
     }
 
     /// A column that stops accepting NULL accepts less than it did, which is
