@@ -335,7 +335,11 @@ pub(super) fn changes(
                 if desired
                     .tables
                     .get(&column.table)
-                    .is_some_and(|t| t.partition_of.is_some()) =>
+                    .is_some_and(|t| t.partition_of.is_some())
+                    || base
+                        .tables
+                        .get(&ids.resolved_in(&column.table, before_ids))
+                        .is_some_and(|t| t.partition_of.is_some()) =>
             {
                 match partition_default(surface, column, base, desired, ids, before_ids)? {
                     Some(pair) => pair,
@@ -387,22 +391,21 @@ pub(super) fn changes(
                     }
                     continue;
                 }
-                // The old default is the column's, or, on a partition the
-                // plan detaches, its own override (#1578), which the detach
-                // keeps (#1610 review).
-                let old = base.tables.get(&before_column.table).and_then(|t| {
-                    t.columns
-                        .get(&before_column.name)
-                        .and_then(|c| c.default.clone())
-                        .or_else(|| {
-                            t.partition_of
-                                .as_ref()?
-                                .columns
-                                .get(&before_column.name)?
-                                .default
-                                .clone()
-                        })
-                });
+                let uid = ids
+                    .column_uid(column)
+                    .ok_or_else(|| Error::Definition(surface.clone()))?
+                    .clone();
+                // A column the plan replaces is created with its default by
+                // the ordinary plan, which binds it anew: there is no default
+                // that stands through the plan to rebuild (#1610 review).
+                if !before_ids.columns.contains_key(&uid) {
+                    continue;
+                }
+                let old = base
+                    .tables
+                    .get(&before_column.table)
+                    .and_then(|t| t.columns.get(&before_column.name))
+                    .and_then(|c| c.default.clone());
                 let new = desired
                     .tables
                     .get(&column.table)
@@ -411,10 +414,6 @@ pub(super) fn changes(
                 let Some((old, new)) = both_defaults(surface, old, new)? else {
                     continue;
                 };
-                let uid = ids
-                    .column_uid(column)
-                    .ok_or_else(|| Error::Definition(surface.clone()))?
-                    .clone();
                 vec![
                     Change::AlterColumnDefault {
                         uid: uid.clone(),
@@ -543,8 +542,11 @@ fn both_defaults(
 /// declares no column, so its default lives in `partition_of.columns`
 /// (#1578) and the column is keyed by the partition's table UID; the name it
 /// had before the plan is its parent column's, found by that column's UID
-/// (#1610). `None` when only one side has a default of the partition's own,
-/// as [`both_defaults`] says.
+/// (#1610). A partition the plan detaches keeps the override as its
+/// column's default, so its restoration is the column's, after the detach
+/// makes the column. `None` when only one side has a default of the
+/// partition's own, as [`both_defaults`] says, or when the plan replaces the
+/// partition.
 fn partition_default(
     surface: &Surface,
     column: &pbps_model::ColumnRef,
@@ -554,15 +556,22 @@ fn partition_default(
     before_ids: &IdsFile,
 ) -> Result<Option<Vec<Change>>, Error> {
     let definition = || Error::Definition(surface.clone());
+    let uid = ids.table_uid(&column.table).ok_or_else(definition)?.clone();
+    // A partition the plan replaces is created with its own default by the
+    // ordinary plan, which binds it anew: there is no default that stands
+    // through the plan to rebuild (#1610 review).
+    let Some(before_table) = before_ids.tables.get(&uid).cloned() else {
+        return Ok(None);
+    };
     let of = desired
         .tables
         .get(&column.table)
-        .and_then(|t| t.partition_of.as_ref())
-        .ok_or_else(definition)?;
-    let uid = ids.table_uid(&column.table).ok_or_else(definition)?.clone();
-    let before_table = ids.resolved_in(&column.table, before_ids);
-    let before_name = ids
-        .column_uid(&of.parent.column(&column.name))
+        .and_then(|t| t.partition_of.as_ref());
+    // A partition declares no column: its column's name before the plan is
+    // its parent column's. A detach makes the column the table's own, under
+    // the name it had.
+    let before_name = of
+        .and_then(|of| ids.column_uid(&of.parent.column(&column.name)))
         .and_then(|parent| before_ids.columns.get(parent))
         .map_or_else(|| column.name.clone(), |c| c.name.clone());
     // A table the plan attaches had no override of its own to release.
@@ -573,39 +582,53 @@ fn partition_default(
     let old = before_of
         .and_then(|of| of.columns.get(&before_name))
         .and_then(|own| own.default.clone());
-    let new = of
-        .columns
-        .get(&column.name)
-        .and_then(|own| own.default.clone());
+    // A detach keeps the override as the table's column default (#1578).
+    let new = match of {
+        Some(of) => of
+            .columns
+            .get(&column.name)
+            .and_then(|own| own.default.clone()),
+        None => desired
+            .tables
+            .get(&column.table)
+            .and_then(|t| t.columns.get(&column.name))
+            .and_then(|c| c.default.clone()),
+    };
     let Some((old, new)) = both_defaults(surface, old, new)? else {
         return Ok(None);
     };
     let before_of = before_of.ok_or_else(definition)?;
-    let fallback = desired
-        .tables
-        .get(&of.parent)
-        .and_then(|parent| parent.columns.get(&column.name))
-        .and_then(|c| c.default.clone());
-    Ok(Some(vec![
-        Change::SetPartitionDefault {
-            uid: uid.clone(),
-            table: before_table,
-            parent: before_of.parent.clone(),
-            column: before_name,
-            from: Some(old),
-            to: None,
-            fallback: None,
-        },
-        Change::SetPartitionDefault {
+    let release = Change::SetPartitionDefault {
+        uid: uid.clone(),
+        table: before_table,
+        parent: before_of.parent.clone(),
+        column: before_name,
+        from: Some(old),
+        to: None,
+        fallback: None,
+    };
+    let restore = match of {
+        Some(of) => Change::SetPartitionDefault {
             uid,
             table: column.table.clone(),
             parent: of.parent.clone(),
             column: column.name.clone(),
             from: None,
             to: Some(new),
-            fallback,
+            fallback: desired
+                .tables
+                .get(&of.parent)
+                .and_then(|parent| parent.columns.get(&column.name))
+                .and_then(|c| c.default.clone()),
         },
-    ]))
+        None => Change::AlterColumnDefault {
+            uid: ids.column_uid(column).ok_or_else(definition)?.clone(),
+            column: column.clone(),
+            from: None,
+            to: Some(new),
+        },
+    };
+    Ok(Some(vec![release, restore]))
 }
 
 fn tears_down(change: &Change, surface: &Surface) -> bool {

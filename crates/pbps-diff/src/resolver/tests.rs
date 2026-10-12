@@ -2816,6 +2816,105 @@ mod generated_surface_coverage {
         ordered.proof.validate(&ordered.changes).unwrap();
     }
 
+    /// The plan's names resolve at every step, as the CLI checks before it
+    /// renders a plan: a change addressed by a UID the plan has not made, or
+    /// one sharing an address with another UID, is refused there.
+    fn names_resolve(ordered: &Ordered, after: &IdsFile) {
+        if let Err(error) = pbps_model::plan_names::PlanNames::of(&ordered.changes.changes, after) {
+            panic!("{error:?}: {:?}", ordered.changes.changes);
+        }
+    }
+
+    /// #1610 review: a default whose owner the plan replaces under its name,
+    /// with a new UID, is created with the replacement and binds anew. No
+    /// pair is added for it: a teardown under the new UID, spelled at the
+    /// shared name before the old owner is dropped, is an address collision.
+    /// Covered for a partition, an ordinary table and a column.
+    #[test]
+    fn a_replaced_default_owner_gets_no_rebuild_pair() {
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let added = |ordered: &Ordered| {
+            ordered
+                .changes
+                .changes
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        &c.change,
+                        Change::SetPartitionDefault { to: None, .. }
+                            | Change::AlterColumnDefault { to: None, .. }
+                    )
+                })
+                .count()
+        };
+
+        let base = partitioned(None, Some("app.f(1)"));
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        let old = before_ids.table_uid(&p).unwrap().clone();
+        after_ids.tables.remove(&old);
+        after_ids
+            .tables
+            .insert("t_zzzzzz".parse().unwrap(), p.clone());
+        let ordered = planned(&base, &before_ids, &base, &after_ids, &[rebinds("app.p")])
+            .unwrap_or_else(|error| panic!("a replaced partition is refused: {error:?}"));
+        names_resolve(&ordered, &after_ids);
+        assert_eq!(added(&ordered), 0, "{:?}", ordered.changes.changes);
+
+        let mut base = Schema::default();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        let mut c = Column::new("int".parse().unwrap());
+        c.default = Some("app.f(1)".into());
+        table.columns.insert("c".into(), c);
+        base.tables.insert(t.clone(), table);
+        let before_ids = ids(&base, &IdsFile::default());
+        let observation = SurfaceResolution {
+            surface: Surface::Default(t.column("c")),
+            ..rebinds("app.t")
+        };
+        // The whole table, then the column alone.
+        let mut whole = IdsFile {
+            version: before_ids.version,
+            ..Default::default()
+        };
+        whole.tables.insert("t_zzzzzz".parse().unwrap(), t.clone());
+        whole
+            .columns
+            .insert("c_yyyyyy".parse().unwrap(), t.column("a"));
+        whole
+            .columns
+            .insert("c_zzzzzz".parse().unwrap(), t.column("c"));
+        let mut column = before_ids.clone();
+        let old = before_ids.column_uid(&t.column("c")).unwrap().clone();
+        column.columns.remove(&old);
+        column
+            .columns
+            .insert("c_zzzzzz".parse().unwrap(), t.column("c"));
+        for after_ids in [whole, column] {
+            let ordered = planned(
+                &base,
+                &before_ids,
+                &base,
+                &after_ids,
+                std::slice::from_ref(&observation),
+            )
+            .unwrap_or_else(|error| panic!("a replaced owner is refused: {error:?}"));
+            names_resolve(&ordered, &after_ids);
+            assert_eq!(added(&ordered), 0, "{:?}", ordered.changes.changes);
+        }
+
+        // Negative: the same default on an owner that stands through the
+        // plan is rebuilt.
+        let ordered = planned(&base, &before_ids, &base, &before_ids, &[observation])
+            .expect("a standing column's default is rebuilt");
+        names_resolve(&ordered, &before_ids);
+        assert_eq!(added(&ordered), 1, "{:?}", ordered.changes.changes);
+    }
+
     /// #1610 review: a table replaced under its name, with new UIDs, whose
     /// generated column comes back as an ordinary one with a default. Only
     /// the plan's side has a default; the ordinary plan's `DropTable` and
@@ -2873,8 +2972,9 @@ mod generated_surface_coverage {
     }
 
     /// #1610 review: a partition detached while its own default rebinds. The
-    /// detach keeps the override as the table's default (#1578), so that is
-    /// the default released before and restored after, not a missing one.
+    /// detach keeps the override as the table's default (#1578): it is
+    /// released as the partition's own before the detach, and restored as
+    /// the column's after it, the detach being what makes the column.
     #[test]
     fn a_detached_partitions_default_is_released_and_restored() {
         let base = partitioned(None, Some("app.f(1)"));
@@ -2900,14 +3000,20 @@ mod generated_surface_coverage {
         )
         .unwrap_or_else(|error| panic!("a detach is refused: {error:?}"));
         let release = at(&ordered, &|c| {
-            matches!(c, Change::AlterColumnDefault { column, from: Some(from), to: None, .. }
-                if column.table == p && from == "app.f(1)")
+            matches!(c, Change::SetPartitionDefault { table, from: Some(from), to: None, fallback: None, .. }
+                if *table == p && from == "app.f(1)")
         });
+        let detach = at(&ordered, &|c| matches!(c, Change::DetachPartition { .. }));
         let restore = at(&ordered, &|c| {
             matches!(c, Change::AlterColumnDefault { column, from: None, to: Some(to), .. }
                 if column.table == p && to == "app.f(1)")
         });
-        assert!(release < restore, "{:?}", ordered.changes.changes);
+        assert!(
+            release < detach && detach < restore,
+            "{:?}",
+            ordered.changes.changes
+        );
+        names_resolve(&ordered, &after_ids);
         ordered.proof.validate(&ordered.changes).unwrap();
     }
 
