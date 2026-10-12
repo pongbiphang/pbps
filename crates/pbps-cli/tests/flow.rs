@@ -4815,6 +4815,7 @@ fn a_staged_resume_rechecks_the_pinned_default_collation() {
             "mssql",
             "2026-09-28T00:00:00Z",
             pbps_model::PlanBaseline {
+                time_zone: None,
                 description: "paused".into(),
                 checksum: pbps_model::state_checksum(&latest.snapshot.schema, &latest.snapshot.ids),
                 database_collation: Some(pinned.to_owned()),
@@ -6328,6 +6329,7 @@ fn apply_refuses_a_plan_that_relabels_a_rebuilt_routine_as_a_fresh_one() {
         "postgres",
         "2026-09-18T00:00:00Z",
         pbps_model::PlanBaseline {
+            time_zone: None,
             description: "test as queried".into(),
             checksum: "0".repeat(64),
             database_collation: None,
@@ -6395,6 +6397,7 @@ fn apply_refuses_a_plan_that_builds_a_routine_and_settles_nothing_about_public()
         "postgres",
         "2026-09-18T00:00:00Z",
         pbps_model::PlanBaseline {
+            time_zone: None,
             description: "test as queried".into(),
             checksum: "0".repeat(64),
             database_collation: None,
@@ -6452,6 +6455,7 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
         "mssql",
         "2026-09-04T00:00:00Z",
         pbps_model::PlanBaseline {
+            time_zone: None,
             description: "test as queried".into(),
             checksum: "0".repeat(64),
             database_collation: None,
@@ -6886,6 +6890,7 @@ fn staged_cardinality_plan(dialect: &str, count: usize, staged: bool) -> pbps_mo
         dialect,
         "2026-09-15T00:00:00Z",
         PlanBaseline {
+            time_zone: None,
             description: "cardinality fixture".into(),
             checksum: "0".repeat(64),
             database_collation: None,
@@ -16603,6 +16608,7 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
         "mssql",
         "2026-09-04T00:00:00Z",
         pbps_model::PlanBaseline {
+            time_zone: None,
             description: "interrupted checkpoint".into(),
             checksum: pbps_model::state_checksum(&checkpoint.schema, &checkpoint.ids),
             database_collation: None,

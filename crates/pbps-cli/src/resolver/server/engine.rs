@@ -65,17 +65,22 @@ pub(crate) async fn compile(
     reconstruction: &mut Reconstruction,
     extras: &[String],
     driver: Driver,
+    zone: Option<&pbps_model::SessionZone>,
     connection: &mut impl pbps_db::transport::ExecuteConnection,
 ) -> Result<(), Error> {
-    match driver {
-        Driver::Postgres => reconstruction
+    match (driver, zone) {
+        (Driver::Postgres, None) => Err(Error::Scope(
+            "the target reported no session time zone to compile in".into(),
+        )),
+        (Driver::Postgres, Some(zone)) => reconstruction
             .compile(
                 &pbps_pg::Postgres::with_write_path_extras(extras.to_vec()),
+                zone,
                 connection,
             )
             .await
             .map_err(compile_failed),
-        Driver::Mssql => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
+        (Driver::Mssql, _) => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
     }
 }
 
@@ -89,6 +94,7 @@ pub(super) fn compile_failed(error: pbps_pg::resolver::reconstruct::ReconstructE
         ReconstructError::Read { .. }
         | ReconstructError::Interrupted { .. }
         | ReconstructError::Transaction(_) => Error::Read(error.to_string()),
+        ReconstructError::Zone { .. } => Error::Scope(error.to_string()),
         ReconstructError::Unsupported(_)
         | ReconstructError::Emit { .. }
         | ReconstructError::Compile { .. }

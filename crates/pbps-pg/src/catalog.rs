@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 
 use pbps_db::{Conn, DbError, Param, Row};
 
-use pbps_model::{Schema, TableName};
+use pbps_model::{Schema, SessionZone, TableName};
 
 // What the spelling checks found is `pbps-db`'s shape (DECISIONS 417).
 pub use pbps_db::catalog::Spellings;
@@ -979,15 +979,52 @@ pub(crate) fn probe_set(token: &str) -> String {
 /// and the threshold is the server's configuration: a larger database, or
 /// `jit_above_cost = 0`, would cross it again. Local like the rest, so the
 /// statements an apply runs after the read are under the session's own `jit`.
-pub(crate) const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', true),
+///
+/// `TimeZone` is the target's own, as its session started (DEC-1916.1), not
+/// UTC: an offset-less value a project declares is read in that zone, so what
+/// is read back has to be rendered in it too, or a hand-written `2026-02-01`
+/// and the instant it stored would read as two values. Fixed for a target all
+/// the same, which is what keeps two pulls of one database agreeing.
+pub(crate) fn canonical_path(zone: &SessionZone) -> String {
+    format!(
+        "SELECT pg_catalog.set_config('search_path', '', true),
        pg_catalog.set_config('quote_all_identifiers', 'off', true),
        pg_catalog.set_config('datestyle', 'ISO, MDY', true),
        pg_catalog.set_config('intervalstyle', 'postgres', true),
-       pg_catalog.set_config('timezone', 'UTC', true),
+       pg_catalog.set_config('timezone', {zone}, true),
        pg_catalog.set_config('bytea_output', 'hex', true),
        pg_catalog.set_config('extra_float_digits', '1', true),
        pg_catalog.set_config('standard_conforming_strings', 'on', true),
-       pg_catalog.set_config('jit', 'off', true)";
+       pg_catalog.set_config('jit', 'off', true)",
+        zone = crate::emit::literal(zone.as_str())
+    )
+}
+
+/// [`canonical_path`] in UTC, for the resolver's captures (DEC-1916.1).
+///
+/// Those are compared only with one another — the target's with its
+/// scratch's, a plan's with its recapture — never with what a project
+/// declares, and the two sides can be read on servers whose own zones differ.
+/// UTC renders a stored instant the same whichever session reads it.
+pub(crate) fn capture_path() -> String {
+    canonical_path(&SessionZone::utc())
+}
+
+/// [`canonical_path`] in the zone `conn`'s session started in.
+///
+/// A PostgreSQL connection always has one; an error and not a default for one
+/// that does not, because a read scope in a zone nobody asked for is the
+/// silent wrong reading this exists to prevent.
+pub(crate) fn canonical_path_of(conn: &Conn) -> Result<String, DbError> {
+    session_zone(conn).map(|zone| canonical_path(&zone))
+}
+
+/// The zone `conn`'s session started in (DEC-1916.1).
+pub(crate) fn session_zone(conn: &Conn) -> Result<SessionZone, DbError> {
+    conn.session_zone()
+        .cloned()
+        .ok_or_else(|| DbError::Refused("this connection reports no session time zone".to_owned()))
+}
 
 /// Reads the whole managed set back: one snapshot, one search path, no writes.
 ///
@@ -1118,7 +1155,8 @@ async fn read_batch(conn: &mut Conn) -> Result<CatalogBatch, DbError> {
 }
 
 async fn read_all(conn: &mut Conn) -> Result<CatalogRead, DbError> {
-    conn.query(CANONICAL_PATH).await?;
+    let scope = canonical_path_of(conn)?;
+    conn.query(&scope).await?;
     decode_batch(&read_batch(conn).await?)
 }
 
@@ -2196,9 +2234,10 @@ pub(crate) async fn canonical_query(
     } else {
         Scope::Own
     };
+    let path = canonical_path_of(conn)?;
     open(conn, scope).await?;
     let outcome = async {
-        conn.query(CANONICAL_PATH).await?;
+        conn.query(&path).await?;
         conn.query_with(sql, params).await
     }
     .await;
@@ -2521,13 +2560,12 @@ async fn read_every_scoped_table(
     scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
 ) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
     let mut out = pbps_model::ObservedRows::new();
-    let any = TableName::new("", "");
-    conn.query(CANONICAL_PATH)
-        .await
-        .map_err(|e| crate::rows::RowsError::Read {
-            table: any,
-            source: Box::new(e),
-        })?;
+    let scope_failed = |e| crate::rows::RowsError::Read {
+        table: TableName::new("", ""),
+        source: Box::new(e),
+    };
+    let path = canonical_path_of(conn).map_err(scope_failed)?;
+    conn.query(&path).await.map_err(scope_failed)?;
     for (name, scope) in scopes {
         let Some(table) = schema.tables.get(name) else {
             continue;
@@ -3000,8 +3038,12 @@ async fn store_and_read(
     // `transform_null_equals = on` would store `FALSE = NULL` as `FALSE IS
     // NULL` here and not at the apply (#1609 review). A `SET` in a
     // transaction that rolls back is undone with it.
-    conn.execute(crate::SESSION_PINS).await.map_err(fail)?;
-    conn.query(CANONICAL_PATH).await.map_err(fail)?;
+    let zone = session_zone(conn).map_err(fail)?;
+    let path = canonical_path(&zone);
+    conn.execute(&crate::session_pins(&zone))
+        .await
+        .map_err(fail)?;
+    conn.query(&path).await.map_err(fail)?;
     let columns = asked
         .iter()
         .enumerate()
@@ -3020,7 +3062,7 @@ async fn store_and_read(
         };
         stored.push(both);
     }
-    conn.query(CANONICAL_PATH).await.map_err(fail)?;
+    conn.query(&path).await.map_err(fail)?;
     let rows = conn
         .query(
             "SELECT a.attname::text AS name, pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS text
@@ -3057,13 +3099,12 @@ async fn ask_about_every_spelling(
     schema: &Schema,
     at: &crate::rows::CatalogNames,
 ) -> Result<Spellings, crate::rows::RowsError> {
-    let any = TableName::new("", "");
-    conn.query(CANONICAL_PATH)
-        .await
-        .map_err(|e| crate::rows::RowsError::Read {
-            table: any,
-            source: Box::new(e),
-        })?;
+    let scope_failed = |e| crate::rows::RowsError::Read {
+        table: TableName::new("", ""),
+        source: Box::new(e),
+    };
+    let path = canonical_path_of(conn).map_err(scope_failed)?;
+    conn.query(&path).await.map_err(scope_failed)?;
     let mut out = Spellings::default();
     for (partition, q) in crate::rows::bound_spelling_queries(schema)? {
         let read = |source| crate::rows::RowsError::Read {
@@ -3990,7 +4031,10 @@ mod tests {
     fn the_read_is_framed_as_one_snapshot_that_cannot_write_or_outlive_itself() {
         assert!(BEGIN.contains("REPEATABLE READ"));
         assert!(BEGIN.contains("READ ONLY"));
-        assert!(CANONICAL_PATH.contains("'search_path', '', true"));
+        let path = canonical_path(&SessionZone::new("Asia/Taipei").unwrap());
+        assert!(path.contains("'search_path', '', true"));
+        // The target's own zone, not UTC (DEC-1916.1).
+        assert!(path.contains("'timezone', 'Asia/Taipei', true"));
         // How a value prints, not only how a name does (DECISIONS 254). Each
         // was measured to change a rendered expression; pinned live by
         // `the_pull_does_not_move_when_the_sessions_search_path_does`.
@@ -4002,11 +4046,11 @@ mod tests {
             "bytea_output",
             "extra_float_digits",
         ] {
-            assert!(CANONICAL_PATH.contains(setting), "{setting}");
+            assert!(path.contains(setting), "{setting}");
         }
         // Not a rendering setting: the cost of the read (DEC-1445.1). Local like the
         // rest; pinned live by `the_canonical_scope_reads_without_jit_and_hands_back_the_sessions_own`.
-        assert!(CANONICAL_PATH.contains("'jit', 'off', true"));
+        assert!(path.contains("'jit', 'off', true"));
         // Asked of this backend, and of the statement rather than the
         // transaction: `xact_start = query_start` is what "no transaction was
         // open before this one" looks like. Pinned live by
@@ -4121,7 +4165,9 @@ mod tests {
             assert!(!sql.contains('\\'), "{name} carries a backslash: {sql}");
         }
         assert!(!NOT_A_PROJECTS_SCHEMA.contains('\\'));
-        assert!(CANONICAL_PATH.contains("standard_conforming_strings"));
+        assert!(
+            canonical_path(&SessionZone::offline_utc()).contains("standard_conforming_strings")
+        );
     }
 
     /// The filter and the validation are the same rule, and this is the thread

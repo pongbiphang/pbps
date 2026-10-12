@@ -58,13 +58,19 @@ async fn a_new_columns_retype_has_no_stored_key_to_probe_but_a_missing_old_one_r
     );
     // The engine accepts exactly the typed steps whose pre-execution catalog
     // read used to refuse the not-yet-created column.
-    db.conn.begin(Mssql.transaction_framing()).await.unwrap();
+    db.conn
+        .begin(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
+        .await
+        .unwrap();
     for p in &changes {
         for statement in Mssql.emit(&p.change, p.strategy).unwrap() {
             db.conn.execute(&statement.sql).await.unwrap();
         }
     }
-    db.conn.commit(Mssql.transaction_framing()).await.unwrap();
+    db.conn
+        .commit(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
+        .await
+        .unwrap();
     let rows = db.conn.query("SELECT max_length FROM sys.columns WHERE object_id=OBJECT_ID(N'dbo.t') AND name=N'added';").await.unwrap();
     assert_eq!(rows[0].try_get::<i16>("max_length").unwrap(), Some(20));
     db.drop().await;
@@ -125,13 +131,19 @@ async fn layout_estimates_measure_each_occupant_before_and_after_name_reuse() {
         assert_eq!(e.rows, Some(rows), "{}", e.about);
         assert_eq!((&e.rewrite, &e.reads), (&Rewrite::Yes, &Reads::EveryRow));
     }
-    db.conn.begin(Mssql.transaction_framing()).await.unwrap();
+    db.conn
+        .begin(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
+        .await
+        .unwrap();
     for p in &changes {
         for statement in Mssql.emit(&p.change, p.strategy).unwrap() {
             db.conn.execute(&statement.sql).await.unwrap();
         }
     }
-    db.conn.commit(Mssql.transaction_framing()).await.unwrap();
+    db.conn
+        .commit(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
+        .await
+        .unwrap();
     let rows = db
         .conn
         .query("SELECT COUNT_BIG(*) AS n FROM dbo.a")

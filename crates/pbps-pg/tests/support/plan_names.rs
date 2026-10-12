@@ -44,7 +44,10 @@ async fn estimates_measure_each_occupant_before_and_after_name_reuse() {
         assert_eq!(e.rows, Some(Rows::Estimated(rows)), "{}", e.about);
     }
     let pg = Postgres::new();
-    db.conn.begin(pg.transaction_framing()).await.unwrap();
+    db.conn
+        .begin(&pg.transaction_framing(&pbps_model::SessionZone::utc()))
+        .await
+        .unwrap();
     let reports = pbps_pg::impact::drop_blockers(
         &mut db.conn,
         &pbps_model::ChangeSet {
@@ -60,7 +63,10 @@ async fn estimates_measure_each_occupant_before_and_after_name_reuse() {
             db.conn.execute(&statement.sql).await.unwrap();
         }
     }
-    db.conn.commit(pg.transaction_framing()).await.unwrap();
+    db.conn
+        .commit(&pg.transaction_framing(&pbps_model::SessionZone::utc()))
+        .await
+        .unwrap();
     let rows = db
         .conn
         .query("SELECT COUNT(*) AS n FROM public.a")
@@ -141,13 +147,19 @@ async fn a_detached_columns_estimate_keeps_its_catalog_spelling_after_rename() {
         "{cost:?}"
     );
     let pg = Postgres::new();
-    db.conn.begin(pg.transaction_framing()).await.unwrap();
+    db.conn
+        .begin(&pg.transaction_framing(&pbps_model::SessionZone::utc()))
+        .await
+        .unwrap();
     for p in &changes {
         for statement in pg.emit(&p.change, p.strategy).unwrap() {
             db.conn.execute(&statement.sql).await.unwrap();
         }
     }
-    db.conn.commit(pg.transaction_framing()).await.unwrap();
+    db.conn
+        .commit(&pg.transaction_framing(&pbps_model::SessionZone::utc()))
+        .await
+        .unwrap();
     let rows = db
         .conn
         .query("SELECT amount FROM public.child")

@@ -22,7 +22,9 @@ fn delete_parent() -> Change {
 }
 
 async fn rolled_back(conn: &mut Conn, cs: &ChangeSet) -> Result<(), String> {
-    conn.begin(Mssql.transaction_framing()).await.unwrap();
+    conn.begin(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
+        .await
+        .unwrap();
     let mut result = Ok(());
     'plan: for p in &cs.changes {
         for statement in Mssql.emit(&p.change, p.strategy).unwrap() {
@@ -32,7 +34,9 @@ async fn rolled_back(conn: &mut Conn, cs: &ChangeSet) -> Result<(), String> {
             }
         }
     }
-    conn.rollback(Mssql.transaction_framing()).await.unwrap();
+    conn.rollback(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
+        .await
+        .unwrap();
     result
 }
 

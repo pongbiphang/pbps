@@ -638,6 +638,7 @@ mod tests {
             "postgres",
             "fixture",
             PlanBaseline {
+                time_zone: None,
                 description: "fixture".into(),
                 checksum: "00".repeat(32),
                 database_collation: None,

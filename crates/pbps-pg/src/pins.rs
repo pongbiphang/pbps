@@ -128,9 +128,9 @@ const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', tr
 
 /// The read's own transaction, when the caller has none open.
 const OWN_TRANSACTION: TransactionFraming = TransactionFraming {
-    begin: "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY;",
-    commit: "COMMIT;",
-    rollback: "ROLLBACK;",
+    begin: std::borrow::Cow::Borrowed("BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY;"),
+    commit: std::borrow::Cow::Borrowed("COMMIT;"),
+    rollback: std::borrow::Cow::Borrowed("ROLLBACK;"),
 };
 
 /// Where the read runs.
@@ -147,9 +147,9 @@ pub enum Within {
 pub async fn read(conn: &mut Conn, within: Within) -> Result<Read, DbError> {
     match within {
         Within::OwnTransaction => {
-            conn.begin(OWN_TRANSACTION).await?;
+            conn.begin(&OWN_TRANSACTION).await?;
             let result = read_under_canonical_path(conn).await;
-            let closed = conn.rollback(OWN_TRANSACTION).await;
+            let closed = conn.rollback(&OWN_TRANSACTION).await;
             let read = result?;
             closed?;
             Ok(read)

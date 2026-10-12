@@ -1095,20 +1095,20 @@ async fn apply(conn: &mut Conn, cs: &pbps_model::ChangeSet) {
 /// The same, in one transaction the way `apply` runs a plan: the engine's
 /// refusal comes back with the statement, and nothing before it stays.
 async fn try_apply(conn: &mut Conn, cs: &pbps_model::ChangeSet) -> Result<(), String> {
-    conn.begin(Mssql.transaction_framing())
+    conn.begin(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
         .await
         .expect("begin");
     for p in &cs.changes {
         for stmt in Mssql.emit(&p.change, p.strategy).expect("emit") {
             if let Err(e) = conn.execute(&stmt.sql).await {
-                conn.rollback(Mssql.transaction_framing())
+                conn.rollback(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
                     .await
                     .expect("rollback");
                 return Err(format!("{}\n{e}", stmt.sql));
             }
         }
     }
-    conn.commit(Mssql.transaction_framing())
+    conn.commit(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
         .await
         .expect("commit");
     Ok(())
@@ -5362,7 +5362,7 @@ async fn a_failed_statement_rolls_the_whole_plan_back() {
         .expect("create");
 
     db.conn
-        .begin(Mssql.transaction_framing())
+        .begin(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
         .await
         .expect("begin");
     db.conn
@@ -5377,7 +5377,7 @@ async fn a_failed_statement_rolls_the_whole_plan_back() {
         "the second statement must fail"
     );
     db.conn
-        .rollback(Mssql.transaction_framing())
+        .rollback(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
         .await
         .expect("rollback");
 
@@ -16016,7 +16016,9 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
     ))
     .await
     .unwrap();
-    conn.begin(Mssql.transaction_framing()).await.unwrap();
+    conn.begin(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
+        .await
+        .unwrap();
     conn.execute("CREATE TABLE dbo.parent (id integer NOT NULL, CONSTRAINT old_key UNIQUE(id)); CREATE TABLE dbo.child (id integer CONSTRAINT child_fk REFERENCES dbo.parent(id)); ALTER TABLE dbo.parent ADD CONSTRAINT other_key UNIQUE(id);").await.unwrap();
     let parent = TableName::new("dbo", "parent");
     let child = TableName::new("dbo", "child");
@@ -16196,7 +16198,9 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         !owner[0].blocking.is_empty(),
         "the owner still reads the actual FK despite a public denial"
     );
-    conn.rollback(Mssql.transaction_framing()).await.unwrap();
+    conn.rollback(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
+        .await
+        .unwrap();
     drop(conn);
     db.drop().await;
 }

@@ -4,11 +4,15 @@
 //! Every write path pins the settings these types read under (DECISIONS 267),
 //! so what an apply stores is the same everywhere. It is not necessarily what
 //! the declaration's author meant: `'01/02/2026'` on a `date` is 2 January
-//! under the pinned `DateStyle` and 1 February to whoever wrote it under DMY,
-//! and `'2026-01-02 09:00'` on a `timestamptz` is 09:00 UTC to the pins and
-//! 09:00 local to an author in Taipei. Nothing said so. A connected plan now
-//! asks the engine to read each such literal under the pins and under
-//! contrasting settings, and refuses one that comes back two ways.
+//! under the pinned `DateStyle` and 1 February to whoever wrote it under DMY.
+//! Nothing said so. A connected plan now asks the engine to read each such
+//! literal under the pins and under contrasting settings, and refuses one that
+//! comes back two ways.
+//!
+//! `TimeZone` is not among the contrasts (DEC-1916.1). An offset-less
+//! `timestamptz` is read in the target database's own zone, which the plan
+//! records and every write pins, so `'2026-01-02 09:00'` has one intended
+//! reading — 09:00 where the database is — and every set below reads it there.
 //!
 //! **Measured, not enumerated.** The engine is asked; no pattern in this file
 //! says which spellings are ambiguous. `2026-01-02`, `20260102`, `Jan 2 2026`
@@ -29,18 +33,17 @@ struct Settings {
     /// How a refusal names the set.
     name: &'static str,
     datestyle: &'static str,
-    timezone: &'static str,
     intervalstyle: &'static str,
     abbreviations: &'static str,
 }
 
-/// The values every write path pins (`session_pins!` in `lib.rs`), so the
+/// The values every write path pins (`session_pins` in `lib.rs`), so the
 /// reading under this set is what an apply stores. The test
-/// `the_pinned_set_is_what_the_write_pins_say` holds the two together.
+/// `the_pinned_set_is_what_the_write_pins_say` holds the two together. The
+/// zone, which every set shares, is the target's own (DEC-1916.1).
 const PINNED: Settings = Settings {
     name: "this tool's settings",
     datestyle: "ISO, MDY",
-    timezone: "UTC",
     intervalstyle: "postgres",
     abbreviations: "Default",
 };
@@ -51,24 +54,19 @@ const PINNED: Settings = Settings {
 /// Measured on 18.6: `'01/01/02'` is 2002-01-01 under both MDY and DMY and
 /// 2001-01-02 under YMD; `'12:00 IST'` is the same instant under the
 /// `Default` and `Australia` abbreviation dictionaries and a different one
-/// under `India`. The zones are odd offsets, +12:45/+13:45 and -3:30/-2:30,
-/// so that no zone-less time can land on the pinned UTC reading by
-/// coincidence. `sql_standard` is the one `IntervalStyle` that parses
+/// under `India`. `sql_standard` is the one `IntervalStyle` that parses
 /// differently: `'-1 2:03:04'` is -1 day +02:03:04 under `postgres` and
 /// -(1 day 02:03:04) under it.
 const CONTRASTS: [Settings; 2] = [
     Settings {
-        name: "DateStyle DMY, TimeZone Pacific/Chatham, IntervalStyle sql_standard, \
-               timezone_abbreviations Australia",
+        name: "DateStyle DMY, IntervalStyle sql_standard, timezone_abbreviations Australia",
         datestyle: "ISO, DMY",
-        timezone: "Pacific/Chatham",
         intervalstyle: "sql_standard",
         abbreviations: "Australia",
     },
     Settings {
-        name: "DateStyle YMD, TimeZone America/St_Johns, timezone_abbreviations India",
+        name: "DateStyle YMD, timezone_abbreviations India",
         datestyle: "ISO, YMD",
-        timezone: "America/St_Johns",
         intervalstyle: "postgres",
         abbreviations: "India",
     },
@@ -107,10 +105,11 @@ pub(crate) async fn ask(conn: &mut Conn, schema: &Schema) -> Result<Vec<Ambiguou
     if literals.is_empty() {
         return Ok(Vec::new());
     }
-    let pinned = read_under(conn, &PINNED, &literals).await?;
+    let zone = crate::catalog::session_zone(conn)?;
+    let pinned = read_under(conn, &PINNED, &zone, &literals).await?;
     let mut contrasts = Vec::with_capacity(CONTRASTS.len());
     for settings in &CONTRASTS {
-        contrasts.push(read_under(conn, settings, &literals).await?);
+        contrasts.push(read_under(conn, settings, &zone, &literals).await?);
     }
     let mut out = Vec::new();
     for (i, literal) in literals.into_iter().enumerate() {
@@ -182,11 +181,11 @@ fn remedy(base: &str, clock: bool) -> &'static str {
         "date" => "write it as an ISO date, `YYYY-MM-DD`",
         "timestamp without time zone" => "write it as an ISO timestamp, `YYYY-MM-DD HH:MM:SS`",
         "timestamp with time zone" => {
-            "write the instant in UTC with its offset, as the engine spells it, \
-             `YYYY-MM-DD HH:MM:SS+00`; a zone abbreviation such as `CST` names different \
+            "write the instant with its offset, as the engine spells it, \
+             `YYYY-MM-DD HH:MM:SS+08`; a zone abbreviation such as `CST` names different \
              offsets in different dictionaries"
         }
-        "time with time zone" => "write it with its UTC offset, `HH:MM:SS+08`",
+        "time with time zone" => "write it with its offset, `HH:MM:SS+08`",
         "interval" => {
             "give every field its own sign, as the engine spells one: `-1 days -02:03:04`"
         }
@@ -360,11 +359,12 @@ fn reading(base: &str, x: &str) -> String {
     }
 }
 
-/// Each literal's text and reading under `settings`, by index; `None` where
-/// the engine cannot read it as its type under them.
+/// Each literal's text and reading under `settings` in `zone`, by index;
+/// `None` where the engine cannot read it as its type under them.
 async fn read_under(
     conn: &mut Conn,
     settings: &Settings,
+    zone: &pbps_model::SessionZone,
     literals: &[Literal],
 ) -> Result<Vec<Option<(String, String)>>, DbError> {
     let mut by_type: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
@@ -382,7 +382,7 @@ async fn read_under(
                     pg_catalog.set_config('intervalstyle', {}, true),
                     pg_catalog.set_config('timezone_abbreviations', {}, true)",
             value_literal(settings.datestyle),
-            value_literal(settings.timezone),
+            value_literal(zone.as_str()),
             value_literal(settings.intervalstyle),
             value_literal(settings.abbreviations),
         ))
@@ -452,10 +452,10 @@ mod tests {
     /// readings against settings no statement runs under.
     #[test]
     fn the_pinned_set_is_what_the_write_pins_say() {
-        let pins = crate::SESSION_PINS;
+        let pins = crate::session_pins(&pbps_model::SessionZone::new("Asia/Taipei").unwrap());
         for (setting, value) in [
             ("DateStyle", PINNED.datestyle),
-            ("TimeZone", PINNED.timezone),
+            ("TimeZone", "Asia/Taipei"),
             ("IntervalStyle", PINNED.intervalstyle),
             ("timezone_abbreviations", PINNED.abbreviations),
         ] {
@@ -470,7 +470,8 @@ mod tests {
     fn every_contrast_differs_from_the_pins_in_every_setting_it_names() {
         for c in &CONTRASTS {
             assert_ne!(c.datestyle, PINNED.datestyle, "{}", c.name);
-            assert_ne!(c.timezone, PINNED.timezone, "{}", c.name);
+            // The zone is not a contrast: it is the target's (DEC-1916.1).
+            assert!(!c.name.contains("TimeZone"), "{}", c.name);
             assert_ne!(c.abbreviations, PINNED.abbreviations, "{}", c.name);
         }
         // `sql_standard` is the one style that parses differently, so one set

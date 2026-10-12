@@ -146,7 +146,7 @@ async fn identify(
         identified.insert(signature.clone(), identity);
     }
     if !dropped.is_empty() {
-        conn.query(crate::catalog::CANONICAL_PATH)
+        conn.query(&crate::catalog::capture_path())
             .await
             .map_err(|_| Failure::Read)?;
     }
@@ -158,7 +158,7 @@ async fn within(
     dropped: &BTreeSet<super::DroppedSignature>,
     qualify: impl FnOnce(&Catalog, u32) -> Result<Selection, Failure>,
 ) -> Result<(Read, Witnesses, super::session::Observation), Failure> {
-    conn.query(crate::catalog::CANONICAL_PATH)
+    conn.query(&crate::catalog::capture_path())
         .await
         .map_err(|_| Failure::Read)?;
     let environment = super::session::pin(conn).await?;
@@ -282,7 +282,7 @@ async fn fresh_witnesses(
         .await
         .map_err(|_| Failure::Read)?;
     let result = async {
-        conn.query(crate::catalog::CANONICAL_PATH)
+        conn.query(&crate::catalog::capture_path())
             .await
             .map_err(|_| Failure::Read)?;
         let mut witnesses = empty_witnesses();

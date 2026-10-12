@@ -538,7 +538,9 @@ impl Run<'_> {
             Some(compile) => compile,
             None => &mut *admin,
         };
-        engine::compile(&mut reconstruction, extras, driver, compile)
+        // The target's zone, read before the scratch is compiled in it.
+        let zone = target.session_zone().cloned();
+        engine::compile(&mut reconstruction, extras, driver, zone.as_ref(), compile)
             .await
             .map_err(|error| {
                 let error = through_shape_view(error, &staged);

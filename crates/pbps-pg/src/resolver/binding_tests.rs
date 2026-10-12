@@ -180,7 +180,7 @@ async fn analyze_on(
         let dropped = signatures(&pg, base_managed.dropped_by(&desired_managed));
         let mut scratch = databases.scratch(&scratch_name).await;
         reconstruction
-            .compile(&pg, &mut scratch)
+            .compile(&pg, &pbps_model::SessionZone::utc(), &mut scratch)
             .await
             .map_err(|e| e.to_string())?;
         let mut scratch =
@@ -2615,7 +2615,9 @@ async fn a_scratch_backend_terminated_mid_statement_is_no_compile_verdict() {
             let mut reconstruction = Reconstruction::new(&pg, &bootstrap(&desired.schema, &[]))
                 .expect("a view is reconstructible");
             let mut scratch = databases.scratch(&name).await;
-            let compiled = reconstruction.compile(&pg, &mut scratch).await;
+            let compiled = reconstruction
+                .compile(&pg, &pbps_model::SessionZone::utc(), &mut scratch)
+                .await;
             drop(scratch);
             databases.drop().await;
             match tag {
@@ -2637,5 +2639,55 @@ async fn a_scratch_backend_terminated_mid_statement_is_no_compile_verdict() {
                 ),
             }
         }
+    }
+}
+
+/// The scratch compiles in the target's zone, not its own (DEC-1916.1): an
+/// offset-less `timestamptz` in a view is the instant the target would store.
+/// A zone the scratch server does not know is refused by name, before any
+/// step runs, rather than compiled in another zone.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn the_scratch_compiles_in_the_targets_zone_or_not_at_all() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let mut databases = Databases {
+            server: server.clone(),
+            names: Vec::new(),
+        };
+        let name = format!("pbps_bind1916_{}", std::process::id());
+        databases.create(name.clone(), &["app"]).await;
+        let desired = Declared::default().view("app.v", "SELECT '2026-02-01'::timestamptz AS at");
+        let pg = dialect(&[]);
+        let taipei = pbps_model::SessionZone::new("Asia/Taipei").unwrap();
+        let mut reconstruction = Reconstruction::new(&pg, &bootstrap(&desired.schema, &[]))
+            .expect("a view is reconstructible");
+        let mut scratch = databases.scratch(&name).await;
+        let compiled = reconstruction.compile(&pg, &taipei, &mut scratch).await;
+        assert!(compiled.is_ok(), "{variable}: {compiled:?}");
+        let at = scratch
+            .query(
+                "SELECT count(*)::integer FROM app.v \
+                  WHERE at = TIMESTAMPTZ '2026-02-01 00:00:00+08'",
+            )
+            .await
+            .unwrap()[0]
+            .try_get_at::<i32>(0)
+            .unwrap();
+        assert_eq!(at, Some(1), "{variable}: compiled in another zone");
+
+        let unknown = pbps_model::SessionZone::new("Nowhere/Else").unwrap();
+        let mut reconstruction = Reconstruction::new(&pg, &bootstrap(&desired.schema, &[]))
+            .expect("a view is reconstructible");
+        let refused = reconstruction.compile(&pg, &unknown, &mut scratch).await;
+        drop(scratch);
+        databases.drop().await;
+        assert!(
+            matches!(
+                &refused,
+                Err(reconstruct::ReconstructError::Zone { zone, .. }) if zone == "Nowhere/Else"
+            ),
+            "{variable}: {refused:?}"
+        );
     }
 }

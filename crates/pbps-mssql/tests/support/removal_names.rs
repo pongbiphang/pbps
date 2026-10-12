@@ -111,7 +111,10 @@ async fn a_removal_keeps_its_stored_table_when_names_change_hands() {
 
             // Check the engine's own constraint after exactly this prefix.
             // Roll back so every case starts with the same names and keys.
-            db.conn.begin(dialect.transaction_framing()).await.unwrap();
+            db.conn
+                .begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
+                .await
+                .unwrap();
             for p in &cs.changes[..cs.changes.len() - 1] {
                 for statement in dialect.emit(&p.change, p.strategy).unwrap() {
                     db.conn.execute(&statement.sql).await.unwrap();
@@ -120,19 +123,22 @@ async fn a_removal_keeps_its_stored_table_when_names_change_hands() {
             let result = db.conn.execute("DELETE FROM dbo.p WHERE id = 1;").await;
             assert_eq!(result.is_err(), expected > 0, "{label}: {result:?}");
             db.conn
-                .rollback(dialect.transaction_framing())
+                .rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
                 .await
                 .unwrap();
             if expected == 0 {
                 // The emitted delete's guard agrees with the raw DELETE too.
-                db.conn.begin(dialect.transaction_framing()).await.unwrap();
+                db.conn
+                    .begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
+                    .await
+                    .unwrap();
                 for p in &cs.changes {
                     for statement in dialect.emit(&p.change, p.strategy).unwrap() {
                         db.conn.execute(&statement.sql).await.unwrap();
                     }
                 }
                 db.conn
-                    .rollback(dialect.transaction_framing())
+                    .rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
                     .await
                     .unwrap();
             }

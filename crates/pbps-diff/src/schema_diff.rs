@@ -6383,8 +6383,11 @@ mod tests {
         ) -> Vec<pbps_dialect::DialectError> {
             MinimalDialect.validate_table(name, table)
         }
-        fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
-            MinimalDialect.transaction_framing()
+        fn transaction_framing(
+            &self,
+            zone: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(zone)
         }
         fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
             MinimalDialect.probe_framing()
@@ -6454,8 +6457,11 @@ mod tests {
         ) -> Vec<pbps_dialect::DialectError> {
             MinimalDialect.validate_table(name, table)
         }
-        fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
-            MinimalDialect.transaction_framing()
+        fn transaction_framing(
+            &self,
+            zone: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(zone)
         }
         fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
             MinimalDialect.probe_framing()
@@ -17229,8 +17235,11 @@ mod tests {
         ) -> Vec<pbps_dialect::DialectError> {
             MinimalDialect.validate_table(name, table)
         }
-        fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
-            MinimalDialect.transaction_framing()
+        fn transaction_framing(
+            &self,
+            zone: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(zone)
         }
         fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
             MinimalDialect.probe_framing()
@@ -17304,8 +17313,11 @@ mod tests {
         ) -> Vec<pbps_dialect::DialectError> {
             MinimalDialect.validate_table(name, table)
         }
-        fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
-            MinimalDialect.transaction_framing()
+        fn transaction_framing(
+            &self,
+            zone: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(zone)
         }
         fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
             MinimalDialect.probe_framing()
@@ -19112,8 +19124,11 @@ mod tests {
             ) -> Vec<pbps_dialect::DialectError> {
                 MinimalDialect.validate_table(name, table)
             }
-            fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
-                MinimalDialect.transaction_framing()
+            fn transaction_framing(
+                &self,
+                zone: &pbps_model::SessionZone,
+            ) -> pbps_dialect::TransactionFraming {
+                MinimalDialect.transaction_framing(zone)
             }
             fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
                 MinimalDialect.probe_framing()
@@ -19608,8 +19623,11 @@ mod tests {
             ) -> Vec<pbps_dialect::DialectError> {
                 MinimalDialect.validate_table(name, table)
             }
-            fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
-                MinimalDialect.transaction_framing()
+            fn transaction_framing(
+                &self,
+                zone: &pbps_model::SessionZone,
+            ) -> pbps_dialect::TransactionFraming {
+                MinimalDialect.transaction_framing(zone)
             }
             fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
                 MinimalDialect.probe_framing()
@@ -19885,8 +19903,11 @@ mod tests {
             ) -> Vec<pbps_dialect::DialectError> {
                 MinimalDialect.validate_table(name, table)
             }
-            fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
-                MinimalDialect.transaction_framing()
+            fn transaction_framing(
+                &self,
+                zone: &pbps_model::SessionZone,
+            ) -> pbps_dialect::TransactionFraming {
+                MinimalDialect.transaction_framing(zone)
             }
             fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
                 MinimalDialect.probe_framing()

@@ -3428,8 +3428,11 @@ impl pbps_dialect::Dialect for Candidates {
     ) -> Vec<pbps_dialect::DialectError> {
         pbps_dialect::MinimalDialect.validate_table(name, table)
     }
-    fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
-        pbps_dialect::MinimalDialect.transaction_framing()
+    fn transaction_framing(
+        &self,
+        zone: &pbps_model::SessionZone,
+    ) -> pbps_dialect::TransactionFraming {
+        pbps_dialect::MinimalDialect.transaction_framing(zone)
     }
     fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
         pbps_dialect::MinimalDialect.probe_framing()

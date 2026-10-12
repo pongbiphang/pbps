@@ -32,6 +32,7 @@ use crate::change::ChangeSet;
 use crate::ids::IdsFile;
 use crate::module::ModuleDeps;
 use crate::schema::Schema;
+use crate::zone::SessionZone;
 
 /// The current plan-file format version.
 ///
@@ -229,7 +230,11 @@ use crate::schema::Schema;
 ///
 /// Bumped to 37 for `SetEnsureKeys` (DEC-1808.1), which older readers cannot
 /// decode and older plans can omit even when the managed scope changes.
-pub const CURRENT_VERSION: u32 = 37;
+///
+/// Bumped to 38 for the target's session time zone (DEC-1916.1): a
+/// baseline's `time_zone`, which an older build cannot read and would apply
+/// under UTC pins, storing every offset-less value at another instant.
+pub const CURRENT_VERSION: u32 = 38;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -311,6 +316,15 @@ pub struct PlanBaseline {
     /// `apply` refuses before the first statement unless it is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_collation: Option<String>,
+
+    /// The target's session time zone when the plan was computed, where the
+    /// engine has one (DEC-1916.1). Every offset-less `timestamptz` and
+    /// `timetz` the plan writes is read in it, and the statements are pinned
+    /// to it; a zone changed since planning would store each of them at
+    /// another instant with no statement looking different. `apply` refuses
+    /// before the first statement unless it is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<SessionZone>,
 }
 
 /// A plan as written to disk by `pbps plan --out`.
@@ -628,6 +642,7 @@ mod tests {
             "mssql",
             "2026-08-31T09:00:00Z",
             PlanBaseline {
+                time_zone: None,
                 description: "prod as queried".into(),
                 checksum: state_checksum(&schema_with("nvarchar(255)"), &IdsFile::default()),
                 database_collation: None,
@@ -688,7 +703,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 37);
+        assert_eq!(CURRENT_VERSION, 38);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads
@@ -701,6 +716,7 @@ mod tests {
             "postgres",
             "2026-09-25T00:00:00Z",
             PlanBaseline {
+                time_zone: None,
                 description: "d".into(),
                 checksum: "c".into(),
                 database_collation: None,

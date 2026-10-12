@@ -40,6 +40,7 @@ fn ordinary_plans_remain_valid_without_resolver_environment_evidence() {
         "postgres",
         "fixture",
         crate::PlanBaseline {
+            time_zone: None,
             description: "ordinary fixture".into(),
             checksum: "00".repeat(32),
             database_collation: None,

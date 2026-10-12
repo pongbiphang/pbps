@@ -986,3 +986,8 @@ Pinned by `a_date_or_time_literal_read_two_ways_is_found_on_both_versions`
 (pbps-pg, on 16 and 18) and
 `an_ambiguous_date_or_time_literal_is_refused_with_both_readings` (CLI: a
 connected plan and bootstrap refuse; the one-reading spellings apply clean).
+
+*Amended by [DEC-1916.1](session.md#dec-1916-1): `TimeZone` is no longer a
+contrast. An offset-less `timestamptz` is read in the target's recorded zone,
+which every set shares, and is no longer refused; the remedy names an offset,
+not UTC.*

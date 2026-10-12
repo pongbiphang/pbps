@@ -7510,8 +7510,8 @@ async fn the_framing_pins_the_settings_that_decide_what_a_definition_means() {
 
     // With it, the same text is a syntax error — `42601` — and the settings
     // the framing established are what made it one.
-    let framing = Postgres::new().transaction_framing();
-    conn.begin(framing).await.expect("begin");
+    let framing = Postgres::new().transaction_framing(&pbps_model::SessionZone::utc());
+    conn.begin(&framing).await.expect("begin");
     assert_eq!(
         text(
             &mut conn,
@@ -7525,7 +7525,7 @@ async fn the_framing_pins_the_settings_that_decide_what_a_definition_means() {
         "on"
     );
     let refusals = run(&mut conn, &statements).await;
-    conn.rollback(framing).await.expect("rollback");
+    conn.rollback(&framing).await.expect("rollback");
     drop_schema(&mut conn, &s).await;
     assert_eq!(
         refusals,
@@ -7615,18 +7615,18 @@ async fn an_online_index_is_built_concurrently_and_says_it_leaves_the_transactio
     // Both run: the concurrent one outside any transaction, the filtered one
     // inside the transaction the framing opens.
     conn.execute(&concurrent[0].sql).await.expect("concurrent");
-    let framing = Postgres::new().transaction_framing();
-    conn.begin(framing).await.expect("begin");
+    let framing = Postgres::new().transaction_framing(&pbps_model::SessionZone::utc());
+    conn.begin(&framing).await.expect("begin");
     conn.execute(&ordinary[0].sql).await.expect("filtered");
-    conn.commit(framing).await.expect("commit");
+    conn.commit(&framing).await.expect("commit");
 
     // And the engine's own refusal is what `non_transactional` is reporting.
-    conn.begin(framing).await.expect("begin");
+    conn.begin(&framing).await.expect("begin");
     let inside = conn
         .execute(&concurrent[0].sql.replace("ix_plain", "ix_again"))
         .await
         .expect_err("a concurrent build inside a transaction");
-    conn.rollback(framing).await.expect("rollback");
+    conn.rollback(&framing).await.expect("rollback");
     drop_schema(&mut conn, &s).await;
     // `25001` is `active_sql_transaction`: `CREATE INDEX CONCURRENTLY cannot
     // run inside a transaction block`, which is the engine's own words for
@@ -8922,13 +8922,13 @@ async fn the_framing_pins_what_an_ambiguous_temporal_literal_means() {
 
     // The same statements, under the framing, with the operator's settings
     // still in the session underneath it.
-    let framing = Postgres::new().transaction_framing();
-    conn.begin(framing).await.expect("begin");
+    let framing = Postgres::new().transaction_framing(&pbps_model::SessionZone::utc());
+    conn.begin(&framing).await.expect("begin");
     run(&mut conn, &statements).await;
     // Read it back before the rollback takes the table away; the catalogue sees
     // this transaction's own DDL.
     let ours = stored(&mut conn, &s).await;
-    conn.rollback(framing).await.expect("rollback");
+    conn.rollback(&framing).await.expect("rollback");
     drop_schema(&mut conn, &s).await;
 
     // A day, an instant, a sign, an abbreviation fifteen and a half hours out,
@@ -9313,8 +9313,8 @@ async fn a_conversion_to_text_renders_under_the_framings_settings_and_not_the_op
         to_collation: None,
     };
 
-    let framing = pg.transaction_framing();
-    conn.begin(framing).await.expect("begin");
+    let framing = pg.transaction_framing(&pbps_model::SessionZone::utc());
+    conn.begin(&framing).await.expect("begin");
     for change in [retype("b", "bytea"), retype("f", "double precision")] {
         for stmt in pg.emit(&change, Strategy::default()).expect("emit") {
             conn.execute(&stmt.sql)
@@ -9323,7 +9323,7 @@ async fn a_conversion_to_text_renders_under_the_framings_settings_and_not_the_op
         }
     }
     let rendered = text(&mut conn, &format!("SELECT b || ' ' || f FROM {s}.t")).await;
-    conn.rollback(framing).await.expect("rollback");
+    conn.rollback(&framing).await.expect("rollback");
     drop_schema(&mut conn, &s).await;
 
     // What the pin decided, not what the session held: `escape` would have
@@ -12427,9 +12427,9 @@ async fn the_settings_a_staged_run_depends_on_reach_a_connection_that_opens_no_t
         .expect("a session that means something else by the same text");
 
     let pins = Postgres::new()
-        .session_pins()
+        .session_pins(&pbps_model::SessionZone::utc())
         .expect("this dialect pins its session");
-    conn.execute(pins).await.expect("pin the session");
+    conn.execute(&pins).await.expect("pin the session");
     assert_eq!(
         text(&mut conn, "SHOW standard_conforming_strings").await,
         "on"
@@ -30069,9 +30069,12 @@ async fn a_length_probe_is_measured_in_the_session_the_statement_will_run_in() {
 
     // The session the probes are answered in is the session the statements run
     // in, which is the whole change. Established exactly as the runner does.
-    conn.execute(pbps_dialect::Dialect::session_pins(&Postgres::new()).expect("this dialect pins"))
-        .await
-        .expect("the pins the runner establishes");
+    conn.execute(
+        &pbps_dialect::Dialect::session_pins(&Postgres::new(), &pbps_model::SessionZone::utc())
+            .expect("this dialect pins"),
+    )
+    .await
+    .expect("the pins the runner establishes");
 
     let measured = counts(&mut conn, &cs).await;
     let counted_for = |table: &str| {
@@ -30880,9 +30883,12 @@ async fn a_length_probe_agrees_with_the_engine_for_every_rendering_the_pins_deci
     let mut conn = connect().await;
     let s = probe_schema_9("renders");
     fresh(&mut conn, &s).await;
-    conn.execute(pbps_dialect::Dialect::session_pins(&Postgres::new()).expect("this dialect pins"))
-        .await
-        .expect("the pins the runner establishes");
+    conn.execute(
+        &pbps_dialect::Dialect::session_pins(&Postgres::new(), &pbps_model::SessionZone::utc())
+            .expect("this dialect pins"),
+    )
+    .await
+    .expect("the pins the runner establishes");
 
     for (declared, literal) in [
         ("bytea", "'\\x0102'"),
@@ -32226,7 +32232,7 @@ async fn constraint_name_validation_preserves_legal_index_sharing() {
 async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
     use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
     let mut conn = connect().await;
-    conn.begin(Postgres::new().transaction_framing())
+    conn.begin(&Postgres::new().transaction_framing(&pbps_model::SessionZone::utc()))
         .await
         .unwrap();
     conn.execute("CREATE SCHEMA key_guard177").await.unwrap();
@@ -32348,7 +32354,7 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         "an absent existing key is not a successful dependency read"
     );
 
-    conn.rollback(Postgres::new().transaction_framing())
+    conn.rollback(&Postgres::new().transaction_framing(&pbps_model::SessionZone::utc()))
         .await
         .unwrap();
 }
@@ -34703,6 +34709,11 @@ async fn a_relation_lookup_finds_every_kind_by_its_exact_name() {
 /// back two ways is listed with the pinned reading, and each that comes back
 /// one way is not. The same characters in a `text` column, a non-literal
 /// default and `pull`'s own spellings are never listed.
+///
+/// An offset-less `timestamptz` or `timetz` is no longer one of them
+/// (DEC-1916.1): it is read in the target's own zone, which the probe no
+/// longer contrasts, so it comes back one way — a temporal misspelling taken
+/// as the value read (DEC-1883.1), rendered in the fixture's zone.
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn a_date_or_time_literal_read_two_ways_is_found_on_both_versions() {
@@ -34803,16 +34814,33 @@ async fn a_date_or_time_literal_read_two_ways_is_found_on_both_versions() {
                     "spans_mixed".to_owned(),
                     some("{\"0 months -1 days 7384.000000 seconds\"}")
                 ),
-                ("ttz_bare".to_owned(), some("12:00:00+00")),
                 ("tz_abbrev".to_owned(), some("2026-01-15 18:00:00+00")),
-                ("tz_bare".to_owned(), some("2026-01-02 09:00:00+00")),
-                ("tzs_bare".to_owned(), some("{\"2026-01-02 09:00:00+00\"}")),
             ],
             "{connection}: {found:#?}"
         );
         // Each listed cell is reported as two readings and not also as a
-        // misspelling whose remedy is the pinned one; the rest are clean.
-        assert!(found.misspelt.is_empty(), "{connection}: {found:#?}");
+        // misspelling whose remedy is the pinned one. The offset-less zoned
+        // values read one way, in the session's zone, and are taken as read;
+        // the rest are clean.
+        let mut taken: Vec<(String, bool, Option<String>)> = found
+            .misspelt
+            .iter()
+            .map(|m| (m.key.as_str().to_owned(), m.temporal, m.canonical.clone()))
+            .collect();
+        taken.sort();
+        assert_eq!(
+            taken,
+            [
+                ("ttz_bare".to_owned(), true, some("12:00:00+00")),
+                ("tz_bare".to_owned(), true, some("2026-01-02 09:00:00+00")),
+                (
+                    "tzs_bare".to_owned(),
+                    true,
+                    some("{\"2026-01-02 09:00:00+00\"}")
+                ),
+            ],
+            "{connection}: {found:#?}"
+        );
     }
 }
 
