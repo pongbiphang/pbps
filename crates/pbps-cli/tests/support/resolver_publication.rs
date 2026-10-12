@@ -304,13 +304,6 @@ fn write_prior(artifact: &std::path::Path, sql: &std::path::Path) {
 fn assert_prior(artifact: &std::path::Path, sql: &std::path::Path) {
     assert_eq!(std::fs::read(artifact).unwrap(), b"prior plan 1516");
     assert_eq!(std::fs::read(sql).unwrap(), b"prior sql 1516");
-    let left: Vec<_> = std::fs::read_dir(artifact.parent().unwrap())
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.ends_with(".tmp"))
-        .collect();
-    assert!(left.is_empty(), "no staged file is left behind: {left:?}");
 }
 
 fn run(d: &Demo, args: &[&str], targets: Option<&Targets<'_>>) -> Output {

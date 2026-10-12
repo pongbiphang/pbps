@@ -1783,10 +1783,9 @@ first, then runs it, and publishes its answer (DEC-1516.1):
 4. **The plan is sealed** in the order step 2 left. The evidence carries
    the target's `system_identifier`, keyed under the project key, never in
    clear, and every limitation the compatibility rule accepted, by name.
-5. **The files are written** through the one emitter. Each is written
-   beside its path first, and both are renamed into place once both are
-   written, the SQL before the plan. A failed write leaves the existing
-   files as they were.
+5. **The files are written** through the one emitter, both rendered first
+   and the SQL written before the plan, so a failed write never leaves a
+   new plan beside an old script.
 
 The connected summary reports `resolver_assessment` with `need: resolved`.
 `--staged` is refused for such a plan before the resolver runs: its evidence

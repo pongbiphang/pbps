@@ -2510,6 +2510,12 @@ the resolver's plan.
 - **A skipped recheck cannot be sealed.** `Unsealed::seal` takes a
   `Rechecked`, which only a passed recheck makes. The library's `produce`
   rechecks too, so every sealed answer has passed one.
+- **An index the evidence rebuilds takes over its parameter change.** The
+  resolver's rebuilds get the normalization the differ's and the
+  dependents pass's get (`drop_parameter_changes_of_rebuilt_indexes`): a
+  `SetIndexStorageParameters` on an index the plan drops and adds again
+  would run against the dropped index, and the add carries the declared
+  parameters.
 - **The evidence seals two more facts.** The target's `system_identifier`
   is keyed under the project key (`pbps/pg-cluster-identity/v1`), never
   written in clear (decided with the maintainer, 2026-10-11); #616 keys
@@ -2518,11 +2524,11 @@ the resolver's plan.
   description (#1700). The evidence version moves to 3. The plan format
   version does not: no build before this one ever wrote a resolved plan,
   and an ordinary plan is unchanged.
-- **No new plan beside an old script.** Each file is written beside its
-  path, and both are renamed into place only once both are written, the
-  SQL before the plan. A write that fails leaves the existing files as they
-  were; a rename of the plan failing after the SQL's leaves an old plan
-  beside a new script, which `apply` never reads without its plan. This
+- **No new plan beside an old script.** Both files are rendered before
+  either is written, and the SQL is written first, so a failed write never
+  leaves a new plan behind; a plan whose own write fails leaves an old plan
+  beside a new script, which `apply` never reads without its plan. Each is
+  written in place, so it keeps its owner, group, permissions and ACL. This
   holds for every connected plan, not only a resolved one.
 - **A dependent the evidence does not cover refuses.** When the
   module-dependents pass finds a declared module the plan leaves alone over
@@ -2544,6 +2550,10 @@ the resolver's plan.
   the point of the binding is a session that might not reach the same one.
 - **Write the plan, then the SQL, as before.** A failed SQL write then
   left a new plan beside an old script.
+- **Write each beside its path and rename it into place.** A rename
+  replaces the file: it takes the writer's group and default mode, drops
+  an ACL, and needs room for a longer name. Keeping all of that is more
+  code than the property is worth, and in place it holds already.
 
 Recorded in SPEC §9.3.2 and §9.8, README, STATUS and RESOLVER-DELIVERY.
 Pinned by the live tests `resolver_recheck_binds_the_target_by_engine_identity`,
