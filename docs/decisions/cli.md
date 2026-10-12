@@ -1051,8 +1051,9 @@ documentation (decision 18).
 Both offline and connected planning compare output paths before any identity
 write or connection. The protected set is the config, the configured identity
 file (even before it exists), all declaration files, an explicit `--base`
-snapshot, and every configured resolver SQL baseline. A baseline remains an
-input even when this invocation does not select its resolver. Existing ordinary
+snapshot, every environment's configured fingerprint key file, and every
+configured resolver SQL baseline. Keys and baselines remain inputs even when
+this invocation does not select their environment or resolver. Existing ordinary
 artifact destinations retain their overwrite behavior; other output commands
 are outside #1800.
 
@@ -1077,4 +1078,8 @@ files with identical bytes, physical symlink-parent resolution, Unix hardlinks
 and inspection errors, and `tests/support/plan_outputs.rs` for both dialects:
 all protected inputs retain their bytes, an absent identity file stays absent,
 connected refusals precede target access, a JSON refusal is a single envelope,
-and distinct overwritten artifacts still pass `explain`.
+and distinct overwritten artifacts still pass `explain`. The live PostgreSQL
+`plan_outputs_preserve_the_fingerprint_key_its_apply_needs` test also seals and
+applies a plan with the retained key. On the unguarded path, writing SQL over
+that key made an otherwise valid plan fail; restoring only the key made the
+same plan apply successfully (review on #1944).

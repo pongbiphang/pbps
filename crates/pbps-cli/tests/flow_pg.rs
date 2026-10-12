@@ -18944,6 +18944,72 @@ fn a_plan_that_must_pin_a_routine_is_refused_without_a_key_and_names_the_remedy(
     succeeds(h.run(&["plan", "--env", "dev"], None));
 }
 
+#[cfg(unix)]
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn plan_outputs_preserve_the_fingerprint_key_its_apply_needs() {
+    let h = PinnedHelper::new("plan_keeps_key");
+    let key_path = h.demo.dir.join("target.key");
+    succeeds(h.run(
+        &["key", "generate", "--out", key_path.to_str().unwrap()],
+        None,
+    ));
+    let key = std::fs::read(&key_path).unwrap();
+    let ids = std::fs::read(h.demo.dir.join("schema.ids.json")).unwrap();
+    std::fs::write(
+        h.demo.dir.join("pbps.yml"),
+        format!(
+            "dialect: postgres\nenvironments:\n  dev:\n    url_env: {}\n    fingerprint_key_file: target.key\n",
+            PinnedHelper::URL,
+        ),
+    )
+    .unwrap();
+    for flag in ["--out", "--sql"] {
+        let refused = h.run(
+            &[
+                "plan",
+                "--env",
+                "dev",
+                flag,
+                key_path.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+            None,
+        );
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        let report: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+        assert_eq!(report["findings"][0]["id"], "flags.conflicting", "{report}");
+        assert!(
+            std::fs::read(&key_path).unwrap() == key,
+            "fingerprint key changed"
+        );
+        assert_eq!(
+            std::fs::read(h.demo.dir.join("schema.ids.json")).unwrap(),
+            ids
+        );
+        assert!(!h.label_exists());
+    }
+    // The retained file still seals a usable plan; refusing the destination
+    // must not break the ordinary plan/apply path that depends on its key.
+    let plan = h.plan(false, "unused: the configured key is a file");
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    assert!(saved.routine_pins.is_some());
+    succeeds(h.apply(&plan, false, "unused: the configured key is a file"));
+    assert!(h.label_exists());
+    assert!(
+        std::fs::read(&key_path).unwrap() == key,
+        "fingerprint key changed"
+    );
+}
+
 #[test]
 #[ignore = "needs live PostgreSQL"]
 fn a_plan_pinned_under_one_key_is_refused_under_another() {

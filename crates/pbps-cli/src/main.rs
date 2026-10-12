@@ -2800,6 +2800,13 @@ fn refuse_aliased_outputs(
         inputs.extend(files);
     }
     inputs.extend(base.map(Path::to_owned));
+    // Replacing a key invalidates plans already sealed under it, including
+    // plans for environments this invocation does not select.
+    for environment in project.config.environments.values() {
+        if let Some(path) = &environment.fingerprint_key_file {
+            inputs.push(project.root.join(path));
+        }
+    }
     for profile in project.config.resolvers.values() {
         let (pbps_config::resolver::ResolverProfile::Docker { baseline, .. }
         | pbps_config::resolver::ResolverProfile::Server { baseline, .. }) = profile;

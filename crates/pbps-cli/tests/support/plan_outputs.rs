@@ -155,6 +155,62 @@ fn an_absent_identity_file_cannot_be_replaced_by_an_artifact() {
 }
 
 #[test]
+fn configured_fingerprint_keys_are_inputs_even_without_selecting_their_environment() {
+    for dialect in ["mssql", "postgres"] {
+        let d = project("fingerprint-keys", dialect, true);
+        let absolute = d.dir.join("spare.key");
+        for path in [d.dir.join("target.key"), absolute.clone()] {
+            std::fs::write(path, "opaque key bytes that planning must preserve\n").unwrap();
+        }
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            format!(
+                "dialect: {dialect}\nenvironments:\n  dev:\n    url_env: PBPS_1800_UNUSED_DB\n    fingerprint_key_file: target.key\n  spare:\n    url_env: PBPS_1800_UNUSED_DB\n    fingerprint_key_file: {}\n",
+                serde_json::to_string(&absolute).unwrap(),
+            ),
+        )
+        .unwrap();
+        for input in ["target.key", "spare.key"] {
+            for flag in ["--out", "--sql"] {
+                for mode in [vec!["plan", "--no-dev"], vec!["plan", "--env", "dev"]] {
+                    let mut args = mode;
+                    args.extend([flag, input, "--format", "json"]);
+                    refused(&d, &args, Some(&d.dir.join(input)));
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("target.key", d.dir.join("key-link")).unwrap();
+            std::fs::hard_link(&absolute, d.dir.join("key-hardlink")).unwrap();
+            for (alias, input) in [("key-link", "target.key"), ("key-hardlink", "spare.key")] {
+                for flag in ["--out", "--sql"] {
+                    refused(
+                        &d,
+                        &["plan", "--no-dev", flag, alias, "--format", "json"],
+                        Some(&d.dir.join(input)),
+                    );
+                }
+            }
+        }
+        // Offline preview does not need to parse or use any environment's
+        // key; distinct artifacts must still be allowed beside opaque bytes.
+        success(
+            &d,
+            &[
+                "plan",
+                "--no-dev",
+                "--out",
+                "preview.json",
+                "--sql",
+                "preview.sql",
+            ],
+        );
+        success(&d, &["explain", "--plan", "preview.json"]);
+    }
+}
+
+#[test]
 fn connected_planning_refuses_output_aliases_before_contacting_the_target() {
     for (dialect, target) in [
         (
