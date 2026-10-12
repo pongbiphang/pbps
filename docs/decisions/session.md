@@ -552,7 +552,7 @@ can disagree with the first. #1917 adds `timezone:` as a check only.
   spelling costs a DBA one `ALTER` where a wrong instant costs every value
   written.
 - **Recorded** in `PlanBaseline.time_zone` (plan version 38) and named in the
-  plan's output, text and JSON (schema set 41): nothing in a statement shows
+  plan's output, text and JSON (schema set 42): nothing in a statement shows
   it, and the same `2026-02-01` is another instant in another zone.
 - **Pinned** by the write pins, the transaction framing, a rendered script,
   the canonical read scope and the #1883 spelling probe. The dialect takes the
@@ -575,7 +575,11 @@ can disagree with the first. #1917 adds `timezone:` as a check only.
   `22023`, measured) rather than compiled in another one. The resolver's
   *captures* read in UTC: they are compared only with one another, on servers
   whose own zones can differ, and UTC renders a stored instant the same
-  whichever session reads it.
+  whichever session reads it. `doctor`'s runway reader (DEC-1789.2) reads in
+  UTC too: it computes with `timestamptz` bounds as `+00` text, the spelling
+  `partitions extend` writes until #1915, and in the target's zone it would
+  report every such series on a database outside UTC as a question it could
+  not answer.
 - **Unchanged.** pbps's own audit times stay UTC (287); `now()` and other
   function defaults; SQL Server, which has no session zone. Offline paths
   (`plan` without `--db`, a target-less `bootstrap --sql`) keep UTC until
@@ -589,4 +593,6 @@ on 16 and 18: a database in New York with its role in Taipei; a row, a default
 and a partition bound stored at Taipei's instants, verify and plan clean, `pull`
 writing `+08`, a `DateStyle` reading still refused, and transactional, staged and
 resumed applies refused after the zone moved) and
-`the_scratch_compiles_in_the_targets_zone_or_not_at_all` (pbps-pg, on 16 and 18).
+`the_scratch_compiles_in_the_targets_zone_or_not_at_all` (pbps-pg, on 16 and 18)
+and `doctor_reads_a_runway_in_utc_on_a_database_in_another_zone` (CLI, on 16 and
+18).

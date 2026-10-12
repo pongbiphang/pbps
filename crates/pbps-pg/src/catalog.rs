@@ -2198,15 +2198,21 @@ async fn close<T>(
 }
 
 /// Opens a `REPEATABLE READ READ ONLY` transaction under the canonical
-/// session ([`CANONICAL_PATH`]), for a reader that asks several statements of
-/// one snapshot and must see a bound as [`introspect`] does. Ended by
-/// [`close_canonical_read`] on every path, since a transaction the engine has
-/// aborted must still be ended.
+/// session in UTC ([`capture_path`]), for a reader that asks several
+/// statements of one snapshot and parses a `timestamptz` bound as UTC text.
+/// Ended by [`close_canonical_read`] on every path, since a transaction the
+/// engine has aborted must still be ended.
+///
+/// UTC and not the target's zone ([`canonical_path_of`], DEC-1916.1): the
+/// runway reader (DEC-1789.2) computes with bounds, and prints its reach,
+/// in the `+00` spelling `partitions extend` writes until #1915 moves both to
+/// the database's zone. Read in the target's zone, every bound on a database
+/// outside UTC would be one it refuses as "not in UTC".
 ///
 /// Refused inside a caller's transaction, for the reason [`introspect`] is.
 pub(crate) async fn open_canonical_read(conn: &mut Conn) -> Result<(), DbError> {
     open(conn, Scope::Own).await?;
-    if let Err(error) = conn.query(CANONICAL_PATH).await {
+    if let Err(error) = conn.query(&capture_path()).await {
         let _ = conn.execute("ROLLBACK").await;
         return Err(error);
     }

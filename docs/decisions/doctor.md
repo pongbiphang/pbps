@@ -1225,8 +1225,9 @@ question about a live database, and the maintainer settled where it is asked
   `pg_partition_tree` answers for a DEFAULT the login may not read. A login without it
   gets `permission denied for table`, which is an `…-unknown` finding.
 - **It reads rows' existence and writes nothing.** `SELECT EXISTS` returns a flag, and
-  every read is `READ ONLY`, in the canonical session (DEC-1170.1), so a `timestamptz`
-  bound prints in UTC. Each question is a transaction of its own, because an error
+  every read is `READ ONLY`, in the canonical session (DEC-1170.1) pinned to UTC
+  rather than the target's zone (DEC-1916.1), so a `timestamptz` bound prints in
+  UTC. Each question is a transaction of its own, because an error
   aborts a transaction and the next question would say only that. Each runs under a
   `lock_timeout` of 5 s, so a parent a rebuild holds `ACCESS EXCLUSIVE` is not waited
   for, and a `statement_timeout` of 30 s, since the DEFAULT is read whole when it holds

@@ -8293,6 +8293,70 @@ fn doctor_does_not_queue_behind_a_locked_partitioned_table_before_postgres_17() 
     partition_runway::locked(&server, "runway-lock-1789-old");
 }
 
+/// `doctor`'s runway reader parses a `timestamptz` bound as UTC text and reads
+/// it in UTC whatever the database's own zone (DEC-1789.2, DEC-1916.1): on a
+/// database in `Asia/Taipei` a weekly series that ends with its newest row is
+/// still reported short, in `+00`, and never as a question it could not
+/// answer. On 16 and 18.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn doctor_reads_a_runway_in_utc_on_a_database_in_another_zone() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        let own = OwnDatabase::new(server, &format!("runway_zone_1916_{k}"));
+        let connection = own.connection();
+        on_server(
+            connection,
+            &format!(
+                "CREATE SCHEMA app; ALTER DATABASE \"{}\" SET timezone = 'Asia/Taipei'",
+                own.name
+            ),
+        );
+        let d = Demo::new(&format!("runway-zone-1916-{k}"));
+        std::fs::write(
+            d.dir.join("schema/app.tz.yml"),
+            "table: app.tz\ncolumns:\n  id: {type: bigint, nullable: false}\n  \
+             k: {type: timestamptz, nullable: false}\nprimary_key: [id, k]\n\
+             partition_by: [k]\npartitions:\n  \
+             tz_2026_12_28: {from: ['2026-12-28 00:00:00+00'], to: ['2027-01-04 00:00:00+00']}\n  \
+             tz_2027_01_04: {from: ['2027-01-04 00:00:00+00'], to: ['2027-01-11 00:00:00+00']}\n",
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        on_server(
+            connection,
+            "INSERT INTO app.tz VALUES (1, '2027-01-05 10:00:00+00')",
+        );
+        assert_eq!(
+            text_of(connection, "SELECT current_setting('TimeZone')"),
+            "Asia/Taipei",
+            "the scenario needs a session outside UTC"
+        );
+
+        let o = d.run(&["doctor", "--db", connection, "--format", "json"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        let json: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        let findings = json["findings"].as_array().unwrap();
+        let with = |id: &str| -> Vec<&serde_json::Value> {
+            findings.iter().filter(|f| f["id"] == id).collect()
+        };
+        assert!(
+            with("doctor.partition-runway-unknown").is_empty(),
+            "a bound read in Taipei would be refused as not in UTC: {json}"
+        );
+        let short = with("doctor.partition-runway");
+        assert_eq!(short.len(), 1, "{json}");
+        let message = short[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("end at `2027-01-11 00:00:00+00`")
+                && message.contains("to `2027-01-18 00:00:00+00` at least"),
+            "{message}"
+        );
+    }
+}
+
 fn generated_series_flow(server: &str, slug: &str) {
     let own = OwnDatabase::new(server, slug);
     let conn = own.connection().to_owned();

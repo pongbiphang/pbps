@@ -183,7 +183,8 @@ enum Lookup {
 }
 
 /// A parent's key and its partitions, from the catalog. Run inside a
-/// canonical read, where a `timestamptz` bound prints in UTC (DEC-1170.1).
+/// canonical read in UTC, where a `timestamptz` bound prints in UTC
+/// (DEC-1170.1) whatever the database's own zone (DEC-1916.1).
 async fn lookup(conn: &mut Conn, physical: &ObjectName) -> Result<Lookup, Failure> {
     let rows = conn
         .query_with(
