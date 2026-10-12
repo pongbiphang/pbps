@@ -2124,6 +2124,1150 @@ mod generated_surface_coverage {
         assert!(drop < into && into < at, "{:?}", freed.changes.changes);
         freed.proof.validate(&freed.changes).unwrap();
     }
+
+    /// A partitioned `app.t(d)` and its partition `app.p`, which holds its
+    /// own default on `d` when `own` is given (#1578), and the parent's
+    /// default when `parent` is.
+    fn partitioned(parent: Option<&str>, own: Option<&str>) -> Schema {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+        let mut d = Column::new("int".parse().unwrap());
+        if let Some(parent) = parent {
+            d.value_source = pbps_model::ValueSource::Default(parent.into());
+        }
+        let mut schema = Schema::default();
+        schema.tables.insert(
+            "app.t".parse().unwrap(),
+            Table {
+                columns: [("d".to_owned(), d)].into(),
+                partition_by: Some(PartitionBy {
+                    external: false,
+                    columns: vec!["d".into()],
+                }),
+                ..Default::default()
+            },
+        );
+        schema.tables.insert(
+            "app.p".parse().unwrap(),
+            Table {
+                partition_of: Some(PartitionOf {
+                    parent: "app.t".parse().unwrap(),
+                    bound: PartitionBound::Default,
+                    columns: own
+                        .map(|own| {
+                            (
+                                "d".to_owned(),
+                                PartitionColumn {
+                                    default: Some(own.into()),
+                                    not_null: false,
+                                },
+                            )
+                        })
+                        .into_iter()
+                        .collect(),
+                }),
+                ..Default::default()
+            },
+        );
+        schema
+    }
+
+    /// The default on `table.d` binds `app.f` before the plan and `app.g`
+    /// after it, so the resolver rebuilds it.
+    fn rebinds(table: &str) -> SurfaceResolution {
+        let column: pbps_model::TableName = table.parse().unwrap();
+        SurfaceResolution {
+            surface: Surface::Default(column.column("d")),
+            current: Some(bound("pg_attrdef", &format!("{table}.d"), &[], "f")),
+            desired: Some(bound("pg_attrdef", &format!("{table}.d"), &[], "g")),
+        }
+    }
+
+    /// The default on `table.d` keeps its binding.
+    fn keeps(table: &str) -> SurfaceResolution {
+        let column: pbps_model::TableName = table.parse().unwrap();
+        let attrdef = Some(bound("pg_attrdef", &format!("{table}.d"), &[], "f"));
+        SurfaceResolution {
+            surface: Surface::Default(column.column("d")),
+            current: attrdef.clone(),
+            desired: attrdef,
+        }
+    }
+
+    /// A function the plan drops (`app.f`) or creates (`app.g`), with no
+    /// bindings of its own.
+    fn function(name: &str, before: bool) -> (pbps_model::ModuleId, SurfaceResolution) {
+        let id: pbps_model::ModuleId = format!("app.{name}(integer)").parse().unwrap();
+        let object = Some(BoundSurface {
+            object: ObjectIdentity {
+                class: "pg_proc".into(),
+                name: vec!["app".into(), name.into()],
+                signature: vec![],
+            },
+            bindings: vec![],
+            managed_inputs: BTreeSet::new(),
+        });
+        let resolution = SurfaceResolution {
+            surface: Surface::Module(id.clone()),
+            current: if before { object.clone() } else { None },
+            desired: if before { None } else { object },
+        };
+        (id, resolution)
+    }
+
+    /// #1610: a partition's own default whose bindings change is released
+    /// and restored in the resolver plan, as the ordinary path's
+    /// `SetPartitionDefault` pair (DEC-1581.1): taken off the partition
+    /// alone, then set again to its own with the parent's as the fallback.
+    /// The release precedes the drop of the function it bound, and the
+    /// restoration follows the creation of the one it binds. It used to be
+    /// skipped, leaving the default bound to the old input.
+    #[test]
+    fn a_partitions_own_default_is_released_and_restored_when_it_rebinds() {
+        let (f, dropped) = function("f", true);
+        let (g, created) = function("g", false);
+        let module = pbps_model::Module {
+            kind: pbps_model::ModuleKind::Function,
+            description: None,
+            definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+        };
+        let mut base = partitioned(Some("0"), Some("app.f(1)"));
+        base.modules.insert(f.clone(), module.clone());
+        let mut desired = partitioned(Some("0"), Some("app.f(1)"));
+        desired.modules.insert(g.clone(), module);
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let own = SurfaceResolution {
+            surface: Surface::Default(p.column("d")),
+            current: Some(bound(
+                "pg_attrdef",
+                "app.p.d",
+                &[Surface::Module(f.clone())],
+                "f",
+            )),
+            desired: Some(bound(
+                "pg_attrdef",
+                "app.p.d",
+                &[Surface::Module(g.clone())],
+                "g",
+            )),
+        };
+        let ordered = sided(&base, &desired, &[keeps("app.t"), own, dropped, created]);
+        let release = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, from: Some(from), to: None, fallback: None, .. }
+                if *table == p && column == "d" && from == "app.f(1)")
+        });
+        let restore = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, from: None, to: Some(to), fallback: Some(fallback), .. }
+                if *table == p && column == "d" && to == "app.f(1)" && fallback == "0")
+        });
+        assert!(release < restore, "{:?}", ordered.changes.changes);
+        let drop = at(
+            &ordered,
+            &|c| matches!(c, Change::DropModule { id, .. } if *id == f),
+        );
+        let create = at(
+            &ordered,
+            &|c| matches!(c, Change::CreateModule { id, .. } if *id == g),
+        );
+        assert!(
+            release < drop && create < restore,
+            "{:?}",
+            ordered.changes.changes
+        );
+        // Negative: the parent's default keeps its binding, so it is not
+        // rebuilt.
+        assert!(
+            !ordered
+                .changes
+                .changes
+                .iter()
+                .any(|c| matches!(c.change, Change::AlterColumnDefault { .. })),
+            "{:?}",
+            ordered.changes.changes
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// #1610: when a parent's default and a partition's own both rebind, the
+    /// partition's restoration follows the parent's. The engine recurses the
+    /// parent's `SET DEFAULT` over every partition's own default, so the
+    /// other way round would leave the partition with its parent's
+    /// (DEC-1687.1).
+    #[test]
+    fn a_partitions_own_default_is_restored_after_its_parents() {
+        let schema = partitioned(Some("app.f(0)"), Some("app.f(1)"));
+        let ordered = sided(&schema, &schema, &[rebinds("app.t"), rebinds("app.p")]);
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let parent = at(
+            &ordered,
+            &|c| matches!(c, Change::AlterColumnDefault { column, to: Some(_), .. } if column.table == t),
+        );
+        let own = at(
+            &ordered,
+            &|c| matches!(c, Change::SetPartitionDefault { table, to: Some(_), .. } if *table == p),
+        );
+        assert!(parent < own, "{:?}", ordered.changes.changes);
+        assert!(
+            ordered
+                .proof
+                .edges()
+                .iter()
+                .any(|e| e.before == parent && e.after == own),
+            "the order is an edge, not an accident of position: {:?}",
+            ordered.proof.edges()
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// #1610 review: one routine both defaults call is rebuilt. Each default
+    /// is released before the routine's drop and restored after its
+    /// creation, and the partition's restoration follows the parent's. The
+    /// parent-before-partition edge covers the partition's restoration only:
+    /// on its release it would close a cycle through the routine's rebuild.
+    #[test]
+    fn a_shared_routine_rebuild_orders_both_defaults_without_a_cycle() {
+        let f: pbps_model::ModuleId = "app.f(integer)".parse().unwrap();
+        let module = |body: &str| pbps_model::Module {
+            kind: pbps_model::ModuleKind::Function,
+            description: None,
+            definition: format!("(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN {body}"),
+        };
+        let mut base = partitioned(Some("app.f(0)"), Some("app.f(1)"));
+        base.modules.insert(f.clone(), module("$1"));
+        let mut desired = partitioned(Some("app.f(0)"), Some("app.f(1)"));
+        desired.modules.insert(f.clone(), module("$1 + 1"));
+        let object = |name: &str| BoundSurface {
+            object: ObjectIdentity {
+                class: "pg_proc".into(),
+                name: vec!["app".into(), name.into()],
+                signature: vec![],
+            },
+            bindings: vec![],
+            managed_inputs: BTreeSet::new(),
+        };
+        let routine = SurfaceResolution {
+            surface: Surface::Module(f.clone()),
+            current: Some(object("f")),
+            desired: Some(object("f")),
+        };
+        let default = |table: &str| {
+            let name: pbps_model::TableName = table.parse().unwrap();
+            let attrdef = format!("{table}.d");
+            SurfaceResolution {
+                surface: Surface::Default(name.column("d")),
+                current: Some(bound(
+                    "pg_attrdef",
+                    &attrdef,
+                    &[Surface::Module(f.clone())],
+                    "f",
+                )),
+                desired: Some(bound(
+                    "pg_attrdef",
+                    &attrdef,
+                    &[Surface::Module(f.clone())],
+                    "f_v2",
+                )),
+            }
+        };
+        let before_ids = ids(&base, &IdsFile::default());
+        let after_ids = ids(&desired, &before_ids);
+        let ordered = super::plan(
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+            &Hints::default(),
+            &[default("app.t"), default("app.p"), routine],
+            &Candidates,
+        )
+        .unwrap_or_else(|error| panic!("a schedulable rebuild is refused: {error:?}"));
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let release_parent = at(
+            &ordered,
+            &|c| matches!(c, Change::AlterColumnDefault { column, to: None, .. } if column.table == t),
+        );
+        let release_own = at(
+            &ordered,
+            &|c| matches!(c, Change::SetPartitionDefault { table, to: None, fallback: None, .. } if *table == p),
+        );
+        let drop = at(
+            &ordered,
+            &|c| matches!(c, Change::DropModule { id, .. } if *id == f),
+        );
+        let create = at(
+            &ordered,
+            &|c| matches!(c, Change::CreateModule { id, .. } if *id == f),
+        );
+        let restore_parent = at(
+            &ordered,
+            &|c| matches!(c, Change::AlterColumnDefault { column, to: Some(_), .. } if column.table == t),
+        );
+        let restore_own = at(
+            &ordered,
+            &|c| matches!(c, Change::SetPartitionDefault { table, to: Some(_), .. } if *table == p),
+        );
+        assert!(
+            release_parent < drop
+                && release_own < drop
+                && drop < create
+                && create < restore_parent
+                && restore_parent < restore_own,
+            "{:?}",
+            ordered.changes.changes
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// #1610 review: a generated column dropped and its name taken by a new
+    /// column, under a new UID and with a default, is the ordinary plan's
+    /// `DropColumn` and `AddColumn`. Its default surface rebinds, but the
+    /// base column has no default to release: the replacement already
+    /// rebuilds it, so the plan is not refused for a missing default.
+    #[test]
+    fn a_replaced_column_is_rebuilt_by_its_replacement_not_refused() {
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let mut base = Schema::default();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        table.columns.insert("c".into(), generated("app.f(a)"));
+        base.tables.insert(t.clone(), table.clone());
+        let mut desired = base.clone();
+        let mut c = Column::new("int".parse().unwrap());
+        c.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
+        desired
+            .tables
+            .get_mut(&t)
+            .unwrap()
+            .columns
+            .insert("c".into(), c);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        let old = before_ids.column_uid(&t.column("c")).unwrap().clone();
+        after_ids.columns.remove(&old);
+        let new: pbps_model::Uid = "c_zzzzzz".parse().unwrap();
+        after_ids.columns.insert(new.clone(), t.column("c"));
+        let ordered = super::plan(
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+            &Hints::default(),
+            &[rebinds("app.t").clone()].map(|r| SurfaceResolution {
+                surface: Surface::Default(t.column("c")),
+                ..r
+            }),
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap_or_else(|error| panic!("a replaced column is refused: {error:?}"));
+        let dropped = at(
+            &ordered,
+            &|ch| matches!(ch, Change::DropColumn { uid, .. } if *uid == old),
+        );
+        let added = at(
+            &ordered,
+            &|ch| matches!(ch, Change::AddColumn { uid, .. } if *uid == new),
+        );
+        assert!(dropped < added, "{:?}", ordered.changes.changes);
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// Plans `base` to `desired` under the given identities, as `sided` does
+    /// under resolved ones.
+    fn planned(
+        base: &Schema,
+        before_ids: &IdsFile,
+        desired: &Schema,
+        after_ids: &IdsFile,
+        observations: &[SurfaceResolution],
+    ) -> Result<Ordered, super::super::Error> {
+        super::plan(
+            crate::Side {
+                schema: base,
+                ids: before_ids,
+            },
+            crate::Side {
+                schema: desired,
+                ids: after_ids,
+            },
+            &Hints::default(),
+            observations,
+            &pbps_dialect::MinimalDialect,
+        )
+    }
+
+    /// #1610 review: a parent drops `d` and renames `e` to `d`. Its
+    /// partition's own default on `d` had no override on `e` before, so only
+    /// the plan's side has one: the ordinary plan installs it, and the plan
+    /// is not refused for an old override that never existed.
+    #[test]
+    fn a_replaced_parent_column_is_not_refused_for_its_partitions_override() {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let tree = |columns: &[&str]| {
+            let mut schema = Schema::default();
+            schema.tables.insert(
+                t.clone(),
+                Table {
+                    columns: columns
+                        .iter()
+                        .map(|c| ((*c).to_owned(), Column::new("int".parse().unwrap())))
+                        .collect(),
+                    partition_by: Some(PartitionBy {
+                        external: false,
+                        columns: vec!["k".into()],
+                    }),
+                    ..Default::default()
+                },
+            );
+            schema.tables.insert(
+                p.clone(),
+                Table {
+                    partition_of: Some(PartitionOf {
+                        parent: t.clone(),
+                        bound: PartitionBound::Default,
+                        columns: [(
+                            "d".to_owned(),
+                            PartitionColumn {
+                                default: Some("app.f(1)".into()),
+                                not_null: false,
+                            },
+                        )]
+                        .into(),
+                    }),
+                    ..Default::default()
+                },
+            );
+            schema
+        };
+        let base = tree(&["k", "d", "e"]);
+        let desired = tree(&["k", "d"]);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        let d = before_ids.column_uid(&t.column("d")).unwrap().clone();
+        let e = before_ids.column_uid(&t.column("e")).unwrap().clone();
+        after_ids.columns.remove(&d);
+        after_ids.columns.get_mut(&e).unwrap().name = "d".into();
+        let ordered = planned(
+            &base,
+            &before_ids,
+            &desired,
+            &after_ids,
+            &[rebinds("app.p")],
+        )
+        .unwrap_or_else(|error| panic!("a replaced parent column is refused: {error:?}"));
+        assert!(
+            ordered
+                .changes
+                .changes
+                .iter()
+                .any(|c| matches!(&c.change, Change::DropColumn { uid, .. } if *uid == d)),
+            "{:?}",
+            ordered.changes.changes
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// #1610 review: as above, but the partition holds its own default on
+    /// `e` too, which the rename keeps as `d`'s. That default rebinds: its
+    /// teardown, spelled `p.e`, runs before the parent renames `e`, and its
+    /// restoration, spelled `p.d`, after it. Either other way addresses a
+    /// column that is not there.
+    #[test]
+    fn a_partitions_kept_override_is_rebuilt_around_its_parents_column_rename() {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let tree = |columns: &[&str], overrides: &[(&str, &str)]| {
+            let mut schema = Schema::default();
+            schema.tables.insert(
+                t.clone(),
+                Table {
+                    columns: columns
+                        .iter()
+                        .map(|c| ((*c).to_owned(), Column::new("int".parse().unwrap())))
+                        .collect(),
+                    partition_by: Some(PartitionBy {
+                        external: false,
+                        columns: vec!["k".into()],
+                    }),
+                    ..Default::default()
+                },
+            );
+            schema.tables.insert(
+                p.clone(),
+                Table {
+                    partition_of: Some(PartitionOf {
+                        parent: t.clone(),
+                        bound: PartitionBound::Default,
+                        columns: overrides
+                            .iter()
+                            .map(|(c, default)| {
+                                (
+                                    (*c).to_owned(),
+                                    PartitionColumn {
+                                        default: Some((*default).into()),
+                                        not_null: false,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    }),
+                    ..Default::default()
+                },
+            );
+            schema
+        };
+        let base = tree(&["k", "d", "e"], &[("d", "app.f(1)"), ("e", "app.f(2)")]);
+        let desired = tree(&["k", "d"], &[("d", "app.f(2)")]);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        let d = before_ids.column_uid(&t.column("d")).unwrap().clone();
+        let e = before_ids.column_uid(&t.column("e")).unwrap().clone();
+        after_ids.columns.remove(&d);
+        after_ids.columns.get_mut(&e).unwrap().name = "d".into();
+        let removed = SurfaceResolution {
+            surface: Surface::Default(p.column("e")),
+            current: Some(bound("pg_attrdef", "app.p.e", &[], "f")),
+            desired: None,
+        };
+        let ordered = planned(
+            &base,
+            &before_ids,
+            &desired,
+            &after_ids,
+            &[rebinds("app.p"), removed],
+        )
+        .unwrap_or_else(|error| panic!("a kept override is refused: {error:?}"));
+        let rename = at(&ordered, &|c| {
+            matches!(c, Change::RenameColumn { table, from, to, .. }
+                if *table == t && from == "e" && to == "d")
+        });
+        let release = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, to: None, fallback: None, .. }
+                if *table == p && column == "e")
+        });
+        let restore = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, to: Some(to), .. }
+                if *table == p && column == "d" && to == "app.f(2)")
+        });
+        assert!(
+            release < rename && rename < restore,
+            "{:?}",
+            ordered.changes.changes
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// A partitioned `parent(k, columns...)` with `partition` holding the
+    /// given own defaults.
+    fn tree(parent: &str, columns: &[&str], partition: &str, overrides: &[(&str, &str)]) -> Schema {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+        let mut schema = Schema::default();
+        schema.tables.insert(
+            parent.parse().unwrap(),
+            Table {
+                columns: columns
+                    .iter()
+                    .map(|c| ((*c).to_owned(), Column::new("int".parse().unwrap())))
+                    .collect(),
+                partition_by: Some(PartitionBy {
+                    external: false,
+                    columns: vec!["k".into()],
+                }),
+                ..Default::default()
+            },
+        );
+        schema.tables.insert(
+            partition.parse().unwrap(),
+            Table {
+                partition_of: Some(PartitionOf {
+                    parent: parent.parse().unwrap(),
+                    bound: PartitionBound::Default,
+                    columns: overrides
+                        .iter()
+                        .map(|(c, default)| {
+                            (
+                                (*c).to_owned(),
+                                PartitionColumn {
+                                    default: Some((*default).into()),
+                                    not_null: false,
+                                },
+                            )
+                        })
+                        .collect(),
+                }),
+                ..Default::default()
+            },
+        );
+        schema
+    }
+
+    /// #1610 review: the parent renames `e` to `f` and `d` to `e`, and the
+    /// plan removes the partition's own default on the original `d`. The
+    /// ordinary plan spells that removal `p.e`, the name the column has once
+    /// both renames have run, so it follows them: placed before `e -> f`, it
+    /// would take the default off the old `e` and leave `d`'s in place.
+    #[test]
+    fn an_ordinary_partition_removal_follows_its_parents_rename_chain() {
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let base = tree("app.t", &["k", "d", "e"], "app.p", &[("d", "app.f(1)")]);
+        let desired = tree("app.t", &["k", "e", "f"], "app.p", &[]);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        let d = before_ids.column_uid(&t.column("d")).unwrap().clone();
+        let e = before_ids.column_uid(&t.column("e")).unwrap().clone();
+        after_ids.columns.get_mut(&e).unwrap().name = "f".into();
+        after_ids.columns.get_mut(&d).unwrap().name = "e".into();
+        let removed = SurfaceResolution {
+            surface: Surface::Default(p.column("d")),
+            current: Some(bound("pg_attrdef", "app.p.d", &[], "f")),
+            desired: None,
+        };
+        let ordered = planned(&base, &before_ids, &desired, &after_ids, &[removed])
+            .unwrap_or_else(|error| panic!("a rename chain is refused: {error:?}"));
+        let renamed = |from: &str| {
+            at(
+                &ordered,
+                &|c| matches!(c, Change::RenameColumn { table, from: f, .. } if *table == t && f == from),
+            )
+        };
+        let removal = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, from: Some(_), to: None, .. }
+                if *table == p && column == "e")
+        });
+        assert!(
+            renamed("e") < removal && renamed("d") < removal,
+            "{:?}",
+            ordered.changes.changes
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// #1610 review: the plan renames the parent `app.t` to `app.u` as well
+    /// as its column `e` to `d`. The rebuilt override's release names the
+    /// parent `app.t` and the rename names `app.u`, so the parent is matched
+    /// by its UID: the release still goes before the column rename.
+    #[test]
+    fn a_partitions_rebuild_follows_its_parents_column_rename_through_a_table_rename() {
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let u: pbps_model::TableName = "app.u".parse().unwrap();
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let base = tree(
+            "app.t",
+            &["k", "d", "e"],
+            "app.p",
+            &[("d", "app.f(1)"), ("e", "app.f(2)")],
+        );
+        let desired = tree("app.u", &["k", "d"], "app.p", &[("d", "app.f(2)")]);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        let parent = before_ids.table_uid(&t).unwrap().clone();
+        let d = before_ids.column_uid(&t.column("d")).unwrap().clone();
+        let e = before_ids.column_uid(&t.column("e")).unwrap().clone();
+        *after_ids.tables.get_mut(&parent).unwrap() = u.clone();
+        for column in after_ids.columns.values_mut() {
+            if column.table == t {
+                column.table = u.clone();
+            }
+        }
+        after_ids.columns.remove(&d);
+        after_ids.columns.get_mut(&e).unwrap().name = "d".into();
+        let removed = SurfaceResolution {
+            surface: Surface::Default(p.column("e")),
+            current: Some(bound("pg_attrdef", "app.p.e", &[], "f")),
+            desired: None,
+        };
+        let ordered = planned(
+            &base,
+            &before_ids,
+            &desired,
+            &after_ids,
+            &[rebinds("app.p"), removed],
+        )
+        .unwrap_or_else(|error| panic!("a renamed parent is refused: {error:?}"));
+        let rename = at(
+            &ordered,
+            &|c| matches!(c, Change::RenameColumn { from, to, .. } if from == "e" && to == "d"),
+        );
+        let release = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, to: None, fallback: None, .. }
+                if *table == p && column == "e")
+        });
+        let restore = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, to: Some(_), .. }
+                if *table == p && column == "d")
+        });
+        assert!(
+            release < rename && rename < restore,
+            "{:?}",
+            ordered.changes.changes
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// The plan's names resolve at every step, as the CLI checks before it
+    /// renders a plan: a change addressed by a UID the plan has not made, or
+    /// one sharing an address with another UID, is refused there.
+    fn names_resolve(ordered: &Ordered, after: &IdsFile) {
+        if let Err(error) = pbps_model::plan_names::PlanNames::of(&ordered.changes.changes, after) {
+            panic!("{error:?}: {:?}", ordered.changes.changes);
+        }
+    }
+
+    /// #1610 review: a default whose owner the plan replaces under its name,
+    /// with a new UID, is created with the replacement and binds anew. No
+    /// pair is added for it: a teardown under the new UID, spelled at the
+    /// shared name before the old owner is dropped, is an address collision.
+    /// Covered for a partition, an ordinary table and a column.
+    #[test]
+    fn a_replaced_default_owner_gets_no_rebuild_pair() {
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let added = |ordered: &Ordered| {
+            ordered
+                .changes
+                .changes
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        &c.change,
+                        Change::SetPartitionDefault { to: None, .. }
+                            | Change::AlterColumnDefault { to: None, .. }
+                    )
+                })
+                .count()
+        };
+
+        let base = partitioned(None, Some("app.f(1)"));
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        let old = before_ids.table_uid(&p).unwrap().clone();
+        after_ids.tables.remove(&old);
+        after_ids
+            .tables
+            .insert("t_zzzzzz".parse().unwrap(), p.clone());
+        let ordered = planned(&base, &before_ids, &base, &after_ids, &[rebinds("app.p")])
+            .unwrap_or_else(|error| panic!("a replaced partition is refused: {error:?}"));
+        names_resolve(&ordered, &after_ids);
+        assert_eq!(added(&ordered), 0, "{:?}", ordered.changes.changes);
+
+        let mut base = Schema::default();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        let mut c = Column::new("int".parse().unwrap());
+        c.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
+        table.columns.insert("c".into(), c);
+        base.tables.insert(t.clone(), table);
+        let before_ids = ids(&base, &IdsFile::default());
+        let observation = SurfaceResolution {
+            surface: Surface::Default(t.column("c")),
+            ..rebinds("app.t")
+        };
+        // The whole table, then the column alone.
+        let mut whole = IdsFile {
+            version: before_ids.version,
+            ..Default::default()
+        };
+        whole.tables.insert("t_zzzzzz".parse().unwrap(), t.clone());
+        whole
+            .columns
+            .insert("c_yyyyyy".parse().unwrap(), t.column("a"));
+        whole
+            .columns
+            .insert("c_zzzzzz".parse().unwrap(), t.column("c"));
+        let mut column = before_ids.clone();
+        let old = before_ids.column_uid(&t.column("c")).unwrap().clone();
+        column.columns.remove(&old);
+        column
+            .columns
+            .insert("c_zzzzzz".parse().unwrap(), t.column("c"));
+        for after_ids in [whole, column] {
+            let ordered = planned(
+                &base,
+                &before_ids,
+                &base,
+                &after_ids,
+                std::slice::from_ref(&observation),
+            )
+            .unwrap_or_else(|error| panic!("a replaced owner is refused: {error:?}"));
+            names_resolve(&ordered, &after_ids);
+            assert_eq!(added(&ordered), 0, "{:?}", ordered.changes.changes);
+        }
+
+        // Negative: the same default on an owner that stands through the
+        // plan is rebuilt.
+        let ordered = planned(&base, &before_ids, &base, &before_ids, &[observation])
+            .expect("a standing column's default is rebuilt");
+        names_resolve(&ordered, &before_ids);
+        assert_eq!(added(&ordered), 1, "{:?}", ordered.changes.changes);
+    }
+
+    /// #1610 review: an ordinary table attached while its default rebinds.
+    /// The attach keeps the column's default as the partition's own (#1578):
+    /// it is released as the column's before the attach, and restored as the
+    /// partition's own after it.
+    #[test]
+    fn an_attached_tables_default_is_released_and_restored() {
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let mut base = partitioned(None, None);
+        let mut d = Column::new("int".parse().unwrap());
+        d.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
+        base.tables.insert(
+            p.clone(),
+            Table {
+                columns: [("d".to_owned(), d)].into(),
+                ..Default::default()
+            },
+        );
+        // A range, which a table is attached as; a DEFAULT partition is
+        // created, not attached.
+        let mut desired = partitioned(None, Some("app.f(1)"));
+        desired
+            .tables
+            .get_mut(&p)
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .bound = pbps_model::PartitionBound::Range {
+            from: vec![pbps_model::BoundDatum::Value("0".into())],
+            to: vec![pbps_model::BoundDatum::Value("10".into())],
+        };
+        let before_ids = ids(&base, &IdsFile::default());
+        let after_ids = ids(&desired, &before_ids);
+        let ordered = planned(
+            &base,
+            &before_ids,
+            &desired,
+            &after_ids,
+            &[rebinds("app.p")],
+        )
+        .unwrap_or_else(|error| panic!("an attach is refused: {error:?}"));
+        let release = at(&ordered, &|c| {
+            matches!(c, Change::AlterColumnDefault { column, from: Some(from), to: None, .. }
+                if column.table == p && from == "app.f(1)")
+        });
+        let attach = at(&ordered, &|c| matches!(c, Change::AttachPartition { .. }));
+        let restore = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, from: None, to: Some(to), .. }
+                if *table == p && to == "app.f(1)")
+        });
+        assert!(
+            release < attach && attach < restore,
+            "{:?}",
+            ordered.changes.changes
+        );
+        names_resolve(&ordered, &after_ids);
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// #1610 review: the plan takes a partition's own default off, leaving
+    /// its parent's, and drops the routine the own default called. Taking it
+    /// off lets go of that routine, so it precedes the drop.
+    #[test]
+    fn a_partition_default_given_back_to_its_parents_precedes_its_routines_drop() {
+        let (f, dropped) = function("f", true);
+        let module = pbps_model::Module {
+            kind: pbps_model::ModuleKind::Function,
+            description: None,
+            definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+        };
+        let mut base = partitioned(Some("0"), Some("app.f(1)"));
+        base.modules.insert(f.clone(), module);
+        let desired = partitioned(Some("0"), None);
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let own = SurfaceResolution {
+            surface: Surface::Default(p.column("d")),
+            current: Some(bound(
+                "pg_attrdef",
+                "app.p.d",
+                &[Surface::Module(f.clone())],
+                "f",
+            )),
+            desired: None,
+        };
+        let ordered = sided(&base, &desired, &[keeps("app.t"), own, dropped]);
+        let given_back = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, from: Some(_), to: None, fallback: Some(_), .. }
+                if *table == p)
+        });
+        let drop = at(
+            &ordered,
+            &|c| matches!(c, Change::DropModule { id, .. } if *id == f),
+        );
+        assert!(given_back < drop, "{:?}", ordered.changes.changes);
+        assert!(
+            ordered
+                .proof
+                .edges()
+                .iter()
+                .any(|e| e.before == given_back && e.after == drop),
+            "the order is an edge, not an accident of position: {:?}",
+            ordered.proof.edges()
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// #1610 review: the parent's default rebinds and its partition's own
+    /// keeps its binding. The parent's restoration is recursed by the engine
+    /// into the partition, over its own default, so that is set again after
+    /// it (DEC-1687.1). Negative: a partition holding only its parent's
+    /// default is not set again.
+    #[test]
+    fn a_partitions_standing_default_is_set_again_after_its_parents_rebuild() {
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let schema = partitioned(Some("app.f(0)"), Some("7"));
+        let before_ids = ids(&schema, &IdsFile::default());
+        let ordered = planned(
+            &schema,
+            &before_ids,
+            &schema,
+            &before_ids,
+            &[rebinds("app.t"), keeps("app.p")],
+        )
+        .unwrap_or_else(|error| panic!("a parent's rebuild is refused: {error:?}"));
+        let parent = at(
+            &ordered,
+            &|c| matches!(c, Change::AlterColumnDefault { column, to: Some(_), .. } if column.table == t),
+        );
+        let again = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, from: Some(from), to: Some(to), fallback: Some(fallback), .. }
+                if *table == p && from == "7" && to == "7" && fallback == "app.f(0)")
+        });
+        assert!(
+            ordered
+                .proof
+                .edges()
+                .iter()
+                .any(|e| e.before == parent && e.after == again),
+            "the order is an edge, not an accident of position: {:?}",
+            ordered.proof.edges()
+        );
+        names_resolve(&ordered, &before_ids);
+        ordered.proof.validate(&ordered.changes).unwrap();
+
+        let schema = partitioned(Some("app.f(0)"), None);
+        let before_ids = ids(&schema, &IdsFile::default());
+        let ordered = planned(
+            &schema,
+            &before_ids,
+            &schema,
+            &before_ids,
+            &[rebinds("app.t")],
+        )
+        .unwrap_or_else(|error| panic!("a parent's rebuild is refused: {error:?}"));
+        assert!(
+            !ordered
+                .changes
+                .changes
+                .iter()
+                .any(|c| matches!(c.change, Change::SetPartitionDefault { .. })),
+            "{:?}",
+            ordered.changes.changes
+        );
+    }
+
+    /// #1610 review: a table replaced under its name, with new UIDs, whose
+    /// generated column comes back as an ordinary one with a default. Only
+    /// the plan's side has a default; the ordinary plan's `DropTable` and
+    /// `CreateTable` rebuild it, and the plan is not refused.
+    #[test]
+    fn a_replaced_table_is_not_refused_for_its_new_default() {
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let mut base = Schema::default();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        table.columns.insert("c".into(), generated("app.f(a)"));
+        base.tables.insert(t.clone(), table);
+        let mut desired = base.clone();
+        let mut c = Column::new("int".parse().unwrap());
+        c.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
+        desired
+            .tables
+            .get_mut(&t)
+            .unwrap()
+            .columns
+            .insert("c".into(), c);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = IdsFile {
+            version: before_ids.version,
+            ..Default::default()
+        };
+        let old = before_ids.table_uid(&t).unwrap().clone();
+        after_ids
+            .tables
+            .insert("t_zzzzzz".parse().unwrap(), t.clone());
+        after_ids
+            .columns
+            .insert("c_yyyyyy".parse().unwrap(), t.column("a"));
+        after_ids
+            .columns
+            .insert("c_zzzzzz".parse().unwrap(), t.column("c"));
+        let observation = SurfaceResolution {
+            surface: Surface::Default(t.column("c")),
+            ..rebinds("app.t")
+        };
+        let ordered = planned(&base, &before_ids, &desired, &after_ids, &[observation])
+            .unwrap_or_else(|error| panic!("a replaced table is refused: {error:?}"));
+        let dropped = at(
+            &ordered,
+            &|c| matches!(c, Change::DropTable { uid, .. } if *uid == old),
+        );
+        let created = at(
+            &ordered,
+            &|c| matches!(c, Change::CreateTable { name, .. } if *name == t),
+        );
+        assert!(dropped < created, "{:?}", ordered.changes.changes);
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// #1610 review: a partition detached while its own default rebinds. The
+    /// detach keeps the override as the table's default (#1578): it is
+    /// released as the partition's own before the detach, and restored as
+    /// the column's after it, the detach being what makes the column.
+    #[test]
+    fn a_detached_partitions_default_is_released_and_restored() {
+        let base = partitioned(None, Some("app.f(1)"));
+        let mut desired = base.clone();
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let mut d = Column::new("int".parse().unwrap());
+        d.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
+        desired.tables.insert(
+            p.clone(),
+            Table {
+                columns: [("d".to_owned(), d)].into(),
+                ..Default::default()
+            },
+        );
+        let before_ids = ids(&base, &IdsFile::default());
+        let after_ids = ids(&desired, &before_ids);
+        let ordered = planned(
+            &base,
+            &before_ids,
+            &desired,
+            &after_ids,
+            &[rebinds("app.p")],
+        )
+        .unwrap_or_else(|error| panic!("a detach is refused: {error:?}"));
+        let release = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, from: Some(from), to: None, fallback: None, .. }
+                if *table == p && from == "app.f(1)")
+        });
+        let detach = at(&ordered, &|c| matches!(c, Change::DetachPartition { .. }));
+        let restore = at(&ordered, &|c| {
+            matches!(c, Change::AlterColumnDefault { column, from: None, to: Some(to), .. }
+                if column.table == p && to == "app.f(1)")
+        });
+        assert!(
+            release < detach && detach < restore,
+            "{:?}",
+            ordered.changes.changes
+        );
+        names_resolve(&ordered, &after_ids);
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// Negative for #1610: a partition holding only its parent's copy has no
+    /// default of its own to rebuild. The parent's default is rebuilt, and
+    /// the partition gets no pair.
+    #[test]
+    fn a_partition_holding_its_parents_default_gets_no_pair_of_its_own() {
+        let schema = partitioned(Some("app.f(1)"), None);
+        let ordered = sided(&schema, &schema, &[rebinds("app.t")]);
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let release = at(
+            &ordered,
+            &|c| matches!(c, Change::AlterColumnDefault { column, to: None, .. } if column.table == t),
+        );
+        let restore = at(
+            &ordered,
+            &|c| matches!(c, Change::AlterColumnDefault { column, from: None, to: Some(_), .. } if column.table == t),
+        );
+        assert!(release < restore, "{:?}", ordered.changes.changes);
+        assert!(
+            !ordered
+                .changes
+                .changes
+                .iter()
+                .any(|c| matches!(c.change, Change::SetPartitionDefault { .. })),
+            "{:?}",
+            ordered.changes.changes
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// #1610: a rebuilt default surface with no default on either side, own
+    /// or column, is refused by name rather than skipped: an absent default
+    /// is a definition the rebuild cannot spell, not nothing to rebuild.
+    #[test]
+    fn a_rebuilt_default_with_no_default_anywhere_is_refused_by_name() {
+        let schema = partitioned(None, None);
+        let before_ids = ids(&schema, &IdsFile::default());
+        let after_ids = ids(&schema, &before_ids);
+        for table in ["app.t", "app.p"] {
+            let name: pbps_model::TableName = table.parse().unwrap();
+            let surface = Surface::Default(name.column("d"));
+            let result = super::super::prepare::changes(
+                &ChangeSet::default(),
+                &schema,
+                &schema,
+                &after_ids,
+                &before_ids,
+                &[surface.clone()].into(),
+                &Hints::default(),
+                &pbps_dialect::MinimalDialect,
+            );
+            assert!(
+                matches!(&result, Err(super::super::Error::Definition(s)) if *s == surface),
+                "{table}: {:?}",
+                result.map(|(changes, _)| changes)
+            );
+        }
+        // Negative: the same surface with a default is rebuilt, not refused:
+        // its pair, and for the parent the partition's own set again after
+        // it.
+        let schema = partitioned(Some("0"), Some("1"));
+        let before_ids = ids(&schema, &IdsFile::default());
+        let after_ids = ids(&schema, &before_ids);
+        for (table, expected) in [("app.t", 3), ("app.p", 2)] {
+            let name: pbps_model::TableName = table.parse().unwrap();
+            let (changes, _) = super::super::prepare::changes(
+                &ChangeSet::default(),
+                &schema,
+                &schema,
+                &after_ids,
+                &before_ids,
+                &[Surface::Default(name.column("d"))].into(),
+                &Hints::default(),
+                &pbps_dialect::MinimalDialect,
+            )
+            .unwrap_or_else(|error| panic!("{table}: {error:?}"));
+            assert_eq!(
+                changes.changes.len(),
+                expected,
+                "{table}: {:?}",
+                changes.changes
+            );
+        }
+    }
 }
 
 /// A dialect whose candidate test rebuilds every unchanged module whenever

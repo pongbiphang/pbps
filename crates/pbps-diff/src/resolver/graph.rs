@@ -49,6 +49,17 @@ pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
         | Change::AlterColumnExpression { column, .. } => {
             BTreeSet::from([Surface::Default(column.clone())])
         }
+        // A partition's own default, or its parent's again: either is the
+        // partition's `pg_attrdef` (#1610).
+        Change::SetPartitionDefault {
+            table,
+            column,
+            to,
+            fallback,
+            ..
+        } if to.is_some() || fallback.is_some() => {
+            BTreeSet::from([Surface::Default(table.column(column))])
+        }
         Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => {
             BTreeSet::from([Surface::Module(id.clone())])
         }
@@ -74,6 +85,19 @@ fn release(c: &Change, surface: &Surface) -> bool {
             },
             Surface::Default(r),
         ) => column == r,
+        // Its own default taken off, whether the partition is left with
+        // none or with its parent's again: either lets go of what its own
+        // expression bound (#1610 review).
+        (
+            Change::SetPartitionDefault {
+                table,
+                column,
+                from: Some(_),
+                to: None,
+                ..
+            },
+            Surface::Default(r),
+        ) => *table == r.table && *column == r.name,
         (Change::DropColumn { column, .. }, Surface::Default(r)) => column == r,
         // A rewritten generation expression lets go of what the old one
         // bound, as a dropped default does, so it precedes the drop of a
@@ -122,6 +146,11 @@ fn table_of(s: &Surface) -> Option<&TableName> {
 fn expression(c: &Change) -> Option<bool> {
     match c {
         Change::AlterColumnDefault { to, .. } => Some(to.is_some()),
+        // A partition's default is installed or released as a column's is,
+        // so the rebuild's pair takes the same order (#1610).
+        Change::SetPartitionDefault { to, fallback, .. } => {
+            Some(to.is_some() || fallback.is_some())
+        }
         Change::AddCheck { .. } | Change::AddIndex { .. } => Some(true),
         Change::DropCheck { .. } | Change::DropIndex { .. } => Some(false),
         _ => None,
@@ -304,6 +333,82 @@ pub(super) fn constraints(
         }
     }
 
+    // A parent's default change before its partitions' own on that column:
+    // the engine recurses the parent's `SET DEFAULT` or `DROP DEFAULT` into
+    // every partition, over the partition's own default, so the partition's
+    // must come after it to stay (DEC-1687.1, docs/ORDERING.md). The ordinary
+    // plan's (9, 4) rank is no edge here (#1610). Only what sets the
+    // partition's default waits: its release has nothing to keep, and when
+    // one routine both defaults call is rebuilt, the release must precede
+    // the routine's drop, which precedes the parent's restoration (#1610
+    // review).
+    for (i, change) in steps.iter().enumerate() {
+        let Change::AlterColumnDefault { column, .. } = change else {
+            continue;
+        };
+        for (j, other) in steps.iter().enumerate() {
+            if let Change::SetPartitionDefault {
+                parent,
+                column: c,
+                to,
+                fallback,
+                ..
+            } = other
+                && (to.is_some() || fallback.is_some())
+                && *parent == column.table
+                && *c == column.name
+            {
+                edge(i, j, OrderReason::Structural);
+            }
+        }
+    }
+
+    // A partition's own default spelled by a column name its parent's
+    // rename moves. A partition declares no column, so the parent's rename is
+    // the one that moves the name, and the rules below that read a column's
+    // own rename by its UID do not see it (#1610 review). Only a release the
+    // resolver appended is spelled by the base name, so it goes before the
+    // parent's rename away from that name; every other change, the ordinary
+    // plan's included, is spelled by the name the column has once the
+    // renames have run, so it goes after the rename into that name. The
+    // parent is matched by its table UID, which a rename of the parent
+    // itself does not change.
+    for (i, change) in steps.iter().enumerate() {
+        let Change::SetPartitionDefault {
+            parent,
+            column,
+            to,
+            fallback,
+            ..
+        } = change
+        else {
+            continue;
+        };
+        let base_spelled = i >= ordinary && to.is_none() && fallback.is_none();
+        let parent_uid = if base_spelled {
+            base.ids.table_uid(parent)
+        } else {
+            desired
+                .ids
+                .table_uid(parent)
+                .or_else(|| base.ids.table_uid(parent))
+        };
+        if parent_uid.is_none() {
+            continue;
+        }
+        for (j, other) in steps.iter().enumerate() {
+            if let Change::RenameColumn { from, to, .. } = other
+                && owners[j] == parent_uid
+            {
+                if base_spelled && from == column {
+                    edge(i, j, OrderReason::Identity);
+                } else if !base_spelled && to == column {
+                    edge(j, i, OrderReason::Identity);
+                }
+            }
+        }
+    }
+
     // A default change spelled by its own column's final name: where the
     // plan renames that column, by its UID, into the name the change uses.
     let own_rename: Vec<Option<usize>> = steps
@@ -364,7 +469,12 @@ pub(super) fn constraints(
                 if row(other) {
                     // A DEFAULT is consumed by INSERT/UPDATE. CHECKs and
                     // indexes keep the differ's data-before-validation order.
-                    if install && matches!(change, Change::AlterColumnDefault { .. }) {
+                    if install
+                        && matches!(
+                            change,
+                            Change::AlterColumnDefault { .. } | Change::SetPartitionDefault { .. }
+                        )
+                    {
                         edge(i, j, OrderReason::Data);
                     } else if install {
                         edge(j, i, OrderReason::Data);
