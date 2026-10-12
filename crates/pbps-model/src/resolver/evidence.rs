@@ -223,8 +223,7 @@ impl ResolverEvidence {
         }
         // A limitation is named and described; an empty one says nothing
         // about what was accepted.
-        if q
-            .limitations
+        if q.limitations
             .iter()
             .any(|(name, description)| name.is_empty() || description.is_empty())
         {
@@ -758,10 +757,11 @@ mod tests {
         let PlanAnalysis::Resolved(read) = &restored.analysis else {
             panic!("resolved")
         };
-        assert!(read
-            .qualification()
-            .limitations
-            .contains_key("build:server_version"));
+        assert!(
+            read.qualification()
+                .limitations
+                .contains_key("build:server_version")
+        );
         assert_eq!(restored.checksum(), plan.checksum());
 
         let mut removed = serde_json::to_value(&plan).unwrap();

@@ -11,16 +11,16 @@ child follows the repository's full local verification, review and CI gates.
 resolver, on a server or Docker scratch the operator vouches for (#1672,
 #1674), with external objects from a reviewed baseline (#1673). The measured
 profiles (#608, #609) were removed by #1636, and the confidential source
-transfer (#617) is closed. The remaining order:
-1. [#1516](https://github.com/pongbiphang/pbps/issues/1516): the fresh
-   pre-publication recheck and publication from the sealed order;
-2. [#1517](https://github.com/pongbiphang/pbps/issues/1517): offline
+transfer (#617) is closed. #1516 publishes the resolver's plan after the
+fresh pre-publication recheck, from the sealed order (DEC-1516.1). The
+remaining order:
+1. [#1517](https://github.com/pongbiphang/pbps/issues/1517): offline
    `explain` of resolver evidence and the explicit gates;
-3. [#1778](https://github.com/pongbiphang/pbps/issues/1778): the baseline
+2. [#1778](https://github.com/pongbiphang/pbps/issues/1778): the baseline
    draft command, then automatic fill;
-4. [#616](https://github.com/pongbiphang/pbps/issues/616): apply under the
+3. [#616](https://github.com/pongbiphang/pbps/issues/616): apply under the
    deployment lock, with #618's approval-consumer checks;
-5. SQL Server: [#619](https://github.com/pongbiphang/pbps/issues/619),
+4. SQL Server: [#619](https://github.com/pongbiphang/pbps/issues/619),
    then [#620](https://github.com/pongbiphang/pbps/issues/620), then
    [#621](https://github.com/pongbiphang/pbps/issues/621).
 

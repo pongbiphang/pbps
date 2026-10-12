@@ -3223,8 +3223,13 @@ fn cmd_plan(
 /// Writes a plan file. A trailing newline, so it never shows
 /// "\ No newline at end of file" when a reviewer diffs two of them.
 fn write_plan(path: &std::path::Path, plan: &pbps_model::SavedPlan) -> anyhow::Result<()> {
-    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(plan)?))
+    std::fs::write(path, rendered_plan(plan)?)
         .with_context(|| format!("cannot write `{}`", path.display()))
+}
+
+/// A plan file's contents, as [`write_plan`] writes them.
+fn rendered_plan(plan: &pbps_model::SavedPlan) -> anyhow::Result<String> {
+    Ok(format!("{}\n", serde_json::to_string_pretty(plan)?))
 }
 
 /// Renders the change set as one SQL script.

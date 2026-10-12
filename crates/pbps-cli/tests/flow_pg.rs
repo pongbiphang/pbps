@@ -215,6 +215,28 @@ fn a_required_resolver_refuses_by_class_and_keeps_existing_files() {
     resolver_selection::required(&server(), "postgres");
 }
 
+#[path = "support/resolver_publication.rs"]
+mod resolver_publication;
+
+fn old_server() -> String {
+    std::env::var("PBPS_TEST_PG_OLD_DB")
+        .expect("PBPS_TEST_PG_OLD_DB is not set; see scripts/live-tests-pg.sh")
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn resolver_publishes_its_rechecked_plan_in_the_exact_order() {
+    resolver_publication::published(&server());
+    resolver_publication::published(&old_server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn resolver_plans_pass_the_ordinary_connected_checks() {
+    resolver_publication::ordinary_checks(&old_server(), true);
+    resolver_publication::ordinary_checks(&server(), false);
+}
+
 #[path = "support/resolver_discovery.rs"]
 mod resolver_discovery;
 

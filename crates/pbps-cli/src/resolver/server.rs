@@ -10,7 +10,7 @@ use pbps_db::resolver::ScratchNames;
 
 pub(crate) mod engine;
 mod producer;
-pub use producer::ProduceError;
+pub use producer::{ProduceError, Rechecked, Unsealed};
 mod resolution;
 pub mod scratch;
 mod transitions;
@@ -41,6 +41,11 @@ pub enum Error {
     /// the target's (#1673). Each finding names the object or statement.
     #[error("the resolver's baseline was refused: {}", .0.join("; "))]
     Baseline(Vec<String>),
+    /// The publication recheck found the target other than the run read
+    /// it: another cluster, or a changed fact, authorization or captured
+    /// object, each named (#1516). Nothing is published.
+    #[error("the target changed after the resolver read it: {}", .0.join("; "))]
+    Changed(Vec<String>),
 }
 
 /// What a run is asked to qualify: the schemas its plan writes to, the extras

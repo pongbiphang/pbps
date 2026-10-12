@@ -792,6 +792,10 @@ carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
   - `resolver_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates`
   - `resolver_recheck_binds_the_target_by_engine_identity`
   - `resolver_recheck_refuses_an_external_shape_changed_after_planning`
+  - `resolver_recheck_refuses_a_target_changed_after_the_run` (a
+    prerequisite, an in-place mutation, a compared setting, an extension and
+    the deployer's authorization, each written from a second connection)
+  - `resolver_seals_an_accepted_build_limitation_and_rechecks_it`
 
 ## Architectural placement
 

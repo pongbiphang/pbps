@@ -736,7 +736,7 @@
       ]
     },
     "ResolverAssessment": {
-      "description": "Case 2's report: a selected resolver this plan did not need.",
+      "description": "What the selected resolver was to this plan: not needed (case 2), or\nneeded and answering, its plan published (case 3, #1516).",
       "type": "object",
       "properties": {
         "need": {
@@ -767,6 +767,11 @@
           "description": "The lightweight assessment answered every binding question.",
           "type": "string",
           "const": "not_needed"
+        },
+        {
+          "description": "The resolver answered the questions the assessment could not, and\nthe plan carries its sealed evidence (#1516).",
+          "type": "string",
+          "const": "resolved"
         }
       ]
     },
@@ -2068,6 +2073,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 41,
+  "x-pbps-schema-version": 42,
   "x-pbps-tool-version": "0.0.0"
 }

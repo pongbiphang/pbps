@@ -7,8 +7,9 @@
 //!    and nothing resolver-only is opened — no key, no Docker socket, no
 //!    scratch connection.
 //! 3. A resolver selected, and some question needs it: the resolver answers,
-//!    or deployable output is refused. Its answer is not yet published: that
-//!    waits for the fresh pre-publication recheck (#1516).
+//!    or deployable output is refused. Its answer is published after the
+//!    ordinary connected checks and a fresh recheck of the target
+//!    (DEC-1516.1).
 
 use pbps_config::resolver::ResolverSelection;
 use pbps_diff::resolver::{Answer, Assessment};
@@ -48,7 +49,8 @@ pub fn case<'a>(
     }
 }
 
-/// Case 2's report: a selected resolver this plan did not need.
+/// What the selected resolver was to this plan: not needed (case 2), or
+/// needed and answering, its plan published (case 3, #1516).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct ResolverAssessment {
     pub need: ResolutionNeed,
@@ -63,6 +65,9 @@ pub struct ResolverAssessment {
 pub enum ResolutionNeed {
     /// The lightweight assessment answered every binding question.
     NotNeeded,
+    /// The resolver answered the questions the assessment could not, and
+    /// the plan carries its sealed evidence (#1516).
+    Resolved,
 }
 
 impl ResolverAssessment {
@@ -71,6 +76,13 @@ impl ResolverAssessment {
             need: ResolutionNeed::NotNeeded,
             unaffected: assessment.count(Answer::Unaffected),
             rebuilt: assessment.count(Answer::Rebuild),
+        }
+    }
+
+    pub fn resolved(assessment: &Assessment) -> Self {
+        Self {
+            need: ResolutionNeed::Resolved,
+            ..Self::not_needed(assessment)
         }
     }
 }
@@ -184,9 +196,11 @@ fn unresolved(request: &Request<'_>, why: impl std::fmt::Display) -> Refused {
 /// the refusal classes. Only [`producer::produce`] is profile-specific
 /// (#1528), so a profile that binds its target differently plugs in there.
 ///
-/// The evidence is not returned: nothing publishes it before the recheck
-/// that #1516 adds, and a value no caller may use is one a caller will.
-pub async fn resolve(request: &Request<'_>) -> Result<pbps_model::ChangeSet, Refused> {
+/// The answer comes back unsealed: the caller runs its ordinary passes on
+/// it, rechecks the target, then seals it (#1516).
+pub async fn resolve(
+    request: &Request<'_>,
+) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
     let driver = request.target.driver();
     if driver != pbps_db::Driver::Postgres {
         return Err(unresolved(
@@ -264,7 +278,7 @@ mod producer {
         request: &Request<'_>,
         driver: pbps_db::Driver,
         bootstrap: &[pbps_model::Change],
-    ) -> Result<pbps_model::ChangeSet, Refused> {
+    ) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
         let binding = pbps_cli::resolver::server::BindingRequest {
             bootstrap,
             desired: request.desired.schema,
@@ -314,7 +328,7 @@ mod producer {
         let run = async |scratch: &str,
                          standard: &pbps_pg::resolver::standard::Standard,
                          provenance: Provenance| {
-            scratch::produce(
+            scratch::produce_unsealed(
                 driver,
                 scratch,
                 request.target.connection(),
@@ -370,9 +384,7 @@ mod producer {
                 .await
             }
         };
-        produced
-            .map(|resolved| resolved.changes)
-            .map_err(|failure| refused(request, failure))
+        produced.map_err(|failure| refused(request, failure))
     }
 
     fn refused(request: &Request<'_>, failure: ProduceError) -> Refused {
@@ -419,6 +431,10 @@ mod producer {
             // A declared surface had no sound verdict, or the environment was
             // read and differs.
             Error::Binding(_) | Error::Incompatible(_) => true,
+            // The recheck read the target in full and found it other than
+            // the run read it (#1516). Never a run's failure: the recheck
+            // runs after the run, and `deploy` names it `resolver.recheck`.
+            Error::Changed(_) => true,
             // Not answered: the run could not establish what it needed. A
             // catalog read that failed is one of these, however far into the
             // binding it came (#1575).

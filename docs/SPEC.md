@@ -1746,10 +1746,10 @@ DEC-1674.1).**
   for this new option. `--resolve-with` requires a target-aware plan and cannot
   turn `--check` or a snapshot preview into a connected operation.
 
-Selection (#606) and lazy acquisition (#1515) are implemented. A plan that
-needs the selected resolver runs it; publishing the resolver-backed plan waits
-for the fresh pre-publication recheck (#1516). Existing connected planning
-checks still apply:
+Selection (#606), lazy acquisition (#1515) and publication (#1516) are
+implemented. A plan that needs the selected resolver runs it, and publishes
+its plan after a fresh recheck of the target. Existing connected planning
+checks apply to that plan as to any other:
 
 ```bash
 pbps plan --env prod --resolve-with pg_local \
@@ -1765,9 +1765,33 @@ the resolver owns — no fingerprint key, Docker socket or scratch connection �
 and its connected summary reports `resolver_selection` with status
 `not_acquired` and `resolver_assessment` with `need: not_needed`, outside the
 saved plan and its checksum. A plan that requires the resolver reads the key
-first, then runs it. Until #1516, its answer is reported and refused as
-`resolver.publication-unavailable`, writing neither file. Selection does not
-replace or waive any existing planning check.
+first, then runs it, and publishes its answer (DEC-1516.1):
+1. **The run ends.** Its scratch is released before anything else.
+2. **The ordinary checks run on the resolver's plan**, every connected pass
+   an ordinary plan goes through. A pass that adds or moves changes, such as
+   rebuilding a dependent view or ordering role drops, runs here, before
+   sealing. A pass may not remove a change the resolver ordered or undo
+   one of its order edges; that would be a defect in pbps, and the plan is
+   refused rather than sealed. A refusal writes nothing.
+3. **The target is rechecked** on a new session. It must report the cluster
+   identity the planning read recorded (DEC-1685.1). Its reported facts and
+   its deployer's authorization are read again and must equal the run's
+   opening read. The run's capture, including the objects the baseline
+   staged, is taken again and must equal it. A difference refuses as
+   `resolver.recheck`, naming what changed; an unreadable read is
+   `unanswerable`.
+4. **The plan is sealed** in the order step 2 left. The evidence carries
+   the target's `system_identifier`, keyed under the project key, never in
+   clear, and every limitation the compatibility rule accepted, by name.
+5. **The files are written** through the one emitter. Each is written
+   beside its path first, and both are renamed into place once both are
+   written, the SQL before the plan. A failed write leaves the existing
+   files as they were.
+
+The connected summary reports `resolver_assessment` with `need: resolved`.
+`--staged` is refused for such a plan before the resolver runs: its evidence
+describes one transaction. Selection does not replace or waive any existing
+planning check.
 
 `pbps.yml` declares Docker or server resolvers, both the one resolver. `kind`
 is required: nothing selects one for the user.
@@ -2560,9 +2584,9 @@ reason in both offline and connected JSON, remaining `unanswerable` with exit `1
 
 For a selected resolver (§9.3.2), a required question it leaves unresolved,
 an observed incompatibility or a known unsupported resolution case
-(`resolver.unresolved`), a missing fingerprint key (`resolver.key`) and, until
-#1516, an answer that cannot yet be published
-(`resolver.publication-unavailable`) are finding refusals (exit `2`).
+(`resolver.unresolved`), a missing fingerprint key (`resolver.key`) and a
+target the publication recheck found changed after the run
+(`resolver.recheck`) are finding refusals (exit `2`).
 Connection, metadata-read, image-acquisition and startup failures, and an
 analysis scope that cannot be established, are `unanswerable` (exit `1`). A
 required question with no resolver selected is not refused: the existing
