@@ -784,7 +784,10 @@ fn owned_sequence_statements(
 /// So a sequence for a table that already exists is given to the table's
 /// owner first, as the engine's own `serial` expansion does; for a table the
 /// running role owns, that is no change. The owner is the catalog's at apply
-/// time, which no plan holds (#1631).
+/// time, which no plan holds (#1631). It runs on the table's write path, so
+/// its one comparison names the catalog's operator over two `oid`s: a bare
+/// `=` resolves along that path, where an `=(oid, regclass)` a schema user
+/// added would match more exactly than the catalog's (DEC-1564.1).
 fn sequence_to_table_owner(
     table: &TableName,
     sequence: &TableName,
@@ -793,7 +796,7 @@ fn sequence_to_table_owner(
         "BEGIN\n\
          \x20 EXECUTE pg_catalog.format('ALTER SEQUENCE %s OWNER TO %I', {}, \
          (SELECT pg_catalog.pg_get_userbyid(c.relowner) FROM pg_catalog.pg_class c \
-         WHERE c.oid = {}::pg_catalog.regclass));\n\
+         WHERE c.oid OPERATOR(pg_catalog.=) {}::pg_catalog.regclass::pg_catalog.oid));\n\
          END",
         literal(&qualified(sequence)?),
         literal(&qualified(table)?),

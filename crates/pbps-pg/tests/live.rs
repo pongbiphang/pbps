@@ -3102,7 +3102,10 @@ async fn a_stored_generated_column_round_trips_and_changes_its_expression() {
 /// refuses a sequence whose owner is not the table's. Measured on 16 and 18,
 /// "sequence must have same owner as table it is linked to". The plan gives
 /// the sequence to the table's owner first, as the engine's own `serial`
-/// does, and the rows are numbered (#1631).
+/// does, and the rows are numbered (#1631). The owner is found on the
+/// table's write path, where an `=(oid, regclass)` a schema user added would
+/// match a bare `=` more exactly than the catalog's: it is never called
+/// (DEC-1564.1).
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_serial_added_to_another_roles_table_is_that_roles() {
@@ -3117,10 +3120,14 @@ async fn a_serial_added_to_another_roles_table_is_that_roles() {
          CREATE ROLE {owner};
          CREATE TABLE {s}.t (id integer PRIMARY KEY);
          INSERT INTO {s}.t VALUES (1), (2);
-         ALTER TABLE {s}.t OWNER TO {owner};"
+         ALTER TABLE {s}.t OWNER TO {owner};
+         CREATE TABLE {s}.called (op text);
+         CREATE FUNCTION {s}.eq(oid, regclass) RETURNS boolean LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO {s}.called VALUES ('='); RETURN $1 = $2::oid; END $$;
+         CREATE OPERATOR {s}.= (leftarg = oid, rightarg = regclass, function = {s}.eq);"
     ))
     .await
-    .expect("a table another role owns");
+    .expect("a table another role owns, and an operator a schema user added");
     let read = ours_only(&pull(&mut db).await, &s);
     let ids = mint_ids(&read, &IdsFile::default(), &[]);
     let mut changed = read.clone();
@@ -3152,6 +3159,7 @@ async fn a_serial_added_to_another_roles_table_is_that_roles() {
         &format!("SELECT string_agg(n::text, ',' ORDER BY n) FROM {s}.t"),
     )
     .await;
+    let called = number(&mut db, &format!("SELECT count(*)::int4 FROM {s}.called")).await;
     let after = ours_only(&pull(&mut db).await, &s);
     drop_schema(&mut db, &s).await;
     db.drop().await;
@@ -3160,6 +3168,7 @@ async fn a_serial_added_to_another_roles_table_is_that_roles() {
         .execute(&format!("DROP ROLE {owner}"))
         .await
         .expect("drop the role");
+    assert_eq!(called, 0, "the schema user's operator ran");
     assert_eq!(sequence_owner, owner);
     assert_eq!(numbered, "1,2");
     assert!(plan(&after, &changed_ids, &changed, &changed_ids).is_empty());

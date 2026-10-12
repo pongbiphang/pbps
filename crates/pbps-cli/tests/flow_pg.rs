@@ -2150,6 +2150,38 @@ fn a_connected_plan_knows_a_serials_generated_sequence_name() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+/// `verify` compares two reads, and each knows the sequence name it leaves
+/// out: a `serial`'s sequence renamed by hand since the baseline is drift
+/// that names its column, not one the model cannot see. The negative case:
+/// with nothing renamed there is no drift (#1631).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn verify_names_a_serials_renamed_sequence() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "serial-verify");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.t (id serial PRIMARY KEY)",
+    );
+    let d = Demo::new("serial-verify");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    succeeds(d.run(&["verify", "--db", connection]));
+    on_server(
+        connection,
+        "ALTER SEQUENCE app.t_id_seq RENAME TO renamed_seq",
+    );
+    let drifted = d.run(&["verify", "--db", connection, "--format", "json"]);
+    assert_ne!(code(&drifted), 0, "{}", stdout(&drifted));
+    let report = stdout(&drifted);
+    assert!(
+        report.contains("state.drift-unexpressible") && report.contains("column app.t.id"),
+        "{report}"
+    );
+}
+
 /// A staged apply checkpoints after every statement, and reads what it has
 /// done so far. A `serial` table, and a `serial` added to a table holding
 /// rows, are each one statement with their sequence and its ownership, so

@@ -5953,13 +5953,21 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         // one table's altered `IDENTITY` silently deleted every expressible
         // difference the same comparison had found — an undercount in the
         // report, in the finding count, and in the hook's payload.
+        // Both sides are reads, which know the sequence names they leave
+        // out; compared unnamed, a renamed sequence would take the other
+        // side's name and read as no change (#1631). The checksums below are
+        // the reads' own.
+        let mut recorded_read = baseline.snapshot.schema.clone();
+        pbps_dialect::name_read_sequences(&mut recorded_read, dialect.as_ref());
+        let mut live_read = scoped.schema.clone();
+        pbps_dialect::name_read_sequences(&mut live_read, dialect.as_ref());
         let diffed = pbps_diff::diff_partial(
             pbps_diff::Side {
-                schema: &baseline.snapshot.schema,
+                schema: &recorded_read,
                 ids: &recorded_ids,
             },
             pbps_diff::Side {
-                schema: &scoped.schema,
+                schema: &live_read,
                 ids: &observed,
             },
             dialect.as_ref(),
