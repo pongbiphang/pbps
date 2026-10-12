@@ -2435,7 +2435,9 @@ pub trait Dialect {
     /// whose generated names meet do not fail: the engine suffixes the later
     /// one, and which one is later is the plan's order. A declared name equal
     /// to a fallback is the same order dependence as one equal to the first
-    /// choice. The default is none, like the first choices.
+    /// choice. The default is none, like the first choices. A first choice
+    /// the engine never retries, one created by name, is listed after every
+    /// one that has a fallback, so it has none at its position.
     fn implicit_relation_fallbacks(
         &self,
         _name: &TableName,

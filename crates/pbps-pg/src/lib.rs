@@ -1350,6 +1350,10 @@ impl Dialect for Postgres {
         sources: pbps_model::diagnostic::ColumnSources<'_>,
     ) -> Vec<pbps_dialect::ImplicitRelation> {
         let mut out = Vec::new();
+        // A `serial`'s sequence is created by name, so the engine never
+        // retries it: after every name that has a fallback, which
+        // `implicit_relation_fallbacks` lists at the same positions (#1631).
+        let mut by_name = Vec::new();
         if table
             .primary_key
             .as_ref()
@@ -1391,7 +1395,7 @@ impl Dialect for Postgres {
                 });
             }
             if let pbps_model::ValueSource::Sequence(sequence) = &spec.value_source {
-                out.push(pbps_dialect::ImplicitRelation {
+                by_name.push(pbps_dialect::ImplicitRelation {
                     name: emit::owned_sequence(name, column, sequence).name,
                     descriptor: format!("the sequence of `serial` column `{name}.{column}`"),
                     remedy: "Rename the other object, or name the sequence with `sequence: \
@@ -1400,6 +1404,7 @@ impl Dialect for Postgres {
                 });
             }
         }
+        out.extend(by_name);
         out
     }
 
@@ -1442,7 +1447,8 @@ impl Dialect for Postgres {
         for (column, spec) in &table.columns {
             if sources.get(column, spec).iter().any(|source| match source {
                 pbps_model::ValueSource::Identity(_) => true,
-                // Created by name, so the engine never retries one (#1631).
+                // Created by name, so the engine never retries one, and listed
+                // after every name here (#1631).
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Default(_)
                 | pbps_model::ValueSource::Sequence(_)
@@ -2592,6 +2598,53 @@ mod tests {
         );
     }
 
+    /// A `serial`'s sequence is created by name and never retried, so it
+    /// takes no other claimant's fallback: a serial before an identity in its
+    /// table does not reach the identity's `_seq1`, and a table under that
+    /// name is no collision. The identity still reaches it (#1631).
+    #[test]
+    fn a_serial_takes_no_fallback_of_an_identity_beside_it() {
+        use pbps_model::{Column, Identity, Schema, Table};
+        let identity = || {
+            let mut c = Column::new("integer".parse().unwrap()).not_null();
+            c.value_source = pbps_model::ValueSource::Identity(Identity {
+                seed: 1,
+                increment: 1,
+            });
+            c
+        };
+        let mut serial = Column::new("integer".parse().unwrap()).not_null();
+        serial.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+            start: 1,
+            increment: 1,
+            name: Some("u_id_seq".into()),
+        });
+        let mut t = Table::default();
+        t.columns.insert("a".into(), serial);
+        t.columns.insert("id".into(), identity());
+        let mut u = Table::default();
+        u.columns.insert("id".into(), identity());
+        let mut other = Table::default();
+        other
+            .columns
+            .insert("x".into(), Column::new("integer".parse().unwrap()));
+        let mut schema = Schema::default();
+        schema.tables.insert(TableName::new("app", "t"), t.clone());
+        schema.tables.insert(TableName::new("app", "u"), u);
+        schema
+            .tables
+            .insert(TableName::new("app", "t_id_seq1"), other);
+        let pg = super::Postgres::new();
+        let found = pbps_dialect::check_index_names(&schema, &pg);
+        assert!(found.is_empty(), "{found:?}");
+        // The positions agree: the identity's fallback is at its own.
+        let names = pg.implicit_relation_names(&TableName::new("app", "t"), &t);
+        let fallbacks = pg.implicit_relation_fallbacks(&TableName::new("app", "t"), &t, 1);
+        assert_eq!(names[0].name, "t_id_seq");
+        assert_eq!(fallbacks, ["t_id_seq1"]);
+        assert_eq!(names[1].name, "u_id_seq");
+    }
+
     /// #1112: PostgreSQL names a primary key's index with
     /// `ChooseRelationName(..., isconstraint = true)`, which also takes a
     /// constraint's name in the schema as used. A check named `t_pkey` on
@@ -2824,6 +2877,79 @@ mod tests {
     #[test]
     fn an_empty_postgres_script_does_not_change_session_settings() {
         assert!(pbps_dialect::render_script(&[], &super::Postgres::new()).is_empty());
+    }
+
+    /// A table's rename keeps its `serial`'s sequence under the name the old
+    /// table generated, so the renamed table may declare that name: the
+    /// base's generated name is resolved at its own table before the two are
+    /// compared. Another name is still a change (#1631).
+    #[test]
+    fn a_renamed_tables_serial_may_name_the_sequence_it_kept() {
+        use pbps_model::{Column, Hints, IdsFile, Intent, Schema, Table, TableName};
+
+        let serial = |name: Option<&str>| {
+            let mut c = Column::new("integer".parse().unwrap()).not_null();
+            c.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                start: 1,
+                increment: 1,
+                name: name.map(str::to_owned),
+            });
+            c
+        };
+        let schema = |table: &str, column: Column| {
+            let mut t = Table::default();
+            t.columns.insert("id".into(), column);
+            let mut s = Schema::default();
+            s.tables.insert(table.parse::<TableName>().unwrap(), t);
+            s
+        };
+        let context = pbps_diff::Context {
+            operator: "test".into(),
+            today: "2026-10-12".into(),
+        };
+        let base = schema("app.t", serial(None));
+        let base_ids = pbps_diff::resolve(&base, &IdsFile::default(), &[], &context)
+            .unwrap()
+            .ids;
+        let rename = [Intent::RenameTable {
+            from: "app.t".parse().unwrap(),
+            to: "app.u".parse().unwrap(),
+        }];
+        let diff = |declared: &Schema| {
+            let ids = pbps_diff::resolve(declared, &base_ids, &rename, &context)
+                .unwrap()
+                .ids;
+            pbps_diff::diff(
+                pbps_diff::Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                pbps_diff::Side {
+                    schema: declared,
+                    ids: &ids,
+                },
+                &super::Postgres::new(),
+                &Hints::default(),
+            )
+        };
+        let kept = diff(&schema("app.u", serial(Some("t_id_seq")))).expect("the kept name");
+        assert!(
+            matches!(
+                kept.changes.as_slice(),
+                [p] if matches!(p.change, pbps_model::Change::RenameTable { .. })
+            ),
+            "{kept:#?}"
+        );
+        diff(&schema("app.u", serial(None))).expect("no name declared");
+        // The negative case: a name the sequence does not have.
+        let errs = diff(&schema("app.u", serial(Some("other_seq")))).expect_err("another name");
+        assert!(
+            matches!(
+                errs.as_slice(),
+                [pbps_diff::DiffError::SequenceChangeUnsupported { .. }]
+            ),
+            "{errs:?}"
+        );
     }
 
     #[test]

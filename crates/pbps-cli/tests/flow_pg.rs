@@ -2105,6 +2105,74 @@ fn a_new_column_calling_a_function_that_reads_it_is_refused_by_name() {
     }
 }
 
+/// A staged apply checkpoints after every statement, and reads what it has
+/// done so far. A `serial` table, and a `serial` added to a table holding
+/// rows, are each one statement with their sequence and its ownership, so
+/// no checkpoint reads a default on a sequence nobody owns (#1631).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_staged_apply_creates_serials_whole() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "serial-staged");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.base (id integer PRIMARY KEY); \
+         INSERT INTO app.base VALUES (1), (2)",
+    );
+    let d = Demo::new("serial-staged");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    // `--staged` takes one logical change at a time.
+    let stage = || {
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--staged",
+            "--out",
+            plan.to_str().unwrap(),
+        ]));
+        succeeds(approved_apply(&d, connection, &plan, &["--staged"]));
+        succeeds(d.run(&["verify", "--db", connection]));
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    };
+    let base = d.dir.join("schema/app.base.yml");
+    let text = std::fs::read_to_string(&base).unwrap();
+    std::fs::write(
+        &base,
+        text.replacen(
+            "columns:\n",
+            "columns:\n  num:\n    type: serial\n    sequence: {start: 10}\n",
+            1,
+        ),
+    )
+    .unwrap();
+    stage();
+    assert_eq!(
+        scalar(connection, "SELECT sum(num)::bigint FROM app.base"),
+        21
+    );
+    std::fs::write(
+        d.dir.join("schema/app.made.yml"),
+        "table: app.made\ncolumns:\n  id: {type: bigserial}\n  note: {type: text}\n\
+         primary_key: {name: made_pkey, columns: [id]}\n",
+    )
+    .unwrap();
+    stage();
+    on_server(connection, "INSERT INTO app.made (note) VALUES ('x')");
+    assert_eq!(
+        scalar(connection, "SELECT max(id)::bigint FROM app.made"),
+        1
+    );
+}
+
 /// A `data:` block beside a `serial` leaves the column to its sequence, as
 /// beside an identity (DECISIONS 94): its rows are inserted and numbered,
 /// the apply holds them as declared, and the next plan is empty. A row

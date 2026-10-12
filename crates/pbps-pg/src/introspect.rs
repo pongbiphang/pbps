@@ -838,7 +838,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 // A default of its own may use a sequence, as a column's may;
                 // one equal to the parent's is the parent's, named there.
                 if own.default.is_some() {
-                    sequence_limitations(column, &parts, false, &mut pulled);
+                    sequence_limitations(column, &parts, None, &mut pulled);
                 }
                 if own != pbps_model::PartitionColumn::default() {
                     own_columns.insert(column.name.clone(), own);
@@ -2238,15 +2238,21 @@ fn note_target(pulled: &mut Pulled, target: LimitationTarget, detail: String) {
 
 /// The sequences a column's default uses, each named as a limitation: the
 /// model holds the default and has nowhere to put a sequence. A table's
-/// column, and a partition's own default (#1578).
-fn sequence_limitations(raw: &RawColumn, parts: &Parts, held: bool, pulled: &mut Pulled) {
+/// column, and a partition's own default (#1578). `held` is the sequence the
+/// column is held as a `serial` of, which is not one: only it, since a column
+/// may own others its default does not use, which nothing recreates (#1631).
+fn sequence_limitations(raw: &RawColumn, parts: &Parts, held: Option<&str>, pulled: &mut Pulled) {
     // A `serial` is not a type (DECISIONS 227): the column is an `integer`
     // whose default is `nextval(...)`, and the sequence that default needs is a
     // separate object with nowhere to live in this model. The column is carried
     // — it is exactly what the model says — and the sequence is named, because
     // a declaration pulled from here cannot recreate this table in an empty
     // database.
-    if let Some(sequence) = raw.owned_sequence.as_ref().filter(|_| !held) {
+    if let Some(sequence) = raw
+        .owned_sequence
+        .as_ref()
+        .filter(|sequence| held != Some(sequence.as_str()))
+    {
         note(
             pulled,
             &parts.name,
@@ -2374,7 +2380,15 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
     };
 
     let sequence = held_serial(raw, parts, &ty);
-    sequence_limitations(raw, parts, sequence.is_some(), pulled);
+    sequence_limitations(
+        raw,
+        parts,
+        sequence
+            .is_some()
+            .then(|| raw.serial.as_ref().map(|serial| serial.name.as_str()))
+            .flatten(),
+        pulled,
+    );
 
     // A collation decides comparison, ordering and therefore which values a
     // unique key calls equal. Read back as an ordinary column, one collated
@@ -6117,6 +6131,35 @@ mod tests {
             pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial())
         );
         assert!(held.limitations.is_empty(), "{:?}", held.warnings);
+
+        // A second sequence the column owns and its default does not use
+        // arrives as a second row: it is still named, and the held one not.
+        let twice = |serial: RawSerial| {
+            let mut column = col(1, 1, "id", "integer");
+            column.nullable = false;
+            column.default = Some("nextval('app.t_id_seq'::regclass)".to_owned());
+            column.owned_sequence = Some(serial.name.clone());
+            column.serial = Some(serial);
+            let mut other = column.clone();
+            other.owned_sequence = Some("extra_seq".to_owned());
+            assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![column, other],
+                ..RawCatalog::default()
+            })
+        };
+        let extra = twice(plain());
+        assert_eq!(extra.limitations.len(), 1, "{:?}", extra.warnings);
+        assert!(
+            extra.warnings[0].contains("extra_seq"),
+            "{:?}",
+            extra.warnings
+        );
+        assert!(
+            !extra.warnings[0].contains("`t_id_seq`"),
+            "{:?}",
+            extra.warnings
+        );
 
         let renamed = pull(
             RawSerial {

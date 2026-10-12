@@ -514,6 +514,7 @@
         "a_second_statement_failure_rolls_back_the_first_and_records_only_a_failed_attempt",
         "a_sequence_a_schema_transfer_carries_refuses_a_table_at_its_name",
         "a_sequence_or_index_at_a_new_tables_name_refuses_the_plan",
+        "a_staged_apply_creates_serials_whole",
         "a_staged_cli_checkpoint_survives_state_json_and_resume_checks_its_intermediate_name",
         "a_staged_create_never_closes_over_a_replaced_pending_part",
         "a_staged_or_bootstrapped_definer_routine_without_a_pinned_path_is_refused_before_it_commits",

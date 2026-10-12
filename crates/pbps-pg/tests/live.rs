@@ -3103,7 +3103,8 @@ async fn a_stored_generated_column_round_trips_and_changes_its_expression() {
 /// that read in another database, and read back the same. A `serial` added
 /// to a table holding rows numbers them from its declared start, and the
 /// next plan is empty (#1631, DEC-1631.1). A sequence another column also
-/// calls, and one no column owns, are still named rather than held.
+/// calls, and one no column owns, are still named rather than held, and so
+/// is a second sequence a held `serial` owns and its default does not use.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_serial_round_trips_and_numbers_the_rows_it_is_added_to() {
@@ -3125,7 +3126,9 @@ async fn a_serial_round_trips_and_numbers_the_rows_it_is_added_to() {
              CREATE TABLE {s}.shared (id serial);
              CREATE TABLE {s}.sharer (id integer NOT NULL DEFAULT nextval('{s}.shared_id_seq'));
              CREATE SEQUENCE {s}.loose;
-             CREATE TABLE {s}.loose_t (id integer NOT NULL DEFAULT nextval('{s}.loose'));"
+             CREATE TABLE {s}.loose_t (id integer NOT NULL DEFAULT nextval('{s}.loose'));
+             CREATE TABLE {s}.extra (id serial);
+             CREATE SEQUENCE {s}.extra_more OWNED BY {s}.extra.id;"
         ))
         .await
         .expect("the source tables");
@@ -3144,10 +3147,24 @@ async fn a_serial_round_trips_and_numbers_the_rows_it_is_added_to() {
     // sequence nobody owns stay defaults, each named.
     assert_eq!(
         named,
-        ["loose_t", "shared", "sharer"],
+        ["extra", "loose_t", "shared", "sharer"],
         "{:?}",
         read.warnings
     );
+    let extra: Vec<&String> = ours_limitations(&read, &s)
+        .iter()
+        .filter(|l| l.target.object_name().name == "extra")
+        .map(|l| &l.detail)
+        .collect();
+    assert!(
+        matches!(extra.as_slice(), [d] if d.contains("extra_more")),
+        "{extra:?}"
+    );
+    assert_eq!(
+        read.schema.tables[&TableName::new(&s, "extra")].columns["id"].value_source,
+        pbps_model::ValueSource::Sequence(OwnedSequence::serial())
+    );
+    pulled.tables.remove(&TableName::new(&s, "extra"));
     for off in ["shared", "sharer", "loose_t"] {
         let column = &pulled.tables[&TableName::new(&s, off)].columns["id"];
         assert!(

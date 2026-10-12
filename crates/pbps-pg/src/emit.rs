@@ -2520,30 +2520,23 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             column,
             ..
         } => {
-            // A `serial`'s sequence before the column and its ownership after
-            // (#1631). Logged: the differ refuses a `serial` added to an
-            // `UNLOGGED` table, whose persistence this change does not carry.
-            let sequence = owned_sequence_statements(table, name, column, false)?;
-            let mut out = Vec::new();
-            if let Some((create, _)) = &sequence {
-                out.push(on(pg, table, create)?);
-            }
-            out.push(
-                on(
-                    pg,
-                    table,
-                    &format!(
-                        "ALTER TABLE {} ADD COLUMN {};",
-                        qualified(table)?,
-                        column_definition(table, name, column)?
-                    ),
-                )?
-                .creating(Created::Column(table.clone(), name.clone())),
+            // A `serial`'s sequence before the column and its ownership after,
+            // in the column's own statement, so no staged checkpoint falls
+            // between them (#1631). Logged: the differ refuses a `serial`
+            // added to an `UNLOGGED` table, whose persistence this change does
+            // not carry.
+            let add = format!(
+                "ALTER TABLE {} ADD COLUMN {};",
+                qualified(table)?,
+                column_definition(table, name, column)?
             );
-            if let Some((_, owned)) = &sequence {
-                out.push(on(pg, table, owned)?);
-            }
-            Ok(out)
+            let body = match owned_sequence_statements(table, name, column, false)? {
+                Some((create, owned)) => format!("{create}\n{add}\n{owned}"),
+                None => add,
+            };
+            Ok(vec![
+                on(pg, table, &body)?.creating(Created::Column(table.clone(), name.clone())),
+            ])
         }
 
         Change::DropColumn { column, .. } => one(
@@ -3829,41 +3822,45 @@ fn create_table(
     // to create a divergent table with. What is measured is each half — the
     // setting exists and is validated against the installed methods, and
     // `USING heap` fixes `relam` — and the reader's rule is code, not a guess.
-    let mut out = vec![on(
-        pg,
-        name,
-        &format!(
-            "CREATE {}TABLE {q} (\n    {}\n){}{};",
-            // Unlogged from its creation, so it is never written to the log
-            // and switched after (#1443).
-            if table.unlogged { "UNLOGGED " } else { "" },
-            body.join(",\n    "),
-            // A partitioned parent has no storage of its own, and 16 refuses
-            // an access method on one; its partitions each say `USING heap`
-            // (#1170).
-            match &table.partition_by {
-                Some(by) => format!(
-                    " PARTITION BY RANGE ({})",
-                    by.columns
-                        .iter()
-                        .map(|c| quote(c))
-                        .collect::<Result<Vec<_>, _>>()?
-                        .join(", ")
-                ),
-                None => " USING heap".to_owned(),
-            },
-            // In the `CREATE`, so the table never exists without them (#1441).
-            if table.storage_parameters.is_empty() {
-                String::new()
-            } else {
-                format!(" WITH ({})", storage_list(&table.storage_parameters)?)
-            }
-        ),
-    )?];
-    for (i, (create, owned)) in sequences.iter().enumerate() {
-        out.insert(i, on(pg, name, create)?);
-        out.push(on(pg, name, owned)?);
-    }
+    let create = format!(
+        "CREATE {}TABLE {q} (\n    {}\n){}{};",
+        // Unlogged from its creation, so it is never written to the log
+        // and switched after (#1443).
+        if table.unlogged { "UNLOGGED " } else { "" },
+        body.join(",\n    "),
+        // A partitioned parent has no storage of its own, and 16 refuses
+        // an access method on one; its partitions each say `USING heap`
+        // (#1170).
+        match &table.partition_by {
+            Some(by) => format!(
+                " PARTITION BY RANGE ({})",
+                by.columns
+                    .iter()
+                    .map(|c| quote(c))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", ")
+            ),
+            None => " USING heap".to_owned(),
+        },
+        // In the `CREATE`, so the table never exists without them (#1441).
+        if table.storage_parameters.is_empty() {
+            String::new()
+        } else {
+            format!(" WITH ({})", storage_list(&table.storage_parameters)?)
+        }
+    );
+    // Each `serial`'s sequence before the table and its ownership after, in
+    // the table's own statement: a staged checkpoint between them would read
+    // a default on a sequence nobody owns, which the reader names as a
+    // limitation (#1631).
+    let body = sequences
+        .iter()
+        .map(|(sequence, _)| sequence.as_str())
+        .chain([create.as_str()])
+        .chain(sequences.iter().map(|(_, owned)| owned.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = vec![on(pg, name, &body)?];
 
     for (n, u) in &table.unique {
         out.push(on(
@@ -5324,10 +5321,12 @@ mod tests {
             )
         };
         let sql = create(false);
+        // One statement, so no staged checkpoint falls inside it.
+        let first = &sql[0];
         let at = |needle: &str| {
-            sql.iter()
-                .position(|s| s.contains(needle))
-                .unwrap_or_else(|| panic!("no `{needle}` in {sql:#?}"))
+            first
+                .find(needle)
+                .unwrap_or_else(|| panic!("no `{needle}` in {first}"))
         };
         let id_seq =
             at("CREATE SEQUENCE \"app\".\"t_id_seq\" AS integer START WITH 1 INCREMENT BY 1;");
@@ -5338,52 +5337,45 @@ mod tests {
         at("ALTER SEQUENCE \"app\".\"legacy\" OWNED BY \"app\".\"t\".\"big\";");
         assert!(
             id_seq < table_at && big_seq < table_at && table_at < owned,
-            "{sql:#?}"
+            "{first}"
         );
+        at("\"id\" integer NOT NULL DEFAULT pg_catalog.nextval('\"app\".\"t_id_seq\"'::regclass)");
+        // The negative case: an ordinary column gets no sequence, and nothing
+        // of the construction is in a statement of its own.
+        assert_eq!(first.matches("CREATE SEQUENCE").count(), 2, "{first}");
+        assert!(sql[1..].iter().all(|s| !s.contains("SEQUENCE")), "{sql:#?}");
         assert!(
-            sql[table_at].contains(
-                "\"id\" integer NOT NULL DEFAULT pg_catalog.nextval('\"app\".\"t_id_seq\"'::regclass)"
-            ),
-            "{}",
-            sql[table_at]
-        );
-        // The negative case: an ordinary column gets no sequence.
-        assert_eq!(
-            sql.iter().filter(|s| s.contains("CREATE SEQUENCE")).count(),
-            2,
-            "{sql:#?}"
-        );
-        assert!(
-            create(true)
-                .iter()
-                .any(|s| s.contains("CREATE UNLOGGED SEQUENCE \"app\".\"t_id_seq\"")),
+            create(true)[0].contains("CREATE UNLOGGED SEQUENCE \"app\".\"t_id_seq\""),
             "{:#?}",
             create(true)
         );
 
-        let added = sql_of(
-            &Postgres::new(),
-            &Change::AddColumn {
-                uid: Uid::generate(UidKind::Column),
-                table: name("app", "t"),
-                name: "n".into(),
-                column: Box::new(serial("integer", 7, 2, None)),
-            },
-        );
-        assert_eq!(added.len(), 3, "{added:#?}");
-        assert!(
-            added[0].contains(
-                "CREATE SEQUENCE \"app\".\"t_n_seq\" AS integer START WITH 7 INCREMENT BY 2;"
-            ),
-            "{added:#?}"
-        );
-        assert!(
-            added[1].contains("ADD COLUMN \"n\" integer NOT NULL DEFAULT"),
-            "{added:#?}"
-        );
-        assert!(
-            added[2].contains("OWNED BY \"app\".\"t\".\"n\""),
-            "{added:#?}"
+        let added = Postgres::new()
+            .emit(
+                &Change::AddColumn {
+                    uid: Uid::generate(UidKind::Column),
+                    table: name("app", "t"),
+                    name: "n".into(),
+                    column: Box::new(serial("integer", 7, 2, None)),
+                },
+                Strategy::default(),
+            )
+            .expect("emit");
+        assert_eq!(added.len(), 1, "{added:#?}");
+        let one = &added[0].sql;
+        let create_at = one
+            .find("CREATE SEQUENCE \"app\".\"t_n_seq\" AS integer START WITH 7 INCREMENT BY 2;")
+            .expect("the sequence");
+        let add_at = one
+            .find("ADD COLUMN \"n\" integer NOT NULL DEFAULT")
+            .expect("the column");
+        let owned_at = one
+            .find("OWNED BY \"app\".\"t\".\"n\"")
+            .expect("the ownership");
+        assert!(create_at < add_at && add_at < owned_at, "{one}");
+        assert_eq!(
+            added[0].creates,
+            [Created::Column(name("app", "t"), "n".into())]
         );
     }
 

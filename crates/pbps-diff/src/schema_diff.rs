@@ -1833,10 +1833,18 @@ fn diff_columns(
             }
             // A name is compared only where the declaration gives one: a
             // rename keeps the sequence's, so the generated name stops
-            // matching (`OwnedSequence::declares`). Any other change to a
-            // `serial`'s sequence, or to or from one, is #1889's (#1631).
+            // matching (`OwnedSequence::declares`). The base's name is the
+            // one its own table and column generated where it holds none, so
+            // a renamed table may name the sequence it kept. Any other change
+            // to a `serial`'s sequence, or to or from one, is #1889's (#1631).
             (ValueSource::Sequence(from), ValueSource::Sequence(to)) => {
-                if !to.declares(from) {
+                let from = pbps_model::OwnedSequence {
+                    name: dialect
+                        .owned_sequence_name(base_table_name, &base_ref.name, from)
+                        .or_else(|| from.name.clone()),
+                    ..from.clone()
+                };
+                if !to.declares(&from) {
                     errs.push(DiffError::SequenceChangeUnsupported {
                         column: declared_ref.clone(),
                     });
