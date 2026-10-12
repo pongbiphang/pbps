@@ -17617,3 +17617,108 @@ async fn fixture_key_drop_blockers(
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
     pbps_mssql::impact::key_drop_blockers(conn, &names).await
 }
+
+/// The differ emits one rename per UID when comparing its before/after maps;
+/// it does not currently produce a repeated-UID chain. Exercise the actual
+/// target/report consumer with a consistent typed plan, whose index supports
+/// such chains, without claiming this fixture came from the planner (#1860).
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn rename_chains_report_each_identity_once_without_changing_dependency_decisions() {
+    use pbps_model::{Change, IdsFile, PlannedChange, plan_names::PlanNames};
+    use pbps_mssql::impact::{RenameTarget, rename_impact, rename_targets};
+
+    let mut db = TestDb::create("impact_chain1860").await;
+    db.conn
+        .execute("CREATE TABLE dbo.client (id int NOT NULL, email nvarchar(255) NULL);")
+        .await
+        .unwrap();
+    db.conn
+        .execute("CREATE VIEW dbo.v_client WITH SCHEMABINDING AS SELECT id, email FROM dbo.client;")
+        .await
+        .unwrap();
+    let table = |from: &str, to: &str| {
+        PlannedChange::new(Change::RenameTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            from: from.parse().unwrap(),
+            to: to.parse().unwrap(),
+            defaults: vec![],
+        })
+    };
+    let column = |owner: &str, from: &str, to: &str| {
+        PlannedChange::new(Change::RenameColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            table: owner.parse().unwrap(),
+            from: from.into(),
+            to: to.into(),
+            table_was: None,
+        })
+    };
+    let changes = [
+        table("dbo.client", "dbo.tmp"),
+        column("dbo.tmp", "email", "intermediate"),
+        table("dbo.tmp", "dbo.customer"),
+        column("dbo.customer", "intermediate", "contact"),
+    ];
+    let after = IdsFile {
+        tables: [("t_aaaaaa".parse().unwrap(), "dbo.customer".parse().unwrap())].into(),
+        columns: [(
+            "c_aaaaaa".parse().unwrap(),
+            "dbo.customer.contact".parse().unwrap(),
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let names = PlanNames::of(&changes, &after).unwrap();
+    let targets = rename_targets(&names);
+    let expected_targets = [
+        RenameTarget::Table("dbo.client".parse().unwrap()),
+        RenameTarget::Column("dbo.client.email".parse().unwrap()),
+    ];
+    // Like deploy::preflight, read one report per selected target. Compare the
+    // whole report with the ordinary stored-address read, not just its count.
+    for dependent_exists in [true, false] {
+        let mut expected = Vec::new();
+        for target in &expected_targets {
+            expected.push(rename_impact(&mut db.conn, target).await.unwrap());
+        }
+        let mut reports = Vec::new();
+        for target in &targets {
+            reports.push(rename_impact(&mut db.conn, target).await.unwrap());
+        }
+        assert_eq!(
+            reports.len(),
+            2,
+            "one report per identity, not per rename step"
+        );
+        assert_eq!(
+            reports, expected,
+            "classification and the accept/refuse decision must agree"
+        );
+        if dependent_exists {
+            assert_eq!(
+                reports[1]
+                    .blocking
+                    .iter()
+                    .map(|r| r.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["dbo.v_client"],
+                "the same schema-bound dependency must refuse the rename"
+            );
+        } else {
+            assert!(
+                reports.iter().all(|r| r.blocking.is_empty()),
+                "removing the blocker must still permit the rename"
+            );
+        }
+        if dependent_exists {
+            db.conn.execute("DROP VIEW dbo.v_client;").await.unwrap();
+        } else {
+            assert!(
+                reports.iter().all(|r| r.is_empty()),
+                "no dependency remains: {reports:?}"
+            );
+        }
+    }
+    db.drop().await;
+}

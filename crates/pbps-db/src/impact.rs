@@ -87,7 +87,8 @@ impl std::fmt::Display for RenameTarget {
     }
 }
 
-/// Impact targets in plan order, named as the catalog knows them before execution.
+/// Impact targets in first-occurrence order, with each renamed identity queried
+/// once, named as the catalog knows it before execution.
 ///
 /// Both halves of a renamed column's address must use the stored spelling:
 /// its change carries the declared table name, which may itself be renamed.
@@ -103,11 +104,17 @@ pub fn rename_targets(
     include_module_drops: bool,
 ) -> Vec<RenameTarget> {
     use pbps_model::plan_names::At;
-    names.changes().iter().filter_map(|p| match &p.change {
-            Change::RenameTable { uid, .. } => names.table_at(uid, At::Start).cloned().map(RenameTarget::Table),
+    let mut seen = std::collections::BTreeSet::new();
+    names
+        .changes()
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameTable { uid, .. } => names.table_at(uid, At::Start)
+                .filter(|_| seen.insert(uid)).cloned().map(RenameTarget::Table),
             Change::RenameColumn { uid, .. } => {
                 let (owner, column) = names.column_at(uid, At::Start)?;
-                Some(RenameTarget::Column(names.table_at(owner, At::Start)?.column(column)))
+                let table = names.table_at(owner, At::Start)?;
+                seen.insert(uid).then(|| RenameTarget::Column(table.column(column)))
             }
             // A module rename reaches the plan as this drop plus a create,
             // so the drop side is where the catalog has to be asked what
@@ -229,9 +236,121 @@ pub enum ImpactError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::{IdsFile, PlannedChange};
 
     fn table(s: &str) -> TableName {
         s.parse().unwrap()
+    }
+
+    fn rename_table(uid: &str, from: &str, to: &str) -> PlannedChange {
+        PlannedChange::new(Change::RenameTable {
+            uid: uid.parse().unwrap(),
+            from: table(from),
+            to: table(to),
+            defaults: vec![],
+        })
+    }
+
+    fn rename_column(uid: &str, owner: &str, from: &str, to: &str) -> PlannedChange {
+        PlannedChange::new(Change::RenameColumn {
+            uid: uid.parse().unwrap(),
+            table: table(owner),
+            from: from.into(),
+            to: to.into(),
+            table_was: None,
+        })
+    }
+
+    #[test]
+    fn a_swap_reports_each_starting_identity_once_in_first_occurrence_order() {
+        let changes = [
+            rename_table("t_bbbbbb", "app.b", "app.tmp"),
+            rename_table("t_aaaaaa", "app.a", "app.b"),
+            rename_table("t_bbbbbb", "app.tmp", "app.a"),
+        ];
+        let after = IdsFile {
+            tables: [
+                ("t_aaaaaa".parse().unwrap(), table("app.b")),
+                ("t_bbbbbb".parse().unwrap(), table("app.a")),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let names = pbps_model::plan_names::PlanNames::of(&changes, &after).unwrap();
+        assert_eq!(
+            rename_targets(&names, false),
+            [
+                RenameTarget::Table(table("app.b")),
+                RenameTarget::Table(table("app.a")),
+            ]
+        );
+    }
+
+    #[test]
+    fn column_chains_keep_their_owners_and_the_table_target_distinct() {
+        let changes = [
+            rename_column("c_bbbbbb", "app.b", "email", "tmp"),
+            rename_table("t_aaaaaa", "app.a", "app.moved"),
+            rename_column("c_aaaaaa", "app.moved", "email", "tmp"),
+            rename_column("c_bbbbbb", "app.b", "tmp", "contact"),
+            rename_column("c_aaaaaa", "app.moved", "tmp", "contact"),
+        ];
+        let after = IdsFile {
+            tables: [
+                ("t_aaaaaa".parse().unwrap(), table("app.moved")),
+                ("t_bbbbbb".parse().unwrap(), table("app.b")),
+            ]
+            .into(),
+            columns: [
+                (
+                    "c_aaaaaa".parse().unwrap(),
+                    table("app.moved").column("contact"),
+                ),
+                (
+                    "c_bbbbbb".parse().unwrap(),
+                    table("app.b").column("contact"),
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let names = pbps_model::plan_names::PlanNames::of(&changes, &after).unwrap();
+        assert_eq!(
+            rename_targets(&names, false),
+            [
+                RenameTarget::Column(table("app.b").column("email")),
+                RenameTarget::Table(table("app.a")),
+                RenameTarget::Column(table("app.a").column("email")),
+            ]
+        );
+    }
+
+    #[test]
+    fn module_drop_selection_remains_the_callers_policy_beside_rename_chains() {
+        let changes = [
+            rename_table("t_aaaaaa", "app.a", "app.tmp"),
+            PlannedChange::new(Change::DropModule {
+                id: "app.v".parse().unwrap(),
+                kind: ModuleKind::View,
+            }),
+            rename_table("t_aaaaaa", "app.tmp", "app.b"),
+        ];
+        let after = IdsFile {
+            tables: [("t_aaaaaa".parse().unwrap(), table("app.b"))].into(),
+            ..Default::default()
+        };
+        let names = pbps_model::plan_names::PlanNames::of(&changes, &after).unwrap();
+        assert_eq!(
+            rename_targets(&names, false),
+            [RenameTarget::Table(table("app.a"))]
+        );
+        assert_eq!(
+            rename_targets(&names, true),
+            [
+                RenameTarget::Table(table("app.a")),
+                RenameTarget::Module(table("app.v")),
+            ]
+        );
     }
 
     #[test]
@@ -259,10 +378,7 @@ mod tests {
         let names = pbps_model::plan_names::PlanNames::of(&changes, &after).unwrap();
         assert_eq!(
             rename_targets(&names, false),
-            vec![
-                RenameTarget::Table(table("app.a")),
-                RenameTarget::Table(table("app.a"))
-            ]
+            vec![RenameTarget::Table(table("app.a"))]
         );
     }
 
@@ -298,6 +414,27 @@ mod tests {
         };
         let names = pbps_model::plan_names::PlanNames::of(&changes, &after).unwrap();
         assert!(rename_targets(&names, false).is_empty());
+    }
+
+    #[test]
+    fn a_new_tables_rename_chain_has_no_catalog_target() {
+        let changes = [
+            PlannedChange::new(Change::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: table("app.new"),
+                table: Box::default(),
+                beside_default: None,
+                moves_at_most: None,
+            }),
+            rename_table("t_aaaaaa", "app.new", "app.tmp"),
+            rename_table("t_aaaaaa", "app.tmp", "app.final"),
+        ];
+        let after = IdsFile {
+            tables: [("t_aaaaaa".parse().unwrap(), table("app.final"))].into(),
+            ..Default::default()
+        };
+        let names = pbps_model::plan_names::PlanNames::of(&changes, &after).unwrap();
+        assert!(rename_targets(&names, true).is_empty());
     }
 
     #[test]
