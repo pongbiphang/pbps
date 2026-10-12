@@ -6,7 +6,75 @@ use pbps_model::{
     Schema, SystemTime, Table, TableName, Uid,
 };
 
-use super::{Expr, Req};
+use super::{Expr, Req, Source};
+
+/// Field-sized requirements: retyping a column does not own its default,
+/// identity or nullability, and Whole owns only one-sided presence (DECISIONS 173).
+pub(crate) struct ColumnExpected<'a> {
+    pub(super) ty: Req<&'a pbps_model::ColumnType>,
+    pub(super) nullable: Req<bool>,
+    pub(super) default: Expr<'a>,
+    pub(super) deprecated: Req<Option<&'a str>>,
+    pub(super) collation: Req<Option<&'a pbps_model::Collation>>,
+    pub(super) generated_kind: Option<bool>,
+    pub(super) generated_expression: Expr<'a>,
+    pub(super) identity: Option<&'a pbps_model::Identity>,
+    pub(super) sequence: Option<&'a pbps_model::OwnedSequence>,
+    pub(super) description: Option<&'a str>,
+}
+
+impl<'a> ColumnExpected<'a> {
+    pub(crate) fn keeping(
+        was: &'a pbps_model::Column,
+        changed: &BTreeSet<pbps_model::ColumnField>,
+    ) -> Self {
+        use pbps_model::{Column, ColumnField};
+        let Column {
+            ty,
+            nullable,
+            value_source,
+            collation,
+            description,
+            deprecated,
+        } = was;
+        let source = Source::of(value_source);
+        fn kept<T>(value: T, changed: bool) -> Req<T> {
+            if changed {
+                Req::Unpromised
+            } else {
+                Req::Keep(value)
+            }
+        }
+        let expression = |value, field| {
+            if changed.contains(&field) {
+                Expr::Unpromised
+            } else {
+                Expr::Keep(value)
+            }
+        };
+        Self {
+            ty: kept(ty, changed.contains(&ColumnField::Type)),
+            nullable: kept(*nullable, changed.contains(&ColumnField::Nullable)),
+            default: expression(source.default, ColumnField::Default),
+            deprecated: kept(
+                deprecated.as_deref(),
+                changed.contains(&ColumnField::Deprecated),
+            ),
+            collation: kept(
+                collation.as_ref(),
+                changed.contains(&ColumnField::Collation),
+            ),
+            generated_kind: source.generated.map(|g| g.stored),
+            generated_expression: expression(
+                source.generated.map(|g| g.expression.as_str()),
+                ColumnField::Generated,
+            ),
+            identity: source.identity,
+            sequence: source.sequence,
+            description: description.as_deref(),
+        }
+    }
+}
 
 type Storage = BTreeMap<String, String>;
 type StorageSetting<'a> = (&'a Storage, &'a BTreeSet<String>);
@@ -23,9 +91,9 @@ struct TablePlan<'a> {
 
 pub(crate) struct TableChanges<'a> {
     scalars: BTreeMap<&'a Uid, TablePlan<'a>>,
-    parents: BTreeSet<&'a TableName>,
-    parent_effects: BTreeMap<&'a TableName, Vec<(usize, OwnEffect<'a>)>>,
-    own_effects: BTreeMap<&'a TableName, Vec<(usize, OwnEffect<'a>)>>,
+    parents: BTreeSet<TableName>,
+    parent_effects: BTreeMap<TableName, Vec<(usize, OwnEffect<'a>)>>,
+    own_effects: BTreeMap<TableName, Vec<(usize, OwnEffect<'a>)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -85,7 +153,7 @@ pub(crate) struct Expected<'a> {
 }
 
 impl<'a> TableChanges<'a> {
-    pub(crate) fn of(plan: &'a ChangeSet) -> Self {
+    pub(crate) fn of(plan: &'a ChangeSet, names: &pbps_model::plan_names::PlanNames<'_>) -> Self {
         let mut tables: BTreeMap<&Uid, TablePlan<'_>> = BTreeMap::new();
         let mut parents = BTreeSet::new();
         let mut parent_effects: BTreeMap<_, Vec<_>> = BTreeMap::new();
@@ -216,6 +284,38 @@ impl<'a> TableChanges<'a> {
                 | Change::PublicExecution { .. } => {}
             }
         }
+        use pbps_model::plan_names::{At, Holder};
+        let endpoint = |table: &TableName, at: usize| {
+            let Holder::Tracked(uid) = names.holder(table, At::Before(at)) else {
+                return None;
+            };
+            names.table_at(uid, At::End).cloned()
+        };
+        let forward = |effects: BTreeMap<&TableName, Vec<(usize, OwnEffect<'a>)>>| {
+            let mut projected: BTreeMap<TableName, Vec<_>> = BTreeMap::new();
+            for (table, effects) in effects {
+                for (at, effect) in effects {
+                    if let Some(table) = endpoint(table, at) {
+                        projected.entry(table).or_default().push((at, effect));
+                    }
+                }
+            }
+            projected
+        };
+        let parents: BTreeSet<TableName> = parents.into_iter().cloned().collect();
+        // Reach children observed under either endpoint of the parent UID.
+        let mut parents = parents;
+        for (at, p) in plan.changes.iter().enumerate() {
+            for table in p.change.objects() {
+                if parents.contains(table)
+                    && let Some(end) = endpoint(table, at)
+                {
+                    parents.insert(end);
+                }
+            }
+        }
+        let parent_effects = forward(parent_effects);
+        let own_effects = forward(own_effects);
         // A rename alone supplies no scalar requirement. Retaining those
         // entries would make every touched table scan every rename even
         // when the plan changes no scalar at all.
@@ -436,4 +536,228 @@ pub(super) fn place(table: &Table) -> Place {
             .map(|of| (of.parent.clone(), of.bound.clone())),
         table.partition_by.clone(),
     )
+}
+
+/// Requirements are addressed through the pinned UID history, then rendered
+/// under the final spelling. A vacated name never lends its old occupant's
+/// requirements to a replacement (DECISIONS 474).
+pub(crate) struct ColumnChanges<'a> {
+    changed: BTreeMap<TableName, BTreeMap<String, BTreeSet<pbps_model::ColumnField>>>,
+    pub(super) presence: BTreeMap<pbps_model::ColumnRef, pbps_model::Presence>,
+    pub(super) promises:
+        BTreeMap<(pbps_model::ColumnRef, pbps_model::ColumnField), pbps_model::ColumnPromise<'a>>,
+    pub(crate) renamed: BTreeMap<TableName, BTreeMap<String, String>>,
+    pub(crate) handoffs: BTreeMap<TableName, BTreeMap<String, Option<String>>>,
+    pub(crate) partition_handoffs: BTreeMap<TableName, BTreeMap<String, Option<String>>>,
+    replaced: BTreeSet<pbps_model::ColumnRef>,
+}
+
+impl<'a> ColumnChanges<'a> {
+    pub(crate) fn of(
+        changes: &'a ChangeSet,
+        names: &pbps_model::plan_names::PlanNames<'_>,
+    ) -> Self {
+        use pbps_model::{
+            ColumnField, ColumnRef, Presence,
+            plan_names::{At, Holder},
+        };
+        let mut this = Self {
+            changed: BTreeMap::new(),
+            presence: BTreeMap::new(),
+            promises: BTreeMap::new(),
+            renamed: BTreeMap::new(),
+            handoffs: BTreeMap::new(),
+            partition_handoffs: BTreeMap::new(),
+            replaced: BTreeSet::new(),
+        };
+        // A spelling without a current column (DROP or the old end of a
+        // rename) still belongs to its known table. Only the table's UID may
+        // carry that vacancy through a later table rename.
+        let spelling = |column: &ColumnRef, at| {
+            let Holder::Tracked(owner) = names.holder(&column.table, at) else {
+                return None;
+            };
+            Some(names.table_at(owner, At::End)?.column(&column.name))
+        };
+        let surviving = |column: &ColumnRef, at| {
+            let Holder::Tracked(uid) = names.column_holder(column, at) else {
+                return None;
+            };
+            let (owner, name) = names.column_at(uid, At::End)?;
+            Some(names.table_at(owner, At::End)?.column(name))
+        };
+        let mut touched_names: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
+        for (i, p) in changes.changes.iter().enumerate() {
+            for (column, field) in p.change.columns_redefined() {
+                let final_column = if field == ColumnField::Whole {
+                    spelling(&column, At::Before(i))
+                } else {
+                    surviving(&column, At::Before(i))
+                };
+                if let Some(column) = final_column {
+                    if field == ColumnField::Whole {
+                        touched_names
+                            .entry(column.table.clone())
+                            .or_default()
+                            .insert(column.name.clone());
+                    }
+                    this.changed
+                        .entry(column.table)
+                        .or_default()
+                        .entry(column.name)
+                        .or_default()
+                        .insert(field);
+                }
+            }
+            for (column, _) in p.change.columns_after() {
+                if let Some(column) = spelling(&column, At::After(i)) {
+                    let present =
+                        matches!(names.column_holder(&column, At::End), Holder::Tracked(_));
+                    this.presence.insert(
+                        column,
+                        if present {
+                            Presence::Present
+                        } else {
+                            Presence::Absent
+                        },
+                    );
+                }
+            }
+            // Last promise wins for this identity, even if it is renamed
+            // again. A column removed later has no final definition to hold.
+            for (column, promise) in p.change.columns_promised() {
+                if let Some(column) = surviving(&column, At::After(i)) {
+                    this.promises.insert((column, promise.field()), promise);
+                }
+            }
+        }
+        for (table, columns) in touched_names {
+            let Holder::Tracked(owner) = names.holder(&table, At::End) else {
+                continue;
+            };
+            let Some(original) = names.table_at(owner, At::Start) else {
+                continue;
+            };
+            let mut net = BTreeMap::new();
+            let (mut hands, mut replaced) = (false, false);
+            for column in columns {
+                let address = table.column(&column);
+                let before = names.column_holder(&original.column(&column), At::Start);
+                let after = names.column_holder(&address, At::End);
+                let held = match after {
+                    Holder::Tracked(uid) => names
+                        .column_at(uid, At::Start)
+                        .map(|(_, name)| name.to_owned()),
+                    Holder::Unmanaged | Holder::Vacant => None,
+                };
+                if let Holder::Tracked(was) = before
+                    && let Holder::Tracked(now) = after
+                    && was != now
+                {
+                    if names.column_at(was, At::End).is_some() {
+                        hands = true;
+                    } else {
+                        replaced = true;
+                        this.replaced.insert(address);
+                    }
+                }
+                if let Some(from) = &held
+                    && from != &column
+                {
+                    this.renamed
+                        .entry(table.clone())
+                        .or_default()
+                        .insert(column.clone(), from.clone());
+                }
+                net.insert(column, held);
+            }
+            if hands || replaced {
+                this.partition_handoffs.insert(table.clone(), net.clone());
+            }
+            if hands {
+                this.handoffs.insert(table, net);
+            }
+        }
+        this
+    }
+}
+
+/// Derivation chooses the observed identity; comparison only checks fields.
+pub(super) struct ColumnObservation<'a> {
+    pub(super) name: String,
+    pub(super) present: Req<bool>,
+    pub(super) fields: Option<ColumnExpected<'a>>,
+}
+
+pub(crate) struct ColumnsExpected<'a>(pub(super) Vec<ColumnObservation<'a>>);
+
+impl ColumnChanges<'_> {
+    pub(crate) fn expect<'b>(
+        &self,
+        name: &TableName,
+        was: &'b Table,
+        now: &Table,
+    ) -> ColumnsExpected<'b> {
+        use pbps_model::ColumnField;
+        let mut baseline: BTreeMap<_, _> =
+            was.columns.iter().map(|(n, c)| (n.clone(), c)).collect();
+        // Lookup order and reporting order differ: preserve the catalog's
+        // IndexMap order, including the legacy repeated two-sided findings.
+        let mut order: Vec<_> = was.columns.keys().collect();
+        if let Some(net) = self.handoffs.get(name) {
+            order.retain(|column| !net.contains_key(*column));
+            baseline.retain(|column, _| !net.contains_key(column));
+            for (column, from) in net {
+                if let Some(held) = from.as_ref().and_then(|from| was.columns.get(from)) {
+                    baseline.insert(column.clone(), held);
+                    order.push(column);
+                }
+            }
+        }
+        let empty = BTreeSet::new();
+        let changed = |column: &String| {
+            self.changed
+                .get(name)
+                .and_then(|c| c.get(column))
+                .unwrap_or(&empty)
+        };
+        ColumnsExpected(
+            order
+                .into_iter()
+                .chain(now.columns.keys())
+                .map(|column| {
+                    let mut fields = changed(column).clone();
+                    let from = self.renamed.get(name).and_then(|r| r.get(column));
+                    // Only the read that spans the rename can hand the old spelling
+                    // to another identity. At close both reads already use the result;
+                    // after DROP alone the surviving source still exists (DECISIONS 474).
+                    let spanning = from.is_some_and(|from| {
+                        baseline.contains_key(from) && !now.columns.contains_key(from)
+                    });
+                    let replaced = spanning && self.replaced.contains(&name.column(column));
+                    let kept = baseline
+                        .get(column)
+                        .copied()
+                        .filter(|_| !replaced)
+                        .or_else(|| {
+                            let from = from?;
+                            if now.columns.contains_key(from) {
+                                return None;
+                            }
+                            fields.extend(changed(from));
+                            baseline.get(from).copied()
+                        });
+                    ColumnObservation {
+                        name: column.clone(),
+                        present: if fields.contains(&ColumnField::Whole) {
+                            Req::Unpromised
+                        } else {
+                            Req::Keep(kept.is_some())
+                        },
+                        fields: kept.map(|was| ColumnExpected::keeping(was, &fields)),
+                    }
+                })
+                .collect(),
+        )
+    }
 }

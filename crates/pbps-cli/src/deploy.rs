@@ -3535,70 +3535,6 @@ fn same_type(
     }
 }
 
-/// Whether a column read back is the one a declaration asked for, in the
-/// fields the catalog reads back unchanged: the normalized type, the
-/// nullability, the identity, and whether there is a default at all — its
-/// **text** is the engine's (`0` comes back `((0))`), so only its presence is
-/// comparable (DECISIONS 185, 186).
-fn column_as_declared(
-    dialect: &dyn pbps_dialect::Dialect,
-    declared: &pbps_model::Column,
-    now: &pbps_model::Column,
-) -> bool {
-    same_type(dialect, &declared.ty, &now.ty)
-        && declared.nullable == now.nullable
-        && match (&declared.value_source, &now.value_source) {
-            (pbps_model::ValueSource::None, pbps_model::ValueSource::None)
-            | (pbps_model::ValueSource::Default(_), pbps_model::ValueSource::Default(_)) => true,
-            (pbps_model::ValueSource::Identity(a), pbps_model::ValueSource::Identity(b)) => a == b,
-            // An owned sequence's name only where the declaration gives one
-            // (#1631, `OwnedSequence::declares`).
-            (pbps_model::ValueSource::Sequence(a), pbps_model::ValueSource::Sequence(b)) => {
-                a.declares(b)
-            }
-            // The engine respells generated SQL, but preserves its kind.
-            (pbps_model::ValueSource::Generated(a), pbps_model::ValueSource::Generated(b)) => {
-                a.stored == b.stored
-            }
-            (
-                pbps_model::ValueSource::None,
-                pbps_model::ValueSource::Default(_)
-                | pbps_model::ValueSource::Identity(_)
-                | pbps_model::ValueSource::Sequence(_)
-                | pbps_model::ValueSource::Generated(_),
-            )
-            | (
-                pbps_model::ValueSource::Default(_),
-                pbps_model::ValueSource::None
-                | pbps_model::ValueSource::Identity(_)
-                | pbps_model::ValueSource::Sequence(_)
-                | pbps_model::ValueSource::Generated(_),
-            )
-            | (
-                pbps_model::ValueSource::Identity(_),
-                pbps_model::ValueSource::None
-                | pbps_model::ValueSource::Default(_)
-                | pbps_model::ValueSource::Sequence(_)
-                | pbps_model::ValueSource::Generated(_),
-            )
-            | (
-                pbps_model::ValueSource::Sequence(_),
-                pbps_model::ValueSource::None
-                | pbps_model::ValueSource::Default(_)
-                | pbps_model::ValueSource::Identity(_)
-                | pbps_model::ValueSource::Generated(_),
-            )
-            | (
-                pbps_model::ValueSource::Generated(_),
-                pbps_model::ValueSource::None
-                | pbps_model::ValueSource::Default(_)
-                | pbps_model::ValueSource::Identity(_)
-                | pbps_model::ValueSource::Sequence(_),
-            ) => false,
-        }
-        && declared.collation == now.collation
-}
-
 /// Whether an index read back is the one declared. Structure only: the
 /// filter's text is the engine's to rewrite, and whether there is one at all
 /// decides which rows the index covers, and is not (DECISIONS 185). The
@@ -3722,163 +3658,7 @@ fn sequences_named<'a>(
     std::borrow::Cow::Owned(out)
 }
 
-/// Every field of a column two reads disagree on, with the word to call it.
-///
-/// Field by field because the exclusion above is: a plan that retypes a column
-/// cannot be held to what the type became — only the engine's stored form says
-/// that — while the same column's default, identity and nullability came back
-/// from two reads like anything else (DECISIONS 173).
-///
-/// `description` and `deprecated` are compared too, and are always equal today
-/// because no catalog reads them back. That is the right way round: if one
-/// ever does, a description another session changed is drift, and no change of
-/// this model moves it.
-fn differing(
-    was: &pbps_model::Column,
-    now: &pbps_model::Column,
-) -> Vec<(Option<pbps_model::ColumnField>, &'static str)> {
-    use pbps_model::{ColumnField, ValueSource};
-    // The guard tracks planned fields separately, so a source-kind change can
-    // report more than one moved field. Derive all three from the exclusive
-    // source in one exhaustive policy, never from independent model options.
-    let [
-        (was_default, was_identity, was_sequence, was_generated),
-        (now_default, now_identity, now_sequence, now_generated),
-    ] = [&was.value_source, &now.value_source].map(|source| match source {
-        ValueSource::None => (None, None, None, None),
-        ValueSource::Default(default) => (Some(default), None, None, None),
-        ValueSource::Identity(identity) => (None, Some(identity), None, None),
-        ValueSource::Sequence(sequence) => (None, None, Some(sequence), None),
-        ValueSource::Generated(generated) => (None, None, None, Some(generated)),
-    });
-    let mut out = Vec::new();
-    if was.ty != now.ty {
-        out.push((Some(ColumnField::Type), "type"));
-    }
-    if was.nullable != now.nullable {
-        out.push((Some(ColumnField::Nullable), "nullability"));
-    }
-    if was_default != now_default {
-        out.push((Some(ColumnField::Default), "default"));
-    }
-    if was.deprecated != now.deprecated {
-        out.push((Some(ColumnField::Deprecated), "deprecation"));
-    }
-    if was.collation != now.collation {
-        out.push((Some(ColumnField::Collation), "collation"));
-    }
-    // Only the expression text is a planned change's to move
-    // (`AlterColumnExpression`, DEC-1168.1). A column becoming or ceasing to
-    // be generated, or changing kind, has no change in this model, so it
-    // falls to the `None` below.
-    match (was_generated, now_generated) {
-        (Some(a), Some(b)) if a.stored == b.stored => {
-            if a.expression != b.expression {
-                out.push((Some(ColumnField::Generated), "generation expression"));
-            }
-        }
-        (None, None) => {}
-        _ => out.push((None, "generation")),
-    }
-    // `None` is "no change of this model moves this", so nothing can excuse
-    // it: an identity or a description that differs across an apply is
-    // somebody else's work, and the whole-column exclusion used to hide it.
-    if was_identity != now_identity {
-        out.push((None, "identity"));
-    }
-    // No change of this model moves a `serial`'s sequence either (#1631).
-    if was_sequence != now_sequence {
-        out.push((None, "sequence"));
-    }
-    if was.description != now.description {
-        out.push((None, "description"));
-    }
-    out
-}
-
-/// One of a plan's column changes to a table, in the plan's order.
-enum ColumnStep<'a> {
-    Rename(&'a str, &'a str),
-    Add(&'a str),
-    Drop(&'a str),
-}
-
-/// Whether a name changes hands within the plan: one rename gives it up and
-/// another rename, or a new column, takes it.
-fn names_change_hands(steps: &[ColumnStep<'_>]) -> bool {
-    let sources: BTreeSet<&str> = steps
-        .iter()
-        .filter_map(|step| match step {
-            ColumnStep::Rename(from, _) => Some(*from),
-            ColumnStep::Add(_) | ColumnStep::Drop(_) => None,
-        })
-        .collect();
-    steps.iter().any(|step| match step {
-        ColumnStep::Rename(_, to) => sources.contains(to),
-        ColumnStep::Add(name) => sources.contains(name),
-        ColumnStep::Drop(_) => false,
-    })
-}
-
-/// Whether a column the steps drop leaves its name to a later rename or a new
-/// column.
-fn reuses_a_dropped_name(steps: &[ColumnStep<'_>]) -> bool {
-    steps.iter().enumerate().any(|(i, step)| {
-        let ColumnStep::Drop(dropped) = step else {
-            return false;
-        };
-        steps[i + 1..].iter().any(|later| match later {
-            ColumnStep::Rename(_, to) => to == dropped,
-            ColumnStep::Add(name) => name == dropped,
-            ColumnStep::Drop(_) => false,
-        })
-    })
-}
-
-/// Every name the plan's column changes touch, mapped to the baseline column
-/// it holds afterwards: `Some` for one that kept or moved its identity, `None`
-/// for a new column or a name left empty. A name the steps do not touch is
-/// not in the map and keeps its own column.
-fn net_columns(steps: &[ColumnStep<'_>]) -> BTreeMap<String, Option<String>> {
-    let mut net: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for step in steps {
-        match step {
-            ColumnStep::Rename(from, to) => {
-                let moving = net
-                    .remove(*from)
-                    .unwrap_or_else(|| Some((*from).to_owned()));
-                net.insert((*from).to_owned(), None);
-                net.insert((*to).to_owned(), moving);
-            }
-            ColumnStep::Add(name) | ColumnStep::Drop(name) => {
-                net.insert((*name).to_owned(), None);
-            }
-        }
-    }
-    net
-}
-
-/// `was`, its columns keyed by the names the plan leaves them under: a moved
-/// column under its new name, and a name that ends up empty or new left out.
-fn realign_columns(
-    was: &pbps_model::Table,
-    net: &BTreeMap<String, Option<String>>,
-) -> pbps_model::Table {
-    let mut table = was.clone();
-    table.columns = was
-        .columns
-        .iter()
-        .filter(|(name, _)| !net.contains_key(name.as_str()))
-        .map(|(name, column)| (name.clone(), column.clone()))
-        .collect();
-    for (now, held) in net {
-        if let Some(column) = held.as_ref().and_then(|b| was.columns.get(b)) {
-            table.columns.insert(now.clone(), column.clone());
-        }
-    }
-    table
-}
-
+#[cfg(test)]
 fn refuse_unplanned_movement(
     dialect: &dyn pbps_dialect::Dialect,
     changes: &pbps_model::ChangeSet,
@@ -3887,6 +3667,49 @@ fn refuse_unplanned_movement(
     label: &str,
     settled: Settled,
 ) -> anyhow::Result<()> {
+    let ids = guard::fixture_ids(changes, before);
+    refuse_pinned_movement(
+        dialect,
+        guard::Plan { changes, ids: &ids },
+        before,
+        after,
+        label,
+        settled,
+    )
+}
+
+#[cfg(test)]
+fn staged_movement(
+    dialect: &dyn pbps_dialect::Dialect,
+    changes: &pbps_model::ChangeSet,
+    before: &Schema,
+    after: &Schema,
+    label: &str,
+    environment: Option<&str>,
+    read: StagedRead,
+) -> anyhow::Result<()> {
+    let ids = guard::fixture_ids(changes, before);
+    staged_pinned_movement(
+        dialect,
+        guard::Plan { changes, ids: &ids },
+        before,
+        after,
+        label,
+        environment,
+        read,
+    )
+}
+
+fn refuse_pinned_movement(
+    dialect: &dyn pbps_dialect::Dialect,
+    plan: guard::Plan<'_>,
+    before: &Schema,
+    after: &Schema,
+    label: &str,
+    settled: Settled,
+) -> anyhow::Result<()> {
+    let changes = plan.changes;
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, plan.ids)?;
     // Each owned sequence under the name it has, before anything below maps
     // a column or table across a rename: a held name is `None` where it is
     // the generated one, and a rename changes that without touching the
@@ -3907,7 +3730,8 @@ fn refuse_unplanned_movement(
         touched_modules.extend(p.change.module_id());
         roles.extend(p.change.roles());
     }
-    let table_changes = guard::TableChanges::of(changes);
+    let table_changes = guard::TableChanges::of(changes, &names);
+    let column_changes = guard::ColumnChanges::of(changes, &names);
     let implied = table_changes.implied(before, after, &objects);
     objects.extend(implied.names());
 
@@ -3916,15 +3740,6 @@ fn refuse_unplanned_movement(
     // different names across a rename.
     let mut renamed: BTreeMap<&TableName, &TableName> = BTreeMap::new();
     let mut renamed_roles: BTreeMap<&str, &str> = BTreeMap::new();
-    // And the columns, under the name each ends with: across the read that
-    // spans the rename statement, the column is under one name before and
-    // another after, and the shape comparison follows it rather than
-    // excusing both ends (DECISIONS 189).
-    let mut renamed_columns: BTreeMap<(&TableName, &str), &str> = BTreeMap::new();
-    // And the columns it drops, because one name can belong to two of them
-    // across one plan: the occupant this plan removes and the column it
-    // renames into the name that leaves (DECISIONS 474).
-    let mut dropped_columns: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
     // And the tables it drops, for the same reason one level up: a later
     // revision can rename another table into the name one leaves (DEC-536.1).
     let mut dropped_tables: BTreeSet<&TableName> = BTreeSet::new();
@@ -3944,11 +3759,6 @@ fn refuse_unplanned_movement(
     // saying so: a renamed column re-keys every row of its table, and a
     // dropped table takes its grants with it (DECISIONS 158).
     let mut columns: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
-    // Per column *and* field: the reason for excluding anything here is
-    // field-sized. Only the engine's stored form says what a retyped column
-    // became, but that column's default, identity and nullability still came
-    // back from two reads, and a whole-column exclusion meant nothing
-    // compared them (DECISIONS 173).
     // The tables this plan creates, with the shape the `CREATE` asks for.
     // They have no baseline entry, so the comparison below cannot reach them
     // any other way (DECISIONS 181).
@@ -3973,8 +3783,6 @@ fn refuse_unplanned_movement(
     // by another session would be recorded as this plan's.
     let mut added_indexes: BTreeMap<(&TableName, &str), &pbps_model::Index> = BTreeMap::new();
     let mut added_parts: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
-    let mut redefined: BTreeMap<TableName, BTreeMap<String, BTreeSet<pbps_model::ColumnField>>> =
-        BTreeMap::new();
     let mut gone: BTreeSet<pbps_model::Dropped> = BTreeSet::new();
     // The constraints and indexes this plan moves, and the tables whose
     // primary key it sets. Everything else on a touched table then answers for
@@ -4030,20 +3838,8 @@ fn refuse_unplanned_movement(
         if let pbps_model::Change::RenameRole { from, to, .. } = &p.change {
             renamed_roles.insert(from, to);
         }
-        if let pbps_model::Change::RenameColumn {
-            table, from, to, ..
-        } = &p.change
-        {
-            renamed_columns.insert((table, to), from);
-        }
         if let pbps_model::Change::DropTable { name, .. } = &p.change {
             dropped_tables.insert(name);
-        }
-        if let pbps_model::Change::DropColumn { column, .. } = &p.change {
-            dropped_columns
-                .entry(&column.table)
-                .or_default()
-                .insert(column.name.as_str());
         }
         if let Some((table, key, _)) = p.change.row() {
             written.entry(table).or_default().insert(key);
@@ -4057,17 +3853,6 @@ fn refuse_unplanned_movement(
         }
         for column in p.change.columns() {
             columns.entry(column.table).or_default().insert(column.name);
-        }
-        // A second set, because the two comparisons ask different questions of
-        // it: `columns` is whose *reading* moved, for the rows; this is whose
-        // *definition* moved, for the shape (DECISIONS 170).
-        for (column, field) in p.change.columns_redefined() {
-            redefined
-                .entry(column.table)
-                .or_default()
-                .entry(column.name)
-                .or_default()
-                .insert(field);
         }
         if let Some(part) = p.change.constraints() {
             let table = part_table_after(part.table, &changes.changes[index + 1..]);
@@ -4248,76 +4033,39 @@ fn refuse_unplanned_movement(
             undo_after.rename_table((*to).clone(), (*from).clone());
         }
     }
-    // A `RenameColumn` carries its table's *declared* name — the one the
-    // rename leaves it under — which is already the key this map wants. And
-    // `order_key` runs the table renames (class 1) before the column renames
-    // (class 3), so at every read a table whose column has been renamed is
-    // already under its new name: the key is never a spelling that did not
-    // exist yet.
+    // The identity index supplies final table spellings. A staged table
+    // rename is one logical change and carries no separate column rename;
+    // ordinary column renames are still undone only on unambiguous reads.
     let holds_column = |s: &Schema, table: &TableName, a: &str, b: &str| {
         s.tables
             .get(table)
             .is_some_and(|t| t.columns.contains_key(a) && t.columns.contains_key(b))
     };
-    // A table whose column names change hands within this plan: a name one
-    // rename gives up is taken by another rename or by a new column. Both
-    // reads then hold that name for two different columns, and no rule about
-    // names can say which is which (DEC-541.1). Such a plan makes at least two
-    // changes, and `--staged` applies one (ADR-0003), so it is transactional:
-    // the earlier read is from before its first statement and the later one
-    // from after its last. The plan's own column changes, in its order, then
-    // say which baseline column each final name holds.
-    let mut column_steps: BTreeMap<&TableName, Vec<ColumnStep<'_>>> = BTreeMap::new();
-    for p in &changes.changes {
-        let (table, step) = if let pbps_model::Change::RenameColumn {
-            table, from, to, ..
-        } = &p.change
-        {
-            (table, ColumnStep::Rename(from, to))
-        } else if let pbps_model::Change::AddColumn { table, name, .. } = &p.change {
-            (table, ColumnStep::Add(name))
-        } else if let pbps_model::Change::DropColumn { column, .. } = &p.change {
-            (&column.table, ColumnStep::Drop(&column.name))
-        } else {
-            continue;
-        };
-        column_steps.entry(table).or_default().push(step);
-    }
-    let changing_hands: BTreeMap<&TableName, BTreeMap<String, Option<String>>> = column_steps
-        .iter()
-        .filter(|(_, steps)| names_change_hands(steps))
-        .map(|(table, steps)| (*table, net_columns(steps)))
-        .collect();
-    // A partition's own entries are keyed by its parent's column names, so
-    // they need the names the plan leaves wherever a name passes to another
-    // column: changing hands, or a dropped column's name taken by a rename
-    // or a new column, where no undo rename is built (#1692 review).
-    let partition_hands: BTreeMap<&TableName, BTreeMap<String, Option<String>>> = column_steps
-        .iter()
-        .filter(|(_, steps)| names_change_hands(steps) || reuses_a_dropped_name(steps))
-        .map(|(table, steps)| (*table, net_columns(steps)))
-        .collect();
-    for ((table, to), from) in &renamed_columns {
-        if changing_hands.contains_key(table) {
-            continue;
-        }
-        // Each read is undone only where it holds the rename's result alone.
-        // One that holds both names has not run the rename — or holds a
-        // dropped column under the name the rename takes — and undoing it
-        // would move that column's constraints onto the renamed one. Both
-        // reads were left alone when either held both, so a column renamed
-        // into a dropped column's name kept its index under two spellings,
-        // and a valid plan was refused at apply (#1699).
-        let column = pbps_model::ColumnRef::new((*table).clone(), *to);
-        if !holds_column(before, table, from, to) {
-            undo_before.rename_column(column.clone(), *from);
-        }
-        if !holds_column(after, table, from, to) {
-            undo_after.rename_column(column, *from);
+    let changing_hands = &column_changes.handoffs;
+    let partition_hands = &column_changes.partition_handoffs;
+    for (table, renames) in &column_changes.renamed {
+        for (to, from) in renames {
+            if changing_hands.contains_key(table) {
+                continue;
+            }
+            // Each read is undone only where it holds the rename's result alone.
+            // One that holds both names has not run the rename — or holds a
+            // dropped column under the name the rename takes — and undoing it
+            // would move that column's constraints onto the renamed one. Both
+            // reads were left alone when either held both, so a column renamed
+            // into a dropped column's name kept its index under two spellings,
+            // and a valid plan was refused at apply (#1699).
+            let column = pbps_model::ColumnRef::new(table.clone(), to.clone());
+            if !holds_column(before, table, from, to) {
+                undo_before.rename_column(column.clone(), from.clone());
+            }
+            if !holds_column(after, table, from, to) {
+                undo_after.rename_column(column, from.clone());
+            }
         }
     }
     // The earlier read has run nothing, so only the later one is undone.
-    for (table, net) in &changing_hands {
+    for (table, net) in changing_hands {
         for (now, was) in net {
             if let Some(was) = was.as_deref().filter(|was| *was != now) {
                 undo_after.rename_column(pbps_model::ColumnRef::new((*table).clone(), now), was);
@@ -4505,7 +4253,7 @@ fn refuse_unplanned_movement(
                 let Some(now) = now.columns.get(n) else {
                     continue;
                 };
-                let as_created = column_as_declared(dialect, was, now);
+                let as_created = guard::declared_column(dialect, was, now);
                 // With a default this plan sets later: that one once every
                 // statement has run, and either before then, since a staged
                 // checkpoint may fall between the `CREATE` and the default.
@@ -4524,7 +4272,7 @@ fn refuse_unplanned_movement(
                             | pbps_model::ValueSource::Sequence(_)
                             | pbps_model::ValueSource::Generated(_) => to.is_none(),
                         };
-                        (compatible && column_as_declared(dialect, &finished, now))
+                        (compatible && guard::declared_column(dialect, &finished, now))
                             || (!settled.whole() && as_created)
                     }
                     None => as_created,
@@ -4750,18 +4498,7 @@ fn refuse_unplanned_movement(
             // lands in the same spelling.
             let was = &undo_before.apply(was, name);
             let now = &undo_after.apply(now, now_name);
-            // Each baseline column under the name the plan leaves it with, so
-            // the loop below compares a column with itself (DEC-541.1).
-            let realigned;
-            let was: &pbps_model::Table = match changing_hands.get(now_name) {
-                Some(net) => {
-                    realigned = realign_columns(was, net);
-                    &realigned
-                }
-                None => was,
-            };
-            let no_fields = BTreeMap::new();
-            let moved_columns = redefined.get(now_name).unwrap_or(&no_fields);
+            let expected_columns = column_changes.expect(now_name, was, now);
             let no_names = BTreeSet::new();
             let mut moved_parts = constraints.get(now_name).unwrap_or(&no_names).clone();
             if settled != Settled::Closing
@@ -4788,88 +4525,7 @@ fn refuse_unplanned_movement(
                 pending!(indexes, Index);
                 pending!(computed, Computed);
             }
-            let empty = BTreeSet::new();
-            for column in was.columns.keys().chain(now.columns.keys()) {
-                let mut moves = moved_columns.get(column).unwrap_or(&empty).clone();
-                // A renamed column is under its old name in a read taken
-                // before the rename statement and its new one after, so the
-                // read that spans the statement finds it under `from` on one
-                // side and `to` on the other. It is one column, and it is
-                // compared as one — excusing both names left it exempt at
-                // every later read of a staged run as well (DECISIONS 189).
-                // The old name itself is then the one-sided entry below.
-                let from = renamed_columns.get(&(now_name, column.as_str())).copied();
-                // One name, two columns. When this plan *drops* the column
-                // that held the name and renames another into it, the entry
-                // the baseline has under that name is the doomed one and the
-                // entry the read-back has is the survivor: comparing them
-                // reports the rename as a retype of a column nobody touched,
-                // and refuses a valid plan at its own checkpoint after the
-                // engine has already performed it (DECISIONS 474). The
-                // survivor's own baseline is under `from`, which is where the
-                // rename branch below already looks — so the name the plan
-                // gives up stops answering for the name it claims.
-                //
-                // The doomed column is not left uncompared: its absence is
-                // what `columns_after` holds this plan to, and the plan is in
-                // `order_key` order, so the rename's `Present` is the net
-                // promise about the name (DECISIONS 280).
-                //
-                // Only across the rename itself: the earlier read still has
-                // the source and the later one does not. That is the one
-                // arrangement in which the entry under this name really is the
-                // doomed column on one side and the survivor on the other.
-                //
-                // Both halves were a review finding of their own. Without the
-                // first, a staged run's closing read — compared against the
-                // checkpoint the last statement left, where neither side holds
-                // the source — fell through to nothing, and the rename's
-                // `Whole` excused the `None` as a one-sided column, so a
-                // concurrent retype between that checkpoint and the closing
-                // read passed. Without the second, a checkpoint spanning the
-                // *drop* alone did the same when another session put the name
-                // back before the read: the source is still there, the rename
-                // has not run, and what stands under the claimed name is a
-                // replacement rather than the survivor. Either way SPEC 7.6
-                // promises to catch it, so neither read may take this branch.
-                let given_up = from.is_some_and(|from| {
-                    was.columns.contains_key(from) && !now.columns.contains_key(from)
-                }) && dropped_columns
-                    .get(now_name)
-                    .is_some_and(|d| d.contains(column.as_str()));
-                let was_c = was.columns.get(column).filter(|_| !given_up).or_else(|| {
-                    let from = from?;
-                    if now.columns.contains_key(from) {
-                        return None;
-                    }
-                    moves.extend(moved_columns.get(from).into_iter().flatten().copied());
-                    was.columns.get(from)
-                });
-                // Added, dropped or renamed: the column is on one side only,
-                // and its presence is what `columns_after` answers for. Only
-                // where it *is* one-sided, though — a column this plan adds
-                // that is on both sides of a later read of a staged run is
-                // two read-backs like any other, and excusing it there is
-                // what let a concurrent redefinition through (DECISIONS 189).
-                let (Some(was_c), Some(now_c)) = (was_c, now.columns.get(column)) else {
-                    if !moves.contains(&pbps_model::ColumnField::Whole) {
-                        moved.push(format!(
-                            "{now_name} column `{column}` is not on both sides, and no change of \
-                             this plan adds or removes it"
-                        ));
-                    }
-                    continue;
-                };
-                for (field, what) in differing(was_c, now_c) {
-                    if field.is_some_and(|f| moves.contains(&f)) {
-                        continue;
-                    }
-                    moved.push(format!(
-                        "{now_name} column `{column}` has a different {what} from the one the \
-                         plan was approved over, and no change of this plan moves it"
-                    ));
-                }
-            }
+            guard::columns(&expected_columns, now, now_name, &mut moved);
             if !keys.contains(now_name) && was.primary_key != now.primary_key {
                 moved.push(format!("{now_name} has a different primary key"));
             }
@@ -5366,8 +5022,6 @@ fn refuse_unplanned_movement(
         // the plan's own result (DECISIONS 168). Presence here, and the
         // definition next: a presence check is the wrong size for an
         // exclusion of a definition (DECISIONS 189).
-        let mut expected_columns: BTreeMap<pbps_model::ColumnRef, pbps_model::Presence> =
-            BTreeMap::new();
         // Keyed, not collected: a constraint or index whose *definition*
         // changes is a drop and an add under one name (`by_name!` in the
         // differ), and holding both outcomes meant the add satisfied
@@ -5380,96 +5034,13 @@ fn refuse_unplanned_movement(
             (&TableName, pbps_model::Part, Option<&str>),
             pbps_model::PartAfter<'_>,
         > = BTreeMap::new();
-        // And the *definition* of each column field the plan moves, for the
-        // same reason: the shape comparison excludes exactly those fields,
-        // so nothing but this says what became of them. Presence alone let a
-        // column another session retyped between the plan's `ALTER` and the
-        // checkpoint read be recorded as the plan's own result — while the
-        // created-table block above already held its columns to the
-        // declaration, in the same fields (DECISIONS 189).
-        //
-        // Keyed by field, and for the reason the parts above are keyed by
-        // name: a column that changes type and replaces its default gives up
-        // the old default, changes type and takes the new one (DECISIONS 271),
-        // so one field carries `Default(false)` and then `Default(true)` and
-        // no read can satisfy both. The plan is in `order_key` order, so the
-        // last promise about a field is the net one (DECISIONS 280).
-        let mut expected_promises: BTreeMap<
-            (pbps_model::ColumnRef, pbps_model::ColumnField),
-            pbps_model::ColumnPromise<'_>,
-        > = BTreeMap::new();
         for (index, p) in changes.changes.iter().enumerate() {
-            expected_columns.extend(p.change.columns_after());
-            for (column, promise) in p.change.columns_promised() {
-                expected_promises.insert((column, promise.field()), promise);
-            }
             if let Some(part) = p.change.constraints() {
                 let table = part_table_after(part.table, &changes.changes[index + 1..]);
                 expected_parts.insert((table, part.part(), part.name), part.after);
             }
         }
-        for (column, expected) in expected_columns {
-            let Some(table) = after.tables.get(&column.table) else {
-                // The table itself is gone or renamed; its own check answers.
-                continue;
-            };
-            match (expected, table.columns.contains_key(&column.name)) {
-                (pbps_model::Presence::Present, false) => moved.push(format!(
-                    "{} column `{}` is not there, and this plan writes it",
-                    column.table, column.name
-                )),
-                (pbps_model::Presence::Absent, true) => moved.push(format!(
-                    "{} column `{}` is still there, and this plan removes it",
-                    column.table, column.name
-                )),
-                _ => {}
-            }
-        }
-        for ((column, _), promise) in expected_promises {
-            let Some(now) = after
-                .tables
-                .get(&column.table)
-                .and_then(|t| t.columns.get(&column.name))
-            else {
-                // Reported above, or the table's own check answers.
-                continue;
-            };
-            use pbps_model::ColumnPromise;
-            let (kept, what) = match promise {
-                ColumnPromise::Whole(declared) => {
-                    (column_as_declared(dialect, declared, now), "definition")
-                }
-                ColumnPromise::Type(to) => (same_type(dialect, to, &now.ty), "type"),
-                ColumnPromise::Nullable(to) => (now.nullable == to, "nullability"),
-                ColumnPromise::Default(has) => (
-                    (match now.value_source {
-                        pbps_model::ValueSource::Default(_) => true,
-                        pbps_model::ValueSource::None
-                        | pbps_model::ValueSource::Identity(_)
-                        | pbps_model::ValueSource::Sequence(_)
-                        | pbps_model::ValueSource::Generated(_) => false,
-                    }) == has,
-                    "default",
-                ),
-                ColumnPromise::Generated(has) => (
-                    (match now.value_source {
-                        pbps_model::ValueSource::Generated(_) => true,
-                        pbps_model::ValueSource::None
-                        | pbps_model::ValueSource::Default(_)
-                        | pbps_model::ValueSource::Identity(_)
-                        | pbps_model::ValueSource::Sequence(_) => false,
-                    }) == has,
-                    "generation expression",
-                ),
-                ColumnPromise::Collation(c) => (now.collation.as_ref() == c, "collation"),
-            };
-            if !kept {
-                moved.push(format!(
-                    "{} column `{}` does not have the {what} this plan gives it",
-                    column.table, column.name
-                ));
-            }
-        }
+        guard::columns_after(dialect, &column_changes, after, &mut moved);
         for ((table_name, part, part_name), after_it) in expected_parts {
             let Some(table) = after.tables.get(table_name) else {
                 continue;
@@ -8353,9 +7924,12 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         // the recording commands follow: a permission the declarations cannot
         // express stops a state being written down, whether it was there at
         // the start or arrived during the run (110).
-        refuse_unplanned_movement(
+        refuse_pinned_movement(
             dialect,
-            &plan.changes,
+            guard::Plan {
+                changes: &plan.changes,
+                ids: &plan.ids,
+            },
             &before,
             &after.schema,
             &target.label,
@@ -8930,9 +8504,22 @@ async fn apply_staged_under_lock(
         // true — refusing before writing it would lose the record of a
         // statement that has already committed, which is what checkpoints are
         // for. Stopping is the whole remedy a staged run has.
-        staged_movement(
+        let statement_changes = staged_statement_changes(&plan.changes, stmt);
+        let mut statement_ids = plan.ids.clone();
+        if let [logical] = plan.changes.changes.as_slice()
+            && let pbps_model::Change::RenameTable { to, .. } = &logical.change
+            && let [(.., statement_to)] = stmt.renames.as_slice()
+        {
+            // The emitter's intermediate address belongs to the pinned UID;
+            // changing its spelling preserves the recorded identity intent.
+            statement_ids.rename_table(to, statement_to);
+        }
+        staged_pinned_movement(
             dialect,
-            &staged_statement_changes(&plan.changes, stmt),
+            guard::Plan {
+                changes: &statement_changes,
+                ids: &statement_ids,
+            },
             &previous,
             &recorded,
             &target.label,
@@ -8975,9 +8562,12 @@ async fn apply_staged_under_lock(
     // what says the deployment finished — leaving the environment on its last
     // checkpoint is the honest answer, and `refuse_mid_deployment` then makes
     // every other command say so.
-    staged_movement(
+    staged_pinned_movement(
         dialect,
-        &plan.changes,
+        guard::Plan {
+            changes: &plan.changes,
+            ids: &plan.ids,
+        },
         &previous,
         &after.schema,
         &target.label,
@@ -9137,7 +8727,7 @@ fn staged_statement_changes(
 ///
 /// # Why this is not part of the movement comparison
 ///
-/// `refuse_unplanned_movement` compares two `Schema`s, and what `PUBLIC` holds
+/// `refuse_pinned_movement` compares two `Schema`s, and what `PUBLIC` holds
 /// is never in one: it is the engine's default rather than a grant, so putting
 /// it there would make every routine read back as drift (DECISIONS 371, 95).
 /// The decision this plan carries is therefore checked against the read's own
@@ -9191,9 +8781,9 @@ fn refuse_unmet_public_execution(
     Ok(())
 }
 
-fn staged_movement(
+fn staged_pinned_movement(
     dialect: &dyn pbps_dialect::Dialect,
-    changes: &pbps_model::ChangeSet,
+    plan: guard::Plan<'_>,
     before: &Schema,
     after: &Schema,
     label: &str,
@@ -9209,7 +8799,7 @@ fn staged_movement(
         StagedRead::Checkpoint { .. } => Settled::Whole,
         StagedRead::Closing { .. } => Settled::Closing,
     };
-    refuse_unplanned_movement(dialect, changes, before, after, label, settled).map_err(|e| {
+    refuse_pinned_movement(dialect, plan, before, after, label, settled).map_err(|e| {
         match read {
             StagedRead::Checkpoint { completed, total } => anyhow::anyhow!(
                 "{e:#}\n\n\
@@ -18545,7 +18135,7 @@ mod tests {
                     defaults: Vec::new(),
                 },
                 pbps_model::Change::RenameRole {
-                    uid,
+                    uid: "r_aaaaaa".parse().unwrap(),
                     from: "was".to_owned(),
                     to: "now".to_owned(),
                 },

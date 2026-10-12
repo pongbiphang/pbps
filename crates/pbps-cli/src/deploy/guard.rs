@@ -3,8 +3,10 @@
 mod check;
 mod expect;
 
-pub(super) use check::{created_place, implied, own, system_time, table};
-pub(super) use expect::{OwnNames, TableChanges};
+pub(super) use check::{
+    columns, columns_after, created_place, declared_column, implied, own, system_time, table,
+};
+pub(super) use expect::{ColumnChanges, OwnNames, TableChanges};
 
 /// Kept readings compare exactly; only a field the plan changes can be
 /// unpromised between statements (SPEC 7.6). The two planned forms preserve
@@ -24,6 +26,34 @@ enum Expr<'a> {
     Keep(Option<&'a str>),
     Planned(bool),
     Unpromised,
+}
+
+/// Read-only field views of the exclusive value source. A planned expression
+/// may move without excusing a change to its source kind or owned metadata.
+struct Source<'a> {
+    default: Option<&'a str>,
+    identity: Option<&'a pbps_model::Identity>,
+    sequence: Option<&'a pbps_model::OwnedSequence>,
+    generated: Option<&'a pbps_model::Generated>,
+}
+
+impl<'a> Source<'a> {
+    fn of(source: &'a pbps_model::ValueSource) -> Self {
+        use pbps_model::ValueSource;
+        let (default, identity, sequence, generated) = match source {
+            ValueSource::None => (None, None, None, None),
+            ValueSource::Default(text) => (Some(text.as_str()), None, None, None),
+            ValueSource::Identity(identity) => (None, Some(identity), None, None),
+            ValueSource::Sequence(sequence) => (None, None, Some(sequence), None),
+            ValueSource::Generated(generated) => (None, None, None, Some(generated)),
+        };
+        Self {
+            default,
+            identity,
+            sequence,
+            generated,
+        }
+    }
 }
 
 impl Expr<'_> {
@@ -56,3 +86,14 @@ impl<T: PartialEq> Req<T> {
 
 #[cfg(test)]
 mod tests;
+
+/// Both inputs are pinned by the saved plan; observations supply no identity intent.
+pub(super) struct Plan<'a> {
+    pub(super) changes: &'a pbps_model::ChangeSet,
+    pub(super) ids: &'a pbps_model::IdsFile,
+}
+
+#[cfg(test)]
+mod fixture;
+#[cfg(test)]
+pub(super) use fixture::ids as fixture_ids;

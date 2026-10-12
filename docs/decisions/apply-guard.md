@@ -1308,3 +1308,51 @@ The parent still owns column expectations, the remaining created-table and
 part comparisons, table presence/renames, and the production-only staged
 single-change restriction. Existing synthetic intermediate-read tests remain
 supported through this slice.
+
+<a id="dec-1929-1"></a>
+
+**DEC-1929.1. Column requirements follow pinned identities before comparing
+observations (#1774 slice 3).** The production guard receives the saved plan's
+actual `IdsFile` and builds `PlanNames` over its ordered changes. Column
+movement, final presence and the last promise for each field are derived in
+`deploy::guard::expect`; `check` consumes those requirements. The former
+column-step/name-handoff simulation and separate field/presence/promise
+collectors are removed from the deployment function.
+
+A column name can belong to different UIDs on the two sides of a transaction.
+The name index supplies the surviving UID's original spelling, or a known
+vacancy, rather than treating a missing identity as a same-named replacement.
+Field promises follow that UID through intermediate column spellings. A
+vacated spelling has its own absence requirement. Parent effects retain their
+execution position and follow the parent's UID through a later table rename,
+so dropping a column before renaming its parent also removes the partition's
+corresponding own entry. Kept columns, own entries and constraint references
+continue to use their respective observation policies.
+
+`Column` is destructured without `..` both when deriving kept requirements and
+when comparing held or declared columns. Kept type, nullability, collation,
+expression text, source metadata and annotations compare exactly; a field the
+plan sets still uses the existing dialect normalization or expression-presence
+contract. Whole-column presence permission never excuses another field's
+movement between two catalog readings. A generated column's stored kind,
+identity and owned-sequence metadata remain held even when an expression is
+planned. Owned sequence names are resolved at their original table/column
+address before rename alignment; only a planned declaration uses
+`OwnedSequence::declares`.
+
+A staged schema transfer followed by a rename still has a statement-specific
+intermediate address (DECISIONS 436). The guard uses that statement's typed
+rename with the same pinned table UID and its columns, not newly inferred
+identity intent. The production one-logical-change restriction and existing
+checkpoint/closing policies remain. No synthetic intermediate-read fixture
+needed to be re-scoped for this slice. The legacy fixture adapter is compiled
+only in tests; explicit fixture UIDs remain subject to `PlanNames` validation.
+
+Regression cases cover intermediate column spellings with a replaced default,
+a parent drop before rename, a retired UID whose name gets a new holder, every
+held column field across the rename and
+at close, and column diagnostic order. Existing name handoffs, impostors,
+partition reach, sequence names and staged deployment tests remain in force.
+The remaining parts, clustered holder, created-table families and table
+presence/rename policy stay with #1774's later slices. Managed spelling history
+here makes no claim about physical catalog lineage, which belongs to #1875.
