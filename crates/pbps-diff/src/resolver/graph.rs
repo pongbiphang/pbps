@@ -361,11 +361,15 @@ pub(super) fn constraints(
     }
 
     // A partition's own default spelled by a column name its parent's
-    // rename moves: a release spelled by the old name before the rename, and
-    // a setting spelled by the new name after it. A partition declares no
-    // column, so the parent's rename is the one that moves the name, and the
-    // rules below that read a column's own rename by its UID do not see it
-    // (#1610 review).
+    // rename moves. A partition declares no column, so the parent's rename is
+    // the one that moves the name, and the rules below that read a column's
+    // own rename by its UID do not see it (#1610 review). Only a release the
+    // resolver appended is spelled by the base name, so it goes before the
+    // parent's rename away from that name; every other change, the ordinary
+    // plan's included, is spelled by the name the column has once the
+    // renames have run, so it goes after the rename into that name. The
+    // parent is matched by its table UID, which a rename of the parent
+    // itself does not change.
     for (i, change) in steps.iter().enumerate() {
         let Change::SetPartitionDefault {
             parent,
@@ -377,16 +381,25 @@ pub(super) fn constraints(
         else {
             continue;
         };
-        let sets = to.is_some() || fallback.is_some();
+        let base_spelled = i >= ordinary && to.is_none() && fallback.is_none();
+        let parent_uid = if base_spelled {
+            base.ids.table_uid(parent)
+        } else {
+            desired
+                .ids
+                .table_uid(parent)
+                .or_else(|| base.ids.table_uid(parent))
+        };
+        if parent_uid.is_none() {
+            continue;
+        }
         for (j, other) in steps.iter().enumerate() {
-            if let Change::RenameColumn {
-                table, from, to, ..
-            } = other
-                && table == parent
+            if let Change::RenameColumn { from, to, .. } = other
+                && owners[j] == parent_uid
             {
-                if !sets && from == column {
+                if base_spelled && from == column {
                     edge(i, j, OrderReason::Identity);
-                } else if sets && to == column {
+                } else if !base_spelled && to == column {
                     edge(j, i, OrderReason::Identity);
                 }
             }

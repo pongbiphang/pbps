@@ -2668,6 +2668,154 @@ mod generated_surface_coverage {
         ordered.proof.validate(&ordered.changes).unwrap();
     }
 
+    /// A partitioned `parent(k, columns...)` with `partition` holding the
+    /// given own defaults.
+    fn tree(parent: &str, columns: &[&str], partition: &str, overrides: &[(&str, &str)]) -> Schema {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+        let mut schema = Schema::default();
+        schema.tables.insert(
+            parent.parse().unwrap(),
+            Table {
+                columns: columns
+                    .iter()
+                    .map(|c| ((*c).to_owned(), Column::new("int".parse().unwrap())))
+                    .collect(),
+                partition_by: Some(PartitionBy {
+                    external: false,
+                    columns: vec!["k".into()],
+                }),
+                ..Default::default()
+            },
+        );
+        schema.tables.insert(
+            partition.parse().unwrap(),
+            Table {
+                partition_of: Some(PartitionOf {
+                    parent: parent.parse().unwrap(),
+                    bound: PartitionBound::Default,
+                    columns: overrides
+                        .iter()
+                        .map(|(c, default)| {
+                            (
+                                (*c).to_owned(),
+                                PartitionColumn {
+                                    default: Some((*default).into()),
+                                    not_null: false,
+                                },
+                            )
+                        })
+                        .collect(),
+                }),
+                ..Default::default()
+            },
+        );
+        schema
+    }
+
+    /// #1610 review: the parent renames `e` to `f` and `d` to `e`, and the
+    /// plan removes the partition's own default on the original `d`. The
+    /// ordinary plan spells that removal `p.e`, the name the column has once
+    /// both renames have run, so it follows them: placed before `e -> f`, it
+    /// would take the default off the old `e` and leave `d`'s in place.
+    #[test]
+    fn an_ordinary_partition_removal_follows_its_parents_rename_chain() {
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let base = tree("app.t", &["k", "d", "e"], "app.p", &[("d", "app.f(1)")]);
+        let desired = tree("app.t", &["k", "e", "f"], "app.p", &[]);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        let d = before_ids.column_uid(&t.column("d")).unwrap().clone();
+        let e = before_ids.column_uid(&t.column("e")).unwrap().clone();
+        after_ids.columns.get_mut(&e).unwrap().name = "f".into();
+        after_ids.columns.get_mut(&d).unwrap().name = "e".into();
+        let removed = SurfaceResolution {
+            surface: Surface::Default(p.column("d")),
+            current: Some(bound("pg_attrdef", "app.p.d", &[], "f")),
+            desired: None,
+        };
+        let ordered = planned(&base, &before_ids, &desired, &after_ids, &[removed])
+            .unwrap_or_else(|error| panic!("a rename chain is refused: {error:?}"));
+        let renamed = |from: &str| {
+            at(
+                &ordered,
+                &|c| matches!(c, Change::RenameColumn { table, from: f, .. } if *table == t && f == from),
+            )
+        };
+        let removal = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, from: Some(_), to: None, .. }
+                if *table == p && column == "e")
+        });
+        assert!(
+            renamed("e") < removal && renamed("d") < removal,
+            "{:?}",
+            ordered.changes.changes
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// #1610 review: the plan renames the parent `app.t` to `app.u` as well
+    /// as its column `e` to `d`. The rebuilt override's release names the
+    /// parent `app.t` and the rename names `app.u`, so the parent is matched
+    /// by its UID: the release still goes before the column rename.
+    #[test]
+    fn a_partitions_rebuild_follows_its_parents_column_rename_through_a_table_rename() {
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let u: pbps_model::TableName = "app.u".parse().unwrap();
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let base = tree(
+            "app.t",
+            &["k", "d", "e"],
+            "app.p",
+            &[("d", "app.f(1)"), ("e", "app.f(2)")],
+        );
+        let desired = tree("app.u", &["k", "d"], "app.p", &[("d", "app.f(2)")]);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        let parent = before_ids.table_uid(&t).unwrap().clone();
+        let d = before_ids.column_uid(&t.column("d")).unwrap().clone();
+        let e = before_ids.column_uid(&t.column("e")).unwrap().clone();
+        *after_ids.tables.get_mut(&parent).unwrap() = u.clone();
+        for column in after_ids.columns.values_mut() {
+            if column.table == t {
+                column.table = u.clone();
+            }
+        }
+        after_ids.columns.remove(&d);
+        after_ids.columns.get_mut(&e).unwrap().name = "d".into();
+        let removed = SurfaceResolution {
+            surface: Surface::Default(p.column("e")),
+            current: Some(bound("pg_attrdef", "app.p.e", &[], "f")),
+            desired: None,
+        };
+        let ordered = planned(
+            &base,
+            &before_ids,
+            &desired,
+            &after_ids,
+            &[rebinds("app.p"), removed],
+        )
+        .unwrap_or_else(|error| panic!("a renamed parent is refused: {error:?}"));
+        let rename = at(
+            &ordered,
+            &|c| matches!(c, Change::RenameColumn { from, to, .. } if from == "e" && to == "d"),
+        );
+        let release = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, to: None, fallback: None, .. }
+                if *table == p && column == "e")
+        });
+        let restore = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, to: Some(_), .. }
+                if *table == p && column == "d")
+        });
+        assert!(
+            release < rename && rename < restore,
+            "{:?}",
+            ordered.changes.changes
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
     /// #1610 review: a table replaced under its name, with new UIDs, whose
     /// generated column comes back as an ordinary one with a default. Only
     /// the plan's side has a default; the ordinary plan's `DropTable` and
