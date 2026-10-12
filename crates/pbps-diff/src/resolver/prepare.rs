@@ -337,8 +337,10 @@ pub(super) fn changes(
                     .get(&column.table)
                     .is_some_and(|t| t.partition_of.is_some()) =>
             {
-                partition_default(column, base, desired, ids, before_ids)
-                    .ok_or_else(|| Error::Definition(surface.clone()))?
+                match partition_default(surface, column, base, desired, ids, before_ids)? {
+                    Some(pair) => pair,
+                    None => continue,
+                }
             }
             Surface::Default(column) => {
                 let Surface::Default(before_column) = &previous else {
@@ -385,37 +387,30 @@ pub(super) fn changes(
                     }
                     continue;
                 }
-                // A column the ordinary plan replaces, its name taken by a
-                // new column under a new UID, is rebuilt by that replacement:
-                // the `AddColumn` writes the new default, and the old column
-                // may have had none, such as a generated one (#1610 review).
-                if ordinary.changes.iter().any(|p| {
-                    matches!(&p.change, Change::DropColumn { column: c, .. } if c == before_column)
-                        || matches!(&p.change, Change::AddColumn { table, name, .. }
-                            if *table == column.table && *name == column.name)
-                }) {
-                    continue;
-                }
-                // Otherwise a surface the plan rebuilds had a default to bind:
-                // one that is gone is a definition the rebuild cannot spell,
-                // not nothing to rebuild (#1610).
-                let old = base
-                    .tables
-                    .get(&before_column.table)
-                    .and_then(|t| t.columns.get(&before_column.name))
-                    .and_then(|c| c.default.clone())
-                    .ok_or_else(|| Error::Definition(surface.clone()))?;
+                // The old default is the column's, or, on a partition the
+                // plan detaches, its own override (#1578), which the detach
+                // keeps (#1610 review).
+                let old = base.tables.get(&before_column.table).and_then(|t| {
+                    t.columns
+                        .get(&before_column.name)
+                        .and_then(|c| c.default.clone())
+                        .or_else(|| {
+                            t.partition_of
+                                .as_ref()?
+                                .columns
+                                .get(&before_column.name)?
+                                .default
+                                .clone()
+                        })
+                });
                 let new = desired
                     .tables
                     .get(&column.table)
                     .and_then(|t| t.columns.get(&column.name))
-                    .and_then(|c| match &c.value_source {
-                        ValueSource::Default(value) => Some(value.clone()),
-                        ValueSource::None
-                        | ValueSource::Identity(_)
-                        | ValueSource::Generated(_) => None,
-                    })
-                    .ok_or_else(|| Error::Definition(surface.clone()))?;
+                    .and_then(|c| c.default.clone());
+                let Some((old, new)) = both_defaults(surface, old, new)? else {
+                    continue;
+                };
                 let uid = ids
                     .column_uid(column)
                     .ok_or_else(|| Error::Definition(surface.clone()))?
@@ -525,35 +520,73 @@ pub(super) fn changes(
     Ok((ChangeSet { changes }, ordinary))
 }
 
+/// Both sides' defaults of a rebuilt surface, or `None` when only one side
+/// has one: the ordinary plan adds or removes that default itself, through
+/// the change, or a column, table or partition it replaces, attaches or
+/// detaches, so there is no default bound on both sides to rebuild. A
+/// surface with no default on either side is a definition the rebuild cannot
+/// spell, and is refused by name rather than skipped (#1610).
+fn both_defaults(
+    surface: &Surface,
+    old: Option<String>,
+    new: Option<String>,
+) -> Result<Option<(String, String)>, Error> {
+    match (old, new) {
+        (Some(old), Some(new)) => Ok(Some((old, new))),
+        (Some(_), None) | (None, Some(_)) => Ok(None),
+        (None, None) => Err(Error::Definition(surface.clone())),
+    }
+}
+
 /// The release and restoration of a partition's own default, the pair the
 /// ordinary path builds for a module rebuild (DEC-1581.1). A partition
 /// declares no column, so its default lives in `partition_of.columns`
 /// (#1578) and the column is keyed by the partition's table UID; the name it
 /// had before the plan is its parent column's, found by that column's UID
-/// (#1610). `None` when either side has no default of the partition's own.
+/// (#1610). `None` when only one side has a default of the partition's own,
+/// as [`both_defaults`] says.
 fn partition_default(
+    surface: &Surface,
     column: &pbps_model::ColumnRef,
     base: &Schema,
     desired: &Schema,
     ids: &IdsFile,
     before_ids: &IdsFile,
-) -> Option<Vec<Change>> {
-    let of = desired.tables.get(&column.table)?.partition_of.as_ref()?;
-    let uid = ids.table_uid(&column.table)?.clone();
+) -> Result<Option<Vec<Change>>, Error> {
+    let definition = || Error::Definition(surface.clone());
+    let of = desired
+        .tables
+        .get(&column.table)
+        .and_then(|t| t.partition_of.as_ref())
+        .ok_or_else(definition)?;
+    let uid = ids.table_uid(&column.table).ok_or_else(definition)?.clone();
     let before_table = ids.resolved_in(&column.table, before_ids);
-    let before_of = base.tables.get(&before_table)?.partition_of.as_ref()?;
     let before_name = ids
         .column_uid(&of.parent.column(&column.name))
         .and_then(|parent| before_ids.columns.get(parent))
         .map_or_else(|| column.name.clone(), |c| c.name.clone());
-    let old = before_of.columns.get(&before_name)?.default.clone()?;
-    let new = of.columns.get(&column.name)?.default.clone()?;
+    // A table the plan attaches had no override of its own to release.
+    let before_of = base
+        .tables
+        .get(&before_table)
+        .and_then(|t| t.partition_of.as_ref());
+    let old = before_of
+        .and_then(|of| of.columns.get(&before_name))
+        .and_then(|own| own.default.clone());
+    let new = of
+        .columns
+        .get(&column.name)
+        .and_then(|own| own.default.clone());
+    let Some((old, new)) = both_defaults(surface, old, new)? else {
+        return Ok(None);
+    };
+    let before_of = before_of.ok_or_else(definition)?;
     let fallback = desired
         .tables
         .get(&of.parent)
         .and_then(|parent| parent.columns.get(&column.name))
         .and_then(|c| c.default.clone());
-    Some(vec![
+    Ok(Some(vec![
         Change::SetPartitionDefault {
             uid: uid.clone(),
             table: before_table,
@@ -572,7 +605,7 @@ fn partition_default(
             to: Some(new),
             fallback,
         },
-    ])
+    ]))
 }
 
 fn tears_down(change: &Change, surface: &Surface) -> bool {
