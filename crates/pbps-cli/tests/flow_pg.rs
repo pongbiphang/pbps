@@ -3999,6 +3999,35 @@ fn pull_leaves_out_and_names_what_validate_would_refuse() {
     );
 }
 
+/// `text` is PostgreSQL's ordinary unbounded string. The deprecated-type rule
+/// judged it by SQL Server's list and told a PostgreSQL project to use
+/// `varchar(max)`, a type PostgreSQL does not have (#1869). Offline, so it
+/// runs without a server.
+#[test]
+fn validate_does_not_call_postgres_text_deprecated() {
+    let d = Demo::new("text-not-deprecated");
+    d.table("table: app.t\ncolumns:\n  id: {type: integer}\n  body: {type: text}\n");
+    for config in [
+        "dialect: postgres\n",
+        "dialect: postgres\npolicies:\n  rules:\n    column.no-deprecated-type: error\n",
+    ] {
+        std::fs::write(d.dir.join("pbps.yml"), config).unwrap();
+        let o = d.run(&["validate", "--format", "json"]);
+        assert_eq!(code(&o), 0, "{config}: {}{}", stdout(&o), stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        let ids: Vec<&str> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["id"].as_str())
+            .collect();
+        assert!(
+            !ids.contains(&"column.no-deprecated-type"),
+            "{config}: `text` is not deprecated on PostgreSQL: {v}"
+        );
+    }
+}
+
 /// Issue #919. A pull into a project whose `pbps.yml` sets a declaration rule
 /// to `error` evaluated only `data.max-rows`, so it wrote a table the next
 /// `validate` refused for its name. Every declaration rule is evaluated now,
@@ -4013,10 +4042,14 @@ fn pull_draws_the_line_the_projects_own_rules_draw() {
     on_server(
         &connection,
         "CREATE SCHEMA app; CREATE TABLE app.\"BadName\" (id integer PRIMARY KEY); \
-         CREATE TABLE app.good (id integer PRIMARY KEY)",
+         CREATE TABLE app.good (id integer PRIMARY KEY, note text)",
     );
+    // `text` is PostgreSQL's ordinary string, not SQL Server's deprecated LOB
+    // type: at `error` the deprecated-type rule would refuse every pull below
+    // if it still judged PostgreSQL by SQL Server's list (#1869).
     let rule = "dialect: postgres\npolicies:\n  rules:\n    naming.table: \
-                {severity: SEVERITY, pattern: \"^[a-z][a-z0-9_]*$\"}\n";
+                {severity: SEVERITY, pattern: \"^[a-z][a-z0-9_]*$\"}\n    \
+                column.no-deprecated-type: error\n";
 
     let d = Demo::new("pull-policy-error");
     std::fs::write(d.dir.join("pbps.yml"), rule.replace("SEVERITY", "error")).unwrap();
@@ -4044,8 +4077,10 @@ fn pull_draws_the_line_the_projects_own_rules_draw() {
     let o = d.run(&["pull", "--db", &connection]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     assert!(stderr(&o).contains("app.BadName"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("deprecated"), "{}", stderr(&o));
     let o = d.run(&["validate"]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(!stderr(&o).contains("deprecated"), "{}", stderr(&o));
 
     // Excused by name at `error`: the pull writes, and so does `validate` pass.
     let d = Demo::new("pull-policy-suppressed");

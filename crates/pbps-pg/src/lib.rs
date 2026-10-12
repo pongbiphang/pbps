@@ -685,6 +685,13 @@ impl Dialect for Postgres {
         Some(session_pins!())
     }
 
+    /// None: `text` is PostgreSQL's ordinary unbounded string, not SQL
+    /// Server's deprecated LOB type, and nothing this dialect accepts is
+    /// deprecated by the engine (DEC-1869.1).
+    fn deprecated_types(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
     fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
         types::normalize(ty)
     }

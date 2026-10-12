@@ -99,6 +99,12 @@ impl Dialect for Mssql {
         }
     }
 
+    fn deprecated_types(&self) -> &'static [(&'static str, &'static str)] {
+        const LOB: &str = "has been deprecated since SQL Server 2005; \
+                           use varchar(max), nvarchar(max) or varbinary(max)";
+        &[("text", LOB), ("ntext", LOB), ("image", LOB)]
+    }
+
     fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
         types::normalize(ty)
     }

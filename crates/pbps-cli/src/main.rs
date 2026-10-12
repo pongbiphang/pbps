@@ -1477,8 +1477,14 @@ fn cmd_pull(
     Ok(())
 }
 
-/// What the policy rules need besides the block (ADR-0008).
-fn policy_context(project: &Project, connected: bool) -> pbps_policy::Context {
+/// What the policy rules need besides the block (ADR-0008), including the
+/// dialect's deprecated types, which the policy crate cannot know itself
+/// (DEC-1869.1).
+fn policy_context(
+    project: &Project,
+    dialect: &dyn Dialect,
+    connected: bool,
+) -> pbps_policy::Context {
     pbps_policy::Context {
         now: unix_seconds(),
         max_rows: project
@@ -1487,6 +1493,7 @@ fn policy_context(project: &Project, connected: bool) -> pbps_policy::Context {
             .unwrap_or(pbps_model::data::DEFAULT_MAX_ROWS),
         connected,
         only: None,
+        deprecated_types: dialect.deprecated_types(),
     }
 }
 
@@ -1499,6 +1506,7 @@ fn policy_context(project: &Project, connected: bool) -> pbps_policy::Context {
 pub fn attach_policy_findings(
     cs: &mut pbps_model::ChangeSet,
     project: &Project,
+    dialect: &dyn Dialect,
     connected: bool,
 ) -> Vec<output::Finding> {
     let policies = project.config.policies();
@@ -1511,7 +1519,7 @@ pub fn attach_policy_findings(
             .at(project.config_file(), None),
         ];
     }
-    let ctx = policy_context(project, connected);
+    let ctx = policy_context(project, dialect, connected);
     let mut out = Vec::new();
     for (at, f) in pbps_policy::plan(cs, &policies, &ctx) {
         out.push(policy_finding(&f));
@@ -2039,7 +2047,7 @@ pub fn validate_findings(
                 (_, Err(_)) => Some(Default::default()),
             },
         };
-        let mut ctx = policy_context(project, false);
+        let mut ctx = policy_context(project, dialect, false);
         ctx.only = only;
         // Types in the dialect's own spelling, because the policy crate is
         // dialect-agnostic on purpose and a rule that names a type sees
@@ -2829,7 +2837,7 @@ fn cmd_plan(
     // the plan file carries them to `explain`, and reported here at the
     // severity the project chose. An `error` refuses to produce the plan —
     // nothing below writes a file for it — and never reaches `apply`.
-    let policy = attach_policy_findings(&mut cs, project, false);
+    let policy = attach_policy_findings(&mut cs, project, dialect.as_ref(), false);
     let refused = policy.iter().any(|f| f.severity == output::Severity::Error);
     findings.extend(policy);
 

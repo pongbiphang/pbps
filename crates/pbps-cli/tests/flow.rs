@@ -14173,7 +14173,10 @@ fn an_unknown_revision_is_refused_rather_than_read_as_empty() {
 #[test]
 fn a_deprecated_type_is_reported_under_its_alias() {
     let d = Demo::new("aliastype");
-    for ty in ["ntext", "national text"] {
+    // The dialect's whole list, not only the alias: moving the list from the
+    // policy crate to the dialect (DEC-1869.1) must leave SQL Server's
+    // findings as they were.
+    for ty in ["text", "ntext", "national text", "image"] {
         d.table(&format!(
             "table: dbo.t\ncolumns:\n  id: {{type: int}}\n  body: {{type: \"{ty}\"}}\n"
         ));
@@ -14193,6 +14196,22 @@ fn a_deprecated_type_is_reported_under_its_alias() {
             "{ty} is deprecated whichever way it is spelled: {v}"
         );
     }
+    // At `error` the same finding fails `validate`: exit 2, something to act
+    // on (SPEC's exit-code table).
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    column.no-deprecated-type: error\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 2, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("has been deprecated since SQL Server 2005")
+            || stderr(&o).contains("has been deprecated since SQL Server 2005"),
+        "{}{}",
+        stdout(&o),
+        stderr(&o)
+    );
 }
 
 /// `git ls-tree --name-only` C-quotes any path outside ASCII with
