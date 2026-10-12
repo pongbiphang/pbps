@@ -93,11 +93,11 @@ test runtime for the shipped browser module, not a product dependency.
 
 [ADR-0016](ADR-0016-engine-assisted-planning.md) and
 [SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
-are accepted design; initial read-only `doctor` environment discovery (#597)
-and named profile selection/policy (#606) are implemented. The internal Docker
-runtime supports acquisition, native target separation and contained private
-channels (#608). Engine compatibility qualification and binding evidence remain
-planned. The design preserves the boundaries
+are accepted design; initial read-only `doctor` environment discovery (#597),
+resolver selection/policy (#606), engine compatibility qualification (#610,
+#611) and the resolver's server and Docker scratch runs (#1672, #1674) are
+implemented. Publishing binding evidence remains planned. The design
+preserves the boundaries
 above: CLI owns resolver lifecycle and reporting; the engine crates own
 environment queries, compatibility rules, scratch DDL and binding extraction;
 `pbps-db` owns transport, not SQL or provisioning. Connected work continues
@@ -106,17 +106,13 @@ through `pbps-cli::engine`, not I/O on the pure `Dialect` trait or in the differ
 Shared deterministic plan evidence belongs beside semantic `Schema`, never in
 its equality or as driver-specific types. The final typed ChangeSet remains the
 only input to deployment SQL emission. Target reads and scratch writes use
-separate connections and credentials. The operator-vouched resolver needs only
-another database, empty, behind another credential variable; the operator
-vouches for the rest (DEC-1528.1). **Measured profiles only:** target and
-scratch use separate instances/clusters, engine identity checks and trusted
-provisioning evidence must establish separation before scratch DDL, and a
-different database name is insufficient. Their CLI lifecycle and
-engine-specific profiles also qualify runtime-enforced network/filesystem containment before
-any compiled source is sent, plus source handling for external definitions,
-including server/container log capture and disposable storage (ADR-0016).
-Containment is enforced outside SQL privileges by the qualified runtime, not by
-adding a plugin engine or moving provisioning into database transport.
+separate connections and credentials. The resolver needs only another
+database, empty, behind another credential variable, or a container it starts
+through the runner's `docker` command; the operator vouches for its isolation
+(DEC-1528.1, DEC-1636.1). Separation is decided by the engines' own identity
+before any scratch write, not by names. pbps enforces no containment and
+observes no process, so the resolver reaches its scratch with SQL alone and
+runs on every platform pbps supports.
 `apply` checks saved prerequisites without invoking the resolver or adding
 changes after approval.
 
@@ -138,46 +134,23 @@ profiles and pure precedence lookup contain credential-variable names only.
 CLI exposes the unacquired selection as optional command-summary data, never
 as model evidence or acquisition/compatibility proof (DECISIONS 494).
 
-The verified TLS primitive lives in `pbps-db::transport`; its opaque connection
-identity belongs to one successfully authenticated handshake. Only the private
-driver modules interpret connection options or name driver types. It contains
-no SQL or provisioning and grants no resolver admission: runtime and engine
-profiles must qualify every backend hop, separation and run binding before
-using its replies as evidence (DECISIONS 495).
+`pbps-db::transport` holds the sealed query-connection seam engine-owned
+resolver SQL runs through, implemented by the ordinary connection only. Only
+the private driver modules interpret connection options or name driver types.
+It contains no SQL or provisioning (DECISIONS 495).
 
-The internal Docker runtime layer lives in `pbps-cli::resolver`: local Docker
-API ownership and lifecycle remain outside database transport. Its `engine`
-routing modules select fixed source-free bootstrap recipes and dispatch the
-engine-owned identity queries. `pbps-db::transport::StreamConn` provides only
-database protocol over a supplied stream, with no host lookup, reconnect or
-claim of peer qualification. It is not a fallback for failed TLS. Engine
-identity SQL remains in `pbps-pg::resolver` and `pbps-mssql::resolver` through
-the sealed query-connection seam. Native process/channel and kernel leases are
-ephemeral CLI capabilities, never semantic schema or saved-plan evidence.
-The supplied-server profile in the same module measures a runtime pbps did not
-provision and owns its scratch resources' lifecycle; its per-engine session and
-scratch-resource SQL stays in the engine crates behind that same seam.
-See [the runtime boundary](RESOLVER-RUNTIME.md) for its staged startup,
-supported profiles and the remaining environment/binding gates.
-
-Both native catalog capture operations route through `native/target_engine`
-by an exhaustive match on the actual verified connection's driver. Capture
-refusals and comparison reports use `pbps-db::resolver::capture`; opaque
-PostgreSQL catalog/source capabilities remain engine-owned private state, as
-with the engine-only state in DECISIONS 417. SQL Server capture refuses by name
-until implemented. The CLI still takes ownership before the first await and
-expires the complete native binding on refusal or cancellation.
-
-Native capture transfers source-bearing library requirements through an opaque
-engine capability issued separately to the producer of a fresh connected read
-(DEC-974.1). Ordinary captured evidence cannot recover this capability. Its
-operations still require the CLI's qualified native observations (DEC-876.1). The PostgreSQL adapter owns its loader rules and
-opens one candidate beneath a root capability supplied by the CLI. It returns
-a mapping index or a reader with no path/raw-handle getter, Debug or Serialize.
-CLI still owns process/root qualification, mapping observation, content hashing,
-alias correlation, cancellation and every runtime lifecycle operation. The
-engine neither discovers processes nor acquires/provisions a runtime, and no
-filesystem responsibility moves into database transport.
+The resolver's run lives in `pbps-cli::resolver::server::scratch`: it reaches
+a supplied scratch server through its connection string, or starts and
+removes a Docker container through the runner's `docker` command, and owns the
+scratch resources' lifecycle. Its per-engine scratch and authorization SQL
+stays in the engine crates (`pbps-pg::resolver`, `pbps-mssql::resolver`)
+behind the sealed query-connection seam. Capture refusals and comparison
+reports use `pbps-db::resolver::capture`; opaque PostgreSQL catalog
+capabilities remain engine-owned private state, as with the engine-only state
+in DECISIONS 417. SQL Server capture refuses by name until implemented. The
+measured runtime layer — Docker API ownership, native process and channel
+leases, kernel containment and executable identity — was removed by #1636
+(DEC-1636.1).
 
 ## Inviolable constraints
 

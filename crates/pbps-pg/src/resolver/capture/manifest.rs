@@ -15,51 +15,13 @@ pub(super) struct Input {
 
 /// Private in-memory catalog evidence. It intentionally has no Debug,
 /// Serialize, digest getter, persistence constructor or verified flag.
-/// Executable/environment qualification is still required by the lifecycle.
-/// Receiving ordinary evidence does not grant its producer's native-input
-/// capability (DEC-974.1). In particular, caller-chosen mappings cannot probe it:
-/// ```compile_fail,E0624
-/// use pbps_pg::resolver::capture::{CapturedInputs, NativeLibrary};
-/// use std::{fs::File, path::Path};
-/// fn guess(captured: &CapturedInputs, name: String) -> bool {
-///     let inputs = captured.runtime_inputs().unwrap();
-///     let resolved = inputs.resolve_native(Path::new("/bin/postgres"), Path::new("/"));
-///     let root = File::open("/dev/null").unwrap();
-///     (0..resolved.len()).any(|i| matches!(resolved.open(i, &root, &[name.clone()]),
-///         Ok(NativeLibrary::Mapped { .. })))
-/// }
-/// ```
-/// Neither crafted roots nor selected-candidate positions can reveal its names:
-/// ```compile_fail,E0624
-/// use pbps_pg::resolver::capture::{CapturedInputs, NativeLibrary};
-/// use std::{fs::File, path::Path};
-/// fn probe(captured: &CapturedInputs, crafted_root: &File) -> Option<(usize, Vec<u8>)> {
-///     let inputs = captured.runtime_inputs().unwrap();
-///     let resolved = inputs.resolve_native(Path::new("/bin/postgres"), Path::new("/"));
-///     for i in 0..resolved.len() {
-///         if let Ok(NativeLibrary::Candidate { candidate, reader }) = resolved.open(i, crafted_root, &[]) {
-///             let mut content = Vec::new();
-///             reader.read_to_end(&mut content).ok()?;
-///             return Some((candidate, content));
-///         }
-///     }
-///     None
-/// }
-/// ```
-/// The capability cannot be recovered for later probing either:
-/// ```compile_fail,E0624
-/// use pbps_pg::resolver::capture::{CapturedInputs, RuntimeInputs};
-/// fn acquire(captured: &CapturedInputs) -> RuntimeInputs {
-///     captured.runtime_inputs().unwrap()
-/// }
-/// ```
 /// A result consumer cannot select a known key and test guesses of private
 /// properties. Only a fresh catalog read grants sealing authority:
 /// ```compile_fail,E0624
 /// use pbps_pg::resolver::capture::CapturedInputs;
 /// use pbps_db::fingerprint::EnvironmentFingerprintKey;
 /// fn probe(captured: &CapturedInputs, chosen: &EnvironmentFingerprintKey) {
-///     let _ = captured.seal(chosen);
+///     let _ = captured.seal_with_roles(chosen, None, None);
 /// }
 /// ```
 pub struct CapturedInputs {
@@ -263,19 +225,9 @@ fn normalize_value(
 }
 
 impl CapturedInputs {
-    /// Persistable catalog facts, keyed by the target environment. This is
-    /// still catalog evidence only: it does not confer runtime qualification.
-    /// No property value, including an external definition's literals, crosses
-    /// this boundary. The process-key comparison API cannot supply this key.
-    /// Only the producer of a fresh read may seal private inputs. An ordinary
-    /// recipient must not test guesses by supplying a known key (DEC-974.1).
-    /// ```compile_fail,E0624
-    /// use pbps_pg::resolver::capture::CapturedInputs;
-    /// use pbps_db::fingerprint::FingerprintKey;
-    /// fn persist(captured: &CapturedInputs) {
-    ///     let _ = captured.seal(FingerprintKey::process());
-    /// }
-    /// ```
+    /// [`Self::seal_with_roles`] without a role map or ownership, for the
+    /// capture tests.
+    #[cfg(test)]
     pub(super) fn seal(
         &self,
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
@@ -283,9 +235,22 @@ impl CapturedInputs {
         self.seal_with_roles(key, None, None)
     }
 
-    /// The mapped variant is used only during the scratch read owned by the
-    /// qualified run. Every principal position is normalized before hashing;
-    /// neither NULL ACLs nor grant options are collapsed.
+    /// Persistable catalog facts, keyed by the target environment. No property
+    /// value, including an external definition's literals, crosses this
+    /// boundary. The process-key comparison API cannot supply this key. Only
+    /// the producer of a fresh read may seal private inputs. An ordinary
+    /// recipient must not test guesses by supplying a known key (DEC-974.1).
+    /// ```compile_fail,E0624
+    /// use pbps_pg::resolver::capture::CapturedInputs;
+    /// use pbps_db::fingerprint::FingerprintKey;
+    /// fn persist(captured: &CapturedInputs) {
+    ///     let _ = captured.seal_with_roles(FingerprintKey::process(), None, None);
+    /// }
+    /// ```
+    ///
+    /// The role map is used only during the scratch read owned by the run.
+    /// Every principal position is normalized before hashing; neither NULL
+    /// ACLs nor grant options are collapsed.
     pub(super) fn seal_with_roles(
         &self,
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
@@ -409,73 +374,6 @@ impl CapturedInputs {
 
     pub fn scope(&self) -> &CaptureScope {
         &self.scope
-    }
-
-    // Only the producer of a fresh read may obtain the source capability.
-    // Making this public lets an ordinary result recipient guess names through
-    // mapped equality, crafted-root opens and candidate positions (DEC-974.1).
-    pub(super) fn runtime_inputs(&self) -> Result<super::RuntimeInputs, Uncovered> {
-        let mut libraries = BTreeSet::new();
-        for (object, input) in &self.inputs {
-            if object.class == "pg_proc"
-                && input
-                    .properties
-                    .get("prolang")
-                    .and_then(|language| language.get("name"))
-                    == Some(&serde_json::json!(["c"]))
-            {
-                let library = input
-                    .properties
-                    .get("probin")
-                    .and_then(Value::as_str)
-                    .filter(|name| !name.is_empty())
-                    .ok_or_else(|| {
-                        Uncovered::object(object, "required native library is unreadable")
-                    })?;
-                libraries.insert(library.to_owned());
-            }
-        }
-        for setting in [
-            "shared_preload_libraries",
-            "session_preload_libraries",
-            "local_preload_libraries",
-        ] {
-            let value = self.session.settings.get(setting).ok_or_else(|| {
-                Uncovered::class(
-                    "session-environment",
-                    "required preload setting is unreadable",
-                )
-            })?;
-            let names =
-                pbps_db::resolver::environment::guc_list(&value.value).ok_or_else(|| {
-                    Uncovered::class(
-                        "session-environment",
-                        "required preload list is unqualified",
-                    )
-                })?;
-            for name in names {
-                libraries.insert(
-                    if setting == "local_preload_libraries" && !name.contains('/') {
-                        format!("$libdir/plugins/{name}")
-                    } else {
-                        name
-                    },
-                );
-            }
-        }
-        let dynamic_library_path = self
-            .session
-            .settings
-            .get("dynamic_library_path")
-            .ok_or_else(|| {
-                Uncovered::class("session-environment", "library search path is unreadable")
-            })?
-            .value
-            .clone();
-        Ok(super::RuntimeInputs {
-            libraries: libraries.into_iter().collect(),
-            dynamic_library_path,
-        })
     }
 
     pub fn objects(&self) -> impl Iterator<Item = &ObjectIdentity> {

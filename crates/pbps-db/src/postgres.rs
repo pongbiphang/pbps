@@ -30,7 +30,6 @@ pub struct Row(tokio_postgres::Row);
 /// An open PostgreSQL connection.
 pub struct Conn {
     client: tokio_postgres::Client,
-    endpoints: Option<crate::transport::TcpEndpoints>,
     /// The polled connection future. Held, not detached — see the module header.
     _driver: tokio::task::JoinHandle<()>,
 }
@@ -164,8 +163,8 @@ impl Conn {
     /// [`connect`] to `database` on the same server, as `login` when given:
     /// the string supplies the endpoint and the TLS it asked for, the caller
     /// the database and credentials it created, and a new login none of the
-    /// string's startup `options`. The operator-vouched
-    /// resolver reaches its run-owned scratch database this way, so a
+    /// string's startup `options`. The resolver reaches its run-owned
+    /// scratch database this way, so a
     /// scratch server behind TLS stays behind it (#1672).
     pub(crate) async fn connect_with(
         connection_string: &str,
@@ -204,29 +203,6 @@ impl Conn {
             config.ssl_mode(tokio_postgres::config::SslMode::Require);
         }
         Ok((config, defaulted))
-    }
-
-    pub(crate) async fn connect_verified(connection_string: &str) -> Result<Self, DbError> {
-        let mut config: Config = connection_string
-            .parse()
-            .map_err(|e: tokio_postgres::Error| DbError::BadConnectionString(e.to_string()))?;
-        // A string that names no `sslmode` means verified TLS here as on every
-        // other connection (DECISIONS 543), so a target accepted by connected
-        // planning is accepted by the resolver too (#1514 review).
-        if !names_ssl_mode(connection_string) {
-            config.ssl_mode(tokio_postgres::config::SslMode::Require);
-        }
-        // Prefer may accept a server's plaintext refusal of SSLRequest. This
-        // constructor promises peer verification before database authentication,
-        // so a written insecure mode is refused rather than honoured.
-        if config.get_ssl_mode() != tokio_postgres::config::SslMode::Require {
-            return Err(DbError::Refused(
-                "peer-verified PostgreSQL connections require sslmode=require".into(),
-            ));
-        }
-        // No defaulted-mode advice here: this constructor's callers name what
-        // they asked for, and the advice is about a mode nobody wrote.
-        Self::connect_config(config, cfg!(target_os = "linux"), false).await
     }
 
     /// `defaulted` is whether the string named no `sslmode`, so the TLS this
@@ -281,11 +257,6 @@ impl Conn {
         // socket-level; `Config::connect`'s own `connect_socket` is the one
         // place that does, and this seam does not call it (issue #113).
         apply_socket_options(&tcp, &config, tcp_user_timeout, &format!("{host}:{port}"))?;
-        let endpoints =
-            crate::transport::TcpEndpoints::capture(&tcp).map_err(|reason| DbError::Connect {
-                addr: format!("{host}:{port}"),
-                reason,
-            })?;
 
         // `connect_raw`, not `connect`: the driver's own `connect` opens the
         // socket, and then the three failures above collapse into its error
@@ -316,7 +287,6 @@ impl Conn {
         let mut conn = Self {
             client,
             _driver: driver,
-            endpoints: Some(endpoints),
         };
         // The endpoint is spelled again rather than kept: `addr` is moved into
         // whichever of the two connect errors above fires.
@@ -346,31 +316,6 @@ impl Conn {
     /// emitter's scopes end on this setting instead.
     async fn pin_search_path(&mut self) -> Result<(), DbError> {
         self.execute("SET search_path = ''").await
-    }
-
-    pub(crate) fn tcp_endpoints(&self) -> Option<crate::transport::TcpEndpoints> {
-        self.endpoints
-    }
-
-    pub(crate) async fn connect_stream(
-        stream: crate::transport::BoxedStream,
-        login: crate::transport::StreamLogin,
-    ) -> Result<Self, DbError> {
-        let mut config = Config::new();
-        config
-            .user(&login.user)
-            .password(&login.password)
-            .dbname(&login.database)
-            .application_name(crate::session_application_name())
-            .ssl_mode(tokio_postgres::config::SslMode::Disable);
-        let (client, connection) = config.connect_raw(stream, tokio_postgres::NoTls).await?;
-        let mut conn = Self {
-            client,
-            _driver: hold(connection),
-            endpoints: None,
-        };
-        conn.pin_search_path().await?;
-        Ok(conn)
     }
 
     /// Enforces `target_session_attrs`, which `connect_raw` does not.
@@ -1161,33 +1106,6 @@ mod tests {
             "postgresql://u:p?x@db.example",
         ] {
             assert!(!names_ssl_mode(unnamed), "{unnamed}");
-        }
-    }
-
-    /// A verified connection takes an unwritten `sslmode` as verified TLS,
-    /// as every connection does, and still refuses a written insecure one
-    /// before any socket opens (#1514 review).
-    #[tokio::test]
-    async fn a_verified_connection_takes_an_unwritten_sslmode_as_verified_tls() {
-        for refused in ["sslmode=disable", "sslmode=prefer"] {
-            let error = Conn::connect_verified(&format!("host=localhost port=1 user=u {refused}"))
-                .await
-                .err()
-                .expect("a written insecure mode is refused");
-            assert!(matches!(error, DbError::Refused(_)), "{refused}: {error:?}");
-        }
-        for unwritten in [
-            "host=localhost port=1 user=u connect_timeout=1",
-            "postgres://u@localhost:1/d?connect_timeout=1",
-        ] {
-            let error = Conn::connect_verified(unwritten)
-                .await
-                .err()
-                .expect("nothing listens on port 1");
-            assert!(
-                !matches!(error, DbError::Refused(_)),
-                "{unwritten}: {error:?}"
-            );
         }
     }
 

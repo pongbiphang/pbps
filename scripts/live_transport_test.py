@@ -139,12 +139,8 @@ class FixtureOwnership(unittest.TestCase):
         verified = "verified_round_trips_reject_wrong_peers_and_corrupted_replies"
         invalid = "invalid_trust_cannot_yield_a_verified_connection"
         for engine in ("pg", "mssql"):
-            expected = [(verified, "ca.pem"), (invalid, "untrusted.pem")]
-            if engine == "mssql":
-                expected.append(("ado_options_cannot_disable_peer_verification",
-                                 "untrusted.pem"))
-            expected.extend([(invalid, "invalid.pem"),
-                             (invalid, "missing.pem")])
+            expected = [(verified, "ca.pem"), (invalid, "untrusted.pem"),
+                        (invalid, "invalid.pem"), (invalid, "missing.pem")]
             for fail_at in (None, *range(len(expected))):
                 with self.subTest(engine=engine, fail_at=fail_at):
                     calls = []

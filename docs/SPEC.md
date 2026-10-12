@@ -5,7 +5,7 @@
 > Position: declarative database schema version control and deployment
 > Supported dialects: SQL Server and PostgreSQL
 > Accepted, not yet implemented: engine-assisted planning — CLI binding resolution and saved binding evidence (§9.3.2; ADR-0016)
-> Partially delivered: resolver environment discovery — read-only `doctor` discovery, profile selection, runtime profiles and compatibility qualification are built; the remaining stages are planned (§9.3.3; [delivery tracking](RESOLVER-DELIVERY.md))
+> Partially delivered: resolver environment discovery — read-only `doctor` discovery, resolver selection, the Docker and server scratch runs and compatibility qualification are built; the remaining stages are planned (§9.3.3; [delivery tracking](RESOLVER-DELIVERY.md))
 
 ---
 
@@ -1550,24 +1550,23 @@ whether desired declarations bind differently from the objects already on the
 target. [ADR-0016](ADR-0016-engine-assisted-planning.md) records the rationale,
 evidence contract, implementation boundaries and acceptance tests.
 
-**Two kinds of resolver environment (#1528, DEC-1528.1, DEC-1672.1; a server
-entry implemented by #1672, a Docker entry by #1674, DEC-1674.1).**
+**The resolver and its two kinds of scratch (#1528, DEC-1528.1, DEC-1672.1,
+DEC-1636.1; a server entry implemented by #1672, a Docker entry by #1674,
+DEC-1674.1).**
 
-- **The operator-vouched resolver** is what selecting a resolver gives, of
-  either kind: a `kind: docker` entry, a scratch server pbps starts for the
-  run (#1674), or a `kind: server` entry, one the operator supplies (#1672).
-  Users see it simply as the resolver. Internally, and in this
-  specification, it is always the *operator-vouched resolver* (`vouched`).
-  - pbps does not measure or enforce its scratch's isolation, containment, log
-    handling or channels. The operator vouches for them, and the evidence and
-    `explain` say so: `resolver: operator-vouched scratch (not measured) on a
-    supplied server`, or `on a container of postgres:18, the image as
-    configured and not verified`.
+- **The resolver** is what selecting a resolver gives, of either kind: a
+  `kind: docker` entry, a scratch server pbps starts for the run (#1674), or
+  a `kind: server` entry, one the operator supplies (#1672). It is the only
+  resolver, and it runs on every platform pbps supports (#1636).
+  - pbps does not enforce its scratch's isolation, log handling or channels,
+    and observes no process on it. The operator vouches for them. The
+    evidence records the scratch's kind, and `explain` prints it:
+    `resolver: server scratch`, or `resolver: docker scratch from
+    postgres:18 (the image as configured, not verified)`.
   - **A Docker scratch** (DEC-1674.1) is a PostgreSQL server pbps starts from
     the entry's `image` for one run, through whatever `docker` command the
     runner has: Docker, rootless Docker, or Podman's compatible command or
-    socket (`DOCKER_HOST`). Nothing about it is measured: no containment,
-    admission or process observation.
+    socket (`DOCKER_HOST`). pbps enforces nothing about its isolation.
     - Its port is published on loopback only, and its superuser password is
       generated for the run. So the run is the run-owned layout (below), and
       every check below still runs, although the container is a separate
@@ -1672,13 +1671,11 @@ entry implemented by #1672, a Docker entry by #1674, DEC-1674.1).**
     Two builds that report the same facts are taken to bind alike, and
     that is part of what the operator vouches for (#1657).
 - **The measured profiles** (`linux-amd64-v1`, `linux-dedicated-v1`,
-  `linux-dedicated-pg16-v1`) are frozen and to be removed (#1636). No entry
-  selects them: both kinds are the operator-vouched resolver (#1674).
-- **Reading this section:** a paragraph marked **Measured profiles only**
-  binds them alone. Text written before #1528 that says "resolver" while
-  describing containment, process observation, executable identity or
-  verified channels means the measured profiles, and none of it carries over
-  to the operator-vouched resolver.
+  `linux-dedicated-pg16-v1`), which enforced containment, observed the
+  engines' processes and compared their executables, were removed (#1636,
+  DEC-1636.1). A configuration entry or a `--resolve-with` value that names
+  one is refused with a message that names the resolver, and a saved plan
+  whose evidence records one no longer reads.
 
 - Plain `plan`, `plan --check` and offline `explain` keep their no-target,
   no-resolver paths. Offline binding uncertainty is reported as unverified,
@@ -1736,14 +1733,15 @@ first, then runs it. Until #1516, its answer is reported and refused as
 `resolver.publication-unavailable`, writing neither file. Selection does not
 replace or waive any existing planning check.
 
-`pbps.yml` declares Docker or server resolvers, both the operator-vouched
-resolver. `kind` is required: nothing selects one for the user.
+`pbps.yml` declares Docker or server resolvers, both the one resolver. `kind`
+is required: nothing selects one for the user.
 - **A Docker entry is the default to reach for** (DEC-1674.1). Its scratch is
   started and removed for each run, so there is nothing to keep clean.
 - **A server entry is for special needs:** a managed target whose
   extensions or build no community image matches; a CI without a container
   runtime; an engine with no Linux image to run (#620).
-- An entry has no `profile` field (#1654).
+- An entry has no `profile` field (#1654). One that names a profile is
+  refused, naming the resolver (#1636).
 - An entry's optional `baseline` names the baseline file (below; #1673).
 - An entry's optional `outside_writes` decides what a baseline may change
   outside the scratch database (below): `refuse`, the default, or `allow`.
@@ -1785,8 +1783,7 @@ refuses, naming the image, before anything is started. `if_missing`
 authorizes acquisition of the configured source only when absent. It is not
 permission for compiled code to access a network.
 Build compatibility still requires qualification for every resolver
-environment. A measured profile also qualifies its actual digest/platform,
-instance separation, transport and containment. A server entry names a
+environment. A server entry names a
 separate credential variable, never an inline connection string, and there
 is no fallback to target credentials. The variable holds an ordinary
 connection string, in either form the target's takes and with the TLS it
@@ -1819,7 +1816,7 @@ candidate sets, not just managed objects. Missing definitions, unreadable
 metadata or an environment that cannot be reproduced remain unresolved;
 fabricated stubs never constitute binding evidence.
 
-**The operator-vouched resolver stages objects outside the managed set from a
+**The resolver stages objects outside the managed set from a
 reviewed baseline, compared with the target (#1528).** A managed view or routine
 that references anything outside the managed set otherwise fails the whole
 scratch compile (#1616).
@@ -2003,20 +2000,12 @@ of no dependencies. Runtime-bound bodies and dynamic SQL keep their existing
 limitations and impact warnings; the resolver does not execute routines to
 discover those dependencies or claim whole-program validation.
 
-**Measured profiles only.** Compilation itself may evaluate expressions or
-extension code. Before resolver DDL or declaration transfer, verify and enforce an engine/platform containment
-profile for all compiled source, not just retained external definitions. Deny
-workload-initiated network access and access to host files, credentials, devices
-or runtime sockets outside the isolated run; allow only the bounded incoming
-pbps control channel and qualified runtime inputs/private disposable storage.
-Controls live outside SQL privileges and bound resource use and lifetime.
-Image acquisition is a separate trusted phase, not workload egress permission.
-Unknown controls refuse compilation; violations abort without evidence or a
-broader-access retry. Supplied scratch servers under a measured profile must
-meet the same contract. The operator-vouched resolver measures none of this;
-its operator vouches for it.
-Required semantics that cannot run within it remain unsupported, not stubbed;
-ADR-0016 defines the trusted-runtime boundary and negative acceptance cases.
+Compilation itself may evaluate expressions or extension code. pbps enforces
+no containment on the scratch that runs it: what compiled code can reach is
+the operator's, who chooses the scratch (DEC-1528.1, DEC-1636.1). Image
+acquisition is a separate phase, not permission for compiled code to reach a
+network. Required semantics that cannot run on scratch remain unsupported,
+not stubbed.
 
 All resolver DDL runs in isolated scratch resources, never on the target, even
 inside a savepoint. No production rows are copied. The saved plan pins the
@@ -2047,35 +2036,17 @@ Closing checks use a post-apply manifest derived and sealed from the approved
 typed changes, so planned candidate/grant changes are distinguished from drift.
 An unprovable transition refuses at planning, never becomes an apply-time choice.
 
-**Measured profiles only.** Retained external definitions are private,
-ephemeral reconstruction inputs, not additional source shipped to reviewers. Saved evidence records their
-logical identities and versioned canonical fingerprints, never the full text.
-Publication/apply checks re-read and hash the target definitions; a changed,
-missing or unreadable prerequisite cannot pass. `explain`, generated SQL,
-diagnostics and logs do not expose this external source or its confidential
-literals, including through engine errors. Before transmitting any external
-definition, verify and enforce a supported engine/platform safety profile for
-server statement/audit/error logging, intermediaries and container log capture
-or forwarding. Source-bearing diagnostics and scratch storage must stay private
-and disposable, without persistent/exported copies. Unknown or unenforceable
-controls refuse reconstruction before transfer; client redaction or deleting a
-scratch database is not proof, and pre-existing audit policies are not disabled
-to satisfy the check. ADR-0016 defines the trusted-runtime boundary and lifecycle.
-The operator-vouched resolver retains no external source of its own. Its
-baseline is reviewed repository content the operator chose to send.
+The resolver transfers no target source. What lies outside the managed set
+comes from the baseline, reviewed repository content the operator chose to
+send (#1673); a measured transfer of the target's own definitions is not
+planned (#617 is closed, DEC-1636.1). Saved evidence records the logical
+identities and keyed fingerprints of the external inputs a binding read,
+never their text, and publication and apply checks re-read the target's: a
+changed, missing or unreadable prerequisite cannot pass.
 
-**Measured profiles only.** Every resolver qualification, target-evidence read
-(including apply rechecks), scratch DDL/control exchange and binding result
-requires authenticated integrity and peer validation, including managed-only analysis without private inputs.
-Qualify the actual channels before accepting evidence or sending declarations;
-private inputs additionally require confidentiality. The initial remote profile
-uses authenticated encryption for all these exchanges; plaintext, downgrade and
-disabled peer checks refuse. Local channels require qualified peer/host
-isolation, not merely localhost. Reconnects requalify and results stay bound to
-the actual peer/run. Private-source logging controls remain conditional.
-Existing unrelated connection defaults are unchanged; apply does not contact
-a resolver. The operator-vouched resolver uses whatever TLS the operator
-configured on each connection.
+Each resolver connection uses the TLS its connection string asks for; pbps
+qualifies no channel of its own (DEC-1528.1). Existing unrelated connection
+defaults are unchanged; apply does not contact a resolver.
 
 The user's managed declarations and explicit deployment changes remain ordinary
 reviewable plan contents. A bare hash of a definition would be a guessing
@@ -2101,26 +2072,24 @@ The key is configured per environment, never shared and never defaulted:
 pbps generates and checks keys; it does not store, share or rotate them, so this
 is no key-management service (ADR-0016 decision 5, as amended). A leaked key
 restores the guessing exposure to whoever holds it and the ledger, and nothing
-more. The plaintext of retained definitions stays private during reconstruction,
-as above: keying the verifiers does not declassify the source.
+more.
 
 #### 9.3.3 Resolver environment discovery (partial delivery)
 
 **Delivery status:** the initial read-only `doctor` subset is implemented
-(#597), followed by named profile selection/policy (#606) and the Docker
-(#608) and dedicated-server (#609) runtime profiles. Analysis-scope
+(#597), followed by named resolver selection/policy (#606). Analysis-scope
 compatibility and deployment-context qualification is implemented for
 PostgreSQL (#610) and SQL Server (#611). PostgreSQL target-input capture and fresh
 comparison are available as a private library boundary (#612), including actual
 historical bindings and complete requested prerequisites; see
-[the capture contract](RESOLVER-CAPTURE.md). A qualified dedicated-server run can
-compile managed declarations on its scratch database and compare what they bind
-with the target's observed bindings, surface by surface (#613). CLI resolution, saved binding evidence
-and the remaining steps stay planned under #595; the requirements below still
-govern their delivery. Paragraphs marked **Measured profiles only** bind the
-frozen measured profiles alone, as in §9.3.2. The operator-vouched resolver
-follows §9.3.2: its two separation checks, the shared compatibility and
-authorization qualification, and its baseline. See
+[the capture contract](RESOLVER-CAPTURE.md). The resolver compiles managed
+declarations on a server or Docker scratch and compares what they bind with
+the target's observed bindings, surface by surface (#613, #1672, #1674). The
+measured Docker and dedicated-server runtime profiles (#608, #609) were
+removed (#1636, DEC-1636.1). Saved binding evidence and the remaining steps
+stay planned under #595; the requirements below still govern their delivery,
+and the resolver follows §9.3.2: its separation checks, the shared
+compatibility and authorization qualification, and its baseline. See
 [delivery tracking](RESOLVER-DELIVERY.md).
 
 `pbps doctor --env prod` (or `--db`, with optional `--format json`) now reports
@@ -2135,8 +2104,8 @@ where the observed version/product permits one. It never contacts a registry,
 starts Docker or creates scratch resources. Missing resolver qualification
 does not fail ordinary deployment readiness. These observations are not a
 coherent evidence capture or a complete deployment requirement manifest;
-persisted module settings, per-object collations, executable identities and
-per-statement authorization still require the later analysis-specific readers.
+persisted module settings, per-object collations and per-statement
+authorization still require the later analysis-specific readers.
 
 **PostgreSQL and SQL Server are both in scope from the first environment
 support stage.** Collect the target requirements read-only, suggest a candidate
@@ -2157,20 +2126,11 @@ edition limits remain independent checks. A Developer scratch run cannot waive
 target edition checks, and Azure products cannot be mapped to boxed SQL Server
 by comparing version numbers alone.
 
-**Measured profiles only** (the operator-vouched resolver compares reported
-builds, #1657). Require qualified provenance/content identity for the actual
-target and resolver engine plus analysis-relevant loaded or required native libraries, including
-extensions and parser hooks. Matching reported versions or catalog fingerprints
-do not establish equivalence between vendor-patched or locally rebuilt binaries.
-Accept identical qualified content or a versioned, real-engine-tested mapping
-for the identified builds and analysis scope; unknown identity or unmeasured
-differences refuse. Read-only runtime/provisioning evidence must establish the
-actual backend's loaded/required content, not merely files on disk or a candidate
-image digest. Seal identities and the compatibility rule in the evidence manifest,
-maintain scratch stability and recheck target executable prerequisites at every
-capture, including publication and both apply captures. No new target agent,
-binary copying, host scan or attestation service is introduced; inadequate
-hosted-product evidence remains an explicit unsupported case (ADR-0016).
+Executables are not compared. The resolver observes no process, so two
+builds that report the same facts are taken to bind alike, and the build
+behind them is what the operator vouches for (#1657, DEC-1528.1). The
+compatibility rule's name is sealed in the evidence manifest. No target agent,
+binary copying, host scan or attestation service is introduced.
 
 Compatibility includes the effective deployment authorization context, not
 merely the introspection or scratch administrator's login. Capture and reproduce
@@ -2192,39 +2152,28 @@ scratch server instead; never silently downgrade required compatibility.
 
 Merely connecting to production does not download or start anything. After
 explicit resolver opt-in, acquisition follows a configured pull policy, supports
-preloaded images/internal registries and records the actual image digest and
-platform. The container runs on the pbps host/CI runner, not on production.
-**Measured profiles only** (the operator-vouched resolver allows another
-database on the target's cluster, §9.3.2, #1667): the resolver must be
-outside the target PostgreSQL cluster or SQL Server instance, not merely in
-another database. Before any scratch DDL or external
-source transfer, use qualified read-only identity and provisioning/endpoint
-evidence to prove separation; different names, credentials or connection URLs
-are insufficient. Reject the target instance/cluster and unknown or ambiguous
-identity; reconnects/failovers must requalify. Never use target-side writes to
-prove identity. Scratch credentials are separate from production credentials,
-and cleanup is restricted to resources created for that run. Air-gapped
-operation needs no registry access when a suitable image or server is already
-available.
+preloaded images/internal registries and records the image reference as
+configured (DEC-1674.1). The container runs on the pbps host/CI runner, not on
+production. Scratch is told apart from the target by the engines' own
+identity, as §9.3.2 describes, never by names, credentials or connection URLs;
+a scratch on the target's cluster needs a confined account (#1667,
+DEC-1672.1, DEC-1685.1). Never use target-side writes to prove identity.
+Scratch credentials are separate from production credentials, and cleanup is
+restricted to resources created for that run. Air-gapped operation needs no
+registry access when a suitable image or server is already available.
 
 Qualification is pinned to the actual backend/session, not its connection URL.
 Reconnects, failovers and pooled-session/runtime replacements invalidate all
 previous qualification and partial binding results. Recheck full environment
 compatibility and effective session settings before further DDL/source
-transfer or evidence publication, and, for the measured profiles, isolation
-and applicable source controls. Even a
+transfer or evidence publication. Even a
 compatible replacement restarts complete compilation in fresh run-owned scratch
 resources; never combine old-session results with new-session evidence.
 
-**Measured profiles only** (scratch stability is part of what the operator
-vouches for). The same connection can still observe in-place changes. Keep all relevant
-resolver settings, authorization and reconstructed namespace stable throughout
-qualification, compilation and evidence capture, using qualified exclusivity
-or mutation detection that catches every relevant intervening change, including
-change-and-restore. Initial/final equality alone is insufficient. Unexpected or
-unanswerable drift discards the entire run and refuses publication or restarts
-complete reconstruction after requalification. Supplied servers must qualify
-this property too; no long production transaction or DDL lock is introduced.
+Scratch stability is part of what the operator vouches for: pbps qualifies no
+exclusivity on the scratch, and another session changing it during a run is
+the operator's to prevent (DEC-1528.1). No long production transaction or DDL
+lock is introduced.
 
 `doctor` will extend its initial inventory with this full profile for read-only requirements and candidate
 diagnostics; it does not pull images, create scratch databases or call a mere

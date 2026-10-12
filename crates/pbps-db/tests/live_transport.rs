@@ -1,9 +1,11 @@
 //! Disposable real-engine TLS fixtures: scripts/live-transport.py provisions
 //! the selected engine and process-private trust roots. No production source
-//! or credentials are used. This tests the TLS hop, not runtime admission.
+//! or credentials are used. These pin the ordinary connection's TLS: chain
+//! and host-name verification, and an intercepted hop that alters or replays
+//! records. The peer-verified connection type these once also covered was
+//! removed with the measured resolver profiles (#1636).
 
-use pbps_db::transport::PeerVerifiedConn;
-use pbps_db::{Driver, Param};
+use pbps_db::{Conn, Driver, Param};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,7 +38,7 @@ fn address(host: &str, port: u16) -> String {
     }
 }
 
-async fn read_value(conn: &mut PeerVerifiedConn) {
+async fn read_value(conn: &mut Conn) {
     let rows = conn
         .query("SELECT CAST(607 AS INT) AS value")
         .await
@@ -53,20 +55,15 @@ async fn read_value(conn: &mut PeerVerifiedConn) {
 #[tokio::test]
 #[ignore = "needs disposable TLS engine and CA; scripts/live-transport.py"]
 async fn verified_round_trips_reject_wrong_peers_and_corrupted_replies() {
-    let mut first = PeerVerifiedConn::connect(driver(), &address("localhost", port()))
+    let mut first = Conn::connect(driver(), &address("localhost", port()))
         .await
         .unwrap();
     assert_eq!(first.driver(), driver());
     read_value(&mut first).await;
-    let mut replacement = PeerVerifiedConn::connect(driver(), &address("localhost", port()))
-        .await
-        .unwrap();
-    assert_ne!(first.id(), replacement.id());
-    read_value(&mut replacement).await;
     // The certificate is valid for localhost only. This reaches the same
     // actual engine, so failure cannot be explained by DNS or a dead port.
     assert!(
-        PeerVerifiedConn::connect(driver(), &address("127.0.0.1", port()))
+        Conn::connect(driver(), &address("127.0.0.1", port()))
             .await
             .is_err()
     );
@@ -80,7 +77,7 @@ async fn verified_round_trips_reject_wrong_peers_and_corrupted_replies() {
                 port()
             )
         };
-        let mut ordinary = pbps_db::Conn::connect(Driver::Postgres, &unnamed("localhost"))
+        let mut ordinary = Conn::connect(Driver::Postgres, &unnamed("localhost"))
             .await
             .unwrap_or_else(|e| panic!("a trusted server under the default: {e}"));
         let rows = ordinary
@@ -88,8 +85,7 @@ async fn verified_round_trips_reject_wrong_peers_and_corrupted_replies() {
             .await
             .unwrap();
         assert_eq!(rows[0].try_get::<i32>("value").unwrap(), Some(1));
-        let Err(refused) = pbps_db::Conn::connect(Driver::Postgres, &unnamed("127.0.0.1")).await
-        else {
+        let Err(refused) = Conn::connect(Driver::Postgres, &unnamed("127.0.0.1")).await else {
             panic!("a certificate for localhost accepted for 127.0.0.1 under the default");
         };
         // #829: the server speaks TLS and its certificate does not name this
@@ -114,7 +110,7 @@ async fn verified_round_trips_reject_wrong_peers_and_corrupted_replies() {
         // The upstream driver must still verify the chain and host name on
         // ordinary connections, without asking the caller to add the key.
         let no_encrypt = |host: &str| address(host, port()).replace(";Encrypt=true", "");
-        let mut ordinary = pbps_db::Conn::connect(Driver::Mssql, &no_encrypt("localhost"))
+        let mut ordinary = Conn::connect(Driver::Mssql, &no_encrypt("localhost"))
             .await
             .expect("omitted Encrypt must use verified TLS");
         let rows = ordinary
@@ -123,13 +119,13 @@ async fn verified_round_trips_reject_wrong_peers_and_corrupted_replies() {
             .unwrap();
         assert_eq!(rows[0].try_get::<i32>("value").unwrap(), Some(611));
         assert!(
-            pbps_db::Conn::connect(Driver::Mssql, &no_encrypt("127.0.0.1"))
+            Conn::connect(Driver::Mssql, &no_encrypt("127.0.0.1"))
                 .await
                 .is_err(),
             "omitted Encrypt accepted a certificate for the wrong host"
         );
         let ca = std::env::var("PBPS_TEST_TLS_CA").unwrap();
-        let mut custom = PeerVerifiedConn::connect(
+        let mut custom = Conn::connect(
             driver(),
             &format!(
                 "{};TrustServerCertificateCA={ca}",
@@ -140,7 +136,7 @@ async fn verified_round_trips_reject_wrong_peers_and_corrupted_replies() {
         .unwrap();
         read_value(&mut custom).await;
         assert!(
-            PeerVerifiedConn::connect(
+            Conn::connect(
                 driver(),
                 &format!(
                     "{};TrustServerCertificateCA={ca}.missing",
@@ -153,7 +149,7 @@ async fn verified_round_trips_reject_wrong_peers_and_corrupted_replies() {
     }
 
     let relay = Relay::start(port()).await;
-    let mut proxied = PeerVerifiedConn::connect(driver(), &address("localhost", relay.port))
+    let mut proxied = Conn::connect(driver(), &address("localhost", relay.port))
         .await
         .unwrap();
     read_value(&mut proxied).await;
@@ -170,7 +166,7 @@ async fn verified_round_trips_reject_wrong_peers_and_corrupted_replies() {
     assert!(relay.did_corrupt.load(Ordering::SeqCst));
 
     let relay = Relay::start(port()).await;
-    let mut proxied = PeerVerifiedConn::connect(driver(), &address("localhost", relay.port))
+    let mut proxied = Conn::connect(driver(), &address("localhost", relay.port))
         .await
         .unwrap();
     relay.capture.store(true, Ordering::SeqCst);
@@ -207,59 +203,9 @@ async fn verified_round_trips_reject_wrong_peers_and_corrupted_replies() {
 #[ignore = "needs isolated invalid trust environment; scripts/live-transport.py"]
 async fn invalid_trust_cannot_yield_a_verified_connection() {
     assert!(
-        PeerVerifiedConn::connect(driver(), &address("localhost", port()))
+        Conn::connect(driver(), &address("localhost", port()))
             .await
             .is_err()
-    );
-}
-
-/// #861: the policy and the driver use different ADO.NET parsers. Password
-/// markers and duplicate keys must not become certificate-bypass options
-/// after the policy accepts them. An untrusted root must fail at TLS before
-/// SQL login; a conservatively refused string is also safe.
-#[tokio::test]
-#[ignore = "needs disposable SQL Server TLS engine and untrusted CA; scripts/live-transport.py"]
-async fn ado_options_cannot_disable_peer_verification() {
-    assert_eq!(driver(), Driver::Mssql);
-    let with_password = |password: &str| {
-        format!(
-            "Server=localhost,{};User Id=sa;Password={password};Encrypt=true",
-            port()
-        )
-    };
-    let cases = [
-        with_password("{marker;TrustServerCertificate=true}"),
-        with_password("\"marker;TrustServerCertificate=true\""),
-        with_password("'marker;TrustServerCertificate=true'"),
-        format!(
-            "Server=localhost,{};User Id=sa;Password=marker;TrustServerCertificate=true;TRUSTSERVERCERTIFICATE=false;Encrypt=false;ENCRYPT=true",
-            port()
-        ),
-    ];
-    let mut tls_checks = 0;
-    for connection_string in cases {
-        let result = PeerVerifiedConn::connect(Driver::Mssql, &connection_string).await;
-        match result {
-            Err(pbps_db::DbError::Refused(_)) | Err(pbps_db::DbError::BadConnectionString(_)) => {}
-            Err(pbps_db::DbError::Driver { message, code }) => {
-                tls_checks += 1;
-                assert!(
-                    code.is_none(),
-                    "{connection_string}: reached SQL Server: {message}"
-                );
-                let lower = message.to_ascii_lowercase();
-                assert!(
-                    lower.contains("cert") || lower.contains("tls"),
-                    "{connection_string}: did not fail TLS verification: {message}"
-                );
-            }
-            Err(other) => panic!("{connection_string}: unexpected failure: {other}"),
-            Ok(_) => panic!("{connection_string}: bypassed TLS verification"),
-        }
-    }
-    assert!(
-        tls_checks > 0,
-        "no accepted ADO.NET option case reached TLS verification"
     );
 }
 

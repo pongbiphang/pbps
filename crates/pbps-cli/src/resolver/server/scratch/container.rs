@@ -1,6 +1,6 @@
 //! A Docker scratch: a PostgreSQL server pbps starts from the configured
 //! image for one run and removes afterwards (#1674). Apart from where it
-//! comes from, it is the same operator-vouched resolver as a supplied
+//! comes from, it is the same resolver as a supplied
 //! server (DEC-1528.1): the operator vouches for the image and the runtime,
 //! and pbps measures neither. pbps generates the superuser's password, so
 //! the run is the run-owned layout (DEC-1672.1), and the ordinary checks of
@@ -57,11 +57,11 @@ async fn bind_target(
     let mut target = Conn::connect(driver, target_connection)
         .await
         .map_err(|error| {
-            ProduceError::Run(Error::Vouched(format!(
+            ProduceError::Run(Error::Unusable(format!(
                 "the target could not be connected: {error}"
             )))
         })?;
-    let identity = pbps_pg::resolver::vouched::cluster_identity(&mut target)
+    let identity = pbps_pg::resolver::scratch::cluster_identity(&mut target)
         .await
         .map_err(|error| {
             ProduceError::Run(Error::Read(format!(
@@ -69,7 +69,7 @@ async fn bind_target(
             )))
         })?;
     if identity != planned_identity {
-        return Err(ProduceError::Run(Error::Vouched(
+        return Err(ProduceError::Run(Error::Unusable(
             "the target connection reaches another database cluster than the planning read; \
              the resolver answers for the cluster the plan was read from, so nothing was \
              started"

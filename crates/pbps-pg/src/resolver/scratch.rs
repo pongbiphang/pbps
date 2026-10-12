@@ -1,4 +1,4 @@
-//! Instance SQL for the operator-vouched resolver (DEC-1528.1; #1667, #1672).
+//! Instance SQL for the resolver (DEC-1528.1; #1667, #1672).
 //!
 //! The operator vouches for the scratch server: pbps observes no process and
 //! proves no containment. What it still establishes, before any scratch
@@ -230,7 +230,7 @@ fn token_literal(token: &str) -> Result<String, DbError> {
 fn text(row: &Row, field: &str) -> Result<String, DbError> {
     row.try_get::<&str>(field)?
         .map(str::to_owned)
-        .ok_or_else(|| DbError::BadRow(format!("the vouched resolver read no {field}")))
+        .ok_or_else(|| DbError::BadRow(format!("the resolver read no {field}")))
 }
 
 fn one(rows: Vec<Row>, what: &str) -> Result<Row, DbError> {

@@ -341,6 +341,29 @@ fn image_reference<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::
     }
 }
 
+/// The measured profiles pbps once implemented (#1636). A resolver may still
+/// be configured under one of these names; only an unconfigured selection of
+/// one is refused as removed.
+const REMOVED_PROFILES: [&str; 3] = [
+    "linux-amd64-v1",
+    "linux-dedicated-v1",
+    "linux-dedicated-pg16-v1",
+];
+
+/// The first resolver entry that carries a `profile` field, read loosely
+/// from a configuration the typed parse refused.
+pub(super) fn entry_naming_a_profile(yaml: &str) -> Option<String> {
+    let value: serde_json::Value = serde_saphyr::from_str(yaml).ok()?;
+    value
+        .get("resolvers")?
+        .as_object()?
+        .iter()
+        // A name the loader would refuse is not echoed: the plain parse
+        // error reports that entry instead.
+        .find(|(name, entry)| entry.get("profile").is_some() && valid_profile_name(name))
+        .map(|(name, _)| name.clone())
+}
+
 pub(super) fn valid_profile_name(value: &str) -> bool {
     value
         .bytes()
@@ -419,21 +442,24 @@ impl Config {
         if !valid_profile_name(name) {
             return Err(ConfigError::InvalidResolverName);
         }
-        let profile = self
-            .resolvers
-            .get(name)
-            .ok_or_else(|| ConfigError::UnknownResolver {
+        let profile = self.resolvers.get(name);
+        if profile.is_none() && REMOVED_PROFILES.contains(&name) {
+            return Err(ConfigError::RemovedResolverProfile {
                 name: name.to_owned(),
-                available: if self.resolvers.is_empty() {
-                    "none".to_owned()
-                } else {
-                    self.resolvers
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                },
-            })?;
+            });
+        }
+        let profile = profile.ok_or_else(|| ConfigError::UnknownResolver {
+            name: name.to_owned(),
+            available: if self.resolvers.is_empty() {
+                "none".to_owned()
+            } else {
+                self.resolvers
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        })?;
         Ok(Some(ResolverSelection {
             name: name.to_owned(),
             source,
@@ -447,6 +473,64 @@ impl Config {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// #1636: a selection or an entry naming a measured profile is refused
+    /// with a message that says the profiles are gone and names the
+    /// resolver, not as an unknown name or field.
+    #[test]
+    fn a_removed_measured_profile_is_refused_naming_the_resolver() {
+        let config = |resolvers: &str| {
+            Config::parse(
+                &format!("dialect: postgres\nresolvers:\n{resolvers}"),
+                Path::new("pbps.yml"),
+            )
+        };
+        let ours = config("  ours: {kind: server, url_env: S}\n").unwrap();
+        for removed in REMOVED_PROFILES {
+            let refused = ours.select_resolver(Some(removed), None).unwrap_err();
+            assert!(
+                matches!(&refused, ConfigError::RemovedResolverProfile { name } if name == removed),
+                "{refused}"
+            );
+            let message = refused.to_string();
+            assert!(
+                message.contains("resolver") && message.contains("#1636"),
+                "{message}"
+            );
+        }
+        // Negative: any other missing name is merely unknown.
+        assert!(matches!(
+            ours.select_resolver(Some("linux-amd64-v2"), None),
+            Err(ConfigError::UnknownResolver { .. })
+        ));
+        // Negative: a resolver configured under a removed name is selected.
+        let reused = config("  linux-amd64-v1: {kind: docker, image: postgres:18}\n").unwrap();
+        assert!(reused.select_resolver(Some("linux-amd64-v1"), None).is_ok());
+
+        for entry in [
+            "  r: {kind: server, url_env: S, profile: linux-dedicated-v1}\n",
+            "  r: {kind: docker, image: postgres:18, profile: linux-amd64-v1}\n",
+            "  r: {kind: supplied, profile: linux-dedicated-v1}\n",
+        ] {
+            let refused = config(entry).unwrap_err();
+            assert!(
+                matches!(&refused, ConfigError::RemovedResolverProfileField { resolver, .. } if resolver == "r"),
+                "{entry}: {refused}"
+            );
+        }
+        // Negative: another malformed entry keeps its positioned parse error,
+        // and an entry name the loader refuses is never echoed.
+        for entry in [
+            "  r: {kind: server, url_env: S, trusted: true}\n",
+            "  'bad name': {kind: server, profile: linux-dedicated-v1}\n",
+        ] {
+            let refused = config(entry).unwrap_err();
+            assert!(
+                matches!(refused, ConfigError::Parse { .. }),
+                "{entry}: {refused}"
+            );
+        }
+    }
 
     fn config(extra: &str) -> Config {
         Config::parse(&format!(
@@ -505,7 +589,6 @@ mod tests {
             "{kind: docker, image: 'postgres:18 --privileged'}",
             "{kind: unknown}",
             "{kind: docker, image: postgres:18, standard: {comment: c}}",
-            // Docker stays the measured profile until #1674.
             "{kind: docker, image: postgres:18, outside_writes: sometimes}",
             "{kind: server, url_env: S, baseline: ''}",
         ] {

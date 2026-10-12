@@ -23,16 +23,16 @@ fn evidence() -> ResolverEvidence {
     ResolverEvidence::new(
         &changes,
         Qualification {
-            rule: compatibility::RULE.into(),
+            rule: compatibility::REPORTED_RULE.into(),
             target_environment: "04".repeat(32),
             target_environment_after: "04".repeat(32),
             resolver_environment: "05".repeat(32),
             target_build: "06".repeat(32),
             resolver_build: "07".repeat(32),
             channels: "08".repeat(32),
-            runtime: ResolverRuntime::Supplied {
-                profile: "linux-dedicated-v1".into(),
-                identity: "09".repeat(32),
+            runtime: ResolverRuntime::Scratch {
+                scratch: ScratchSource::Server {},
+                outside_writes: OutsideWrites::Refused,
             },
         },
         AuthorizationCondition {
@@ -69,7 +69,13 @@ fn saved_evidence_requires_a_supported_adapter_major_and_qualification_rule() {
         ("/before/engine_major", serde_json::json!(17)),
         (
             "/qualification/rule",
-            serde_json::json!("pg-analysis-scope-v2"),
+            serde_json::json!("pg-reported-scope-v2"),
+        ),
+        // The removed measured profiles' rule: its evidence compared
+        // executables the one resolver never observes (#1636).
+        (
+            "/qualification/rule",
+            serde_json::json!("pg-analysis-scope-v1"),
         ),
         ("/authorization/rule", serde_json::json!("pg-auth-v2")),
     ] {

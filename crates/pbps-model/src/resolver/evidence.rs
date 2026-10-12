@@ -31,30 +31,22 @@ pub enum EvidenceHandling {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ResolverRuntime {
-    Container {
-        image_digest: String,
-        platform: String,
-        profile: String,
-    },
-    Supplied {
-        profile: String,
-        identity: String,
-    },
     /// A scratch engine the operator vouches for: nothing about it was
     /// measured, and the evidence claims no image digest, containment or
-    /// build (DEC-1528.1).
-    Vouched {
-        scratch: VouchedScratch,
+    /// build (DEC-1528.1). The measured runtimes that once stood beside it
+    /// are gone (#1636), so a plan naming one no longer reads.
+    Scratch {
+        scratch: ScratchSource,
         /// Whether the baseline's writes outside the scratch database were
         /// refused or allowed (#1674).
         outside_writes: OutsideWrites,
     },
 }
 
-/// Where an operator-vouched scratch came from.
+/// Where the resolver's scratch came from.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum VouchedScratch {
+pub enum ScratchSource {
     /// A server the operator supplied. A struct variant, not a unit one:
     /// serde's internally tagged unit variant drops fields it does not
     /// know, where this one refuses them (#1843 review).
@@ -213,25 +205,10 @@ impl ResolverEvidence {
         {
             return Err(EvidenceError::Incomplete);
         }
-        let qualified = match &q.runtime {
-            ResolverRuntime::Container {
-                image_digest,
-                platform,
-                profile,
-            } => {
-                image_digest
-                    .strip_prefix("sha256:")
-                    .is_some_and(|d| hex(d, 64))
-                    && !platform.is_empty()
-                    && !profile.is_empty()
-            }
-            ResolverRuntime::Supplied { profile, identity } => {
-                !profile.is_empty() && hex(identity, 64)
-            }
-            ResolverRuntime::Vouched { scratch, .. } => match scratch {
-                VouchedScratch::Server {} => true,
-                VouchedScratch::Docker { image } => !image.is_empty(),
-            },
+        let ResolverRuntime::Scratch { scratch, .. } = &q.runtime;
+        let qualified = match scratch {
+            ScratchSource::Server {} => true,
+            ScratchSource::Docker { image } => !image.is_empty(),
         };
         if !qualified {
             return Err(EvidenceError::Incomplete);
@@ -592,10 +569,9 @@ mod tests {
                 target_build: "03".repeat(32),
                 resolver_build: "04".repeat(32),
                 channels: "05".repeat(32),
-                runtime: ResolverRuntime::Container {
-                    image_digest: format!("sha256:{}", "06".repeat(32)),
-                    platform: "linux/amd64".into(),
-                    profile: "fixture-v1".into(),
+                runtime: ResolverRuntime::Scratch {
+                    scratch: ScratchSource::Server {},
+                    outside_writes: OutsideWrites::Refused,
                 },
             },
             AuthorizationCondition {
@@ -913,8 +889,8 @@ mod tests {
     fn a_docker_scratch_is_recorded_by_its_configured_image() {
         let plan = plan();
         let mut evidence = resolved(&plan);
-        evidence.qualification.runtime = ResolverRuntime::Vouched {
-            scratch: VouchedScratch::Docker {
+        evidence.qualification.runtime = ResolverRuntime::Scratch {
+            scratch: ScratchSource::Docker {
                 image: "postgres:18".into(),
             },
             outside_writes: OutsideWrites::Allowed,
@@ -923,34 +899,47 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&evidence.qualification.runtime).unwrap(),
             json!({
-                "kind": "vouched",
+                "kind": "scratch",
                 "scratch": {"kind": "docker", "image": "postgres:18"},
                 "outside_writes": "allowed",
             })
         );
         // Negative: a Docker scratch with no image names nothing.
-        evidence.qualification.runtime = ResolverRuntime::Vouched {
-            scratch: VouchedScratch::Docker { image: "".into() },
+        evidence.qualification.runtime = ResolverRuntime::Scratch {
+            scratch: ScratchSource::Docker { image: "".into() },
             outside_writes: OutsideWrites::Refused,
         };
         assert_eq!(
             evidence.validate(&plan.changes),
             Err(EvidenceError::Incomplete)
         );
-        // Negative: the pre-#1674 unit form names neither the scratch nor
-        // the outside-write choice, and is not read as either.
-        assert!(serde_json::from_value::<ResolverRuntime>(json!({"kind": "vouched"})).is_err());
+        // Negative: a form that names neither the scratch nor the
+        // outside-write choice is not read as either, nor is a runtime that
+        // no longer exists: the pre-#1636 operator-vouched tag, or a removed
+        // measured one (#1636).
+        for gone in [
+            json!({"kind": "scratch"}),
+            json!({"kind": "vouched", "scratch": {"kind": "server"}, "outside_writes": "refused"}),
+            json!({"kind": "container", "image_digest": format!("sha256:{}", "06".repeat(32)),
+                   "platform": "linux/amd64", "profile": "linux-amd64-v1"}),
+            json!({"kind": "supplied", "profile": "linux-dedicated-v1", "identity": "07".repeat(32)}),
+        ] {
+            assert!(
+                serde_json::from_value::<ResolverRuntime>(gone.clone()).is_err(),
+                "{gone}"
+            );
+        }
         // Negative: a server scratch carries nothing, and a field it does
         // not have is refused rather than dropped.
         assert!(
-            serde_json::from_value::<VouchedScratch>(
+            serde_json::from_value::<ScratchSource>(
                 json!({"kind": "server", "image": "postgres:18"})
             )
             .is_err()
         );
         assert_eq!(
-            serde_json::from_value::<VouchedScratch>(json!({"kind": "server"})).unwrap(),
-            VouchedScratch::Server {}
+            serde_json::from_value::<ScratchSource>(json!({"kind": "server"})).unwrap(),
+            ScratchSource::Server {}
         );
     }
 

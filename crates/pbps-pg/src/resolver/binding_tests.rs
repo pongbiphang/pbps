@@ -12,7 +12,6 @@ use crate::Postgres;
 use crate::resolver::capture::{self, Assessment, Managed, Verdict};
 use crate::resolver::reconstruct::{self, Reconstruction};
 use pbps_db::resolver::capture::ObjectIdentity;
-use pbps_db::transport::{StreamConn, StreamLogin};
 use pbps_db::{Conn, Driver};
 use pbps_model::{Hints, IdsFile, Module, ModuleId, ModuleKind, Schema};
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,13 +24,6 @@ fn ctx() -> pbps_diff::Context {
 }
 
 const SERVERS: [&str; 2] = ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"];
-
-fn setting<'a>(connection: &'a str, key: &str) -> &'a str {
-    connection
-        .split_whitespace()
-        .find_map(|part| part.strip_prefix(&format!("{key}=")))
-        .unwrap_or_else(|| panic!("{key} in the live connection setting"))
-}
 
 /// A declared schema, built the way the loader would hand it over.
 #[derive(Default)]
@@ -105,21 +97,11 @@ impl Databases {
         conn
     }
 
-    async fn stream(&self, name: &str) -> StreamConn {
-        let host = setting(&self.server, "host");
-        let port: u16 = setting(&self.server, "port").parse().unwrap();
-        let socket = tokio::net::TcpStream::connect((host, port)).await.unwrap();
-        StreamConn::connect(
-            Driver::Postgres,
-            socket,
-            StreamLogin {
-                user: setting(&self.server, "user").to_owned(),
-                password: setting(&self.server, "password").to_owned(),
-                database: name.to_owned(),
-            },
-        )
-        .await
-        .unwrap()
+    /// A plain session on `name`, as the resolver's scratch run opens one.
+    async fn scratch(&self, name: &str) -> Conn {
+        Conn::connect(Driver::Postgres, &format!("{} dbname={name}", self.server))
+            .await
+            .unwrap()
     }
 
     async fn drop(self) {
@@ -196,7 +178,7 @@ async fn analyze_on(
         let desired_managed = Managed::from_schema(&case.desired.schema);
         let base_managed = Managed::from_schema(&case.base.schema);
         let dropped = signatures(&pg, base_managed.dropped_by(&desired_managed));
-        let mut scratch = databases.stream(&scratch_name).await;
+        let mut scratch = databases.scratch(&scratch_name).await;
         reconstruction
             .compile(&pg, &mut scratch)
             .await
@@ -2632,7 +2614,7 @@ async fn a_scratch_backend_terminated_mid_statement_is_no_compile_verdict() {
             let pg = dialect(&[]);
             let mut reconstruction = Reconstruction::new(&pg, &bootstrap(&desired.schema, &[]))
                 .expect("a view is reconstructible");
-            let mut scratch = databases.stream(&name).await;
+            let mut scratch = databases.scratch(&name).await;
             let compiled = reconstruction.compile(&pg, &mut scratch).await;
             drop(scratch);
             databases.drop().await;

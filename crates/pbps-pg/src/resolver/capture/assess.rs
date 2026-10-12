@@ -248,7 +248,7 @@ fn is_system(schema: &str) -> bool {
 
 /// The surfaces worth comparing: an object in a user schema that carries
 /// bindings on scratch. Scratch's user schemas hold the desired managed
-/// objects and, for the vouched resolver, what its baseline staged, so
+/// objects and, for the resolver, what its baseline staged, so
 /// these are the managed declarations and their parts, and the staged
 /// objects with bindings, whose verdicts no declaration reads.
 fn surfaces(

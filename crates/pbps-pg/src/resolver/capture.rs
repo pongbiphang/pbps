@@ -95,9 +95,8 @@ pub use pbps_db::resolver::capture::{Assessment, Verdict};
 pub use staged::{StageError, Staged, compare as compare_staged};
 
 /// Read coherent catalog inputs and release the transaction before returning.
-/// This does not qualify executable content or a scratch runtime. The native
-/// lifecycle must enclose it in its separately qualified input boundary and
-/// discard the connection on cancellation; no publication path exists here.
+/// The caller discards the connection on cancellation; no publication path
+/// exists here.
 pub async fn capture(
     connection: &mut impl pbps_db::transport::QueryConnection,
     scope: &CaptureScope,
@@ -125,35 +124,6 @@ pub async fn capture_identifying(
         scope.clone(),
     )
     .map_err(CaptureError::Coverage)
-}
-
-/// Capture and seal in the same authorized read. The caller fixes the key
-/// before this read starts; no method on a retained capture can rekey it.
-pub async fn capture_identifying_sealed(
-    connection: &mut impl pbps_db::transport::QueryConnection,
-    scope: &CaptureScope,
-    dropped: &BTreeSet<DroppedSignature>,
-    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
-) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
-    let captured = capture_identifying(connection, scope, dropped).await?;
-    let manifest = captured.seal(key).map_err(|_| CaptureError::Incomplete)?;
-    Ok((captured, manifest))
-}
-
-/// Seal scratch's fresh capture with the role map the qualified run made.
-/// No caller-supplied text rewrite or retained-capture rekey entry is exposed.
-pub async fn capture_identifying_sealed_with_roles(
-    connection: &mut impl pbps_db::transport::QueryConnection,
-    scope: &CaptureScope,
-    dropped: &BTreeSet<DroppedSignature>,
-    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
-    roles: &crate::resolver::authorization::RoleMap,
-) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
-    let captured = capture_identifying(connection, scope, dropped).await?;
-    let manifest = captured
-        .seal_with_roles(key, Some(roles), None)
-        .map_err(|_| CaptureError::Incomplete)?;
-    Ok((captured, manifest))
 }
 
 /// Qualify recorded ownership while the final coherent read still holds its
@@ -190,47 +160,6 @@ pub async fn capture_identifying_for_plan(
     Ok(CompiledCapture::new(captured, key, roles, ownership))
 }
 
-/// Read and seal on behalf of the holder of catalog-read authority. A
-/// previously captured result cannot be fingerprinted under a recipient's
-/// chosen key: that would expose its private properties as a guessing oracle.
-/// Runtime qualification is still separate; this is not verified plan evidence.
-pub async fn capture_sealed(
-    connection: &mut impl pbps_db::transport::QueryConnection,
-    scope: &CaptureScope,
-    dropped: &BTreeSet<DroppedSignature>,
-    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
-) -> Result<pbps_model::resolver::InputManifest, CaptureError> {
-    capture_identifying_sealed(connection, scope, dropped, key)
-        .await
-        .map(|(_, manifest)| manifest)
-}
-
-/// Give the producer of a fresh coherent database read its native-input
-/// capability separately from ordinary captured evidence (DEC-974.1).
-///
-/// The connection grants the same catalog-read authority needed to read this
-/// source directly. A previously captured result cannot mint this capability.
-/// Retain `RuntimeInputs` only inside the native lifecycle; do not hand it to
-/// ordinary result consumers. It grants access to source-dependent operations,
-/// not process/root/mapping qualification, which remains the lifecycle's job.
-///
-/// ```compile_fail,E0277
-/// use pbps_pg::resolver::capture::{capture_with_runtime_inputs, CapturedInputs};
-/// async fn acquire(captured: &mut CapturedInputs) {
-///     let scope = captured.scope().clone();
-///     let _ = capture_with_runtime_inputs(captured, &scope, &Default::default()).await;
-/// }
-/// ```
-pub async fn capture_with_runtime_inputs(
-    connection: &mut impl pbps_db::transport::QueryConnection,
-    scope: &CaptureScope,
-    dropped: &BTreeSet<DroppedSignature>,
-) -> Result<(CapturedInputs, RuntimeInputs), CaptureError> {
-    let captured = capture_identifying(connection, scope, dropped).await?;
-    let runtime = captured.runtime_inputs().map_err(CaptureError::Coverage)?;
-    Ok((captured, runtime))
-}
-
 /// A new owned snapshot is required on every recheck; cached rows cannot
 /// answer whether candidate additions or property changes invalidated inputs.
 pub async fn recapture(
@@ -255,46 +184,6 @@ mod tests;
 mod baseline;
 
 mod session;
-
-/// Source-bearing capability issued only to the producer of a fresh database
-/// read by [`capture_with_runtime_inputs`], not recoverable from ordinary
-/// [`CapturedInputs`]. The native lifecycle keeps it private (DEC-974.1).
-/// Paths remain opaque, but resolution/open results depend on them: holders
-/// are authorized to use these operations, so this is not an ordinary report
-/// or a value to delegate to an untrusted result consumer.
-///
-/// A downstream caller cannot extract either source-bearing field:
-/// ```compile_fail,E0616
-/// use pbps_pg::resolver::capture::RuntimeInputs;
-/// fn extract(inputs: RuntimeInputs) -> Vec<String> { inputs.libraries }
-/// ```
-/// ```compile_fail,E0616
-/// use pbps_pg::resolver::capture::RuntimeInputs;
-/// fn extract(inputs: RuntimeInputs) -> String { inputs.dynamic_library_path }
-/// ```
-/// Ordinary formatting cannot turn the transfer into a path report:
-/// ```compile_fail,E0277
-/// use pbps_pg::resolver::capture::RuntimeInputs;
-/// fn report(inputs: RuntimeInputs) -> String { format!("{inputs:?}") }
-/// ```
-/// ```compile_fail,E0277
-/// use pbps_pg::resolver::capture::RuntimeInputs;
-/// fn report(inputs: RuntimeInputs) { let _ = serde_json::to_string(&inputs); }
-/// ```
-// Catalog capture is portable; only the Linux native lifecycle consumes these
-// private fields. Keep the same opaque transfer on the other platforms too.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub struct RuntimeInputs {
-    libraries: Vec<String>,
-    dynamic_library_path: String,
-}
-
-#[cfg(target_os = "linux")]
-mod native_inputs;
-#[cfg(target_os = "linux")]
-pub use native_inputs::{
-    NativeLibrary, NativeLibraryReader, RuntimeResolution, native_library_candidates,
-};
 
 #[cfg(test)]
 mod ordering_tests;

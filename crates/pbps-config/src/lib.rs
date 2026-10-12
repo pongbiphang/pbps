@@ -36,6 +36,21 @@ pub enum ConfigError {
     )]
     UnknownResolver { name: String, available: String },
 
+    /// A selection naming one of the measured profiles pbps once had. It is
+    /// told apart from an unknown name so the operator learns what replaced
+    /// it, not only that it is missing (#1636).
+    #[error(
+        "`{name}` was a measured resolver profile, which pbps no longer has (#1636). Declare a resolver under resolvers in {CONFIG_FILE}, with kind: docker or kind: server, and select it by its name with --resolve-with"
+    )]
+    RemovedResolverProfile { name: String },
+
+    /// A resolver entry carrying the `profile` field the measured profiles
+    /// were chosen by (#1636).
+    #[error(
+        "`{path}` is malformed: resolver `{resolver}` names a profile, but the measured resolver profiles were removed (#1636). An entry is the resolver itself, chosen by its kind: docker or server"
+    )]
+    RemovedResolverProfileField { path: PathBuf, resolver: String },
+
     #[error(
         "resolver profile names must start with an ASCII letter or digit and contain only letters, digits, dots, underscores or hyphens"
     )]
@@ -346,9 +361,19 @@ fn default_ids_file() -> PathBuf {
 
 impl Config {
     pub fn parse(yaml: &str, path: &Path) -> Result<Self, ConfigError> {
-        let config: Self = serde_saphyr::from_str(yaml).map_err(|e| ConfigError::Parse {
-            path: path.to_owned(),
-            message: e.to_string(),
+        let config: Self = serde_saphyr::from_str(yaml).map_err(|e| {
+            // Read again only on failure, so every other error keeps the
+            // typed parse's own position.
+            match resolver::entry_naming_a_profile(yaml) {
+                Some(resolver) => ConfigError::RemovedResolverProfileField {
+                    path: path.to_owned(),
+                    resolver,
+                },
+                None => ConfigError::Parse {
+                    path: path.to_owned(),
+                    message: e.to_string(),
+                },
+            }
         })?;
         if config
             .resolvers
