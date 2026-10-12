@@ -7138,6 +7138,11 @@ pub fn cmd_plan_db(
             planned
         })
         .collect();
+        // The zero-SQL changes the diff cannot see, carried by every plan this
+        // read makes: the initial one, each re-derivation, and the resolver's
+        // (#1516 review). One list, so a plan cannot carry one and not the
+        // other.
+        let zero_sql: Vec<_> = takeovers.into_iter().chain(ensure_keys).collect();
         // The read-back goes in beside the overlaid base, for the comparisons
         // the engine makes by parse tree (an attach's checks and generation
         // expressions, #1642 review).
@@ -7160,8 +7165,7 @@ pub fn cmd_plan_db(
             .map(|mut changes| {
                 // Re-derivations and resolver planning must retain the same
                 // zero-SQL changes as the initial connected plan.
-                changes.changes.extend(takeovers.iter().cloned());
-                changes.changes.extend(ensure_keys.iter().cloned());
+                changes.changes.extend(zero_sql.iter().cloned());
                 changes
             })
         };
@@ -7234,10 +7238,10 @@ pub fn cmd_plan_db(
                         resolver_assessment =
                             Some(crate::resolution::ResolverAssessment::resolved(&assessment));
                         // The resolver's order, with the connected plan's
-                        // zero-SQL takeovers after it, where `diff_here`
+                        // zero-SQL changes after it, where `diff_here`
                         // keeps them.
                         cs = unsealed.changes().clone();
-                        cs.changes.extend(takeovers.iter().cloned());
+                        cs.changes.extend(zero_sql.iter().cloned());
                         resolution = Some((selection.name.clone(), unsealed, asked));
                     }
                     Err(crate::resolution::Refused::Finding(finding)) => {

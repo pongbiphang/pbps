@@ -6,6 +6,10 @@ use super::*;
 /// revision declares `app.f(integer)`, which captures every one of those
 /// calls. The scratch is a confined login in its own database on the
 /// target's server: the one layout both pinned servers support.
+///
+/// The same revision brings a row the target already holds under an
+/// `ensure` table's management: a change with no SQL, which the published
+/// plan carries as the ordinary one does (#1516 review).
 pub fn published(server: &str) {
     let own = OwnDatabase::new(server, "publish1516");
     let connection = own.connection();
@@ -16,10 +20,16 @@ pub fn published(server: &str) {
     successful(run(&d, &["plan"], None));
     d.commit();
     successful(run(&d, &["bootstrap", "--db", connection], None));
+    on_server(connection, "INSERT INTO app.country VALUES ('JP', 'Japan')");
     std::fs::write(
         d.dir.join("schema/app.f%28integer%29.function.yml"),
         "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
          (integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.country.yml"),
+        country("\n    TW: {label: Taiwan}\n    JP: {label: Japan}"),
     )
     .unwrap();
     successful(run(&d, &["plan"], None));
@@ -83,6 +93,28 @@ pub fn published(server: &str) {
     let saved: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
     assert_eq!(saved["origin"], "resolved_database", "{saved}");
+    let typed: pbps_model::SavedPlan = serde_json::from_value(saved.clone()).unwrap();
+    let keys: Vec<_> = typed
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::SetEnsureKeys { table, from, to } = &p.change {
+                Some((table.to_string(), from.clone(), to.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![(
+            "app.country".to_owned(),
+            ["TW"].into_iter().map(Into::into).collect(),
+            ["TW", "JP"].into_iter().map(Into::into).collect()
+        )],
+        "the published plan keeps the newly managed key"
+    );
     let cluster = saved["analysis"]["evidence"]["qualification"]["target_cluster"]
         .as_str()
         .unwrap_or_else(|| panic!("the evidence seals the target's cluster: {saved}"));
@@ -231,6 +263,21 @@ fn declare(d: &Demo) {
     for (name, body) in files {
         std::fs::write(d.dir.join("schema").join(name), body).unwrap();
     }
+    std::fs::write(
+        d.dir.join("schema/app.country.yml"),
+        country("\n    TW: {label: Taiwan}"),
+    )
+    .unwrap();
+}
+
+/// A reference table the project manages with `ensure`, holding `rows`.
+fn country(rows: &str) -> String {
+    format!(
+        "table: app.country\ncolumns:\n  code: {{type: varchar(2), nullable: false}}\n  \
+         label: {{type: varchar(40), nullable: false}}\n\
+         primary_key: {{name: pk_country, columns: [code]}}\n\
+         data:\n  mode: ensure\n  rows: {rows}\n"
+    )
 }
 
 /// Each surface the arriving overload captures is created again after it,
