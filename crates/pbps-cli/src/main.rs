@@ -1750,6 +1750,14 @@ pub(crate) fn declaration_problems(
     loaded: &pbps_load::Loaded,
     dialect: &dyn Dialect,
 ) -> Vec<(&'static str, String)> {
+    declaration_problems_with_sources(loaded, dialect, &Default::default())
+}
+
+fn declaration_problems_with_sources(
+    loaded: &pbps_load::Loaded,
+    dialect: &dyn Dialect,
+    conflicts: &pbps_load::SourceConflicts,
+) -> Vec<(&'static str, String)> {
     let schema = &loaded.schema;
     let mut out: Vec<(&'static str, String)> = Vec::new();
     // Three layers, all reported in the same pass: the loader checks shape, the
@@ -1757,7 +1765,11 @@ pub(crate) fn declaration_problems(
     // IDENTITY on nvarchar), and the whole-schema checks below see what no
     // single declaration can.
     for (name, table) in &schema.tables {
-        for e in dialect.validate_table(name, table) {
+        for e in dialect.validate_table_sources(
+            name,
+            table,
+            conflicts.get(name).unwrap_or(&Default::default()),
+        ) {
             out.push(("dialect.rejected", format!("{name}: {e}")));
         }
         // A partition's own checks and indexes, against the columns it has
@@ -1961,6 +1973,32 @@ pub fn validate_findings(
     dialect: &dyn Dialect,
     since: Option<&str>,
 ) -> (Vec<output::Finding>, ValidateData) {
+    let dir = project.schema_dir();
+    let inspected = if dir.is_dir() {
+        pbps_load::inspect_schema_dir(&dir)
+    } else {
+        Err(vec![pbps_load::LoadError::Io {
+            path: dir,
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no declarations directory"),
+        }])
+    };
+    match inspected {
+        Ok(mut inspected) => inspected.inspect(|loaded, conflicts| {
+            validate_inspected(project, dialect, since, Ok(loaded), conflicts)
+        }),
+        Err(errors) => {
+            validate_inspected(project, dialect, since, Err(&errors), &Default::default())
+        }
+    }
+}
+
+fn validate_inspected(
+    project: &Project,
+    dialect: &dyn Dialect,
+    since: Option<&str>,
+    mut loaded: Result<&mut pbps_load::Loaded, &Vec<pbps_load::LoadError>>,
+    source_conflicts: &pbps_load::SourceConflicts,
+) -> (Vec<output::Finding>, ValidateData) {
     // Both halves run before either is allowed to fail. A bad merge produces a
     // broken declaration *and* a scrambled identity file together, and the rule
     // everywhere else in this tool is to report every problem in one pass rather
@@ -1969,7 +2007,6 @@ pub fn validate_findings(
     // the identities every other command will: two declarations this engine
     // reads as one routine are a problem `validate` has to report, not one it
     // discovers by planning (ADR-0009 §1).
-    let mut loaded = load_quiet(project);
     let mut collisions = Vec::new();
     if let Ok(l) = &mut loaded {
         collisions = routine_ids_as_the_dialect_spells_them(&mut l.schema, &mut l.hints, dialect);
@@ -1997,7 +2034,7 @@ pub fn validate_findings(
         // size warning below is the `data.max-rows` policy rule, with
         // `max_data_rows` as its default parameter.
         findings.extend(
-            declaration_problems(l, dialect)
+            declaration_problems_with_sources(l, dialect, source_conflicts)
                 .into_iter()
                 .map(|(id, problem)| output::Finding::error(id, problem)),
         );
@@ -3919,7 +3956,9 @@ mod tests {
             let dialect = dialect_for(name);
             for default in [Some("zz.null\u{301}x()"), None, Some("NULL")] {
                 let mut column = Column::new("integer".parse().unwrap()).not_null();
-                column.default = default.map(str::to_owned);
+                column.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+                    pbps_model::ValueSource::Default(text.into())
+                });
                 let mut planned = PlannedChange::new(Change::AddColumn {
                     uid: Uid::generate(UidKind::Column),
                     table: "app.t".parse().unwrap(),

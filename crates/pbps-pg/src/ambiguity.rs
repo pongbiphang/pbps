@@ -15,6 +15,7 @@
 //! and `2026-01-02 09:00+08` read the same under every set below and pass,
 //! whatever a rule about slashes or offsets would have said.
 
+use pbps_model::ValueSource;
 use std::collections::BTreeMap;
 
 use pbps_db::catalog::{Ambiguous, LiteralAt};
@@ -219,7 +220,11 @@ fn declared_literals(schema: &Schema) -> Result<Vec<Literal>, DbError> {
             let key =
                 crate::rows::key_column(name, table).map_err(|e| DbError::BadRow(e.to_string()))?;
             for (column, spec) in &table.columns {
-                if spec.engine_assigned() {
+                if match spec.value_source {
+                    pbps_model::ValueSource::Identity(_)
+                    | pbps_model::ValueSource::Generated(_) => true,
+                    pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) => false,
+                } {
                     continue;
                 }
                 let Some((base, ty, array)) = sensitive(&spec.ty)? else {
@@ -258,7 +263,15 @@ fn declared_literals(schema: &Schema) -> Result<Vec<Literal>, DbError> {
             None => table
                 .columns
                 .iter()
-                .filter_map(|(c, spec)| spec.default.as_deref().map(|d| (c, d)))
+                .filter_map(|(c, spec)| {
+                    (match &spec.value_source {
+                        ValueSource::Default(value) => Some(value.as_str()),
+                        ValueSource::None
+                        | ValueSource::Identity(_)
+                        | ValueSource::Generated(_) => None,
+                    })
+                    .map(|d| (c, d))
+                })
                 .collect(),
         };
         for (column, default) in own_defaults {

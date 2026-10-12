@@ -59,7 +59,12 @@ impl Dialect for Mssql {
         table
             .columns
             .iter()
-            .filter(|(_, column)| column.default.is_some())
+            .filter(|(_, column)| match column.value_source {
+                pbps_model::ValueSource::Default(_) => true,
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Generated(_) => false,
+            })
             .flat_map(|(column, _)| emit::generated_default_names(name, column))
             .collect()
     }
@@ -210,7 +215,16 @@ impl Dialect for Mssql {
     }
 
     fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError> {
-        let mut found = validate::table(name, table);
+        self.validate_table_sources(name, table, &Default::default())
+    }
+
+    fn validate_table_sources(
+        &self,
+        name: &TableName,
+        table: &Table,
+        sources: &std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>>,
+    ) -> Vec<DialectError> {
+        let mut found = validate::table_sources(name, table, sources);
         // The pull filters the ledger tables out by their qualified names, so a
         // declaration of one would read back as absent and be planned for
         // creation over the table that is there: refused here instead, as the
@@ -381,7 +395,7 @@ mod tests {
         t.columns.insert(
             "c".into(),
             pbps_model::Column {
-                default: Some("0".into()),
+                value_source: pbps_model::ValueSource::Default("0".into()),
                 ..pbps_model::Column::new("int".parse().unwrap())
             },
         );

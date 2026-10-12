@@ -563,26 +563,25 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             ..
         } => {
             let about = format!("adding the column {}", table.column(name));
-            // The identity sequence backfills every stored row even though
-            // `default` is absent. Measured on PostgreSQL 16 and 18, this also
-            // rebuilds an empty table (DEC-605.1, narrowing Decision 401).
-            if column.identity.is_some() {
-                return e(
-                    about,
-                    table,
-                    Rewrite::Yes,
-                    Reads::EveryRow,
-                    Lock::AccessExclusive,
-                );
-            }
             // Measured, `ADD COLUMN d integer DEFAULT 7` rewrites nothing and
             // reads nothing, and `ADD COLUMN d uuid DEFAULT gen_random_uuid()`
             // rebuilds the table. Both are one `AddColumn` carrying a default,
             // and only the expression tells them apart — which this tool does
             // not parse (SPEC §8.2). So a default that is not a literal is
             // `unknown`, never free: ADR-0012 §4 rules out the guess by name.
-            match column.default.as_deref() {
-                Some(default) if !crate::rows::is_constant(default.trim()) => {
+            match &column.value_source {
+                // Both sources populate every existing row. A stored generated
+                // ADD rewrites even when nullable, measured on PG16 and PG18.
+                pbps_model::ValueSource::Identity(_) | pbps_model::ValueSource::Generated(_) => e(
+                    about,
+                    table,
+                    Rewrite::Yes,
+                    Reads::EveryRow,
+                    Lock::AccessExclusive,
+                ),
+                pbps_model::ValueSource::Default(default)
+                    if !crate::rows::is_constant(default.trim()) =>
+                {
                     let mut estimate = Estimate::new(
                         about,
                         table.clone(),
@@ -598,7 +597,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
                     );
                     Some(estimate)
                 }
-                _ => e(
+                pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) => e(
                     about,
                     table,
                     Rewrite::No,
@@ -1818,7 +1817,7 @@ mod tests {
     fn an_unparsed_default_is_never_called_cheap() {
         let column = |default: &str| {
             let mut c = pbps_model::Column::new(ty("uuid"));
-            c.default = Some(default.to_owned());
+            c.value_source = pbps_model::ValueSource::Default(default.to_owned());
             Change::AddColumn {
                 uid: "c_aaaaaa".parse().expect("a uid"),
                 table: tname("app.t"),
@@ -1841,6 +1840,40 @@ mod tests {
     }
 
     #[test]
+    fn a_nullable_stored_generated_add_rewrites_and_reads_every_row() {
+        let mut column = pbps_model::Column::new(ty("integer"));
+        column.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+            expression: "a * 2".into(),
+            stored: true,
+        });
+        assert!(column.nullable);
+        let change = Change::AddColumn {
+            uid: "c_1402aa".parse().unwrap(),
+            table: tname("app.t"),
+            name: "g".into(),
+            column: Box::new(column),
+        };
+        let cost = estimate(&change, Strategy::default()).unwrap();
+        assert_eq!(cost.rewrite, Rewrite::Yes);
+        assert_eq!(cost.reads, Reads::EveryRow);
+        assert_eq!(cost.lock, Lock::AccessExclusive);
+        assert!(!cost.is_cheap());
+        for source in [
+            pbps_model::ValueSource::None,
+            pbps_model::ValueSource::Default("7".into()),
+        ] {
+            let mut control = change.clone();
+            let Change::AddColumn { column, .. } = &mut control else {
+                unreachable!()
+            };
+            column.value_source = source;
+            let cost = estimate(&control, Strategy::default()).unwrap();
+            assert_eq!(cost.rewrite, Rewrite::No);
+            assert_eq!(cost.reads, Reads::Nothing);
+        }
+    }
+
+    #[test]
     fn adding_an_identity_backfills_rows_without_an_explicit_default() {
         for identity in [
             None,
@@ -1850,7 +1883,10 @@ mod tests {
             }),
         ] {
             let mut column = pbps_model::Column::new(ty("integer"));
-            column.identity = identity;
+            column.value_source = identity.map_or(
+                pbps_model::ValueSource::None,
+                pbps_model::ValueSource::Identity,
+            );
             column.nullable = identity.is_none();
             let change = Change::AddColumn {
                 uid: "c_aaaaaa".parse().expect("a uid"),

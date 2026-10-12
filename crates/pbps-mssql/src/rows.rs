@@ -55,6 +55,7 @@
 //! "empty" and "unreadable" are three different answers, and only one of them
 //! is good news.
 
+use pbps_model::ValueSource;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::DbError;
@@ -178,7 +179,10 @@ pub fn query(
         kind: ValueKind::of(&key_spec.ty.base),
         value_at: 0,
         default_at: None,
-        has_default: key_spec.default.is_some(),
+        has_default: (match &key_spec.value_source {
+            ValueSource::Default(_) => true,
+            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => false,
+        }),
         assume_default: false,
     };
 
@@ -193,14 +197,16 @@ pub fn query(
         // omission every declaration has to make, and every connected plan
         // would restate an UPDATE the engine refuses. So it is never read:
         // both sides omit it, and omission agrees with omission (DECISIONS 94).
-        if spec.identity.is_some() {
-            continue;
-        }
+        let default = match &spec.value_source {
+            ValueSource::Default(default) => Some(default),
+            ValueSource::None | ValueSource::Generated(_) => None,
+            ValueSource::Identity(_) => continue,
+        };
         let quoted = quote(column)?;
         let value_at = select.len();
         select.push(read_expr(&quoted, &spec.ty.base));
         let asked = confirms_default(spec);
-        let default_at = match &spec.default {
+        let default_at = match default {
             Some(default) if asked => {
                 // Compare what assignment stores, as the emitter's
                 // defaulted_cell does. Type precedence must not convert a
@@ -239,8 +245,8 @@ pub fn query(
             kind: ValueKind::of(&spec.ty.base),
             value_at,
             default_at,
-            has_default: spec.default.is_some(),
-            assume_default: spec.default.is_some() && !asked,
+            has_default: default.is_some(),
+            assume_default: default.is_some() && !asked,
         });
     }
 
@@ -447,7 +453,12 @@ pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQ
         out.push(query(None, input_for(&key)?, &base, ty, keys));
     }
     for (column, spec) in &table.columns {
-        if *column == key || spec.identity.is_some() {
+        if *column == key
+            || (match &spec.value_source {
+                ValueSource::Identity(_) => true,
+                ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => false,
+            })
+        {
             continue;
         }
         let (base, ty) = ty_of(column)?;
@@ -709,7 +720,11 @@ pub(crate) fn same_value(stored: &str, other: &str, base: &str) -> String {
 /// is no type left to exclude — and excluding one cost the read-back the whole
 /// column (DECISIONS 331's shape, on this dialect).
 pub fn confirms_default(spec: &pbps_model::Column) -> bool {
-    spec.default.as_deref().is_some_and(is_constant)
+    (match &spec.value_source {
+        ValueSource::Default(value) => Some(value.as_str()),
+        ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+    })
+    .is_some_and(is_constant)
 }
 
 /// Whether a default expression is a literal — a number, a string, `NULL`, a
@@ -1269,7 +1284,9 @@ mod tests {
         let mut t = Table::default();
         for (name, ty, default) in columns {
             let mut c = Column::new(ColumnType::from_str(ty).unwrap());
-            c.default = default.map(str::to_owned);
+            c.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+                pbps_model::ValueSource::Default(text.into())
+            });
             t.columns.insert((*name).to_owned(), c);
         }
         t.primary_key = pk.map(|c| PrimaryKey {
@@ -1502,7 +1519,7 @@ mod tests {
             ],
         );
         let mut seq = Column::new(ColumnType::from_str("int").unwrap()).not_null();
-        seq.identity = Some(pbps_model::Identity {
+        seq.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
         });

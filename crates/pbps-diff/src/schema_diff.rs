@@ -30,7 +30,7 @@ use pbps_model::{
     Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, DetachedKind, DetachedName,
     GrantTarget, Hints, IdsFile, Index, IndexMethod, IndexPart, ModuleId, Permission,
     PlannedChange, PrimaryKey, PublicAccess, Renames, ReplicaIdentity, RoutineOrigin, Schema,
-    Table, TableName, Uid, UniqueConstraint, Value,
+    Table, TableName, Uid, UniqueConstraint, Value, ValueSource,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -537,10 +537,14 @@ fn diff_partial_rebuilding(
             // give the emitter a second place to produce DML.
             match (&table.data, table.primary_key.as_ref()) {
                 (Some(data), Some(pk)) if pk.columns.len() == 1 => {
-                    let identity_key = table
-                        .columns
-                        .get(&pk.columns[0])
-                        .is_some_and(|c| c.identity.is_some());
+                    let identity_key = table.columns.get(&pk.columns[0]).is_some_and(|c| match &c
+                        .value_source
+                    {
+                        ValueSource::Identity(_) => true,
+                        ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => {
+                            false
+                        }
+                    });
                     for (key, row) in &data.rows {
                         let (defaults, types) = omitted_defaults(&table, &pk.columns[0], row);
                         changes.push(Change::InsertRow {
@@ -628,7 +632,12 @@ fn diff_partial_rebuilding(
                 .map(|t| {
                     t.columns
                         .iter()
-                        .filter(|(_, c)| c.default.is_some())
+                        .filter(|(_, c)| match &c.value_source {
+                            ValueSource::Default(_) => true,
+                            ValueSource::None
+                            | ValueSource::Identity(_)
+                            | ValueSource::Generated(_) => false,
+                        })
                         .map(|(name, _)| name.clone())
                         .collect()
                 })
@@ -759,9 +768,14 @@ fn diff_partial_rebuilding(
                     let parent = declared.schema.tables.get(&of.parent);
                     for column in defaultless {
                         let own = of.columns.get(&column).and_then(|c| c.default.as_ref());
-                        let fallback = parent
-                            .and_then(|p| p.columns.get(&column))
-                            .and_then(|c| c.default.clone());
+                        let fallback = parent.and_then(|p| p.columns.get(&column)).and_then(|c| {
+                            match &c.value_source {
+                                ValueSource::Default(value) => Some(value.clone()),
+                                ValueSource::None
+                                | ValueSource::Identity(_)
+                                | ValueSource::Generated(_) => None,
+                            }
+                        });
                         if let (None, Some(fallback)) = (own, fallback) {
                             changes.push(Change::SetPartitionDefault {
                                 uid: uid.clone(),
@@ -1346,7 +1360,10 @@ fn diff_partial_rebuilding(
             table
                 .columns
                 .iter()
-                .filter(|(_, c)| c.generated.is_some())
+                .filter(|(_, c)| match &c.value_source {
+                    ValueSource::Generated(_) => true,
+                    ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
+                })
                 .filter_map(move |(column, _)| base.ids.column_uid(&name.column(column)).cloned())
         })
         .collect();
@@ -1605,7 +1622,10 @@ fn diff_partial_rebuilding(
             return (order_key(c), 0);
         }
         if let Change::AddColumn { column, .. } = c
-            && column.generated.is_some()
+            && (match &column.value_source {
+                ValueSource::Generated(_) => true,
+                ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
+            })
         {
             return (COLUMN_ALTERATIONS, 2);
         }
@@ -1747,16 +1767,28 @@ fn diff_columns(
             continue;
         };
 
-        if base_col.identity != col.identity {
-            errs.push(DiffError::IdentityChangeUnsupported {
-                column: declared_ref.clone(),
-            });
-        }
         let mut recomputed = false;
-        match (&base_col.generated, &col.generated) {
-            (None, None) => {}
-            (Some(from), Some(to)) if from.stored == to.stored => {
-                if from.expression != to.expression {
+        // Compare the source as one property: ordinary defaults may change,
+        // generated text may change in place, and identity/kind changes refuse.
+        let (old_default, new_default) = match (&base_col.value_source, &col.value_source) {
+            (ValueSource::None, ValueSource::None) => (None, None),
+            (ValueSource::Default(old), ValueSource::Default(new)) => (Some(old), Some(new)),
+            (ValueSource::None, ValueSource::Default(new)) => (None, Some(new)),
+            (ValueSource::Default(old), ValueSource::None) => (Some(old), None),
+            (ValueSource::Identity(old), ValueSource::Identity(new)) => {
+                if old != new {
+                    errs.push(DiffError::IdentityChangeUnsupported {
+                        column: declared_ref.clone(),
+                    });
+                }
+                (None, None)
+            }
+            (ValueSource::Generated(from), ValueSource::Generated(to)) => {
+                if from.stored != to.stored {
+                    errs.push(DiffError::GenerationChangeUnsupported {
+                        column: declared_ref.clone(),
+                    });
+                } else if from.expression != to.expression {
                     recomputed = true;
                     changes.push(Change::AlterColumnExpression {
                         uid: uid.clone(),
@@ -1765,11 +1797,33 @@ fn diff_columns(
                         to: to.expression.clone(),
                     });
                 }
+                (None, None)
             }
-            _ => errs.push(DiffError::GenerationChangeUnsupported {
-                column: declared_ref.clone(),
-            }),
-        }
+            (ValueSource::Identity(_), ValueSource::None | ValueSource::Default(_))
+            | (ValueSource::None | ValueSource::Default(_), ValueSource::Identity(_)) => {
+                errs.push(DiffError::IdentityChangeUnsupported {
+                    column: declared_ref.clone(),
+                });
+                (None, None)
+            }
+            (ValueSource::Generated(_), ValueSource::None | ValueSource::Default(_))
+            | (ValueSource::None | ValueSource::Default(_), ValueSource::Generated(_)) => {
+                errs.push(DiffError::GenerationChangeUnsupported {
+                    column: declared_ref.clone(),
+                });
+                (None, None)
+            }
+            (ValueSource::Identity(_), ValueSource::Generated(_))
+            | (ValueSource::Generated(_), ValueSource::Identity(_)) => {
+                errs.push(DiffError::IdentityChangeUnsupported {
+                    column: declared_ref.clone(),
+                });
+                errs.push(DiffError::GenerationChangeUnsupported {
+                    column: declared_ref.clone(),
+                });
+                (None, None)
+            }
+        };
 
         let norm = |t: &ColumnType| dialect.normalize_type(t).unwrap_or_else(|_| t.clone());
         let (from_ty, to_ty) = (norm(&base_col.ty), norm(&col.ty));
@@ -1819,7 +1873,7 @@ fn diff_columns(
                 collation: col.collation.clone(),
             });
         }
-        if base_col.default != col.default {
+        if old_default != new_default {
             // A default that is *replaced* on a column this same plan retypes
             // is two changes, because the type change has to run between them.
             // Measured on SQL Server, an `ALTER COLUMN` that changes the type
@@ -1834,19 +1888,19 @@ fn diff_columns(
             // the SQL Server emitter already drops and adds inside its one
             // statement. Splitting it there would put two lines at opposite
             // ends of the plan where one says it better (SPEC §14.1).
-            let split = retyped && base_col.default.is_some() && col.default.is_some();
+            let split = retyped && old_default.is_some() && new_default.is_some();
             changes.push(Change::AlterColumnDefault {
                 uid: uid.clone(),
                 column: declared_ref.clone(),
-                from: base_col.default.clone(),
-                to: if split { None } else { col.default.clone() },
+                from: old_default.cloned(),
+                to: if split { None } else { new_default.cloned() },
             });
             if split {
                 changes.push(Change::AlterColumnDefault {
                     uid: uid.clone(),
                     column: declared_ref.clone(),
                     from: None,
-                    to: col.default.clone(),
+                    to: new_default.cloned(),
                 });
             }
         }
@@ -2655,7 +2709,7 @@ fn detached_names(
         for (column, own) in &of.columns {
             if let Some(c) = parent.columns.get_mut(column) {
                 if let Some(default) = &own.default {
-                    c.default = Some(default.clone());
+                    c.value_source = pbps_model::ValueSource::Default(default.clone());
                 }
                 if own.not_null {
                     c.nullable = false;
@@ -2889,7 +2943,13 @@ fn attached(
                 let column = pbps_model::Column {
                     ty,
                     nullable: true,
-                    default: None,
+                    value_source: match &c.value_source {
+                        ValueSource::Default(_) | ValueSource::None => ValueSource::None,
+                        ValueSource::Identity(identity) => ValueSource::Identity(*identity),
+                        ValueSource::Generated(generated) => {
+                            ValueSource::Generated(generated.clone())
+                        }
+                    },
                     description: None,
                     deprecated: None,
                     ..c.clone()
@@ -2921,15 +2981,20 @@ fn attached(
             }
         }
         for (column, spec) in &mut t.columns {
-            let Some(generated) = &mut spec.generated else {
-                continue;
+            let generated = match &mut spec.value_source {
+                ValueSource::Generated(generated) => generated,
+                ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => continue,
             };
             match read {
                 Some(read) => {
-                    if let Some(engine) = read
-                        .and_then(|r| r.columns.get(column))
-                        .and_then(|c| c.generated.as_ref())
-                    {
+                    if let Some(engine) = read.and_then(|r| r.columns.get(column)).and_then(|c| {
+                        match &c.value_source {
+                            ValueSource::Generated(value) => Some(value),
+                            ValueSource::None
+                            | ValueSource::Default(_)
+                            | ValueSource::Identity(_) => None,
+                        }
+                    }) {
                         generated.expression = engine.expression.clone();
                     }
                 }
@@ -2965,7 +3030,11 @@ fn attached(
                     "its column `{name}` is not its parent's in type, collation, identity or \
                      generation"
                 ));
-            } else if a.generated.is_some() && base_name.schema != of.parent.schema {
+            } else if (match &a.value_source {
+                ValueSource::Generated(_) => true,
+                ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
+            }) && base_name.schema != of.parent.schema
+            {
                 // The engine does not compare generation expressions as it
                 // attaches, and keeps the table's: in another schema the same
                 // text may call another function, and each partition would
@@ -2996,13 +3065,29 @@ fn attached(
             // unqualified name in it may be another schema's object, so it
             // is the table's own, and taking the parent's back sets the
             // parent's under the parent's path (DEC-1581.1).
-            default: c
-                .default
-                .clone()
-                .filter(|d| base_name.schema != of.parent.schema || Some(d) != p.default.as_ref()),
+            default: (match &c.value_source {
+                ValueSource::Default(value) => Some(value.clone()),
+                ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+            })
+            .filter(|d| {
+                base_name.schema != of.parent.schema
+                    || Some(d)
+                        != (match &p.value_source {
+                            ValueSource::Default(value) => Some(value),
+                            ValueSource::None
+                            | ValueSource::Identity(_)
+                            | ValueSource::Generated(_) => None,
+                        })
+            }),
             not_null: !c.nullable && p.nullable,
         };
-        if c.default.is_none() && p.default.is_some() {
+        if (match &c.value_source {
+            ValueSource::Default(_) => false,
+            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => true,
+        }) && (match &p.value_source {
+            ValueSource::Default(_) => true,
+            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => false,
+        }) {
             defaultless.push(name.clone());
         }
         if own != pbps_model::PartitionColumn::default() {
@@ -3603,7 +3688,12 @@ fn refuse_partition_changes(
                     format!("{}, which is in its partition key", change_in_words(change)),
                 );
             } else if let Change::AddColumn { column: c, .. } = change
-                && c.identity.is_some()
+                && (match &c.value_source {
+                    ValueSource::Identity(_) => true,
+                    ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => {
+                        false
+                    }
+                })
             {
                 refuse(
                     table,
@@ -3982,8 +4072,12 @@ fn diff_partition_columns(
         let to = now.columns.get(column).unwrap_or(&none);
         let theirs = parent.and_then(|p| p.columns.get(column));
         let theirs_was = base_of.get(column);
+        let parent_default = |c: &pbps_model::Column| match &c.value_source {
+            ValueSource::Default(default) => Some(default.clone()),
+            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+        };
         let default_moved =
-            theirs_was.is_some_and(|b| Some(&b.default) != theirs.map(|c| &c.default));
+            theirs_was.is_some_and(|b| Some(parent_default(b)) != theirs.map(parent_default));
         if from.default != to.default || (default_moved && to.default.is_some()) {
             changes.push(Change::SetPartitionDefault {
                 uid: uid.clone(),
@@ -3994,9 +4088,14 @@ fn diff_partition_columns(
                 to: to.default.clone(),
                 // What the engine gave the partition when it was made, and
                 // what a row written to it directly gets without one.
-                fallback: parent
-                    .and_then(|p| p.columns.get(column))
-                    .and_then(|c| c.default.clone()),
+                fallback: parent.and_then(|p| p.columns.get(column)).and_then(|c| {
+                    match &c.value_source {
+                        ValueSource::Default(value) => Some(value.clone()),
+                        ValueSource::None
+                        | ValueSource::Identity(_)
+                        | ValueSource::Generated(_) => None,
+                    }
+                }),
             });
         }
         let tightened =
@@ -4694,7 +4793,10 @@ fn diff_data(
     let identity_key = declared
         .columns
         .get(&key_column)
-        .is_some_and(|c| c.identity.is_some());
+        .is_some_and(|c| match &c.value_source {
+            ValueSource::Identity(_) => true,
+            ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => false,
+        });
 
     let Some(declared_data) = &declared.data else {
         // The block was removed. Nothing is deleted and nothing is inserted:
@@ -4799,7 +4901,13 @@ fn diff_data(
                     // back (DECISIONS 94), so both sides resolve it to NULL
                     // and it is neither a change nor a cell the row can be
                     // held to — the engine assigned it.
-                    if spec.engine_assigned() {
+                    if match spec.value_source {
+                        pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Generated(_) => true,
+                        pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) => {
+                            false
+                        }
+                    } {
                         continue;
                     }
                     // Each side against *its own* table, and the base side
@@ -4921,7 +5029,13 @@ fn diff_data(
                     let Some(spec) = base.columns.get(base_column) else {
                         continue;
                     };
-                    if spec.engine_assigned() {
+                    if match spec.value_source {
+                        pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Generated(_) => true,
+                        pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) => {
+                            false
+                        }
+                    } {
                         continue;
                     }
                     row.insert(
@@ -4956,7 +5070,14 @@ fn diff_data(
                 // reviewer-only cells need their own map (DECISIONS 442).
                 let mut dropped = BTreeMap::new();
                 for (base_column, spec) in &base.columns {
-                    if spec.engine_assigned() || surviving.contains(base_column.as_str()) {
+                    if (match spec.value_source {
+                        pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Generated(_) => true,
+                        pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) => {
+                            false
+                        }
+                    }) || surviving.contains(base_column.as_str())
+                    {
                         continue;
                     }
                     dropped.insert(base_column.clone(), cell(before, base_column, Some(spec)));
@@ -5827,7 +5948,10 @@ fn omitted_defaults(
         .map(|(c, spec)| (c.clone(), spec.ty.clone()))
         .collect();
     let defaults = omitted_columns(table, key_column, row)
-        .filter_map(|(c, spec)| spec.default.clone().map(|d| (c.clone(), d)))
+        .filter_map(|(c, spec)| match &spec.value_source {
+            ValueSource::Default(value) => Some((c.clone(), value.clone())),
+            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+        })
         .collect();
     (defaults, types)
 }
@@ -5859,9 +5983,10 @@ mod tests {
         let mut t = Table::default();
         let mut col = |name: &str, ty: &str, default: Option<&str>, identity: bool| {
             let mut c = Column::new(ColumnType::from_str(ty).unwrap());
-            c.default = default.map(str::to_owned);
+            c.value_source =
+                default.map_or(ValueSource::None, |text| ValueSource::Default(text.into()));
             if identity {
-                c.identity = Some(pbps_model::Identity {
+                c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                     seed: 1,
                     increment: 1,
                 });
@@ -5917,7 +6042,7 @@ mod tests {
         let mut col = |name: &str, ty: &str, identity: bool| {
             let mut c = Column::new(ColumnType::from_str(ty).unwrap());
             if identity {
-                c.identity = Some(pbps_model::Identity {
+                c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                     seed: 1,
                     increment: 1,
                 });
@@ -5934,7 +6059,15 @@ mod tests {
         let expected: BTreeSet<String> = t
             .columns
             .iter()
-            .filter(|(c, spec)| c.as_str() != "code" && spec.identity.is_none())
+            .filter(|(c, spec)| {
+                c.as_str() != "code"
+                    && (match &spec.value_source {
+                        ValueSource::Identity(_) => false,
+                        ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => {
+                            true
+                        }
+                    })
+            })
             .map(|(c, _)| c.clone())
             .collect();
         assert_eq!(types.keys().cloned().collect::<BTreeSet<_>>(), expected);
@@ -7926,7 +8059,8 @@ mod tests {
         let defaulted = planned(
             &with(
                 &|p| {
-                    p.columns.get_mut("m").unwrap().default = Some("1".into());
+                    p.columns.get_mut("m").unwrap().value_source =
+                        pbps_model::ValueSource::Default("1".into());
                 },
                 &keep_a,
                 &keep_b,
@@ -8051,7 +8185,7 @@ mod tests {
             &with(
                 &|p| {
                     let mut c = Column::new(ty("int")).not_null();
-                    c.identity = Some(pbps_model::Identity {
+                    c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                         seed: 1,
                         increment: 1,
                     });
@@ -8408,7 +8542,10 @@ mod tests {
         );
         reads(&mut renamed_checked, "\"M2\" > 0");
         let mut defaulted = with(
-            &|p| p.columns.get_mut("n").unwrap().default = Some("5".into()),
+            &|p| {
+                p.columns.get_mut("n").unwrap().value_source =
+                    pbps_model::ValueSource::Default("5".into())
+            },
             &keep_a,
             &keep_b,
         );
@@ -9008,7 +9145,7 @@ mod tests {
             .columns
             .get_mut("v")
             .unwrap()
-            .default = Some("1".into());
+            .value_source = pbps_model::ValueSource::Default("1".into());
         declared.tables.insert(
             "app.ev_rest".parse().unwrap(),
             partition(PartitionBound::Default, true),
@@ -9092,7 +9229,7 @@ mod tests {
             ])
         };
         let mut parent = columns();
-        parent.columns["n"].default = Some("0".into());
+        parent.columns["n"].value_source = pbps_model::ValueSource::Default("0".into());
         parent.primary_key = Some(key("ev_pk", &["id", "ts"]));
         parent.checks.insert("ev_n_ck".into(), check("n > 0"));
         parent.indexes.insert("ev_n".into(), index_on("n"));
@@ -9264,7 +9401,9 @@ mod tests {
         );
 
         // A default of its own is kept, and none is asked of the parent.
-        let own_default = ordinary(&|t| t.columns["n"].default = Some("7".into()));
+        let own_default = ordinary(&|t| {
+            t.columns["n"].value_source = pbps_model::ValueSource::Default("7".into())
+        });
         let mut keeps = declared.clone();
         keeps
             .tables
@@ -9778,7 +9917,9 @@ mod tests {
             moved.tables.insert("x.t".parse().unwrap(), t);
             moved
         };
-        let other = elsewhere(&ordinary(&|t| t.columns["n"].default = Some("0".into())));
+        let other = elsewhere(&ordinary(&|t| {
+            t.columns["n"].value_source = pbps_model::ValueSource::Default("0".into())
+        }));
         let other_declared = elsewhere(&declared);
         let set_back = outcome(&other, &other_declared, &[]).2.expect("attached");
         assert!(
@@ -9792,7 +9933,9 @@ mod tests {
         );
         // Negative: in the parent's schema the same text is the parent's.
         let same = outcome(
-            &ordinary(&|t| t.columns["n"].default = Some("0".into())),
+            &ordinary(&|t| {
+                t.columns["n"].value_source = pbps_model::ValueSource::Default("0".into())
+            }),
             &declared,
             &[],
         )
@@ -9862,7 +10005,7 @@ mod tests {
             let mut schema = schema.clone();
             for (t, expression) in spellings {
                 let mut g = Column::new(ty("int"));
-                g.generated = Some(pbps_model::Generated {
+                g.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
                     expression: (*expression).into(),
                     stored: true,
                 });
@@ -9912,7 +10055,7 @@ mod tests {
             let mut schema = schema.clone();
             for t in tables {
                 let mut g = Column::new(ty("int"));
-                g.generated = Some(pbps_model::Generated {
+                g.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
                     expression: "f(n)".into(),
                     stored: true,
                 });
@@ -10418,7 +10561,7 @@ mod tests {
                 .columns
                 .get_mut("n")
                 .unwrap()
-                .default = Some("1".into());
+                .value_source = pbps_model::ValueSource::Default("1".into());
         };
         let mut was = tree.clone();
         parents(&mut was);
@@ -10476,7 +10619,7 @@ mod tests {
             declared
         };
         let mut kept = Column::new(ty("int")).not_null();
-        kept.default = Some("7".into());
+        kept.value_source = pbps_model::ValueSource::Default("7".into());
         let planned = outcome(&tree, &detached(kept)).expect("a detach");
         assert!(
             matches!(
@@ -10502,7 +10645,7 @@ mod tests {
         // attached in the same plan: refused by name, with the two-plan
         // remedy, and not also as a detached shape (#1692 review).
         let mut kept = Column::new(ty("int")).not_null();
-        kept.default = Some("7".into());
+        kept.value_source = pbps_model::ValueSource::Default("7".into());
         let grown = |s: &mut Schema| {
             for t in s.tables.values_mut() {
                 if t.partition_of.is_none() {
@@ -11161,7 +11304,7 @@ mod tests {
         for column in [
             Column::new(ty("int")),
             Column {
-                default: Some("5".into()),
+                value_source: ValueSource::Default("5".into()),
                 ..Column::new(ty("int"))
             },
         ] {
@@ -11986,13 +12129,13 @@ mod tests {
             .columns
             .insert("note".to_owned(), Column::new(ty("nvarchar(50)")));
         let mut sort = Column::new(ty("int"));
-        sort.default = Some("(0)".to_owned());
+        sort.value_source = pbps_model::ValueSource::Default("(0)".to_owned());
         base_t.columns.insert("sort".to_owned(), sort);
         // The engine's own: never read back, so never a cell to hold the
         // row to (DECISIONS 94) — holding it to NULL would refuse every
         // update on the table.
         let mut seq = Column::new(ty("int")).not_null();
-        seq.identity = Some(pbps_model::Identity {
+        seq.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
         });
@@ -12282,7 +12425,8 @@ mod tests {
     #[test]
     fn dropping_a_written_value_in_favour_of_the_default_updates_to_default() {
         let mut base_t = lookup(DataMode::Exact, &[("new", "x")]);
-        base_t.columns.get_mut("label").unwrap().default = Some("''".to_owned());
+        base_t.columns.get_mut("label").unwrap().value_source =
+            pbps_model::ValueSource::Default("''".to_owned());
         let mut declared_t = base_t.clone();
         declared_t.data.as_mut().unwrap().rows =
             [(pbps_model::RowKey::from("new"), Row::default())]
@@ -12322,8 +12466,10 @@ mod tests {
                 ("n", Column::new(ty("int"))),
                 ("d", Column::new(ty("date"))),
             ]);
-            t.columns.get_mut("n").unwrap().default = Some("0".to_owned());
-            t.columns.get_mut("d").unwrap().default = Some("GETDATE()".to_owned());
+            t.columns.get_mut("n").unwrap().value_source =
+                pbps_model::ValueSource::Default("0".to_owned());
+            t.columns.get_mut("d").unwrap().value_source =
+                pbps_model::ValueSource::Default("GETDATE()".to_owned());
             t.checks.insert(
                 "ck_n".to_owned(),
                 pbps_model::CheckConstraint {
@@ -12349,8 +12495,10 @@ mod tests {
         };
         let read_back_t = {
             let mut t = declared_t.clone();
-            t.columns.get_mut("n").unwrap().default = Some("(0)".to_owned());
-            t.columns.get_mut("d").unwrap().default = Some("getdate()".to_owned());
+            t.columns.get_mut("n").unwrap().value_source =
+                pbps_model::ValueSource::Default("(0)".to_owned());
+            t.columns.get_mut("d").unwrap().value_source =
+                pbps_model::ValueSource::Default("getdate()".to_owned());
             t.checks.get_mut("ck_n").unwrap().expression = "[n]>(0) AND [n]<(10)".to_owned();
             t.indexes.get_mut("ix_n").unwrap().filter = Some("[n]>(0)".to_owned());
             t
@@ -12399,7 +12547,8 @@ mod tests {
             t
         };
         let mut declared_t = base_t.clone();
-        declared_t.columns.get_mut("label").unwrap().default = Some("''".to_owned());
+        declared_t.columns.get_mut("label").unwrap().value_source =
+            pbps_model::ValueSource::Default("''".to_owned());
         let cs = run(
             &schema_of("dbo.s", base_t),
             &schema_of("dbo.s", declared_t),
@@ -12418,7 +12567,8 @@ mod tests {
     #[test]
     fn two_omissions_of_a_defaulted_column_are_equal() {
         let mut t = lookup(DataMode::Exact, &[("new", "x")]);
-        t.columns.get_mut("label").unwrap().default = Some("''".to_owned());
+        t.columns.get_mut("label").unwrap().value_source =
+            pbps_model::ValueSource::Default("''".to_owned());
         t.data.as_mut().unwrap().rows = [(pbps_model::RowKey::from("new"), Row::default())]
             .into_iter()
             .collect();
@@ -12446,7 +12596,8 @@ mod tests {
     fn a_default_on_the_key_column_never_updates_the_key() {
         let base_t = lookup(DataMode::Exact, &[("new", "New")]);
         let mut declared_t = base_t.clone();
-        declared_t.columns.get_mut("code").unwrap().default = Some("NEWID()".to_owned());
+        declared_t.columns.get_mut("code").unwrap().value_source =
+            pbps_model::ValueSource::Default("NEWID()".to_owned());
         let cs = run(
             &schema_of("dbo.s", base_t),
             &schema_of("dbo.s", declared_t),
@@ -12468,12 +12619,14 @@ mod tests {
     #[test]
     fn a_changed_default_restates_the_rows_that_omit_the_column() {
         let mut base_t = lookup(DataMode::Exact, &[("new", "x")]);
-        base_t.columns.get_mut("label").unwrap().default = Some("'a'".to_owned());
+        base_t.columns.get_mut("label").unwrap().value_source =
+            pbps_model::ValueSource::Default("'a'".to_owned());
         base_t.data.as_mut().unwrap().rows = [(pbps_model::RowKey::from("new"), Row::default())]
             .into_iter()
             .collect();
         let mut declared_t = base_t.clone();
-        declared_t.columns.get_mut("label").unwrap().default = Some("'b'".to_owned());
+        declared_t.columns.get_mut("label").unwrap().value_source =
+            pbps_model::ValueSource::Default("'b'".to_owned());
 
         let cs = run(
             &schema_of("dbo.s", base_t),
@@ -13768,7 +13921,7 @@ mod tests {
             .collect()
         };
         let mut x = Column::new(ty("int"));
-        x.default = Some("0".into());
+        x.value_source = pbps_model::ValueSource::Default("0".into());
         assert_eq!(order(&table(&[("x", x)])), ["s1.old", "s1.a"]);
         // Nothing frees the name here, so the name order stands.
         assert_eq!(
@@ -13786,7 +13939,7 @@ mod tests {
     #[test]
     fn a_generated_default_name_never_displaces_a_real_release_edge() {
         let mut x = Column::new(ty("int"));
-        x.default = Some("0".into());
+        x.value_source = pbps_model::ValueSource::Default("0".into());
         let old = table(&[("id", Column::new(ty("int"))), ("x", x)]);
         let other = table(&[("id", Column::new(ty("int")))]);
         // Two revisions, skipped: `a.new` leaves first, then `z.old` takes it.
@@ -13826,7 +13979,7 @@ mod tests {
         // outranks the generated name's, whichever was found first.
         let other = table(&[("id", Column::new(ty("int")))]);
         let mut x = Column::new(ty("int"));
-        x.default = Some("0".into());
+        x.value_source = pbps_model::ValueSource::Default("0".into());
         let old = table(&[("id", Column::new(ty("int"))), ("x", x)]);
         let cs = across_revisions_with(
             &NamesItsDefaults,
@@ -13868,7 +14021,7 @@ mod tests {
     fn a_rename_in_its_schema_releases_and_claims_generated_default_names() {
         let other = table(&[("id", Column::new(ty("int")))]);
         let mut x = Column::new(ty("int"));
-        x.default = Some("0".into());
+        x.value_source = pbps_model::ValueSource::Default("0".into());
         let defaulted = table(&[("id", Column::new(ty("int"))), ("x", x)]);
         let plain = table(&[
             ("id", Column::new(ty("int"))),
@@ -15271,7 +15424,7 @@ mod tests {
     #[test]
     fn a_retyped_column_drops_its_old_default_changes_type_then_takes_the_new_one() {
         let with = |t: &str, d: &str| Column {
-            default: Some(d.to_owned()),
+            value_source: ValueSource::Default(d.to_owned()),
             ..Column::new(ty(t))
         };
         let base = schema_of("dbo.t", table(&[("n", with("int", "0"))]));
@@ -15301,7 +15454,7 @@ mod tests {
     #[test]
     fn a_default_replaced_without_a_retype_stays_one_change() {
         let with = |t: &str, d: &str| Column {
-            default: Some(d.to_owned()),
+            value_source: ValueSource::Default(d.to_owned()),
             ..Column::new(ty(t))
         };
         let base = schema_of("dbo.t", table(&[("n", with("int", "0"))]));
@@ -16572,7 +16725,12 @@ mod tests {
             table
                 .columns
                 .iter()
-                .filter(|(_, c)| c.default.is_some())
+                .filter(|(_, c)| match &c.value_source {
+                    ValueSource::Default(_) => true,
+                    ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => {
+                        false
+                    }
+                })
                 .map(|(column, _)| format!("df_{}_{column}", name.name))
                 .collect()
         }
@@ -16848,7 +17006,7 @@ mod tests {
     #[test]
     fn a_table_rename_lists_the_columns_that_carry_a_default_by_their_names_then() {
         let mut with_default = Column::new(ty("int"));
-        with_default.default = Some("0".into());
+        with_default.value_source = pbps_model::ValueSource::Default("0".into());
         let base = two_tables(
             (
                 "app.old",
@@ -17545,7 +17703,7 @@ mod tests {
     fn identity_change_is_rejected() {
         let base = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
         let mut c = Column::new(ty("int"));
-        c.identity = Some(pbps_model::Identity {
+        c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
         });
@@ -17585,7 +17743,7 @@ mod tests {
     fn a_generated_column_is_added_after_and_dropped_before_its_inputs() {
         let generated_over = |input: &str| {
             let mut c = Column::new(ty("int"));
-            c.generated = Some(pbps_model::Generated {
+            c.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
                 expression: format!("{input} * 2"),
                 stored: true,
             });
@@ -17703,7 +17861,7 @@ mod tests {
         let generated_as = |type_: &str, expression: &str, nullable: bool| {
             let mut c = Column::new(ty(type_));
             c.nullable = nullable;
-            c.generated = Some(pbps_model::Generated {
+            c.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
                 expression: expression.into(),
                 stored: true,
             });
@@ -17778,7 +17936,7 @@ mod tests {
     fn a_generated_expression_changes_in_place_and_nothing_else_about_generation_does() {
         let generated = |expression: &str, stored: bool| {
             let mut c = Column::new(ty("int"));
-            c.generated = Some(pbps_model::Generated {
+            c.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
                 expression: expression.into(),
                 stored,
             });
@@ -17837,7 +17995,7 @@ mod tests {
         }
         // Negative: a default is not a generation, and changes as a default.
         let mut with_default = Column::new(ty("int"));
-        with_default.default = Some("7".into());
+        with_default.value_source = pbps_model::ValueSource::Default("7".into());
         let defaulted = diff_of(Column::new(ty("int")), with_default);
         assert_eq!(kinds(&defaulted.changes), ["AlterColumnDefault"]);
     }
@@ -17853,7 +18011,7 @@ mod tests {
             table(&[("a", Column::new(ty("int"))), ("b", Column::new(ty("int")))]),
         );
         let mut identity_changed = Column::new(ty("int"));
-        identity_changed.identity = Some(pbps_model::Identity {
+        identity_changed.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
         });

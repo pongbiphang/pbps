@@ -611,7 +611,10 @@ mod tests {
     fn table(ty: &str, identity: Option<Identity>) -> Table {
         let mut t = Table::default();
         let mut id = Column::new(ty.parse().unwrap()).not_null();
-        id.identity = identity;
+        id.value_source = identity.map_or(
+            pbps_model::ValueSource::None,
+            pbps_model::ValueSource::Identity,
+        );
         t.columns.insert("id".into(), id);
         t.primary_key = Some(PrimaryKey {
             name: None,

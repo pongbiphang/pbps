@@ -24,6 +24,7 @@
 //! [`state_checksum`] therefore sorts away before hashing (DECISIONS 238).
 
 pub mod change;
+mod column_wire;
 pub mod data;
 pub mod declared;
 pub mod drift;
@@ -77,7 +78,7 @@ pub use schema::{
     BoundDatum, CheckConstraint, Clustered, Collation, Column, ComputedColumn, ForeignKey,
     Generated, Identity, Index, IndexColumn, IndexKey, IndexMethod, PartitionBound, PartitionBy,
     PartitionColumn, PartitionOf, PrimaryKey, ReferentialAction, ReplicaIdentity, Retention,
-    RetentionUnit, Schema, SystemTime, SystemVersioning, Table, UniqueConstraint,
+    RetentionUnit, Schema, SystemTime, SystemVersioning, Table, UniqueConstraint, ValueSource,
 };
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};

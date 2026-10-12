@@ -14,6 +14,7 @@
 //! promising something it cannot check.
 
 use pbps_db::{Conn, DbError};
+use pbps_model::ValueSource;
 use pbps_model::{Change, ChangeSet};
 
 use crate::catalog::get;
@@ -135,7 +136,10 @@ pub fn size_of_data_warnings(changes: &ChangeSet, edition: &Edition) -> Vec<Stri
             ..
         } = &p.change
             && !column.nullable
-            && column.default.is_some()
+            && (match &column.value_source {
+                ValueSource::Default(_) => true,
+                ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => false,
+            })
         {
             out.push(format!(
                 "{table}.{name}: adding a NOT NULL column with a DEFAULT rewrites every row on \
@@ -186,7 +190,9 @@ mod tests {
     fn add_column(nullable: bool, default: Option<&str>) -> pbps_model::PlannedChange {
         let mut column = pbps_model::Column::new("int".parse().unwrap());
         column.nullable = nullable;
-        column.default = default.map(str::to_owned);
+        column.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+            pbps_model::ValueSource::Default(text.into())
+        });
         pbps_model::PlannedChange::new(Change::AddColumn {
             uid: "c_a1b2c3".parse().unwrap(),
             table: "dbo.customer".parse().unwrap(),

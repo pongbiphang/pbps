@@ -4867,3 +4867,34 @@ case with applying the emitted plan and retain the failing CHECKs as negative
 controls. Filtered
 indexes already refuse a projection across added or renamed columns, so they
 need no additional handoff rule.
+
+
+<a id="dec-1402-1"></a>
+
+**DEC-1402.1. A column has one value source, with unchanged persisted spelling.**
+`Column.value_source` is a closed `ValueSource::{None, Default, Identity,
+Generated}`. Separate options allowed impossible combinations and made a new
+source invisible to consumers that asked only about identity or default
+(#1402, #1286, #1287). Source-sensitive decisions match every named variant;
+there is no wildcard or general source getter that silently chooses policy for
+a future variant. Defaults may be added and removed, generated text may change
+in place, and unsupported identity or generation-kind changes retain their
+existing refusals. A generated source is still not a guarantee of a non-NULL
+value for required-column preflight.
+
+The internal enum does not change YAML or JSON. A private model wire adapter
+serializes the historical `default`, `identity`, `generated` keys in their
+original position and omits absent sources. It rejects conflicting JSON sources,
+unknown fields and duplicate fields (including a duplicate after explicit NULL).
+Valid artifacts keep their canonical bytes and approval checksums; full plan,
+state, schema and declared-expression fixtures captured from the implementation
+base pin that contract. A tagged wire enum would unnecessarily invalidate
+already approved plans. Source payloads remain verbatim SQL or identity options,
+with no parser or preapproval evaluation added.
+
+Generated expressions retain `Surface::Default` as their physical `pg_attrdef`
+identity, inline CREATE/ADD generation, and typed same-text
+`AlterColumnExpression` reconstruction. Those resolver repairs already existed
+on the implementation base (#1339); this migration preserves them. They do not
+make a retained generated expression's function droppable: DEC-1168.1's
+release and version restrictions still apply.

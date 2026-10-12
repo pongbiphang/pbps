@@ -796,13 +796,13 @@ fn final_coordinate_default_removal_uses_the_recorded_opening_uid() {
     let renamed: pbps_model::TableName = "app.b".parse().unwrap();
     let mut table = Table::default();
     let mut column = Column::new("integer".parse().unwrap());
-    column.default = Some("1".into());
+    column.value_source = pbps_model::ValueSource::Default("1".into());
     table.columns.insert("id".into(), column);
     let mut base = Schema::default();
     base.tables.insert(old.clone(), table.clone());
     let mut desired = Schema::default();
     let mut final_column = table.columns.shift_remove("id").unwrap();
-    final_column.default = None;
+    final_column.value_source = pbps_model::ValueSource::None;
     table.columns.insert("n".into(), final_column);
     desired.tables.insert(renamed.clone(), table);
     let base_ids = ids(&base, &IdsFile::default());
@@ -900,13 +900,13 @@ fn generation_schema(table: &pbps_model::TableName) -> Schema {
         .columns
         .insert("a".into(), Column::new("integer".parse().unwrap()));
     let mut generated = Column::new("integer".parse().unwrap());
-    generated.generated = Some(Generated {
+    generated.value_source = pbps_model::ValueSource::Generated(Generated {
         expression: "a * 2 + 1".into(),
         stored: true,
     });
     definition.columns.insert("g".into(), generated);
     let mut ordinary = Column::new("integer".parse().unwrap());
-    ordinary.default = Some("7".into());
+    ordinary.value_source = pbps_model::ValueSource::Default("7".into());
     definition.columns.insert("d".into(), ordinary);
     let mut schema = Schema::default();
     schema.tables.insert(table.clone(), definition);
@@ -1047,7 +1047,10 @@ fn generated_expression_transitions_keep_exact_inventory_and_recorded_rename_ide
         let mut desired = base.clone();
         let mut definition = desired.tables.remove(&old).unwrap();
         let mut column = definition.columns.shift_remove("g").unwrap();
-        column.generated.as_mut().unwrap().expression = "a * 3".into();
+        let pbps_model::ValueSource::Generated(generated) = &mut column.value_source else {
+            panic!("generated fixture")
+        };
+        generated.expression = "a * 3".into();
         definition.columns.insert(final_name.into(), column);
         desired.tables.insert(final_table.clone(), definition);
         let mut desired_ids = base_ids.clone();
@@ -1517,7 +1520,7 @@ fn a_surface_removed_after_its_rename_is_named_as_its_removal_names_it() {
     let new: pbps_model::TableName = "app.u".parse().unwrap();
     let mut table = Table::default();
     let mut id = Column::new("integer".parse().unwrap());
-    id.default = Some("0".into());
+    id.value_source = pbps_model::ValueSource::Default("0".into());
     table.columns.insert("id".into(), id);
     table.checks.insert(
         "c".into(),
@@ -1793,9 +1796,9 @@ mod column_vector_parent {
                 _ => {
                     let mut column = Column::new("integer".parse().unwrap());
                     if kind == "default" {
-                        column.default = Some("7".into());
+                        column.value_source = pbps_model::ValueSource::Default("7".into());
                     } else if kind == "generated" {
-                        column.generated = Some(Generated {
+                        column.value_source = pbps_model::ValueSource::Generated(Generated {
                             expression: "a + 4".into(),
                             stored: true,
                         });

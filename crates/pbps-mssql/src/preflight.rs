@@ -26,6 +26,7 @@
 //! - **Reducing a `decimal`'s scale** rounds rather than failing, so no count
 //!   exists to take. The `narrowing` class still flags it for approval.
 
+use pbps_model::ValueSource;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{DialectError, Preflight, Probe, Unchecked};
@@ -471,7 +472,7 @@ impl<'a> AsStored<'a> {
                     let added = if column.nullable {
                         Added::Null
                     } else {
-                        match column.default.as_deref().and_then(constant_default).and_then(|e| {
+                        match (match &column.value_source { ValueSource::Default(value) => Some(value.as_str()), ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None }).and_then(constant_default).and_then(|e| {
                             assigned_default(e, Some(&column.ty), column.collation.as_ref())
                         }) {
                             Some(sql) => Added::Backfilled(sql),
@@ -755,7 +756,7 @@ fn build(
             // expression is the case DECISIONS 124 answers with no probe rather
             // than a guess; asking the engine `(expr) IS NULL` would run the
             // operator's expression before approval, the hazard in #274.
-            if let Some(default) = column.default.as_deref() {
+            if let Some(default) = match &column.value_source { ValueSource::Default(value) => Some(value.as_str()), ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None } {
                 if !crate::rows::is_constant(default) {
                     return Ok(skip(change, "the default cannot be evaluated before apply", unchecked));
                 }
@@ -2516,7 +2517,7 @@ mod tests {
     fn a_null_default_does_not_hide_the_required_add_probe() {
         let mut column = pbps_model::Column::new(ty("int"));
         column.nullable = false;
-        column.default = Some("((NULL))".into());
+        column.value_source = pbps_model::ValueSource::Default("((NULL))".into());
         let sql = sql_of(&Change::AddColumn {
             uid: uid("c_aaaaaa"),
             table: tname("dbo.customer"),
@@ -2542,7 +2543,7 @@ mod tests {
         ] {
             let mut column = pbps_model::Column::new(ty("int"));
             column.nullable = false;
-            column.default = Some(default.into());
+            column.value_source = pbps_model::ValueSource::Default(default.into());
             let sql = sql_of(&Change::AddColumn {
                 uid: uid("c_aaaaaa"),
                 table: tname("dbo.customer"),
@@ -2572,7 +2573,7 @@ mod tests {
         ] {
             let mut column = pbps_model::Column::new(ty("int"));
             column.nullable = false;
-            column.default = Some(default.into());
+            column.value_source = pbps_model::ValueSource::Default(default.into());
             let sql = sql_of(&Change::AddColumn {
                 uid: uid("c_aaaaaa"),
                 table: tname("dbo.customer"),
@@ -2591,7 +2592,7 @@ mod tests {
         for default in ["NULLIF(1, 2)", "NULLIF(1, 1)", "CONVERT(int, NULL)"] {
             let mut column = pbps_model::Column::new(ty("int"));
             column.nullable = false;
-            column.default = Some(default.into());
+            column.value_source = pbps_model::ValueSource::Default(default.into());
             let sql = sql_of(&Change::AddColumn {
                 uid: uid("c_aaaaaa"),
                 table: tname("dbo.customer"),
@@ -2606,7 +2607,8 @@ mod tests {
     fn a_quoted_null_identifier_does_not_invent_a_required_add_probe() {
         let mut column = pbps_model::Column::new(ty("bigint"));
         column.nullable = false;
-        column.default = Some("NEXT VALUE FOR dbo.[seq]]null]".into());
+        column.value_source =
+            pbps_model::ValueSource::Default("NEXT VALUE FOR dbo.[seq]]null]".into());
         let sql = sql_of(&Change::AddColumn {
             uid: uid("c_aaaaaa"),
             table: tname("dbo.customer"),
@@ -2620,7 +2622,8 @@ mod tests {
     fn a_regular_identifier_continuation_does_not_invent_a_required_add_probe() {
         let mut column = pbps_model::Column::new(ty("bigint"));
         column.nullable = false;
-        column.default = Some("NEXT VALUE FOR dbo.seq$null".into());
+        column.value_source =
+            pbps_model::ValueSource::Default("NEXT VALUE FOR dbo.seq$null".into());
         let sql = sql_of(&Change::AddColumn {
             uid: uid("c_aaaaaa"),
             table: tname("dbo.customer"),
@@ -3589,7 +3592,8 @@ mod tests {
         let mut region = pbps_model::Table::default();
         let mut code = pbps_model::Column::new(ty("varchar(10)"));
         // A default the probe cannot evaluate: not a literal (117).
-        code.default = Some("CONVERT(varchar(10), 'eu')".to_owned());
+        code.value_source =
+            pbps_model::ValueSource::Default("CONVERT(varchar(10), 'eu')".to_owned());
         region.columns.insert("region_id".to_owned(), code);
         let sql = probes(&plan(vec![
             Change::CreateTable {
@@ -3638,7 +3642,8 @@ mod tests {
     fn one_row_the_probe_cannot_spell_takes_the_whole_relation_with_it() {
         let mut region = pbps_model::Table::default();
         let mut code = pbps_model::Column::new(ty("varchar(10)"));
-        code.default = Some("CONVERT(varchar(10), 'eu')".to_owned());
+        code.value_source =
+            pbps_model::ValueSource::Default("CONVERT(varchar(10), 'eu')".to_owned());
         region.columns.insert("region_id".to_owned(), code);
         let spelled = pbps_model::Row(
             [(
@@ -4162,7 +4167,9 @@ mod tests {
         let added = |nullable: bool, default: Option<&str>| {
             let mut c = pbps_model::Column::new(ty("varchar(10)"));
             c.nullable = nullable;
-            c.default = default.map(str::to_owned);
+            c.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+                pbps_model::ValueSource::Default(text.into())
+            });
             Change::AddColumn {
                 uid: uid("c_cccccc"),
                 table: tname("dbo.customer"),
@@ -4220,7 +4227,9 @@ mod tests {
         let add = |nullable: bool, default: Option<&str>| {
             let mut c = pbps_model::Column::new(ty("varchar(10)"));
             c.nullable = nullable;
-            c.default = default.map(str::to_owned);
+            c.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+                pbps_model::ValueSource::Default(text.into())
+            });
             Change::AddColumn {
                 uid: uid("c_cccccc"),
                 table: tname("dbo.customer"),

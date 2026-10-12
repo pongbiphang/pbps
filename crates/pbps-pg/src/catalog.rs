@@ -24,6 +24,7 @@
 //! pin the empty path — the one value that does not move with the project's
 //! shape — and put back whatever the session had.
 
+use pbps_model::ValueSource;
 use std::collections::BTreeMap;
 
 use pbps_db::{Conn, DbError, Param, Row};
@@ -2596,7 +2597,10 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
             else {
                 continue;
             };
-            let Some(parents) = theirs.default.as_deref() else {
+            let Some(parents) = (match &theirs.value_source {
+                ValueSource::Default(value) => Some(value.as_str()),
+                ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
+            }) else {
                 continue;
             };
             // The same text is validation's to refuse (DEC-1578.1).

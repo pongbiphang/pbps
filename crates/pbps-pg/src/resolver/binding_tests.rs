@@ -444,7 +444,7 @@ async fn a_table_generating_from_a_declared_function_compiles_on_scratch() {
             pbps_model::Column::new("integer".parse().unwrap()),
         );
         let mut generated = pbps_model::Column::new("integer".parse().unwrap());
-        generated.generated = Some(pbps_model::Generated {
+        generated.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
             expression: "app.f(id)".into(),
             stored: true,
         });
@@ -729,7 +729,7 @@ async fn every_covered_expression_surface_gets_the_engines_answer() {
         let declared = || {
             let mut table = pbps_model::Table::default();
             let mut column = pbps_model::Column::new("numeric".parse().unwrap());
-            column.default = Some("f(1)".into());
+            column.value_source = pbps_model::ValueSource::Default("f(1)".into());
             table.columns.insert("c".into(), column);
             table.checks.insert(
                 "ck".into(),
@@ -1607,7 +1607,7 @@ async fn an_object_a_declaration_creates_is_reproduced_with_it() {
             let mut table = pbps_model::Table::default();
             let mut id = pbps_model::Column::new("integer".parse().unwrap());
             id.nullable = false;
-            id.identity = Some(pbps_model::Identity {
+            id.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                 seed: 1,
                 increment: 1,
             });
@@ -1658,7 +1658,7 @@ async fn a_shared_identity_the_target_did_not_get_from_a_managed_object_is_unres
         let mut table = pbps_model::Table::default();
         let mut id = pbps_model::Column::new("integer".parse().unwrap());
         id.nullable = false;
-        id.identity = Some(pbps_model::Identity {
+        id.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
         });

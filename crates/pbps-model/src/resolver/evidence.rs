@@ -279,9 +279,12 @@ impl ResolverEvidence {
                     name,
                     column,
                     ..
-                } if column.default.is_some() || column.generated.is_some() => {
-                    vec![super::Surface::Default(table.column(name))]
-                }
+                } => match column.value_source {
+                    crate::ValueSource::Default(_) | crate::ValueSource::Generated(_) => {
+                        vec![super::Surface::Default(table.column(name))]
+                    }
+                    crate::ValueSource::None | crate::ValueSource::Identity(_) => Vec::new(),
+                },
                 Change::AddCheck { table, name, .. } | Change::DropCheck { table, name } => {
                     vec![super::Surface::Check {
                         table: table.clone(),

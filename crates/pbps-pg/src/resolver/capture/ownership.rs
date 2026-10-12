@@ -7,6 +7,7 @@
 
 use super::{CapturedInputs, DroppedSignature, Uncovered};
 use pbps_db::resolver::capture::ObjectIdentity;
+use pbps_model::ValueSource;
 use pbps_model::resolver::{ObjectOwnership, Surface};
 use pbps_model::{IdsFile, ModuleId, ModuleKind, Schema, TableName};
 use serde_json::Value;
@@ -198,7 +199,15 @@ pub(super) fn classify(
             // A generated attrdef is an explicit root too (DEC-1168.1).
             // Its internal column edge must not broaden its exact owner.
             if capture.inputs.contains_key(&default_id)
-                && (declaration.default.is_some() || declaration.generated.is_some())
+                && ((match &declaration.value_source {
+                    ValueSource::Default(_) => true,
+                    ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => {
+                        false
+                    }
+                }) || (match &declaration.value_source {
+                    ValueSource::Generated(_) => true,
+                    ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => false,
+                }))
             {
                 assign(&mut owned, default_id, Surface::Default(reference))?;
             }

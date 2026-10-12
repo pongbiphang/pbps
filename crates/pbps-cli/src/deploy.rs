@@ -1109,10 +1109,23 @@ pub(crate) fn object_reads(
                 name,
                 column,
                 ..
-            } if column.default.is_some() => names.push(in_schema(table, generated(table, name))),
+            } if (match column.value_source {
+                pbps_model::ValueSource::Default(_) => true,
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Generated(_) => false,
+            }) =>
+            {
+                names.push(in_schema(table, generated(table, name)))
+            }
             Change::CreateTable { name, table, .. } => {
                 for (column, spec) in &table.columns {
-                    if spec.default.is_some() {
+                    if match spec.value_source {
+                        pbps_model::ValueSource::Default(_) => true,
+                        pbps_model::ValueSource::None
+                        | pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Generated(_) => false,
+                    } {
                         names.push(in_schema(name, generated(name, column)));
                     }
                 }
@@ -1711,7 +1724,15 @@ impl<'f> Walk<'f> {
                 name,
                 column,
                 ..
-            } if column.default.is_some() => self.claim(step, default_of(table, name)),
+            } if (match column.value_source {
+                pbps_model::ValueSource::Default(_) => true,
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Generated(_) => false,
+            }) =>
+            {
+                self.claim(step, default_of(table, name))
+            }
             Change::DropUnique { table, name }
             | Change::DropForeignKey { table, name }
             | Change::DropCheck { table, name } => {
@@ -1759,7 +1780,12 @@ impl<'f> Walk<'f> {
                 // Its own constraints and generated defaults take their names
                 // with it, for whatever the plan creates after.
                 for (column, spec) in &table.columns {
-                    if spec.default.is_some() {
+                    if match spec.value_source {
+                        pbps_model::ValueSource::Default(_) => true,
+                        pbps_model::ValueSource::None
+                        | pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Generated(_) => false,
+                    } {
                         self.claim(step, default_of(name, column));
                     }
                 }
@@ -3412,11 +3438,39 @@ fn column_as_declared(
 ) -> bool {
     same_type(dialect, &declared.ty, &now.ty)
         && declared.nullable == now.nullable
-        && declared.identity == now.identity
-        && declared.default.is_some() == now.default.is_some()
-        // A generation expression by presence, as a default: the engine
-        // respells its text. Its kind is read back exactly (DEC-1168.1).
-        && declared.generated.as_ref().map(|g| g.stored) == now.generated.as_ref().map(|g| g.stored)
+        && match (&declared.value_source, &now.value_source) {
+            (pbps_model::ValueSource::None, pbps_model::ValueSource::None)
+            | (pbps_model::ValueSource::Default(_), pbps_model::ValueSource::Default(_)) => true,
+            (pbps_model::ValueSource::Identity(a), pbps_model::ValueSource::Identity(b)) => a == b,
+            // The engine respells generated SQL, but preserves its kind.
+            (pbps_model::ValueSource::Generated(a), pbps_model::ValueSource::Generated(b)) => {
+                a.stored == b.stored
+            }
+            (
+                pbps_model::ValueSource::None,
+                pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Generated(_),
+            )
+            | (
+                pbps_model::ValueSource::Default(_),
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Generated(_),
+            )
+            | (
+                pbps_model::ValueSource::Identity(_),
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Generated(_),
+            )
+            | (
+                pbps_model::ValueSource::Generated(_),
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Identity(_),
+            ) => false,
+        }
         && declared.collation == now.collation
 }
 
@@ -3532,7 +3586,19 @@ fn differing(
     was: &pbps_model::Column,
     now: &pbps_model::Column,
 ) -> Vec<(Option<pbps_model::ColumnField>, &'static str)> {
-    use pbps_model::ColumnField;
+    use pbps_model::{ColumnField, ValueSource};
+    // The guard tracks planned fields separately, so a source-kind change can
+    // report more than one moved field. Derive all three from the exclusive
+    // source in one exhaustive policy, never from independent model options.
+    let [
+        (was_default, was_identity, was_generated),
+        (now_default, now_identity, now_generated),
+    ] = [&was.value_source, &now.value_source].map(|source| match source {
+        ValueSource::None => (None, None, None),
+        ValueSource::Default(default) => (Some(default), None, None),
+        ValueSource::Identity(identity) => (None, Some(identity), None),
+        ValueSource::Generated(generated) => (None, None, Some(generated)),
+    });
     let mut out = Vec::new();
     if was.ty != now.ty {
         out.push((Some(ColumnField::Type), "type"));
@@ -3540,7 +3606,7 @@ fn differing(
     if was.nullable != now.nullable {
         out.push((Some(ColumnField::Nullable), "nullability"));
     }
-    if was.default != now.default {
+    if was_default != now_default {
         out.push((Some(ColumnField::Default), "default"));
     }
     if was.deprecated != now.deprecated {
@@ -3553,7 +3619,7 @@ fn differing(
     // (`AlterColumnExpression`, DEC-1168.1). A column becoming or ceasing to
     // be generated, or changing kind, has no change in this model, so it
     // falls to the `None` below.
-    match (&was.generated, &now.generated) {
+    match (was_generated, now_generated) {
         (Some(a), Some(b)) if a.stored == b.stored => {
             if a.expression != b.expression {
                 out.push((Some(ColumnField::Generated), "generation expression"));
@@ -3565,7 +3631,7 @@ fn differing(
     // `None` is "no change of this model moves this", so nothing can excuse
     // it: an identity or a description that differs across an apply is
     // somebody else's work, and the whole-column exclusion used to hide it.
-    if was.identity != now.identity {
+    if was_identity != now_identity {
         out.push((None, "identity"));
     }
     if was.description != now.description {
@@ -4379,8 +4445,18 @@ fn refuse_unplanned_movement(
                 let as_declared = match set_defaults.get(&(now_name, n.as_str())) {
                     Some(to) => {
                         let mut finished = was.clone();
-                        finished.default = to.cloned();
-                        column_as_declared(dialect, &finished, now)
+                        let compatible = match was.value_source {
+                            pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) => {
+                                finished.value_source = to.cloned().map_or(
+                                    pbps_model::ValueSource::None,
+                                    pbps_model::ValueSource::Default,
+                                );
+                                true
+                            }
+                            pbps_model::ValueSource::Identity(_)
+                            | pbps_model::ValueSource::Generated(_) => to.is_none(),
+                        };
+                        (compatible && column_as_declared(dialect, &finished, now))
                             || (!settled.whole() && as_created)
                     }
                     None => as_created,
@@ -5552,10 +5628,24 @@ fn refuse_unplanned_movement(
                 }
                 ColumnPromise::Type(to) => (same_type(dialect, to, &now.ty), "type"),
                 ColumnPromise::Nullable(to) => (now.nullable == to, "nullability"),
-                ColumnPromise::Default(has) => (now.default.is_some() == has, "default"),
-                ColumnPromise::Generated(has) => {
-                    (now.generated.is_some() == has, "generation expression")
-                }
+                ColumnPromise::Default(has) => (
+                    (match now.value_source {
+                        pbps_model::ValueSource::Default(_) => true,
+                        pbps_model::ValueSource::None
+                        | pbps_model::ValueSource::Identity(_)
+                        | pbps_model::ValueSource::Generated(_) => false,
+                    }) == has,
+                    "default",
+                ),
+                ColumnPromise::Generated(has) => (
+                    (match now.value_source {
+                        pbps_model::ValueSource::Generated(_) => true,
+                        pbps_model::ValueSource::None
+                        | pbps_model::ValueSource::Default(_)
+                        | pbps_model::ValueSource::Identity(_) => false,
+                    }) == has,
+                    "generation expression",
+                ),
                 ColumnPromise::Collation(c) => (now.collation.as_ref() == c, "collation"),
             };
             if !kept {
@@ -10428,7 +10518,7 @@ mod tests {
         // And a new column's generated default, where the old default is
         // still held because target and fallback are both taken.
         let mut defaulted = pbps_model::Column::new("int".parse().unwrap());
-        defaulted.default = Some("0".into());
+        defaulted.value_source = pbps_model::ValueSource::Default("0".into());
         let add_c = PlannedChange::new(Change::AddColumn {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.old", 0),
             table: old.clone(),
@@ -13511,10 +13601,13 @@ mod tests {
     fn a_generation_this_plan_does_not_move_is_still_compared() {
         let schema = |generated: Option<(&str, bool)>| {
             let mut c = pbps_model::Column::new("integer".parse().unwrap());
-            c.generated = generated.map(|(expression, stored)| pbps_model::Generated {
-                expression: expression.to_owned(),
-                stored,
-            });
+            c.value_source =
+                generated.map_or(pbps_model::ValueSource::None, |(expression, stored)| {
+                    pbps_model::ValueSource::Generated(pbps_model::Generated {
+                        expression: expression.to_owned(),
+                        stored,
+                    })
+                });
             let mut t = pbps_model::Table::default();
             t.columns.insert(
                 "a".to_owned(),
@@ -16776,7 +16869,10 @@ mod tests {
             .insert("v".into(), Column::new("int".parse().unwrap()));
         let with_default = |default: Option<&str>| {
             let mut t = created.clone();
-            t.columns.get_mut("v").unwrap().default = default.map(Into::into);
+            t.columns.get_mut("v").unwrap().value_source = default
+                .map_or(pbps_model::ValueSource::None, |text| {
+                    pbps_model::ValueSource::Default(text.into())
+                });
             Schema {
                 tables: [(name.clone(), t)].into(),
                 ..Default::default()
@@ -17203,12 +17299,14 @@ mod tests {
         for tamper in [
             (&|c: &mut pbps_model::Column| c.nullable = false) as &dyn Fn(&mut pbps_model::Column),
             &|c: &mut pbps_model::Column| {
-                c.identity = Some(pbps_model::Identity {
+                c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                     seed: 1,
                     increment: 1,
                 })
             },
-            &|c: &mut pbps_model::Column| c.default = Some("((0))".to_owned()),
+            &|c: &mut pbps_model::Column| {
+                c.value_source = pbps_model::ValueSource::Default("((0))".to_owned())
+            },
         ] {
             let e = refuse_unplanned_movement(
                 &pbps_mssql::Mssql,
@@ -17540,7 +17638,9 @@ mod tests {
     fn a_column_this_plan_retypes_still_answers_for_its_other_fields() {
         let schema_with = |ty: &str, default: Option<&str>, nullable: bool| {
             let mut c = pbps_model::Column::new(ty.parse().unwrap());
-            c.default = default.map(str::to_owned);
+            c.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+                pbps_model::ValueSource::Default(text.into())
+            });
             c.nullable = nullable;
             let mut t = pbps_model::Table::default();
             t.columns.insert("note".to_owned(), c);
@@ -17638,7 +17738,7 @@ mod tests {
             .columns
             .get_mut("note")
             .unwrap()
-            .identity = Some(pbps_model::Identity {
+            .value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
         });
@@ -19129,7 +19229,9 @@ mod tests {
         let column = |ty: &str, nullable: bool, default: Option<&str>| {
             let mut c = pbps_model::Column::new(ty.parse().unwrap());
             c.nullable = nullable;
-            c.default = default.map(str::to_owned);
+            c.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+                pbps_model::ValueSource::Default(text.into())
+            });
             c
         };
         let schema = |columns: &[(&str, pbps_model::Column)]| {
@@ -19943,7 +20045,9 @@ mod tests {
         let schema = |cells: &[(&str, &str)]| {
             let column = |ty: &str, default: Option<&str>| {
                 let mut c = pbps_model::Column::new(ty.parse().unwrap());
-                c.default = default.map(str::to_owned);
+                c.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+                    pbps_model::ValueSource::Default(text.into())
+                });
                 c
             };
             let mut t = pbps_model::Table::default();

@@ -139,26 +139,12 @@ pub const MAX_IDENT_BYTES: usize = 63;
 /// and 18.6: a default beside a generation expression is refused ("both
 /// default and generation expression specified"), and a virtual kind is 18's
 /// only and computes on read, which this model does not hold.
-fn generation_problems(column: &str, declared: &pbps_model::Column) -> Vec<DialectError> {
-    let Some(generated) = &declared.generated else {
-        return Vec::new();
-    };
+fn generation_problems(column: &str, generated: &pbps_model::Generated) -> Vec<DialectError> {
     let invalid = |message: String| DialectError::Invalid {
         dialect: crate::types::DIALECT,
         message,
     };
     let mut found = Vec::new();
-    if declared.default.is_some() {
-        found.push(invalid(format!(
-            "column `{column}` has both a default and a generation expression; a generated \
-             column is computed on every write, and a default would never apply"
-        )));
-    }
-    if declared.identity.is_some() {
-        found.push(invalid(format!(
-            "column `{column}` is both an identity and a generated column"
-        )));
-    }
     if !generated.stored {
         found.push(invalid(format!(
             "column `{column}` is a virtual generated column (`stored: false`), which this model \
@@ -259,10 +245,11 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
     found
 }
 
-fn identity_problems(column: &str, declared: &pbps_model::Column) -> Vec<DialectError> {
-    let Some(identity) = declared.identity else {
-        return Vec::new();
-    };
+fn identity_problems(
+    column: &str,
+    declared: &pbps_model::Column,
+    identity: &pbps_model::Identity,
+) -> Vec<DialectError> {
     let mut found = Vec::new();
     let invalid = |message: String| DialectError::Invalid {
         dialect: "postgres",
@@ -322,13 +309,6 @@ fn identity_problems(column: &str, declared: &pbps_model::Column) -> Vec<Dialect
         found.push(invalid(format!(
             "column `{column}` has an `identity:` with an increment of 0, which never advances: \
              the engine refuses it as INCREMENT must not be zero."
-        )));
-    }
-    // `both default and identity specified for column`.
-    if declared.default.is_some() {
-        found.push(invalid(format!(
-            "column `{column}` has an `identity:` and a `default:`. The engine refuses both on \
-             one column, and the identity is the one that supplies the value."
         )));
     }
     found
@@ -840,22 +820,21 @@ impl Dialect for Postgres {
             let Some(default) = &own.default else {
                 continue;
             };
-            if theirs.default.as_ref() == Some(default) {
-                found.push(invalid(format!(
-                    "column `{column}`'s default is its parent's, which the partition takes; \
-                     leave out its `default:`"
-                )));
-            }
-            if theirs.generated.is_some() || theirs.identity.is_some() {
-                found.push(invalid(format!(
-                    "column `{column}` is {} on its parent, and takes no default of the \
-                     partition's own",
-                    if theirs.generated.is_some() {
-                        "generated"
-                    } else {
-                        "an identity column"
+            match &theirs.value_source {
+                pbps_model::ValueSource::Default(parent_default) => {
+                    if parent_default == default {
+                        found.push(invalid(format!(
+                            "column `{column}`'s default is its parent's, which the partition takes; leave out its `default:`"
+                        )));
                     }
-                )));
+                }
+                pbps_model::ValueSource::Generated(_) => found.push(invalid(format!(
+                    "column `{column}` is generated on its parent, and takes no default of the partition's own"
+                ))),
+                pbps_model::ValueSource::Identity(_) => found.push(invalid(format!(
+                    "column `{column}` is an identity column on its parent, and takes no default of the partition's own"
+                ))),
+                pbps_model::ValueSource::None => {}
             }
             if crate::LEXICON.expression_in(default) == pbps_dialect::Expression::Absent {
                 found.push(invalid(format!(
@@ -881,6 +860,15 @@ impl Dialect for Postgres {
     /// Returns every problem rather than the first — a schema with three
     /// unspellable columns should need one pass, not three.
     fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError> {
+        self.validate_table_sources(name, table, &Default::default())
+    }
+
+    fn validate_table_sources(
+        &self,
+        name: &TableName,
+        table: &Table,
+        sources: &std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>>,
+    ) -> Vec<DialectError> {
         let mut found = Vec::new();
         // A partition's columns are its parent's, which it does not declare:
         // its checks and indexes are held to them by `validate_partition`.
@@ -1060,11 +1048,54 @@ impl Dialect for Postgres {
                     continue;
                 }
             };
-            if let Some(expr) = &column.default {
-                found.extend(default_problems(column_name, column, &normalized, expr));
+            let supplied = sources
+                .get(column_name)
+                .map(Vec::as_slice)
+                .unwrap_or_else(|| std::slice::from_ref(&column.value_source));
+            // Sources retain YAML's canonical default/identity/generated order.
+            // A valid model supplies one; diagnostic recovery may supply several.
+            let (mut has_default, mut has_identity) = (false, false);
+            for source in supplied {
+                match source {
+                    pbps_model::ValueSource::None => {}
+                    pbps_model::ValueSource::Default(_) => has_default = true,
+                    pbps_model::ValueSource::Identity(_) => has_identity = true,
+                    pbps_model::ValueSource::Generated(_) => {}
+                }
             }
-            found.extend(identity_problems(column_name, column));
-            found.extend(generation_problems(column_name, column));
+            let invalid = |message| DialectError::Invalid {
+                dialect: types::DIALECT,
+                message,
+            };
+            for source in supplied {
+                match source {
+                    pbps_model::ValueSource::None => {}
+                    pbps_model::ValueSource::Default(expr) => {
+                        found.extend(default_problems(column_name, column, &normalized, expr));
+                    }
+                    pbps_model::ValueSource::Identity(identity) => {
+                        found.extend(identity_problems(column_name, column, identity));
+                        if has_default {
+                            found.push(invalid(format!(
+                                "column `{column_name}` has an `identity:` and a `default:`. The engine refuses both on one column, and the identity is the one that supplies the value."
+                            )));
+                        }
+                    }
+                    pbps_model::ValueSource::Generated(generated) => {
+                        if has_default {
+                            found.push(invalid(format!(
+                                "column `{column_name}` has both a default and a generation expression; a generated column is computed on every write, and a default would never apply"
+                            )));
+                        }
+                        if has_identity {
+                            found.push(invalid(format!(
+                                "column `{column_name}` is both an identity and a generated column"
+                            )));
+                        }
+                        found.extend(generation_problems(column_name, generated));
+                    }
+                }
+            }
         }
         // Reference data: the rules whose answer is this engine's, ADR-0013 §2
         // among them. The model's own rules — a row's key is its identity in
@@ -1170,7 +1201,12 @@ impl Dialect for Postgres {
             });
         }
         for (column, spec) in &table.columns {
-            if spec.identity.is_some() {
+            if match spec.value_source {
+                pbps_model::ValueSource::Identity(_) => true,
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Generated(_) => false,
+            } {
                 // Named after the table and the column: naming the key moves
                 // nothing here (#990). Renaming the column does not either
                 // once the sequence exists: `RENAME COLUMN` keeps the owned
@@ -1217,7 +1253,12 @@ impl Dialect for Postgres {
             out.push(generated_name(&name.name, None, &format!("pkey{suffix}")));
         }
         for (column, spec) in &table.columns {
-            if spec.identity.is_some() {
+            if match spec.value_source {
+                pbps_model::ValueSource::Identity(_) => true,
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Generated(_) => false,
+            } {
                 out.push(generated_name(
                     &name.name,
                     Some(column),
@@ -1597,17 +1638,17 @@ mod tests {
         use pbps_dialect::Dialect;
         let mut parent = partitioned(&["id", "ts"], &["ts"]);
         let mut v = pbps_model::Column::new("integer".parse().unwrap());
-        v.default = Some("0".into());
+        v.value_source = pbps_model::ValueSource::Default("0".into());
         parent.columns.insert("v".into(), v);
         let mut g = pbps_model::Column::new("integer".parse().unwrap());
-        g.generated = Some(pbps_model::Generated {
+        g.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
             expression: "v * 2".into(),
             stored: true,
         });
         parent.columns.insert("g".into(), g);
         let mut i = pbps_model::Column::new("integer".parse().unwrap());
         i.nullable = false;
-        i.identity = Some(pbps_model::Identity {
+        i.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
         });
@@ -1851,7 +1892,7 @@ mod tests {
         let identity = |ty: &str| {
             let mut t = pbps_model::Table::default();
             let mut c = pbps_model::Column::new(ty.parse().unwrap()).not_null();
-            c.identity = Some(pbps_model::Identity {
+            c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                 seed: 1,
                 increment: 1,
             });
@@ -2067,7 +2108,7 @@ mod tests {
         let long = format!("{}x", "a".repeat(59));
         let mut t = Table::default();
         let mut id = Column::new("integer".parse().unwrap()).not_null();
-        id.identity = Some(Identity {
+        id.value_source = pbps_model::ValueSource::Identity(Identity {
             seed: 1,
             increment: 1,
         });
@@ -2397,7 +2438,7 @@ mod tests {
             let mut t = Table::default();
             let mut id = Column::new("integer".parse().unwrap()).not_null();
             if identity {
-                id.identity = Some(Identity {
+                id.value_source = pbps_model::ValueSource::Identity(Identity {
                     seed: 1,
                     increment: 1,
                 });
@@ -2521,7 +2562,7 @@ mod tests {
             let mut t = Table::default();
             let mut id = Column::new("integer".parse().unwrap()).not_null();
             if identity {
-                id.identity = Some(Identity {
+                id.value_source = pbps_model::ValueSource::Identity(Identity {
                     seed: 1,
                     increment: 1,
                 });
@@ -2617,7 +2658,9 @@ mod tests {
         ] {
             let mut declared = base.clone();
             let mut column = Column::new("integer".parse().unwrap()).not_null();
-            column.default = default.map(str::to_owned);
+            column.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+                pbps_model::ValueSource::Default(text.into())
+            });
             declared
                 .tables
                 .get_mut(&table)
@@ -2660,7 +2703,9 @@ mod tests {
             (Some("NULL"), true),
         ] {
             let mut column = Column::new("integer".parse().unwrap()).not_null();
-            column.default = default.map(str::to_owned);
+            column.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
+                pbps_model::ValueSource::Default(text.into())
+            });
             let change = Change::AddColumn {
                 uid: Uid::generate(UidKind::Column),
                 table: "app.t".parse().unwrap(),
@@ -2947,7 +2992,7 @@ mod tests {
         ];
         for (name, ty, default) in erased.iter().chain(&kept) {
             let mut c = pbps_model::Column::new(ty.parse().expect("a type"));
-            c.default = Some((*default).into());
+            c.value_source = pbps_model::ValueSource::Default((*default).into());
             table.columns.insert((*name).into(), c);
         }
         table.columns.insert(
@@ -2984,16 +3029,16 @@ mod tests {
     fn validating_a_table_names_a_default_the_applying_session_would_decide() {
         let mut table = Table::default();
         let mut d = pbps_model::Column::new("date".parse().expect("a type"));
-        d.default = Some("'01/02/2026'".into());
+        d.value_source = pbps_model::ValueSource::Default("'01/02/2026'".into());
         table.columns.insert("d".into(), d);
         // The same text on a type whose input function reads no setting is not
         // a problem, and saying it were would refuse a valid declaration.
         let mut label = pbps_model::Column::new("text".parse().expect("a type"));
-        label.default = Some("'01/02/2026'".into());
+        label.value_source = pbps_model::ValueSource::Default("'01/02/2026'".into());
         table.columns.insert("label".into(), label);
         // Nor is the resolved spelling, which is what the pull reads back.
         let mut ok = pbps_model::Column::new("date".parse().expect("a type"));
-        ok.default = Some("'2026-01-02'::date".into());
+        ok.value_source = pbps_model::ValueSource::Default("'2026-01-02'::date".into());
         table.columns.insert("resolved".into(), ok);
 
         let problems =
@@ -3899,7 +3944,7 @@ mod tests {
             let mut table = Table::default();
             let mut column = pbps_model::Column::new(ty(declared));
             column.nullable = false;
-            column.identity = Some(pbps_model::Identity {
+            column.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                 seed: 1,
                 increment: 1,
             });
@@ -3928,43 +3973,57 @@ mod tests {
     fn a_generated_column_is_held_to_what_the_engine_and_the_model_take() {
         let generated = |expression: &str, stored: bool| {
             let mut c = pbps_model::Column::new(ty("integer"));
-            c.generated = Some(pbps_model::Generated {
+            c.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
                 expression: expression.into(),
                 stored,
             });
             c
         };
-        let problems = |column: pbps_model::Column| {
+        let problems = |column: pbps_model::Column, additional: Option<pbps_model::ValueSource>| {
+            let sources = additional
+                .map(|source| {
+                    std::collections::BTreeMap::from([(
+                        "b".into(),
+                        vec![source, column.value_source.clone()],
+                    )])
+                })
+                .unwrap_or_default();
             let mut table = Table::default();
             table
                 .columns
                 .insert("a".into(), pbps_model::Column::new(ty("integer")));
             table.columns.insert("b".into(), column);
             Postgres::new()
-                .validate_table(&"app.t".parse().unwrap(), &table)
+                .validate_table_sources(&"app.t".parse().unwrap(), &table, &sources)
                 .into_iter()
                 .map(|e| e.to_string())
                 .collect::<Vec<_>>()
         };
-        assert!(problems(generated("a * 2", true)).is_empty());
-        let mut defaulted = generated("a * 2", true);
-        defaulted.default = Some("0".into());
+        assert!(problems(generated("a * 2", true), None).is_empty());
         let mut identity = generated("a * 2", true);
         identity.nullable = false;
-        identity.identity = Some(pbps_model::Identity {
-            seed: 1,
-            increment: 1,
-        });
-        for (column, expected) in [
-            (defaulted, "both a default and a generation expression"),
-            (identity, "both an identity and a generated column"),
-            (generated("a * 2", false), "virtual generated column"),
+        for (column, additional, expected) in [
+            (
+                generated("a * 2", true),
+                Some(pbps_model::ValueSource::Default("0".into())),
+                "both a default and a generation expression",
+            ),
+            (
+                identity,
+                Some(pbps_model::ValueSource::Identity(pbps_model::Identity {
+                    seed: 1,
+                    increment: 1,
+                })),
+                "both an identity and a generated column",
+            ),
+            (generated("a * 2", false), None, "virtual generated column"),
             (
                 generated(" -- nothing", true),
+                None,
                 "empty generation expression",
             ),
         ] {
-            let found = problems(column);
+            let found = problems(column, additional);
             assert!(
                 found.iter().any(|m| m.contains(expected)),
                 "{expected}: {found:?}"
@@ -3981,8 +4040,7 @@ mod tests {
         let mut table = Table::default();
         let mut column = pbps_model::Column::new(ty("integer"));
         column.nullable = true;
-        column.default = Some("7".to_owned());
-        column.identity = Some(pbps_model::Identity {
+        column.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 0,
         });
@@ -3992,13 +4050,23 @@ mod tests {
         table.columns.insert("other".to_owned(), {
             let mut c = pbps_model::Column::new(ty("bigint"));
             c.nullable = false;
-            c.identity = Some(pbps_model::Identity {
+            c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                 seed: 1,
                 increment: 1,
             });
             c
         });
-        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
+        // Invalid declarations belong to the diagnostic boundary; a Column
+        // itself can no longer contain both sources.
+        let sources = std::collections::BTreeMap::from([(
+            "id".into(),
+            vec![
+                pbps_model::ValueSource::Default("7".into()),
+                column.value_source.clone(),
+            ],
+        )]);
+        let found =
+            Postgres::new().validate_table_sources(&"app.t".parse().unwrap(), &table, &sources);
         assert_eq!(found.len(), 3, "{found:?}");
         assert!(found.iter().any(|e| e.to_string().contains("nullable")));
         assert!(found.iter().any(|e| e.to_string().contains("`default:`")));
@@ -4037,7 +4105,8 @@ mod tests {
             let mut table = Table::default();
             let mut column = pbps_model::Column::new(ty(declared));
             column.nullable = false;
-            column.identity = Some(pbps_model::Identity { seed, increment });
+            column.value_source =
+                pbps_model::ValueSource::Identity(pbps_model::Identity { seed, increment });
             table.columns.insert("id".to_owned(), column);
             let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
             assert_eq!(
@@ -4076,7 +4145,8 @@ mod tests {
             let mut table = Table::default();
             let mut column = pbps_model::Column::new(ty(declared));
             column.nullable = false;
-            column.identity = Some(pbps_model::Identity { seed, increment });
+            column.value_source =
+                pbps_model::ValueSource::Identity(pbps_model::Identity { seed, increment });
             table.columns.insert("id".into(), column);
             let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
             assert_eq!(

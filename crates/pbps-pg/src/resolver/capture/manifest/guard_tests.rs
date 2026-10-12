@@ -75,12 +75,12 @@ fn generated_attrdef_fixture(major: u32) -> (CapturedInputs, pbps_model::Schema,
     ] {
         let mut column = Column::new("integer".parse().unwrap());
         if name == "g" {
-            column.generated = Some(Generated {
+            column.value_source = pbps_model::ValueSource::Generated(Generated {
                 expression: "a * 2 + 1".into(),
                 stored: true,
             });
         } else if name == "d" {
-            column.default = Some("7".into());
+            column.value_source = pbps_model::ValueSource::Default("7".into());
         }
         definition.columns.insert(name.into(), column);
         ids.columns.insert(uid.parse().unwrap(), table.column(name));

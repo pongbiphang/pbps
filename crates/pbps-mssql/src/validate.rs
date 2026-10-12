@@ -461,6 +461,14 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
 /// Stopping at the first would turn fixing a table into as many round trips as
 /// it has mistakes.
 pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
+    table_sources(name, table, &Default::default())
+}
+
+pub(crate) fn table_sources(
+    name: &TableName,
+    table: &Table,
+    sources: &std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>>,
+) -> Vec<DialectError> {
     let mut errs = Vec::new();
     errs.extend(table.constraint_name_conflicts().into_iter().map(invalid));
     errs.extend(table.clustered_problems().into_iter().map(invalid));
@@ -530,11 +538,17 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
         }
         // PostgreSQL's (DEC-1168.1): SQL Server's computed columns are a
         // different object, with no declared type, and #1174's to model.
-        if col.generated.is_some() {
-            errs.push(invalid(format!(
-                "column `{col_name}` is a generated column, which this model holds for \
-                 PostgreSQL only"
-            )));
+        let supplied = sources
+            .get(col_name)
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| std::slice::from_ref(&col.value_source));
+        for source in supplied {
+            match source {
+                pbps_model::ValueSource::Generated(_) => errs.push(invalid(format!(
+                    "column `{col_name}` is a generated column, which this model holds for PostgreSQL only"
+                ))),
+                pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) | pbps_model::ValueSource::Identity(_) => {}
+            }
         }
         match types::normalize(&col.ty) {
             Ok(_) => {}
@@ -563,7 +577,13 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                 errs.push(e);
             }
         }
-        if let Some(identity) = col.identity {
+        for source in supplied {
+            let identity = match source {
+                pbps_model::ValueSource::Identity(identity) => identity,
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Generated(_) => continue,
+            };
             identity_columns.push(col_name.clone());
             if !types::can_be_identity(&col.ty) {
                 errs.push(invalid(format!(
@@ -581,7 +601,12 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                     "column `{col_name}` has an IDENTITY increment of 0, which never advances"
                 )));
             }
-            if col.default.is_some() {
+            if supplied.iter().any(|source| match source {
+                pbps_model::ValueSource::Default(_) => true,
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Identity(_)
+                | pbps_model::ValueSource::Generated(_) => false,
+            }) {
                 errs.push(invalid(format!(
                     "column `{col_name}` is IDENTITY, so it cannot also have a default"
                 )));
@@ -989,7 +1014,12 @@ fn system_time(name: &TableName, table: &Table, st: &pbps_model::SystemTime) -> 
                  `nullable: false`"
             )));
         }
-        if col.identity.is_some() {
+        if match col.value_source {
+            pbps_model::ValueSource::Identity(_) => true,
+            pbps_model::ValueSource::None
+            | pbps_model::ValueSource::Default(_)
+            | pbps_model::ValueSource::Generated(_) => false,
+        } {
             errs.push(invalid(format!(
                 "column `{column}` is the period's {role}, which the engine writes, so it \
                  cannot also be an identity"
@@ -1244,7 +1274,7 @@ mod tests {
             .columns
             .insert("a".into(), Column::new("int".parse().unwrap()));
         let mut b = Column::new("int".parse().unwrap());
-        b.generated = Some(pbps_model::Generated {
+        b.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
             expression: "a * 2".into(),
             stored: true,
         });
@@ -1441,7 +1471,8 @@ mod tests {
                 storage_parameters: Default::default(),
             });
             // A default on a period column is accepted by the engine, and kept.
-            table.columns.get_mut("vf").unwrap().default = Some("SYSUTCDATETIME()".into());
+            table.columns.get_mut("vf").unwrap().value_source =
+                pbps_model::ValueSource::Default("SYSUTCDATETIME()".into());
             table.system_time = Some(SystemTime {
                 start: "vf".into(),
                 end: "vt".into(),
@@ -1502,10 +1533,11 @@ mod tests {
             ),
             (
                 |t| {
-                    t.columns.get_mut("vf").unwrap().identity = Some(pbps_model::Identity {
-                        seed: 1,
-                        increment: 1,
-                    })
+                    t.columns.get_mut("vf").unwrap().value_source =
+                        pbps_model::ValueSource::Identity(pbps_model::Identity {
+                            seed: 1,
+                            increment: 1,
+                        })
                 },
                 "cannot also be an identity",
             ),
@@ -1720,7 +1752,7 @@ mod tests {
     fn identity_rules_are_enforced() {
         let (name, mut t) = base_table();
         let mut c = Column::new(ty("nvarchar(10)"));
-        c.identity = Some(Identity {
+        c.value_source = pbps_model::ValueSource::Identity(Identity {
             seed: 1,
             increment: 0,
         });
@@ -2227,7 +2259,7 @@ mod tests {
         let (name, mut t) = base_table();
         for col in ["a", "b"] {
             let mut c = Column::new(ty("int")).not_null();
-            c.identity = Some(Identity {
+            c.value_source = pbps_model::ValueSource::Identity(Identity {
                 seed: 1,
                 increment: 1,
             });

@@ -884,10 +884,8 @@ mod tests {
         assert!(snap.check_version().is_ok());
         assert!(snap.declared.is_empty());
         assert_eq!(
-            snap.schema.tables[&"dbo.t".parse::<TableName>().unwrap()].columns["n"]
-                .default
-                .as_deref(),
-            Some("((0))")
+            snap.schema.tables[&"dbo.t".parse::<TableName>().unwrap()].columns["n"].value_source,
+            crate::ValueSource::Default("((0))".into())
         );
         // Nor any layout (#1178): a state from before `clustered` is the
         // default layout, at version 6 and at 7 alike (DEC-1178.2).

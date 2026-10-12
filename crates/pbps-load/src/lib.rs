@@ -34,6 +34,56 @@ pub struct Loaded {
     pub hints: Hints,
 }
 
+/// Rejected source declarations, retained only for the diagnostic visitor.
+/// The checked load APIs never return these beside a usable schema.
+pub type SourceConflicts = std::collections::BTreeMap<
+    TableName,
+    std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>>,
+>;
+
+/// A recovery tree is exposed through a diagnostic visitor; checked loading
+/// still rejects its conflicting sources. This keeps a refusal from hiding independent
+/// dialect findings in the rest of the project.
+pub struct DiagnosticSchema {
+    loaded: Loaded,
+    conflicts: SourceConflicts,
+}
+
+impl DiagnosticSchema {
+    pub fn inspect<R>(&mut self, visitor: impl FnOnce(&mut Loaded, &SourceConflicts) -> R) -> R {
+        visitor(&mut self.loaded, &self.conflicts)
+    }
+}
+
+pub fn inspect_schema_dir(dir: &Path) -> Result<DiagnosticSchema, Vec<LoadError>> {
+    let mut conflicts = SourceConflicts::new();
+    let loaded = collect_schema_dir(dir, |path| {
+        let text = read(path)?;
+        let probe: dto::KindProbe = serde_saphyr::from_str(&text).map_err(|e| {
+            vec![LoadError::Yaml {
+                path: path.to_owned(),
+                message: e.to_string(),
+            }]
+        })?;
+        if probe.table.is_none() {
+            return load_file_str(path, &text);
+        }
+        let raw: dto::TableDto = serde_saphyr::from_str(&text).map_err(|e| {
+            vec![LoadError::Yaml {
+                path: path.to_owned(),
+                message: e.to_string(),
+            }]
+        })?;
+        let (table, sources) =
+            convert::convert_for_diagnostics(&SourceFile::new(path, &text), raw)?;
+        if !sources.is_empty() {
+            conflicts.insert(table.name.clone(), sources);
+        }
+        Ok(LoadedFile::Table(Box::new(table)))
+    })?;
+    Ok(DiagnosticSchema { loaded, conflicts })
+}
+
 /// What one declaration file turned out to hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadedFile {
@@ -152,6 +202,13 @@ fn already(path: &std::path::Path, what: &str, first: &std::path::Path) -> LoadE
 }
 
 pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
+    collect_schema_dir(dir, load_file)
+}
+
+fn collect_schema_dir(
+    dir: &Path,
+    mut load: impl FnMut(&Path) -> Result<LoadedFile, Vec<LoadError>>,
+) -> Result<Loaded, Vec<LoadError>> {
     let mut files = Vec::new();
     collect_yaml_files(dir, &mut files).map_err(|source| {
         vec![LoadError::Io {
@@ -181,7 +238,7 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
         std::collections::BTreeMap::new();
 
     for path in files {
-        let file = match load_file(&path) {
+        let file = match load(&path) {
             Ok(f) => f,
             Err(mut e) => {
                 errs.append(&mut e);
@@ -314,6 +371,40 @@ mod tests {
         load_table_str(p(), text).expect_err("expected the load to fail")
     }
 
+    #[test]
+    fn conflicting_value_sources_never_leave_the_checked_loader() {
+        let fields = [
+            "default: '7'",
+            "identity: [1, 1]",
+            "generated: {expression: 'a * 2', stored: true}",
+        ];
+        for mask in 0u32..8 {
+            let sources = fields
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                .map(|(_, field)| *field)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let text = format!(
+                "table: app.t\ncolumns:\n  a: {{type: int}}\n  g: {{type: int, {sources}}}\n"
+            );
+            let loaded = load_table_str(p(), &text);
+            if mask.count_ones() < 2 {
+                assert!(loaded.is_ok(), "{sources}: {loaded:?}");
+            } else {
+                let errors = loaded.unwrap_err();
+                assert_eq!(errors.len(), 1);
+                assert!(errors[0].to_string().contains("app.t.g"));
+                assert!(
+                    errors[0]
+                        .to_string()
+                        .contains("only one of default, identity or generated")
+                );
+            }
+        }
+    }
+
     /// #410: a dotted column name and a malformed type on the same column
     /// are two independent problems, and one load reports both. A type error
     /// used to `continue` before the name was checked, so the bad name only
@@ -440,7 +531,10 @@ indexes:
     #[test]
     fn identity_and_deprecated_are_carried() {
         let t = load(FULL);
-        let id = t.table.columns["customer_id"].identity.unwrap();
+        let pbps_model::ValueSource::Identity(id) = t.table.columns["customer_id"].value_source
+        else {
+            panic!("identity fixture")
+        };
         assert_eq!((id.seed, id.increment), (1, 1));
         assert_eq!(
             t.table.columns["legacy_code"].deprecated.as_deref(),

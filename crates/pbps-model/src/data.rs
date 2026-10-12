@@ -242,9 +242,14 @@ impl fmt::Display for Cell {
 pub fn cell(row: &Row, column: &str, spec: Option<&crate::schema::Column>) -> Cell {
     match row.get(column) {
         Some(v) => Cell::Value(v.clone()),
-        None => match spec.and_then(|c| c.default.as_ref()) {
-            Some(default) => Cell::Default(default.clone()),
-            None => Cell::Value(Value::Null),
+        None => match spec.map(|c| &c.value_source) {
+            Some(crate::ValueSource::Default(default)) => Cell::Default(default.clone()),
+            None
+            | Some(
+                crate::ValueSource::None
+                | crate::ValueSource::Identity(_)
+                | crate::ValueSource::Generated(_),
+            ) => Cell::Value(Value::Null),
         },
     }
 }
@@ -804,6 +809,7 @@ pub const DEFAULT_MAX_ROWS: usize = 1000;
 ///
 /// Returns one message per problem, all of them, in a stable order.
 pub fn check(name: &TableName, table: &Table) -> Vec<String> {
+    use crate::ValueSource;
     let Some(data) = &table.data else {
         return Vec::new();
     };
@@ -834,6 +840,19 @@ pub fn check(name: &TableName, table: &Table) -> Vec<String> {
         }
     };
 
+    // Even an empty body inserts its map key. Reject the key once per table,
+    // while retaining independent row findings. An empty scope inserts no key.
+    if !data.rows.is_empty()
+        && let Some(column) = key_column.as_ref()
+        && let Some(spec) = table.columns.get(column)
+    {
+        match spec.value_source {
+            ValueSource::Generated(_) => problems.push(format!(
+                "{name}: declared rows set `{column}` through their primary-key values, but it is a generated column the engine computes — use an ordinary declared key or leave the rows outside reference-data management"
+            )),
+            ValueSource::None | ValueSource::Default(_) | ValueSource::Identity(_) => {}
+        }
+    }
     for (key, row) in &data.rows {
         for column in row.0.keys() {
             if !table.columns.contains_key(column) {
@@ -846,28 +865,22 @@ pub fn check(name: &TableName, table: &Table) -> Vec<String> {
             // insert. Any other identity column is the engine's to assign;
             // a value for it would be refused at apply time, after `validate`
             // had said the declaration was fine.
-            if table
-                .columns
-                .get(column)
-                .is_some_and(|c| c.identity.is_some())
-                && key_column.as_deref() != Some(column.as_str())
-            {
-                problems.push(format!(
-                    "{name}: row `{key}` sets `{column}`, which is an IDENTITY column the engine \
-                     assigns — leave it out"
-                ));
-            }
-            // A generated column is computed from the row's other columns on
-            // every write, and the engine refuses a value for it (DEC-1168.1).
-            if table
-                .columns
-                .get(column)
-                .is_some_and(|c| c.generated.is_some())
-            {
-                problems.push(format!(
-                    "{name}: row `{key}` sets `{column}`, which is a generated column the engine \
-                     computes — leave it out"
-                ));
+            if let Some(spec) = table.columns.get(column) {
+                match spec.value_source {
+                    ValueSource::Identity(_) => {
+                        if key_column.as_deref() != Some(column.as_str()) {
+                            problems.push(format!(
+                                "{name}: row `{key}` sets `{column}`, which is an IDENTITY column the engine \
+                                 assigns — leave it out"
+                            ));
+                        }
+                    }
+                    ValueSource::Generated(_) => problems.push(format!(
+                        "{name}: row `{key}` sets `{column}`, which is a generated column the engine \
+                         computes — leave it out"
+                    )),
+                    ValueSource::None | ValueSource::Default(_) => {}
+                }
             }
             if key_column.as_deref() == Some(column.as_str()) {
                 // Not a style rule. If the body could restate the key, it could
@@ -893,17 +906,17 @@ pub fn check(name: &TableName, table: &Table) -> Vec<String> {
             match row.0.get(column) {
                 Some(Value::Null) => problems.push(format!(
                     "{name}: row `{key}` sets `{column}` to null, but it is NOT NULL{}",
-                    if spec.default.is_some() {
-                        " — leave it out to get the default"
-                    } else {
-                        ""
+                    match spec.value_source {
+                        ValueSource::Default(_) => " — leave it out to get the default",
+                        ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => "",
                     }
                 )),
-                None if spec.default.is_none() && !spec.engine_assigned() => {
-                    problems.push(format!(
+                None => match spec.value_source {
+                    ValueSource::None => problems.push(format!(
                         "{name}: row `{key}` leaves `{column}` unset, but it is NOT NULL with no default"
-                    ));
-                }
+                    )),
+                    ValueSource::Default(_) | ValueSource::Identity(_) | ValueSource::Generated(_) => {}
+                },
                 _ => {}
             }
         }
@@ -1057,7 +1070,8 @@ mod tests {
             Some(vec!["code"]),
             vec![("new", vec![("label", Value::Null)])],
         );
-        t.columns.get_mut("label").unwrap().default = Some("''".to_owned());
+        t.columns.get_mut("label").unwrap().value_source =
+            crate::ValueSource::Default("''".to_owned());
         let p = check(&name(), &t);
         assert!(p.iter().any(|m| m.contains("to null")), "{p:?}");
         assert!(
@@ -1070,7 +1084,7 @@ mod tests {
     fn an_omitted_column_resolves_to_its_default_and_otherwise_to_null() {
         let with_default = {
             let mut c = Column::new(ColumnType::from_str("int").unwrap());
-            c.default = Some("0".to_owned());
+            c.value_source = crate::ValueSource::Default("0".to_owned());
             c
         };
         let without = Column::new(ColumnType::from_str("int").unwrap());
@@ -1094,6 +1108,80 @@ mod tests {
     /// that sets one is refused, and a `NOT NULL` one a row leaves out is
     /// not "unset" (DEC-1168.1).
     #[test]
+    fn a_generated_map_key_refuses_an_actual_row_even_with_an_empty_body() {
+        use crate::{Generated, Identity, ValueSource};
+        let mut t = table(Some(vec!["code"]), vec![("new", vec![])]);
+        // The empty body has no other required cell, so only its implicit
+        // generated key can explain the refusal (#1286).
+        t.columns.get_mut("label").unwrap().nullable = true;
+        let generated = ValueSource::Generated(Generated {
+            expression: "upper(label)".into(),
+            stored: true,
+        });
+        t.columns.get_mut("code").unwrap().value_source = generated.clone();
+        let findings = check(&name(), &t);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("declared rows set `code` through their primary-key values"));
+        for source in [
+            ValueSource::None,
+            ValueSource::Default("'fallback'".into()),
+            ValueSource::Identity(Identity {
+                seed: 1,
+                increment: 1,
+            }),
+        ] {
+            t.columns.get_mut("code").unwrap().value_source = source;
+            assert!(check(&name(), &t).is_empty());
+        }
+        t.columns.get_mut("code").unwrap().value_source = generated;
+        for mode in [DataMode::Exact, DataMode::Ensure] {
+            t.data.as_mut().unwrap().mode = mode;
+            t.data
+                .as_mut()
+                .unwrap()
+                .rows
+                .insert(RowKey::from("other"), Row::default());
+            assert_eq!(
+                check(&name(), &t).len(),
+                1,
+                "the key is refused once per table"
+            );
+            t.data
+                .as_mut()
+                .unwrap()
+                .rows
+                .get_mut(&RowKey::from("new"))
+                .unwrap()
+                .0
+                .insert("missing".into(), Value::Int(1));
+            let findings = check(&name(), &t);
+            assert_eq!(findings.len(), 2, "{findings:?}");
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.contains("which the table does not declare"))
+            );
+            t.data
+                .as_mut()
+                .unwrap()
+                .rows
+                .get_mut(&RowKey::from("new"))
+                .unwrap()
+                .0
+                .remove("missing");
+        }
+        // No rows means no generated value is supplied. Keep empty scopes
+        // representable: exact mode may still need to delete existing rows.
+        t.data.as_mut().unwrap().rows.clear();
+        for mode in [DataMode::Exact, DataMode::Ensure] {
+            t.data.as_mut().unwrap().mode = mode;
+            assert!(check(&name(), &t).is_empty());
+        }
+        t.data = None;
+        assert!(check(&name(), &t).is_empty());
+    }
+
+    #[test]
     fn a_row_writing_a_generated_column_is_refused_and_leaving_it_out_is_not() {
         let mut t = table(
             Some(vec!["code"]),
@@ -1106,7 +1194,7 @@ mod tests {
             )],
         );
         let mut twice = Column::new(ColumnType::from_str("int").unwrap()).not_null();
-        twice.generated = Some(crate::schema::Generated {
+        twice.value_source = crate::ValueSource::Generated(crate::schema::Generated {
             expression: "length(label) * 2".into(),
             stored: true,
         });
@@ -1137,7 +1225,7 @@ mod tests {
             )],
         );
         let mut seq = Column::new(ColumnType::from_str("int").unwrap()).not_null();
-        seq.identity = Some(crate::schema::Identity {
+        seq.value_source = crate::ValueSource::Identity(crate::schema::Identity {
             seed: 1,
             increment: 1,
         });
@@ -1161,7 +1249,8 @@ mod tests {
         // The negative case for the rule above: the value exists, it just is
         // not written here.
         let mut t = table(Some(vec!["code"]), vec![("new", vec![])]);
-        t.columns.get_mut("label").unwrap().default = Some("''".to_owned());
+        t.columns.get_mut("label").unwrap().value_source =
+            crate::ValueSource::Default("''".to_owned());
         assert_eq!(check(&name(), &t), Vec::<String>::new());
     }
 
