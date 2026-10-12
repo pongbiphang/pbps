@@ -2493,7 +2493,9 @@ the resolver's plan.
   pass or the ordering of role drops, runs before sealing, on the
   resolver's plan, so the sealed order holds its result (decided with the
   maintainer, 2026-10-11). The resolver's order edges are carried to the
-  positions the passes leave, matched change by change. A pass that
+  positions the passes leave, matched change by change: a change is what
+  it does, except the facts the connected plan reads from the target and
+  writes into it, of which a dropped role's members are the one. A pass that
   removes a change the resolver ordered, or puts one of its edges the
   other way round, is a defect in pbps: the plan is refused, never sealed
   in an order its proof does not hold.

@@ -315,9 +315,9 @@ tokio::task_local! {
 
 /// The resolver's edges, from its own order to `after`, the order the
 /// caller's passes left. A change is matched by what it does, in order
-/// among equal ones; a pass may add changes and their findings, but not
-/// remove one the resolver ordered or put one before another the resolver
-/// ordered after it.
+/// among equal ones ([`same_change`]); a pass may add changes and their
+/// findings, but not remove one the resolver ordered or put one before
+/// another the resolver ordered after it.
 fn remap(
     before: &pbps_model::ChangeSet,
     after: &pbps_model::ChangeSet,
@@ -330,7 +330,7 @@ fn remap(
             .changes
             .iter()
             .enumerate()
-            .position(|(i, p)| !taken[i] && p.change == planned.change)
+            .position(|(i, p)| !taken[i] && same_change(&planned.change, &p.change))
         else {
             return Err(Error::Binding(format!(
                 "a planning pass removed a change the resolver ordered: {}",
@@ -359,6 +359,28 @@ fn remap(
             }
         })
         .collect()
+}
+
+/// Whether `then`, a change the resolver ordered, is `now` after the
+/// connected passes. What a change does is all of it, except what the
+/// connected plan reads from the target and writes into it: a dropped
+/// role's members, which the resolver leaves empty (#1516 review). Every
+/// other field is the change's own, and a pass that rewrote one made
+/// another change.
+fn same_change(then: &pbps_model::Change, now: &pbps_model::Change) -> bool {
+    use pbps_model::Change::DropRole;
+    if let (
+        DropRole { uid, name, members },
+        DropRole {
+            uid: now_uid,
+            name: now_name,
+            ..
+        },
+    ) = (then, now)
+    {
+        return members.is_empty() && uid == now_uid && name == now_name;
+    }
+    then == now
 }
 
 /// A change as a refusal names it: its kind and what it acts on.
@@ -421,6 +443,39 @@ mod remap_tests {
         )
         .unwrap();
         assert_eq!(edges, BTreeSet::from([edge(1, 2)]));
+    }
+
+    /// #1516 review: the connected plan fills a dropped role's members
+    /// from the target; the drop is still the one the resolver ordered.
+    /// Negative: another role's drop is not it.
+    #[test]
+    fn a_dropped_roles_members_filled_in_keep_its_edges() {
+        let uid = Uid::generate(UidKind::Role);
+        let drop = |name: &str, members: &[&str]| {
+            PlannedChange::new(Change::DropRole {
+                uid: uid.clone(),
+                name: name.into(),
+                members: members.iter().map(|&m| m.to_owned()).collect(),
+            })
+        };
+        let a = role("a");
+        let (resolved, filled) = (drop("old", &[]), drop("old", &["alice"]));
+        let edges = remap(
+            &set(&[&resolved, &a]),
+            &set(&[&filled, &a]),
+            &BTreeSet::from([edge(0, 1)]),
+        )
+        .unwrap();
+        assert_eq!(edges, BTreeSet::from([edge(0, 1)]));
+        let other = drop("other", &["alice"]);
+        assert!(
+            remap(
+                &set(&[&resolved, &a]),
+                &set(&[&other, &a]),
+                &BTreeSet::new()
+            )
+            .is_err()
+        );
     }
 
     #[test]
