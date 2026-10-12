@@ -85,12 +85,15 @@ fn release(c: &Change, surface: &Surface) -> bool {
             },
             Surface::Default(r),
         ) => column == r,
+        // Its own default taken off, whether the partition is left with
+        // none or with its parent's again: either lets go of what its own
+        // expression bound (#1610 review).
         (
             Change::SetPartitionDefault {
                 table,
                 column,
+                from: Some(_),
                 to: None,
-                fallback: None,
                 ..
             },
             Surface::Default(r),

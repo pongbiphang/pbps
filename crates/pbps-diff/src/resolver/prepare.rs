@@ -542,11 +542,11 @@ fn both_defaults(
 /// declares no column, so its default lives in `partition_of.columns`
 /// (#1578) and the column is keyed by the partition's table UID; the name it
 /// had before the plan is its parent column's, found by that column's UID
-/// (#1610). A partition the plan detaches keeps the override as its
-/// column's default, so its restoration is the column's, after the detach
-/// makes the column. `None` when only one side has a default of the
-/// partition's own, as [`both_defaults`] says, or when the plan replaces the
-/// partition.
+/// (#1610). A table the plan attaches or detaches keeps its default across
+/// the change (#1578), as a column's default on one side and the
+/// partition's own on the other: each half of the pair is spelled in the
+/// form its side holds. `None` when only one side has a default, as
+/// [`both_defaults`] says, or when the plan replaces the partition.
 fn partition_default(
     surface: &Surface,
     column: &pbps_model::ColumnRef,
@@ -567,21 +567,32 @@ fn partition_default(
         .tables
         .get(&column.table)
         .and_then(|t| t.partition_of.as_ref());
-    // A partition declares no column: its column's name before the plan is
-    // its parent column's. A detach makes the column the table's own, under
-    // the name it had.
-    let before_name = of
-        .and_then(|of| ids.column_uid(&of.parent.column(&column.name)))
-        .and_then(|parent| before_ids.columns.get(parent))
-        .map_or_else(|| column.name.clone(), |c| c.name.clone());
-    // A table the plan attaches had no override of its own to release.
     let before_of = base
         .tables
         .get(&before_table)
         .and_then(|t| t.partition_of.as_ref());
-    let old = before_of
-        .and_then(|of| of.columns.get(&before_name))
-        .and_then(|own| own.default.clone());
+    // A partition declares no column: its column's name before the plan is
+    // its parent column's. A table the plan attaches or detaches has the
+    // column as its own, under the name it keeps.
+    let before_name = of
+        .filter(|_| before_of.is_some())
+        .and_then(|of| ids.column_uid(&of.parent.column(&column.name)))
+        .and_then(|parent| before_ids.columns.get(parent))
+        .map_or_else(|| column.name.clone(), |c| c.name.clone());
+    // An attach keeps the table's column default as the partition's own
+    // (#1578), as a detach keeps the override as the column's: each side's
+    // default is read in the form that side holds it.
+    let old = match before_of {
+        Some(of) => of
+            .columns
+            .get(&before_name)
+            .and_then(|own| own.default.clone()),
+        None => base
+            .tables
+            .get(&before_table)
+            .and_then(|t| t.columns.get(&before_name))
+            .and_then(|c| c.default.clone()),
+    };
     // A detach keeps the override as the table's column default (#1578).
     let new = match of {
         Some(of) => of
@@ -597,15 +608,28 @@ fn partition_default(
     let Some((old, new)) = both_defaults(surface, old, new)? else {
         return Ok(None);
     };
-    let before_of = before_of.ok_or_else(definition)?;
-    let release = Change::SetPartitionDefault {
-        uid: uid.clone(),
-        table: before_table,
-        parent: before_of.parent.clone(),
-        column: before_name,
-        from: Some(old),
-        to: None,
-        fallback: None,
+    let release = match before_of {
+        Some(before_of) => Change::SetPartitionDefault {
+            uid: uid.clone(),
+            table: before_table,
+            parent: before_of.parent.clone(),
+            column: before_name,
+            from: Some(old),
+            to: None,
+            fallback: None,
+        },
+        None => {
+            let before_column = before_table.column(&before_name);
+            Change::AlterColumnDefault {
+                uid: before_ids
+                    .column_uid(&before_column)
+                    .ok_or_else(definition)?
+                    .clone(),
+                column: before_column,
+                from: Some(old),
+                to: None,
+            }
+        }
     };
     let restore = match of {
         Some(of) => Change::SetPartitionDefault {

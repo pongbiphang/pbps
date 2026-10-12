@@ -2915,6 +2915,112 @@ mod generated_surface_coverage {
         assert_eq!(added(&ordered), 1, "{:?}", ordered.changes.changes);
     }
 
+    /// #1610 review: an ordinary table attached while its default rebinds.
+    /// The attach keeps the column's default as the partition's own (#1578):
+    /// it is released as the column's before the attach, and restored as the
+    /// partition's own after it.
+    #[test]
+    fn an_attached_tables_default_is_released_and_restored() {
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let mut base = partitioned(None, None);
+        let mut d = Column::new("int".parse().unwrap());
+        d.default = Some("app.f(1)".into());
+        base.tables.insert(
+            p.clone(),
+            Table {
+                columns: [("d".to_owned(), d)].into(),
+                ..Default::default()
+            },
+        );
+        // A range, which a table is attached as; a DEFAULT partition is
+        // created, not attached.
+        let mut desired = partitioned(None, Some("app.f(1)"));
+        desired
+            .tables
+            .get_mut(&p)
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .bound = pbps_model::PartitionBound::Range {
+            from: vec![pbps_model::BoundDatum::Value("0".into())],
+            to: vec![pbps_model::BoundDatum::Value("10".into())],
+        };
+        let before_ids = ids(&base, &IdsFile::default());
+        let after_ids = ids(&desired, &before_ids);
+        let ordered = planned(
+            &base,
+            &before_ids,
+            &desired,
+            &after_ids,
+            &[rebinds("app.p")],
+        )
+        .unwrap_or_else(|error| panic!("an attach is refused: {error:?}"));
+        let release = at(&ordered, &|c| {
+            matches!(c, Change::AlterColumnDefault { column, from: Some(from), to: None, .. }
+                if column.table == p && from == "app.f(1)")
+        });
+        let attach = at(&ordered, &|c| matches!(c, Change::AttachPartition { .. }));
+        let restore = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, from: None, to: Some(to), .. }
+                if *table == p && to == "app.f(1)")
+        });
+        assert!(
+            release < attach && attach < restore,
+            "{:?}",
+            ordered.changes.changes
+        );
+        names_resolve(&ordered, &after_ids);
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// #1610 review: the plan takes a partition's own default off, leaving
+    /// its parent's, and drops the routine the own default called. Taking it
+    /// off lets go of that routine, so it precedes the drop.
+    #[test]
+    fn a_partition_default_given_back_to_its_parents_precedes_its_routines_drop() {
+        let (f, dropped) = function("f", true);
+        let module = pbps_model::Module {
+            kind: pbps_model::ModuleKind::Function,
+            description: None,
+            definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+        };
+        let mut base = partitioned(Some("0"), Some("app.f(1)"));
+        base.modules.insert(f.clone(), module);
+        let desired = partitioned(Some("0"), None);
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let own = SurfaceResolution {
+            surface: Surface::Default(p.column("d")),
+            current: Some(bound(
+                "pg_attrdef",
+                "app.p.d",
+                &[Surface::Module(f.clone())],
+                "f",
+            )),
+            desired: None,
+        };
+        let ordered = sided(&base, &desired, &[keeps("app.t"), own, dropped]);
+        let given_back = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, from: Some(_), to: None, fallback: Some(_), .. }
+                if *table == p)
+        });
+        let drop = at(
+            &ordered,
+            &|c| matches!(c, Change::DropModule { id, .. } if *id == f),
+        );
+        assert!(given_back < drop, "{:?}", ordered.changes.changes);
+        assert!(
+            ordered
+                .proof
+                .edges()
+                .iter()
+                .any(|e| e.before == given_back && e.after == drop),
+            "the order is an edge, not an accident of position: {:?}",
+            ordered.proof.edges()
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
     /// #1610 review: a table replaced under its name, with new UIDs, whose
     /// generated column comes back as an ordinary one with a default. Only
     /// the plan's side has a default; the ordinary plan's `DropTable` and
