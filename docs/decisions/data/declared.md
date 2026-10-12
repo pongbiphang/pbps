@@ -204,6 +204,10 @@ to add an entry here.
     creates: the alias query (71) has no table to ask yet. Keys are checked
     only for that, since their spelling is aliased at read time.
 
+    *Amended by [DEC-1883.1](#dec-1883-1): a date or time the engine reads
+    one way only is taken as the value it reads, in the engine's spelling,
+    rather than refused. Every other type is unchanged.*
+
 <a id="decision-103"></a>
 
 103. **`validate` refuses a key whose text no spelling of its type has.**
@@ -689,3 +693,77 @@ blanket prohibition would change those existing semantics without fixing any
 additional explicit-key insert. Tests cover the empty body, two rows with one
 key diagnostic, an independent invalid cell, both empty modes, no data, and
 ordinary/default/identity controls.
+
+<a id="dec-1883-1"></a>
+
+**DEC-1883.1. A date or time the engine reads one way only is the value it
+reads, not a spelling to match (#1883).** DECISIONS 101 refuses a declared
+text unless the engine gives it back as written, because rows are compared as
+text and a different spelling restates a no-op update on every plan. For a
+`decimal` that is the right demand: `1.5` and `1.50` are what a reader of the
+declaration sees, and no setting makes either mean anything else. For a date
+it asked the author to be the engine. `2026-02-01` for a `timestamp` had to be
+written `2026-02-01 00:00:00`, `2026-02-01 00:00:00Z` for a `timestamptz`
+`2026-02-01 00:00:00+00`, and on SQL Server `2026-02-01` for a `datetime2`
+`2026-02-01T00:00:00` — one exact rendering per type, learnt from a refusal.
+
+So for `date`, `time`, `timetz`, `timestamp`, `timestamptz` and `interval`
+on PostgreSQL, and `date`, `time`, `datetime`, `datetime2`, `datetimeoffset`
+and `smalldatetime` on SQL Server, the reading the spelling check already
+computes replaces the declared text instead of refusing it: `refuse_misspelt`
+hands back the declarations with each such cell, key and range bound in the
+engine's spelling, and `plan --db`, `bootstrap` and the `dev` rehearsal plan,
+compare and record that schema from there on. The plan's rows, its recorded
+scope and the state all carry the engine's text, so the apply's own checks,
+which compare what they read back with the plan's literal, hold unchanged, and
+two spellings of one value plan clean against each other. `pull` still writes
+the engine's spelling.
+
+- **Only a text with one reading.** The reading replaces the text only where
+  the engine reads it the same under every setting it was asked under. On
+  PostgreSQL every literal of these types already goes through DEC-1756.1's
+  probe, and one with two readings is dropped from the spelling list before
+  this is reached. SQL Server sets no `DATEFORMAT` of its own and this tool
+  sets none, so the login decides; each of its date and time texts is read
+  again under all six `DATEFORMAT` orders, and one that names a month or day
+  (any letter but ISO 8601's `T` and `Z`) under every language in
+  `sys.syslanguages` too, each inside `sp_executesql`, where the setting
+  reverts when the batch returns. Measured on 2022: `'2026-02-01'` as a
+  `datetime` is 2026-02-01 under `mdy` and 2026-01-02 under `dmy`, as a `date`
+  or `datetime2` 2026-02-01 under both; `'01/2026/02'` differs between `myd`
+  and `dym`, orders no language sets but a session can; `'28 listopad 2018'`
+  is November under `polski` and October under `hrvatski`, which no order
+  shows; and `'2026-02-01T00:00:00'` and `'20260201'` are the same under
+  every setting. Three orders and no languages was the first version, and
+  review showed the last two cases through it. A text that differs is refused
+  as DEC-1756.1's are, with both readings and the ISO form with a `T` as the
+  remedy. Before this, such a text was refused for not
+  being the engine's spelling, so the contrast was not needed; taking a
+  reading without it would store whichever the login's language picked.
+- **Keys too, and two that read as one are still one row.** A key's spelling
+  was aliased at read time (71) on SQL Server and refused on PostgreSQL; a
+  date or time key now takes its reading on both. `2026-02-01` and
+  `2026-02-01 00:00:00` declared together are refused as one row
+  (DECISIONS 106), before any replacement: the refusal comes first, so a
+  replaced key cannot land on another row.
+- **A text the engine cannot read is still refused.** There is no reading to
+  take.
+- **Defaults are not touched.** They are compared through the declared
+  expression record (ADR-0013 §4), not as row text.
+- **Offline, nothing can be asked.** `plan` without `--db` and `bootstrap
+  --sql` alone carry the declared text, as before. Offline, a bound written
+  another way is a changed bound, which this tool cannot alter in place; the
+  connected plan sees the same value. A connected `bootstrap` asks before it
+  builds its statements, and before its lock: the engine's reading of a text
+  does not turn on what the database holds, and the statements and the
+  `--sql` script are made from the answer.
+
+Pinned by `a_date_or_time_is_taken_as_the_value_the_engine_reads` in
+`flow_pg` (PostgreSQL 16 and 18: plan, apply, bootstrap, verify and pull, and
+the four refusals) and in `flow` (SQL Server, the `DATEFORMAT` refusal among
+them); by `a_date_read_differently_by_another_language_or_order_is_ambiguous`
+(pbps-mssql, under a `polski` session); by
+`the_engines_reading_replaces_only_the_texts_it_was_read_for`; and,
+changed from a refusal, by the bound in
+`a_partition_tree_round_trips_through_the_cli` and the date in
+`a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is_written`.

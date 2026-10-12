@@ -322,6 +322,63 @@ pub struct SpellingQuery {
     /// twice and fail on the second, and the alias query (71) cannot see
     /// them on a table that does not hold either yet (DECISIONS 106).
     pub collisions: Option<String>,
+    /// Whether the column holds a date or time ([`temporal`]).
+    pub temporal: bool,
+}
+
+/// Whether a column of this base type holds a date or a time: a declared
+/// text the engine reads one way only is then taken as the value it reads,
+/// in the engine's spelling, rather than refused for not being that spelling
+/// (DEC-1883.1). The six [`read_expr`] renders in style 126.
+pub(crate) fn temporal(base: &str) -> bool {
+    matches!(
+        base,
+        "date" | "time" | "datetime" | "datetime2" | "datetimeoffset" | "smalldatetime"
+    )
+}
+
+/// Every order `SET DATEFORMAT` can name: a temporal text is read under each,
+/// and one that reads differently under two is refused rather than taken as
+/// what this session reads (DEC-1883.1).
+///
+/// Measured on 2022: `'2026-02-01'` as a `datetime` is 2026-02-01 under
+/// `mdy` and 2026-01-02 under `dmy`, while as a `date` or `datetime2` it is
+/// 2026-02-01 under both, and `'2026-02-01T00:00:00'` and `'20260201'` are
+/// 2026-02-01 under every order for every type. `'01/2026/02'` is
+/// 2026-01-02 under `myd` and 2026-02-01 under `dym`: all six, not the three
+/// a language sets, because a session can name any of them. The tool sets
+/// no `DATEFORMAT` of its own, so without asking, the meaning of such a text
+/// would be the login's.
+pub const DATEFORMATS: [&str; 6] = ["mdy", "dmy", "ymd", "ydm", "myd", "dym"];
+
+/// `sql` run under `SET DATEFORMAT order`, for one batch only. Inside
+/// `sp_executesql` the setting reverts when it returns — measured, the
+/// session's `date_format` reads `mdy` again after a `dmy` call — so the
+/// session the rest of the command runs in is left as it came.
+pub fn under_dateformat(sql: &str, order: &str) -> String {
+    let batch = format!("SET DATEFORMAT {order}; {sql}");
+    format!("EXEC sys.sp_executesql {};", literal(&batch))
+}
+
+/// Whether a temporal text names something only a language can read: a
+/// month or day name, an `AM` or `PM`. Its letters other than ISO 8601's `T`
+/// and `Z`, which every language reads alike. Measured on 2022,
+/// `'28 listopad 2018'` is November under `polski` and October under
+/// `hrvatski`, a difference no `DATEFORMAT` shows; a text of digits and
+/// separators is read by the order alone, which [`DATEFORMATS`] covers.
+pub fn names_by_language(text: &str) -> bool {
+    text.chars()
+        .any(|c| c.is_alphabetic() && !matches!(c, 'T' | 't' | 'Z' | 'z'))
+}
+
+/// The languages a session can be set to, as `sys.syslanguages` names them.
+pub const LANGUAGES: &str = "SELECT name FROM sys.syslanguages ORDER BY langid;";
+
+/// `sql` run under `SET LANGUAGE language`, for one batch only: the setting
+/// reverts with `sp_executesql` as `DATEFORMAT` does (measured).
+pub fn under_language(sql: &str, language: &str) -> String {
+    let batch = format!("SET LANGUAGE {}; {sql}", literal(language));
+    format!("EXEC sys.sp_executesql {};", literal(&batch))
 }
 
 /// The engine's own answer to "is this text the spelling it reads back":
@@ -338,9 +395,10 @@ pub struct SpellingQuery {
 /// text the type cannot read at all — the other thing a table this plan
 /// creates cannot be asked about through its alias query, since there is no
 /// table yet. Keys are only checked for that: their spelling is aliased at
-/// read time (71). Integer and bit cells are parsed by the loader and
-/// spelled by the model; only text-kind columns carry a spelling to ask
-/// about.
+/// read time (71). A date or time, key or cell, is read as a value instead
+/// (DEC-1883.1): its reading is handed back to be taken in its place. Integer
+/// and bit cells are parsed by the loader and spelled by the model; only
+/// text-kind columns carry a spelling to ask about.
 pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQuery>, RowsError> {
     let Some(data) = &table.data else {
         return Ok(Vec::new());
@@ -439,6 +497,7 @@ pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQ
             literals,
             sql: format!("SELECT v.i AS i, {rendered} AS c\n  FROM (VALUES {values}) AS v(i, s);"),
             collisions,
+            temporal: temporal(base),
         }
     };
 
@@ -1279,6 +1338,60 @@ mod tests {
     use super::*;
     use pbps_model::{Column, ColumnType, PrimaryKey};
     use std::str::FromStr;
+
+    /// DEC-1883.1: a contrast reading runs the spelling query whole inside
+    /// `sp_executesql`, which is what makes its `SET DATEFORMAT` revert, with
+    /// every quote in it doubled so the literals arrive as written.
+    #[test]
+    fn a_dateformat_contrast_runs_the_query_whole_inside_its_own_batch() {
+        assert_eq!(
+            under_dateformat("SELECT N'2026-02-01' AS c;", "dmy"),
+            "EXEC sys.sp_executesql N'SET DATEFORMAT dmy; SELECT N''2026-02-01'' AS c;';"
+        );
+        assert_eq!(
+            under_language("SELECT 1;", "polski"),
+            "EXEC sys.sp_executesql N'SET LANGUAGE N''polski''; SELECT 1;';"
+        );
+        // A name is a language's to read; digits, separators and ISO 8601's
+        // own letters are not.
+        for text in [
+            "28 listopad 2018",
+            "Feb 1 2026",
+            "9:00 PM",
+            "1 février 2026",
+        ] {
+            assert!(names_by_language(text), "{text}");
+        }
+        for text in [
+            "2026-02-01",
+            "2026-02-01T00:00:00Z",
+            "20260201",
+            "01/02/2026",
+        ] {
+            assert!(!names_by_language(text), "{text}");
+        }
+        // Only the six date and time types are read as values; a decimal and
+        // a string keep their spelling (DECISIONS 101).
+        for base in [
+            "date",
+            "time",
+            "datetime",
+            "datetime2",
+            "datetimeoffset",
+            "smalldatetime",
+        ] {
+            assert!(temporal(base), "{base}");
+        }
+        for base in [
+            "decimal",
+            "varchar",
+            "nvarchar",
+            "timestamp",
+            "uniqueidentifier",
+        ] {
+            assert!(!temporal(base), "{base}");
+        }
+    }
 
     fn table(pk: Option<Vec<&str>>, columns: &[(&str, &str, Option<&str>)]) -> Table {
         let mut t = Table::default();

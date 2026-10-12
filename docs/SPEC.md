@@ -554,6 +554,15 @@ can imply.
   float does not promise to give it back. Quoted, it is text, and the engine
   converts it — the same "keep it verbatim, never parse it" the defaults and
   check expressions get.
+- **A date or time is a value, not a spelling.** Against a target, a
+  `2026-02-01` cell, key or range bound on a `timestamp` (or `datetime2`) is
+  what the engine reads it as, `2026-02-01 00:00:00`, and the plan, the
+  comparison and the recorded state carry the engine's spelling, so either
+  spelling plans clean. Only a text the engine reads one way under every
+  setting it is asked under qualifies; one with two readings is refused with
+  both (DEC-1756.1), and every other type must still be written as the engine
+  reads it back, `1.50` and not `1.5` for a `decimal(5,2)` (DECISIONS 101,
+  DEC-1883.1).
 - **Boolean-ish and number-shaped row keys are real** (`no` is a status code,
   `1`, `0x1f` and `1_000` are keys), so `fmt` quotes them, under the same rule
   as §4.3. The rule also preserves text cells that resemble YAML numbers.

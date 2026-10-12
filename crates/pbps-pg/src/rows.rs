@@ -1146,6 +1146,32 @@ pub struct SpellingQuery {
     /// insert twice and fail on the second, and the alias query cannot see
     /// them on a table that does not hold either yet (DECISIONS 106).
     pub collisions: Option<String>,
+    /// Whether the column holds a date or time ([`temporal`]).
+    pub temporal: bool,
+}
+
+/// Whether a column of this base type holds a date or a time: a declared text that the engine reads one way only is then
+/// taken as the value it reads, and stands in the plan, the comparison and
+/// the recorded state in the engine's spelling (DEC-1883.1). `2026-02-01` for
+/// a `timestamp` is a value, and asking its author to write the engine's
+/// `2026-02-01 00:00:00` instead asks them to be the engine.
+///
+/// Every other type keeps DECISIONS 101: `1.5` for a `numeric(5,2)` is
+/// refused, because there the spelling *is* what a reader of the declaration
+/// sees, and no setting of the session can make it mean anything else. The
+/// six are the ones `ambiguity` asks about other than the two floats, so a
+/// text taken as its reading here is always one that was asked whether it has
+/// more than one.
+pub(crate) fn temporal(base: &str) -> bool {
+    matches!(
+        base,
+        "date"
+            | "time without time zone"
+            | "time with time zone"
+            | "timestamp without time zone"
+            | "timestamp with time zone"
+            | "interval"
+    )
 }
 
 /// The engine's own answer to "is this text the spelling it reads back":
@@ -1263,6 +1289,7 @@ pub fn spelling_queries(
                  FROM {source};"
             ),
             collisions,
+            temporal: temporal(base),
         })
     };
 
@@ -1324,6 +1351,8 @@ pub struct BoundSpellingQuery {
     /// The declared values, by the index the query returns.
     pub values: Vec<String>,
     pub sql: String,
+    /// Whether the key column holds a date or time ([`temporal`]).
+    pub temporal: bool,
 }
 
 /// One query per partition and key column whose bound declares a value: the
@@ -1363,12 +1392,12 @@ pub fn bound_spelling_queries(
             if values.is_empty() {
                 continue;
             }
-            let ty = crate::types::normalize(&spec.ty)
-                .map_err(|e| RowsError::Unreadable {
+            let normalized =
+                crate::types::normalize(&spec.ty).map_err(|e| RowsError::Unreadable {
                     table: name.clone(),
                     why: e.to_string(),
-                })?
-                .to_string();
+                })?;
+            let ty = normalized.to_string();
             let readable = format!("pg_catalog.pg_input_is_valid(v.s, {})", value_literal(&ty));
             let rendered = read_expr(&format!("CAST(v.s AS {ty})"));
             let list = values
@@ -1391,6 +1420,7 @@ pub fn bound_spelling_queries(
                     ty,
                     values,
                     sql,
+                    temporal: temporal(&normalized.base),
                 },
             ));
         }
@@ -1695,6 +1725,21 @@ mod tests {
     use super::*;
     use pbps_model::{Column, ColumnType, DataMode, PrimaryKey, TableData};
     use std::str::FromStr;
+
+    /// DEC-1883.1: the six date and time types are read as values, and every
+    /// type `ambiguity` asks about is among them but the two floats, so no
+    /// text is taken as its reading without having been asked whether it has
+    /// another. A number, a string and the floats keep DECISIONS 101.
+    #[test]
+    fn only_the_date_and_time_types_are_read_as_values() {
+        for base in crate::emit::SETTING_SENSITIVE {
+            let float = matches!(*base, "real" | "double precision");
+            assert_eq!(temporal(base), !float, "{base}");
+        }
+        for base in ["numeric", "text", "character varying", "integer", "uuid"] {
+            assert!(!temporal(base), "{base}");
+        }
+    }
 
     /// Every spelling of a default that is one string, with or without a type
     /// around it, gives that string up for the ambiguity check (#1756).

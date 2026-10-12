@@ -3000,6 +3000,7 @@ async fn ask_about_every_spelling(
                 declared: declared.clone(),
                 ty: q.ty.clone(),
                 canonical,
+                temporal: q.temporal,
             });
         }
     }
@@ -3044,6 +3045,7 @@ async fn ask_about_every_spelling(
                     declared: declared.clone(),
                     ty: q.ty.clone(),
                     canonical,
+                    temporal: q.temporal,
                 });
             }
         }
