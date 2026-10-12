@@ -2577,6 +2577,97 @@ mod generated_surface_coverage {
         ordered.proof.validate(&ordered.changes).unwrap();
     }
 
+    /// #1610 review: as above, but the partition holds its own default on
+    /// `e` too, which the rename keeps as `d`'s. That default rebinds: its
+    /// teardown, spelled `p.e`, runs before the parent renames `e`, and its
+    /// restoration, spelled `p.d`, after it. Either other way addresses a
+    /// column that is not there.
+    #[test]
+    fn a_partitions_kept_override_is_rebuilt_around_its_parents_column_rename() {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let p: pbps_model::TableName = "app.p".parse().unwrap();
+        let tree = |columns: &[&str], overrides: &[(&str, &str)]| {
+            let mut schema = Schema::default();
+            schema.tables.insert(
+                t.clone(),
+                Table {
+                    columns: columns
+                        .iter()
+                        .map(|c| ((*c).to_owned(), Column::new("int".parse().unwrap())))
+                        .collect(),
+                    partition_by: Some(PartitionBy {
+                        external: false,
+                        columns: vec!["k".into()],
+                    }),
+                    ..Default::default()
+                },
+            );
+            schema.tables.insert(
+                p.clone(),
+                Table {
+                    partition_of: Some(PartitionOf {
+                        parent: t.clone(),
+                        bound: PartitionBound::Default,
+                        columns: overrides
+                            .iter()
+                            .map(|(c, default)| {
+                                (
+                                    (*c).to_owned(),
+                                    PartitionColumn {
+                                        default: Some((*default).into()),
+                                        not_null: false,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    }),
+                    ..Default::default()
+                },
+            );
+            schema
+        };
+        let base = tree(&["k", "d", "e"], &[("d", "app.f(1)"), ("e", "app.f(2)")]);
+        let desired = tree(&["k", "d"], &[("d", "app.f(2)")]);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        let d = before_ids.column_uid(&t.column("d")).unwrap().clone();
+        let e = before_ids.column_uid(&t.column("e")).unwrap().clone();
+        after_ids.columns.remove(&d);
+        after_ids.columns.get_mut(&e).unwrap().name = "d".into();
+        let removed = SurfaceResolution {
+            surface: Surface::Default(p.column("e")),
+            current: Some(bound("pg_attrdef", "app.p.e", &[], "f")),
+            desired: None,
+        };
+        let ordered = planned(
+            &base,
+            &before_ids,
+            &desired,
+            &after_ids,
+            &[rebinds("app.p"), removed],
+        )
+        .unwrap_or_else(|error| panic!("a kept override is refused: {error:?}"));
+        let rename = at(&ordered, &|c| {
+            matches!(c, Change::RenameColumn { table, from, to, .. }
+                if *table == t && from == "e" && to == "d")
+        });
+        let release = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, to: None, fallback: None, .. }
+                if *table == p && column == "e")
+        });
+        let restore = at(&ordered, &|c| {
+            matches!(c, Change::SetPartitionDefault { table, column, to: Some(to), .. }
+                if *table == p && column == "d" && to == "app.f(2)")
+        });
+        assert!(
+            release < rename && rename < restore,
+            "{:?}",
+            ordered.changes.changes
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
     /// #1610 review: a table replaced under its name, with new UIDs, whose
     /// generated column comes back as an ordinary one with a default. Only
     /// the plan's side has a default; the ordinary plan's `DropTable` and

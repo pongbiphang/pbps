@@ -360,6 +360,39 @@ pub(super) fn constraints(
         }
     }
 
+    // A partition's own default spelled by a column name its parent's
+    // rename moves: a release spelled by the old name before the rename, and
+    // a setting spelled by the new name after it. A partition declares no
+    // column, so the parent's rename is the one that moves the name, and the
+    // rules below that read a column's own rename by its UID do not see it
+    // (#1610 review).
+    for (i, change) in steps.iter().enumerate() {
+        let Change::SetPartitionDefault {
+            parent,
+            column,
+            to,
+            fallback,
+            ..
+        } = change
+        else {
+            continue;
+        };
+        let sets = to.is_some() || fallback.is_some();
+        for (j, other) in steps.iter().enumerate() {
+            if let Change::RenameColumn {
+                table, from, to, ..
+            } = other
+                && table == parent
+            {
+                if !sets && from == column {
+                    edge(i, j, OrderReason::Identity);
+                } else if sets && to == column {
+                    edge(j, i, OrderReason::Identity);
+                }
+            }
+        }
+    }
+
     // A default change spelled by its own column's final name: where the
     // plan renames that column, by its UID, into the name the change uses.
     let own_rename: Vec<Option<usize>> = steps
