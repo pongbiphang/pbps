@@ -6,7 +6,7 @@ This document described the measured resolver runtime: the Docker profile
 socket observation, executable identity and verified channels. #1636 removed
 them ([DEC-1636.1](decisions/resolver.md#dec-1636-1)); the resolver that
 remains is specified in
-[SPEC §9.3.2](SPEC.md#932-engine-assisted-planning-accepted-not-implemented).
+[SPEC §9.3.2](SPEC.md#932-engine-assisted-planning-postgresql-planning-delivered).
 
 Decision records and pitfalls written before #1636 still cite this document
 and its sections. Its text is in the git history of this file.

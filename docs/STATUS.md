@@ -203,7 +203,7 @@ say whether what the emitter sent is what comes back.
 ### Engine-assisted planning and resolver environments
 
 **Doctor discovery, resolver selection and the resolver's scratch runs implemented; publication remains planned.**
-[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
+[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-postgresql-planning-delivered)
 and [ADR-0016](ADR-0016-engine-assisted-planning.md) retain offline previews and
 the existing SQL Server `--dev` rehearsal. Target planning accepts
 `--resolve-with <profile>` (#606), with CLI > environment > project precedence.
@@ -258,8 +258,13 @@ proves its scratch is not the target and, on the target's cluster, that its
 account is confined; then it runs the shared compatibility qualification. Its
 plan is published after the ordinary connected checks and a fresh recheck of
 the target, with the target's cluster identity and the accepted limitations
-sealed in its evidence (#1516, DEC-1516.1).
-[Delivery tracking](RESOLVER-DELIVERY.md) has the remaining order: #1517,
+sealed in its evidence (#1516, DEC-1516.1). `explain` shows that evidence
+from the plan alone, in human and JSON output: the entry that ran, its
+scratch kind and layout, the qualification, each surface's verdict, the
+order and the prerequisites. SQL Server resolution, `--staged` and a
+retained external object the baseline does not stage refuse by name (#1517,
+DEC-1517.1). PostgreSQL planning is delivered; applying a resolved plan is
+#616. [Delivery tracking](RESOLVER-DELIVERY.md) has the remaining order:
 #1778 and #616, then SQL Server's #619, #620 and #621.
 
 Delivery is split into three stages:

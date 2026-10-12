@@ -92,7 +92,7 @@ test runtime for the shipped browser module, not a product dependency.
 ## Planned engine-assisted planning
 
 [ADR-0016](ADR-0016-engine-assisted-planning.md) and
-[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
+[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-postgresql-planning-delivered)
 are accepted design; initial read-only `doctor` environment discovery (#597),
 resolver selection/policy (#606), engine compatibility qualification (#610,
 #611) and the resolver's server and Docker scratch runs (#1672, #1674) are

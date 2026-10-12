@@ -4,7 +4,7 @@
 > Language: Rust
 > Position: declarative database schema version control and deployment
 > Supported dialects: SQL Server and PostgreSQL
-> Accepted, not yet implemented: engine-assisted planning — CLI binding resolution and saved binding evidence (§9.3.2; ADR-0016)
+> Partially delivered: engine-assisted planning — PostgreSQL planning with the resolver, its sealed evidence and its offline `explain` are built; resolver-backed apply (#616) and SQL Server (#619–#621) are planned (§9.3.2; ADR-0016)
 > Partially delivered: resolver environment discovery — read-only `doctor` discovery, resolver selection, the Docker and server scratch runs and compatibility qualification are built; the remaining stages are planned (§9.3.3; [delivery tracking](RESOLVER-DELIVERY.md))
 
 ---
@@ -1597,7 +1597,12 @@ Three stances govern this preview rehearsal:
   rather than pretending otherwise (see [ADR-0003](ADR-0003-execution-strategy.md)
   on edition-dependent risk).
 
-#### 9.3.2 Engine-assisted planning (accepted, not implemented)
+#### 9.3.2 Engine-assisted planning (PostgreSQL planning delivered)
+
+Delivered for PostgreSQL planning only (#1514–#1517): `plan` publishes the
+resolver's sealed plan, and `explain` shows its evidence offline. Applying
+such a plan is #616: until then `apply` refuses it, and `explain` says so.
+SQL Server resolution is refused by name until #619 and #620.
 
 The new **resolver** answers a different question from preview rehearsal:
 whether desired declarations bind differently from the objects already on the
@@ -1614,9 +1619,10 @@ DEC-1674.1).**
   resolver, and it runs on every platform pbps supports (#1636).
   - pbps does not enforce its scratch's isolation, log handling or channels,
     and observes no process on it. The operator vouches for them. The
-    evidence records the scratch's kind, and `explain` prints it:
-    `resolver: server scratch`, or `resolver: docker scratch from
-    postgres:18 (the image as configured, not verified)`.
+    evidence records the entry that ran, the scratch's kind and its
+    layout, and `explain` prints them from the plan alone (#1517):
+    `resolver: ci (server scratch, supplied)`, or `resolver: local (docker
+    scratch, run-owned); image postgres:18, as configured, not verified`.
   - **A Docker scratch** (DEC-1674.1) is a PostgreSQL server pbps starts from
     the entry's `image` for one run, through whatever `docker` command the
     runner has: Docker, rootless Docker, or Podman's compatible command or
@@ -2095,8 +2101,14 @@ snapshot. PostgreSQL follows DECISIONS 250 and 423 for owned and caller-owned
 reads respectively; non-snapshot inputs must be pinned/validated separately,
 and closing verification must see the apply's own DDL. Necessary target facts
 are rechecked before publishing the artifact and at apply; stale facts require
-replanning and renewed approval. `explain` can show this evidence
-and its limits offline. The first resolver-backed apply path is transactional
+replanning and renewed approval. `explain` shows this evidence offline,
+from the plan file alone, in human and JSON output (#1517): the entry, the
+scratch's kind and layout, the qualification's rule and key identifier, the
+facts it seals by name (never a fingerprint's value), the limitations it
+accepted, each surface's verdict (created, rebuilt, unaffected or removed,
+as its sealed sides say), every order edge with its reason, and the
+prerequisites by identity and fingerprint presence. The JSON lists each
+prerequisite; the human output counts them by catalog class. The first resolver-backed apply path is transactional
 only, with the additional guard in §7.6; staged restrictions remain unchanged.
 
 The evidence manifest pins every required external resolution input, not only
@@ -2610,7 +2622,9 @@ reason in both offline and connected JSON, remaining `unanswerable` with exit `1
 
 For a selected resolver (§9.3.2), a required question it leaves unresolved,
 an observed incompatibility or a known unsupported resolution case
-(`resolver.unresolved`), a missing fingerprint key (`resolver.key`) and a
+(`resolver.unresolved`; each gate names itself: SQL Server resolution,
+`--staged`, and a retained external object the baseline does not stage,
+named with the declaration that could bind it, #1517), a missing fingerprint key (`resolver.key`) and a
 target the publication recheck found changed after the run
 (`resolver.recheck`) are finding refusals (exit `2`).
 Connection, metadata-read, image-acquisition and startup failures, and an

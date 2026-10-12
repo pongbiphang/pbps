@@ -2,7 +2,7 @@
 
 Tracking parent: [#595](https://github.com/pongbiphang/pbps/issues/595).
 The requirements are [ADR-0016](ADR-0016-engine-assisted-planning.md) and
-[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented).
+[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-postgresql-planning-delivered).
 This plan divides their implementation without reducing the acceptance bar.
 The parent stays open until both engine adapters are delivered. Each bounded
 child follows the repository's full local verification, review and CI gates.
@@ -11,16 +11,15 @@ child follows the repository's full local verification, review and CI gates.
 resolver, on a server or Docker scratch the operator vouches for (#1672,
 #1674), with external objects from a reviewed baseline (#1673). The measured
 profiles (#608, #609) were removed by #1636, and the confidential source
-transfer (#617) is closed. #1516 publishes the resolver's plan after the
-fresh pre-publication recheck, from the sealed order (DEC-1516.1). The
-remaining order:
-1. [#1517](https://github.com/pongbiphang/pbps/issues/1517): offline
-   `explain` of resolver evidence and the explicit gates;
-2. [#1778](https://github.com/pongbiphang/pbps/issues/1778): the baseline
+transfer (#617) is closed. #615 is delivered for PostgreSQL planning by
+#1514–#1517: the resolver's plan is published after the fresh
+pre-publication recheck, from the sealed order (DEC-1516.1), and `explain`
+shows its evidence offline (DEC-1517.1). The remaining order:
+1. [#1778](https://github.com/pongbiphang/pbps/issues/1778): the baseline
    draft command, then automatic fill;
-3. [#616](https://github.com/pongbiphang/pbps/issues/616): apply under the
+2. [#616](https://github.com/pongbiphang/pbps/issues/616): apply under the
    deployment lock, with #618's approval-consumer checks;
-4. SQL Server: [#619](https://github.com/pongbiphang/pbps/issues/619),
+3. SQL Server: [#619](https://github.com/pongbiphang/pbps/issues/619),
    then [#620](https://github.com/pongbiphang/pbps/issues/620), then
    [#621](https://github.com/pongbiphang/pbps/issues/621).
 
@@ -161,7 +160,7 @@ delivered, #608's and #609's profiles were removed by #1636, and #617 and
 | 9 | [#614](https://github.com/pongbiphang/pbps/issues/614) | seal versioned evidence and deterministic cross-kind change ordering |
 | 10a | [#1273](https://github.com/pongbiphang/pbps/issues/1273) | share scratch analysis lifecycle across supplied-server and run-owned container controls |
 | 10b | [#1274](https://github.com/pongbiphang/pbps/issues/1274) | construct qualified resolver evidence for the shared analysis run |
-| 10 | [#615](https://github.com/pongbiphang/pbps/issues/615) | integrate lazy target planning and pre-publication verification |
+| 10 | [#615](https://github.com/pongbiphang/pbps/issues/615) | integrate lazy target planning and pre-publication verification: delivered for PostgreSQL by #1514–#1517 |
 | 11 | [#616](https://github.com/pongbiphang/pbps/issues/616) | verify sealed prerequisites and closing bindings during apply |
 | 12 | [#617](https://github.com/pongbiphang/pbps/issues/617) | closed: the baseline replaces a source transfer (#1673) |
 | 13 | [#618](https://github.com/pongbiphang/pbps/issues/618) | closed: its checks go to #616 and #621 |
@@ -244,3 +243,33 @@ Indexes extracted from a newly created empty table use the ordinary creation
 strategy. A table-level online hint cannot turn that extraction into concurrent
 DDL and invalidate the resolver plan's transactional boundary. Index changes
 on existing tables retain their requested strategy.
+
+## PostgreSQL planning integration (#615: #1514–#1517)
+
+#615 shipped in four steps. #1514 read the target natively from `--db`;
+#1515 assessed a plan lazily and opened a resolver only for a question the
+assessment could not answer (DEC-1515.1); #1516 published the resolver's
+plan after the ordinary connected checks and a fresh recheck of the target,
+from the sealed order (DEC-1516.1).
+
+#1517 makes the evidence reviewable from the plan alone (DEC-1517.1).
+`explain`, in human and JSON output and with no project, key or resolver,
+shows:
+- which `pbps.yml` entry ran, its scratch kind and its layout, now sealed in
+  the evidence's runtime (evidence version 4);
+- the qualification's rule and key identifier, and the facts it seals, by
+  name only;
+- the limitations it accepted (#1700's `explain` half);
+- each surface's verdict and every order edge with its reason;
+- the prerequisites by identity and fingerprint presence.
+
+The JSON is the field the human line and the viewer read.
+
+Three gates refuse by name, as `resolver.unresolved`, before deployable
+output exists: SQL Server resolution (#619, #620); `--staged` with a plan that
+needs the resolver; and a retained external object of any candidate class
+that the baseline does not stage, named with the declaration that could bind
+it, whether or not the entry has a baseline.
+
+SPEC §9.3.2 is delivered for PostgreSQL planning only. Applying a resolved
+plan is #616, and this build refuses it before any DDL.

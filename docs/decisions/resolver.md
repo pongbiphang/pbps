@@ -8,7 +8,7 @@ how to add an entry here.
 
 490. **Engine-assisted planning is optional infrastructure, but required
      evidence cannot be waived (accepted design; not implemented).**
-     [SPEC §9.3.2–9.3.3](../SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
+     [SPEC §9.3.2–9.3.3](../SPEC.md#932-engine-assisted-planning-postgresql-planning-delivered)
      and [ADR-0016](../ADR-0016-engine-assisted-planning.md) keep offline previews
      and the existing `--dev` rehearsal distinct from a future target-aware
      `--resolve-with` path. Typed/catalog facts retain a lightweight path;
@@ -2568,3 +2568,58 @@ and `resolver_plans_pass_the_ordinary_connected_checks` (`flow_pg`), the
 `remap_tests` in `resolver::server::producer`, and
 `an_accepted_limitation_is_sealed_and_its_removal_changes_the_checksum`
 (`pbps-model`).
+
+<a id="dec-1517-1"></a>
+
+**DEC-1517.1. A resolved plan explains its evidence from the file alone, and
+the cases the resolver does not answer refuse by name (#1517).** A reviewer
+holding a resolved plan could see only `resolver: server scratch`, in the
+human output only: the JSON, which the viewer reads, said nothing of where
+the evidence came from or what it sealed.
+
+**What was decided.**
+- **The provenance is sealed, not looked up.** The runtime records the
+  `pbps.yml` entry that ran and the layout the run used (`run-owned` or
+  `supplied`) beside the scratch's kind and outside-write choice. The run
+  finds the layout itself, from the account it was given, so the evidence
+  says what happened rather than what was configured. The evidence version
+  moves to 4; no release wrote version 3.
+- **`explain` reads one field.** `Explanation.resolver` holds the entry,
+  kind, layout, the qualification's rule and key identifier, the facts it
+  seals by name, the accepted limitations, each surface's verdict, the
+  order edges with their reasons, and the prerequisites. The human line,
+  `resolver: <entry> (<kind> scratch, <layout>)`, the evidence section and
+  the viewer are all rendered from it. An ordinary plan has no such field.
+- **A verdict is what the sealed sides say.** The evidence keeps each
+  surface's current and desired bindings, not the run's verdict, so
+  `explain` derives it: only desired is created, only current is removed,
+  both with equal bindings is unaffected, both with different bindings is
+  rebuilt. The run could only seal those four; an unresolved surface
+  refuses before sealing.
+- **No fingerprint value is shown.** The qualification's digests are
+  named, not printed; a prerequisite shows its identity and whether it
+  carries a fingerprint. The JSON lists every prerequisite. The human output
+  counts them by catalog class: the capture's scope includes the system
+  catalog, thousands of records a reviewer would scroll past.
+- **The gates are `resolver.unresolved` findings that name themselves**,
+  SPEC §9.8's known unsupported cases, refused before any deployable output:
+  - SQL Server resolution, until #619 and #620; the remedy is to select no
+    resolver, so the existing protection keeps deciding (DEC-1515.1);
+  - `--staged` with a plan that needs the resolver. It was an unanswerable
+    error until now; it is the user's choice to change, so it is a finding,
+    exit 2;
+  - a retained external object the baseline does not stage. Before, only a
+    routine was named, and only when the entry had a baseline. Now an object
+    of any candidate class is named, with or without a baseline, together
+    with the declaration that could bind it and the remedy, add it to the
+    baseline. The resolver transfers no target source, so only the operator
+    can stage it.
+
+**Pinned by** `a_resolved_plan_explains_its_provenance_and_sealed_qualification`
+and the viewer case in `explain_resolver`; `assert_explained`,
+`resolver_publishes_its_rechecked_plan_in_the_exact_order`'s `--staged` case
+(`flow_pg`); `sql_server_resolution_is_refused_by_name` (`resolution`);
+`an_unstaged_external_object_of_any_class_is_refused_by_name` (`pbps-pg`
+binding tests); the layout cases of the run-owned and confined-account
+resolver tests; and
+`a_docker_scratch_is_recorded_by_its_entry_image_and_layout` (`pbps-model`).
