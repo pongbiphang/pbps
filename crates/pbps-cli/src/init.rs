@@ -14,7 +14,7 @@ use clap::Args;
 use pbps_config::{Config, ConfigError, DialectName, Environment, Hooks, Project, Unmanaged};
 use pbps_model::{IdsFile, Schema};
 
-use crate::{context, db};
+use crate::{context, db, paths::absolute};
 
 /// Arguments for `pbps init`.
 #[derive(Debug, Args)]
@@ -314,45 +314,6 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         ),
     }
     Ok(())
-}
-
-/// Resolves `path` to an absolute path with no `..` left in it.
-///
-/// `Project::discover` walks this path's ancestors, and a lexical `..` puts
-/// directories that are not ancestors on that walk: `pbps --project ../sibling
-/// init` run from inside a project would refuse because it "is already inside"
-/// the very project it is escaping. `std::path::absolute` does not help — on
-/// Unix it keeps `..` on purpose, because dropping it lexically names the wrong
-/// directory whenever a component is a symlink. So the deepest existing prefix
-/// is canonicalized, which resolves `..` against the real filesystem, and the
-/// part that does not exist yet is appended to it.
-fn absolute(path: &Path) -> anyhow::Result<PathBuf> {
-    let joined = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        std::env::current_dir()
-            .context("cannot determine the current directory")?
-            .join(path)
-    };
-
-    let mut existing = joined.as_path();
-    let mut missing = Vec::new();
-    loop {
-        if let Ok(resolved) = existing.canonicalize() {
-            return Ok(missing.iter().rev().fold(resolved, |mut out, name| {
-                out.push(name);
-                out
-            }));
-        }
-        // `file_name` is None for a path ending in `..`, which can only happen
-        // when its parent does not exist either. Nothing can be resolved then,
-        // so hand back the joined path rather than invent a normalization.
-        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
-            return Ok(joined);
-        };
-        missing.push(name.to_owned());
-        existing = parent;
-    }
 }
 
 fn refuse_existing(root: &Path) -> anyhow::Result<()> {
