@@ -1498,12 +1498,13 @@ a declared check expression:  CHECK ((label <> 'none'::text))
 a declared index filter:      (label <> 'none'::text)
 ```
 
-and `diff_constraints`'s `by_name!` macro
-(`crates/pbps-diff/src/schema_diff.rs:444`) compares the whole
-`CheckConstraint` / `Index` with `!=` and, on a mismatch, pushes a **drop
-followed by an add**. So the cost here is worse than the default case: an
-unchanged check is dropped and revalidated over the whole table on every
-connected plan, and an unchanged filtered index is dropped and rebuilt.
+and `diff_constraints`'s `by_name` traversal
+(`crates/pbps-diff/src/schema_diff.rs`) uses each part's definition comparison
+to keep it or push a **drop followed by an add**. Check expressions and index
+filters participate in that comparison. So the cost here is worse than the
+default case: an unchanged check is dropped and revalidated over the whole
+table on every connected plan, and an unchanged filtered index is dropped
+and rebuilt.
 
 So the same fix carries, and carries to all three: **the state records the
 declared expression beside the one read back** — for `Column::default`,
