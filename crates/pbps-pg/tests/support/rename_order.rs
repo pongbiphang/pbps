@@ -207,7 +207,7 @@ async fn rename_dependencies_execute_with_their_statement_time_names() {
         let mut sql = Vec::new();
         let mut failure = None;
         db.conn.execute("BEGIN").await.unwrap();
-        let blockers = pbps_pg::impact::drop_blockers(&mut db.conn, &replay).await;
+        let blockers = physical_sources::reports(&mut db.conn, &replay).await;
         for p in &replay.changes {
             for stmt in pg.emit(&p.change, p.strategy).unwrap() {
                 sql.push(stmt.sql.clone());

@@ -1330,6 +1330,8 @@ pub async fn check_drop_blockers(
     conn: &mut Conn,
     changes: &ChangeSet,
     ids: &pbps_model::IdsFile,
+    stored: &pbps_model::Schema,
+    stored_ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<ConnectedCheck> {
     match conn.driver() {
         Driver::Mssql => {
@@ -1361,7 +1363,10 @@ pub async fn check_drop_blockers(
             })
         }
         Driver::Postgres => {
-            let reports = pbps_pg::impact::drop_blockers(conn, changes).await?;
+            let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+            let sources =
+                pbps_model::physical_sources::PhysicalSources::of(names, stored, stored_ids)?;
+            let reports = pbps_pg::impact::drop_blockers(conn, &sources).await?;
             refuse_drop_reports("PostgreSQL", &reports)?;
             Ok(ConnectedCheck {
                 name: "drop_blockers",
@@ -2991,7 +2996,7 @@ pub async fn account_for_module_dependents(
     conn: &mut Conn,
     changes: &mut ChangeSet,
     declared: &pbps_model::Schema,
-    ids: &[&pbps_model::IdsFile],
+    sources: crate::dependents::Sources<'_>,
     deps: &pbps_model::ModuleDeps,
     dialect: &dyn pbps_dialect::Dialect,
     rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<ChangeSet>,
@@ -3004,6 +3009,7 @@ pub async fn account_for_module_dependents(
             message: "SQL Server uses CREATE OR ALTER, so a module change drops nothing that depends on it".into(),
         });
     }
+    let ids = &[sources.after, sources.before.ids][..];
     let mut found = module_dependents(conn, changes).await?;
     let untouched = crate::dependents::untouched_module_dependents(changes, &found, declared);
     if !untouched.is_empty() {
@@ -3013,12 +3019,19 @@ pub async fn account_for_module_dependents(
     // Out of the way of the reordering passes, and back beside each routine's
     // final `CREATE` once they are done (#687).
     let decisions = crate::dependents::take_public_execution(changes);
-    let added = crate::dependents::weave(changes, &found, declared, ids, dialect)
+    let added = crate::dependents::weave(changes, &found, declared, sources, dialect)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     let split = crate::dependents::split_new_tables(changes, ids, dialect)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     let partitions = crate::dependents::standing_partitions(declared, changes);
-    let released = crate::dependents::released(changes, &found, &partitions);
+    let released = crate::dependents::released(
+        changes,
+        &found,
+        &partitions,
+        &sources
+            .project(&changes.changes)
+            .map_err(anyhow::Error::msg)?,
+    );
     // A create that moves rows out of a DEFAULT is not held with the rest
     // (#1763 review).
     crate::dependents::split_moving_defaults(changes, declared, dialect);
@@ -3052,7 +3065,14 @@ pub async fn account_for_module_dependents(
     crate::dependents::later_relation_refusal(&later)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     crate::dependents::settle_public_execution(changes, decisions);
-    let left = crate::dependents::unaccounted(changes, &found, &partitions);
+    let left = crate::dependents::unaccounted(
+        changes,
+        &found,
+        &partitions,
+        &sources
+            .project(&changes.changes)
+            .map_err(anyhow::Error::msg)?,
+    );
     if !left.is_empty() {
         anyhow::bail!(
             "module_dependents (PostgreSQL): the plan still drops a module before what depends \
@@ -3102,6 +3122,7 @@ pub async fn check_module_dependents(
     changes: &ChangeSet,
     stored: &pbps_model::Schema,
     ids: &pbps_model::IdsFile,
+    stored_ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<()> {
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
     let found = module_dependents(conn, changes).await?;
@@ -3109,7 +3130,8 @@ pub async fn check_module_dependents(
     // a parent's column change names it as declared, and the baseline holds
     // its partitions under its name before a rename (#1751 review).
     let partitions = crate::dependents::standing_partitions(stored, changes).renamed(&names);
-    let left = crate::dependents::unaccounted(changes, &found, &partitions);
+    let sources = pbps_model::physical_sources::PhysicalSources::of(names, stored, stored_ids)?;
+    let left = crate::dependents::unaccounted(changes, &found, &partitions, &sources);
     if !left.is_empty() {
         anyhow::bail!(
             "module_dependents (PostgreSQL): the database now holds dependents this plan does not \

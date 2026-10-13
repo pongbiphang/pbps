@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::impact::{DropReport, ImpactError};
 use pbps_db::{Conn, DbError, Param, Row};
-use pbps_model::{Change, ChangeSet, ModuleId, ModuleKind, TableName};
+use pbps_model::physical_sources::{PhysicalSources, Source};
+use pbps_model::plan_names::At;
+use pbps_model::{Change, ModuleId, ModuleKind, TableName};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Address {
@@ -179,10 +181,10 @@ impl Classes {
 /// the caller's transaction; no DDL or catalog mutation is used to test a drop.
 pub async fn drop_blockers(
     conn: &mut Conn,
-    cs: &ChangeSet,
+    sources: &PhysicalSources<'_>,
 ) -> Result<Vec<DropReport>, ImpactError> {
+    let cs = sources.names().changes();
     let targets: Vec<_> = cs
-        .changes
         .iter()
         .enumerate()
         .filter_map(|(index, p)| match &p.change {
@@ -261,8 +263,8 @@ pub async fn drop_blockers(
     let classes = Classes::read(conn).await?;
     let mut removals = Vec::new();
     let mut detached = BTreeSet::new();
-    for index in 0..=last {
-        if let Some(address) = removal(conn, &classes, cs, index).await? {
+    for (index, step) in cs.iter().enumerate().take(last + 1) {
+        if let Some(address) = removal(conn, &classes, sources, index).await? {
             removals.push((index, address));
             // A partition's drop detaches it first, and the detach removes
             // the clones a foreign key to its parent keeps on each
@@ -272,7 +274,7 @@ pub async fn drop_blockers(
             if let Change::DropTable {
                 detach_from: Some(_),
                 ..
-            } = &cs.changes[index].change
+            } = &step.change
             {
                 for clone in detached_clones(conn, &classes, address).await? {
                     removals.push((index, clone));
@@ -285,8 +287,8 @@ pub async fn drop_blockers(
             ..
         }
         | Change::DropUnique { table, .. }
-        | Change::DropIndex { table, .. } = &cs.changes[index].change
-            && stored(cs, index, table, None).is_some()
+        | Change::DropIndex { table, .. } = &step.change
+            && stored(sources, index, table, None)?.is_some()
         {
             return Err(error(format!(
                 "drop_blockers: key on {table} is absent from the catalog"
@@ -299,7 +301,7 @@ pub async fn drop_blockers(
     // is the foreign key on its own table, which stays (#1171).
     let replaced: BTreeSet<Address> = removals
         .iter()
-        .filter(|(i, _)| matches!(cs.changes[*i].change, Change::AlterColumnExpression { .. }))
+        .filter(|(i, _)| matches!(cs[*i].change, Change::AlterColumnExpression { .. }))
         .map(|(_, a)| *a)
         .chain(detached)
         .collect();
@@ -328,77 +330,38 @@ pub async fn drop_blockers(
     Ok(reports)
 }
 
-/// Reverse only earlier renames: these names describe statement-time objects,
-/// while the read still sees the original catalog. Return None for a table
-/// created earlier by this plan instead of querying an unrelated old occupant.
+/// Ask for the physical source at this removal's execution boundary. A
+/// managed-scope change is not a creation, and unavailable proof is not absence.
 fn stored(
-    cs: &ChangeSet,
+    sources: &PhysicalSources<'_>,
     index: usize,
     table: &TableName,
     column: Option<&str>,
-) -> Option<(TableName, Option<String>)> {
-    let mut table = table.clone();
-    let mut column = column.map(str::to_owned);
-    for p in cs.changes[..index].iter().rev() {
-        match &p.change {
-            Change::RenameColumn {
-                table: on,
-                from,
-                to,
-                ..
-            } if on == &table && column.as_ref() == Some(to) => column = Some(from.clone()),
-            Change::RenameTable { from, to, .. } if to == &table => table = from.clone(),
-            Change::CreateTable { name, .. } if name == &table => return None,
-            Change::AddColumn {
-                table: on, name, ..
-            } if on == &table && column.as_ref() == Some(name) => return None,
-            Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => {}
+) -> Result<Option<(TableName, Option<String>)>, ImpactError> {
+    fn existing<A>(source: Source<A>, about: &str) -> Result<Option<A>, ImpactError> {
+        match source {
+            Source::Stored(address) => Ok(Some(address)),
+            Source::Created { .. } => Ok(None),
+            Source::Retired | Source::Unavailable => Err(error(format!(
+                "drop_blockers: physical source for {about} is unavailable"
+            ))
+            .into()),
         }
     }
-    Some((table, column))
+    let at = At::Before(index);
+    match column {
+        Some(column) => {
+            let address = table.column(column);
+            Ok(
+                existing(sources.source(&address, at), &address.to_string())?
+                    .map(|stored| (stored.table, Some(stored.name))),
+            )
+        }
+        None => Ok(
+            existing(sources.table_source(table, at), &table.to_string())?
+                .map(|stored| (stored, None)),
+        ),
+    }
 }
 
 async fn relation(
@@ -459,13 +422,13 @@ async fn detached_clones(
 async fn removal(
     conn: &mut Conn,
     classes: &Classes,
-    cs: &ChangeSet,
+    sources: &PhysicalSources<'_>,
     index: usize,
 ) -> Result<Option<Address>, ImpactError> {
-    let p = &cs.changes[index];
+    let p = &sources.names().changes()[index];
     match &p.change {
         Change::DropTable { name, .. } => {
-            let Some((table, _)) = stored(cs, index, name, None) else {
+            let Some((table, _)) = stored(sources, index, name, None)? else {
                 return Ok(None);
             };
             relation(conn, classes, &table, None)
@@ -479,7 +442,8 @@ async fn removal(
                 })
         }
         Change::DropColumn { column, .. } => {
-            let Some((table, name)) = stored(cs, index, &column.table, Some(&column.name)) else {
+            let Some((table, name)) = stored(sources, index, &column.table, Some(&column.name))?
+            else {
                 return Ok(None);
             };
             relation(conn, classes, &table, name.as_deref())
@@ -497,16 +461,16 @@ async fn removal(
         Change::DropCheck { table, name }
         | Change::DropUnique { table, name }
         | Change::DropForeignKey { table, name } => {
-            table_part(conn, classes, cs, index, table, Part::Constraint(name)).await
+            table_part(conn, classes, sources, index, table, Part::Constraint(name)).await
         }
         Change::DropIndex { table, name } => {
-            table_part(conn, classes, cs, index, table, Part::Index(name)).await
+            table_part(conn, classes, sources, index, table, Part::Index(name)).await
         }
         Change::SetPrimaryKey {
             table,
             from: Some(_),
             ..
-        } => table_part(conn, classes, cs, index, table, Part::PrimaryKey).await,
+        } => table_part(conn, classes, sources, index, table, Part::PrimaryKey).await,
         // `SET EXPRESSION` replaces the column's `pg_attrdef` row as a default
         // change does, and its old edges go with the old row: an input the
         // old expression read is no longer blocked by it (DEC-1316.1).
@@ -516,12 +480,12 @@ async fn removal(
             ..
         }
         | Change::AlterColumnExpression { column, .. } => {
-            default_row(conn, classes, cs, index, &column.table, &column.name).await
+            default_row(conn, classes, sources, index, &column.table, &column.name).await
         }
         // A partition's row, its own default or its copy of its parent's,
         // goes as a column's does (#1581).
         Change::SetPartitionDefault { table, column, .. } => {
-            default_row(conn, classes, cs, index, table, column).await
+            default_row(conn, classes, sources, index, table, column).await
         }
         Change::CreateTable { .. }
         | Change::DetachPartition { .. }
@@ -565,12 +529,12 @@ async fn removal(
 async fn default_row(
     conn: &mut Conn,
     classes: &Classes,
-    cs: &ChangeSet,
+    sources: &PhysicalSources<'_>,
     index: usize,
     table: &TableName,
     column: &str,
 ) -> Result<Option<Address>, ImpactError> {
-    let Some((table, name)) = stored(cs, index, table, Some(column)) else {
+    let Some((table, name)) = stored(sources, index, table, Some(column))? else {
         return Ok(None);
     };
     let Some(on) = relation(conn, classes, &table, name.as_deref()).await? else {
@@ -623,12 +587,12 @@ enum Part<'a> {
 async fn table_part(
     conn: &mut Conn,
     classes: &Classes,
-    cs: &ChangeSet,
+    sources: &PhysicalSources<'_>,
     index: usize,
     table: &TableName,
     part: Part<'_>,
 ) -> Result<Option<Address>, ImpactError> {
-    let Some((table, _)) = stored(cs, index, table, None) else {
+    let Some((table, _)) = stored(sources, index, table, None)? else {
         return Ok(None);
     };
     let Some(on) = relation(conn, classes, &table, None).await? else {
@@ -735,7 +699,7 @@ async fn read_graph(conn: &mut Conn, roots: &BTreeSet<Address>) -> Result<Graph,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pbps_model::PlannedChange;
+    use pbps_model::{ChangeSet, IdsFile, PlannedChange, Schema};
 
     fn address(object: i64) -> Address {
         Address {
@@ -880,18 +844,39 @@ mod tests {
                 }),
             ],
         };
+        let ids = IdsFile {
+            tables: [
+                ("t_aaaaaa".parse().unwrap(), u.clone()),
+                ("t_bbbbbb".parse().unwrap(), t.clone()),
+            ]
+            .into(),
+            columns: [
+                ("c_aaaaaa".parse().unwrap(), u.column("new")),
+                ("c_bbbbbb".parse().unwrap(), u.column("other")),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();
+        let sources = PhysicalSources::of(names, &Schema::default(), &IdsFile::default()).unwrap();
         assert_eq!(
-            stored(&cs, 2, &u, Some("new")),
+            stored(&sources, 2, &u, Some("new")).unwrap(),
             Some((t.clone(), Some("old".into())))
         );
         assert_eq!(
-            stored(&cs, 1, &u, Some("new")),
-            Some((t.clone(), Some("new".into())))
+            stored(&sources, 1, &u, Some("old")).unwrap(),
+            Some((t.clone(), Some("old".into())))
         );
-        assert_eq!(stored(&cs, 3, &t, None), None);
+        // There is no catalog source for this future spelling. The reader
+        // must not invent one from the name of an unrelated occupant.
+        assert!(stored(&sources, 1, &u, Some("new")).is_err());
         assert_eq!(
-            stored(&cs, 3, &u, Some("other")),
-            Some((t, Some("other".into())))
+            sources.table_source(&t, At::End),
+            Source::Created { step: 2 }
+        );
+        assert_eq!(
+            sources.source(&u.column("other"), At::End),
+            Source::Stored(t.column("other"))
         );
     }
 }

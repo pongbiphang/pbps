@@ -48,7 +48,7 @@ async fn estimates_measure_each_occupant_before_and_after_name_reuse() {
         .begin(&pg.transaction_framing(&pbps_model::SessionZone::utc()))
         .await
         .unwrap();
-    let reports = pbps_pg::impact::drop_blockers(
+    let reports = physical_sources::reports(
         &mut db.conn,
         &pbps_model::ChangeSet {
             changes: changes.to_vec(),

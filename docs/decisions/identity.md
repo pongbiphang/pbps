@@ -964,3 +964,32 @@ and the detach/rename CHECK-cost case. Restoring each removed replay body
 while retaining its new API wiring makes its boundary regression fail at
 runtime. First-spelling tests also pin absent and unknown UID controls without
 extending the managed lifetime.
+
+<a id="dec-1875-1"></a>
+
+**DEC-1875.1. Track physical sources separately from managed identity, and
+select a dependent's owner at its insertion boundary.** Attach and detach
+change the managed UID scope without creating or dropping a catalog column.
+`PhysicalSources` owns the borrowed `PlanNames` view and adds sparse physical
+histories over the same immutable order. Recorded schema and ids supply
+inherited columns and ordinary identities retired by attach. Creation and
+actual removal end continuity; a rename or ownership transition does not.
+Stored, created, retired and unavailable are distinct results. There is no
+fallback that binds an old dependent to the next holder of its name.
+
+The PostgreSQL drop reader asks for the stored source before each removal;
+the module-dependent planner and apply check follow that same source forward.
+A synthesized or moved default uses its boundary's column UID or partition
+UID and typed change, even when the declarations describe the other scope.
+Standing-partition recursion and the existing two-plan refusals remain their
+own policy. A splice discards its borrowed view; subsequent lookups rebuild
+from the resulting order. SQL emission, catalog dependency enumeration and
+namespace allocation remain outside this pure projection.
+
+Measured on PostgreSQL 16 and 18: a detached column's drop releases its existing
+FK; own defaults can be removed and restored around a function replacement on
+either side of attach and detach. The connected planning and apply checks then
+execute the exact emitted SQL. A partition default restored before its parent's
+column rename must use the old spelling at that boundary; the later rename
+carries it. Restoring the final spelling there fails execution. Managed UID
+lifetimes remain unchanged, and inherited columns receive no invented UIDs.

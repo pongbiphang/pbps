@@ -104,6 +104,6 @@ pub(super) struct Plan<'a> {
 }
 
 #[cfg(test)]
-mod fixture;
+use crate::test_plan_ids as fixture;
 #[cfg(test)]
 pub(super) use fixture::ids as fixture_ids;

@@ -1,4 +1,4 @@
-//! Saved-plan identity fixtures for the older schema-only guard tests.
+//! Saved-plan identities for schema-only guard and dependency fixtures.
 //! Explicit UIDs remain authoritative: invalid reuse is a fixture error, never
 //! a reason for production to fall back to an observed same-named object.
 
