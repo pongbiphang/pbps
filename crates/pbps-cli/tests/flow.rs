@@ -11869,6 +11869,126 @@ esac
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_dead_dev_engine_reports_its_cause_without_secrets_and_removes_only_its_container() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = Demo::new("deaddev");
+    d.table(ONE_COLUMN);
+    let bin = d.dir.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let docker = bin.join("docker");
+    std::fs::write(&docker, r#"#!/bin/sh
+case "$1" in
+  run)
+    for arg in "$@"; do
+      case "$arg" in MSSQL_SA_PASSWORD=*) printf '%s' "${arg#MSSQL_SA_PASSWORD=}" > "$PBPS_DEV_SECRET";; esac
+    done
+    printf 'run\n' >> "$PBPS_DEV_LOG"
+    printf 'owned-dev-container\n';;
+  port)
+    printf '%s\n' "$*" >> "$PBPS_DEV_LOG"
+    printf '127.0.0.1:%s\n' "$PBPS_DEV_PORT";;
+  inspect)
+    printf '%s\n' "$*" >> "$PBPS_DEV_LOG"
+    if [ ! -e "$PBPS_DEV_ONCE" ]; then
+      : > "$PBPS_DEV_ONCE"
+      case "$PBPS_DEV_FIRST" in
+        malformed) printf '{}\n'; exit 0;;
+        denied) printf '{"Running":false,"ExitCode":137,"OOMKilled":false,"Error":""}\n'; printf 'permission denied\n' >&2; exit 1;;
+        hung) exec sleep 30;;
+      esac
+    fi
+    if [ "$PBPS_DEV_FIRST" = missing ]; then
+      printf 'Error: no such object: "owned-dev-container"\n' >&2; exit 125
+    fi
+    printf '{"Running":false,"ExitCode":137,"OOMKilled":false,"Error":""}\n';;
+  logs)
+    printf '%s\n' "$*" >> "$PBPS_DEV_LOG"
+    printf 'startup failure; password='; cat "$PBPS_DEV_SECRET"; printf '\n';;
+  rm) printf '%s\n' "$*" >> "$PBPS_DEV_LOG";;
+  *) exit 99;;
+esac
+"#).unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let path = std::env::join_paths(paths).unwrap();
+    let log = d.dir.join("docker.log");
+    let secret = d.dir.join("secret");
+    let once = d.dir.join("once");
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+    for first in ["stopped", "malformed", "denied", "hung", "missing"] {
+        std::fs::write(&log, "").unwrap();
+        if once.exists() {
+            std::fs::remove_file(&once).unwrap();
+        }
+        let mut command = Command::new(BIN);
+        command
+            .arg("--project")
+            .arg(&d.dir)
+            .args(["plan", "--dev", "docker://stand-in", "--format", "json"])
+            .env("PATH", &path)
+            .env("PBPS_DEV_LOG", &log)
+            .env("PBPS_DEV_SECRET", &secret)
+            .env("PBPS_DEV_ONCE", &once)
+            .env("PBPS_DEV_FIRST", first)
+            .env("PBPS_DEV_PORT", &port);
+        let start = std::time::Instant::now();
+        let mut o = command.output().unwrap();
+        for _ in 0..200 {
+            if !stdout(&o).contains("Text file busy")
+                || !std::fs::read_to_string(&log).unwrap().is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            o = command.output().unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        let cause = if first == "missing" {
+            "no longer exists"
+        } else {
+            "exit status 137, OOM killed: false"
+        };
+        assert!(
+            v["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["id"] == "rehearsal.unavailable"
+                    && f.to_string().contains(cause)
+                    && f.to_string()
+                        .contains("startup failure; password=[redacted]")),
+            "{v}"
+        );
+        let password = std::fs::read_to_string(&secret).unwrap();
+        assert!(!password.is_empty());
+        assert!(!stdout(&o).contains(&password) && !stderr(&o).contains(&password));
+        let inspections = if matches!(first, "malformed" | "denied" | "hung") {
+            2
+        } else {
+            1
+        };
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!(
+                "run\nport owned-dev-container 1433/tcp\n{}logs --tail 20 owned-dev-container\nrm -f owned-dev-container\n",
+                "inspect --format {{json .State}} owned-dev-container\n".repeat(inspections)
+            )
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(45),
+            "{first}: {elapsed:?}"
+        );
+    }
+}
+
 /// `plan --dev docker://<image>` end to end, which is the one path through
 /// `dev.rs` that had **no automated coverage at all** — every other `--dev`
 /// test passes a connection string, so `Container::start` was never run.
