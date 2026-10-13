@@ -1472,3 +1472,44 @@ tests do not pass merely because an invalid fixture was rejected at the new
 boundary. Reverting the admission and read-mode predicates must fail the
 corresponding behavioral regressions. This completes #1774's staged-admission
 requirement without enabling the future multi-change work in #624 or #443.
+
+<a id="dec-1774-1"></a>
+
+**DEC-1774.1. Table observation policy is derived before field comparison.**
+The final apply-guard slice moves table presence and observation alignment into
+`guard::Tables`. The exhaustive `Change::tables_after` accessor folds the final
+presence promise in plan order; a table named by an ordinary alteration stays
+present at every read unless an explicit presence effect owns that decision
+(DEC-1687.2). Their diagnostics remain at the original positions around row,
+column, part and role checks. The surviving table spelling comes from the
+pinned `PlanNames` UID history, not a second forward rename map.
+
+The rename graph here answers a different question: what a read proves has
+already executed. Its bounded `has_run` walk follows observed source presence
+and refills. Each read is rewound independently, and the ambiguous-source
+impostor rule remains in force (DEC-536.1). Planned identity cannot establish
+observed execution. Column handoff alignment reuses the existing ColumnChanges
+requirements rather than collecting another name history. The checked read
+contract from DEC-1950.1 still admits only one staged logical change and retains
+statement-local schema-transfer endpoints; this slice enables no multi-change
+staging.
+
+`check::Fields` exhaustively destructures Table and passes borrowed fields to
+the actual column, part, scalar, partition-own and created-table comparators.
+There is no fallback to the whole Table in those comparisons. Table description
+is explicitly catalog-unobserved metadata under SPEC 7.6; data is routed to the
+existing scope-aware row comparison. Kept expression text and planned expression
+presence retain their separate policies. The untouched-table comparison remains
+whole-object equality, as before. Both the Table and Column comparison patterns
+refuse a newly added model field until its policy is explicit. Compiler probes
+complete temporary upstream constructors only to reach these actual guard
+patterns; an unrelated missing initializer is not qualification.
+
+The CLI names the workspace's existing indexmap dependency solely to borrow the
+model's ordered column map, avoiding copies or a type-erased wrapper. No package
+version, model representation, saved-plan encoding or emitted SQL changes.
+The temporary old/new guard harness compares complete accepted and refused
+results, including diagnostic ordering, and is removed after qualification.
+Runtime predicate reversions establish the retained negative coverage. Table
+presence/renames and exhaustive field/read-mode integration now complete #1774's
+five slices; module, grant and row policy stays with its existing owner.

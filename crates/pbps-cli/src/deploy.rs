@@ -3639,51 +3639,6 @@ fn primary_key_as_declared(
         && declared.storage_parameters == now.storage_parameters
 }
 
-/// Whether a part read back is the one the plan adds it as, or `None` where
-/// the definition has nothing a read-back can be held to: a check is nothing
-/// but an expression and SQL Server rewrites it (167), so its name is all
-/// that is comparable (DECISIONS 183).
-///
-/// `None` as well where the part is not there at all: absent and wrong are
-/// two different findings, and the presence check answers for the first.
-fn part_as_planned(
-    planned: pbps_model::PartDefinition<'_>,
-    table: &pbps_model::Table,
-    name: &str,
-) -> Option<bool> {
-    use pbps_model::PartDefinition;
-    // The layout is held with the rest: which index is clustered is read
-    // back as the table's selector, so a key the engine built nonclustered
-    // where the plan built it clustered is movement, not the plan's result
-    // (#1178).
-    Some(match planned {
-        PartDefinition::PrimaryKey(was, clustered) => {
-            primary_key_as_declared(was, table.primary_key.as_ref()?)
-                && table.primary_key_is_clustered() == clustered
-        }
-        // A unique constraint is nothing but its columns, its index's
-        // storage parameters (#1442) and its layout.
-        PartDefinition::Unique(was, clustered) => {
-            table.unique.get(name)? == was && table.unique_is_clustered(name) == clustered
-        }
-        // And a foreign key nothing but structure — the columns, the parent
-        // and the two referential actions — so all of it is comparable (182).
-        PartDefinition::ForeignKey(was) => table.foreign_keys.get(name)? == was,
-        PartDefinition::Check(_) => return None,
-        PartDefinition::Index(was, clustered) => {
-            index_as_declared(was, table.indexes.get(name)?)
-                && table.index_is_clustered(name) == clustered
-        }
-        // Held to its persistence, which the catalog reads back as given.
-        // The expression is respelled (`([a]*(2))`), as a check's is, so it
-        // is not compared here (#1174).
-        PartDefinition::Computed(was) => {
-            let now = table.computed.get(name)?;
-            now.persisted == was.persisted && (!was.not_null || now.not_null)
-        }
-    })
-}
-
 /// `schema` with each owned sequence's name set to the one it has
 /// ([`pbps_dialect::Dialect::owned_sequence_name`]), so that two reads compare
 /// the sequence and not the name its column's or table's name would generate.
@@ -3815,14 +3770,9 @@ fn refuse_pinned_movement(
     let implied = table_changes.implied(before, after, &objects);
     objects.extend(implied.names());
 
-    // The rows this plan writes, under the name it gives their table, and the
-    // old name too where it renames one — the two states are keyed by
-    // different names across a rename.
-    let mut renamed: BTreeMap<&TableName, &TableName> = BTreeMap::new();
     let mut renamed_roles: BTreeMap<&str, &str> = BTreeMap::new();
-    // And the tables it drops, for the same reason one level up: a later
-    // revision can rename another table into the name one leaves (DEC-536.1).
-    let mut dropped_tables: BTreeSet<&TableName> = BTreeSet::new();
+    // Row scope remains keyed by each statement's table spelling. The table
+    // expectations below carry that scope to the surviving identity.
     let mut written: BTreeMap<&TableName, BTreeSet<&pbps_model::RowKey>> = BTreeMap::new();
     // The permissions this plan moves, keyed by the role it moves them on and
     // the target they sit on. A role can be both granted and revoked on one
@@ -3841,14 +3791,8 @@ fn refuse_pinned_movement(
     let mut columns: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
     let mut gone: BTreeSet<pbps_model::Dropped> = BTreeSet::new();
     for p in &changes.changes {
-        if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
-            renamed.insert(from, to);
-        }
         if let pbps_model::Change::RenameRole { from, to, .. } = &p.change {
             renamed_roles.insert(from, to);
-        }
-        if let pbps_model::Change::DropTable { name, .. } = &p.change {
-            dropped_tables.insert(name);
         }
         if let Some((table, key, _)) = p.change.row() {
             written.entry(table).or_default().insert(key);
@@ -3868,114 +3812,10 @@ fn refuse_pinned_movement(
         }
     }
 
-    // This plan's renames, backwards: the name each renamed thing had, keyed
-    // by the name it ends with. The later of the two reads is brought back to
-    // the earlier spelling with it, and then compared as it always was.
-    //
-    // Backwards rather than forwards, and part by part rather than whole,
-    // because a staged run is checked after every statement: at a checkpoint
-    // some of the renames have happened and some have not, so neither read is
-    // in one spelling. A child with two foreign keys to two separately renamed
-    // parents is carried for one and not the other. Undoing what *has*
-    // happened needs no knowledge of what has not (the same reason `settled`
-    // exists, DECISIONS 161).
-    //
-    // A rename is undone only where the two names cannot be confused. If a
-    // read holds *both* spellings, the vacated name has been taken by
-    // something else — another session creating a table under it, or adding a
-    // column back — and rewinding would collapse two identities into one:
-    // a foreign key repointed at the impostor would compare equal to one
-    // still on the original, and SPEC 7.6's promise that an untouched object's
-    // change is caught at the first checkpoint after it lands would be broken.
-    // Left un-rewound, the two spellings simply differ and the read is
-    // refused, which is the safe direction for an ambiguity that a
-    // name-keyed read cannot resolve. The cost is a plan that renames a table
-    // and creates another under the vacated name in one revision: its
-    // untouched children report as moved. Splitting that revision is the
-    // answer, and refusing beats recording another session's write as this
-    // plan's own.
-    let holds = |s: &Schema, a: &TableName, b: &TableName| {
-        s.tables.contains_key(a) && s.tables.contains_key(b)
-    };
-    // Except where this plan explains the second spelling (DEC-536.1): on the
-    // earlier read, an occupant it drops or renames away, whose statement has
-    // not run yet; on the later read, a table it renames into the source
-    // name, the next link of a chain.
-    //
-    // Each read undoes only the renames that had run when it was taken: in a
-    // chain, `z` on the earlier read is still `z`, and on the later one it is
-    // the renamed `y`, so one map for both sides rewrote a reference that had
-    // not moved. A rename has run when its source name is gone, or when the
-    // table there is the next link's, and that link's rename has run.
-    let refills: BTreeMap<&TableName, &TableName> =
-        renamed.iter().map(|(from, to)| (*to, *from)).collect();
-    let has_run = |s: &Schema, from: &TableName| {
-        let mut name = from;
-        for _ in 0..=renamed.len() {
-            if !s.tables.contains_key(name) {
-                return true;
-            }
-            match refills.get(name) {
-                Some(next) => name = next,
-                None => return false,
-            }
-        }
-        false
-    };
-    let mut undo_before = pbps_model::Renames::default();
-    let mut undo_after = pbps_model::Renames::default();
-    for (from, to) in &renamed {
-        let vacated = dropped_tables.contains(to) || renamed.contains_key(to);
-        let refilled = refills.contains_key(from);
-        if (holds(before, from, to) && !vacated) || (holds(after, from, to) && !refilled) {
-            continue;
-        }
-        if has_run(before, from) {
-            undo_before.rename_table((*to).clone(), (*from).clone());
-        }
-        if has_run(after, from) {
-            undo_after.rename_table((*to).clone(), (*from).clone());
-        }
-    }
-    // The identity index supplies final table spellings. A staged table
-    // rename is one logical change and carries no separate column rename;
-    // ordinary column renames are still undone only on unambiguous reads.
-    let holds_column = |s: &Schema, table: &TableName, a: &str, b: &str| {
-        s.tables
-            .get(table)
-            .is_some_and(|t| t.columns.contains_key(a) && t.columns.contains_key(b))
-    };
-    let changing_hands = &column_changes.handoffs;
+    let tables = guard::Tables::of(&names, before, after, &column_changes);
+    let undo_before = &tables.undo_before;
+    let undo_after = &tables.undo_after;
     let partition_hands = &column_changes.partition_handoffs;
-    for (table, renames) in &column_changes.renamed {
-        for (to, from) in renames {
-            if changing_hands.contains_key(table) {
-                continue;
-            }
-            // Each read is undone only where it holds the rename's result alone.
-            // One that holds both names has not run the rename — or holds a
-            // dropped column under the name the rename takes — and undoing it
-            // would move that column's constraints onto the renamed one. Both
-            // reads were left alone when either held both, so a column renamed
-            // into a dropped column's name kept its index under two spellings,
-            // and a valid plan was refused at apply (#1699).
-            let column = pbps_model::ColumnRef::new(table.clone(), to.clone());
-            if !holds_column(before, table, from, to) {
-                undo_before.rename_column(column.clone(), from.clone());
-            }
-            if !holds_column(after, table, from, to) {
-                undo_after.rename_column(column, from.clone());
-            }
-        }
-    }
-    // The earlier read has run nothing, so only the later one is undone.
-    for (table, net) in changing_hands {
-        for (now, was) in net {
-            if let Some(was) = was.as_deref().filter(|was| *was != now) {
-                undo_after.rename_column(pbps_model::ColumnRef::new((*table).clone(), now), was);
-            }
-        }
-    }
 
     let mut moved = Vec::new();
     let named = |n: &TableName| objects.contains(n);
@@ -4004,7 +3844,7 @@ fn refuse_pinned_movement(
     let carried: BTreeSet<&TableName> = before
         .tables
         .keys()
-        .map(|name| renamed.get(name).copied().unwrap_or(name))
+        .map(|name| tables.final_name(name))
         .collect();
     let no_rows = pbps_model::TableData {
         mode: pbps_model::DataMode::Exact,
@@ -4013,7 +3853,7 @@ fn refuse_pinned_movement(
     let touched_tables = before
         .tables
         .iter()
-        .map(|(name, was)| (name, was.data.as_ref()))
+        .map(|(name, was)| (name, guard::Fields::of(was).data))
         .chain(
             after
                 .tables
@@ -4029,14 +3869,10 @@ fn refuse_pinned_movement(
         // A table this plan drops, read while a table it renames into that
         // name was still under its own: the later read's occupant is the
         // renamed one, which its own entry compares (DEC-536.1).
-        if dropped_tables.contains(name)
-            && renamed
-                .iter()
-                .any(|(from, to)| *to == name && before.tables.contains_key(*from))
-        {
+        if tables.retired(name) {
             continue;
         }
-        let now_name = renamed.get(name).copied().unwrap_or(name);
+        let now_name = tables.final_name(name);
         // The table's *shape*, entry by entry, over everything this plan does
         // not move. Its own columns and constraints are compared between two
         // read-backs — never against the declaration — so nothing here depends
@@ -4077,7 +3913,13 @@ fn refuse_pinned_movement(
         if let (Some(declared), Some(now)) = (created.get(now_name), after.tables.get(now_name))
             && !not_yet_attached
         {
-            declared.check(dialect, now_name, now, settled, &mut moved);
+            declared.check(
+                dialect,
+                now_name,
+                &guard::Fields::of(now),
+                settled,
+                &mut moved,
+            );
         }
         // Held to its declared shape above: a detached table's partition held
         // nothing to compare it with, and an attached table's columns are its
@@ -4108,11 +3950,13 @@ fn refuse_pinned_movement(
             let was = &undo_before.apply(was, name);
             let now = &undo_after.apply(now, now_name);
             let expected_columns = column_changes.expect(now_name, was, now);
-            guard::columns(&expected_columns, now, now_name, &mut moved);
+            let was_fields = guard::Fields::of(was);
+            let now_fields = guard::Fields::of(now);
+            guard::columns(&expected_columns, &now_fields, now_name, &mut moved);
             let pending = (settled != Settled::Closing)
                 .then(|| created.get(now_name).map(|created| created.table()))
                 .flatten();
-            part_changes.kept(now_name, was, now, pending, &mut moved);
+            part_changes.kept(now_name, &was_fields, &now_fields, pending, &mut moved);
             let key_handoff = partition_hands.get(now_name);
             let scalar_expected =
                 table_changes.expect(name, now_name, was, settled.whole(), key_handoff);
@@ -4121,7 +3965,13 @@ fn refuse_pinned_movement(
             } else {
                 now
             };
-            guard::table(&scalar_expected, now, placed, now_name, &mut moved);
+            guard::table(
+                &scalar_expected,
+                &now_fields,
+                &guard::Fields::of(placed),
+                now_name,
+                &mut moved,
+            );
             let parent = was.partition_of.as_ref().and_then(|of| {
                 use pbps_model::plan_names::{At, Holder};
                 match names.holder(&of.parent, At::Start) {
@@ -4138,7 +3988,7 @@ fn refuse_pinned_movement(
                 guard::OwnNames {
                     parent,
                     handoff: own_handoff,
-                    undo: &undo_after,
+                    undo: undo_after,
                     index: &names,
                 },
             );
@@ -4147,16 +3997,30 @@ fn refuse_pinned_movement(
             } else {
                 now
             };
-            guard::own(&own_expected, own_now, now_name, &mut moved);
-            guard::system_time(&scalar_expected, now, now_name, &mut moved);
-            part_changes.storage(now_name, was, now, settled.whole(), &mut moved);
-            part_changes.layout(now_name, was, now, &mut moved);
+            guard::own(
+                &own_expected,
+                &guard::Fields::of(own_now),
+                now_name,
+                &mut moved,
+            );
+            guard::system_time(&scalar_expected, &now_fields, now_name, &mut moved);
+            part_changes.storage(
+                now_name,
+                &was_fields,
+                &now_fields,
+                settled.whole(),
+                &mut moved,
+            );
+            part_changes.layout(now_name, &was_fields, &now_fields, &mut moved);
         }
         // Dropped, or outside the row scope on one side: there is no pair of
         // row sets to compare, and "absent" is not "empty".
         let (Some(was_rows), Some(now_rows)) = (
             was_rows,
-            after.tables.get(now_name).and_then(|t| t.data.as_ref()),
+            after
+                .tables
+                .get(now_name)
+                .and_then(|t| guard::Fields::of(t).data),
         ) else {
             continue;
         };
@@ -4324,36 +4188,7 @@ fn refuse_pinned_movement(
         }
     }
 
-    // A table a change works on but neither creates, drops, renames,
-    // attaches nor detaches stays, at every read: the shape comparison
-    // passes over every table a change names, so without this a table whose
-    // index the plan drops, gone with all its rows by a DDL trigger, was
-    // recorded as success. At every read and not only the closing one,
-    // since a staged run compares each read with the checkpoint before it,
-    // and a table gone at one checkpoint would be gone from the next one's
-    // `before` (DEC-1687.2).
-    let presence_planned: BTreeSet<&TableName> = changes
-        .changes
-        .iter()
-        .flat_map(|p| p.change.tables_after())
-        .map(|(t, _)| t)
-        .collect();
-    let mut stays: BTreeSet<&TableName> = BTreeSet::new();
-    for p in &changes.changes {
-        if let Some(t) = p.change.table()
-            && before.tables.contains_key(t)
-            && !presence_planned.contains(t)
-        {
-            stays.insert(t);
-        }
-    }
-    for name in stays {
-        if !after.tables.contains_key(name) {
-            moved.push(format!(
-                "{name} is gone, and no change of this plan drops it"
-            ));
-        }
-    }
+    tables.kept(after, &mut moved);
 
     // And the names the plan leaves standing or empty. Existence, for the
     // tables and roles themselves: a table's shape is answered for above,
@@ -4362,23 +4197,11 @@ fn refuse_pinned_movement(
     // `CREATE ROLE` another session undid was recorded as success
     // (DECISIONS 161).
     if settled.whole() {
-        let mut expected_tables: BTreeMap<&TableName, pbps_model::Presence> = BTreeMap::new();
         let mut expected_roles: BTreeMap<&str, pbps_model::Presence> = BTreeMap::new();
         for p in &changes.changes {
-            expected_tables.extend(p.change.tables_after());
             expected_roles.extend(p.change.roles_after());
         }
-        for (name, expected) in expected_tables {
-            match (expected, after.tables.contains_key(name)) {
-                (pbps_model::Presence::Present, false) => {
-                    moved.push(format!("{name} is not there, and this plan creates it"))
-                }
-                (pbps_model::Presence::Absent, true) => {
-                    moved.push(format!("{name} is still there, and this plan removes it"))
-                }
-                _ => {}
-            }
-        }
+        tables.after(after, &mut moved);
         guard::columns_after(dialect, &column_changes, after, &mut moved);
         part_changes.after(after, &mut moved);
         for (name, expected) in expected_roles {
@@ -4415,13 +4238,9 @@ fn refuse_pinned_movement(
                 .filter(|(target, _)| !gone.iter().any(|d| d.takes(target)))
                 .map(|(target, held)| {
                     let target = match target {
-                        pbps_model::GrantTarget::Object(object) => pbps_model::GrantTarget::Object(
-                            renamed
-                                .get(object)
-                                .copied()
-                                .cloned()
-                                .unwrap_or_else(|| object.clone()),
-                        ),
+                        pbps_model::GrantTarget::Object(object) => {
+                            pbps_model::GrantTarget::Object(tables.final_name(object).clone())
+                        }
                         // Only tables are renamed, and a routine is not a
                         // table — as `diff_roles` says. Where routines have a
                         // namespace of their own, `app.f(integer)` stands

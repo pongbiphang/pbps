@@ -1,10 +1,88 @@
-use pbps_model::{PartitionColumn, Schema, Table, TableName};
+use pbps_model::{
+    CheckConstraint, Clustered, Column, ComputedColumn, ForeignKey, Index, PartitionBy,
+    PartitionColumn, PartitionOf, PrimaryKey, ReplicaIdentity, Schema, SystemTime, Table,
+    TableData, TableName, UniqueConstraint,
+};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use super::{
     Expr, Req, Source,
     expect::{ColumnExpected, Expected, Implied, Own, OwnExpected, place},
 };
+
+/// The comparator's complete catalog field boundary. These borrowed fields,
+/// rather than the original Table, are what the comparison families consume.
+/// A new model field therefore needs an explicit policy here (DEC-1774.1).
+#[derive(Clone, Copy)]
+pub(crate) struct Fields<'a> {
+    pub(crate) columns: &'a indexmap::IndexMap<String, Column>,
+    pub(crate) computed: &'a BTreeMap<String, ComputedColumn>,
+    pub(crate) primary_key: &'a Option<PrimaryKey>,
+    pub(crate) unique: &'a BTreeMap<String, UniqueConstraint>,
+    pub(crate) foreign_keys: &'a BTreeMap<String, ForeignKey>,
+    pub(crate) checks: &'a BTreeMap<String, CheckConstraint>,
+    pub(crate) indexes: &'a BTreeMap<String, Index>,
+    pub(crate) clustered: &'a Option<Clustered>,
+    pub(crate) replica_identity: &'a Option<ReplicaIdentity>,
+    pub(crate) storage_parameters: &'a BTreeMap<String, String>,
+    pub(crate) unlogged: bool,
+    pub(crate) system_time: &'a Option<SystemTime>,
+    pub(crate) partition_by: &'a Option<PartitionBy>,
+    pub(crate) partition_of: &'a Option<PartitionOf>,
+    pub(crate) data: Option<&'a TableData>,
+}
+
+impl<'a> Fields<'a> {
+    pub(crate) fn of(table: &'a Table) -> Self {
+        let Table {
+            // This metadata is not a catalog observation (SPEC 7.6). Rows
+            // remain with the existing scope-aware row comparator below.
+            description: _,
+            columns,
+            computed,
+            primary_key,
+            unique,
+            foreign_keys,
+            checks,
+            indexes,
+            clustered,
+            replica_identity,
+            storage_parameters,
+            unlogged,
+            system_time,
+            partition_by,
+            partition_of,
+            data,
+        } = table;
+        Self {
+            columns,
+            computed,
+            primary_key,
+            unique,
+            foreign_keys,
+            checks,
+            indexes,
+            clustered,
+            replica_identity,
+            storage_parameters,
+            unlogged: *unlogged,
+            system_time,
+            partition_by,
+            partition_of,
+            data: data.as_ref(),
+        }
+    }
+
+    pub(crate) fn place(&self) -> super::expect::Place {
+        (
+            self.partition_of
+                .as_ref()
+                .map(|of| (of.parent.clone(), of.bound.clone())),
+            self.partition_by.clone(),
+        )
+    }
+}
 
 pub(crate) fn column(expected: &ColumnExpected<'_>, now: &pbps_model::Column) -> Vec<&'static str> {
     let pbps_model::Column {
@@ -71,7 +149,7 @@ pub(crate) fn implied(expected: &Implied<'_>, now: &Schema, moved: &mut Vec<Stri
 
 pub(crate) fn own(
     expected: &OwnExpected<'_>,
-    now: &Table,
+    now: &Fields<'_>,
     name: &TableName,
     moved: &mut Vec<String>,
 ) {
@@ -100,14 +178,14 @@ pub(crate) fn own(
 
 pub(crate) fn created_place(
     declared: &Table,
-    now: &Table,
+    now: &Fields<'_>,
     name: &TableName,
     moved: &mut Vec<String>,
 ) {
     // Connected planning and bootstrap check bound spellings before DDL;
     // an offline preview cannot be applied. Hold the pinned declaration
     // even at the first staged read, before it could become a baseline.
-    if !Req::Planned(place(declared)).accepts(&place(now)) {
+    if !Req::Planned(place(declared)).accepts(&now.place()) {
         moved.push(format!(
             "{name}'s partition parent, bound or key is not the one this plan creates"
         ));
@@ -116,8 +194,8 @@ pub(crate) fn created_place(
 
 pub(crate) fn table(
     expected: &Expected<'_>,
-    now: &Table,
-    placed: &Table,
+    now: &Fields<'_>,
+    placed: &Fields<'_>,
     name: &TableName,
     moved: &mut Vec<String>,
 ) {
@@ -133,7 +211,7 @@ pub(crate) fn table(
     }
     if !expected
         .storage
-        .accepts(&Cow::Borrowed(&now.storage_parameters))
+        .accepts(&Cow::Borrowed(now.storage_parameters))
     {
         moved.push(format!(
             "{name} storage parameters are not the ones this plan leaves"
@@ -145,7 +223,7 @@ pub(crate) fn table(
             if now.unlogged { "unlogged" } else { "logged" }
         ));
     }
-    if !expected.place.accepts(&place(placed)) {
+    if !expected.place.accepts(&placed.place()) {
         moved.push(format!(
             "{name}'s partition parent, bound or key is not the one the plan was approved over"
         ));
@@ -156,7 +234,7 @@ pub(crate) fn table(
 // expectation slice moves them here too.
 pub(crate) fn system_time(
     expected: &Expected<'_>,
-    now: &Table,
+    now: &Fields<'_>,
     name: &TableName,
     moved: &mut Vec<String>,
 ) {
@@ -271,7 +349,7 @@ pub(crate) fn columns_after(
 
 pub(crate) fn columns(
     expected: &super::expect::ColumnsExpected<'_>,
-    now: &Table,
+    now: &Fields<'_>,
     name: &TableName,
     moved: &mut Vec<String>,
 ) {

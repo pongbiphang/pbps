@@ -23,6 +23,7 @@ pbps-db.workspace = true
 pbps-policy.workspace = true
 pbps-docs.workspace = true
 pbps-ui.workspace = true
+indexmap.workspace = true
 rand.workspace = true
 base64.workspace = true
 tokio = { workspace = true, features = ["macros", "sync"] }

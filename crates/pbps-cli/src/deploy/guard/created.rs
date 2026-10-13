@@ -6,7 +6,7 @@ use pbps_model::{
 };
 
 use super::super::{Settled, index_as_declared, primary_key_as_declared};
-use super::{PartChanges, TableChanges, parts::final_table};
+use super::{Fields, PartChanges, TableChanges, parts::final_table};
 
 /// Attach/detach adopt a declared shape, but neither acquires CREATE's
 /// placement or replica-identity policy (DEC-1544.1, DEC-1545.1).
@@ -158,7 +158,7 @@ impl Created<'_> {
         &self,
         dialect: &dyn pbps_dialect::Dialect,
         now_name: &TableName,
-        now: &Table,
+        now: &Fields<'_>,
         settled: Settled,
         moved: &mut Vec<String>,
     ) {
@@ -248,9 +248,8 @@ impl Created<'_> {
         // NOT NULL exactly, a default by presence, the engine respelling
         // its text. One read back that the plan does not declare is
         // somebody else's too.
-        let own = |t: &pbps_model::Table| {
-            t.partition_of
-                .as_ref()
+        let own = |partition: Option<&pbps_model::PartitionOf>| {
+            partition
                 .map(|of| {
                     of.columns
                         .iter()
@@ -262,21 +261,21 @@ impl Created<'_> {
         // An attached table's parent and range, which no other part of
         // the shape names: another session can detach it and attach it
         // elsewhere between two reads (#1545).
-        let place = |t: &pbps_model::Table| {
-            t.partition_of
-                .as_ref()
-                .map(|of| (of.parent.clone(), of.bound.clone()))
+        let place = |partition: Option<&pbps_model::PartitionOf>| {
+            partition.map(|of| (of.parent.clone(), of.bound.clone()))
         };
-        if self.attached() && place(declared) != place(now) {
+        if self.attached()
+            && place(declared.partition_of.as_ref()) != place(now.partition_of.as_ref())
+        {
             moved.push(format!(
                 "{now_name} is not attached to the parent and range this plan declares"
             ));
         }
         // With the defaults this plan sets after the `CREATE`, as a
         // column's above.
-        let mut finished = own(&self.finished);
+        let mut finished = own(self.finished.partition_of.as_ref());
         finished.retain(|_, held| *held != (false, false));
-        if settled.whole() && finished != own(now) {
+        if settled.whole() && finished != own(now.partition_of.as_ref()) {
             moved.push(format!(
                 "{now_name}'s own column defaults or NOT NULLs are not the ones this plan's \
                  `CREATE TABLE` declares"
@@ -315,7 +314,7 @@ impl Created<'_> {
         // comparable. The differ normally splits its definition into an
         // AddForeignKey change (182); a carried CREATE payload must answer
         // for the same structure instead of relying on that split.
-        for (n, now) in &now.foreign_keys {
+        for (n, now) in now.foreign_keys {
             if let Some(was) = self.finished.foreign_keys.get(n)
                 && was != now
             {
@@ -324,7 +323,7 @@ impl Created<'_> {
                 ));
             }
         }
-        for (n, now) in &now.indexes {
+        for (n, now) in now.indexes {
             if let Some(was) = self.finished.indexes.get(n)
                 && !index_as_declared(was, now)
             {
@@ -385,7 +384,7 @@ impl Created<'_> {
         // In the `CREATE` itself, period and versioning, so held from the
         // first read that finds the table (#1176): another session's
         // retention or versioning change after it is not the plan's.
-        if declared.system_time != now.system_time {
+        if &declared.system_time != now.system_time {
             moved.push(format!(
                 "{now_name} period or system versioning is not what this plan's `CREATE \
                  TABLE` declares"
@@ -393,7 +392,7 @@ impl Created<'_> {
         }
         // In the `CREATE` itself (`WITH`), so held from the first read
         // that finds the table (#1441).
-        if declared.storage_parameters != now.storage_parameters {
+        if &declared.storage_parameters != now.storage_parameters {
             moved.push(format!(
                 "{now_name} storage parameters are not the ones this plan's `CREATE TABLE` \
                  declares"
