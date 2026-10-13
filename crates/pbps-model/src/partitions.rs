@@ -111,6 +111,28 @@ impl Partitions {
         }
     }
 
+    /// Spell both ends of an existing relation at another plan boundary.
+    /// This changes names only, without adding relations created by attach.
+    /// A name handed to another UID never receives its old holder's relation.
+    pub fn at(&self, names: &PlanNames<'_>, from: At, to: At) -> Self {
+        let address = |table: &TableName| match names.holder(table, from) {
+            Holder::Tracked(uid) => names.table_at(uid, to).cloned(),
+            Holder::Unmanaged => Some(table.clone()),
+            Holder::Vacant => None,
+        };
+        let mut result = Self::default();
+        for (child, parent) in &self.parents {
+            if let (Some(child), Some(parent)) = (address(child), address(parent)) {
+                result.parents.insert(child.clone(), parent.clone());
+                result.held.entry(parent).or_default().push(child);
+            }
+        }
+        for children in result.held.values_mut() {
+            children.sort();
+        }
+        result
+    }
+
     /// Whether this schema has no partition at all.
     pub fn is_empty(&self) -> bool {
         self.parents.is_empty()
@@ -175,6 +197,56 @@ mod tests {
         assert_eq!(moved.parent(&name("app.p_a")), Some(&name("app.q")));
         assert_eq!(moved.parent(&name("app.q_1")), Some(&name("app.p")));
         assert!(moved.of_parent(&name("app.tmp")).is_empty());
+        let original = Partitions::of(&s);
+        let middle = original.at(&names, At::Start, At::Before(2));
+        assert_eq!(middle.parent(&name("app.p_a")), Some(&name("app.tmp")));
+        assert_eq!(middle.parent(&name("app.q_1")), Some(&name("app.p")));
+        assert_eq!(middle.at(&names, At::Before(2), At::End), moved);
+        assert_eq!(moved.at(&names, At::End, At::Start), original);
+    }
+
+    #[test]
+    fn boundary_relations_follow_renamed_children_and_never_their_replacements() {
+        use crate::{Change, IdsFile, PlannedChange, Uid, UidKind};
+        let original = Partitions::of(&schema());
+        let child = Uid::derived(UidKind::Table, "child", 0);
+        let next = Uid::derived(UidKind::Table, "next", 0);
+        let changes = [
+            Change::RenameTable {
+                uid: child.clone(),
+                from: name("app.p_a"),
+                to: name("app.renamed"),
+                defaults: vec![],
+            },
+            Change::DropTable {
+                uid: child.clone(),
+                name: name("app.renamed"),
+                detach_from: Some(name("app.p")),
+            },
+            Change::CreateTable {
+                uid: next.clone(),
+                name: name("app.renamed"),
+                table: Box::new(Table::default()),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ]
+        .map(PlannedChange::new);
+        let ids = IdsFile {
+            tables: [(next, name("app.renamed"))].into(),
+            ..Default::default()
+        };
+        let names = PlanNames::of(&changes, &ids).unwrap();
+        let middle = original.at(&names, At::Start, At::Before(1));
+        assert_eq!(middle.parent(&name("app.renamed")), Some(&name("app.p")));
+        assert_eq!(
+            middle.of_parent(&name("app.p")),
+            [name("app.p_b"), name("app.renamed")]
+        );
+        assert_eq!(middle.parent(&name("app.p_a")), None);
+        let end = original.at(&names, At::Start, At::End);
+        assert_eq!(end.parent(&name("app.renamed")), None);
+        assert_eq!(end.of_parent(&name("app.p")), [name("app.p_b")]);
     }
 
     /// A read before a plan's renames, brought under the names they leave:

@@ -259,7 +259,122 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
                 conn.execute("DROP TABLE public.child; DROP TABLE public.parent; DROP FUNCTION public.f(integer);").await.unwrap();
             }
         }
+        // Moving a parent release across its rename must preserve recursion
+        // and use the parent's name at the insertion boundary.
+        conn.execute("CREATE FUNCTION public.f(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT x $$;
+            CREATE TABLE public.parent(k integer NOT NULL, n integer DEFAULT 0) PARTITION BY RANGE(k);
+            CREATE TABLE public.child PARTITION OF public.parent DEFAULT;
+            ALTER TABLE public.child ALTER COLUMN n SET DEFAULT public.f(1);").await.unwrap();
+        let before = pbps_pg::catalog::introspect(&mut conn).await.unwrap().schema;
+        let (after, after_ids, mut cs) = parent_release(&before);
+        let before_ids = ids(true);
+        let sources = Sources { before: pbps_diff::Side { schema: &before, ids: &before_ids }, after: &after_ids };
+        conn.begin(&framing).await.unwrap();
+        assert!(crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.is_err());
+        crate::engine::account_for_module_dependents(&mut conn, &mut cs, &after, sources,
+            &ModuleDeps::default(), &pg, &|_| panic!("the plan already drops its sole module"))
+            .await.unwrap();
+        assert_parent_release(&cs);
+        crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.unwrap();
+        for p in &cs.changes {
+            for statement in pg.emit(&p.change, p.strategy).unwrap() {
+                conn.execute(&statement.sql).await.unwrap();
+            }
+        }
+        for target in ["child", "renamed"] {
+            let rows = conn.query(&format!("INSERT INTO public.{target}(k) VALUES(7) RETURNING n")).await.unwrap();
+            assert_eq!(rows[0].try_get_at::<i32>(0).unwrap(), None);
+        }
+        conn.rollback(&framing).await.unwrap();
         drop(conn);
         database.drop().await;
     });
+}
+
+#[test]
+fn an_inherited_default_release_moved_before_a_parent_rename_keeps_the_parent_uid_and_old_name() {
+    let mut parent = ordinary();
+    parent.columns.get_mut("n").unwrap().value_source = ValueSource::Default("0".into());
+    let before = Schema {
+        tables: [
+            (table("parent"), parent.clone()),
+            (table("child"), partition()),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let (after, after_ids, mut cs) = parent_release(&before);
+    let before_ids = ids(true);
+    let sources = Sources {
+        before: pbps_diff::Side {
+            schema: &before,
+            ids: &before_ids,
+        },
+        after: &after_ids,
+    };
+    weave(
+        &mut cs,
+        &found(),
+        &after,
+        sources,
+        &pbps_pg::Postgres::new(),
+    )
+    .unwrap();
+    assert_parent_release(&cs);
+}
+
+fn parent_release(before: &Schema) -> (Schema, IdsFile, ChangeSet) {
+    let mut parent = before.tables[&table("parent")].clone();
+    parent.columns.get_mut("n").unwrap().value_source = ValueSource::None;
+    let mut child = partition();
+    let of = child.partition_of.as_mut().unwrap();
+    of.parent = table("renamed");
+    of.columns.clear();
+    let after = Schema {
+        tables: [(table("renamed"), parent), (table("child"), child)].into(),
+        ..Default::default()
+    };
+    let before_ids = ids(true);
+    let mut after_ids = before_ids.clone();
+    after_ids.tables.insert(uid("t_aaaaaa"), table("renamed"));
+    for column in after_ids.columns.values_mut() {
+        column.table = table("renamed");
+    }
+    let cs = ChangeSet {
+        changes: vec![
+            Change::DropModule {
+                id: function(),
+                kind: ModuleKind::Function,
+            },
+            Change::RenameTable {
+                uid: uid("t_aaaaaa"),
+                from: table("parent"),
+                to: table("renamed"),
+                defaults: vec![],
+            },
+            Change::AlterColumnDefault {
+                uid: uid("c_bbbbbb"),
+                column: table("renamed").column("n"),
+                from: Some("0".into()),
+                to: None,
+            },
+        ]
+        .into_iter()
+        .map(PlannedChange::new)
+        .collect(),
+    };
+    (after, after_ids, cs)
+}
+
+fn assert_parent_release(cs: &ChangeSet) {
+    assert!(
+        matches!(&cs.changes[0].change, Change::AlterColumnDefault { uid: u, column, to: None, .. }
+        if *u == uid("c_bbbbbb") && *column == table("parent").column("n")),
+        "{cs:?}"
+    );
+    assert_eq!(
+        cs.changes.len(),
+        3,
+        "no partition-only replacement for the parent's release"
+    );
 }

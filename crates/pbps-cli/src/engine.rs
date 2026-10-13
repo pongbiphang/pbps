@@ -3126,10 +3126,13 @@ pub async fn check_module_dependents(
 ) -> anyhow::Result<()> {
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
     let found = module_dependents(conn, changes).await?;
-    // Under the plan's names, as the declarations the planner matched by are:
-    // a parent's column change names it as declared, and the baseline holds
-    // its partitions under its name before a rename (#1751 review).
-    let partitions = crate::dependents::standing_partitions(stored, changes).renamed(&names);
+    // Match the planner's final relation first; each dependency lookup then
+    // spells both ends at the statement's boundary (DEC-1875.1).
+    let partitions = crate::dependents::standing_partitions(stored, changes).at(
+        &names,
+        pbps_model::plan_names::At::Start,
+        pbps_model::plan_names::At::End,
+    );
     let sources = pbps_model::physical_sources::PhysicalSources::of(names, stored, stored_ids)?;
     let left = crate::dependents::unaccounted(changes, &found, &partitions, &sources);
     if !left.is_empty() {

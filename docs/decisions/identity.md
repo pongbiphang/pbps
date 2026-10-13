@@ -993,3 +993,7 @@ execute the exact emitted SQL. A partition default restored before its parent's
 column rename must use the old spelling at that boundary; the later rename
 carries it. Restoring the final spelling there fails execution. Managed UID
 lifetimes remain unchanged, and inherited columns receive no invented UIDs.
+A parent's release moved before its table rename keeps the parent's UID and
+uses its earlier name, so the engine still removes the child's own default.
+The standing relation is spelled at each lookup boundary as well; comparing
+its final parent name with that earlier statement would refuse this plan.
