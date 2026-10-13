@@ -44,6 +44,27 @@ mod plan_outputs;
 #[path = "support/unexpressible.rs"]
 mod unexpressible;
 
+#[path = "support/rename_cycles.rs"]
+mod rename_cycles;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn a_table_swap_is_refused_at_diff_time_on_every_path() {
+    let server = std::env::var("PBPS_TEST_DB").unwrap();
+    let own = OwnDatabase::new(&server, "swap_1966");
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.a (ay int NOT NULL); CREATE TABLE dbo.b (bee int NOT NULL);",
+    );
+    let d = Demo::new("swap-1966");
+    let ok =
+        |output: Output| assert_eq!(code(&output), 0, "{}{}", stdout(&output), stderr(&output));
+    ok(d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    rename_cycles::swap(&d, own.connection(), "dbo");
+}
+
 #[test]
 #[ignore = "needs live mssql"]
 fn connected_diff_refusals_keep_temporal_reasons_and_existing_artifacts() {

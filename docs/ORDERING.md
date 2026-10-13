@@ -70,10 +70,12 @@ Then, in this order:
   table rename after the drops that release its target name (DECISIONS 496,
   DEC-496.1, DEC-536.1): a dropped table everywhere, an index on PostgreSQL
   (indexes share the relation namespace), a named constraint on SQL Server.
-  It orders chains. A table rename cycle is left out of its graph, and the
-  engine refuses it. A column rename cycle is refused at diff time
-  (`ColumnRenameCycle`); a column chain is ordered by `chain_depth`, and
-  on a connected SQL Server plan by the collation's answer (DEC-1366.3).
+  It orders chains. A table rename cycle, through exact names or a
+  cross-schema move's intermediate name, is left out of its graph and refused
+  at diff time (`TableRenameCycle`, DEC-1966.1), as a column rename cycle is
+  (`ColumnRenameCycle`, DEC-541.1); a column chain is ordered by
+  `chain_depth`, and on a connected SQL Server plan by the collation's answer
+  (DEC-1366.3).
 - **On a connected SQL Server plan, `order_created_object_names`** (in
   `crates/pbps-cli/src/engine.rs`, last of the passes that reorder) first
   orders each table's column renames by the collation's answer (DEC-1366.3),
@@ -251,9 +253,9 @@ rows below list each.
 | `DropColumn` → `RenameColumn` into its name | fixed | the drop moves to (2, 3), ahead of class 3 | ✓ DECISIONS 474 |
 | `DropColumn` or `RenameColumn` away → `AddColumn` of its name | fixed | class 5 or 3 before 8 | ✓ |
 | A column rename chain | fixed | `chain_depth` inside class 3; on a connected SQL Server plan, reordered by the collation's answer | ✓ DEC-1366.3 |
-| A column rename cycle (a swap) | — | refused at diff time, `ColumnRenameCycle` | ✓ refused by design |
+| A column rename cycle (a swap) | — | refused at diff time, `ColumnRenameCycle` | ✓ refused by design, DEC-541.1 |
 | A table rename chain | fixed | `rename_order` | ✓ DEC-536.1 |
-| A table rename cycle | — | left out of `rename_order`'s graph; refused at `plan --db` with the remedy | ✓ refused by design, DEC-1366.2 |
+| A table rename cycle (a swap, a rotation, or a cycle through a cross-schema move's intermediate name) | — | left out of `rename_order`'s graph; refused at diff time, `TableRenameCycle` | ✓ refused by design, DEC-1966.1 |
 | A catalog-only holder (adopted or fallback default, unrecorded object, collation pair) → `RenameTable` into its name | engine-sourced | `object_order` on a connected SQL Server plan | ✓ DEC-1366.1 |
 | A later table rename moving a holder away (P) → a cross-schema rename carrying an index or owned sequence onto the held name | engine-sourced | on a connected PostgreSQL plan, the later rename is hoisted ahead where one hoist clears; refused at `plan --db` with the remedy otherwise | ✓ DEC-1767.1 |
 | `RenameColumn` or another later class freeing a default name → `RenameTable` into it | — | refused at `plan --db` with the remedy | ✓ refused by design, DEC-1366.2 |

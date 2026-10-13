@@ -229,6 +229,22 @@ pub enum DiffError {
         columns: BTreeSet<String>,
     },
 
+    /// Table renames that each wait for a name another of them still holds,
+    /// in a cycle (#1966). Skipped revisions can produce one (`a -> c`, then
+    /// `b -> a`, then `c -> b`), and so can two moves across schemas, each
+    /// passing through its old name in the other's destination. No order of
+    /// the renames is one an engine performs; the temporary name is the
+    /// deployer's to choose, as for columns (DEC-541.1, DEC-1966.1).
+    #[error(
+        "the table renames {} each need a name another of them still holds, in a cycle, and no \
+         order of those renames is one the engine performs. Apply the revisions that form it in \
+         separate deployments, or rename one of the tables through a temporary name first",
+        renames.iter().map(|(from, to)| format!("`{from} -> {to}`")).collect::<Vec<_>>().join(", ")
+    )]
+    TableRenameCycle {
+        renames: Vec<(TableName, TableName)>,
+    },
+
     /// A baseline without a primary key, restored by this plan on a column
     /// the baseline does not have. Not [`Self::DataKeyColumnChanged`]: there
     /// was no key to move, and "rename the column instead" does not apply.
@@ -1714,7 +1730,9 @@ fn diff_partial_rebuilding(
             format!("{:?}", p.change),
         )
     });
-    crate::rename_order::order(&mut planned, base, &renames, dialect);
+    for cycle in crate::rename_order::order(&mut planned, base, &renames, dialect) {
+        errs.push(DiffError::TableRenameCycle { renames: cycle });
+    }
     Diffed {
         changes: ChangeSet { changes: planned },
         errors: errs,
@@ -15385,11 +15403,48 @@ mod tests {
             ],
         );
         assert_eq!(order(&cs), ["s1.z -> s2.a", "s1.y -> s2.z"], "{cs:?}");
+    }
 
-        // Two tables trading names through a third across three revisions
-        // net to a cycle. No order serves it, and the graph must not loop or
-        // panic looking for one: both renames are still planned.
-        let cs = across_revisions(
+    /// #1966: table renames that each wait for a name another still holds
+    /// are refused by name, as a column cycle is (DEC-541.1). Before this the
+    /// differ planned them, and an offline plan wrote a script no engine runs.
+    /// A chain, a cross-schema move nothing else waits on, and a pair equal
+    /// only after case folding are not cycles here.
+    #[test]
+    fn a_table_rename_cycle_is_refused_by_name() {
+        let t = |n: &str| table(&[(n, Column::new(ty("int")))]);
+        let rename = |from: &str, to: &str| Intent::RenameTable {
+            from: from.parse().unwrap(),
+            to: to.parse().unwrap(),
+        };
+        let schema = |tables: &[(&str, &str)]| {
+            let mut s = Schema::default();
+            for (name, column) in tables {
+                s.tables.insert(name.parse().unwrap(), t(column));
+            }
+            s
+        };
+        let cycles = |diffed: &Diffed| -> Vec<BTreeSet<String>> {
+            diffed
+                .errors
+                .iter()
+                .filter_map(|e| match e {
+                    DiffError::TableRenameCycle { renames } => Some(
+                        renames
+                            .iter()
+                            .map(|(from, to)| format!("{from} -> {to}"))
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        };
+        let set = |renames: &[&str]| -> BTreeSet<String> {
+            renames.iter().map(|r| (*r).to_owned()).collect()
+        };
+
+        // Two tables trading names through a third, across three revisions.
+        let swap = revisions_diffed(
             &schema(&[("app.a", "ay"), ("app.b", "bee")]),
             &[
                 (
@@ -15406,7 +15461,123 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(order(&cs).len(), 2, "{cs:?}");
+        assert_eq!(
+            cycles(&swap),
+            [set(&["app.a -> app.b", "app.b -> app.a"])],
+            "{:?}",
+            swap.errors
+        );
+        let message = swap.errors[0].to_string();
+        assert!(message.contains("`app.a -> app.b`"), "{message}");
+        assert!(message.contains("separate deployments"), "{message}");
+        assert!(message.contains("temporary name"), "{message}");
+
+        // Three tables rotating names.
+        let rotation = revisions_diffed(
+            &schema(&[("app.a", "ay"), ("app.b", "bee"), ("app.c", "cee")]),
+            &[
+                (
+                    schema(&[("app.t", "ay"), ("app.b", "bee"), ("app.c", "cee")]),
+                    vec![rename("app.a", "app.t")],
+                ),
+                (
+                    schema(&[("app.t", "ay"), ("app.b", "bee"), ("app.a", "cee")]),
+                    vec![rename("app.c", "app.a")],
+                ),
+                (
+                    schema(&[("app.t", "ay"), ("app.c", "bee"), ("app.a", "cee")]),
+                    vec![rename("app.b", "app.c")],
+                ),
+                (
+                    schema(&[("app.b", "ay"), ("app.c", "bee"), ("app.a", "cee")]),
+                    vec![rename("app.t", "app.b")],
+                ),
+            ],
+        );
+        assert_eq!(
+            cycles(&rotation),
+            [set(&["app.a -> app.b", "app.b -> app.c", "app.c -> app.a"])],
+            "{:?}",
+            rotation.errors
+        );
+
+        // One name trading schemas: each move lands on the other's name.
+        let across = revisions_diffed(
+            &schema(&[("s1.b", "one"), ("s2.b", "two")]),
+            &[
+                (
+                    schema(&[("s1.t", "one"), ("s2.b", "two")]),
+                    vec![rename("s1.b", "s1.t")],
+                ),
+                (
+                    schema(&[("s1.t", "one"), ("s1.b", "two")]),
+                    vec![rename("s2.b", "s1.b")],
+                ),
+                (
+                    schema(&[("s2.b", "one"), ("s1.b", "two")]),
+                    vec![rename("s1.t", "s2.b")],
+                ),
+            ],
+        );
+        assert_eq!(
+            cycles(&across),
+            [set(&["s1.b -> s2.b", "s2.b -> s1.b"])],
+            "{:?}",
+            across.errors
+        );
+
+        // A cycle through intermediate names alone, in one revision: each
+        // move passes through its old name in the other's schema, which the
+        // other still holds. No final name is shared.
+        let intermediate = revisions_diffed(
+            &schema(&[("s1.a", "one"), ("s2.a", "two")]),
+            &[(
+                schema(&[("s2.b", "one"), ("s1.c", "two")]),
+                vec![rename("s1.a", "s2.b"), rename("s2.a", "s1.c")],
+            )],
+        );
+        assert_eq!(
+            cycles(&intermediate),
+            [set(&["s1.a -> s2.b", "s2.a -> s1.c"])],
+            "{:?}",
+            intermediate.errors
+        );
+
+        // Negatives. A chain has an order: the far end first.
+        let chain = revisions_diffed(
+            &schema(&[("app.a", "ay"), ("app.b", "bee")]),
+            &[
+                (
+                    schema(&[("app.a", "ay"), ("app.c", "bee")]),
+                    vec![rename("app.b", "app.c")],
+                ),
+                (
+                    schema(&[("app.b", "ay"), ("app.c", "bee")]),
+                    vec![rename("app.a", "app.b")],
+                ),
+            ],
+        );
+        assert!(chain.errors.is_empty(), "{:?}", chain.errors);
+        // A move across schemas whose intermediate name nothing else holds.
+        let alone = revisions_diffed(
+            &schema(&[("s1.a", "one"), ("s2.x", "two")]),
+            &[(
+                schema(&[("s2.b", "one"), ("s2.x", "two")]),
+                vec![rename("s1.a", "s2.b")],
+            )],
+        );
+        assert!(alone.errors.is_empty(), "{:?}", alone.errors);
+        // Names equal only after case folding: a case-sensitive database
+        // takes both renames in either order, and a case-insensitive one is
+        // the connected plan's to refuse (DEC-1366.3).
+        let folded = revisions_diffed(
+            &schema(&[("app.a", "ay"), ("app.b", "bee")]),
+            &[(
+                schema(&[("app.B", "ay"), ("app.A", "bee")]),
+                vec![rename("app.a", "app.B"), rename("app.b", "app.A")],
+            )],
+        );
+        assert!(cycles(&folded).is_empty(), "{:?}", folded.errors);
     }
 
     /// DEC-1118.1: a trigger keyed by a name that passes to another table is

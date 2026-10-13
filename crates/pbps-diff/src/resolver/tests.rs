@@ -1615,14 +1615,12 @@ mod generated_surface_coverage {
         ordered.proof.validate(&ordered.changes).unwrap();
     }
 
-    /// Two tables swap names while each generation expression keeps its own
-    /// binding. Each observation holds the opening record under its base
-    /// spelling and the compiled one under its desired spelling, so one
-    /// spelling pairs two different tables; the rebuild check pairs them
-    /// through recorded UIDs, and a rename-only swap rewrites nothing
-    /// (DEC-1498.1).
+    /// Two tables swapping names never reach the resolver: the ordinary
+    /// plan refuses the cycle by name (#1966, DEC-1966.1), so no observation
+    /// is ever paired across one. The pairing a swap exercised is pinned on a
+    /// chain below.
     #[test]
-    fn swapped_table_names_pair_bindings_through_recorded_uids() {
+    fn a_table_swap_is_refused_before_the_resolver_binds_it() {
         let (id, module) = routine();
         let a: pbps_model::TableName = "app.a".parse().unwrap();
         let b: pbps_model::TableName = "app.b".parse().unwrap();
@@ -1637,8 +1635,8 @@ mod generated_surface_coverage {
             before_ids.table_uid(&a).unwrap().clone(),
             before_ids.table_uid(&b).unwrap().clone(),
         );
-        after_ids.tables.insert(ua.clone(), b.clone());
-        after_ids.tables.insert(ub.clone(), a.clone());
+        after_ids.tables.insert(ua, b.clone());
+        after_ids.tables.insert(ub, a.clone());
         for column in after_ids.columns.values_mut() {
             column.table = if column.table == a {
                 b.clone()
@@ -1646,6 +1644,83 @@ mod generated_surface_coverage {
                 a.clone()
             };
         }
+        let function = Surface::Module(id);
+        let g = |table: &str| Surface::Default(format!("{table}.g").parse().unwrap());
+        let attrdef = || {
+            Some(bound(
+                "pg_attrdef",
+                "app.x.g",
+                std::slice::from_ref(&function),
+                "f",
+            ))
+        };
+        let observations = [
+            SurfaceResolution {
+                surface: g("app.a"),
+                current: attrdef(),
+                desired: attrdef(),
+            },
+            SurfaceResolution {
+                surface: g("app.b"),
+                current: attrdef(),
+                desired: attrdef(),
+            },
+            SurfaceResolution {
+                surface: function.clone(),
+                current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                desired: Some(bound("pg_proc", "app.f", &[], "int4in")),
+            },
+        ];
+        let refused = super::plan(
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+            &Hints::default(),
+            &observations,
+            &pbps_dialect::MinimalDialect,
+        );
+        let Err(super::Error::Diff(reasons)) = refused else {
+            panic!("a swap must be refused by the ordinary plan");
+        };
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("`app.a -> app.b`") && r.contains("`app.b -> app.a`")),
+            "{reasons:?}"
+        );
+    }
+
+    /// Two tables in a rename chain, app.b to app.c and then app.a to app.b,
+    /// while each generation expression keeps its own binding. The app.b
+    /// observation holds the opening record under its base spelling and the
+    /// compiled one under its desired spelling, so one spelling pairs two
+    /// different tables; the rebuild check pairs them through recorded UIDs,
+    /// and a rename-only chain rewrites nothing (DEC-1498.1).
+    #[test]
+    fn chained_table_names_pair_bindings_through_recorded_uids() {
+        let (id, module) = routine();
+        let names =
+            ["app.a", "app.b", "app.c"].map(|n| n.parse::<pbps_model::TableName>().unwrap());
+        let [a, b, c] = names.clone();
+        let mut base = Schema::default();
+        base.modules.insert(id.clone(), module);
+        base.tables.insert(a.clone(), table(Some("app.f(a)")));
+        base.tables.insert(b.clone(), table(Some("app.f(a)")));
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut desired = Schema {
+            modules: base.modules.clone(),
+            ..Default::default()
+        };
+        desired.tables.insert(b.clone(), table(Some("app.f(a)")));
+        desired.tables.insert(c.clone(), table(Some("app.f(a)")));
+        let mut after_ids = before_ids.clone();
+        after_ids.rename_table(&b, &c);
+        after_ids.rename_table(&a, &b);
         let function = Surface::Module(id);
         let g = |table: &str| Surface::Default(format!("{table}.g").parse().unwrap());
         let attrdef = |binds: &str| {
@@ -1663,12 +1738,17 @@ mod generated_surface_coverage {
                 SurfaceResolution {
                     surface: g("app.a"),
                     current: attrdef("f"),
-                    desired: attrdef("f_exact"),
+                    desired: None,
                 },
                 SurfaceResolution {
                     surface: g("app.b"),
                     current: attrdef("f_exact"),
                     desired: attrdef(old_a_binds),
+                },
+                SurfaceResolution {
+                    surface: g("app.c"),
+                    current: None,
+                    desired: attrdef("f_exact"),
                 },
                 SurfaceResolution {
                     surface: function.clone(),
@@ -1706,14 +1786,16 @@ mod generated_surface_coverage {
                 .collect()
         };
         let unchanged = plan("f");
-        assert!(
+        assert_eq!(
             unchanged
                 .changes
                 .changes
                 .iter()
-                .any(|p| matches!(p.change, Change::RenameTable { .. }))
+                .filter(|p| matches!(p.change, Change::RenameTable { .. }))
+                .count(),
+            2
         );
-        assert_eq!(rewritten(&unchanged), Vec::new(), "a rename-only swap");
+        assert_eq!(rewritten(&unchanged), Vec::new(), "a rename-only chain");
         unchanged.proof.validate(&unchanged.changes).unwrap();
         // The old app.a rebinds: only it is rebuilt, under its new name.
         let rebound = plan("f_exact");
