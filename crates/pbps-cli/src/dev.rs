@@ -579,22 +579,18 @@ impl Container {
         let started = std::time::Instant::now();
         let rt = db::runtime()?;
         loop {
-            let answer = rt.block_on(async {
-                tokio::time::timeout(ready_budget(started), async {
-                    let mut c = Conn::connect(pbps_db::Driver::Mssql, &self.connection).await?;
-                    c.query("SELECT 1 AS ok;").await?;
-                    Ok::<_, anyhow::Error>(())
-                })
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("SQL readiness poll timed out")))
-            });
+            let answer = rt.block_on(readiness_probe(started, async {
+                let mut c = Conn::connect(pbps_db::Driver::Mssql, &self.connection).await?;
+                c.query("SELECT 1 AS ok;").await?;
+                Ok(())
+            }));
             if answer.is_ok() {
                 return Ok(());
             }
             let observed = rt.block_on(async {
                 match runtime_output(
                     &["inspect", "--format", "{{json .State}}", &self.id],
-                    ready_budget(started),
+                    runtime_budget(started),
                 )
                 .await
                 {
@@ -606,7 +602,7 @@ impl Container {
                 Poll::Exited => {
                     let logs = rt.block_on(runtime_output(
                         &["logs", "--tail", "20", &self.id],
-                        ready_budget(started),
+                        runtime_budget(started),
                     ));
                     let tail = match logs {
                         Ok(out) => format!(
@@ -725,9 +721,19 @@ fn observe_container(out: &std::process::Output, id: &str) -> Observed {
     }
 }
 
-fn ready_budget(started: std::time::Instant) -> std::time::Duration {
-    // Both a stalled SQL handshake and an unresponsive runtime must leave
-    // time to observe the other side, without extending the overall wait.
+async fn readiness_probe(
+    started: std::time::Instant,
+    attempt: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    // Restarting a slow but valid handshake every few seconds prevents it
+    // from ever becoming ready. SQL gets the remaining overall budget.
+    tokio::time::timeout(READY_TIMEOUT.saturating_sub(started.elapsed()), attempt)
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("SQL readiness poll timed out")))
+}
+
+fn runtime_budget(started: std::time::Instant) -> std::time::Duration {
+    // An unresponsive runtime must not extend the overall readiness wait.
     std::time::Duration::from_secs(5).min(READY_TIMEOUT.saturating_sub(started.elapsed()))
 }
 
@@ -784,6 +790,22 @@ impl Drop for Container {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_slow_successful_probe_keeps_the_overall_readiness_budget() {
+        let answer = readiness_probe(std::time::Instant::now(), async {
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            Ok(())
+        })
+        .await;
+        assert!(answer.is_ok(), "{answer:?}");
+        let expired = std::time::Instant::now() - READY_TIMEOUT;
+        let answer = readiness_probe(expired, std::future::pending()).await;
+        assert_eq!(
+            answer.unwrap_err().to_string(),
+            "SQL readiness poll timed out"
+        );
+    }
 
     fn runtime_answer(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
         #[cfg(unix)]
