@@ -2400,6 +2400,71 @@ fn canonical_table(
     )
 }
 
+struct FmtInput {
+    path: PathBuf,
+    original: String,
+    loaded: pbps_load::LoadedFile,
+}
+
+/// The writer receives only parsed inputs, all from the same reads used to
+/// judge their names. No input failure may follow a source rewrite (DEC-1802.1).
+fn stage_fmt_inputs(files: &[PathBuf]) -> Result<Vec<FmtInput>, Vec<pbps_load::LoadError>> {
+    let mut staged = Vec::new();
+    let mut errors = Vec::new();
+    for path in files {
+        match std::fs::read_to_string(path) {
+            Ok(original) => match pbps_load::load_file_str(path, &original) {
+                Ok(loaded) => staged.push(FmtInput {
+                    path: path.clone(),
+                    original,
+                    loaded,
+                }),
+                Err(found) => errors.extend(found),
+            },
+            Err(source) => errors.push(pbps_load::LoadError::Io {
+                path: path.clone(),
+                source,
+            }),
+        }
+    }
+    if errors.is_empty() {
+        Ok(staged)
+    } else {
+        Err(errors)
+    }
+}
+
+/// The same completed-change notes belong on success and write failure. A
+/// failure cannot erase the rewrites or annotations the user must review.
+fn fmt_change_findings(changed: &[(PathBuf, Vec<Intent>)], check: bool) -> Vec<output::Finding> {
+    let mut findings = Vec::new();
+    for (path, _) in changed {
+        findings.push(if check {
+            output::Finding::error("fmt.not-canonical", "not in canonical form")
+                .at(path, None)
+                .remedy("pbps fmt")
+        } else {
+            output::Finding::note("fmt.rewritten", "rewritten in canonical form").at(path, None)
+        });
+    }
+    // An absorbed annotation can also be a typo naming a source that never
+    // existed. The ids file cannot distinguish them, so deletion is never silent.
+    if !check {
+        for (path, absorbed) in changed {
+            for intent in absorbed {
+                findings.push(
+                    output::Finding::note(
+                        "fmt.annotation-dropped",
+                        format!("dropped a redundant annotation: {}", report::intent(intent)),
+                    )
+                    .at(path, None),
+                );
+            }
+        }
+    }
+    findings
+}
+
 /// Canonicalizes every declaration file.
 ///
 /// This rewrites each file in full, so ordinary YAML comments are lost —
@@ -2441,43 +2506,53 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
         }
     };
 
-    // The project-wide names, for judging a table's or a role's own
-    // `renamed_from`: its source is another file's table or role (#404). One
-    // file alone could not see a new `dbo.old` declared elsewhere after an
-    // applied `dbo.old -> dbo.new`, so it kept the redundant annotation for
-    // ever while `plan`, which has every file, called it absorbed and asked
-    // for a `fmt` that then changed nothing. A file that cannot be read or
-    // parsed contributes nothing here, and the loop below still stops on it
-    // exactly as it did.
-    let declared = fmt_declared(&files);
+    let staged = stage_fmt_inputs(&files).map_err(|errors| {
+        if json {
+            let mut failed: Vec<_> = errors
+                .iter()
+                .map(|error| match error {
+                    pbps_load::LoadError::Io { path, source } => {
+                        output::Finding::error(error.id(), format!("{error}: {source}"))
+                            .at(path, None)
+                    }
+                    pbps_load::LoadError::Yaml { .. } | pbps_load::LoadError::Semantic(_) => {
+                        load_finding(error)
+                    }
+                })
+                .collect();
+            failed.append(&mut findings);
+            output::unanswerable("fmt", failed);
+        } else {
+            eprint!("{}", output::human(&findings));
+            for error in errors {
+                print_load_error(error);
+            }
+        }
+        anyhow::anyhow!("cannot format declarations with unreadable or invalid input")
+    })?;
+
+    // A table's or role's rename source may be declared in another file (#404).
+    // Use the staged declarations, never a second read with different contents.
+    let mut declared = Schema::default();
+    for input in &staged {
+        match &input.loaded {
+            pbps_load::LoadedFile::Table(t) => {
+                declared.tables.insert(t.name.clone(), t.table.clone());
+            }
+            pbps_load::LoadedFile::Role(r) => {
+                declared.roles.insert(r.name.clone(), r.role.clone());
+            }
+            pbps_load::LoadedFile::Module(_) => {}
+        }
+    }
 
     let mut changed: Vec<(PathBuf, Vec<Intent>)> = Vec::new();
-    for path in &files {
-        let original = output::or_unanswerable(
-            "fmt",
-            json,
-            "load.io",
-            std::fs::read_to_string(path)
-                .with_context(|| format!("cannot read `{}`", path.display())),
-        )?;
-        let loaded = pbps_load::load_file_str(path, &original).map_err(|errs| {
-            // A file that does not parse cannot be canonicalized, and guessing
-            // at what it meant would be the tool rewriting something it did not
-            // understand. This is a tool failure rather than a finding: `fmt`
-            // did not get to answer its own question.
-            if format == OutputFormat::Human {
-                for e in errs {
-                    print_load_error(e);
-                }
-            } else {
-                // Unanswerable: `fmt` did not get to decide whether the file is
-                // canonical, because it could not read it. The findings are the
-                // parse errors, but the routing is "the tool could not run".
-                output::unanswerable("fmt", errs.iter().map(load_finding).collect());
-            }
-            anyhow::anyhow!("`{}` does not parse", path.display())
-        })?;
-
+    for FmtInput {
+        path,
+        original,
+        loaded,
+    } in staged
+    {
         let (rendered, absorbed): (String, Vec<Intent>) = match loaded {
             pbps_load::LoadedFile::Module(m) => (
                 // A module has no one-shot annotations to absorb: it carries no
@@ -2497,53 +2572,28 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
         if rendered == original {
             continue;
         }
-        changed.push((path.clone(), absorbed));
-        if !check {
-            // The rewrite is what `fmt` is for, so failing it is the command
-            // not finishing — and the path is the whole of the remedy, which a
-            // consumer only gets if the envelope names it. Same wrapper as the
-            // listing and the read above; this write was simply missed when
-            // those two were done.
-            output::or_unanswerable(
-                "fmt",
-                json,
-                "load.io",
-                std::fs::write(path, &rendered)
-                    .with_context(|| format!("cannot write `{}`", path.display())),
-            )?;
-        }
-    }
-
-    // In check mode an unformatted file is the finding; in write mode it has
-    // just been fixed, so it is a note. The same list either way — a consumer
-    // asking "what did fmt touch" gets one answer whichever mode ran.
-    for (p, _) in &changed {
-        findings.push(if check {
-            output::Finding::error("fmt.not-canonical", "not in canonical form")
-                .at(p, None)
-                .remedy("pbps fmt")
-        } else {
-            output::Finding::note("fmt.rewritten", "rewritten in canonical form").at(p, None)
-        });
-    }
-    // Deleting a line the user wrote must never be silent. `intent_is_absorbed`
-    // cannot tell "this rename happened" from "this rename never applied": a
-    // `renamed_from` naming a column that never existed also looks absorbed,
-    // because the ids file records no history to distinguish them. Naming what
-    // went is the only thing that lets the user catch the typo.
-    if !check {
-        for (p, absorbed) in &changed {
-            for i in absorbed {
-                findings.push(
-                    output::Finding::note(
-                        "fmt.annotation-dropped",
-                        format!("dropped a redundant annotation: {}", report::intent(i)),
-                    )
-                    .at(p, None),
+        if !check
+            && let Err(error) = std::fs::write(&path, &rendered)
+                .with_context(|| format!("cannot write `{}`", path.display()))
+        {
+            findings.extend(fmt_change_findings(&changed, false));
+            if json {
+                findings.insert(
+                    0,
+                    output::Finding::error("load.io", format!("{error:#}")).at(&path, None),
                 );
+                output::unanswerable("fmt", findings);
+            } else {
+                eprint!("{}", output::human(&findings));
+                for (written, _) in &changed {
+                    println!("rewrote {}", written.display());
+                }
             }
+            return Err(error);
         }
+        changed.push((path, absorbed));
     }
+    findings.extend(fmt_change_findings(&changed, check));
 
     let report = output::Report::new(
         "fmt",

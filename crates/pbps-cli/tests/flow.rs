@@ -217,6 +217,19 @@ fn blank_baseline_reasons_leave_the_live_ledger_unchanged() {
 #[path = "support/fmt_scalars.rs"]
 mod fmt_scalars;
 
+#[path = "support/fmt_failures.rs"]
+mod fmt_failures;
+
+#[test]
+fn formatting_validates_every_input_before_rewriting_any() {
+    fmt_failures::before_writes("mssql");
+}
+
+#[test]
+fn formatting_reports_all_bad_inputs_beside_identity_warnings() {
+    fmt_failures::all_errors_and_warnings("mssql");
+}
+
 #[test]
 fn formatting_preserves_multiline_data_and_refuses_malformed_yaml() {
     fmt_scalars::check("mssql");
@@ -7437,6 +7450,10 @@ fn validate_json_of_a_clean_project_is_ok_with_no_findings() {
 fn fmt_json_names_each_file_and_which_mode_ran() {
     let d = Demo::new("fjson");
     d.table("table:  dbo.t\ncolumns:\n  id:  {type: BIGINT}\n");
+    let other = d.dir.join("schema").join("other.yml");
+    std::fs::write(&other, "table: dbo.other\ncolumns: {id: {type: BIGINT}}\n").unwrap();
+    let paths = [d.dir.join("schema").join("dbo.t.yml"), other];
+    let original: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
 
     let o = d.run(&["fmt", "--check", "--format", "json"]);
     assert_eq!(code(&o), FINDING, "{}", stderr(&o));
@@ -7444,6 +7461,11 @@ fn fmt_json_names_each_file_and_which_mode_ran() {
     assert_eq!(v["data"]["mode"], "check");
     assert_eq!(v["findings"][0]["id"], "fmt.not-canonical");
     assert_eq!(v["findings"][0]["remedy"], "pbps fmt");
+    assert_eq!(v["data"]["checked"], 2);
+    assert_eq!(v["data"]["changed"], 2);
+    for (path, original) in paths.iter().zip(original) {
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
 
     let o = d.run(&["fmt", "--format", "json"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -7452,6 +7474,18 @@ fn fmt_json_names_each_file_and_which_mode_ran() {
     assert_eq!(v["result"], "ok", "a file that was fixed is not a finding");
     assert_eq!(v["findings"][0]["id"], "fmt.rewritten");
     assert_eq!(v["findings"][0]["severity"], "note");
+    assert_eq!(v["data"]["checked"], 2);
+    assert_eq!(v["data"]["changed"], 2);
+    assert_eq!(v["findings"].as_array().unwrap().len(), paths.len());
+    for path in paths {
+        assert!(
+            v["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| { std::path::Path::new(f["location"]["file"].as_str().unwrap()) == path })
+        );
+    }
 }
 
 /// The negative case the split exists for: a project that cannot be found is a
