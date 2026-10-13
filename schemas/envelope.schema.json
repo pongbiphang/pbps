@@ -125,6 +125,13 @@
         "baseline": {
           "type": "string"
         },
+        "time_zone": {
+          "description": "The zone a connected plan read every offset-less date/time value in,\nand the one its apply pins and requires (DEC-1916.1). Absent offline\nand on an engine with no session time zone.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "changes": {
           "type": "integer",
           "format": "uint",
@@ -2073,6 +2080,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 42,
+  "x-pbps-schema-version": 43,
   "x-pbps-tool-version": "0.0.0"
 }

@@ -607,6 +607,18 @@ impl Conn {
     /// functions by it, the way this enum chooses a driver. Reading it is not
     /// naming a driver type (constraint 9): the variant says *which*, and the
     /// client inside stays this crate's.
+    /// The session time zone this target reads an offset-less date/time value
+    /// in, as the session reported it before pbps set anything
+    /// (DEC-1916.1). `None` on an engine with no session zone: SQL Server's
+    /// `datetimeoffset` carries its offset or is read as `+00:00`.
+    #[must_use]
+    pub fn session_zone(&self) -> Option<&pbps_model::SessionZone> {
+        match self {
+            Conn::Mssql(_) => None,
+            Conn::Postgres(c) => Some(c.zone()),
+        }
+    }
+
     #[must_use]
     pub const fn driver(&self) -> Driver {
         match self {
@@ -721,19 +733,19 @@ impl Conn {
     /// through a plan leaves the earlier ones committable — and it is asked
     /// for rather than held here, so this crate keeps to what it owns: that a
     /// transaction is opened, and closed again on every path (ADR-0014 §2).
-    pub async fn begin(&mut self, framing: TransactionFraming) -> Result<(), DbError> {
-        self.execute(framing.begin).await
+    pub async fn begin(&mut self, framing: &TransactionFraming) -> Result<(), DbError> {
+        self.execute(&framing.begin).await
     }
 
-    pub async fn commit(&mut self, framing: TransactionFraming) -> Result<(), DbError> {
-        self.execute(framing.commit).await
+    pub async fn commit(&mut self, framing: &TransactionFraming) -> Result<(), DbError> {
+        self.execute(&framing.commit).await
     }
 
     /// Rolls back. The dialect's statement is expected to tolerate a
     /// transaction the server has already killed, so that its own error cannot
     /// replace the real failure — the statement that broke — with a second one.
-    pub async fn rollback(&mut self, framing: TransactionFraming) -> Result<(), DbError> {
-        self.execute(framing.rollback).await
+    pub async fn rollback(&mut self, framing: &TransactionFraming) -> Result<(), DbError> {
+        self.execute(&framing.rollback).await
     }
 }
 

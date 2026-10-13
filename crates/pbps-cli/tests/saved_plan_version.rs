@@ -187,6 +187,7 @@ fn ordinary_current_artifacts_keep_their_checksum_and_approval_gate() {
         "mssql",
         "fixture",
         PlanBaseline {
+            time_zone: None,
             description: "fixture".into(),
             checksum: "00".repeat(32),
             database_collation: None,

@@ -47,6 +47,7 @@ pub mod storage;
 pub mod strategy;
 pub mod types;
 pub mod uid;
+pub mod zone;
 
 pub use change::{
     CellAfter, Change, ChangeSet, ColumnField, ColumnPromise, DetachedKind, DetachedName, Dropped,
@@ -86,3 +87,4 @@ pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_read
 pub use strategy::{Strategies, Strategy};
 pub use types::{ColumnType, TypeArg, TypeParseError};
 pub use uid::{Uid, UidError, UidKind};
+pub use zone::{SessionZone, ZoneError};

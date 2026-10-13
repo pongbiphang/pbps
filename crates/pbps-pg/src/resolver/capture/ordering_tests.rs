@@ -302,6 +302,7 @@ async fn exercise(target_connection: String, scratch_connection: String, worker:
         "postgres",
         "fixture",
         pbps_model::PlanBaseline {
+            time_zone: None,
             description: "empty fixture".into(),
             checksum: "00".repeat(32),
             database_collation: None,

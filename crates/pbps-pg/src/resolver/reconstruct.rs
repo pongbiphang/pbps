@@ -52,6 +52,11 @@ pub enum ReconstructError {
     Interrupted { declaration: String, reason: String },
     #[error("scratch compilation could not {0} its transaction")]
     Transaction(&'static str),
+    /// The scratch server does not know the target's time zone, so nothing it
+    /// compiles would read an offset-less value as the target does
+    /// (DEC-1916.1).
+    #[error("the scratch server cannot use the target's time zone {zone:?}: {reason}")]
+    Zone { zone: String, reason: String },
     #[error(
         "{0} has a generated column calling a declared function that itself needs the table; \
          no order compiles both"
@@ -496,21 +501,41 @@ impl Reconstruction {
     /// as whatever role the session currently is — the reproduced deployer,
     /// which the scope has entered. Committed only when all of it compiled;
     /// a failure leaves nothing behind and names its declaration.
+    ///
+    /// `zone` is the **target's**, not the scratch server's own: a declared
+    /// offset-less default compiles to the instant the target would store
+    /// (DEC-1916.1). A scratch server that does not know the zone is refused
+    /// by name rather than compiled in another one.
     pub async fn compile(
         &mut self,
         dialect: &crate::Postgres,
+        zone: &pbps_model::SessionZone,
         conn: &mut impl pbps_db::transport::ExecuteConnection,
     ) -> Result<(), ReconstructError> {
-        let framing = dialect.transaction_framing();
-        conn.execute(framing.begin)
-            .await
-            .map_err(|_| ReconstructError::Transaction("begin"))?;
+        let framing = dialect.transaction_framing(zone);
+        conn.execute(&framing.begin).await.map_err(|e| {
+            // `invalid_parameter_value`, measured on 18.6 for an unknown
+            // `TimeZone`. The zone is the one setting in the pins that is not
+            // a constant, so it is the one this can be about.
+            if let pbps_db::DbError::Driver {
+                code: Some(code), ..
+            } = &e
+                && code == "22023"
+            {
+                ReconstructError::Zone {
+                    zone: zone.to_string(),
+                    reason: e.to_string(),
+                }
+            } else {
+                ReconstructError::Transaction("begin")
+            }
+        })?;
         let outcome = self.compile_steps(conn).await;
         if outcome.is_err() {
-            let _ = conn.execute(framing.rollback).await;
+            let _ = conn.execute(&framing.rollback).await;
             return outcome;
         }
-        conn.execute(framing.commit)
+        conn.execute(&framing.commit)
             .await
             .map_err(|_| ReconstructError::Transaction("commit"))
     }

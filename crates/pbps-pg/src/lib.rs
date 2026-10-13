@@ -32,8 +32,8 @@ use std::borrow::Cow;
 
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
 use pbps_model::{
-    Change, ColumnType, Module, ModuleId, ModuleKind, Role, RoutineArg, Schema, Strategy, Table,
-    TableName,
+    Change, ColumnType, Module, ModuleId, ModuleKind, Role, RoutineArg, Schema, SessionZone,
+    Strategy, Table, TableName,
 };
 
 mod ambiguity;
@@ -490,32 +490,30 @@ fn quote(ident: &str) -> Result<String, DialectError> {
 
 /// The settings every write of this dialect runs under, as one statement.
 ///
-/// A macro rather than a constant because the framing needs a **literal**:
-/// [`Dialect::transaction_framing`] builds `begin` by `concat!`ing it with
-/// `BEGIN;`, and `concat!` takes literals and not constants. Transactional
-/// execution, staged/resumed execution and rendered scripts share this text,
-/// so their parser settings cannot drift apart.
+/// Transactional execution, staged/resumed execution and rendered scripts
+/// share this text, so their parser settings cannot drift apart.
 ///
 /// The empty `search_path` is the one setting here that is not a parser's:
 /// pbps's own SQL between the scopes must reach no operator a schema user
 /// added (DEC-1564.1). `pbps-db` sets it on every connection already; here it
 /// reaches a rendered script, and every scope ends on it.
-macro_rules! session_pins {
-    () => {
+///
+/// `TimeZone` is the target's own, which the plan recorded, and not UTC: an
+/// offset-less `timestamptz` is read in the target's zone (DEC-1916.1). It
+/// follows `standard_conforming_strings`, which makes doubling the whole of
+/// quoting its literal.
+pub(crate) fn session_pins(zone: &SessionZone) -> String {
+    format!(
         "SET search_path = ''; \
          SET standard_conforming_strings = on; SET check_function_bodies = on; \
-         SET DateStyle = 'ISO, MDY'; SET TimeZone = 'UTC'; \
+         SET DateStyle = 'ISO, MDY'; SET TimeZone = {zone}; \
          SET IntervalStyle = 'postgres'; \
          SET timezone_abbreviations = 'Default'; \
          SET transform_null_equals = off; \
-         SET bytea_output = 'hex'; SET extra_float_digits = 1;"
-    };
+         SET bytea_output = 'hex'; SET extra_float_digits = 1;",
+        zone = emit::literal(zone.as_str())
+    )
 }
-
-/// [`session_pins!`] as a constant, for a module declared before the macro.
-/// `plan --db` stores a partition's own default under it, so the probe parses
-/// as the apply will (#1609 review).
-pub(crate) const SESSION_PINS: &str = session_pins!();
 
 /// What this engine makes of a column's declared default: one the applying
 /// session would decide, and a NULL it erases. A table's column, and a
@@ -718,13 +716,17 @@ impl Dialect for Postgres {
     /// same transaction ran the body another session had just replaced
     /// (measured on 18.6, DEC-319.1). `READ COMMITTED` gives each check a fresh
     /// snapshot, so it sees what the statements ran.
-    fn transaction_framing(&self) -> TransactionFraming {
+    fn transaction_framing(&self, zone: &SessionZone) -> TransactionFraming {
         TransactionFraming {
-            begin: concat!(session_pins!(), " BEGIN ISOLATION LEVEL READ COMMITTED;"),
-            commit: "COMMIT;",
+            begin: format!(
+                "{} BEGIN ISOLATION LEVEL READ COMMITTED;",
+                session_pins(zone)
+            )
+            .into(),
+            commit: "COMMIT;".into(),
             // Tolerates a transaction the server has already killed, so that
             // this statement's own error cannot replace the real failure.
-            rollback: "ROLLBACK;",
+            rollback: "ROLLBACK;".into(),
         }
     }
 
@@ -737,9 +739,9 @@ impl Dialect for Postgres {
     /// outlive this transaction.
     fn probe_framing(&self) -> Option<TransactionFraming> {
         Some(TransactionFraming {
-            begin: "BEGIN READ ONLY;",
-            commit: "COMMIT;",
-            rollback: "ROLLBACK;",
+            begin: "BEGIN READ ONLY;".into(),
+            commit: "COMMIT;".into(),
+            rollback: "ROLLBACK;".into(),
         })
     }
 
@@ -754,8 +756,8 @@ impl Dialect for Postgres {
     /// the connection instead. Plain `SET`, not `SET LOCAL`, for the reason
     /// given there: outside a transaction `SET LOCAL` is a warning and a no-op,
     /// and a pin that quietly does nothing is the failure it exists to prevent.
-    fn session_pins(&self) -> Option<&'static str> {
-        Some(session_pins!())
+    fn session_pins(&self, zone: &SessionZone) -> Option<String> {
+        Some(session_pins(zone))
     }
 
     /// None: `text` is PostgreSQL's ordinary unbounded string, not SQL
@@ -2930,7 +2932,34 @@ mod tests {
 
     #[test]
     fn an_empty_postgres_script_does_not_change_session_settings() {
-        assert!(pbps_dialect::render_script(&[], &super::Postgres::new()).is_empty());
+        assert!(
+            pbps_dialect::render_script(
+                &[],
+                &super::Postgres::new(),
+                &pbps_model::SessionZone::utc()
+            )
+            .is_empty()
+        );
+    }
+
+    /// The zone is replayed as the engine spelled it, quoted, into every pin
+    /// a write runs under (DEC-1916.1).
+    #[test]
+    fn the_write_pins_carry_the_targets_zone_as_a_quoted_literal() {
+        let pg = super::Postgres::new();
+        let zone = pbps_model::SessionZone::new("<+08>-08").unwrap();
+        let pins = pg.session_pins(&zone).expect("this dialect pins");
+        assert!(pins.contains("SET TimeZone = '<+08>-08';"), "{pins}");
+        assert!(!pins.contains("'UTC'"), "{pins}");
+        let framing = pg.transaction_framing(&zone);
+        assert!(framing.begin.starts_with(&pins), "{}", framing.begin);
+        // A quote in the text cannot end the literal early.
+        let odd = pbps_model::SessionZone::new("a'b").unwrap();
+        assert!(
+            pg.session_pins(&odd)
+                .unwrap()
+                .contains("SET TimeZone = 'a''b';")
+        );
     }
 
     /// A table's rename keeps its `serial`'s sequence under the name the old

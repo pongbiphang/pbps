@@ -23,8 +23,8 @@ use pbps_config::Project;
 use pbps_db::Conn;
 use pbps_dialect::Dialect;
 use pbps_model::{
-    DataScopes, IdsFile, ModuleId, ObservedRows, RowScope, Schema, StateKind, StateSnapshot,
-    TableName,
+    DataScopes, IdsFile, ModuleId, ObservedRows, RowScope, Schema, SessionZone, StateKind,
+    StateSnapshot, TableName,
 };
 
 use crate::db::{self, Target};
@@ -2166,6 +2166,58 @@ async fn refuse_moved_database_collation(
         );
     }
     Ok(())
+}
+
+/// Refuses a plan whose target reads offset-less date/time values in another
+/// zone than the one it was computed in (DEC-1916.1). Every such value the plan
+/// writes, and every pin it runs under, is the recorded zone's; in another
+/// zone the same statements store other instants, and nothing in them looks
+/// different (see [`pbps_model::PlanBaseline::time_zone`]).
+fn refuse_moved_time_zone(
+    conn: &Conn,
+    plan: &pbps_model::SavedPlan,
+    label: &str,
+) -> anyhow::Result<()> {
+    match moved_time_zone(plan.baseline.time_zone.as_ref(), conn.session_zone(), label) {
+        Some(refusal) => Err(anyhow::anyhow!(refusal)),
+        None => Ok(()),
+    }
+}
+
+/// [`refuse_moved_time_zone`]'s verdict, apart from the connection.
+///
+/// The zones compare by their exact text, as the engine reported them: two
+/// spellings of one zone (`UTC`, `Etc/UTC`) are refused too, because which
+/// spellings agree is a fact about the engine's tz database that this side
+/// cannot see, and a spelling costs one `ALTER` where a wrong instant costs
+/// every value written. Absent on one side only is refused as well: a plan
+/// that records no zone for an engine that has one was not computed by this
+/// build's `plan --db`.
+fn moved_time_zone(
+    planned: Option<&SessionZone>,
+    now: Option<&SessionZone>,
+    label: &str,
+) -> Option<String> {
+    let remedy = "Recompute the plan with `pbps plan --db`, or have the zone set back \
+                  (`ALTER DATABASE … SET timezone` or `ALTER ROLE … SET timezone`).";
+    match (planned, now) {
+        (None, None) => None,
+        (Some(planned), Some(now)) if planned == now => None,
+        (Some(planned), Some(now)) => Some(format!(
+            "`{label}` reads offset-less date/time values in `{now}` now, and this plan \
+             was computed in `{planned}`.\nEvery `timestamptz` and `timetz` it writes \
+             without an offset would be stored at another instant than the one approved. \
+             {remedy}"
+        )),
+        (Some(planned), None) => Some(format!(
+            "`{label}` reports no session time zone, and this plan was computed in \
+             `{planned}`. {remedy}"
+        )),
+        (None, Some(now)) => Some(format!(
+            "`{label}` reads offset-less date/time values in `{now}`, and this plan records \
+             no time zone, so what it writes was not read in one. {remedy}"
+        )),
+    }
 }
 
 /// The catalog, read once.
@@ -6027,11 +6079,15 @@ pub fn cmd_bootstrap(
     // as one name, DECISIONS 123) and after the build (a definer routine
     // without a pinned path, #322), so only the end of the build is past all
     // of them. A write that fails there rolls the build back with it.
+    //
+    // Emitted now and rendered at the write: the pins carry the zone the
+    // build ran in, which a target tells only once connected (DEC-1916.1).
     let script = sql_out
-        .map(|_| crate::render_sql(&cs, dialect.as_ref(), "an empty database"))
+        .map(|_| crate::statements(&cs, dialect.as_ref()))
         .transpose()?;
-    let write_script = || -> anyhow::Result<()> {
-        if let (Some(path), Some(script)) = (sql_out, &script) {
+    let write_script = |zone: &SessionZone| -> anyhow::Result<()> {
+        if let (Some(path), Some(statements)) = (sql_out, &script) {
+            let script = crate::sql_script(statements, dialect.as_ref(), "an empty database", zone);
             std::fs::write(path, script)
                 .with_context(|| format!("cannot write `{}`", path.display()))?;
             println!("wrote {}", path.display());
@@ -6046,7 +6102,8 @@ pub fn cmd_bootstrap(
                 crate::report::placeholder("file")
             );
         }
-        return write_script();
+        // No target to ask: UTC until #1918 (DEC-1916.1).
+        return write_script(&SessionZone::offline_utc());
     };
 
     let statements = crate::statements(&cs, dialect.as_ref())?;
@@ -6242,7 +6299,7 @@ pub fn cmd_bootstrap(
             // declared is exactly what bootstrap holds (ADR-0009 §2.2).
             snapshot.declared = pbps_model::Declared::from_schema(&loaded.schema);
             let id = crate::engine::record(&mut conn, &snapshot).await?;
-            write_script()?;
+            write_script(&pin_zone(&conn))?;
             Ok::<_, anyhow::Error>((id, snapshot))
         }
         .await;
@@ -6841,7 +6898,8 @@ pub fn cmd_plan_db(
             )?;
         }
         crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
-        conn.begin(dialect.transaction_framing()).await?;
+        conn.begin(&dialect.transaction_framing(&pin_zone(&conn)))
+            .await?;
         let checks = async {
             // In the read-only planning transaction, with everything below:
             // the names this plan creates, asked of PostgreSQL's whole
@@ -6933,7 +6991,9 @@ pub fn cmd_plan_db(
             Ok::<_, anyhow::Error>((rename_evidence, dependents, rebuilds, drops, slots))
         }
         .await;
-        let rollback = conn.rollback(dialect.transaction_framing()).await;
+        let rollback = conn
+            .rollback(&dialect.transaction_framing(&pin_zone(&conn)))
+            .await;
         let (rename_evidence, dependents, rebuilds, drop_blockers, logical_slots) = checks?;
         rollback?;
         // Again, over what the dependents added: a rebuild the plan now
@@ -7179,7 +7239,13 @@ pub fn cmd_plan_db(
         };
         Ok(Connected::Ordinary(Box::new((
             cs,
-            (baseline, managed.database_collation.clone()),
+            // The zone this session started in: what every offset-less
+            // value above was read in, and what the apply pins (DEC-1916.1).
+            (
+                baseline,
+                managed.database_collation.clone(),
+                conn.session_zone().cloned(),
+            ),
             format!("{} as queried (entry #{})", target.label, entry.id),
             vec![
                 permission_support,
@@ -7202,7 +7268,7 @@ pub fn cmd_plan_db(
     })?;
     let (
         cs,
-        (baseline_checksum, baseline_collation),
+        (baseline_checksum, baseline_collation, baseline_zone),
         baseline_description,
         connected_checks,
         findings,
@@ -7254,6 +7320,7 @@ pub fn cmd_plan_db(
     let (tables, modules) = crate::report::touched(&names);
     let data = crate::PlanData {
         baseline: baseline_description.clone(),
+        time_zone: baseline_zone.as_ref().map(ToString::to_string),
         changes: cs.changes.len(),
         tables,
         modules,
@@ -7266,6 +7333,11 @@ pub fn cmd_plan_db(
     };
     if !json {
         println!("Baseline: {baseline_description}");
+        if let Some(zone) = &baseline_zone {
+            // Named because nothing in a statement shows it: the same
+            // `2026-02-01` is another instant in another zone (DEC-1916.1).
+            println!("Offset-less date/time values read in {zone}");
+        }
         // Case 1 has no resolver to report and claims no verification.
         if let Some(resolution) = &resolution {
             println!(
@@ -7298,6 +7370,7 @@ pub fn cmd_plan_db(
             description: baseline_description,
             checksum: baseline_checksum,
             database_collation: baseline_collation,
+            time_zone: baseline_zone,
         },
         cs,
         resolved.ids,
@@ -7334,7 +7407,16 @@ pub fn cmd_plan_db(
         format!(
             "-- Generated by pbps against {}\n-- Applyable only through `pbps apply --plan`; never hand-edit this file.\n\n{}",
             plan.baseline.description,
-            pbps_dialect::render_script(&statements, dialect.as_ref())
+            pbps_dialect::render_script(
+                &statements,
+                dialect.as_ref(),
+                // The zone the plan recorded: the script is the plan's, and
+                // runs where the plan was computed (DEC-1916.1).
+                plan.baseline
+                    .time_zone
+                    .as_ref()
+                    .unwrap_or(&SessionZone::utc()),
+            )
         )
     });
     let rendered = out.map(|_| crate::rendered_plan(&plan)).transpose()?;
@@ -7800,6 +7882,10 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
             target.label
         );
     };
+    // First, before anything is read: in another zone every offset-less
+    // value reads back as other text, so the drift check below would report
+    // the zone as a change nobody made (DEC-1916.1).
+    refuse_moved_time_zone(conn, plan, &target.label)?;
     refuse_mid_deployment(&entry, &target.label)?;
     // Under the lock, before anything runs: a table made at a history's name
     // since the plan was computed would be adopted, not refused (#1176).
@@ -7894,7 +7980,8 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
 
     println!("Applying {} statement(s)...", statements.len());
     let result = async {
-        conn.begin(dialect.transaction_framing()).await?;
+        conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
+            .await?;
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
         crate::engine::check_module_dependents(conn, &plan.changes, &scoped.schema, &plan.ids)
             .await?;
@@ -8146,6 +8233,9 @@ async fn apply_staged_under_lock(
     // baseline from some other read (DECISIONS 174).
     // A fresh run asks what a transactional one does; a resumed one created
     // the history itself, before its checkpoint (DEC-1176.1).
+    // First, for a fresh run and a resumed one alike, as in
+    // [`apply_under_lock`] (DEC-1916.1).
+    refuse_moved_time_zone(conn, plan, &target.label)?;
     if !resume {
         refuse_taken_history_names(conn, &plan.changes, &target.label).await?;
         // Nothing binds a saved plan to a server: asked again here (#1502).
@@ -8400,7 +8490,8 @@ async fn apply_staged_under_lock(
             // A staged row is still one atomic statement. Hold its trigger
             // locks through the write, then commit before the checkpoint;
             // non-transactional DDL retains the ordinary staged path.
-            conn.begin(dialect.transaction_framing()).await?;
+            conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
+                .await?;
             let result = async {
                 let guard = crate::engine::prepare_data_writes(
                     conn,
@@ -8441,7 +8532,8 @@ async fn apply_staged_under_lock(
             // its own, so that a SECURITY DEFINER routine outside the safe
             // form is refused before its step commits rather than after
             // (#322). A routine a later step creates is not there yet.
-            conn.begin(dialect.transaction_framing()).await?;
+            conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
+                .await?;
             let result = async {
                 conn.execute(&stmt.sql).await?;
                 crate::engine::refuse_unsafe_definers(
@@ -9011,6 +9103,19 @@ async fn check_role_drops(
     Ok(())
 }
 
+/// The zone a deployment over `conn` pins (DEC-1916.1): the one the session
+/// started in.
+///
+/// At `plan --db` that is the zone the plan records. At `apply` it is the
+/// zone the plan recorded, because [`refuse_moved_time_zone`] has refused
+/// before the first statement unless the two are one. An engine with no
+/// session zone ignores the argument, which is why UTC is no guess there.
+fn pin_zone(conn: &Conn) -> SessionZone {
+    conn.session_zone()
+        .cloned()
+        .unwrap_or_else(SessionZone::utc)
+}
+
 /// The settings this dialect's statements depend on, established on the
 /// connection.
 ///
@@ -9018,8 +9123,8 @@ async fn check_role_drops(
 /// than one place on purpose. See [`run_probes`], which does not trust its
 /// caller to have called this.
 async fn pin_session(conn: &mut Conn, dialect: &dyn pbps_dialect::Dialect) -> anyhow::Result<()> {
-    if let Some(pins) = dialect.session_pins() {
-        conn.execute(pins)
+    if let Some(pins) = dialect.session_pins(&pin_zone(conn)) {
+        conn.execute(&pins)
             .await
             .context("the session settings this dialect's statements depend on could not be set")?;
     }
@@ -9032,9 +9137,12 @@ async fn drop_preflight(
     changes: &pbps_model::ChangeSet,
     ids: &IdsFile,
 ) -> anyhow::Result<()> {
-    conn.begin(dialect.transaction_framing()).await?;
+    conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
+        .await?;
     let result = crate::engine::check_drop_blockers(conn, changes, ids).await;
-    let rollback = conn.rollback(dialect.transaction_framing()).await;
+    let rollback = conn
+        .rollback(&dialect.transaction_framing(&pin_zone(conn)))
+        .await;
     result?;
     rollback?;
     Ok(())
@@ -9318,11 +9426,11 @@ async fn probe_query(
     let Some(framing) = dialect.probe_framing() else {
         return Ok(conn.query(sql).await);
     };
-    conn.begin(framing)
+    conn.begin(&framing)
         .await
         .context("could not open the transaction a pre-flight probe runs in")?;
     let rows = conn.query(sql).await;
-    conn.rollback(framing)
+    conn.rollback(&framing)
         .await
         .context("could not close the transaction a pre-flight probe ran in")?;
     Ok(rows)
@@ -9371,7 +9479,7 @@ async fn execute_transaction_body(
     dialect: &dyn Dialect,
     statements: &[pbps_dialect::Statement],
 ) -> anyhow::Result<()> {
-    conn.begin(dialect.transaction_framing())
+    conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
         .await
         .context("cannot open a transaction")?;
     execute_statements(conn, statements, &crate::engine::DataWriteGuard::default()).await
@@ -9414,11 +9522,11 @@ async fn finish_transaction<T>(
     dialect: &dyn Dialect,
     result: anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let framing = dialect.transaction_framing();
+    let framing = dialect.transaction_framing(&pin_zone(conn));
     match result {
         Ok(value) => {
-            if let Err(error) = conn.commit(framing).await {
-                let _ = conn.rollback(framing).await;
+            if let Err(error) = conn.commit(&framing).await {
+                let _ = conn.rollback(&framing).await;
                 return Err(
                     anyhow::Error::new(error).context("the transaction could not be committed")
                 );
@@ -9426,7 +9534,7 @@ async fn finish_transaction<T>(
             Ok(value)
         }
         Err(error) => {
-            let _ = conn.rollback(framing).await;
+            let _ = conn.rollback(&framing).await;
             Err(error)
         }
     }
@@ -9498,6 +9606,50 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+    fn zone(text: &str) -> pbps_model::SessionZone {
+        pbps_model::SessionZone::new(text).unwrap()
+    }
+
+    #[test]
+    fn an_apply_in_the_zone_the_plan_recorded_goes_ahead() {
+        let taipei = zone("Asia/Taipei");
+        assert_eq!(
+            super::moved_time_zone(Some(&taipei), Some(&taipei), "prod"),
+            None
+        );
+        // SQL Server: no zone on either side, nothing to hold.
+        assert_eq!(super::moved_time_zone(None, None, "prod"), None);
+    }
+
+    #[test]
+    fn an_apply_in_another_zone_is_refused_naming_both() {
+        let said = super::moved_time_zone(
+            Some(&zone("Asia/Taipei")),
+            Some(&zone("America/New_York")),
+            "prod",
+        )
+        .expect("refused");
+        assert!(said.contains("`America/New_York` now"), "{said}");
+        assert!(said.contains("computed in `Asia/Taipei`"), "{said}");
+        assert!(said.contains("pbps plan --db"), "{said}");
+        assert!(said.contains("ALTER DATABASE"), "{said}");
+    }
+
+    #[test]
+    fn two_spellings_of_one_zone_are_refused_like_two_zones() {
+        assert!(
+            super::moved_time_zone(Some(&zone("UTC")), Some(&zone("Etc/UTC")), "prod").is_some()
+        );
+    }
+
+    #[test]
+    fn a_zone_on_one_side_only_is_refused() {
+        let taipei = zone("Asia/Taipei");
+        assert!(super::moved_time_zone(Some(&taipei), None, "prod").is_some());
+        let said = super::moved_time_zone(None, Some(&taipei), "prod").expect("refused");
+        assert!(said.contains("records no time zone"), "{said}");
+    }
+
     fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<TableName>) {
         let ids = crate::plan_fixture::ids(cs);
         let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();
@@ -12546,7 +12698,8 @@ mod tests {
         // test's ground truth and must not move with the thing under test, or
         // a regression fails on the wrong assertion.
         conn.execute(
-            pbps_dialect::Dialect::session_pins(&dialect).expect("this dialect pins its session"),
+            &pbps_dialect::Dialect::session_pins(&dialect, &pin_zone(&conn))
+                .expect("this dialect pins its session"),
         )
         .await
         .expect("the pins the framing would establish");

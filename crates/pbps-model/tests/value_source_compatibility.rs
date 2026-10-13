@@ -75,6 +75,7 @@ fn artifacts() -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
         "postgres",
         "2026-10-12T00:00:00Z",
         PlanBaseline {
+            time_zone: None,
             description: "value-source byte fixture".into(),
             checksum: state_checksum(&schema, &ids),
             database_collation: None,

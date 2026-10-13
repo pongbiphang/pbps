@@ -100,8 +100,8 @@ DEC-1789.1). `doctor` warns when a range series ends within a horizon of the
 newest partition that holds a row (`partition_runway:` in `pbps.yml`, twice the
 newest partition's width by default), and when the DEFAULT holds rows of a
 declared partition the database lacks; a question it could not answer is its own
-`-unknown` finding (#1789, DEC-1789.2). Open: non-UTC `timestamptz` bounds
-(#1757).
+`-unknown` finding (#1789, DEC-1789.2). Open: `timestamptz` bounds in the
+database's own zone (#1915).
 
 A SQL Server column may name its collation (`collation:`); `pull` declares one
 that differs from the database's default, and a collation change is a planned
@@ -488,8 +488,9 @@ on` are pinned by the transaction framing, the earlier batch a transactional
 apply runs (DECISIONS 260), and so are the seven that decide what a declared
 expression *means* or what a conversion writes back — `DateStyle`, `TimeZone`,
 `IntervalStyle`, `timezone_abbreviations`, `transform_null_equals`,
-`bytea_output` and `extra_float_digits`. They are constants rather
-than per-object, and measured, the same check constraint stores a different day,
+`bytea_output` and `extra_float_digits`. They are fixed rather than
+per-object — `TimeZone` is the target database's own zone, which the plan
+records and `apply` requires again (DEC-1916.1) — and measured, the same check constraint stores a different day,
 a different instant, an interval with the opposite sign, a time fifteen and a
 half hours out, and a predicate that is no longer the one that was written —
 without a word (DECISIONS 267). A staged apply opens no

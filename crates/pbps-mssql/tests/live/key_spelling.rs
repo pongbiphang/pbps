@@ -365,7 +365,7 @@ async fn exported_updates_keep_key_capture_variables_in_separate_batches() {
                 .unwrap(),
         );
     }
-    let script = pbps_dialect::render_script(&statements, &Mssql);
+    let script = pbps_dialect::render_script(&statements, &Mssql, &pbps_model::SessionZone::utc());
     let mut results = Vec::new();
     for batch in script
         .split("\nGO\n")

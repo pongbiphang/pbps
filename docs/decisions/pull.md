@@ -219,6 +219,10 @@ says how to add an entry here.
     which would turn a readable database into an unreadable one for a difference
     nobody has yet shown.
 
+*Amended by [DEC-1916.1](session.md#dec-1916-1): `TimeZone` is the target's
+own zone, not UTC. It is still fixed for a target, which is what keeps two
+pulls of one database agreeing.*
+
 <a id="decision-255"></a>
 
 255. **A name is round-tripped through the declaration format, not checked

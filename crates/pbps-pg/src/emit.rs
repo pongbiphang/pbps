@@ -1324,7 +1324,7 @@ fn dollar_tag(body: &str) -> String {
 /// Doubling is the whole rule only while `standard_conforming_strings` is `on`,
 /// which the transaction framing pins and which this crate's scanner already
 /// assumes (ADR-0011 Amendment 2).
-fn literal(s: &str) -> String {
+pub(crate) fn literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
@@ -2672,10 +2672,12 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             // knows the shape and answers `Narrowing`, but `Narrowing` is a
             // risk a human clears at the gate, and what the human cleared was
             // the loss, not a zone that was never in the plan. The framing
-            // pins `TimeZone = UTC` for everything pbps applies, which makes
-            // the result *reproducible* — it does not make it *declared*, and
-            // a silent UTC reinterpretation of every stored value is exactly
-            // the undeclared transformation ADR-0012 §5 refuses.
+            // pins the target's recorded zone for everything pbps applies
+            // (DEC-1916.1), which makes the result *reproducible* — it does
+            // not make it *declared*, and a silent reinterpretation of every
+            // stored value in that zone is exactly the undeclared
+            // transformation ADR-0012 §5 refuses. Whether the recorded zone
+            // changes that answer is #1919.
             if types::depends_on_the_session_time_zone(&was, &normalized) {
                 return Err(invalid(format!(
                     "column `{}` cannot be changed from `{was}` to `{normalized}`: the \

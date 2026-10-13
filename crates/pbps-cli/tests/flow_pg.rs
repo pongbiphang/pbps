@@ -772,8 +772,18 @@ SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='app.t'::regc
             output.contains("initial=off,German, DMY"),
             "{name}: {output}"
         );
+        // A connected script replays the target's own zone, as the fixture
+        // spells it; the offline ones have no target to ask and keep UTC
+        // until #1918 (DEC-1916.1).
+        let zone = if name == "connected" {
+            "Etc/UTC"
+        } else {
+            "UTC"
+        };
         assert!(
-            output.contains("pins=on,on,ISO, MDY,UTC,postgres,Default,off,hex,1"),
+            output.contains(&format!(
+                "pins=on,on,ISO, MDY,{zone},postgres,Default,off,hex,1"
+            )),
             "{name}: {output}"
         );
         assert!(output.contains("'2026-01-02'::date"), "{name}: {output}");
@@ -8283,6 +8293,70 @@ fn doctor_does_not_queue_behind_a_locked_partitioned_table_before_postgres_17() 
     partition_runway::locked(&server, "runway-lock-1789-old");
 }
 
+/// `doctor`'s runway reader parses a `timestamptz` bound as UTC text and reads
+/// it in UTC whatever the database's own zone (DEC-1789.2, DEC-1916.1): on a
+/// database in `Asia/Taipei` a weekly series that ends with its newest row is
+/// still reported short, in `+00`, and never as a question it could not
+/// answer. On 16 and 18.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn doctor_reads_a_runway_in_utc_on_a_database_in_another_zone() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        let own = OwnDatabase::new(server, &format!("runway_zone_1916_{k}"));
+        let connection = own.connection();
+        on_server(
+            connection,
+            &format!(
+                "CREATE SCHEMA app; ALTER DATABASE \"{}\" SET timezone = 'Asia/Taipei'",
+                own.name
+            ),
+        );
+        let d = Demo::new(&format!("runway-zone-1916-{k}"));
+        std::fs::write(
+            d.dir.join("schema/app.tz.yml"),
+            "table: app.tz\ncolumns:\n  id: {type: bigint, nullable: false}\n  \
+             k: {type: timestamptz, nullable: false}\nprimary_key: [id, k]\n\
+             partition_by: [k]\npartitions:\n  \
+             tz_2026_12_28: {from: ['2026-12-28 00:00:00+00'], to: ['2027-01-04 00:00:00+00']}\n  \
+             tz_2027_01_04: {from: ['2027-01-04 00:00:00+00'], to: ['2027-01-11 00:00:00+00']}\n",
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        on_server(
+            connection,
+            "INSERT INTO app.tz VALUES (1, '2027-01-05 10:00:00+00')",
+        );
+        assert_eq!(
+            text_of(connection, "SELECT current_setting('TimeZone')"),
+            "Asia/Taipei",
+            "the scenario needs a session outside UTC"
+        );
+
+        let o = d.run(&["doctor", "--db", connection, "--format", "json"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        let json: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        let findings = json["findings"].as_array().unwrap();
+        let with = |id: &str| -> Vec<&serde_json::Value> {
+            findings.iter().filter(|f| f["id"] == id).collect()
+        };
+        assert!(
+            with("doctor.partition-runway-unknown").is_empty(),
+            "a bound read in Taipei would be refused as not in UTC: {json}"
+        );
+        let short = with("doctor.partition-runway");
+        assert_eq!(short.len(), 1, "{json}");
+        let message = short[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("end at `2027-01-11 00:00:00+00`")
+                && message.contains("to `2027-01-18 00:00:00+00` at least"),
+            "{message}"
+        );
+    }
+}
+
 fn generated_series_flow(server: &str, slug: &str) {
     let own = OwnDatabase::new(server, slug);
     let conn = own.connection().to_owned();
@@ -13338,7 +13412,9 @@ fn constraint_trigger_guards_accept_only_the_recorded_managed_definition() {
                 table: "app.t".parse().unwrap(),
                 operation: RowOperation::Insert,
             };
-            conn.begin(pg.transaction_framing()).await.unwrap();
+            conn.begin(&pg.transaction_framing(&pbps_model::SessionZone::utc()))
+                .await
+                .unwrap();
             let guard = pbps_pg::data_triggers::prepare(
                 &mut conn,
                 std::slice::from_ref(&write),
@@ -13351,7 +13427,9 @@ fn constraint_trigger_guards_accept_only_the_recorded_managed_definition() {
                 .await
                 .unwrap();
             conn.execute("INSERT INTO app.t VALUES (1)").await.unwrap();
-            conn.commit(pg.transaction_framing()).await.unwrap();
+            conn.commit(&pg.transaction_framing(&pbps_model::SessionZone::utc()))
+                .await
+                .unwrap();
             // A matching body without the marker must not authenticate another kind.
             let mut ordinary = baseline.clone();
             ordinary
@@ -13364,7 +13442,9 @@ fn constraint_trigger_guards_accept_only_the_recorded_managed_definition() {
                 .unwrap()
                 .to_owned();
             for record in [ordinary, Default::default()] {
-                conn.begin(pg.transaction_framing()).await.unwrap();
+                conn.begin(&pg.transaction_framing(&pbps_model::SessionZone::utc()))
+                    .await
+                    .unwrap();
                 assert!(
                     pbps_pg::data_triggers::prepare(
                         &mut conn,
@@ -13375,7 +13455,9 @@ fn constraint_trigger_guards_accept_only_the_recorded_managed_definition() {
                     .await
                     .is_err()
                 );
-                conn.rollback(pg.transaction_framing()).await.unwrap();
+                conn.rollback(&pg.transaction_framing(&pbps_model::SessionZone::utc()))
+                    .await
+                    .unwrap();
             }
         });
 }
@@ -14979,12 +15061,12 @@ fn unapproved_data_triggers_cannot_use_the_deployers_privileges() {
                     let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &deployment).await.unwrap();
                     let recorded = pbps_pg::catalog::introspect(&mut conn).await.unwrap().schema;
                     let dialect = pbps_pg::Postgres::new();
-                    conn.begin(dialect.transaction_framing()).await.unwrap();
+                    conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                     let refused = pbps_pg::data_triggers::prepare(&mut conn, &[pbps_dialect::RowWrite {
                         table: pbps_model::TableName::new("app", "t"), operation: pbps_dialect::RowOperation::Insert,
                     }], &recorded, &Default::default()).await;
                     assert!(refused.is_err(), "recording a lower-privileged owner's invoker trigger must not authorize it");
-                    conn.rollback(dialect.transaction_framing()).await.unwrap();
+                    conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 });
             }
             let blocked_plan = d.run(&["plan", "--db", &deployment]);
@@ -15125,7 +15207,7 @@ fn a_trigger_guard_holds_off_replacement_until_the_write_finishes() {
         let baseline = pbps_pg::catalog::introspect(&mut writer).await.unwrap().schema;
         let dialect = pbps_pg::Postgres::new();
         let mut write = RowWrite { table: pbps_model::TableName::new("app", "t"), operation: RowOperation::Insert };
-        writer.begin(dialect.transaction_framing()).await.unwrap();
+        writer.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         let guard = pbps_pg::data_triggers::prepare(&mut writer, std::slice::from_ref(&write), &baseline, &Default::default()).await.unwrap();
         other.execute("SET lock_timeout = '100ms'").await.unwrap();
         let replace = "CREATE OR REPLACE TRIGGER guarded BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.replacement()";
@@ -15135,15 +15217,15 @@ fn a_trigger_guard_holds_off_replacement_until_the_write_finishes() {
             write.table = pbps_model::TableName::new("app", "renamed");
         pbps_pg::data_triggers::check(&mut writer, &write, &guard).await.unwrap();
         writer.execute("INSERT INTO app.renamed VALUES (1)").await.unwrap();
-        writer.commit(dialect.transaction_framing()).await.unwrap();
+        writer.commit(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         // After release the same replacement succeeds, proving the first
         // failure came from the guard's lock, not invalid DDL or permissions.
         let baseline = pbps_pg::catalog::introspect(&mut writer).await.unwrap().schema;
             other.execute(&replace.replace("ON app.t", "ON app.renamed")).await.unwrap();
-        writer.begin(dialect.transaction_framing()).await.unwrap();
+        writer.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         let refused = pbps_pg::data_triggers::prepare(&mut writer, &[write], &baseline, &Default::default()).await;
         assert!(refused.is_err());
-        writer.rollback(dialect.transaction_framing()).await.unwrap();
+        writer.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
     });
 }
 
@@ -15306,7 +15388,7 @@ fn update_of_generated_columns_follows_their_source_columns() {
                     columns: [column.to_owned()].into(),
                 },
             };
-            conn.begin(dialect.transaction_framing()).await.unwrap();
+            conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             let checked = pbps_pg::data_triggers::prepare(
                 &mut conn,
                 &[write],
@@ -15320,7 +15402,7 @@ fn update_of_generated_columns_follows_their_source_columns() {
                 "column {column}: {:?}",
                 checked.err()
             );
-            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         }
         conn.execute("CREATE FUNCTION public.noop() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; CREATE TRIGGER before_update BEFORE UPDATE ON app.t FOR EACH ROW EXECUTE FUNCTION public.noop(); ALTER TABLE app.t DISABLE TRIGGER before_update; TRUNCATE public.fired; UPDATE app.t SET audit = 'again'").await.unwrap();
         let rows = conn.query("SELECT count(*)::int8 AS n FROM public.fired").await.unwrap();
@@ -15329,10 +15411,10 @@ fn update_of_generated_columns_follows_their_source_columns() {
             table: pbps_model::TableName::new("app", "t"),
             operation: RowOperation::Update { columns: ["audit".to_owned()].into() },
         };
-        conn.begin(dialect.transaction_framing()).await.unwrap();
+        conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         let checked = pbps_pg::data_triggers::prepare(&mut conn, &[write], &Default::default(), &Default::default()).await;
         assert!(checked.is_err(), "a disabled BEFORE ROW trigger still widens generated-column updates");
-        conn.rollback(dialect.transaction_framing()).await.unwrap();
+        conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         // Unless the plan drops it first: `DropModule` is `order_key` 0, so by
         // the row statement the widener is gone and `size` is not touched.
         let write = RowWrite {
@@ -15347,10 +15429,10 @@ fn update_of_generated_columns_follows_their_source_columns() {
             .into(),
             ..Default::default()
         };
-        conn.begin(dialect.transaction_framing()).await.unwrap();
+        conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         let checked = pbps_pg::data_triggers::prepare(&mut conn, &[write], &Default::default(), &removed).await;
         assert!(checked.is_ok(), "a widener the plan drops widens nothing: {:?}", checked.err().map(|e| e.to_string()));
-        conn.rollback(dialect.transaction_framing()).await.unwrap();
+        conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
     });
 }
 
@@ -15634,7 +15716,9 @@ fn effective_ownership_decides_trust(admin: &str, slug: &str) {
                 if !grant.is_empty() {
                     admin.execute(&grant).await.unwrap();
                 }
-                conn.begin(dialect.transaction_framing()).await.unwrap();
+                conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
+                    .await
+                    .unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
                     &mut conn,
                     &[pbps_dialect::RowWrite {
@@ -15646,7 +15730,9 @@ fn effective_ownership_decides_trust(admin: &str, slug: &str) {
                 )
                 .await;
                 let refusal = checked.as_ref().err().map(|e| e.to_string());
-                conn.rollback(dialect.transaction_framing()).await.unwrap();
+                conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
+                    .await
+                    .unwrap();
                 assert_eq!(checked.is_ok(), trusted, "{property}: {refusal:?}");
                 if let Some(message) = refusal {
                     assert!(message.contains("unsafe data trigger"), "{message}");
@@ -15705,7 +15791,10 @@ fn a_membership_granted_after_planning_is_refused_before_the_row_write() {
                 table: pbps_model::TableName::new("app", "t"),
                 operation: pbps_dialect::RowOperation::Insert,
             };
-            writer.begin(dialect.transaction_framing()).await.unwrap();
+            writer
+                .begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
+                .await
+                .unwrap();
             let guard = pbps_pg::data_triggers::prepare(
                 &mut writer,
                 std::slice::from_ref(&write),
@@ -15724,7 +15813,7 @@ fn a_membership_granted_after_planning_is_refused_before_the_row_write() {
                 .unwrap();
             let refused = pbps_pg::data_triggers::check(&mut writer, &write, &guard).await;
             writer
-                .rollback(dialect.transaction_framing())
+                .rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
                 .await
                 .unwrap();
             let message = refused.expect_err("the write must not run").to_string();
@@ -16575,7 +16664,9 @@ fn the_write_closure_follows_writing_actions_and_stops_at_the_others() {
                 table: pbps_model::TableName::new(label, "p"),
                 operation,
             };
-            conn.begin(dialect.transaction_framing()).await.unwrap();
+            conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
+                .await
+                .unwrap();
             let checked = pbps_pg::data_triggers::prepare(
                 &mut conn,
                 &[write],
@@ -16589,7 +16680,9 @@ fn the_write_closure_follows_writing_actions_and_stops_at_the_others() {
                 "{label}: {:?}",
                 checked.err().map(|e| e.to_string())
             );
-            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
+                .await
+                .unwrap();
         }
     });
 }
@@ -16622,7 +16715,7 @@ fn a_cascade_reached_table_is_held_until_the_write_finishes() {
             table: pbps_model::TableName::new("app", "p"),
             operation: RowOperation::Update { columns: ["ukey".to_owned()].into() },
         };
-        writer.begin(dialect.transaction_framing()).await.unwrap();
+        writer.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         let guard = pbps_pg::data_triggers::prepare(&mut writer, std::slice::from_ref(&write), &baseline, &Default::default()).await.unwrap();
         other.execute("SET lock_timeout = '100ms'").await.unwrap();
         // The named table is not the one under contention here: `app.c` is
@@ -16632,15 +16725,15 @@ fn a_cascade_reached_table_is_held_until_the_write_finishes() {
         assert!(matches!(blocked, pbps_db::DbError::Driver { ref code, .. } if code.as_deref() == Some("55P03")), "{blocked}");
         pbps_pg::data_triggers::check(&mut writer, &write, &guard).await.unwrap();
         writer.execute("UPDATE app.p SET ukey = 'k2' WHERE code = 'first'").await.unwrap();
-        writer.commit(dialect.transaction_framing()).await.unwrap();
+        writer.commit(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         // After release the same replacement succeeds, proving the first
         // failure came from the guard's lock, not invalid DDL or permissions.
         let baseline = pbps_pg::catalog::introspect(&mut writer).await.unwrap().schema;
         other.execute(replace).await.unwrap();
-        writer.begin(dialect.transaction_framing()).await.unwrap();
+        writer.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         let refused = pbps_pg::data_triggers::prepare(&mut writer, &[write], &baseline, &Default::default()).await;
         assert!(refused.is_err(), "a replaced trigger on the cascade's table must refuse the next write");
-        writer.rollback(dialect.transaction_framing()).await.unwrap();
+        writer.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
     });
 }
 
@@ -16693,7 +16786,10 @@ fn a_child_committed_while_a_guarded_delete_waits_fires_cascade_row_triggers() {
                 .execute("SET statement_timeout = '10s'")
                 .await
                 .unwrap();
-            other.begin(dialect.transaction_framing()).await.unwrap();
+            other
+                .begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
+                .await
+                .unwrap();
             other
                 .execute("INSERT INTO app.c VALUES ('k1'); INSERT INTO app.g VALUES ('k1')")
                 .await
@@ -16721,7 +16817,10 @@ fn a_child_committed_while_a_guarded_delete_waits_fires_cascade_row_triggers() {
                 })
                 .await
                 .expect("guarded delete never waited on the inserting session");
-                other.commit(dialect.transaction_framing()).await.unwrap();
+                other
+                    .commit(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
+                    .await
+                    .unwrap();
             };
             hand_off.await;
             let (mut writer, deleted) = deleting.await.unwrap();
@@ -16847,7 +16946,9 @@ fn a_reached_table_the_deployment_role_cannot_lock_is_named_in_the_refusal() {
                     columns: ["ukey".to_owned()].into(),
                 },
             };
-            conn.begin(dialect.transaction_framing()).await.unwrap();
+            conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
+                .await
+                .unwrap();
             let refused = pbps_pg::data_triggers::prepare(
                 &mut conn,
                 &[write],
@@ -16862,7 +16963,9 @@ fn a_reached_table_the_deployment_role_cannot_lock_is_named_in_the_refusal() {
                 refused.contains("cannot lock") && refused.contains("public.c"),
                 "{refused}"
             );
-            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
+                .await
+                .unwrap();
         });
 }
 
@@ -16945,15 +17048,16 @@ fn referential_action_locks(admin: &str) {
             let mut other = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
                 .await
                 .unwrap();
-            let framing = pbps_pg::Postgres::new().transaction_framing();
+            let framing =
+                pbps_pg::Postgres::new().transaction_framing(&pbps_model::SessionZone::utc());
             writer.execute("SET lock_timeout = '250ms'").await.unwrap();
             other.execute("SET lock_timeout = '250ms'").await.unwrap();
-            other.begin(framing).await.unwrap();
+            other.begin(&framing).await.unwrap();
             other
                 .execute("LOCK TABLE ONLY app.unreached IN SHARE MODE")
                 .await
                 .unwrap();
-            writer.begin(framing).await.unwrap();
+            writer.begin(&framing).await.unwrap();
             let write = RowWrite {
                 table: pbps_model::TableName::new("app", "p"),
                 operation: RowOperation::Update {
@@ -16992,7 +17096,7 @@ fn referential_action_locks(admin: &str) {
                 .execute("UPDATE app.p SET id = 2 WHERE id = 1")
                 .await
                 .unwrap();
-            writer.commit(framing).await.unwrap();
+            writer.commit(&framing).await.unwrap();
             // Only the action's actual targets moved. The concurrently locked
             // inheritance child is unaffected by both guard and engine DML.
             let rows = other
@@ -17010,7 +17114,7 @@ fn referential_action_locks(admin: &str) {
             // Direct DML has no ONLY, so its own guard must still recurse and
             // block on that same child. The first refusal is lock contention,
             // not missing privileges on the child (the deployer has none).
-            writer.begin(framing).await.unwrap();
+            writer.begin(&framing).await.unwrap();
             let direct = RowWrite {
                 table: pbps_model::TableName::new("app", "c"),
                 operation: RowOperation::Update {
@@ -17027,13 +17131,13 @@ fn referential_action_locks(admin: &str) {
             .err()
             .expect("direct DML reaches the locked inheritance child");
             assert_eq!(refused.server_error_code().as_deref(), Some("55P03"));
-            writer.rollback(framing).await.unwrap();
-            other.rollback(framing).await.unwrap();
+            writer.rollback(&framing).await.unwrap();
+            other.rollback(&framing).await.unwrap();
 
             // Keep the existing protection against a new partition joining
             // this FK's referencing side while the guard holds its locks.
             // Pair the refusal with success after release on both PGs.
-            writer.begin(framing).await.unwrap();
+            writer.begin(&framing).await.unwrap();
             pbps_pg::data_triggers::prepare(
                 &mut writer,
                 &[write],
@@ -17049,7 +17153,7 @@ fn referential_action_locks(admin: &str) {
                 .await
                 .expect_err("ATTACH must wait for the guarded FK write");
             assert_eq!(refused.server_error_code().as_deref(), Some("55P03"));
-            writer.rollback(framing).await.unwrap();
+            writer.rollback(&framing).await.unwrap();
             other
                 .execute(attach)
                 .await
@@ -17208,7 +17312,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                 ("the key the plan drops first", key, false),
                 ("the table the plan drops first", table, false),
             ] {
-                conn.begin(dialect.transaction_framing()).await.unwrap();
+                conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
                     &mut conn,
                     std::slice::from_ref(&write),
@@ -17222,12 +17326,12 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                     "{label}: {:?}",
                     checked.err().map(|e| e.to_string())
                 );
-                conn.rollback(dialect.transaction_framing()).await.unwrap();
+                conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             }
             // The allowance is the plan's promise, and `check` is where the
             // promise is kept: a key still in the catalog at the write is
             // followed whatever the plan said about it.
-            conn.begin(dialect.transaction_framing()).await.unwrap();
+            conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             let guard = pbps_pg::data_triggers::prepare(
                 &mut conn,
                 std::slice::from_ref(&write),
@@ -17244,7 +17348,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                 refused.is_err(),
                 "a foreign key the plan promised to remove must actually be gone by the write"
             );
-            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             // A partitioned referencing side is catalogued as the declared
             // key plus a copy per partition. The plan can only name the
             // declared one, so a removal has to be matched against it or the
@@ -17274,7 +17378,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                     false,
                 ),
             ] {
-                conn.begin(dialect.transaction_framing()).await.unwrap();
+                conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
                     &mut conn,
                     std::slice::from_ref(&write),
@@ -17288,7 +17392,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                     "partitioned, {label}: {:?}",
                     checked.err().map(|e| e.to_string())
                 );
-                conn.rollback(dialect.transaction_framing()).await.unwrap();
+                conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             }
             conn.execute(
                 "DROP TABLE app.parted; \
@@ -17313,7 +17417,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                 ),
             ] {
                 conn.execute(sql).await.unwrap();
-                conn.begin(dialect.transaction_framing()).await.unwrap();
+                conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
                     &mut conn,
                     std::slice::from_ref(&write),
@@ -17326,9 +17430,9 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                     "{label}: {:?}",
                     checked.err().map(|e| e.to_string())
                 );
-                conn.rollback(dialect.transaction_framing()).await.unwrap();
+                conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 conn.execute(reset).await.unwrap();
-                conn.begin(dialect.transaction_framing()).await.unwrap();
+                conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
                     &mut conn,
                     std::slice::from_ref(&write),
@@ -17340,7 +17444,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                     checked.is_err(),
                     "{label}: restored, the action fires again"
                 );
-                conn.rollback(dialect.transaction_framing()).await.unwrap();
+                conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             }
             // The same two with a partitioned referencing side. The copy
             // PostgreSQL catalogues on each partition owns no action trigger:
@@ -17373,7 +17477,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                 ),
             ] {
                 conn.execute(sql).await.unwrap();
-                conn.begin(dialect.transaction_framing()).await.unwrap();
+                conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
                     &mut conn,
                     std::slice::from_ref(&write),
@@ -17386,9 +17490,9 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                     "{label}: {:?}",
                     checked.err().map(|e| e.to_string())
                 );
-                conn.rollback(dialect.transaction_framing()).await.unwrap();
+                conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 conn.execute(reset).await.unwrap();
-                conn.begin(dialect.transaction_framing()).await.unwrap();
+                conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
                     &mut conn,
                     std::slice::from_ref(&write),
@@ -17400,7 +17504,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                     checked.is_err(),
                     "{label}: restored, the action fires again"
                 );
-                conn.rollback(dialect.transaction_framing()).await.unwrap();
+                conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             }
         });
 }
@@ -17468,7 +17572,7 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
             // there is, so the rewriting trigger is approved in each and the
             // one that arrives next is the only thing the guard can refuse.
             let wide = pbps_pg::catalog::introspect(&mut conn).await.unwrap().schema;
-            conn.begin(dialect.transaction_framing()).await.unwrap();
+            conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             pbps_pg::data_triggers::prepare(
                 &mut conn,
                 std::slice::from_ref(&write),
@@ -17477,7 +17581,7 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
             )
             .await
             .expect("the approved rewriting trigger is not itself a refusal");
-            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             conn.execute(
                 "CREATE OR REPLACE TRIGGER rewrite BEFORE UPDATE OF code ON app.p \
                  FOR EACH ROW EXECUTE FUNCTION app.rewrite()",
@@ -17542,7 +17646,7 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
                 ))
                 .await
                 .unwrap();
-                conn.begin(dialect.transaction_framing()).await.unwrap();
+                conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
                     &mut conn,
                     std::slice::from_ref(&write),
@@ -17556,7 +17660,7 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
                     "{label}: {:?}",
                     checked.err().map(|e| e.to_string())
                 );
-                conn.rollback(dialect.transaction_framing()).await.unwrap();
+                conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             }
             // Disabled, it rewrites nothing — measured — and the same
             // unapproved trigger on `app.c` is out of reach again.
@@ -17567,7 +17671,7 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
             )
             .await
             .unwrap();
-            conn.begin(dialect.transaction_framing()).await.unwrap();
+            conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             let checked =
                 pbps_pg::data_triggers::prepare(&mut conn, &[write], &wide, &Default::default())
                     .await;
@@ -17576,7 +17680,7 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
                 "a disabled trigger writes nothing: {:?}",
                 checked.err().map(|e| e.to_string())
             );
-            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         });
 }
 
@@ -17634,7 +17738,7 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
                     false,
                 ),
             ] {
-                conn.begin(dialect.transaction_framing()).await.unwrap();
+                conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let message = pbps_pg::data_triggers::prepare(
                     &mut conn,
                     &[write],
@@ -17650,7 +17754,7 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
                     refused,
                     "{label}: {message}"
                 );
-                conn.rollback(dialect.transaction_framing()).await.unwrap();
+                conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             }
             // A rule lives on the relation a statement names. Measured, the
             // rewriter runs before partition routing, so a partition's rule
@@ -17664,7 +17768,7 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
             )
             .await
             .unwrap();
-            conn.begin(dialect.transaction_framing()).await.unwrap();
+            conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             let checked = pbps_pg::data_triggers::prepare(
                 &mut conn,
                 std::slice::from_ref(&updates),
@@ -17677,13 +17781,13 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
                 "a partition's rule cannot rewrite the action that names its root: {:?}",
                 checked.err().map(|e| e.to_string())
             );
-            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             conn.execute(
                 "CREATE RULE also AS ON UPDATE TO app.parted DO ALSO INSERT INTO app.side VALUES ('root')",
             )
             .await
             .unwrap();
-            conn.begin(dialect.transaction_framing()).await.unwrap();
+            conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             let message = pbps_pg::data_triggers::prepare(
                 &mut conn,
                 std::slice::from_ref(&updates),
@@ -17698,7 +17802,7 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
                 message.contains("unsafe rewrite rule") && message.contains("app.parted"),
                 "the rule on the relation the action names: {message}"
             );
-            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             conn.execute(
                 "DROP TABLE app.parted; \
                  CREATE TABLE app.c(ukey text REFERENCES app.p(ukey) ON UPDATE CASCADE ON DELETE CASCADE); \
@@ -17710,7 +17814,7 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
             conn.execute("ALTER TABLE app.c DISABLE RULE also")
                 .await
                 .unwrap();
-            conn.begin(dialect.transaction_framing()).await.unwrap();
+            conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             let checked = pbps_pg::data_triggers::prepare(
                 &mut conn,
                 &[updates],
@@ -17723,7 +17827,7 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
                 "a disabled rule rewrites nothing: {:?}",
                 checked.err().map(|e| e.to_string())
             );
-            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         });
 }
 
@@ -24956,8 +25060,10 @@ fn a_date_or_time_is_taken_as_the_value_the_engine_reads() {
 /// plan and a connected bootstrap, each naming both readings and what to write
 /// instead: a row's cell, a column default and a partition bound, and a value
 /// read as the moment the statement runs (#1756). A `text` column holding the
-/// same characters is not one, and offline planning is unchanged. Written the
-/// one way they can be read, the same values plan, apply, verify and plan clean.
+/// same characters is not one, and offline planning is unchanged. Nor is an
+/// offset-less `timestamptz`: it is read in the target's own zone, which no
+/// setting contrasts, and is taken as read (DEC-1916.1). Written the one way
+/// they can be read, the same values plan, apply, verify and plan clean.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn an_ambiguous_date_or_time_literal_is_refused_with_both_readings() {
@@ -25020,12 +25126,9 @@ fn an_ambiguous_date_or_time_literal_is_refused_with_both_readings() {
         assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
         let said = format!("{}{}", stdout(&o), stderr(&o));
         for needle in [
-            "6 declared date/time value(s) can be read more than one way",
+            "5 declared date/time value(s) can be read more than one way",
             "app.ev row `2`: `d` \"01/02/2026\" is read as 2026-01-02 under this tool's \
              settings, but as 2026-02-01 under DateStyle DMY",
-            "app.ev row `3`: `ts` \"2026-01-02 09:00\" is read as 2026-01-02 09:00:00+00 under \
-             this tool's settings",
-            "`YYYY-MM-DD HH:MM:SS+00`",
             "app.ev row `4`: `span` \"-1 2:03:04\" is read as 0 months -1 days 7384",
             "app.ev row `5`: `d` \"today\" is a date decided by the moment the statement runs",
             "app.ev column `d` default \"'01/02/2026'::date\" is read as 2026-01-02",
@@ -25040,6 +25143,8 @@ fn an_ambiguous_date_or_time_literal_is_refused_with_both_readings() {
         // pinned reading is not offered as the spelling to write.
         assert!(!said.contains("label"), "{said}");
         assert!(!said.contains("would not come back as written"), "{said}");
+        // The offset-less instant has one reading, the target's zone.
+        assert!(!said.contains("app.ev row `3`"), "{said}");
     }
     assert_eq!(
         scalar(
@@ -25079,4 +25184,259 @@ fn an_ambiguous_date_or_time_literal_is_refused_with_both_readings() {
         ),
         1_767_315_600
     );
+}
+
+/// An offset-less date/time value is read in the target database's own time
+/// zone, which `plan --db` records and names and every write pins (#1916,
+/// DEC-1916.1): a row's cell, a column default and a partition bound written
+/// without an offset are stored at that zone's instant, then verify and plan
+/// clean, and `pull` writes the offset the database renders. A role's setting
+/// for its database wins over the database's own. A plan applied after the
+/// zone moved is refused before its first statement — transactional, staged
+/// and resumed — and the ledger's own times stay UTC. On 16 and 18.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn an_offset_less_value_is_read_in_the_target_databases_own_zone() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        an_offset_less_value_is_read_in_the_target_databases_own_zone_on(server, k);
+    }
+}
+
+fn an_offset_less_value_is_read_in_the_target_databases_own_zone_on(server: &str, k: usize) {
+    let own = OwnDatabase::new(server, &format!("zone_1916_{k}"));
+    let connection = own.connection();
+    let role_zone = |zone: &str| {
+        on_server(
+            connection,
+            &format!(
+                "ALTER ROLE CURRENT_USER IN DATABASE \"{}\" SET timezone = '{zone}'",
+                own.name
+            ),
+        );
+    };
+    // The database says New York; the role, for this database, Taipei. The
+    // role's setting is the one a fresh session gets.
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app; ALTER DATABASE \"{}\" SET timezone = 'America/New_York'",
+            own.name
+        ),
+    );
+    role_zone("Asia/Taipei");
+
+    let d = Demo::new(&format!("zone-1916-{k}"));
+    std::fs::write(
+        d.dir.join("schema/app.ev.yml"),
+        "table: app.ev\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+         at: {type: timestamp with time zone, default: \"'2026-02-01'::timestamp with time zone\"}\n\
+         primary_key: {name: ev_pkey, columns: [id]}\n\
+         data:\n  mode: exact\n  rows:\n    1: {at: \"2026-03-01 09:00\"}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.p.yml"),
+        "table: app.p\ncolumns:\n  ts: {type: timestamp with time zone, nullable: false}\n\
+         partition_by: [ts]\npartitions:\n  p_a:\n    from: [\"2026-02-01\"]\n    \
+         to: [\"2026-03-01\"]\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+
+    // Recorded, and named, in the zone the role's session starts in.
+    let plan = d.dir.join("plan.json");
+    let planned = succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&planned).contains("Offset-less date/time values read in Asia/Taipei"),
+        "{}",
+        stdout(&planned)
+    );
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert_eq!(saved["baseline"]["time_zone"], "Asia/Taipei");
+    let json = json_output(d.run(&["plan", "--db", connection, "--format", "json"]));
+    assert_eq!(json["data"]["time_zone"], "Asia/Taipei", "{json}");
+
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // Stored at Taipei's instants, asked in UTC so no session zone answers.
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.ev WHERE at = TIMESTAMPTZ '2026-03-01 01:00:00+00'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_attrdef \
+              WHERE adrelid = 'app.ev'::regclass \
+                AND pg_get_expr(adbin, adrelid)::text LIKE '%2026-02-01 00:00:00+08%'"
+        ),
+        1,
+        "the default is Taipei's midnight, rendered in the role's zone"
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class WHERE oid = 'app.p_a'::regclass \
+               AND pg_get_expr(relpartbound, oid) = 'FOR VALUES FROM (''2026-02-01 00:00:00+08'') \
+                   TO (''2026-03-01 00:00:00+08'')'"
+        ),
+        1
+    );
+    // The ledger's own time is UTC whatever the zone (DECISIONS 287).
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT (abs(extract(epoch FROM (now() AT TIME ZONE 'UTC') - max(applied_at))) \
+                     < 600)::int::int8 FROM public.__pbps_state"
+        ),
+        1
+    );
+
+    // `pull` writes the offset the database renders.
+    let pulled = Demo::new(&format!("zone-1916-pull-{k}"));
+    succeeds(pulled.run(&["pull", "--db", connection, "--data", "app.ev"]));
+    let ev = std::fs::read_to_string(pulled.dir.join("schema/app.ev.yml")).unwrap();
+    for needle in ["2026-02-01 00:00:00+08", "at: \"2026-03-01 09:00:00+08\""] {
+        assert!(ev.contains(needle), "missing {needle:?} in:\n{ev}");
+    }
+    let p = std::fs::read_to_string(pulled.dir.join("schema/app.p.yml")).unwrap();
+    assert!(p.contains("2026-02-01 00:00:00+08"), "{p}");
+
+    // The zone is no contrast any more, the date order still is: a value
+    // `DateStyle` decides is refused in Taipei as anywhere (DEC-1756.1).
+    let ev = d.dir.join("schema/app.ev.yml");
+    let declared = std::fs::read_to_string(&ev).unwrap();
+    std::fs::write(
+        &ev,
+        declared.replace("2026-03-01 09:00", "01/02/2026 09:00"),
+    )
+    .unwrap();
+    let o = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("\"01/02/2026 09:00\" is read as"),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::write(&ev, declared).unwrap();
+
+    // Planned in Taipei, applied after the zone moved: refused before the
+    // first statement, transactional, staged and resumed.
+    std::fs::write(
+        d.dir.join("schema/app.u.yml"),
+        "table: app.u\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+         at: {type: timestamp with time zone}\nprimary_key: [id]\nchecks:\n  \
+         b_at: \"at >= '2026-01-01'\"\n  c_at: \"at < '2027-01-01'\"\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let transactional = d.dir.join("transactional.json");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        transactional.to_str().unwrap(),
+    ]));
+    let staged = d.dir.join("staged.json");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--staged",
+        "--out",
+        staged.to_str().unwrap(),
+    ]));
+    let entries = scalar(connection, "SELECT count(*) FROM public.__pbps_state");
+    let refused = |o: Output| {
+        assert_ne!(code(&o), 0, "{}", stdout(&o));
+        assert!(
+            stderr(&o).contains(
+                "reads offset-less date/time values in `America/New_York` now, and this plan \
+                 was computed in `Asia/Taipei`"
+            ),
+            "{}",
+            stderr(&o)
+        );
+    };
+    role_zone("America/New_York");
+    refused(approved_apply(&d, connection, &transactional, &[]));
+    refused(approved_apply(&d, connection, &staged, &["--staged"]));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class WHERE oid = to_regclass('app.u')"
+        ),
+        0
+    );
+    // Each recorded as a failure, as any refused apply is; nothing applied.
+    assert_eq!(
+        scalar(connection, "SELECT count(*) FROM public.__pbps_state"),
+        entries + 2
+    );
+    assert_eq!(
+        latest_snapshot(connection).kind,
+        pbps_model::StateKind::Failed
+    );
+
+    // Stopped partway in Taipei, resumed in New York: refused too.
+    role_zone("Asia/Taipei");
+    on_server(
+        connection,
+        r#"
+CREATE SCHEMA witness;
+CREATE FUNCTION witness.stop_after_first() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='app.u'::regclass AND conname='b_at') THEN
+    RAISE EXCEPTION 'stop before the first check commits';
+  END IF;
+END $$;
+CREATE EVENT TRIGGER stop_after_first ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.stop_after_first();
+"#,
+    );
+    let stopped = approved_apply(&d, connection, &staged, &["--staged"]);
+    assert_eq!(
+        code(&stopped),
+        1,
+        "{}{}",
+        stdout(&stopped),
+        stderr(&stopped)
+    );
+    on_server(connection, "DROP EVENT TRIGGER stop_after_first");
+    role_zone("America/New_York");
+    refused(approved_apply(
+        &d,
+        connection,
+        &staged,
+        &["--staged", "--resume"],
+    ));
+    assert_eq!(
+        latest_snapshot(connection)
+            .staged
+            .as_ref()
+            .unwrap()
+            .completed,
+        1
+    );
+
+    // Back in the zone it was planned in, it finishes.
+    role_zone("Asia/Taipei");
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &staged,
+        &["--staged", "--resume"],
+    ));
+    succeeds(d.run(&["verify", "--db", connection]));
 }

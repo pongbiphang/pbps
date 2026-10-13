@@ -303,11 +303,14 @@ impl Dialect for Mssql {
     /// "no corresponding BEGIN TRANSACTION"; reporting that would replace the
     /// real failure — the statement that broke — with a confusing second one,
     /// so the rollback checks `@@TRANCOUNT` first.
-    fn transaction_framing(&self) -> TransactionFraming {
+    ///
+    /// No zone: SQL Server has no session time zone, and a `datetimeoffset`
+    /// without an offset is read as `+00:00` whatever the session.
+    fn transaction_framing(&self, _zone: &pbps_model::SessionZone) -> TransactionFraming {
         TransactionFraming {
-            begin: "SET XACT_ABORT ON; BEGIN TRANSACTION;",
-            commit: "COMMIT TRANSACTION;",
-            rollback: "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;",
+            begin: "SET XACT_ABORT ON; BEGIN TRANSACTION;".into(),
+            commit: "COMMIT TRANSACTION;".into(),
+            rollback: "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;".into(),
         }
     }
 
@@ -518,7 +521,7 @@ mod tests {
     /// tolerates one already doomed.
     #[test]
     fn the_transaction_framing_dooms_on_error_and_tolerates_a_dead_transaction() {
-        let tx = Mssql.transaction_framing();
+        let tx = Mssql.transaction_framing(&pbps_model::SessionZone::utc());
         assert!(tx.begin.contains("SET XACT_ABORT ON"));
         assert!(tx.rollback.starts_with("IF @@TRANCOUNT > 0"));
     }

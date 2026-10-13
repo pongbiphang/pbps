@@ -193,6 +193,10 @@ add an entry here.
     inside one from a string that merely looks like a date. Pinning the reader
     is what makes the text mean one thing.
 
+*Amended by [DEC-1916.1](#dec-1916-1): `TimeZone` is pinned to the target
+database's own zone, which the plan records, not to UTC. The rule is
+unchanged — the zone is still pinned — only whose zone it is.*
+
 <a id="decision-275"></a>
 
 275. **`$user` is refused as a schema name and as a write-path extra.**
@@ -518,3 +522,77 @@ built-in on the schema's path. A plan made before `key_type` existed has none
 and keeps the unqualified `=`. SQL Server has no user-defined operators and
 ignores the field. The live test above updates and deletes rows by a
 `varchar` key under that trap.
+
+<a id="dec-1916-1"></a>
+
+**DEC-1916.1. An offset-less date/time value is read in the target database's
+own time zone: read on connect, recorded in the plan, replayed into every pin
+and read scope, and required again at apply (#1916).** 267 pinned `TimeZone`
+to UTC and 254 read back in UTC, so a hand-written `2026-02-01` on a
+`timestamptz` was stored as UTC midnight — 08:00 to everyone looking at a
+database in `Asia/Taipei` — and `pull` wrote `+00` for values every other tool
+on that database shows as `+08`. A zone in `pbps.yml` (the first design in
+#1757) was rejected by the maintainer: the zone is the database's, set by
+whoever runs it (`postgresql.conf`, a parameter group), it governs every
+application that connects, and a second statement of the same fact is one that
+can disagree with the first. #1917 adds `timezone:` as a check only.
+
+- **Which zone.** The one a fresh session of the deploying connection gets:
+  server, then database, then the role's setting, then the connection's
+  startup options. Measured on 18, a role's setting for a database wins over
+  the database's own. `pbps-db` reads it with `SHOW TimeZone` on connect,
+  before any pin, because the pins are plain `SET`s that outlive their
+  transaction: after the first one the session reports the pin.
+- **The text is replayed, never parsed.** Measured on 18.6: `SET TimeZone =
+  '+08:00'` is a POSIX zone eight hours *west* of UTC, `<+08>-08` one eight
+  hours east, and `localtime` is the server's system zone. The exact text is
+  the one reading that is the target's by construction. So zones compare by
+  their text: `UTC` and `Etc/UTC` are refused as two zones. Which spellings
+  agree is a fact about the engine's tz database that pbps cannot see, and a
+  spelling costs a DBA one `ALTER` where a wrong instant costs every value
+  written.
+- **Recorded** in `PlanBaseline.time_zone` (plan version 38) and named in the
+  plan's output, text and JSON (schema set 43): nothing in a statement shows
+  it, and the same `2026-02-01` is another instant in another zone.
+- **Pinned** by the write pins, the transaction framing, a rendered script,
+  the canonical read scope and the #1883 spelling probe. The dialect takes the
+  zone as a parameter of `transaction_framing` and `session_pins` rather than
+  as a field: the dialect is chosen before any connection exists, and a field
+  set afterwards is one forgotten call away from UTC again. Here the compiler
+  asks every caller.
+- **Required at apply, before anything is read**, transactional, staged and
+  resumed alike. In another zone every offset-less value reads back as other
+  text, so the drift check would report the zone as a change nobody made —
+  measured in the live test, before the check was moved first, the refusal
+  was "no longer the database this plan was computed against". A plan that
+  records no zone for an engine that has one is refused too.
+- **The ambiguity probe** (DEC-1756.1) stops varying `TimeZone`: the recorded
+  zone is the intended reading, so an offset-less `timestamptz` has one. It
+  still varies `DateStyle`, `IntervalStyle` and `timezone_abbreviations`.
+- **The resolver's scratch compiles in the target's zone**, not its own, so a
+  declared offset-less default compiles to the instant the target would store.
+  A scratch server that does not know the zone is refused by name (SQLSTATE
+  `22023`, measured) rather than compiled in another one. The resolver's
+  *captures* read in UTC: they are compared only with one another, on servers
+  whose own zones can differ, and UTC renders a stored instant the same
+  whichever session reads it. `doctor`'s runway reader (DEC-1789.2) reads in
+  UTC too: it computes with `timestamptz` bounds as `+00` text, the spelling
+  `partitions extend` writes until #1915, and in the target's zone it would
+  report every such series on a database outside UTC as a question it could
+  not answer.
+- **Unchanged.** pbps's own audit times stay UTC (287); `now()` and other
+  function defaults; SQL Server, which has no session zone. Offline paths
+  (`plan` without `--db`, a target-less `bootstrap --sql`) keep UTC until
+  #1918 gives them the declared zone or a refusal; `partitions extend` writes
+  `+00` bounds until #1915; the `timestamp` ↔ `timestamptz` refusal of 268 is
+  revisited in #1919. pbps is unreleased, so no ledger snapshot read under UTC
+  needs migrating.
+
+Pinned by `an_offset_less_value_is_read_in_the_target_databases_own_zone` (CLI,
+on 16 and 18: a database in New York with its role in Taipei; a row, a default
+and a partition bound stored at Taipei's instants, verify and plan clean, `pull`
+writing `+08`, a `DateStyle` reading still refused, and transactional, staged and
+resumed applies refused after the zone moved) and
+`the_scratch_compiles_in_the_targets_zone_or_not_at_all` (pbps-pg, on 16 and 18)
+and `doctor_reads_a_runway_in_utc_on_a_database_in_another_zone` (CLI, on 16 and
+18).

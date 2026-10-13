@@ -22,6 +22,8 @@ use tokio::net::TcpStream;
 use tokio_postgres::Config;
 use tokio_postgres::tls::MakeTlsConnect;
 
+use pbps_model::SessionZone;
+
 use crate::{DbError, Param};
 
 /// One row as this driver hands it back.
@@ -30,8 +32,39 @@ pub struct Row(tokio_postgres::Row);
 /// An open PostgreSQL connection.
 pub struct Conn {
     client: tokio_postgres::Client,
+    /// `TimeZone` as this session started, before anything pbps sets.
+    zone: SessionZone,
     /// The polled connection future. Held, not detached — see the module header.
     _driver: tokio::task::JoinHandle<()>,
+}
+
+/// The `TimeZone` a fresh session got: server, then database, then role
+/// setting, then the connection's startup options (DEC-1916.1).
+///
+/// Read on connect, before any pin, because the pins are plain `SET`s that
+/// outlive their transaction: after the first one this session reports the
+/// pinned zone and not its own. `SHOW` and not `current_setting`, so nothing a
+/// schema user created is on the way before the path is pinned.
+async fn fresh_zone(client: &tokio_postgres::Client) -> Result<SessionZone, DbError> {
+    let rows = client.simple_query("SHOW TimeZone").await?;
+    let answer = rows.iter().find_map(|m| {
+        if let tokio_postgres::SimpleQueryMessage::Row(row) = m {
+            Some(row.get(0))
+        } else {
+            None
+        }
+    });
+    // Absent and unreadable are not "UTC".
+    let Some(Some(text)) = answer else {
+        return Err(DbError::BadRow(
+            "`SHOW TimeZone` returned no value".to_owned(),
+        ));
+    };
+    SessionZone::new(text).map_err(|e| {
+        DbError::BadRow(format!(
+            "`SHOW TimeZone` answered something that is not a zone: {e}"
+        ))
+    })
 }
 
 impl From<tokio_postgres::Error> for DbError {
@@ -284,8 +317,10 @@ impl Conn {
             let (client, connection) = config.connect_raw(tcp, tokio_postgres::NoTls).await?;
             (client, hold(connection))
         };
+        let zone = fresh_zone(&client).await?;
         let mut conn = Self {
             client,
+            zone,
             _driver: driver,
         };
         // The endpoint is spelled again rather than kept: `addr` is moved into
@@ -294,6 +329,12 @@ impl Conn {
             .await?;
         conn.pin_search_path().await?;
         Ok(conn)
+    }
+
+    /// The session's `TimeZone` as it was before pbps set anything: the zone
+    /// an offset-less date/time value is read in on this target (DEC-1916.1).
+    pub(crate) fn zone(&self) -> &SessionZone {
+        &self.zone
     }
 
     /// Empties the session's `search_path` before pbps asks anything.

@@ -1000,6 +1000,15 @@ pbps apply --db $ENV --plan plan.json --checksum $APPROVED_PLAN_SHA256 --allow r
 `apply` first verifies that the database's current checksum still equals the
 baseline the plan was computed against, and aborts otherwise — the drift check.
 
+On PostgreSQL the plan also records the target's session time zone, the one a
+fresh session of the deploying connection gets (server, database, role,
+startup options). Every `timestamptz` and `timetz` value written without an
+offset — a `data:` cell, a default, a partition bound — is read in it, the
+statements run pinned to it, and `pull` writes the offsets it renders. The plan
+names it, and `apply` refuses before reading anything unless the target's zone
+is still the same text (DEC-1916.1). pbps never sets the database's zone; that
+belongs to whoever runs the database.
+
 **The checksum pins "the plan approved at the deployment gate" to "what actually
 runs" — not the MR to the apply.** Jump-version deploys (prod five versions
 behind) are the norm; the plan computed at deployment time naturally covers the

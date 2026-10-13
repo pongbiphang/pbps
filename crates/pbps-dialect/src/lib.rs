@@ -45,7 +45,7 @@ pub mod estimate;
 use pbps_model::ChangeSet;
 use pbps_model::{
     Change, ColumnType, Module, ModuleId, ModuleKind, ObjectName, Partitions, RiskClass, Role,
-    RoutineArg, Schema, Strategy, Table, TableName,
+    RoutineArg, Schema, SessionZone, Strategy, Table, TableName,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -2731,7 +2731,14 @@ pub trait Dialect {
     /// a transaction the server already killed; PostgreSQL needs neither.
     /// `pbps-db` runs these and owns the framing around them, and holds no SQL
     /// of its own (ADR-0014 §2).
-    fn transaction_framing(&self) -> TransactionFraming;
+    ///
+    /// `zone` is the target's session time zone ([`SessionZone`]): the one the
+    /// plan recorded at apply, the one the connection reported at `plan --db`.
+    /// A parameter and not a field of the dialect, because the dialect is
+    /// chosen before any connection exists, and a zone set on it afterwards is
+    /// one call site away from being forgotten; here the compiler asks every
+    /// caller (DEC-1916.1). An engine with no session zone ignores it.
+    fn transaction_framing(&self, zone: &SessionZone) -> TransactionFraming;
 
     /// The settings a deployment must run under, for a mode that opens no
     /// transaction to carry them.
@@ -2751,7 +2758,10 @@ pub trait Dialect {
     /// transaction — SQL Server's `SET XACT_ABORT ON` governs a transaction and
     /// means nothing outside one — and it is the default, so a dialect says
     /// this only when it has something to say.
-    fn session_pins(&self) -> Option<&'static str> {
+    ///
+    /// `zone` as in [`Dialect::transaction_framing`].
+    fn session_pins(&self, zone: &SessionZone) -> Option<String> {
+        let _ = zone;
         None
     }
 
@@ -3633,8 +3643,16 @@ pub fn check_constraint_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<Str
 ///
 /// Taking the dialect, rather than just its separator, keeps a new script
 /// caller from omitting settings the deployment connection already establishes.
-pub fn render_script(statements: &[Statement], dialect: &dyn Dialect) -> String {
-    let Some(pins) = dialect.session_pins().filter(|_| !statements.is_empty()) else {
+/// `zone` is the target's session time zone, pinned with the rest (DEC-1916.1).
+pub fn render_script(
+    statements: &[Statement],
+    dialect: &dyn Dialect,
+    zone: &SessionZone,
+) -> String {
+    let Some(pins) = dialect
+        .session_pins(zone)
+        .filter(|_| !statements.is_empty())
+    else {
         return render_batches(statements, dialect.batch_separator());
     };
     let prepared: Vec<_> = std::iter::once(Statement::new(pins).own_batch())
@@ -3812,10 +3830,10 @@ mod tests {
         assert_eq!(render_batches(&stmts, None), "A;\n\nB;\n\nC;\n\nD;\n");
         assert_eq!(render_batches(&[], Some("GO")), "");
         assert_eq!(
-            render_script(&stmts, &MinimalDialect),
+            render_script(&stmts, &MinimalDialect, &SessionZone::utc()),
             render_batches(&stmts, None)
         );
-        assert_eq!(render_script(&[], &MinimalDialect), "");
+        assert_eq!(render_script(&[], &MinimalDialect, &SessionZone::utc()), "");
     }
 
     /// Almost all DDL is transactional, and the default has to reflect that —
@@ -4249,8 +4267,8 @@ mod tests {
         fn lexicon(&self) -> Lexicon {
             Lexicon::ANSI
         }
-        fn transaction_framing(&self) -> TransactionFraming {
-            MinimalDialect.transaction_framing()
+        fn transaction_framing(&self, zone: &SessionZone) -> TransactionFraming {
+            MinimalDialect.transaction_framing(zone)
         }
         fn probe_framing(&self) -> Option<TransactionFraming> {
             MinimalDialect.probe_framing()
@@ -5109,17 +5127,18 @@ mod tests {
 /// `pbps-db` owns *when* a transaction opens and closes and what a failure on
 /// the way out must not hide; how each step is spelled is the dialect's. Three
 /// plain strings rather than a trait, because nothing about the framing varies
-/// between engines except the text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// between engines except the text. `Cow` because one of them can carry the
+/// target's time zone, known only at run time (DEC-1916.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionFraming {
     /// Opens the transaction — and, where the engine needs telling, makes any
     /// statement error doom it.
-    pub begin: &'static str,
+    pub begin: Cow<'static, str>,
     /// Commits it.
-    pub commit: &'static str,
+    pub commit: Cow<'static, str>,
     /// Rolls it back. Must succeed on a transaction the server has already
     /// aborted, or the rollback's own error replaces the statement that broke.
-    pub rollback: &'static str,
+    pub rollback: Cow<'static, str>,
 }
 
 /// The minimal dialect used by tests and by Phase 1.
@@ -5146,11 +5165,11 @@ impl Dialect for MinimalDialect {
 
     /// Standard SQL, which is all a dialect that is not any real database can
     /// honestly say. Nothing opens a connection with this dialect.
-    fn transaction_framing(&self) -> TransactionFraming {
+    fn transaction_framing(&self, _zone: &SessionZone) -> TransactionFraming {
         TransactionFraming {
-            begin: "START TRANSACTION;",
-            commit: "COMMIT;",
-            rollback: "ROLLBACK;",
+            begin: "START TRANSACTION;".into(),
+            commit: "COMMIT;".into(),
+            rollback: "ROLLBACK;".into(),
         }
     }
 
