@@ -1581,6 +1581,15 @@
       "target": ["pbps-cli", "test", "flow_pg"],
       "owner": "pg",
       "validate_on": "linux",
+      "ignored_on": ["linux", "darwin"],
+      "cases": [
+        "plan_outputs_preserve_the_fingerprint_key_its_apply_needs"
+      ]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow_pg"],
+      "owner": "pg",
+      "validate_on": "linux",
       "ignored_on": ["linux"],
       "cases": [
         "abrupt_staged_apply_resumes_from_a_durable_checkpoint_before_the_next_step"
