@@ -2,9 +2,59 @@ use pbps_model::{PartitionColumn, Schema, Table, TableName};
 use std::borrow::Cow;
 
 use super::{
-    Req,
-    expect::{Expected, Implied, Own, OwnExpected, place},
+    Expr, Req, Source,
+    expect::{ColumnExpected, Expected, Implied, Own, OwnExpected, place},
 };
+
+pub(crate) fn column(expected: &ColumnExpected<'_>, now: &pbps_model::Column) -> Vec<&'static str> {
+    let pbps_model::Column {
+        ty,
+        nullable,
+        value_source,
+        collation,
+        description,
+        deprecated,
+    } = now;
+    let source = Source::of(value_source);
+    let mut moved = Vec::new();
+    for (kept, name) in [
+        (expected.ty.accepts(&ty), "type"),
+        (expected.nullable.accepts(nullable), "nullability"),
+        (expected.default.accepts(source.default), "default"),
+        (
+            expected.deprecated.accepts(&deprecated.as_deref()),
+            "deprecation",
+        ),
+        (expected.collation.accepts(&collation.as_ref()), "collation"),
+    ] {
+        if !kept {
+            moved.push(name);
+        }
+    }
+    // Only the text is a planned expression change's to move. Becoming or
+    // ceasing to be generated, or changing its stored kind, is still drift.
+    if expected.generated_kind != source.generated.map(|g| g.stored) {
+        moved.push("generation");
+    } else if !expected
+        .generated_expression
+        .accepts(source.generated.map(|g| g.expression.as_str()))
+    {
+        moved.push("generation expression");
+    }
+    for (kept, name) in [
+        (expected.identity == source.identity, "identity"),
+        (expected.sequence == source.sequence, "sequence"),
+        (
+            expected.description == description.as_deref(),
+            "description",
+        ),
+    ] {
+        if !kept {
+            moved.push(name);
+        }
+    }
+    moved
+}
 
 pub(crate) fn implied(expected: &Implied<'_>, now: &Schema, moved: &mut Vec<String>) {
     for (name, presence) in &expected.0 {
@@ -114,5 +164,126 @@ pub(crate) fn system_time(
         moved.push(format!(
             "{name} period or system versioning changed, and this plan does not change it"
         ));
+    }
+}
+
+/// Whether a column read back is the one a declaration asked for, in the
+/// fields the catalog reads back unchanged: the normalized type, the
+/// nullability, the identity, and whether there is a default at all — its
+/// **text** is the engine's (`0` comes back `((0))`), so only its presence is
+/// comparable (DECISIONS 185, 186).
+pub(crate) fn declared_column(
+    dialect: &dyn pbps_dialect::Dialect,
+    declared: &pbps_model::Column,
+    now: &pbps_model::Column,
+) -> bool {
+    use pbps_model::Column;
+    // Catalogs do not read the declaration-only annotations. Enumerate them
+    // nevertheless: a new observable model field must choose a policy here.
+    let Column {
+        ty,
+        nullable,
+        value_source,
+        collation,
+        description: _,
+        deprecated: _,
+    } = declared;
+    let Column {
+        ty: observed_type,
+        nullable: observed_nullable,
+        value_source: observed_source,
+        collation: observed_collation,
+        description: _,
+        deprecated: _,
+    } = now;
+    let expected = Source::of(value_source);
+    let observed = Source::of(observed_source);
+    super::super::same_type(dialect, ty, observed_type)
+        && nullable == observed_nullable
+        && collation == observed_collation
+        && Expr::Planned(expected.default.is_some()).accepts(observed.default)
+        && expected.identity == observed.identity
+        && expected.generated.map(|g| g.stored) == observed.generated.map(|g| g.stored)
+        && match (expected.sequence, observed.sequence) {
+            (Some(declared), Some(now)) => declared.declares(now),
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        }
+}
+
+pub(crate) fn columns_after(
+    dialect: &dyn pbps_dialect::Dialect,
+    expected: &super::expect::ColumnChanges<'_>,
+    after: &Schema,
+    moved: &mut Vec<String>,
+) {
+    for (column, expected) in &expected.presence {
+        let Some(table) = after.tables.get(&column.table) else {
+            // The table itself is gone or renamed; its own check answers.
+            continue;
+        };
+        match (expected, table.columns.contains_key(&column.name)) {
+            (pbps_model::Presence::Present, false) => moved.push(format!(
+                "{} column `{}` is not there, and this plan writes it",
+                column.table, column.name
+            )),
+            (pbps_model::Presence::Absent, true) => moved.push(format!(
+                "{} column `{}` is still there, and this plan removes it",
+                column.table, column.name
+            )),
+            _ => {}
+        }
+    }
+    for ((column, _), promise) in &expected.promises {
+        let Some(now) = after
+            .tables
+            .get(&column.table)
+            .and_then(|t| t.columns.get(&column.name))
+        else {
+            // Reported above, or the table's own check answers.
+            continue;
+        };
+        use pbps_model::ColumnPromise;
+        let (kept, what) = match promise {
+            ColumnPromise::Whole(declared) => {
+                (declared_column(dialect, declared, now), "definition")
+            }
+            ColumnPromise::Type(to) => (super::super::same_type(dialect, to, &now.ty), "type"),
+            ColumnPromise::Nullable(to) => (now.nullable == *to, "nullability"),
+            ColumnPromise::Default(has) => (
+                Expr::Planned(*has).accepts(Source::of(&now.value_source).default),
+                "default",
+            ),
+            ColumnPromise::Generated(has) => (
+                *has == Source::of(&now.value_source).generated.is_some(),
+                "generation expression",
+            ),
+            ColumnPromise::Collation(c) => (now.collation.as_ref() == *c, "collation"),
+        };
+        if !kept {
+            moved.push(format!(
+                "{} column `{}` does not have the {what} this plan gives it",
+                column.table, column.name
+            ));
+        }
+    }
+}
+
+pub(crate) fn columns(
+    expected: &super::expect::ColumnsExpected<'_>,
+    now: &Table,
+    name: &TableName,
+    moved: &mut Vec<String>,
+) {
+    for required in &expected.0 {
+        let column = &required.name;
+        let observed = now.columns.get(column);
+        if !required.present.accepts(&observed.is_some()) {
+            moved.push(format!("{name} column `{column}` is not on both sides, and no change of this plan adds or removes it"));
+        } else if let (Some(fields), Some(observed)) = (&required.fields, observed) {
+            for what in self::column(fields, observed) {
+                moved.push(format!("{name} column `{column}` has a different {what} from the one the plan was approved over, and no change of this plan moves it"));
+            }
+        }
     }
 }

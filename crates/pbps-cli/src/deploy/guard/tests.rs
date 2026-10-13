@@ -645,3 +645,899 @@ fn scalar_settings_follow_their_uid_when_a_table_name_changes_hands() {
         }
     }
 }
+
+#[test]
+fn column_requirements_follow_one_uid_through_intermediate_spellings() {
+    use pbps_model::{IdsFile, ValueSource};
+    let name = TableName::new("app", "t");
+    let uid: pbps_model::Uid = "c_000001".parse().unwrap();
+    let rename = |from: &str, to: &str| Change::RenameColumn {
+        uid: uid.clone(),
+        table: name.clone(),
+        from: from.into(),
+        to: to.into(),
+        table_was: None,
+    };
+    let default = |column: &str, from: Option<&str>, to: Option<&str>| Change::AlterColumnDefault {
+        uid: uid.clone(),
+        column: name.column(column),
+        from: from.map(str::to_owned),
+        to: to.map(str::to_owned),
+    };
+    let changes = plan(vec![
+        default("id", Some("1"), None),
+        rename("id", "temporary"),
+        rename("temporary", "final"),
+        default("final", None, Some("2")),
+    ]);
+    let mut ids = IdsFile::default();
+    ids.tables.insert("t_000001".parse().unwrap(), name.clone());
+    ids.columns.insert(uid, name.column("final"));
+    let mut before = schema(table());
+    before
+        .tables
+        .get_mut(&name)
+        .unwrap()
+        .columns
+        .get_mut("id")
+        .unwrap()
+        .value_source = ValueSource::Default("(1)".into());
+    let mut after = before.clone();
+    let t = after.tables.get_mut(&name).unwrap();
+    let mut column = t.columns.shift_remove("id").unwrap();
+    column.value_source = ValueSource::Default("(2)".into());
+    t.columns.insert("final".into(), column);
+    let check = |after: &Schema| {
+        super::super::refuse_pinned_movement(
+            &pbps_pg::Postgres::new(),
+            super::Plan {
+                changes: &changes,
+                ids: &ids,
+            },
+            &before,
+            after,
+            "test",
+            Settled::Closing,
+        )
+    };
+    check(&after).expect("the last default and final spelling belong to the same UID");
+    for impostor in ["id", "temporary"] {
+        let mut wrong = after.clone();
+        wrong
+            .tables
+            .get_mut(&name)
+            .unwrap()
+            .columns
+            .insert(impostor.into(), Column::new("integer".parse().unwrap()));
+        assert!(check(&wrong).is_err(), "an impostor occupies {impostor}");
+    }
+    let mut wrong = after.clone();
+    wrong
+        .tables
+        .get_mut(&name)
+        .unwrap()
+        .columns
+        .get_mut("final")
+        .unwrap()
+        .nullable = false;
+    let error = check(&wrong).expect_err("a planned default does not own nullability");
+    assert!(format!("{error:#}").contains("nullability"));
+    wrong
+        .tables
+        .get_mut(&name)
+        .unwrap()
+        .columns
+        .get_mut("final")
+        .unwrap()
+        .nullable = true;
+    wrong
+        .tables
+        .get_mut(&name)
+        .unwrap()
+        .columns
+        .get_mut("final")
+        .unwrap()
+        .value_source = ValueSource::None;
+    let error = check(&wrong).expect_err("the final default must be present");
+    assert!(format!("{error:#}").contains("does not have the default"));
+}
+
+#[test]
+fn a_column_drop_before_its_parent_rename_reaches_only_its_own_partition_entry() {
+    let parent = TableName::new("app", "events");
+    let renamed = TableName::new("app", "history");
+    let child = TableName::new("app", "t");
+    let mut before = schema(partition(Some("'kept'::text"), false));
+    let mut parent_table = table();
+    parent_table
+        .columns
+        .insert("v".into(), Column::new("text".parse().unwrap()));
+    before.tables.insert(parent.clone(), parent_table);
+    let changes = plan(vec![
+        Change::DropColumn {
+            uid: "c_000001".parse().unwrap(),
+            column: parent.column("v"),
+        },
+        Change::RenameTable {
+            uid: "t_000001".parse().unwrap(),
+            from: parent.clone(),
+            to: renamed.clone(),
+            defaults: Vec::new(),
+        },
+    ]);
+    let ids = super::fixture_ids(&changes, &before);
+    let mut after = before.clone();
+    let mut parent_table = after.tables.remove(&parent).unwrap();
+    parent_table.columns.shift_remove("v");
+    after.tables.insert(renamed.clone(), parent_table);
+    let of = after
+        .tables
+        .get_mut(&child)
+        .unwrap()
+        .partition_of
+        .as_mut()
+        .unwrap();
+    of.parent = renamed;
+    of.columns.remove("v");
+    let check = |after: &Schema| {
+        super::super::refuse_pinned_movement(
+            &pbps_pg::Postgres::new(),
+            super::Plan {
+                changes: &changes,
+                ids: &ids,
+            },
+            &before,
+            after,
+            "test",
+            Settled::Closing,
+        )
+    };
+    check(&after).expect("the parent's UID carries the drop through its later rename");
+    let mut wrong = after.clone();
+    wrong
+        .tables
+        .get_mut(&child)
+        .unwrap()
+        .partition_of
+        .as_mut()
+        .unwrap()
+        .columns
+        .insert(
+            "v".into(),
+            pbps_model::PartitionColumn {
+                default: Some("'kept'::text".into()),
+                not_null: false,
+            },
+        );
+    let error = check(&wrong).expect_err("the dropped column's local override cannot remain");
+    assert!(format!("{error:#}").contains("own column defaults or NOT NULLs"));
+}
+
+#[test]
+fn a_rename_keeps_every_observed_column_field_across_the_move_and_at_close() {
+    use pbps_model::{Generated, Identity, OwnedSequence, ValueSource};
+    let base = Column::new("integer".parse().unwrap());
+    let mut cases = Vec::new();
+    for field in [
+        "type",
+        "nullability",
+        "collation",
+        "deprecation",
+        "description",
+    ] {
+        let mut changed = base.clone();
+        match field {
+            "type" => changed.ty = "bigint".parse().unwrap(),
+            "nullability" => changed.nullable = !changed.nullable,
+            "collation" => {
+                changed.collation = Some(pbps_model::Collation::new("Latin1_General_100_CI_AS"))
+            }
+            "deprecation" => changed.deprecated = Some("another declaration".into()),
+            "description" => changed.description = Some("another writer".into()),
+            _ => unreachable!(),
+        }
+        cases.push((field, base.clone(), changed));
+    }
+    let generated = |text: &str, stored| {
+        ValueSource::Generated(Generated {
+            expression: text.into(),
+            stored,
+        })
+    };
+    for (field, before, after) in [
+        (
+            "default",
+            ValueSource::Default("(1)".into()),
+            ValueSource::Default("(2)".into()),
+        ),
+        (
+            "generation expression",
+            generated("id + 1", true),
+            generated("id + 2", true),
+        ),
+        (
+            "generation",
+            generated("id + 1", true),
+            generated("id + 1", false),
+        ),
+        (
+            "identity",
+            ValueSource::Identity(Identity {
+                seed: 1,
+                increment: 1,
+            }),
+            ValueSource::Identity(Identity {
+                seed: 2,
+                increment: 1,
+            }),
+        ),
+        (
+            "sequence",
+            ValueSource::Sequence(OwnedSequence {
+                start: 1,
+                increment: 1,
+                name: Some("kept_seq".into()),
+            }),
+            ValueSource::Sequence(OwnedSequence {
+                start: 1,
+                increment: 2,
+                name: Some("kept_seq".into()),
+            }),
+        ),
+    ] {
+        let (mut was, mut now) = (base.clone(), base.clone());
+        was.value_source = before;
+        now.value_source = after;
+        cases.push((field, was, now));
+    }
+    let name = TableName::new("app", "t");
+    let changes = plan(vec![Change::RenameColumn {
+        uid: "c_000001".parse().unwrap(),
+        table: name.clone(),
+        from: "id".into(),
+        to: "renamed".into(),
+        table_was: None,
+    }]);
+    let mut ids = pbps_model::IdsFile::default();
+    ids.tables.insert("t_000001".parse().unwrap(), name.clone());
+    ids.columns
+        .insert("c_000001".parse().unwrap(), name.column("renamed"));
+    let observed = |name: &str, column: Column| {
+        schema(Table {
+            columns: [(name.into(), column)].into(),
+            ..Default::default()
+        })
+    };
+    for (field, was, now) in cases {
+        for (before_name, settled) in [("id", Settled::Whole), ("renamed", Settled::Closing)] {
+            let before = observed(before_name, was.clone());
+            let check = |column| {
+                super::super::refuse_pinned_movement(
+                    &pbps_pg::Postgres::new(),
+                    super::Plan {
+                        changes: &changes,
+                        ids: &ids,
+                    },
+                    &before,
+                    &observed("renamed", column),
+                    "test",
+                    settled,
+                )
+            };
+            check(was.clone()).expect("a rename preserves the entire held column");
+            let error = check(now.clone()).expect_err(field);
+            assert!(
+                format!("{error:#}").contains(&format!("different {field}")),
+                "{field}: {error:#}"
+            );
+        }
+    }
+}
+
+#[test]
+fn column_diagnostics_keep_the_observation_order() {
+    let name = TableName::new("app", "t");
+    let before = schema(Table {
+        columns: ["z", "a"]
+            .into_iter()
+            .map(|name| (name.into(), Column::new("integer".parse().unwrap())))
+            .collect(),
+        ..Default::default()
+    });
+    let changes = plan(vec![Change::SetTablePersistence {
+        uid: "t_000001".parse().unwrap(),
+        table: name.clone(),
+        unlogged: true,
+    }]);
+    let mut after = before.clone();
+    let t = after.tables.get_mut(&name).unwrap();
+    t.unlogged = true;
+    for column in t.columns.values_mut() {
+        column.ty = "bigint".parse().unwrap();
+    }
+    let error = refuse_unplanned_movement(
+        &pbps_pg::Postgres::new(),
+        &changes,
+        &before,
+        &after,
+        "test",
+        Settled::Closing,
+    )
+    .expect_err("both untouched types changed");
+    let text = format!("{error:#}");
+    let columns: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("different type"))
+        .map(|line| line.split('`').nth(1).unwrap())
+        .collect();
+    assert_eq!(columns, ["z", "a", "z", "a"], "{text}");
+    let mut kept = before.clone();
+    kept.tables.get_mut(&name).unwrap().unlogged = true;
+    refuse_unplanned_movement(
+        &pbps_pg::Postgres::new(),
+        &changes,
+        &before,
+        &kept,
+        "test",
+        Settled::Closing,
+    )
+    .expect("the plan changes only persistence");
+}
+
+#[test]
+fn a_retired_columns_promise_cannot_answer_for_the_next_holder_of_its_name() {
+    use pbps_model::ValueSource;
+    let name = TableName::new("app", "t");
+    let mut t = Table::default();
+    for (column, value) in [("a", "(1)"), ("b", "(2)")] {
+        let mut spec = Column::new("integer".parse().unwrap());
+        spec.value_source = ValueSource::Default(value.into());
+        t.columns.insert(column.into(), spec);
+    }
+    let before = schema(t);
+    let changes = plan(vec![
+        Change::AlterColumnDefault {
+            uid: "c_000001".parse().unwrap(),
+            column: name.column("a"),
+            from: Some("1".into()),
+            to: None,
+        },
+        Change::DropColumn {
+            uid: "c_000001".parse().unwrap(),
+            column: name.column("a"),
+        },
+        Change::RenameColumn {
+            uid: "c_000002".parse().unwrap(),
+            table: name.clone(),
+            from: "b".into(),
+            to: "a".into(),
+            table_was: None,
+        },
+    ]);
+    let mut ids = pbps_model::IdsFile::default();
+    ids.tables.insert("t_000001".parse().unwrap(), name.clone());
+    ids.columns
+        .insert("c_000002".parse().unwrap(), name.column("a"));
+    let mut after = before.clone();
+    let t = after.tables.get_mut(&name).unwrap();
+    t.columns.shift_remove("a");
+    let survivor = t.columns.shift_remove("b").unwrap();
+    t.columns.insert("a".into(), survivor);
+    let check = |after: &Schema| {
+        super::super::refuse_pinned_movement(
+            &pbps_pg::Postgres::new(),
+            super::Plan {
+                changes: &changes,
+                ids: &ids,
+            },
+            &before,
+            after,
+            "test",
+            Settled::Closing,
+        )
+    };
+    check(&after).expect("the dropped UID's absent default is no promise about its successor");
+    after
+        .tables
+        .get_mut(&name)
+        .unwrap()
+        .columns
+        .get_mut("a")
+        .unwrap()
+        .value_source = ValueSource::None;
+    let error = check(&after).expect_err("the surviving UID keeps its own default text");
+    assert!(format!("{error:#}").contains("different default"));
+}
+
+fn parent_with_distinct_own_columns() -> Schema {
+    use pbps_model::{PartitionColumn, ValueSource};
+    let parent = TableName::new("app", "events");
+    let mut p = table();
+    p.partition_by = Some(pbps_model::PartitionBy {
+        columns: vec!["id".into()],
+        external: false,
+    });
+    for (name, value) in [("a", "1"), ("b", "2")] {
+        let mut c = Column::new("integer".parse().unwrap());
+        c.value_source = ValueSource::Default(value.into());
+        p.columns.insert(name.into(), c);
+    }
+    let mut c = partition(None, false);
+    let of = c.partition_of.as_mut().unwrap();
+    of.bound = pbps_model::PartitionBound::Range {
+        from: vec![pbps_model::BoundDatum::Value("0".into())],
+        to: vec![pbps_model::BoundDatum::Value("10".into())],
+    };
+    of.columns = [
+        (
+            "a".into(),
+            PartitionColumn {
+                default: Some("4".into()),
+                not_null: false,
+            },
+        ),
+        (
+            "b".into(),
+            PartitionColumn {
+                default: Some("3".into()),
+                not_null: true,
+            },
+        ),
+    ]
+    .into();
+    let mut before = schema(c);
+    before.tables.insert(parent.clone(), p);
+    before
+}
+
+#[test]
+fn retired_parent_columns_remove_their_original_own_entries() {
+    let parent = TableName::new("app", "events");
+    let child = TableName::new("app", "t");
+    let mut before = parent_with_distinct_own_columns();
+    before
+        .tables
+        .get_mut(&child)
+        .unwrap()
+        .partition_of
+        .as_mut()
+        .unwrap()
+        .columns
+        .get_mut("a")
+        .unwrap()
+        .not_null = true;
+    for (spellings, move_parent) in [
+        (vec!["renamed"], false),
+        (vec!["intermediate", "renamed"], false),
+        (vec!["intermediate", "renamed"], true),
+    ] {
+        let mut from = "a";
+        let mut changes = Vec::new();
+        for to in spellings {
+            changes.push(Change::RenameColumn {
+                uid: "c_000001".parse().unwrap(),
+                table_was: None,
+                table: parent.clone(),
+                from: from.into(),
+                to: to.into(),
+            });
+            from = to;
+        }
+        let final_parent = if move_parent {
+            let moved = TableName::new("app", "history");
+            changes.push(Change::RenameTable {
+                uid: "t_000002".parse().unwrap(),
+                from: parent.clone(),
+                to: moved.clone(),
+                defaults: Vec::new(),
+            });
+            moved
+        } else {
+            parent.clone()
+        };
+        changes.push(Change::DropColumn {
+            uid: "c_000001".parse().unwrap(),
+            column: final_parent.column(from),
+        });
+        let changes = plan(changes);
+        let mut after = before.clone();
+        let mut parent_table = after.tables.remove(&parent).unwrap();
+        parent_table.columns.shift_remove("a");
+        after.tables.insert(final_parent.clone(), parent_table);
+        let own = after
+            .tables
+            .get_mut(&child)
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap();
+        own.parent = final_parent;
+        let retired = own.columns.remove("a").unwrap();
+        let check = |now: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                &changes,
+                &before,
+                now,
+                "test",
+                Settled::Whole,
+            )
+        };
+        check(&after).expect("dropping the renamed UID removes its original own entry");
+        for spelling in ["a", from] {
+            let mut wrong = after.clone();
+            wrong
+                .tables
+                .get_mut(&child)
+                .unwrap()
+                .partition_of
+                .as_mut()
+                .unwrap()
+                .columns
+                .insert(spelling.into(), retired.clone());
+            let error =
+                check(&wrong).expect_err("the retired UID leaves no own entry under either name");
+            assert!(format!("{error:#}").contains("own column defaults or NOT NULLs"));
+        }
+        for field in ["default", "not_null"] {
+            let mut wrong = after.clone();
+            let kept = wrong
+                .tables
+                .get_mut(&child)
+                .unwrap()
+                .partition_of
+                .as_mut()
+                .unwrap()
+                .columns
+                .get_mut("b")
+                .unwrap();
+            match field {
+                "default" => kept.default = None,
+                "not_null" => kept.not_null = false,
+                _ => unreachable!(),
+            }
+            let error =
+                check(&wrong).expect_err("retirement does not excuse another UID's own fields");
+            assert!(format!("{error:#}").contains("own column defaults or NOT NULLs"));
+        }
+    }
+}
+
+#[test]
+fn retired_parent_fields_do_not_change_the_next_columns_own_entries() {
+    let parent = TableName::new("app", "events");
+    let child = TableName::new("app", "t");
+    let before = parent_with_distinct_own_columns();
+    let fields = [
+        Change::AlterColumnDefault {
+            uid: "c_000001".parse().unwrap(),
+            column: parent.column("a"),
+            from: Some("1".into()),
+            to: None,
+        },
+        Change::AlterColumnNullability {
+            uid: "c_000001".parse().unwrap(),
+            column: parent.column("a"),
+            ty: "integer".parse().unwrap(),
+            to_nullable: false,
+            collation: None,
+            through_external_partitions: false,
+        },
+    ];
+    for field in fields {
+        let changes = plan(vec![
+            field,
+            Change::DropColumn {
+                uid: "c_000001".parse().unwrap(),
+                column: parent.column("a"),
+            },
+            Change::RenameColumn {
+                uid: "c_000002".parse().unwrap(),
+                table_was: None,
+                table: parent.clone(),
+                from: "b".into(),
+                to: "a".into(),
+            },
+        ]);
+        let mut after = before.clone();
+        let p = after.tables.get_mut(&parent).unwrap();
+        p.columns.shift_remove("a");
+        let b = p.columns.shift_remove("b").unwrap();
+        p.columns.insert("a".into(), b);
+        let own = &mut after
+            .tables
+            .get_mut(&child)
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .columns;
+        own.remove("a");
+        let b = own.remove("b").unwrap();
+        own.insert("a".into(), b);
+        refuse_unplanned_movement(
+            &pbps_pg::Postgres::new(),
+            &changes,
+            &before,
+            &after,
+            "test",
+            Settled::Whole,
+        )
+        .expect("the retired column cannot erase the surviving partition override");
+        for field in ["default", "not_null"] {
+            let mut wrong = after.clone();
+            let own = wrong
+                .tables
+                .get_mut(&child)
+                .unwrap()
+                .partition_of
+                .as_mut()
+                .unwrap()
+                .columns
+                .get_mut("a")
+                .unwrap();
+            match field {
+                "default" => own.default = None,
+                "not_null" => own.not_null = false,
+                _ => unreachable!(),
+            }
+            let error = refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                &changes,
+                &before,
+                &wrong,
+                "test",
+                Settled::Whole,
+            )
+            .expect_err("the retired column owns neither field of its replacement");
+            assert!(
+                format!("{error:#}").contains("own column defaults or NOT NULLs"),
+                "{field}: {error:#}"
+            );
+        }
+    }
+}
+
+#[test]
+fn own_field_requirements_follow_the_column_through_a_name_swap() {
+    use pbps_model::ValueSource;
+    let parent = TableName::new("app", "events");
+    let child = TableName::new("app", "t");
+    let before = parent_with_distinct_own_columns();
+    let fields = [
+        (
+            Change::AlterColumnDefault {
+                uid: "c_000002".parse().unwrap(),
+                column: parent.column("b"),
+                from: Some("2".into()),
+                to: None,
+            },
+            None,
+            true,
+            None,
+            true,
+        ),
+        (
+            Change::SetPartitionDefault {
+                uid: "t_000001".parse().unwrap(),
+                table: child.clone(),
+                parent: parent.clone(),
+                column: "b".into(),
+                from: Some("3".into()),
+                to: None,
+                fallback: Some("2".into()),
+            },
+            Some("2"),
+            true,
+            None,
+            true,
+        ),
+        (
+            Change::AlterColumnNullability {
+                uid: "c_000002".parse().unwrap(),
+                column: parent.column("b"),
+                ty: "integer".parse().unwrap(),
+                to_nullable: false,
+                collation: None,
+                through_external_partitions: false,
+            },
+            Some("2"),
+            false,
+            Some("3"),
+            false,
+        ),
+        (
+            Change::SetPartitionNotNull {
+                uid: "t_000001".parse().unwrap(),
+                table: child.clone(),
+                column: "b".into(),
+                not_null: false,
+            },
+            Some("2"),
+            true,
+            Some("3"),
+            false,
+        ),
+    ];
+    let rename = |uid: &str, from: &str, to: &str| Change::RenameColumn {
+        uid: uid.parse().unwrap(),
+        table: parent.clone(),
+        from: from.into(),
+        to: to.into(),
+        table_was: None,
+    };
+    for (field, parent_default, parent_nullable, own_default, own_not_null) in fields {
+        let changes = plan(vec![
+            field,
+            rename("c_000001", "a", "temporary"),
+            rename("c_000002", "b", "a"),
+            rename("c_000001", "temporary", "b"),
+        ]);
+        let mut after = before.clone();
+        let p = after.tables.get_mut(&parent).unwrap();
+        let a = p.columns.shift_remove("a").unwrap();
+        let mut b = p.columns.shift_remove("b").unwrap();
+        b.value_source =
+            parent_default.map_or(ValueSource::None, |v: &str| ValueSource::Default(v.into()));
+        b.nullable = parent_nullable;
+        p.columns.insert("a".into(), b);
+        p.columns.insert("b".into(), a);
+        let own = &mut after
+            .tables
+            .get_mut(&child)
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .columns;
+        let a = own.remove("a").unwrap();
+        let mut b = own.remove("b").unwrap();
+        b.default = own_default.map(str::to_owned);
+        b.not_null = own_not_null;
+        own.insert("a".into(), b);
+        own.insert("b".into(), a);
+        refuse_unplanned_movement(
+            &pbps_pg::Postgres::new(),
+            &changes,
+            &before,
+            &after,
+            "test",
+            Settled::Whole,
+        )
+        .expect("the field setting follows b's UID to a");
+        for field in ["default", "not_null"] {
+            let mut wrong = after.clone();
+            let untouched = wrong
+                .tables
+                .get_mut(&child)
+                .unwrap()
+                .partition_of
+                .as_mut()
+                .unwrap()
+                .columns
+                .get_mut("b")
+                .unwrap();
+            match field {
+                "default" => untouched.default = None,
+                "not_null" => untouched.not_null = true,
+                _ => unreachable!(),
+            }
+            let error = refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                &changes,
+                &before,
+                &wrong,
+                "test",
+                Settled::Whole,
+            )
+            .expect_err("the field setting cannot move a's UID, now called b");
+            assert!(
+                format!("{error:#}").contains("own column defaults or NOT NULLs"),
+                "{field}: {error:#}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_same_named_new_column_does_not_inherit_the_retired_definition() {
+    use pbps_model::{Generated, IdsFile, ValueSource};
+    let name = TableName::new("app", "t");
+    let mut replacement = Column::new("bigint".parse().unwrap());
+    replacement.nullable = false;
+    replacement.value_source = ValueSource::Default("1".into());
+    for generated in [true, false] {
+        for move_table in [false, true] {
+            let mut old = Column::new("integer".parse().unwrap());
+            if generated {
+                old.value_source = ValueSource::Generated(Generated {
+                    expression: "id + 1".into(),
+                    stored: true,
+                });
+            }
+            let mut t = table();
+            t.columns.insert("value".into(), old.clone());
+            let before = schema(t);
+            let mut changes = vec![
+                Change::DropColumn {
+                    uid: "c_000001".parse().unwrap(),
+                    column: name.column("value"),
+                },
+                Change::AddColumn {
+                    uid: "c_000002".parse().unwrap(),
+                    table: name.clone(),
+                    name: "value".into(),
+                    column: Box::new(replacement.clone()),
+                },
+            ];
+            let final_name = if move_table {
+                let to = TableName::new("app", "moved");
+                changes.push(Change::RenameTable {
+                    uid: "t_000001".parse().unwrap(),
+                    from: name.clone(),
+                    to: to.clone(),
+                    defaults: Vec::new(),
+                });
+                to
+            } else {
+                name.clone()
+            };
+            let changes = plan(changes);
+            let mut ids = IdsFile::default();
+            ids.tables
+                .insert("t_000001".parse().unwrap(), final_name.clone());
+            ids.columns
+                .insert("c_000002".parse().unwrap(), final_name.column("value"));
+            ids.columns
+                .insert("c_000003".parse().unwrap(), final_name.column("id"));
+            let mut after = Schema::default();
+            let mut t = table();
+            t.columns.insert("value".into(), replacement.clone());
+            after.tables.insert(final_name.clone(), t);
+            let check = |after: &Schema| {
+                super::super::refuse_pinned_movement(
+                    &pbps_pg::Postgres::new(),
+                    super::Plan {
+                        changes: &changes,
+                        ids: &ids,
+                    },
+                    &before,
+                    after,
+                    "test",
+                    Settled::Whole,
+                )
+            };
+            check(&after).expect("the new UID answers to its declaration, not the retired column");
+            for field in [
+                "type",
+                "nullability",
+                "default",
+                "generation",
+                "presence",
+                "unrelated",
+            ] {
+                let mut wrong = after.clone();
+                let t = wrong.tables.get_mut(&final_name).unwrap();
+                match field {
+                    "type" => t.columns.get_mut("value").unwrap().ty = "text".parse().unwrap(),
+                    "nullability" => t.columns.get_mut("value").unwrap().nullable = true,
+                    "default" => {
+                        t.columns.get_mut("value").unwrap().value_source = ValueSource::None
+                    }
+                    "generation" => {
+                        t.columns.insert("value".into(), old.clone());
+                    }
+                    "presence" => {
+                        t.columns.shift_remove("value");
+                    }
+                    "unrelated" => t.columns.get_mut("id").unwrap().ty = "bigint".parse().unwrap(),
+                    _ => unreachable!(),
+                }
+                let error = check(&wrong)
+                    .expect_err("replacement holds its promise and keeps unrelated fields");
+                let column = if field == "unrelated" { "id" } else { "value" };
+                assert!(format!("{error:#}").contains(&format!("column `{column}`")));
+            }
+        }
+    }
+}
