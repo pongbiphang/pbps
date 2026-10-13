@@ -429,11 +429,8 @@ fn human_json_routes_keep_command_outcomes() {
             assert_eq!(json["findings"][0]["severity"], "error");
             assert!(json["findings"][0]["message"].is_string());
             assert!(json["findings"][0].get("remedy").is_none());
-            let summary = match (args[0], case) {
-                ("fmt", "io") => {
-                    "error: cannot read `./schema/dbo.t.yml`: stream did not contain valid UTF-8\n"
-                }
-                ("fmt", _) => "error: `./schema/dbo.t.yml` does not parse\n",
+            let summary = match args[0] {
+                "fmt" => "error: cannot format declarations with unreadable or invalid input\n",
                 _ => "error: the declarations have 1 problem(s)\n",
             };
             assert_eq!(normalize(&capture.stderr), summary);

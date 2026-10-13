@@ -16,5 +16,5 @@ pbps::load::yaml
   │ 2 | columns: [
   │   |          ^ unclosed bracket '['
 
-error: `./schema/dbo.t.yml` does not parse
+error: cannot format declarations with unreadable or invalid input
 --- end ---
