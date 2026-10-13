@@ -767,3 +767,46 @@ them); by `a_date_read_differently_by_another_language_or_order_is_ambiguous`
 changed from a refusal, by the bound in
 `a_partition_tree_round_trips_through_the_cli` and the date in
 `a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is_written`.
+
+<a id="dec-1805-1"></a>
+
+**DEC-1805.1. PostgreSQL reads requested-key aliases in batches of 128.**
+An unbounded `UNION ALL` of the scalar lookups from 71 made the planner's
+recursive set-operation tree slow at 4,070 keys and exceed the default 2 MB
+stack at 10,000. Keep each untyped literal and scalar lookup unchanged:
+casting a `VALUES` column would change the engine's key conversion. The query
+holds a vector of nonempty statements from `chunks(128)`. The catalog reader
+executes them inside its existing owned or caller-held transaction, merging
+all answers before the model checks aliases and collisions (74). A boundary
+between two spellings cannot conceal a conflict; absent rows still have no
+alias. Owned reads use repeatable read; caller-held reads retain the caller's
+isolation level, so transaction membership alone does not promise a shared
+snapshot at read committed. No reference-data limit, DML policy, transaction
+isolation or JIT setting changes.
+
+Measured on PostgreSQL 18.6 and 16.15, with JIT off and the default stack,
+through loopback TCP: median seconds of three executions, including query
+round trips and fetching all rows, excluding SQL string construction. The
+first 4,070 keys are the retained UCI Online Retail product catalogue; 5,930
+explicitly synthetic keys extend the boundary case to 10,000. Every successful
+read returned all requested key/canonical pairs. Alternating batch order
+between repetitions gave:
+
+| Engine | Keys | One statement | 64 | 128 | 256 | 512 |
+|---|---:|---:|---:|---:|---:|---:|
+| 18.6 | 1,000 | 0.2002 | 0.0354 | 0.0413 | 0.0632 | 0.1056 |
+| 18.6 | 4,070 | 4.4694 | 0.1535 | 0.1632 | 0.2688 | 0.4090 |
+| 18.6 | 10,000 | SQLSTATE 54001 | 0.3958 | 0.4541 | 0.7151 | 1.0750 |
+| 16.15 | 1,000 | 0.2006 | 0.0375 | 0.0395 | 0.0659 | 0.0944 |
+| 16.15 | 4,070 | 4.3977 | 0.1522 | 0.1601 | 0.2593 | 0.3481 |
+| 16.15 | 10,000 | SQLSTATE 54001 | 0.4021 | 0.4297 | 0.6517 | 0.9371 |
+
+64 is fastest on this loopback connection. 128 trades a small measured cost
+for roughly half the round trips (79 rather than 157 at 10,000 keys), while
+avoiding the larger batches' planning cost. This is a bounded default, not a
+claim that one size is fastest at every network latency. Timings are evidence,
+not test thresholds. Live regressions on both engines pin large `Every` and
+`Keys` reads, missing keys, a cross-batch `01`/`1` collision and rollback when
+a later batch fails; CLI regressions
+pin exact/ensure adoption, no-op planning, drift scope, bootstrap and apply
+read-back. Reverting the bound reproduces the stack failure.

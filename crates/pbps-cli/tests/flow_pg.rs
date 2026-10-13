@@ -18,6 +18,9 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/alias_batches.rs"]
+mod alias_batches;
+
 #[path = "support/verify_failures.rs"]
 mod verify_failures;
 
