@@ -1541,3 +1541,341 @@ fn a_same_named_new_column_does_not_inherit_the_retired_definition() {
         }
     }
 }
+
+#[test]
+fn retired_part_requirements_do_not_follow_a_reused_table_name() {
+    let (a, b) = (TableName::new("app", "a"), TableName::new("app", "b"));
+    let mut t = table();
+    t.checks.insert(
+        "ck".into(),
+        CheckConstraint {
+            expression: "id > 0".into(),
+        },
+    );
+    let before = Schema {
+        tables: [(a.clone(), t.clone()), (b.clone(), t.clone())].into(),
+        ..Default::default()
+    };
+    let changes = plan(vec![
+        Change::DropCheck {
+            table: a.clone(),
+            name: "ck".into(),
+        },
+        Change::DropTable {
+            uid: "t_000001".parse().unwrap(),
+            name: a.clone(),
+            detach_from: None,
+        },
+        Change::RenameTable {
+            uid: "t_000002".parse().unwrap(),
+            from: b,
+            to: a.clone(),
+            defaults: vec![],
+        },
+    ]);
+    let mut after = Schema {
+        tables: [(a.clone(), t)].into(),
+        ..Default::default()
+    };
+    for read in [Settled::Whole, Settled::Closing] {
+        refuse_unplanned_movement(
+            &pbps_pg::Postgres::new(),
+            &changes,
+            &before,
+            &after,
+            "test",
+            read,
+        )
+        .expect("the surviving table keeps its own same-named check");
+    }
+    after
+        .tables
+        .get_mut(&a)
+        .unwrap()
+        .checks
+        .get_mut("ck")
+        .unwrap()
+        .expression = "id > 100".into();
+    let error = refuse_unplanned_movement(
+        &pbps_pg::Postgres::new(),
+        &changes,
+        &before,
+        &after,
+        "test",
+        Settled::Whole,
+    )
+    .expect_err("a retired owner's drop cannot excuse the survivor's changed check text");
+    assert!(
+        format!("{error:#}").contains("check `ck` is not as the plan left it"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn index_settings_fold_in_execution_order_and_follow_the_surviving_table() {
+    use pbps_model::{Index, IndexColumn, IndexKey, IndexPart};
+    let (from, to) = (TableName::new("app", "t"), TableName::new("app", "renamed"));
+    let index = |fillfactor: &str| Index {
+        columns: vec![IndexColumn {
+            key: IndexKey::Column("id".into()),
+            descending: false,
+            opclass: None,
+        }],
+        include: vec![],
+        unique: false,
+        filter: Some("id > 0".into()),
+        method: Default::default(),
+        storage_parameters: [("fillfactor".into(), fillfactor.into())].into(),
+    };
+    let setting = |name: &TableName, value: Option<&str>| Change::SetIndexStorageParameters {
+        table: name.clone(),
+        target: IndexPart::Index("ix".into()),
+        method: Default::default(),
+        set: value
+            .map(|v| [("fillfactor".into(), v.into())].into())
+            .unwrap_or_default(),
+        reset: if value.is_none() {
+            ["fillfactor".into()].into()
+        } else {
+            Default::default()
+        },
+    };
+    let mut t = table();
+    t.indexes.insert("ix".into(), index("70"));
+    let before = schema(t.clone());
+    let renamed = || Change::RenameTable {
+        uid: "t_000001".parse().unwrap(),
+        from: from.clone(),
+        to: to.clone(),
+        defaults: vec![],
+    };
+    for changes in [
+        plan(vec![setting(&from, Some("80")), renamed()]),
+        plan(vec![
+            setting(&from, None),
+            renamed(),
+            setting(&to, Some("80")),
+        ]),
+        plan(vec![
+            setting(&from, Some("90")),
+            Change::DropIndex {
+                table: from.clone(),
+                name: "ix".into(),
+            },
+            renamed(),
+            Change::AddIndex {
+                table: to.clone(),
+                name: "ix".into(),
+                index: Box::new(index("80")),
+                clustered: false,
+            },
+        ]),
+        plan(vec![
+            Change::DropIndex {
+                table: from.clone(),
+                name: "ix".into(),
+            },
+            Change::AddIndex {
+                table: from.clone(),
+                name: "ix".into(),
+                index: Box::new(index("90")),
+                clustered: false,
+            },
+            setting(&from, Some("80")),
+            renamed(),
+        ]),
+    ] {
+        let mut expected = t.clone();
+        expected.indexes.insert("ix".into(), index("80"));
+        let good = Schema {
+            tables: [(to.clone(), expected)].into(),
+            ..Default::default()
+        };
+        refuse_unplanned_movement(
+            &pbps_pg::Postgres::new(),
+            &changes,
+            &before,
+            &good,
+            "test",
+            Settled::Whole,
+        )
+        .expect("only the last surviving definition and its settings are required");
+        for wrong_shape in [false, true] {
+            let mut bad = good.clone();
+            let ix = bad
+                .tables
+                .get_mut(&to)
+                .unwrap()
+                .indexes
+                .get_mut("ix")
+                .unwrap();
+            if wrong_shape {
+                ix.columns[0].descending = true;
+            } else {
+                ix.storage_parameters
+                    .insert("fillfactor".into(), "90".into());
+            }
+            let error = refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                &changes,
+                &before,
+                &bad,
+                "test",
+                Settled::Whole,
+            )
+            .expect_err("both the definition and its final settings remain held");
+            assert!(format!("{error:#}").contains("index `ix`"), "{error:#}");
+        }
+    }
+    // A storage-only change never owns an existing filter's text, even when
+    // it is another syntactically valid expression over the same column.
+    let changes = plan(vec![setting(&from, Some("80")), renamed()]);
+    t.indexes.insert("ix".into(), index("80"));
+    t.indexes.get_mut("ix").unwrap().filter = Some("id > 1".into());
+    let bad = Schema {
+        tables: [(to, t)].into(),
+        ..Default::default()
+    };
+    refuse_unplanned_movement(
+        &pbps_pg::Postgres::new(),
+        &changes,
+        &before,
+        &bad,
+        "test",
+        Settled::Whole,
+    )
+    .expect_err("the unchanged filter is compared by read-back text");
+}
+
+#[test]
+fn a_created_tables_parts_use_the_final_definition_and_settings() {
+    use pbps_model::{Index, IndexColumn, IndexKey, IndexPart};
+    let name = TableName::new("app", "t");
+    let index = |fillfactor: &str, descending| Index {
+        columns: vec![IndexColumn {
+            key: IndexKey::Column("id".into()),
+            descending,
+            opclass: None,
+        }],
+        include: vec![],
+        unique: false,
+        filter: Some("id > 0".into()),
+        method: Default::default(),
+        storage_parameters: [("fillfactor".into(), fillfactor.into())].into(),
+    };
+    for carried in [false, true] {
+        let mut declared = table();
+        if carried {
+            declared.indexes.insert("ix".into(), index("70", false));
+        }
+        let mut steps = vec![Change::CreateTable {
+            uid: "t_000001".parse().unwrap(),
+            name: name.clone(),
+            table: Box::new(declared),
+            beside_default: None,
+            moves_at_most: None,
+        }];
+        if carried {
+            steps.push(Change::DropIndex {
+                table: name.clone(),
+                name: "ix".into(),
+            });
+        }
+        steps.extend([
+            Change::AddIndex {
+                table: name.clone(),
+                name: "ix".into(),
+                index: Box::new(index("80", true)),
+                clustered: false,
+            },
+            Change::SetIndexStorageParameters {
+                table: name.clone(),
+                target: IndexPart::Index("ix".into()),
+                method: Default::default(),
+                set: [("fillfactor".into(), "90".into())].into(),
+                reset: Default::default(),
+            },
+        ]);
+        let changes = plan(steps);
+        let mut finished = table();
+        finished.indexes.insert("ix".into(), index("90", true));
+        let before = Schema::default();
+        refuse_unplanned_movement(
+            &pbps_pg::Postgres::new(),
+            &changes,
+            &before,
+            &schema(finished.clone()),
+            "test",
+            Settled::Whole,
+        )
+        .expect("the created table holds the last replacement with its later settings");
+        for wrong in [None, Some(index("80", true)), Some(index("90", false))] {
+            let mut bad = finished.clone();
+            bad.indexes.clear();
+            if let Some(index) = wrong {
+                bad.indexes.insert("ix".into(), index);
+            }
+            let error = refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                &changes,
+                &before,
+                &schema(bad),
+                "test",
+                Settled::Whole,
+            )
+            .expect_err("creation still promises presence, definition and settings");
+            assert!(format!("{error:#}").contains("index `ix`"), "{error:#}");
+        }
+    }
+}
+
+#[test]
+fn a_created_heap_still_requires_exact_primary_key_presence() {
+    use pbps_model::{Clustered, PrimaryKey};
+    let name = TableName::new("app", "t");
+    let key = PrimaryKey {
+        name: Some("pk_t".into()),
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+    };
+    let mut heap = table();
+    heap.columns.get_mut("id").unwrap().nullable = false;
+    heap.clustered = Some(Clustered::Heap);
+    for present in [false, true] {
+        let mut declared = heap.clone();
+        declared.primary_key = present.then(|| key.clone());
+        let changes = plan(vec![Change::CreateTable {
+            uid: "t_000001".parse().unwrap(),
+            name: name.clone(),
+            table: Box::new(declared.clone()),
+            beside_default: None,
+            moves_at_most: None,
+        }]);
+        for read in [Settled::Whole, Settled::Closing] {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &changes,
+                &Schema::default(),
+                &schema(declared.clone()),
+                "test",
+                read,
+            )
+            .expect("the declared primary-key presence and heap layout agree");
+            let mut other = declared.clone();
+            other.primary_key = (!present).then(|| key.clone());
+            let error = refuse_unplanned_movement(&pbps_mssql::Mssql, &changes, &Schema::default(), &schema(other), "test", read)
+                .expect_err("a nonclustered key does not change the row holder, but its presence is still promised");
+            let diagnostic = format!("{error:#}");
+            let expected = if present {
+                "has no primary key"
+            } else {
+                "has a primary key, and this plan declares none"
+            };
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+            assert!(
+                !diagnostic.contains("not clustered"),
+                "the independent presence rule must catch this: {diagnostic}"
+            );
+        }
+    }
+}
