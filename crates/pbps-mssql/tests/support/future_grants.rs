@@ -38,6 +38,76 @@ fn control_gaps(held: &Held) -> Vec<Securable> {
 
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
+async fn existing_unrecorded_modules_use_object_authority_and_preserve_denials() {
+    let mut db = TestDb::create("grant_existing_modules").await;
+    db.conn.execute("EXEC('CREATE SCHEMA app'); CREATE TABLE app.t (id int); CREATE ROLE reader; CREATE USER deployer WITHOUT LOGIN; GRANT ALTER, VIEW DEFINITION ON SCHEMA::app TO deployer;").await.unwrap();
+    db.conn
+        .execute("CREATE VIEW app.v AS SELECT id FROM app.t;")
+        .await
+        .unwrap();
+    db.conn
+        .execute("CREATE PROCEDURE app.p AS SELECT id FROM app.t;")
+        .await
+        .unwrap();
+    db.conn
+        .execute("CREATE FUNCTION app.f() RETURNS TABLE AS RETURN (SELECT id FROM app.t);")
+        .await
+        .unwrap();
+    db.conn.execute("GRANT CONTROL ON app.t TO deployer; GRANT CONTROL ON app.v TO deployer; GRANT CONTROL ON app.p TO deployer; GRANT CONTROL ON app.f TO deployer;").await.unwrap();
+    let modules: Vec<_> = ["v", "p", "f"]
+        .into_iter()
+        .map(|name| ObjectName::new("app", name))
+        .collect();
+    let mut grants = GrantTargets {
+        objects: modules
+            .iter()
+            .cloned()
+            .chain([ObjectName::new("app", "t")])
+            .collect(),
+        managed_modules: modules.iter().cloned().map(ModuleId::Named).collect(),
+        roles: vec!["reader".into()],
+        ..Default::default()
+    };
+    db.conn
+        .execute("EXECUTE AS USER = 'deployer';")
+        .await
+        .unwrap();
+    let existing = holdings(&mut db.conn, &grants, &[ObjectName::new("app", "t")]).await;
+    let granted = db.conn.execute("GRANT SELECT ON app.t TO reader; GRANT SELECT ON app.v TO reader; GRANT EXECUTE ON app.p TO reader; GRANT SELECT ON app.f TO reader;").await;
+    grants.objects.push(ObjectName::new("app", "future"));
+    grants
+        .managed_modules
+        .insert(ModuleId::Named(ObjectName::new("app", "future")));
+    let future = holdings(&mut db.conn, &grants, &[ObjectName::new("app", "t")]).await;
+    // An unreadable metadata DENY may conservatively block a different future
+    // target's absence proof. Isolate the existing-module denial here; the
+    // hidden-target regression below pins that separate proof boundary.
+    grants.objects.pop().unwrap();
+    grants
+        .managed_modules
+        .remove(&ModuleId::Named(ObjectName::new("app", "future")));
+    db.conn.execute("REVERT; GRANT CONTROL ON SCHEMA::app TO deployer; DENY CONTROL ON app.v TO deployer; GRANT VIEW DEFINITION ON app.v TO deployer; EXECUTE AS USER = 'deployer';").await.unwrap();
+    let denied = holdings(&mut db.conn, &grants, &[ObjectName::new("app", "t")]).await;
+    db.conn.execute("REVERT;").await.unwrap();
+    db.drop().await;
+
+    granted.unwrap();
+    assert!(control_gaps(&existing).is_empty(), "{existing:?}");
+    for module in &modules {
+        assert!(
+            matches!(&existing.granted_objects[module], doctor::GrantedAt::Object(rights) if rights.contains("CONTROL")),
+            "{existing:?}"
+        );
+    }
+    assert_eq!(control_gaps(&future), [Securable::Schema("app".into())]);
+    assert_eq!(
+        control_gaps(&denied),
+        [Securable::Object(ObjectName::new("app", "v"))]
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
 async fn future_grants_match_real_creation_authority_for_admin_and_narrow_logins() {
     for authority in ["sa", "owner", "control", "narrow"] {
         let mut db = TestDb::create(&format!("future_grant_{authority}")).await;

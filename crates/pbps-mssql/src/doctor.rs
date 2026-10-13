@@ -897,10 +897,13 @@ pub fn ledger_tables() -> [ObjectName; 2] {
 /// to those the catalog shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Existing {
-    /// Joined against `OBJECT_ID`: an object that is not there is unasked,
-    /// and the caller falls back to the schema answer. Right for the ledger,
-    /// which does not exist before the first deployment.
+    /// Joined against `OBJECT_ID(..., 'U')`: only visible user tables.
+    /// Right for ledger and data tables, whose callers fall back to the
+    /// schema before the table exists.
     Only,
+    /// Visible objects of any kind. Grant targets include views, procedures
+    /// and functions, so a table-only lookup cannot prove their absence.
+    AnyKind,
     /// Every named object, present or not. Metadata visibility hides an
     /// object from a principal with no permission on it, so `OBJECT_ID`
     /// cannot tell "not there" from "not allowed to see"; asking anyway
@@ -1112,6 +1115,7 @@ fn object_permissions_sql<'a>(
     };
     let filter = match existing {
         Existing::Only => " WHERE OBJECT_ID(x.q, N'U') IS NOT NULL",
+        Existing::AnyKind => " WHERE OBJECT_ID(x.q) IS NOT NULL",
         Existing::OrNot => "",
     };
     let sql = format!(
@@ -2240,7 +2244,7 @@ pub async fn permissions(
                 conn,
                 &candidates,
                 &granted_perms,
-                Existing::Only,
+                Existing::AnyKind,
                 Columns::Catalog,
             )
             .await?;
@@ -3135,7 +3139,7 @@ mod tests {
     #[test]
     fn the_object_securable_is_quoted_by_the_server_from_two_bound_parts() {
         let objects = [ObjectName::new("dbo", "a.b"), ObjectName::new("app", "x]y")];
-        for existing in [Existing::Only, Existing::OrNot] {
+        for existing in [Existing::Only, Existing::AnyKind, Existing::OrNot] {
             let (sql, params) =
                 object_permissions_sql(&objects, &["SELECT"], existing, Columns::Catalog);
             // Assembled once, in the server, and every question asks the same
@@ -3159,6 +3163,11 @@ mod tests {
             assert_eq!(
                 sql.contains("WHERE OBJECT_ID(x.q, N'U') IS NOT NULL"),
                 existing == Existing::Only,
+                "{sql}"
+            );
+            assert_eq!(
+                sql.contains("WHERE OBJECT_ID(x.q) IS NOT NULL"),
+                existing == Existing::AnyKind,
                 "{sql}"
             );
         }

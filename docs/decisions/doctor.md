@@ -1287,7 +1287,9 @@ PostgreSQL does (428) would therefore miss a real SQL Server refusal.
 After identity resolution, the target must be unconfirmed, declared as a table
 or module, and absent from recorded tables, modules and role grant targets.
 Membership uses the database collation. Failed recorded-state reads cannot
-establish an unrecorded target. OBJECT_ID must be NULL, schema VIEW DEFINITION
+establish an unrecorded target. OBJECT_ID, without a table-only type filter,
+must be NULL: an existing unrecorded view, procedure or function still has
+object authority and may have an object DENY. Schema VIEW DEFINITION
 must be held, and effective object metadata denials must not hide this target;
 an unreadable denied object blocks the proof. The denial read is shared with
 the delete-count proof without adding delete diagnostics to grant-only
