@@ -723,7 +723,9 @@
         "renamed_data_takeovers_use_final_names_and_require_approval",
         "verify_names_a_serials_renamed_sequence",
         "verify_distinguishes_missing_empty_and_unreadable_recorded_state",
-        "verify_distinguishes_permission_denials_from_failed_connections"
+        "verify_distinguishes_permission_denials_from_failed_connections",
+        "alias_batches::large_exact_and_ensure_catalogues_can_be_adopted_planned_and_verified",
+        "alias_batches::large_catalogues_read_back_inside_bootstrap_and_apply_transactions"
       ]
     },
     {
@@ -1492,7 +1494,9 @@
         "what_the_model_cannot_hold_is_named_and_never_silently_dropped",
         "a_date_or_time_literal_read_two_ways_is_found_on_both_versions",
         "plan_names_tests::estimates_measure_each_occupant_before_and_after_name_reuse",
-        "plan_names_tests::a_detached_columns_estimate_keeps_its_catalog_spelling_after_rename"
+        "plan_names_tests::a_detached_columns_estimate_keeps_its_catalog_spelling_after_rename",
+        "alias_batches::ten_thousand_aliases_keep_every_requested_row_at_the_default_stack_limit",
+        "alias_batches::aliases_in_different_batches_still_refuse_a_collision"
       ]
     },
     {

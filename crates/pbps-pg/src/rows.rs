@@ -117,13 +117,17 @@ pub struct RowQuery {
     pub sql: String,
     pub key: Slot,
     pub columns: Vec<Slot>,
-    /// A second query, when the read was asked to spell keys: each requested
+    /// Bounded queries, when the read was asked to spell keys: each requested
     /// spelling beside the engine's spelling of the row it names
     /// ([`pbps_model::ObservedTable::aliases`]). The engine decides that `01`
     /// names the `integer` row `1`, exactly as it will when the emitter's
     /// `WHERE "id" = E'01'` runs.
-    pub aliases: Option<String>,
+    pub aliases: Vec<String>,
 }
+
+// PostgreSQL plans UNION ALL as a recursive tree. Bound its stack and planning
+// cost while retaining the engine's untyped-literal comparison (DEC-1805.1).
+const ALIAS_BATCH: usize = 128;
 
 /// The single primary-key column, or why there is none.
 pub(crate) fn key_column(name: &TableName, table: &Table) -> Result<String, RowsError> {
@@ -307,20 +311,19 @@ pub fn query(
     }
     sql.push(';');
 
-    let aliases = if requested.is_empty() {
-        None
-    } else {
-        let table = qualified(name)?;
-        let key = quote(&key)?;
-        // One scalar subquery per requested spelling rather than a join
-        // against a `VALUES` list: a `VALUES` column resolves to `text`, and
-        // `"id" = v.requested` on an `integer` column is then an operator that
-        // does not exist. Inside the subquery the literal stays `unknown` and
-        // the engine converts it to the key column's type — which is the
-        // conversion this query exists to observe, and the one the emitter's
-        // predicate will make.
-        Some(
-            requested
+    let table = qualified(name)?;
+    let key = quote(&key)?;
+    // One scalar subquery per requested spelling rather than a join
+    // against a `VALUES` list: a `VALUES` column resolves to `text`, and
+    // `"id" = v.requested` on an `integer` column is then an operator that
+    // does not exist. Inside the subquery the literal stays `unknown` and
+    // the engine converts it to the key column's type — which is the
+    // conversion this query exists to observe, and the one the emitter's
+    // predicate will make. chunks() produces no empty statement.
+    let aliases = requested
+        .chunks(ALIAS_BATCH)
+        .map(|batch| {
+            batch
                 .iter()
                 .map(|r| {
                     format!(
@@ -332,9 +335,9 @@ pub fn query(
                 })
                 .collect::<Vec<_>>()
                 .join("\nUNION ALL\n")
-                + ";",
-        )
-    };
+                + ";"
+        })
+        .collect();
 
     Ok(Some(RowQuery {
         sql,
@@ -2373,7 +2376,8 @@ mod tests {
         )
         .expect("readable")
         .expect("rows");
-        let aliases = q.aliases.expect("a key was spelled");
+        assert_eq!(q.aliases.len(), 1);
+        let aliases = &q.aliases[0];
         assert!(aliases.contains("E'01' AS requested"), "{aliases}");
         assert!(
             aliases.contains("WHERE pbps_table.\"id\" = E'01'"),
@@ -2384,6 +2388,60 @@ mod tests {
         assert!(
             !aliases.contains("AS text) = E'01'"),
             "the join must not compare as text: {aliases}"
+        );
+    }
+
+    #[test]
+    fn alias_batches_bound_the_tree_without_losing_or_reordering_keys() {
+        let t = table(Some(vec!["id"]), &[("id", "integer", None)]);
+        let known: BTreeSet<RowKey> = (0..2 * ALIAS_BATCH + 1)
+            .map(|n| RowKey::from(format!("{n:06}")))
+            .collect();
+        for scope in [
+            RowScope::Every {
+                known: known.clone(),
+            },
+            RowScope::Keys(known.clone()),
+        ] {
+            let q = query(&name(), &t, &scope).unwrap().unwrap();
+            assert_eq!(q.aliases.len(), 3);
+            let mut actual = Vec::new();
+            for sql in &q.aliases {
+                let arms: Vec<_> = sql.split("\nUNION ALL\n").collect();
+                assert!(!arms.is_empty() && arms.len() <= ALIAS_BATCH);
+                assert!(sql.ends_with(';'));
+                for arm in arms {
+                    actual.push(
+                        arm.strip_prefix("SELECT ")
+                            .unwrap()
+                            .split_once(" AS requested,")
+                            .unwrap()
+                            .0,
+                    );
+                }
+            }
+            let expected: Vec<_> = known.iter().map(|k| value_literal(k.as_str())).collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn an_empty_requested_key_set_never_emits_an_alias_statement() {
+        let t = table(Some(vec!["id"]), &[("id", "integer", None)]);
+        let q = query(
+            &name(),
+            &t,
+            &RowScope::Every {
+                known: BTreeSet::new(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(q.aliases.is_empty());
+        assert!(
+            query(&name(), &t, &RowScope::Keys(BTreeSet::new()))
+                .unwrap()
+                .is_none()
         );
     }
 

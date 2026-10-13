@@ -2586,7 +2586,9 @@ async fn read_every_scoped_table(
                 let (key, cells) = crate::rows::decode(name, &query, row)?;
                 observed.rows.insert(key, cells);
             }
-            if let Some(sql) = &query.aliases {
+            // The read's existing transaction covers every batch. Merge all
+            // aliases before the caller asks about collisions (DEC-1805.1).
+            for sql in &query.aliases {
                 for row in &conn.query(sql).await.map_err(read)? {
                     // A requested key the table does not hold has no alias to
                     // record — the row is simply not there, which is what an
