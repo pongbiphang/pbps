@@ -215,16 +215,19 @@ fn a_partition_default_follows_the_last_parent_or_own_setting() {
                 "{error:#}"
             );
         }
-        for intermediate in [&before, &right, &wrong] {
+        // Midpoint default policy applies to one setting, not the composed
+        // parent/own plan whose last promise is tested transactionally above.
+        let setting = plan(vec![own.clone()]);
+        for default in [None, Some("'kept'::text"), Some("'changed'::text")] {
             refuse_unplanned_movement(
                 &pbps_pg::Postgres::new(),
-                &changes,
+                &setting,
                 &before,
-                intermediate,
+                &reading("'parent'::text", default),
                 "test",
                 Settled::SoFar,
             )
-            .expect("planned default presence is unpromised between statements");
+            .expect("one planned default presence is unpromised between statements");
         }
     }
 }
@@ -690,14 +693,13 @@ fn column_requirements_follow_one_uid_through_intermediate_spellings() {
     let check = |after: &Schema| {
         super::super::refuse_pinned_movement(
             &pbps_pg::Postgres::new(),
-            super::Plan {
+            super::Read::transactional(super::Plan {
                 changes: &changes,
                 ids: &ids,
-            },
+            }),
             &before,
             after,
             "test",
-            Settled::Closing,
         )
     };
     check(&after).expect("the last default and final spelling belong to the same UID");
@@ -782,14 +784,13 @@ fn a_column_drop_before_its_parent_rename_reaches_only_its_own_partition_entry()
     let check = |after: &Schema| {
         super::super::refuse_pinned_movement(
             &pbps_pg::Postgres::new(),
-            super::Plan {
+            super::Read::transactional(super::Plan {
                 changes: &changes,
                 ids: &ids,
-            },
+            }),
             &before,
             after,
             "test",
-            Settled::Closing,
         )
     };
     check(&after).expect("the parent's UID carries the drop through its later rename");
@@ -909,19 +910,18 @@ fn a_rename_keeps_every_observed_column_field_across_the_move_and_at_close() {
         })
     };
     for (field, was, now) in cases {
-        for (before_name, settled) in [("id", Settled::Whole), ("renamed", Settled::Closing)] {
+        for before_name in ["id", "renamed"] {
             let before = observed(before_name, was.clone());
             let check = |column| {
                 super::super::refuse_pinned_movement(
                     &pbps_pg::Postgres::new(),
-                    super::Plan {
+                    super::Read::transactional(super::Plan {
                         changes: &changes,
                         ids: &ids,
-                    },
+                    }),
                     &before,
                     &observed("renamed", column),
                     "test",
-                    settled,
                 )
             };
             check(was.clone()).expect("a rename preserves the entire held column");
@@ -1026,14 +1026,13 @@ fn a_retired_columns_promise_cannot_answer_for_the_next_holder_of_its_name() {
     let check = |after: &Schema| {
         super::super::refuse_pinned_movement(
             &pbps_pg::Postgres::new(),
-            super::Plan {
+            super::Read::transactional(super::Plan {
                 changes: &changes,
                 ids: &ids,
-            },
+            }),
             &before,
             after,
             "test",
-            Settled::Closing,
         )
     };
     check(&after).expect("the dropped UID's absent default is no promise about its successor");
@@ -1497,14 +1496,13 @@ fn a_same_named_new_column_does_not_inherit_the_retired_definition() {
             let check = |after: &Schema| {
                 super::super::refuse_pinned_movement(
                     &pbps_pg::Postgres::new(),
-                    super::Plan {
+                    super::Read::transactional(super::Plan {
                         changes: &changes,
                         ids: &ids,
-                    },
+                    }),
                     &before,
                     after,
                     "test",
-                    Settled::Whole,
                 )
             };
             check(&after).expect("the new UID answers to its declaration, not the retired column");

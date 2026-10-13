@@ -1431,3 +1431,44 @@ Existing-result comparison preserves diagnostic text and order; the corrected
 valid-plan refusals are pinned separately. Table presence/rename policy,
 `has_run`, exhaustive Table comparison and the explicit read-mode contract
 remain with slice 5. No model, SQL or saved-plan encoding changes.
+
+<a id="dec-1950-1"></a>
+
+**DEC-1950.1. A guard read carries the plan's staged admission proof.**
+`guard::Read` pairs pinned changes and identities with an explicit transactional,
+staged-midpoint, staged-terminal-checkpoint or staged-closing mode. Its fields
+are private. Only `guard::Staged` can construct staged reads, after the existing
+`logical_changes` rule admits exactly one logical change (ADR-0003 decision 2).
+A routine's own `PublicExecution` companion remains part of that change; raw
+entry count would refuse a valid staged routine. Empty plans, unrelated
+companions and CREATE followed by separate part changes cannot acquire
+checkpoint exemptions through an unqualified `SoFar` argument.
+
+The staged executor constructs the proof before reading its baseline or
+executing the plan.
+Its statement view copies only the already-admitted plan and pinned ids, then
+adapts one logical cross-schema rename through the emitter's recorded endpoints.
+The same operation moves that table's pinned UID to its intermediate spelling
+(DECISIONS 436). This preserves the admitted change count without discovering a
+new admission error after DDL has committed. The closing read keeps the complete
+logical plan. No SQL, saved-plan format, public admission policy or identity
+intent changes.
+
+A transactional read remains plan-scoped, like the staged closing read: an
+omitted confirmable default cell is evidence there, while the terminal staged
+checkpoint still uses its previous checkpoint's cell rendering (DECISIONS 191).
+The existing comparison body and per-field policies remain unchanged. Its
+internal settlement view also continues to serve module scoping; that view is
+not itself authority to construct a guard checkpoint.
+
+Tests that previously supplied several logical changes to a midpoint now use a
+single admitted change or transactional settlement. One `SetPrimaryKey` already
+emits its own drop/add; a CREATE payload can emit parts over several statements.
+Those supported intermediate states remain covered, as do observed expression
+text, wrong part definitions, incoming references and rename impostors. Empty
+plans still test transactional comparisons; staged recovery-message fixtures
+instead create one unrelated table. Admission tracing verifies that negative
+tests do not pass merely because an invalid fixture was rejected at the new
+boundary. Reverting the admission and read-mode predicates must fail the
+corresponding behavioral regressions. This completes #1774's staged-admission
+requirement without enabling the future multi-change work in #624 or #443.

@@ -4,6 +4,7 @@ mod check;
 mod created;
 mod expect;
 mod parts;
+mod read;
 
 pub(super) use check::{
     columns, columns_after, created_place, declared_column, implied, own, system_time, table,
@@ -11,6 +12,7 @@ pub(super) use check::{
 pub(super) use created::CreatedChanges;
 pub(super) use expect::{ColumnChanges, OwnNames, TableChanges};
 pub(super) use parts::PartChanges;
+pub(super) use read::{Read, Staged};
 
 /// Kept readings compare exactly; only a field the plan changes can be
 /// unpromised between statements (SPEC 7.6). The two planned forms preserve
@@ -92,6 +94,7 @@ impl<T: PartialEq> Req<T> {
 mod tests;
 
 /// Both inputs are pinned by the saved plan; observations supply no identity intent.
+#[derive(Clone, Copy)]
 pub(super) struct Plan<'a> {
     pub(super) changes: &'a pbps_model::ChangeSet,
     pub(super) ids: &'a pbps_model::IdsFile,

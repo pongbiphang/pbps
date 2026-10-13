@@ -3720,14 +3720,40 @@ fn refuse_unplanned_movement(
     settled: Settled,
 ) -> anyhow::Result<()> {
     let ids = guard::fixture_ids(changes, before);
-    refuse_pinned_movement(
-        dialect,
-        guard::Plan { changes, ids: &ids },
-        before,
-        after,
-        label,
-        settled,
-    )
+    let plan = guard::Plan { changes, ids: &ids };
+    let read = match settled {
+        // Final-shape fixtures use the transactional plan-scoped read.
+        // Staged terminal-checkpoint policy is tested through staged_movement.
+        Settled::Whole | Settled::Closing => guard::Read::transactional(plan),
+        Settled::SoFar => guard::Staged::new(plan)?.read(StagedRead::Checkpoint {
+            completed: 1,
+            total: 2,
+        }),
+    };
+    refuse_pinned_movement(dialect, read, before, after, label)
+}
+
+#[cfg(test)]
+fn staged_comparison(
+    dialect: &dyn pbps_dialect::Dialect,
+    changes: &pbps_model::ChangeSet,
+    before: &Schema,
+    after: &Schema,
+    label: &str,
+    settled: Settled,
+) -> anyhow::Result<()> {
+    let read = match settled {
+        Settled::SoFar => StagedRead::Checkpoint {
+            completed: 1,
+            total: 2,
+        },
+        Settled::Whole => StagedRead::Checkpoint {
+            completed: 2,
+            total: 2,
+        },
+        Settled::Closing => StagedRead::Closing { total: 2 },
+    };
+    staged_movement(dialect, changes, before, after, label, None, read)
 }
 
 #[cfg(test)]
@@ -3743,7 +3769,7 @@ fn staged_movement(
     let ids = guard::fixture_ids(changes, before);
     staged_pinned_movement(
         dialect,
-        guard::Plan { changes, ids: &ids },
+        guard::Staged::new(guard::Plan { changes, ids: &ids })?,
         before,
         after,
         label,
@@ -3754,12 +3780,12 @@ fn staged_movement(
 
 fn refuse_pinned_movement(
     dialect: &dyn pbps_dialect::Dialect,
-    plan: guard::Plan<'_>,
+    read: guard::Read<'_>,
     before: &Schema,
     after: &Schema,
     label: &str,
-    settled: Settled,
 ) -> anyhow::Result<()> {
+    let (plan, settled) = read.parts();
     let changes = plan.changes;
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, plan.ids)?;
     // Each owned sequence under the name it has, before anything below maps
@@ -7297,14 +7323,13 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         // the start or arrived during the run (110).
         refuse_pinned_movement(
             dialect,
-            guard::Plan {
+            guard::Read::transactional(guard::Plan {
                 changes: &plan.changes,
                 ids: &plan.ids,
-            },
+            }),
             &before,
             &after.schema,
             &target.label,
-            Settled::Closing,
         )
         .and_then(|()| refuse_unmet_public_execution(&plan.changes, &after, &target.label))
         .map_err(|e| {
@@ -7435,6 +7460,10 @@ async fn apply_staged_under_lock(
         dialect,
         operator,
     } = *d;
+    let staged = guard::Staged::new(guard::Plan {
+        changes: &plan.changes,
+        ids: &plan.ids,
+    })?;
     let Some(mut entry) = crate::engine::latest(conn).await? else {
         bail!(
             "`{}` has a ledger but no entries; a plan cannot be pinned to a state that was never recorded.",
@@ -7880,22 +7909,10 @@ async fn apply_staged_under_lock(
         // true — refusing before writing it would lose the record of a
         // statement that has already committed, which is what checkpoints are
         // for. Stopping is the whole remedy a staged run has.
-        let statement_changes = staged_statement_changes(&plan.changes, stmt);
-        let mut statement_ids = plan.ids.clone();
-        if let [logical] = plan.changes.changes.as_slice()
-            && let pbps_model::Change::RenameTable { to, .. } = &logical.change
-            && let [(.., statement_to)] = stmt.renames.as_slice()
-        {
-            // The emitter's intermediate address belongs to the pinned UID;
-            // changing its spelling preserves the recorded identity intent.
-            statement_ids.rename_table(to, statement_to);
-        }
+        let statement_plan = staged.statement(stmt);
         staged_pinned_movement(
             dialect,
-            guard::Plan {
-                changes: &statement_changes,
-                ids: &statement_ids,
-            },
+            statement_plan.staged(),
             &previous,
             &recorded,
             &target.label,
@@ -7940,10 +7957,7 @@ async fn apply_staged_under_lock(
     // every other command say so.
     staged_pinned_movement(
         dialect,
-        guard::Plan {
-            changes: &plan.changes,
-            ids: &plan.ids,
-        },
+        staged,
         &previous,
         &after.schema,
         &target.label,
@@ -8076,28 +8090,6 @@ fn removed_table_names(
         .collect()
 }
 
-/// A checkpoint spans one emitted statement, not the whole logical rename.
-/// A schema transfer followed by a rename has an intermediate name absent
-/// from the plan's endpoints. Compare the exact move the emitter recorded so
-/// that table's disappearance is not mistaken for another writer's DROP,
-/// and its unchanged columns, rows and incoming references remain compared
-/// (DECISIONS 436). The saved-plan boundary admits one logical change, even
-/// when the emitter needs more than one statement for it (ADR-0003).
-fn staged_statement_changes(
-    changes: &pbps_model::ChangeSet,
-    statement: &pbps_dialect::Statement,
-) -> pbps_model::ChangeSet {
-    let mut at_statement = changes.clone();
-    if let [change] = at_statement.changes.as_mut_slice()
-        && let pbps_model::Change::RenameTable { from, to, .. } = &mut change.change
-        && let [(statement_from, statement_to)] = statement.renames.as_slice()
-    {
-        *from = statement_from.clone();
-        *to = statement_to.clone();
-    }
-    at_statement
-}
-
 /// What the plan promised about `PUBLIC`, asked of the read that closes the
 /// run.
 ///
@@ -8159,23 +8151,14 @@ fn refuse_unmet_public_execution(
 
 fn staged_pinned_movement(
     dialect: &dyn pbps_dialect::Dialect,
-    plan: guard::Plan<'_>,
+    plan: guard::Staged<'_>,
     before: &Schema,
     after: &Schema,
     label: &str,
     environment: Option<&str>,
     read: StagedRead,
 ) -> anyhow::Result<()> {
-    // Only the last read of a staged run can be asked what the plan achieved:
-    // at a checkpoint most of the plan has not happened, and putting its
-    // postconditions to one demanded changes that were still to come
-    // (DECISIONS 161).
-    let settled = match read {
-        StagedRead::Checkpoint { completed, total } if completed < total => Settled::SoFar,
-        StagedRead::Checkpoint { .. } => Settled::Whole,
-        StagedRead::Closing { .. } => Settled::Closing,
-    };
-    refuse_pinned_movement(dialect, plan, before, after, label, settled).map_err(|e| {
+    refuse_pinned_movement(dialect, plan.read(read), before, after, label).map_err(|e| {
         match read {
             StagedRead::Checkpoint { completed, total } => anyhow::anyhow!(
                 "{e:#}\n\n\
@@ -13006,21 +12989,11 @@ mod tests {
         );
     }
 
-    /// A table the plan never mentions can be a hybrid at a checkpoint too,
-    /// and it is not enough for the *table* to match one spelling or the
-    /// other.
-    ///
-    /// A child with two foreign keys to two separately renamed parents has one
-    /// of them carried and one not after the first statement. Compared whole,
-    /// it matches neither the read before it nor that read with every rename
-    /// applied, and the checkpoint reported a table the plan does not touch as
-    /// unplanned movement.
-    ///
-    /// The comparison therefore brings the *later* read back to the earlier
-    /// spelling part by part, which has no whole-table state to be wrong
-    /// about.
+    /// A single staged parent rename carries only its own incoming references.
+    /// The child's other foreign key and a vacated name's new occupant remain
+    /// independently held. Multiple parents are a transactional plan (ADR-0003).
     #[test]
-    fn a_checkpoint_accepts_a_child_carried_only_halfway() {
+    fn a_checkpoint_carries_only_the_named_parent_in_a_child() {
         use pbps_model::{Change, ChangeSet, ForeignKey, PlannedChange, Table};
 
         let child = |first: &str, second: &str| {
@@ -13043,20 +13016,12 @@ mod tests {
         };
 
         let renames = ChangeSet {
-            changes: vec![
-                PlannedChange::new(Change::RenameTable {
-                    uid: "t_aaaaaa".parse().unwrap(),
-                    from: "dbo.one".parse().unwrap(),
-                    to: "dbo.one_x".parse().unwrap(),
-                    defaults: Vec::new(),
-                }),
-                PlannedChange::new(Change::RenameTable {
-                    uid: "t_bbbbbb".parse().unwrap(),
-                    from: "dbo.two".parse().unwrap(),
-                    to: "dbo.two_x".parse().unwrap(),
-                    defaults: Vec::new(),
-                }),
-            ],
+            changes: vec![PlannedChange::new(Change::RenameTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                from: "dbo.one".parse().unwrap(),
+                to: "dbo.one_x".parse().unwrap(),
+                defaults: Vec::new(),
+            })],
         };
 
         // The parents themselves, so the reads are the shape a real one has:
@@ -13092,15 +13057,11 @@ mod tests {
         let e = refuse_unplanned_movement(
             &pbps_mssql::Mssql,
             &renames,
-            // The checkpoint the last statement left: both renames done.
-            &with("dbo.one_x", "dbo.two_x", &["dbo.one_x", "dbo.two_x"]),
+            // The checkpoint the last statement left: the single rename done.
+            &with("dbo.one_x", "dbo.two", &["dbo.one_x", "dbo.two"]),
             // The read after it: a new `dbo.one` exists and the child points
             // at it.
-            &with(
-                "dbo.one",
-                "dbo.two_x",
-                &["dbo.one", "dbo.one_x", "dbo.two_x"],
-            ),
+            &with("dbo.one", "dbo.two", &["dbo.one", "dbo.one_x", "dbo.two"]),
             "prod",
             Settled::SoFar,
         )
@@ -13120,18 +13081,10 @@ mod tests {
         assert!(format!("{e:#}").contains("dbo.child"), "{e:#}");
     }
 
-    /// A staged run is checked after **every** statement, with the whole plan
-    /// in hand, so a read taken between two renames finds one of them done and
-    /// the other not.
-    ///
-    /// Bringing the previous checkpoint forward through every rename the plan
-    /// contains would expect both new spellings and report the half that has
-    /// not happened as unplanned movement — a valid staged deployment stopped
-    /// at its own checkpoint. The comparison therefore accepts a constraint
-    /// under either spelling: the one the read before it had, or the one the
-    /// rename leaves.
+    /// A single column rename carries its constraints at a checkpoint;
+    /// multiple renames compose only at transactional settlement (DEC-1950.1).
     #[test]
-    fn a_checkpoint_between_two_renames_accepts_both_spellings() {
+    fn renames_keep_constraints_at_single_change_checkpoints_and_transactional_close() {
         use pbps_model::{Change, ChangeSet, Column, PlannedChange, PrimaryKey, Table};
 
         // The columns and the constraints that name them move together: a
@@ -13180,17 +13133,20 @@ mod tests {
             ],
         };
 
-        // The first rename has run; the second has not. Both constraints are
-        // in a state this plan is passing through.
+        let first = ChangeSet {
+            changes: vec![renames.changes[0].clone()],
+        };
+        // Staged reads admit the first rename alone. Both renames together
+        // are still checked transactionally below.
         refuse_unplanned_movement(
             &pbps_mssql::Mssql,
-            &renames,
+            &first,
             &table("a", "b"),
             &table("a2", "b"),
             "prod",
             Settled::SoFar,
         )
-        .expect("a checkpoint between the two renames");
+        .expect("a checkpoint of the single rename");
 
         // And at the end, both.
         refuse_unplanned_movement(
@@ -13207,7 +13163,7 @@ mod tests {
         // at a checkpoint as much as at the end.
         let e = refuse_unplanned_movement(
             &pbps_mssql::Mssql,
-            &renames,
+            &first,
             &table("a", "b"),
             &table("a2", "b"),
             "prod",
@@ -13215,11 +13171,8 @@ mod tests {
         );
         e.expect("the control: the same read with nothing else moved");
 
-        // The closing read of a staged run compares two checkpoints, and by
-        // then *both* carry the rename: `previous` is the checkpoint the last
-        // statement left. Rewinding only the later one would leave the earlier
-        // under the new spelling and refuse to close a run that has committed
-        // every statement it was asked to.
+        // Two reads already at the final spelling still compare directly;
+        // neither side can borrow the retired source spelling's definition.
         refuse_unplanned_movement(
             &pbps_mssql::Mssql,
             &renames,
@@ -13247,7 +13200,7 @@ mod tests {
             );
         let e = refuse_unplanned_movement(
             &pbps_mssql::Mssql,
-            &renames,
+            &first,
             &table("a", "b"),
             &drifted,
             "prod",
@@ -13640,13 +13593,9 @@ mod tests {
         .expect_err("a column the plan never names is answerable for itself");
         assert!(format!("{e:#}").contains("`code`"), "{e:#}");
 
-        // A staged run's closing read: the checkpoint it is compared against
-        // is the one the last statement left, so both sides already hold the
-        // survivor under the claimed name and neither holds the source. The
-        // fallback must not fire there — with nothing to fall back to it
-        // returns `None`, the rename's `Whole` excuses the one-sided entry,
-        // and a concurrent retype between the last checkpoint and the closing
-        // read is recorded as this plan's own result (SPEC 7.6).
+        // When both reads already hold the survivor under its final name,
+        // falling back to the absent source would lose its held definition.
+        // A final comparison must still reject a concurrent retype (SPEC 7.6).
         let e = refuse_unplanned_movement(
             &pbps_mssql::Mssql,
             &changes,
@@ -13658,11 +13607,9 @@ mod tests {
         .expect_err("once both reads hold the survivor, they are compared directly");
         assert!(format!("{e:#}").contains("`note`"), "{e:#}");
 
-        // A checkpoint spanning the drop alone, with another session putting
-        // the name back before the read: the source is still there, so the
-        // rename has not run and what stands under the claimed name is not the
-        // survivor. Falling through there compared the baseline's doomed
-        // column with nothing at all and let the replacement past.
+        // A transactional result that still holds the source and an impostor
+        // at the destination is not the promised surviving column. This is
+        // not a supported multi-change staged checkpoint (ADR-0003).
         let e = refuse_unplanned_movement(
             &pbps_mssql::Mssql,
             &changes,
@@ -13677,7 +13624,7 @@ mod tests {
                 ("note", "bigint"),
             ]),
             "prod",
-            Settled::SoFar,
+            Settled::Whole,
         )
         .expect_err("a name put back before the rename claims it is not the survivor");
         assert!(format!("{e:#}").contains("`note`"), "{e:#}");
@@ -14585,10 +14532,18 @@ mod tests {
                 ..Default::default()
             }
         };
-        for settled in [Settled::SoFar, Settled::Whole] {
+        let mut carried = changes.clone();
+        carried.changes.truncate(1);
+        let Change::CreateTable { table, .. } = &mut carried.changes[0].change else {
+            unreachable!()
+        };
+        table.indexes.insert("ix".into(), planned_index.clone());
+        // A separate AddIndex is transactional; a CREATE payload can emit
+        // its index in a later statement of the same staged logical change.
+        for (changes, settled) in [(&carried, Settled::SoFar), (&changes, Settled::Whole)] {
             refuse_unplanned_movement(
                 &pbps_mssql::Mssql,
-                &changes,
+                changes,
                 &Schema::default(),
                 &with_index(planned_index.clone()),
                 "test",
@@ -14602,7 +14557,7 @@ mod tests {
             ] {
                 let e = refuse_unplanned_movement(
                     &pbps_mssql::Mssql,
-                    &changes,
+                    changes,
                     &Schema::default(),
                     &with_index(other.clone()),
                     "test",
@@ -14860,17 +14815,11 @@ mod tests {
         check(&drop_index, &with_table(false), Settled::Whole).expect("as planned");
         check(&drop_index, &with_table(false), Settled::SoFar).expect("as planned so far");
         // Negative: a plan that drops the table answers for it as before.
-        let drop_table = plan(vec![
-            Change::DropIndex {
-                table: name.clone(),
-                name: "t_v".into(),
-            },
-            Change::DropTable {
-                uid: "t_a1b2c3".parse().unwrap(),
-                name: name.clone(),
-                detach_from: None,
-            },
-        ]);
+        let drop_table = plan(vec![Change::DropTable {
+            uid: "t_a1b2c3".parse().unwrap(),
+            name: name.clone(),
+            detach_from: None,
+        }]);
         check(&drop_table, &Schema::default(), Settled::Whole).expect("dropped as planned");
         check(&drop_table, &Schema::default(), Settled::SoFar).expect("dropped so far");
     }
@@ -14939,7 +14888,7 @@ mod tests {
             &nothing,
             &none,
             &schema(&[("v", false, true)]),
-            Settled::SoFar,
+            Settled::Whole,
         )
         .expect_err("tightened by another");
         assert!(format!("{e:#}").contains("app.ev_1"), "{e:#}");
@@ -15282,7 +15231,7 @@ mod tests {
             changes: Vec::new(),
         };
         check(&nothing, &schema(false), &schema(false), Settled::Whole).expect("unchanged");
-        let e = check(&nothing, &schema(false), &schema(true), Settled::SoFar)
+        let e = check(&nothing, &schema(false), &schema(true), Settled::Whole)
             .expect_err("switched by another");
         assert!(format!("{e:#}").contains("app.t"), "{e:#}");
         let switching = pbps_model::ChangeSet {
@@ -15386,7 +15335,7 @@ mod tests {
             &nothing,
             &schema(None),
             &schema(Some("1 day")),
-            Settled::SoFar,
+            Settled::Whole,
         )
         .expect_err("changed by another, untouched");
         assert!(format!("{e:#}").contains("dbo.t"), "{e:#}");
@@ -15674,16 +15623,15 @@ mod tests {
                 }),
             ],
         };
-        check(&split, &empty, &schema(None), Settled::SoFar).expect("before the setting");
-        for settled in [Settled::SoFar, Settled::Whole] {
-            check(
-                &split,
-                &empty,
-                &schema(Some(ReplicaIdentity::Full)),
-                settled,
-            )
-            .expect("the split setting");
-        }
+        // Splitting the setting creates a multi-change transactional plan;
+        // the single-CREATE midpoint policy is covered above.
+        check(
+            &split,
+            &empty,
+            &schema(Some(ReplicaIdentity::Full)),
+            Settled::Whole,
+        )
+        .expect("the split setting");
         let e = check(&split, &empty, &schema(None), Settled::Whole).expect_err("never set");
         assert!(
             format!("{e:#}").contains("replica identity is not the one"),
@@ -15806,22 +15754,26 @@ mod tests {
                 },
             })],
         };
-        let check = |plan: &pbps_model::ChangeSet, after: &Schema| {
+        let check = |plan: &pbps_model::ChangeSet, after: &Schema, settled| {
             refuse_unplanned_movement(
                 &pbps_mssql::Mssql,
                 plan,
                 &schema(None),
                 after,
                 "test",
-                Settled::SoFar,
+                settled,
             )
         };
         // The control: nothing moved the layout.
-        check(&unrelated, &schema(None)).expect("the layout as approved");
-        let e = check(&unrelated, &schema(Some(Clustered::Index("ix".into()))))
-            .expect_err("another session made ix the clustered index");
+        check(&unrelated, &schema(None), Settled::SoFar).expect("the layout as approved");
+        let e = check(
+            &unrelated,
+            &schema(Some(Clustered::Index("ix".into()))),
+            Settled::SoFar,
+        )
+        .expect_err("another session made ix the clustered index");
         assert!(format!("{e:#}").contains("clustered differently"), "{e:#}");
-        let e = check(&unrelated, &schema(Some(Clustered::Heap)))
+        let e = check(&unrelated, &schema(Some(Clustered::Heap)), Settled::SoFar)
             .expect_err("another session rebuilt the key nonclustered");
         assert!(format!("{e:#}").contains("clustered differently"), "{e:#}");
         // The plan's own move is not movement.
@@ -15851,8 +15803,12 @@ mod tests {
                 }),
             ],
         };
-        check(&moving, &schema(Some(Clustered::Index("ix".into()))))
-            .expect("the plan moved it itself");
+        check(
+            &moving,
+            &schema(Some(Clustered::Index("ix".into()))),
+            Settled::Whole,
+        )
+        .expect("the plan moved it itself");
 
         // A change to a key that holds the rows on neither side moves
         // nothing: with the key nonclustered beside a clustered `ix`, a
@@ -15867,21 +15823,15 @@ mod tests {
                 ..Default::default()
             }
         };
+        // One SetPrimaryKey emits its own DROP/ADD statements. Two separate
+        // changes would not be an admitted staged plan.
         let rekeying = pbps_model::ChangeSet {
-            changes: vec![
-                PlannedChange::new(Change::SetPrimaryKey {
-                    table: name.clone(),
-                    from: t.primary_key.clone(),
-                    to: None,
-                    nonclustered: false,
-                }),
-                PlannedChange::new(Change::SetPrimaryKey {
-                    table: name.clone(),
-                    from: None,
-                    to: t.primary_key.clone(),
-                    nonclustered: true,
-                }),
-            ],
+            changes: vec![PlannedChange::new(Change::SetPrimaryKey {
+                table: name.clone(),
+                from: t.primary_key.clone(),
+                to: t.primary_key.clone(),
+                nonclustered: true,
+            })],
         };
         let recheck = |after: &Schema| {
             refuse_unplanned_movement(
@@ -16047,9 +15997,21 @@ mod tests {
         let e = check(&planned, &with_default(None), Settled::Whole)
             .expect_err("every statement ran, and the planned default is missing");
         assert!(format!("{e:#}").contains("column `v`"), "{e:#}");
+        // The split CREATE/default plan above is transactional. The default
+        // change alone admits a checkpoint over an already-existing table.
+        let setting = pbps_model::ChangeSet {
+            changes: vec![planned.changes[1].clone()],
+        };
         for default in [None, Some("1")] {
-            check(&planned, &with_default(default), Settled::SoFar)
-                .expect("a checkpoint may fall between the CREATE and the default");
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &setting,
+                &with_default(None),
+                &with_default(default),
+                "test",
+                Settled::SoFar,
+            )
+            .expect("a single default change can be before or after its statement");
         }
         let unplanned = pbps_model::ChangeSet {
             changes: vec![create],
@@ -16133,7 +16095,7 @@ mod tests {
         recorded.checks.get_mut("ck").unwrap().expression = "([id]>(0))".into();
         let after = schema(recorded.clone());
         for settled in [Settled::SoFar, Settled::Whole] {
-            refuse_unplanned_movement(
+            staged_comparison(
                 &pbps_mssql::Mssql,
                 &changes,
                 &before,
@@ -16143,7 +16105,7 @@ mod tests {
             )
             .expect("the CREATE payload's parts are emitted after the table");
         }
-        refuse_unplanned_movement(
+        staged_comparison(
             &pbps_mssql::Mssql,
             &changes,
             &after,
@@ -16152,7 +16114,7 @@ mod tests {
             Settled::Closing,
         )
         .expect("unchanged recorded parts still close");
-        refuse_unplanned_movement(
+        staged_comparison(
             &pbps_mssql::Mssql,
             &changes,
             &before,
@@ -16200,7 +16162,7 @@ mod tests {
             let changed = schema(changed);
             if matches!(part, "unique" | "foreign key" | "index") {
                 for settled in [Settled::SoFar, Settled::Whole, Settled::Closing] {
-                    refuse_unplanned_movement(
+                    staged_comparison(
                         &pbps_mssql::Mssql,
                         &changes,
                         &before,
@@ -16209,7 +16171,7 @@ mod tests {
                         settled,
                     )
                     .expect_err("the first observed part must match the CREATE payload");
-                    refuse_unplanned_movement(
+                    staged_comparison(
                         &pbps_mssql::Mssql,
                         &changes,
                         &changed,
@@ -16221,7 +16183,7 @@ mod tests {
                 }
             }
             for settled in [Settled::SoFar, Settled::Whole, Settled::Closing] {
-                refuse_unplanned_movement(
+                staged_comparison(
                     &pbps_mssql::Mssql,
                     &changes,
                     &after,
@@ -19036,6 +18998,10 @@ mod tests {
     /// down a path that cannot work (DECISIONS 190).
     #[test]
     fn a_closing_staged_refusal_does_not_promise_a_resume() {
+        let declared = pbps_model::Table {
+            columns: [("id".into(), pbps_model::Column::new("int".parse().unwrap()))].into(),
+            ..Default::default()
+        };
         let schema = |rows: &[&str]| {
             let t = pbps_model::Table {
                 data: Some(pbps_model::TableData {
@@ -19049,12 +19015,33 @@ mod tests {
             };
             let mut s = Schema::default();
             s.tables.insert("dbo.other".parse().unwrap(), t);
+            s.tables
+                .insert("dbo.planned".parse().unwrap(), declared.clone());
             s
         };
+        // The data table is untouched while one other table is created.
         let untouched = pbps_model::ChangeSet {
-            changes: Vec::new(),
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.planned".parse().unwrap(),
+                    table: Box::new(declared.clone()),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            )],
         };
         let refusal_for = |environment: Option<&str>, read: StagedRead| {
+            staged_movement(
+                &pbps_mssql::Mssql,
+                &untouched,
+                &schema(&["kept"]),
+                &schema(&["kept"]),
+                "prod",
+                environment,
+                read,
+            )
+            .expect("the unrelated create leaves the data table unchanged");
             let e = staged_movement(
                 &pbps_mssql::Mssql,
                 &untouched,
@@ -19115,6 +19102,10 @@ mod tests {
     /// (DECISIONS 196).
     #[test]
     fn a_checkpoint_refusal_names_status_only_to_a_caller_who_can_run_it() {
+        let declared = pbps_model::Table {
+            columns: [("id".into(), pbps_model::Column::new("int".parse().unwrap()))].into(),
+            ..Default::default()
+        };
         let schema = |rows: &[&str]| {
             let t = pbps_model::Table {
                 data: Some(pbps_model::TableData {
@@ -19128,12 +19119,36 @@ mod tests {
             };
             let mut s = Schema::default();
             s.tables.insert("dbo.other".parse().unwrap(), t);
+            s.tables
+                .insert("dbo.planned".parse().unwrap(), declared.clone());
             s
         };
+        // The data table is untouched while one other table is created.
         let untouched = pbps_model::ChangeSet {
-            changes: Vec::new(),
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.planned".parse().unwrap(),
+                    table: Box::new(declared.clone()),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            )],
         };
         let refusal = |environment: Option<&str>| {
+            staged_movement(
+                &pbps_mssql::Mssql,
+                &untouched,
+                &schema(&["kept"]),
+                &schema(&["kept"]),
+                "localhost/app",
+                environment,
+                StagedRead::Checkpoint {
+                    completed: 1,
+                    total: 2,
+                },
+            )
+            .expect("the unchanged rows do not produce a recovery message");
             let e = staged_movement(
                 &pbps_mssql::Mssql,
                 &untouched,
@@ -19240,7 +19255,7 @@ mod tests {
         });
         let before = schema(&[("note", "custom")]);
         let check = |after: &Schema, settled: Settled| {
-            refuse_unplanned_movement(
+            staged_comparison(
                 &pbps_mssql::Mssql,
                 &defaulting,
                 &before,
@@ -19270,6 +19285,29 @@ mod tests {
         check(&schema(&[("note", "rogue")]), Settled::Whole)
             .expect("a checkpoint read cannot tell at-default from a value");
 
+        // The transactional read is plan-scoped too; its API must not lose
+        // closing-read default evidence while separating it from checkpoints.
+        for (note, accepted) in [(None, true), (Some("rogue"), false)] {
+            let cells = note.map(|value| vec![("note", value)]).unwrap_or_default();
+            let result = refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &defaulting,
+                &before,
+                &schema(&cells),
+                "prod",
+                Settled::Closing,
+            );
+            if accepted {
+                result.expect("transactional omission proves the planned default");
+            } else {
+                let error = result.expect_err("transactional closing still holds default cells");
+                assert!(
+                    format!("{error:#}").contains("leaves it at its default"),
+                    "{error:#}"
+                );
+            }
+        }
+
         // An insert leaves columns to their defaults too.
         let inserting = plan(pbps_model::Change::InsertRow {
             table: dbo_t.clone(),
@@ -19283,7 +19321,7 @@ mod tests {
             types: Default::default(),
         });
         let empty = Schema::default();
-        let e = refuse_unplanned_movement(
+        let e = staged_comparison(
             &pbps_mssql::Mssql,
             &inserting,
             &empty,
@@ -19293,7 +19331,7 @@ mod tests {
         )
         .expect_err("inserted at its default, read back with a value");
         assert!(format!("{e:#}").contains("`note`"), "{e:#}");
-        refuse_unplanned_movement(
+        staged_comparison(
             &pbps_mssql::Mssql,
             &inserting,
             &empty,
