@@ -1387,3 +1387,47 @@ partition reach, sequence names and staged deployment tests remain in force.
 The remaining parts, clustered holder, created-table families and table
 presence/rename policy stay with #1774's later slices. Managed spelling history
 here makes no claim about physical catalog lineage, which belongs to #1875.
+
+<a id="dec-1947-1"></a>
+
+**DEC-1947.1. Part and created-table guard requirements are derived before
+observations are compared.** This is #1774 slice 4. `PartChanges` consumes the
+existing exhaustive `Change::constraints()` accessor; it adds no parallel list
+of change kinds. Each effect resolves its owner through `PlanNames` at the
+statement's `Before` boundary and then at `End`. The primary key has its own
+unnamed slot; named constraint, index and computed-column slots remain distinct.
+A retired table UID contributes no requirements to the next holder of its name.
+
+The last definition or removal at a slot supersedes its previous definition
+and settings. Later parameter settings fold by key, with set/reset order
+preserved. A storage-only change derives the complete part from the read-back,
+including filter text: either endpoint is accepted while in progress and only
+the planned endpoint when whole. A replacement instead compares its declared
+structure, normalized keys and expression presence under the existing
+SPEC 7.6 policy. Derivation follows execution order; reporting follows the
+existing table/kind/name order, with storage findings in statement order.
+
+The clustered holder is derived from the same part effects. Its semantic
+selector distinguishes a default primary key from a keyless heap even though
+both can have an absent `clustered` field. Storage settings do not move that
+holder. SQL Server refuses those settings in its emitter, and PostgreSQL does
+not read back a SQL Server clustered selector; the old permissive combination
+was not evidence of an engine-reachable SQL Server bug.
+
+`CreatedChanges` keeps create, attach and detach policies separate. It derives
+split column defaults, partition-own settings and separately emitted parts
+before comparison, using the same final part fold. A later replacement or
+parameter setting is the surviving definition, rather than another concurrent
+requirement beside the CREATE payload. Created columns reuse the existing
+declaration comparator, and placement reuses the existing placement comparator.
+A part arriving in a later CREATE statement may first appear at a checkpoint;
+a definition already recorded there still compares exactly on subsequent reads.
+
+The retired-owner, setting-across-rename and replacement/setting regressions
+failed with the former guard. PostgreSQL 16 and 18 confirm that the surviving
+table keeps its own same-named check, and that index settings follow the
+surviving definition through rename and replacement. The probes roll back.
+Existing-result comparison preserves diagnostic text and order; the corrected
+valid-plan refusals are pinned separately. Table presence/rename policy,
+`has_run`, exhaustive Table comparison and the explicit read-mode contract
+remain with slice 5. No model, SQL or saved-plan encoding changes.
