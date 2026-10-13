@@ -5431,6 +5431,48 @@ fn compare<K, V>(
     }
 }
 
+/// No `From` conversion: every fallible verify step must choose its own ID,
+/// so a successful connection cannot relabel a later read failure (DEC-1804.1).
+#[derive(Debug)]
+struct VerifyFailure {
+    id: &'static str,
+    error: anyhow::Error,
+}
+
+impl VerifyFailure {
+    fn at(id: &'static str, error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            id,
+            error: error.into(),
+        }
+    }
+}
+
+fn recorded_verify_state(
+    found: Result<Option<pbps_db::LedgerEntry>, pbps_db::LedgerError>,
+    label: &str,
+) -> Result<pbps_db::LedgerEntry, VerifyFailure> {
+    match found {
+        Ok(Some(entry)) => Ok(entry),
+        Ok(None) => Err(VerifyFailure::at(
+            "state.no-entries",
+            anyhow::anyhow!(
+                "`{label}` has a ledger but no entries; there is nothing to compare against.\n\
+                 Record one with `pbps snapshot` or `pbps baseline --reason ...`."
+            ),
+        )),
+        Err(error) => {
+            let id = match &error {
+                pbps_db::LedgerError::NotInitialized => "state.uninitialized",
+                pbps_db::LedgerError::BadEntry { .. }
+                | pbps_db::LedgerError::Db(_)
+                | pbps_db::LedgerError::Locked(_) => "state.unreadable",
+            };
+            Err(VerifyFailure::at(id, error))
+        }
+    }
+}
+
 /// `pbps verify` — the drift check (SPEC §8.2).
 ///
 /// The comparison is scoped and identified by the **recorded** state's identity
@@ -5449,15 +5491,11 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
 
     let rt = crate::output::or_unanswerable("verify", json, "runtime.unavailable", db::runtime())?;
     let (report, unmanaged_refusal, unmanaged_inventory) = match rt.block_on(async {
-        let mut conn = db::connect(target).await?;
-
-        let Some(baseline) = crate::engine::latest(&mut conn).await? else {
-            bail!(
-                "`{}` has a ledger but no entries; there is nothing to compare against.\n\
-                 Record one with `pbps snapshot` or `pbps baseline --reason ...`.",
-                target.label
-            );
-        };
+        let mut conn = db::connect(target)
+            .await
+            .map_err(|error| VerifyFailure::at("environment.unreachable", error))?;
+        let baseline =
+            recorded_verify_state(crate::engine::latest(&mut conn).await, &target.label)?;
 
         let recorded_ids = baseline.snapshot.ids.clone();
         let recorded_modules = managed_modules(Some(&baseline.snapshot), None);
@@ -5476,13 +5514,13 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             &rows_to_read(&recorded_scopes),
             crate::engine::Read::Snapshot,
         )
-        .await?;
+        .await
+        .map_err(|error| VerifyFailure::at("environment.unreadable", error))?;
         let mut scoped = managed.scoped;
-        scoped.schema = scoped.schema.with_observed_rows(
-            &managed.rows,
-            &recorded_scopes,
-            &baseline.snapshot.schema,
-        )?;
+        scoped.schema = scoped
+            .schema
+            .with_observed_rows(&managed.rows, &recorded_scopes, &baseline.snapshot.schema)
+            .map_err(|error| VerifyFailure::at("verify.failed", error))?;
 
         // The live side is identified by what is actually there, not by the
         // recorded mapping. Comparing two sides that share one identity file
@@ -5551,7 +5589,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
                 Ok(()) => None,
                 Err(error) => match error.downcast::<UnmanagedPolicy>() {
                     Ok(policy) => Some(policy),
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(VerifyFailure::at("verify.failed", error)),
                 },
             };
 
@@ -5578,7 +5616,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         ))
     }) {
         Ok(outcome) => outcome,
-        Err(e) => {
+        Err(VerifyFailure { id, error }) => {
             // Unanswerable: `verify` was asked whether this database still
             // matches its recorded state, and it could not look. Without
             // this the JSON path returned before its own branch, leaving
@@ -5589,12 +5627,12 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
                 crate::output::unanswerable(
                     "verify",
                     vec![crate::output::Finding::error(
-                        "environment.unreachable",
-                        format!("{}: {e:#}", target.label),
+                        id,
+                        format!("{}: {error:#}", target.label),
                     )],
                 );
             }
-            return Err(e);
+            return Err(error);
         }
     };
 
@@ -9606,6 +9644,70 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn verify_keeps_the_recorded_entry_and_distinguishes_its_absence_from_emptiness() {
+        let entry = pbps_db::LedgerEntry {
+            id: 7,
+            applied_at: "2026-10-13T00:00:00Z".into(),
+            snapshot: pbps_model::StateSnapshot::new(
+                pbps_model::StateKind::Baseline,
+                pbps_model::Schema::default(),
+                pbps_model::IdsFile::default(),
+                "operator",
+            ),
+        };
+        assert_eq!(
+            super::recorded_verify_state(Ok(Some(entry.clone())), "prod").unwrap(),
+            entry
+        );
+        let empty = super::recorded_verify_state(Ok(None), "prod").unwrap_err();
+        assert_eq!(empty.id, "state.no-entries");
+        assert!(
+            empty
+                .error
+                .to_string()
+                .contains("`prod` has a ledger but no entries")
+        );
+        assert!(empty.error.to_string().contains("pbps snapshot"));
+        let absent =
+            super::recorded_verify_state(Err(pbps_db::LedgerError::NotInitialized), "prod")
+                .unwrap_err();
+        assert_eq!(absent.id, "state.uninitialized");
+        assert!(absent.error.to_string().contains("pbps baseline"));
+        assert!(absent.error.to_string().contains("pbps bootstrap"));
+    }
+
+    #[test]
+    fn verify_keeps_ledger_read_causes_out_of_connection_failures() {
+        for error in [
+            pbps_db::LedgerError::BadEntry {
+                id: 8,
+                message: "malformed JSON".into(),
+            },
+            pbps_db::LedgerError::BadEntry {
+                id: 9,
+                message: "unsupported version 999".into(),
+            },
+            pbps_db::LedgerError::Db(pbps_db::DbError::Refused("ledger query denied".into())),
+            pbps_db::LedgerError::Locked(pbps_db::LockInfo {
+                locked_by: "another operator".into(),
+                locked_at: "2026-10-13T00:00:00Z".into(),
+                session_lookup: None,
+            }),
+        ] {
+            let cause = error.to_string();
+            let failure = super::recorded_verify_state(Err(error), "prod").unwrap_err();
+            assert_eq!(failure.id, "state.unreadable");
+            assert_eq!(failure.error.to_string(), cause);
+            assert!(
+                failure
+                    .error
+                    .downcast_ref::<pbps_db::LedgerError>()
+                    .is_some()
+            );
+        }
+    }
+
     fn zone(text: &str) -> pbps_model::SessionZone {
         pbps_model::SessionZone::new(text).unwrap()
     }

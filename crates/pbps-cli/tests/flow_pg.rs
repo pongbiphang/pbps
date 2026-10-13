@@ -18,6 +18,21 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/verify_failures.rs"]
+mod verify_failures;
+
+#[test]
+#[ignore = "needs live pg"]
+fn verify_distinguishes_missing_empty_and_unreadable_recorded_state() {
+    verify_failures::state_failures(&server(), true);
+}
+
+#[test]
+#[ignore = "needs live pg"]
+fn verify_distinguishes_permission_denials_from_failed_connections() {
+    verify_failures::permission_and_connection_failures(&server(), true);
+}
+
 #[path = "support/unexpressible.rs"]
 mod unexpressible;
 

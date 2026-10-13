@@ -20,6 +20,24 @@ async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbErro
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/verify_failures.rs"]
+mod verify_failures;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn verify_distinguishes_missing_empty_and_unreadable_recorded_state() {
+    verify_failures::state_failures(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn verify_distinguishes_permission_denials_from_failed_connections() {
+    verify_failures::permission_and_connection_failures(
+        &std::env::var("PBPS_TEST_DB").unwrap(),
+        false,
+    );
+}
+
 #[path = "support/plan_outputs.rs"]
 mod plan_outputs;
 

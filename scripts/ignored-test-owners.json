@@ -407,7 +407,9 @@
         "ensure_scope_changes_refuse_edited_plans_and_changed_union_rows",
         "ensure_scope_changes_compose_with_row_writes_and_table_renames",
         "first_data_takeovers_refuse_changed_rows_and_wrong_checksums",
-        "renamed_data_takeovers_use_final_names_and_require_approval"
+        "renamed_data_takeovers_use_final_names_and_require_approval",
+        "verify_distinguishes_missing_empty_and_unreadable_recorded_state",
+        "verify_distinguishes_permission_denials_from_failed_connections"
       ]
     },
     {
@@ -719,7 +721,9 @@
         "ensure_scope_changes_compose_with_row_writes_and_table_renames",
         "first_data_takeovers_refuse_changed_rows_and_wrong_checksums",
         "renamed_data_takeovers_use_final_names_and_require_approval",
-        "verify_names_a_serials_renamed_sequence"
+        "verify_names_a_serials_renamed_sequence",
+        "verify_distinguishes_missing_empty_and_unreadable_recorded_state",
+        "verify_distinguishes_permission_denials_from_failed_connections"
       ]
     },
     {

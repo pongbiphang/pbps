@@ -97,3 +97,27 @@ the [decision record](../DECISIONS.md), which says how to add an entry here.
     sync function handed the read's result, so a test can hand it a failure;
     the two tests that do fail against the old return with exactly the
     missing finding.
+
+<a id="dec-1804-1"></a>
+
+**DEC-1804.1. Verify classifies an unanswered comparison at the failing step.**
+An `anyhow` catch-all labelled missing and empty ledgers, damaged or newer
+snapshots, and denied reference-row reads `environment.unreachable`, even
+after the server had answered. `VerifyFailure` carries the ID and original
+error and deliberately has no `From` conversion: each fallible step must
+choose its classification. Only connecting uses `environment.unreachable`.
+The ledger result distinguishes `state.uninitialized`, `state.no-entries`,
+and `state.unreadable`; managed catalog and row reads use
+`environment.unreadable`, and other operational comparison failures use
+`verify.failed`. Policy findings and drift retain their existing exit-2
+behavior. The typed ledger cause, target label, human error, and single JSON
+envelope remain intact, with exit 1 for an unanswered comparison.
+
+The boundary is the step, not an engine-message parser: finer permission and
+snapshot-version causes remain the general diagnostic work in #1405. Real
+PostgreSQL and SQL Server regressions cover absent/empty ledgers, malformed
+and future snapshots, denied ledger and declared-row reads, wrong passwords,
+and repaired successful reads; the refused-TCP control retains the connection
+ID. Reverting the classification reproduces the mislabel without changing
+the failures' underlying causes. Other commands' classifications are outside
+this fix.
