@@ -594,7 +594,9 @@ pub const REQUIRED: [Requirement; 26] = [
 // (It *is* demanded, per securable, on what a declared role is granted on —
 // `Needed::Granted` — because a `GRANT` is authorized there and nothing else
 // in this list covers it. That is a narrow ask on named objects a project
-// chose to grant on, not the broad one refused below.)
+// chose to grant on, not the broad one refused below. Before a proven-absent
+// declared target is created, its schema answers that narrow demand instead:
+// the schema owner, not the creator, owns the new object. DEC-1806.1.)
 //
 // A rename that moves a table between schemas is emitted as
 // `ALTER SCHEMA ... TRANSFER`, which the engine authorizes with `CONTROL` on
@@ -613,6 +615,14 @@ pub const REQUIRED: [Requirement; 26] = [
 // case belongs in the plan-aware pre-flight, which does see the statements —
 // it is recorded in SPEC §9.5 as a known gap rather than silently covered.
 //
+
+/// Where a grant target's authority was checked. A target cannot claim both
+/// existing-object and future-creation authority (DEC-1806.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantedAt {
+    Object(BTreeSet<String>),
+    Creates(BTreeSet<String>),
+}
 
 /// What the connected account effectively holds, per securable.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -714,16 +724,14 @@ pub struct Held {
     /// cannot see through — the exact condition `counting_statement` refuses
     /// on before a reference-data delete (DECISIONS 460, 505).
     ///
-    /// Empty and *not asked about* are the same thing here on purpose: the
-    /// question is only put when the declarations would remove a row, so a
-    /// project that removes none is neither asked nor told. That is the
-    /// `roles_declared` bargain, and the read it saves is a database-wide scan
-    /// of `sys.database_permissions`.
+    /// Populated only when declarations would remove rows. The capture may
+    /// also serve a future grant target's absence proof (DEC-1806.1), but a
+    /// grant-only project must not receive delete-specific diagnostics.
     pub metadata_denials: BTreeSet<Securable>,
 
-    /// Per object, the permissions effective on it — asked about every named
-    /// object, absent or invisible included, for the same reason
-    /// `referenced_objects` is.
+    /// Each grant target's object rights, or its creation schema's rights
+    /// only when a declared, unrecorded target is proven absent (DEC-1806.1).
+    /// Invisible, recorded and undeclared objects keep the object demand.
     ///
     /// Keyed by the name the object was actually asked about: the current
     /// physical name for a declared target this resolution judged safe, or
@@ -736,9 +744,9 @@ pub struct Held {
     /// by this environment's own recorded ids, to belong to a *different*
     /// identity — is not in this map. It is in
     /// [`Held::granted_unresolvable`] instead, which `missing` reports as an
-    /// unconditional gap: GRANTED has no schema-scope fallback to fall back
-    /// to (issue #133 round 2).
-    pub granted_objects: BTreeMap<ObjectName, BTreeSet<String>>,
+    /// unconditional gap: an unsafe resolution cannot prove a future object
+    /// (issue #133 round 2).
+    pub granted_objects: BTreeMap<ObjectName, GrantedAt>,
 
     /// A declared grant target whose current physical name this environment
     /// could not safely determine: the name its own resolution would use is
@@ -749,9 +757,9 @@ pub struct Held {
     /// an unconditional gap instead.
     ///
     /// This is the same collision `Held::data_tables`'s declared-name keying
-    /// exists to survive; GRANTED has no schema-scope fallback to fall back
-    /// to, unlike the data requirements, so an unresolvable target cannot be
-    /// silently skipped (issue #133 round 2).
+    /// exists to survive; an unresolvable grant target cannot establish
+    /// future creation, so it cannot use the schema answer or be silently
+    /// skipped (issue #133 round 2).
     pub granted_unresolvable: BTreeSet<ObjectName>,
 
     /// Per schema a declared role is granted on (`schema::x`), the
@@ -897,8 +905,9 @@ enum Existing {
     /// object from a principal with no permission on it, so `OBJECT_ID`
     /// cannot tell "not there" from "not allowed to see"; asking anyway
     /// lands both as a gap rather than as silence. Right for the foreign-key
-    /// targets and the grant targets, where silence would under-report the
-    /// one case a readiness check is for.
+    /// targets and grant targets whose absence and future creation have not
+    /// both been proven, where silence would under-report the one case a
+    /// readiness check is for (DEC-1806.1).
     OrNot,
 }
 
@@ -1590,6 +1599,115 @@ async fn claimed_elsewhere<'a>(
     )
 }
 
+/// Resolve first, then compare declaration and history membership using the
+/// engine's identifier collation. A recorded module has no uid but is still
+/// an existing deployment obligation, as is a recorded role's grant target.
+async fn future_grant_candidates(
+    conn: &mut Conn,
+    safe: &BTreeMap<ObjectName, ObjectName>,
+    managed_tables: &[ObjectName],
+    targets: &GrantTargets,
+    recorded: &pbps_model::Schema,
+    ids: &Ids<'_>,
+) -> Result<BTreeSet<ObjectName>, DbError> {
+    let unconfirmed: Vec<_> = safe
+        .iter()
+        .filter(|(declared, _)| !resolution(declared, ids).1)
+        .map(|(_, query)| query.clone())
+        .collect();
+    let mut declared = managed_tables.to_vec();
+    declared.extend(
+        targets
+            .managed_modules
+            .iter()
+            .map(pbps_model::ModuleId::object_name),
+    );
+    let candidates = crate::catalog::matching_table_names(conn, &unconfirmed, &declared).await?;
+    let mut existing: Vec<_> = recorded.tables.keys().cloned().collect();
+    existing.extend(
+        recorded
+            .modules
+            .keys()
+            .map(pbps_model::ModuleId::object_name),
+    );
+    existing.extend(
+        recorded
+            .roles
+            .values()
+            .flat_map(|r| r.grants.keys())
+            .filter_map(|t| match t {
+                pbps_model::GrantTarget::Object(o) => Some(o.clone()),
+                pbps_model::GrantTarget::Routine(r) => Some(r.name.clone()),
+                pbps_model::GrantTarget::Schema(_) => None,
+            }),
+    );
+    let recorded: BTreeSet<_> = crate::catalog::matching_table_names(conn, &candidates, &existing)
+        .await?
+        .into_iter()
+        .collect();
+    Ok(candidates
+        .into_iter()
+        .filter(|o| !recorded.contains(o))
+        .collect())
+}
+
+/// Effective metadata denials matter to both delete counting and proof that a
+/// future grant target is absent. Unknown names retain their ids; they must
+/// never disappear from either proof (DECISIONS 505, DEC-1806.1).
+async fn metadata_denials(conn: &mut Conn) -> Result<BTreeSet<Securable>, DbError> {
+    let mut metadata_denials = BTreeSet::new();
+    // `sys.database_permissions.class` is a `tinyint`; the driver hands
+    // that back as a `u8` and reading it as an `i32` fails outright, so
+    // the widening happens in the engine where the column is named.
+    let sql = "SELECT CONVERT(int, dp.class) AS class, dp.major_id AS major_id, \
+               OBJECT_SCHEMA_NAME(dp.major_id) AS obj_schema, \
+               OBJECT_NAME(dp.major_id) AS obj_name, \
+               SCHEMA_NAME(dp.major_id) AS sch_name \
+               FROM sys.database_permissions dp \
+               WHERE dp.state = N'D' \
+                 AND dp.permission_name IN (N'VIEW DEFINITION', N'CONTROL') \
+                 AND (dp.grantee_principal_id = USER_ID() \
+                      OR IS_MEMBER(USER_NAME(dp.grantee_principal_id)) = 1) \
+                 AND ((dp.class = 1 AND dp.minor_id = 0 \
+                       AND COALESCE(HAS_PERMS_BY_NAME( \
+                             QUOTENAME(OBJECT_SCHEMA_NAME(dp.major_id)) + N'.' \
+                             + QUOTENAME(OBJECT_NAME(dp.major_id)), \
+                             N'OBJECT', N'VIEW DEFINITION'), 0) <> 1) \
+                   OR (dp.class = 3 \
+                       AND COALESCE(HAS_PERMS_BY_NAME(SCHEMA_NAME(dp.major_id), \
+                             N'SCHEMA', N'VIEW DEFINITION'), 0) <> 1));";
+    for row in &conn.query(sql).await? {
+        let class: i32 = row.try_get("class")?.unwrap_or(0);
+        let id: i32 = row.try_get("major_id")?.unwrap_or(0);
+        // A securable the account cannot name is still a denial it cannot
+        // see through, so an unread name travels as its id rather than
+        // being dropped: silence here would read as "no DENY", and the
+        // `DENY` this reports is itself what hides the name.
+        let securable = if class == 3 {
+            match row.try_get::<&str>("sch_name")? {
+                Some(name) => Securable::Schema(name.to_owned()),
+                None => Securable::Unreadable {
+                    class: "SCHEMA",
+                    id,
+                },
+            }
+        } else {
+            match (
+                row.try_get::<&str>("obj_schema")?,
+                row.try_get::<&str>("obj_name")?,
+            ) {
+                (Some(schema), Some(name)) => Securable::Object(ObjectName::new(schema, name)),
+                _ => Securable::Unreadable {
+                    class: "OBJECT",
+                    id,
+                },
+            }
+        };
+        metadata_denials.insert(securable);
+    }
+    Ok(metadata_denials)
+}
+
 /// The permissions the connected account effectively holds.
 ///
 /// `schemas` are the schemas the project manages; `dbo` is added because the
@@ -1648,7 +1766,7 @@ async fn claimed_elsewhere<'a>(
 /// is refused rather than asked about, because asking would read the other
 /// identity's permissions instead. `Held::data_tables` is keyed by the
 /// declared name for the same reason and survives the refusal by falling back
-/// to the schema answer; `Held::granted_objects` has no such fallback, so a
+/// to the schema answer; a refused grant target cannot prove creation, so a
 /// refused grant target is reported through `Held::granted_unresolvable` as
 /// an unconditional gap instead.
 //
@@ -1668,6 +1786,7 @@ pub async fn permissions(
     declared_keys: &DeclaredKeys,
     project_ids: &pbps_model::IdsFile,
 ) -> Result<Held, DbError> {
+    let creation_tables = managed_tables;
     let rows = conn
         .query("SELECT permission_name AS name FROM sys.fn_my_permissions(NULL, 'DATABASE');")
         .await?;
@@ -1688,12 +1807,19 @@ pub async fn permissions(
     // uid for anything, so every resolution below falls through to the name
     // it was asked with, exactly like an environment that never had the
     // object. The permission gap this read's own failure causes is reported
-    // by the ledger permission rows, not by this fallback.
-    let (recorded, recorded_ids) = match crate::state::latest(conn).await {
-        Ok(Some(entry)) => (entry.snapshot.schema, entry.snapshot.ids),
-        _ => (
+    // by the ledger permission rows, not by this fallback. Failed reads also
+    // prevent claiming a future grant target is absent from recorded state.
+    let (recorded, recorded_ids, record_readable) = match crate::state::latest(conn).await {
+        Ok(Some(entry)) => (entry.snapshot.schema, entry.snapshot.ids, true),
+        Ok(None) | Err(pbps_db::ledger::LedgerError::NotInitialized) => (
             pbps_model::Schema::default(),
             pbps_model::IdsFile::default(),
+            true,
+        ),
+        Err(_) => (
+            pbps_model::Schema::default(),
+            pbps_model::IdsFile::default(),
+            false,
         ),
     };
     let ids = Ids::new(project_ids, &recorded_ids);
@@ -2033,10 +2159,10 @@ pub async fn permissions(
     .await?;
 
     // What the declared roles are granted on (ADR-0005). Objects the way the
-    // foreign-key targets are asked — every named one, so absent and
-    // invisible both land as a gap — and schemas through `sys.schemas`, so a
-    // schema that does not exist yet is unasked rather than reported.
-    let mut granted_objects: BTreeMap<ObjectName, BTreeSet<String>> = BTreeMap::new();
+    // foreign-key targets are asked, except for proven-absent declared
+    // creation targets (DEC-1806.1). A missing schema is reported separately
+    // from permission gaps: it has no securable on which to hold rights.
+    let mut granted_objects: BTreeMap<ObjectName, GrantedAt> = BTreeMap::new();
     let mut granted_schemas: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     // A declared target `resolve_for_query` could not safely ask about — see
     // its own doc comment. Reported by `missing` as an unconditional gap:
@@ -2059,6 +2185,9 @@ pub async fn permissions(
     // role by name, or a grant target the caller asks about.
     let roles_declared =
         !roles.is_empty() || !granted.objects.is_empty() || !granted.schemas.is_empty();
+    // Share this potentially database-wide read with the delete proof, but
+    // keep its delete-specific diagnostics conditional on an actual delete.
+    let mut denials = None;
     if roles_declared {
         let targets = granted;
         let granted_perms: Vec<&str> = REQUIRED
@@ -2090,6 +2219,100 @@ pub async fn permissions(
         let (safe_targets, unresolvable_targets) =
             resolve_for_query(targets.objects.iter(), &ids, &colliding);
         granted_unresolvable.extend(unresolvable_targets);
+        let candidates = if record_readable {
+            future_grant_candidates(
+                conn,
+                &safe_targets,
+                creation_tables,
+                targets,
+                &recorded,
+                &ids,
+            )
+            .await?
+        } else {
+            BTreeSet::new()
+        };
+        let mut creates = BTreeSet::new();
+        let mut absent_creation_schemas = BTreeSet::new();
+        if !candidates.is_empty() {
+            let candidates: Vec<_> = candidates.into_iter().collect();
+            let visible = object_permissions(
+                conn,
+                &candidates,
+                &granted_perms,
+                Existing::Only,
+                Columns::Catalog,
+            )
+            .await?;
+            let denied = metadata_denials(conn).await?;
+            let denied_names: Vec<_> = denied
+                .iter()
+                .filter_map(|d| match d {
+                    Securable::Object(o) => Some(o.clone()),
+                    Securable::Database | Securable::Schema(_) | Securable::Unreadable { .. } => {
+                        None
+                    }
+                })
+                .collect();
+            let denied_targets: BTreeSet<_> =
+                crate::catalog::matching_table_names(conn, &candidates, &denied_names)
+                    .await?
+                    .into_iter()
+                    .collect();
+            let unreadable = denied.iter().any(|d| {
+                matches!(
+                    d,
+                    Securable::Unreadable {
+                        class: "OBJECT",
+                        ..
+                    }
+                )
+            });
+            // A grant may spell a declared schema differently under the
+            // database collation. Ask that spelling instead of treating a
+            // missing Rust map key as a missing schema.
+            let aliases: BTreeSet<_> = candidates
+                .iter()
+                .map(|o| o.schema.as_str())
+                .filter(|s| !per_schema.contains_key(*s))
+                .collect();
+            let aliases: Vec<_> = aliases.into_iter().collect();
+            let mut alias_visibility: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for chunk in schema_statements(&aliases, 1) {
+                let (sql, params) = schema_permissions_sql(chunk, &["VIEW DEFINITION"]);
+                for row in &conn.query_with(&sql, &params).await? {
+                    let schema: &str = get(row, "schema")?;
+                    let rights = alias_visibility.entry(schema.to_owned()).or_default();
+                    if row.try_get::<i32>("held")? == Some(1) {
+                        rights.insert("VIEW DEFINITION".into());
+                    }
+                }
+            }
+            for object in candidates {
+                if visible.contains_key(&object) {
+                    continue;
+                }
+                match per_schema
+                    .get(&object.schema)
+                    .or_else(|| alias_visibility.get(&object.schema))
+                {
+                    None => {
+                        // pbps never creates schemas; report the absent
+                        // prerequisite instead of an impossible GRANT.
+                        absent_creation_schemas.insert(object);
+                    }
+                    Some(rights)
+                        if rights.contains("VIEW DEFINITION")
+                            && !unreadable
+                            && !denied_targets.contains(&object) =>
+                    {
+                        creates.insert(object);
+                    }
+                    _ => {}
+                }
+            }
+            denials = Some(denied);
+        }
         let mut objects: BTreeSet<ObjectName> = safe_targets.into_values().collect();
         let mut schemas_wanted: BTreeSet<String> = targets.schemas.iter().cloned().collect();
         for role in recorded.roles.values() {
@@ -2148,6 +2371,12 @@ pub async fn permissions(
                 }
             }
         }
+        for object in &absent_creation_schemas {
+            objects.remove(object);
+            absent_granted.insert(object.schema.clone());
+        }
+        let schema_grant_targets = schemas_wanted.clone();
+        schemas_wanted.extend(creates.iter().map(|o| o.schema.clone()));
         let objects: Vec<ObjectName> = objects.into_iter().collect();
         let schemas_wanted: Vec<String> = schemas_wanted.into_iter().collect();
         granted_objects = object_permissions(
@@ -2157,7 +2386,10 @@ pub async fn permissions(
             Existing::OrNot,
             Columns::Catalog,
         )
-        .await?;
+        .await?
+        .into_iter()
+        .map(|(object, rights)| (object, GrantedAt::Object(rights)))
+        .collect();
         if !schemas_wanted.is_empty() {
             // The same statement as the managed-schema read, in the same
             // pieces (#351): a role granted on more schemas than one
@@ -2182,6 +2414,18 @@ pub async fn permissions(
                     .cloned(),
             );
         }
+        for object in creates {
+            // If the schema disappeared during these reads, report that
+            // missing prerequisite; do not manufacture empty holdings.
+            if let Some(rights) = granted_schemas.get(&object.schema) {
+                granted_objects.insert(object, GrantedAt::Creates(rights.clone()));
+            } else {
+                granted_objects.remove(&object);
+            }
+        }
+        // The extra schema questions above answered future objects, not
+        // explicit schema grants. Each requirement has one typed answer.
+        granted_schemas.retain(|schema, _| schema_grant_targets.contains(schema));
     }
 
     // The other half of the delete count's proof, asked only of a project that
@@ -2193,55 +2437,10 @@ pub async fn permissions(
     // alone would answer 1 and still leave the count refusing.
     let mut metadata_denials: BTreeSet<Securable> = BTreeSet::new();
     if data.values().any(DataDemand::removes) {
-        // `sys.database_permissions.class` is a `tinyint`; the driver hands
-        // that back as a `u8` and reading it as an `i32` fails outright, so
-        // the widening happens in the engine where the column is named.
-        let sql = "SELECT CONVERT(int, dp.class) AS class, dp.major_id AS major_id, \
-                   OBJECT_SCHEMA_NAME(dp.major_id) AS obj_schema, \
-                   OBJECT_NAME(dp.major_id) AS obj_name, \
-                   SCHEMA_NAME(dp.major_id) AS sch_name \
-                   FROM sys.database_permissions dp \
-                   WHERE dp.state = N'D' \
-                     AND dp.permission_name IN (N'VIEW DEFINITION', N'CONTROL') \
-                     AND (dp.grantee_principal_id = USER_ID() \
-                          OR IS_MEMBER(USER_NAME(dp.grantee_principal_id)) = 1) \
-                     AND ((dp.class = 1 AND dp.minor_id = 0 \
-                           AND COALESCE(HAS_PERMS_BY_NAME( \
-                                 QUOTENAME(OBJECT_SCHEMA_NAME(dp.major_id)) + N'.' \
-                                 + QUOTENAME(OBJECT_NAME(dp.major_id)), \
-                                 N'OBJECT', N'VIEW DEFINITION'), 0) <> 1) \
-                       OR (dp.class = 3 \
-                           AND COALESCE(HAS_PERMS_BY_NAME(SCHEMA_NAME(dp.major_id), \
-                                 N'SCHEMA', N'VIEW DEFINITION'), 0) <> 1));";
-        for row in &conn.query(sql).await? {
-            let class: i32 = row.try_get("class")?.unwrap_or(0);
-            let id: i32 = row.try_get("major_id")?.unwrap_or(0);
-            // A securable the account cannot name is still a denial it cannot
-            // see through, so an unread name travels as its id rather than
-            // being dropped: silence here would read as "no DENY", and the
-            // `DENY` this reports is itself what hides the name.
-            let securable = if class == 3 {
-                match row.try_get::<&str>("sch_name")? {
-                    Some(name) => Securable::Schema(name.to_owned()),
-                    None => Securable::Unreadable {
-                        class: "SCHEMA",
-                        id,
-                    },
-                }
-            } else {
-                match (
-                    row.try_get::<&str>("obj_schema")?,
-                    row.try_get::<&str>("obj_name")?,
-                ) {
-                    (Some(schema), Some(name)) => Securable::Object(ObjectName::new(schema, name)),
-                    _ => Securable::Unreadable {
-                        class: "OBJECT",
-                        id,
-                    },
-                }
-            };
-            metadata_denials.insert(securable);
-        }
+        metadata_denials = match denials {
+            Some(denied) => denied,
+            None => self::metadata_denials(conn).await?,
+        };
     }
 
     let mut catalog_view = BTreeSet::new();
@@ -2615,13 +2814,18 @@ fn gaps(requirements: &[Requirement], held: &Held) -> Vec<Gap> {
                 }
             }
             Needed::Granted => {
+                let mut missing_schemas = BTreeSet::new();
                 for (object, granted) in &held.granted_objects {
-                    if !granted.contains(r.name) {
-                        out.push(Gap {
+                    match granted {
+                        GrantedAt::Object(rights) if !rights.contains(r.name) => out.push(Gap {
                             permission: r.name,
                             why: r.why,
                             securable: Securable::Object(object.clone()),
-                        });
+                        }),
+                        GrantedAt::Creates(rights) if !rights.contains(r.name) => {
+                            missing_schemas.insert(object.schema.clone());
+                        }
+                        GrantedAt::Object(_) | GrantedAt::Creates(_) => {}
                     }
                 }
                 // Never asked about at all — see `Held::granted_unresolvable`'s
@@ -2637,13 +2841,14 @@ fn gaps(requirements: &[Requirement], held: &Held) -> Vec<Gap> {
                 }
                 for (schema, granted) in &held.granted_schemas {
                     if !granted.contains(r.name) {
-                        out.push(Gap {
-                            permission: r.name,
-                            why: r.why,
-                            securable: Securable::Schema(schema.clone()),
-                        });
+                        missing_schemas.insert(schema.clone());
                     }
                 }
+                out.extend(missing_schemas.into_iter().map(|schema| Gap {
+                    permission: r.name,
+                    why: r.why,
+                    securable: Securable::Schema(schema),
+                }));
             }
             Needed::DataInsert => data_gaps(held, r, DataDemand::inserts, &mut out),
             Needed::DataUpdate => data_gaps(held, r, DataDemand::corrects, &mut out),
@@ -4027,7 +4232,7 @@ mod tests {
         // only permission `Needed::Granted` asks for.
         held.granted_objects.insert(
             table("app.old"),
-            ["CONTROL".to_owned()].into_iter().collect(),
+            GrantedAt::Object(["CONTROL".to_owned()].into_iter().collect()),
         );
         // The target this test is about could not be resolved without
         // colliding with that claim, so `permissions` put it here instead of
@@ -4075,8 +4280,10 @@ mod tests {
         held.roles_declared = true;
         held.database.insert("CREATE ROLE".into());
         held.database.insert("ALTER ANY ROLE".into());
-        held.granted_objects
-            .insert("app.customer".parse().unwrap(), BTreeSet::new());
+        held.granted_objects.insert(
+            "app.customer".parse().unwrap(),
+            GrantedAt::Object(BTreeSet::new()),
+        );
         held.granted_schemas
             .insert("app".into(), ["CONTROL".to_owned()].into_iter().collect());
         let gaps = missing(&held);
@@ -4088,9 +4295,39 @@ mod tests {
         );
         held.granted_objects.insert(
             "app.customer".parse().unwrap(),
-            ["CONTROL".to_owned()].into_iter().collect(),
+            GrantedAt::Object(["CONTROL".to_owned()].into_iter().collect()),
         );
         assert!(missing(&held).is_empty());
+    }
+
+    #[test]
+    fn future_grants_share_one_schema_gap_without_hiding_existing_or_unresolved_targets() {
+        let mut held = everything(&["app"]);
+        for name in ["app.t", "app.v"] {
+            held.granted_objects
+                .insert(table(name), GrantedAt::Creates(BTreeSet::new()));
+        }
+        held.granted_schemas.insert("app".into(), BTreeSet::new());
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].securable, Securable::Schema("app".into()));
+        for rights in held.granted_objects.values_mut() {
+            *rights = GrantedAt::Creates(["CONTROL".into()].into_iter().collect());
+        }
+        held.granted_schemas
+            .get_mut("app")
+            .unwrap()
+            .insert("CONTROL".into());
+        assert!(missing(&held).is_empty());
+        held.granted_objects
+            .insert(table("app.old"), GrantedAt::Object(BTreeSet::new()));
+        held.granted_unresolvable.insert(table("app.renamed"));
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
+        assert!(
+            gaps.iter()
+                .all(|g| matches!(g.securable, Securable::Object(_)))
+        );
     }
 
     /// The same holdings, but with the ledger tables present and carrying

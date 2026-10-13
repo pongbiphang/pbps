@@ -409,7 +409,8 @@
         "first_data_takeovers_refuse_changed_rows_and_wrong_checksums",
         "renamed_data_takeovers_use_final_names_and_require_approval",
         "verify_distinguishes_missing_empty_and_unreadable_recorded_state",
-        "verify_distinguishes_permission_denials_from_failed_connections"
+        "verify_distinguishes_permission_denials_from_failed_connections",
+        "doctor_accepts_future_table_and_view_grants_before_a_db_owner_bootstrap"
       ]
     },
     {
@@ -1038,7 +1039,10 @@
         "unicode_capacity_matches_alter_under_supplementary_character_collations",
         "unicode_to_varchar_probes_character_loss",
         "unmodelled_check_and_unique_write_behavior_is_inventoried_before_rebuild",
-        "widening_a_referenced_string_keeps_its_key_but_rebuilds_the_fk_and_filter"
+        "widening_a_referenced_string_keeps_its_key_but_rebuilds_the_fk_and_filter",
+        "future_grants_tests::future_grants_match_real_creation_authority_for_admin_and_narrow_logins",
+        "future_grants_tests::hidden_denied_recorded_and_undeclared_grant_targets_keep_object_gaps",
+        "future_grants_tests::future_grant_proof_respects_collation_missing_schemas_and_recorded_modules"
       ]
     },
     {

@@ -47,6 +47,9 @@ mod removal_names_tests;
 #[path = "support/null_predelete.rs"]
 mod null_predelete_tests;
 
+#[path = "support/future_grants.rs"]
+mod future_grants_tests;
+
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn an_authorized_migration_connection_failure_does_not_claim_missing_rights() {
@@ -14315,19 +14318,13 @@ async fn an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named() {
     .await
     .expect("read permissions");
 
-    for (name, map) in [
-        (&dot, &held.granted_objects),
-        (&hyphen, &held.granted_objects),
-        (&bracket, &held.referenced_objects),
-    ] {
-        let granted = map
-            .get(name)
-            .unwrap_or_else(|| panic!("{name} was not asked about: {held:?}"));
+    for name in [&dot, &hyphen] {
         assert!(
-            granted.contains("CONTROL") || granted.contains("REFERENCES"),
-            "`sa` holds everything on {name}, and the question answered {granted:?}"
+            matches!(held.granted_objects.get(name), Some(pbps_mssql::doctor::GrantedAt::Object(rights)) if rights.contains("CONTROL")),
+            "{name}: {held:?}"
         );
     }
+    assert!(held.referenced_objects[&bracket].contains("REFERENCES"));
     let gaps = pbps_mssql::doctor::missing(&held);
     for name in [&dot, &hyphen, &bracket] {
         assert!(
@@ -14404,7 +14401,7 @@ async fn a_role_granted_on_more_tables_than_one_statement_holds_is_read_whole() 
     );
     for o in &objects {
         assert!(
-            held.granted_objects[o].contains("CONTROL"),
+            matches!(&held.granted_objects[o], pbps_mssql::doctor::GrantedAt::Object(rights) if rights.contains("CONTROL")),
             "`sa` holds CONTROL on {o}: {:?}",
             held.granted_objects[o]
         );

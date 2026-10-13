@@ -2498,6 +2498,15 @@ project, always, to cover a statement most deployments never emit. That is the
 instead: `ALTER` covers *most* table changes, not every one. Catching the real
 case belongs in the plan-aware pre-flight, which does see the statements.
 
+For declared role grants on a SQL Server table or module **proven not yet
+created**, `doctor` asks for `CONTROL` on that target's creation schema
+(DEC-1806.1). A new object inherits the schema owner; creation rights alone
+do not authorize its grants. This exception requires visible schema metadata,
+no metadata denial hiding the target, and no recorded identity, module or role
+grant claiming it. Existing, hidden, recorded and unresolvable targets retain
+their object-scope check. The exception does not demand schema CONTROL from
+projects that grant on no future object.
+
 **A declared schema the database does not have is a readiness error**, not a
 permission one and not a silence. Nothing in pbps emits `CREATE SCHEMA`, so a
 project declaring `app.customer` against a database with no `app` fails on its

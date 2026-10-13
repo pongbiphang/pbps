@@ -25,6 +25,91 @@ mod verify_failures;
 
 #[test]
 #[ignore = "needs live mssql"]
+fn doctor_accepts_future_table_and_view_grants_before_a_db_owner_bootstrap() {
+    let server = std::env::var("PBPS_TEST_DB").unwrap();
+    let name = format!("pbps_future_cli_{}", std::process::id());
+    let password = "pbpsFutureCli!1806";
+    on_server(
+        &server,
+        &format!("CREATE LOGIN [{name}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"),
+    );
+    struct Login(String, String);
+    impl Drop for Login {
+        fn drop(&mut self) {
+            after_test_on_server(&self.0, &format!("DROP LOGIN [{}];", self.1));
+        }
+    }
+    let _login = Login(server.clone(), name.clone());
+    let own = OwnDatabase::new(&server, "future_grants1806");
+    on_server(
+        own.connection(),
+        &format!(
+            "CREATE USER [{name}] FOR LOGIN [{name}]; ALTER ROLE db_owner ADD MEMBER [{name}];"
+        ),
+    );
+    let base = server
+        .split(';')
+        .filter(|part| {
+            !matches!(
+                part.split('=')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let deployer = format!(
+        "{};User Id={name};Password={password};Database={}",
+        base.trim_end_matches(';'),
+        own.name()
+    );
+    on_server(
+        &deployer,
+        "IF IS_SRVROLEMEMBER('sysadmin') <> 0 THROW 51000, 'fixture must not be sysadmin', 1;",
+    );
+    let d = Demo::new("future-grants1806");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  local:\n    url_env: PBPS_FUTURE_GRANT_TARGET\n",
+    )
+    .unwrap();
+    d.table(ONE_COLUMN);
+    d.module("v.yml", A_VIEW);
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        "role: reader\ngrants:\n  dbo.t: [select]\n  dbo.active_t: [select]\n",
+    )
+    .unwrap();
+    let planned = d.run(&["plan", "--no-dev"]);
+    assert_eq!(code(&planned), 0, "{}", stderr(&planned));
+    d.commit();
+    for connection in [own.connection(), deployer.as_str()] {
+        let before = d.run_with_env(
+            &["doctor", "--env", "local", "--format", "json"],
+            &[("PBPS_FUTURE_GRANT_TARGET", connection)],
+        );
+        assert_eq!(code(&before), 0, "{} {}", stdout(&before), stderr(&before));
+    }
+    let bootstrap = d.run_with_env(
+        &["bootstrap", "--env", "local"],
+        &[("PBPS_FUTURE_GRANT_TARGET", &deployer)],
+    );
+    assert_eq!(code(&bootstrap), 0, "{}", stderr(&bootstrap));
+    for command in ["doctor", "verify"] {
+        let after = d.run_with_env(
+            &[command, "--env", "local", "--format", "json"],
+            &[("PBPS_FUTURE_GRANT_TARGET", &deployer)],
+        );
+        assert_eq!(code(&after), 0, "{} {}", stdout(&after), stderr(&after));
+    }
+}
+
+#[test]
+#[ignore = "needs live mssql"]
 fn verify_distinguishes_missing_empty_and_unreadable_recorded_state() {
     verify_failures::state_failures(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }
