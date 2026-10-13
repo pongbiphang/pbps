@@ -1550,8 +1550,15 @@ fn retired_part_requirements_do_not_follow_a_reused_table_name() {
             expression: "id > 0".into(),
         },
     );
+    // Distinct baselines prove that the retired owner is not compared with
+    // the survivor. Identical tables would pass even without that boundary.
+    let mut retired = t.clone();
+    retired.columns.insert(
+        "retired_only".into(),
+        Column::new("integer".parse().unwrap()),
+    );
     let before = Schema {
-        tables: [(a.clone(), t.clone()), (b.clone(), t.clone())].into(),
+        tables: [(a.clone(), retired), (b.clone(), t.clone())].into(),
         ..Default::default()
     };
     let changes = plan(vec![
@@ -1873,6 +1880,434 @@ fn a_created_heap_still_requires_exact_primary_key_presence() {
             assert!(
                 !diagnostic.contains("not clustered"),
                 "the independent presence rule must catch this: {diagnostic}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_rename_into_a_retired_name_carries_untouched_references() {
+    let a = TableName::new("app", "a");
+    let b = TableName::new("app", "b");
+    let child = TableName::new("app", "child");
+    let (parent, mut referencing) = parent_and_child(&b);
+    let before = Schema {
+        tables: [
+            (a.clone(), parent.clone()),
+            (b.clone(), parent.clone()),
+            (child.clone(), referencing.clone()),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let changes = plan(vec![
+        Change::DropTable {
+            uid: "t_000001".parse().unwrap(),
+            name: a.clone(),
+            detach_from: None,
+        },
+        Change::RenameTable {
+            uid: "t_000002".parse().unwrap(),
+            from: b,
+            to: a.clone(),
+            defaults: vec![],
+        },
+    ]);
+    referencing
+        .foreign_keys
+        .get_mut("fk")
+        .unwrap()
+        .references_table = a.clone();
+    let after = Schema {
+        tables: [(a, parent), (child.clone(), referencing)].into(),
+        ..Default::default()
+    };
+    for dialect in [
+        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
+        &pbps_mssql::Mssql,
+    ] {
+        refuse_unplanned_movement(dialect, &changes, &before, &after, "test", Settled::Closing)
+            .expect("the plan explains the baseline's occupied destination; the child's reference follows only the surviving parent");
+        let mut wrong = after.clone();
+        wrong
+            .tables
+            .get_mut(&child)
+            .unwrap()
+            .foreign_keys
+            .get_mut("fk")
+            .unwrap()
+            .on_delete = pbps_model::ReferentialAction::Cascade;
+        let error =
+            refuse_unplanned_movement(dialect, &changes, &before, &wrong, "test", Settled::Closing)
+                .expect_err(
+                    "carrying the referenced name never excuses a changed referential action",
+                );
+        assert!(format!("{error:#}").contains("app.child"), "{error:#}");
+    }
+}
+
+#[test]
+fn a_refilled_rename_source_keeps_the_moved_tables_incoming_reference() {
+    let a = TableName::new("app", "a");
+    let b = TableName::new("app", "b");
+    let c = TableName::new("app", "c");
+    let child = TableName::new("app", "child");
+    let (parent, mut referencing) = parent_and_child(&b);
+    let before = Schema {
+        tables: [
+            (a.clone(), parent.clone()),
+            (b.clone(), parent.clone()),
+            (child.clone(), referencing.clone()),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let changes = plan(vec![
+        Change::RenameTable {
+            uid: "t_000002".parse().unwrap(),
+            from: b.clone(),
+            to: c.clone(),
+            defaults: vec![],
+        },
+        Change::RenameTable {
+            uid: "t_000001".parse().unwrap(),
+            from: a,
+            to: b.clone(),
+            defaults: vec![],
+        },
+    ]);
+    referencing
+        .foreign_keys
+        .get_mut("fk")
+        .unwrap()
+        .references_table = c.clone();
+    let after = Schema {
+        tables: [
+            (b.clone(), parent.clone()),
+            (c, parent),
+            (child.clone(), referencing),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    for dialect in [
+        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
+        &pbps_mssql::Mssql,
+    ] {
+        refuse_unplanned_movement(dialect, &changes, &before, &after, "test", Settled::Closing)
+            .expect("b's source is occupied by a's table, but b's original table and incoming reference have moved to c");
+        let mut wrong = after.clone();
+        wrong
+            .tables
+            .get_mut(&child)
+            .unwrap()
+            .foreign_keys
+            .get_mut("fk")
+            .unwrap()
+            .references_table = b.clone();
+        let error =
+            refuse_unplanned_movement(dialect, &changes, &before, &wrong, "test", Settled::Closing)
+                .expect_err(
+                    "the reference cannot switch to the other table now holding the old spelling",
+                );
+        assert!(format!("{error:#}").contains("app.child"), "{error:#}");
+    }
+}
+
+fn parent_and_child(parent_name: &TableName) -> (Table, Table) {
+    let mut parent = table();
+    parent.columns.get_mut("id").unwrap().nullable = false;
+    parent.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+    });
+    let mut referencing = table();
+    referencing.foreign_keys.insert(
+        "fk".into(),
+        pbps_model::ForeignKey {
+            columns: vec!["id".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    (parent, referencing)
+}
+
+#[test]
+fn closing_reads_keep_untouched_references_after_the_parent_has_moved() {
+    let from = TableName::new("app", "old");
+    let to = TableName::new("archive", "new");
+    let child = TableName::new("app", "child");
+    let (parent, referencing) = parent_and_child(&to);
+    let checkpoint = Schema {
+        tables: [(to.clone(), parent), (child.clone(), referencing)].into(),
+        ..Default::default()
+    };
+    let changes = plan(vec![Change::RenameTable {
+        uid: "t_000001".parse().unwrap(),
+        from,
+        to,
+        defaults: vec![],
+    }]);
+    for dialect in [
+        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
+        &pbps_mssql::Mssql,
+    ] {
+        super::super::staged_comparison(
+            dialect,
+            &changes,
+            &checkpoint,
+            &checkpoint,
+            "test",
+            Settled::Closing,
+        )
+        .expect("both the previous checkpoint and closing read already carry the parent rename");
+        let mut wrong = checkpoint.clone();
+        wrong
+            .tables
+            .get_mut(&child)
+            .unwrap()
+            .foreign_keys
+            .get_mut("fk")
+            .unwrap()
+            .on_delete = pbps_model::ReferentialAction::Cascade;
+        let error = super::super::staged_comparison(dialect, &changes, &checkpoint, &wrong, "test", Settled::Closing)
+            .expect_err("the already-moved name does not excuse a later change to its child's referential action");
+        assert!(format!("{error:#}").contains("app.child"), "{error:#}");
+    }
+}
+
+#[test]
+fn incoming_references_follow_column_identity_through_a_name_swap() {
+    let name = TableName::new("app", "parent");
+    let child = TableName::new("app", "child");
+    let (mut parent, mut referencing) = parent_and_child(&name);
+    parent
+        .columns
+        .insert("other".into(), Column::new("integer".parse().unwrap()));
+    let before = Schema {
+        tables: [
+            (name.clone(), parent.clone()),
+            (child.clone(), referencing.clone()),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let rename = |uid: &str, from: &str, to: &str| Change::RenameColumn {
+        uid: uid.parse().unwrap(),
+        table: name.clone(),
+        from: from.into(),
+        to: to.into(),
+        table_was: None,
+    };
+    let changes = plan(vec![
+        rename("c_000001", "id", "temporary"),
+        rename("c_000002", "other", "id"),
+        rename("c_000001", "temporary", "other"),
+    ]);
+    let id = parent.columns["id"].clone();
+    let other = parent.columns["other"].clone();
+    parent.columns.insert("id".into(), other);
+    parent.columns.insert("other".into(), id);
+    parent.primary_key.as_mut().unwrap().columns = vec!["other".into()];
+    referencing
+        .foreign_keys
+        .get_mut("fk")
+        .unwrap()
+        .references_columns = vec!["other".into()];
+    let after = Schema {
+        tables: [(name, parent), (child.clone(), referencing)].into(),
+        ..Default::default()
+    };
+    for dialect in [
+        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
+        &pbps_mssql::Mssql,
+    ] {
+        refuse_unplanned_movement(dialect, &changes, &before, &after, "test", Settled::Closing)
+            .expect("the untouched child still references the original primary-key column");
+        let mut wrong = after.clone();
+        wrong
+            .tables
+            .get_mut(&child)
+            .unwrap()
+            .foreign_keys
+            .get_mut("fk")
+            .unwrap()
+            .references_columns = vec!["id".into()];
+        let error = refuse_unplanned_movement(
+            dialect,
+            &changes,
+            &before,
+            &wrong,
+            "test",
+            Settled::Closing,
+        )
+        .expect_err(
+            "reusing a column name cannot transfer its incoming reference to another identity",
+        );
+        assert!(format!("{error:#}").contains("app.child"), "{error:#}");
+    }
+}
+
+#[test]
+fn a_new_clustered_part_cannot_leave_the_table_as_a_heap() {
+    use pbps_model::{Clustered, Index, IndexColumn, IndexKey, UniqueConstraint};
+    let name = TableName::new("app", "t");
+    let unique = UniqueConstraint {
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+    };
+    let index = Index {
+        columns: vec![IndexColumn {
+            key: IndexKey::Column("id".into()),
+            descending: false,
+            opclass: None,
+        }],
+        include: vec![],
+        unique: false,
+        filter: None,
+        method: Default::default(),
+        storage_parameters: Default::default(),
+    };
+    let mut heap = table();
+    heap.clustered = Some(Clustered::Heap);
+    let mut with_unique = heap.clone();
+    with_unique.unique.insert("uq".into(), unique.clone());
+    with_unique.clustered = Some(Clustered::Unique("uq".into()));
+    let mut with_index = heap.clone();
+    with_index.indexes.insert("ix".into(), index.clone());
+    with_index.clustered = Some(Clustered::Index("ix".into()));
+    for (change, expected, part) in [
+        (
+            Change::AddUnique {
+                table: name.clone(),
+                name: "uq".into(),
+                constraint: unique,
+                clustered: true,
+            },
+            with_unique,
+            "unique `uq`",
+        ),
+        (
+            Change::AddIndex {
+                table: name,
+                name: "ix".into(),
+                index: Box::new(index),
+                clustered: true,
+            },
+            with_index,
+            "index `ix`",
+        ),
+    ] {
+        let changes = plan(vec![change]);
+        for read in [Settled::Whole, Settled::Closing] {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &changes,
+                &schema(heap.clone()),
+                &schema(expected.clone()),
+                "test",
+                read,
+            )
+            .expect("the new part holds the promised clustered layout");
+            let mut wrong = expected.clone();
+            wrong.clustered = Some(Clustered::Heap);
+            let error = refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &changes,
+                &schema(heap.clone()),
+                &schema(wrong),
+                "test",
+                read,
+            )
+            .expect_err("an unchanged heap is not completion of the promised clustered build");
+            assert!(format!("{error:#}").contains(part), "{error:#}");
+        }
+    }
+}
+
+#[test]
+fn computed_builds_require_persistence_and_declared_not_null() {
+    for (persisted, not_null) in [(false, false), (true, false), (true, true)] {
+        let declared = pbps_model::ComputedColumn {
+            expression: "id * 2".into(),
+            persisted,
+            not_null,
+        };
+        let changes = plan(vec![Change::AddComputedColumn {
+            table: TableName::new("app", "t"),
+            name: "doubled".into(),
+            computed: declared.clone(),
+        }]);
+        let mut expected = table();
+        let mut observed = declared.clone();
+        observed.expression = "([id]*(2))".into();
+        // A catalog may infer NOT NULL even when the declaration omits it.
+        observed.not_null = persisted;
+        expected.computed.insert("doubled".into(), observed);
+        for read in [Settled::Whole, Settled::Closing] {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &changes,
+                &schema(table()),
+                &schema(expected.clone()),
+                "test",
+                read,
+            )
+            .expect("expression respelling and inferred NOT NULL retain their existing policies");
+            let mut wrong_persistence = expected.clone();
+            let computed = wrong_persistence.computed.get_mut("doubled").unwrap();
+            computed.persisted = !persisted;
+            computed.not_null = false;
+            let mut wrong = vec![wrong_persistence];
+            if not_null {
+                let mut nullable = expected.clone();
+                nullable.computed.get_mut("doubled").unwrap().not_null = false;
+                wrong.push(nullable);
+            }
+            for bad in wrong {
+                let error = refuse_unplanned_movement(
+                    &pbps_mssql::Mssql,
+                    &changes,
+                    &schema(table()),
+                    &schema(bad),
+                    "test",
+                    read,
+                )
+                .expect_err("the declared persisted and NOT NULL properties must be observed");
+                assert!(
+                    format!("{error:#}").contains("computed column `doubled`"),
+                    "{error:#}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_completed_drop_requires_the_table_to_be_absent() {
+    let changes = plan(vec![Change::DropTable {
+        uid: "t_000001".parse().unwrap(),
+        name: TableName::new("app", "t"),
+        detach_from: None,
+    }]);
+    let before = schema(table());
+    for dialect in [
+        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
+        &pbps_mssql::Mssql,
+    ] {
+        for read in [Settled::Whole, Settled::Closing] {
+            refuse_unplanned_movement(dialect, &changes, &before, &Schema::default(), "test", read)
+                .expect("the promised drop has removed its table");
+            let error =
+                refuse_unplanned_movement(dialect, &changes, &before, &before, "test", read)
+                    .expect_err("an unchanged table is not completion of the promised drop");
+            assert!(
+                format!("{error:#}").contains("app.t is still there, and this plan removes it"),
+                "{error:#}"
             );
         }
     }

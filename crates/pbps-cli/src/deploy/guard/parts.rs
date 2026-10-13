@@ -5,7 +5,8 @@ use pbps_model::{
     plan_names::{At, Holder, PlanNames},
 };
 
-use super::super::part_as_planned;
+use super::super::{index_as_declared, primary_key_as_declared};
+use super::Fields;
 
 /// The primary key has no map name; names in different part namespaces never
 /// exempt one another (DECISIONS 168).
@@ -63,7 +64,7 @@ impl<'a> Slot<'a> {
 
     /// Layout is compared separately; equality here holds the complete catalog
     /// definition, including stored check/filter text (SPEC 7.6).
-    fn read(self, table: &Table) -> Option<PartDefinition<'_>> {
+    fn read<'t>(self, table: &Fields<'t>) -> Option<PartDefinition<'t>> {
         Some(match self {
             Self::PrimaryKey => PartDefinition::PrimaryKey(table.primary_key.as_ref()?, false),
             Self::Unique(n) => PartDefinition::Unique(table.unique.get(n)?, false),
@@ -74,7 +75,7 @@ impl<'a> Slot<'a> {
         })
     }
 
-    fn all(table: &'a Table) -> BTreeSet<Self> {
+    fn all(table: &Fields<'a>) -> BTreeSet<Self> {
         std::iter::once(Self::PrimaryKey)
             .chain(table.unique.keys().map(|n| Self::Unique(n)))
             .chain(table.foreign_keys.keys().map(|n| Self::ForeignKey(n)))
@@ -174,7 +175,8 @@ impl<'a> PartChanges<'a> {
         let Some(parts) = self.0.get(name) else {
             return;
         };
-        let expected_holder = parts.holder(holder(table));
+        let fields = Fields::of(table);
+        let expected_holder = parts.holder(holder(&fields));
         // Own the selector before mutating the table it may borrow from.
         let selector = match expected_holder {
             Some(Slot::PrimaryKey) => None,
@@ -291,8 +293,8 @@ impl<'a> PartChanges<'a> {
     pub(crate) fn kept(
         &self,
         name: &TableName,
-        was: &Table,
-        now: &Table,
+        was: &Fields<'_>,
+        now: &Fields<'_>,
         pending: Option<&Table>,
         moved: &mut Vec<String>,
     ) {
@@ -307,7 +309,7 @@ impl<'a> PartChanges<'a> {
             if *slot != Slot::PrimaryKey
                 && before.is_none()
                 && after.is_some()
-                && pending.is_some_and(|declared| slot.read(declared).is_some())
+                && pending.is_some_and(|declared| slot.read(&Fields::of(declared)).is_some())
             {
                 continue;
             }
@@ -328,8 +330,8 @@ impl<'a> PartChanges<'a> {
     pub(crate) fn storage(
         &self,
         name: &TableName,
-        was: &Table,
-        now: &Table,
+        was: &Fields<'_>,
+        now: &Fields<'_>,
         whole: bool,
         moved: &mut Vec<String>,
     ) {
@@ -372,8 +374,8 @@ impl<'a> PartChanges<'a> {
     pub(crate) fn layout(
         &self,
         name: &TableName,
-        was: &Table,
-        now: &Table,
+        was: &Fields<'_>,
+        now: &Fields<'_>,
         moved: &mut Vec<String>,
     ) {
         let (before, after) = (holder(was), holder(now));
@@ -398,6 +400,7 @@ impl<'a> PartChanges<'a> {
             let Some(table) = schema.tables.get(name) else {
                 continue;
             };
+            let table = &Fields::of(table);
             for (slot, effect) in &parts.effects {
                 let Some(after) = effect.after else {
                     continue;
@@ -441,14 +444,15 @@ impl Parts<'_> {
     }
 }
 
-pub(super) fn created_layout(expected: &Table, now: &Table, whole: bool) -> bool {
-    let target = holder(expected);
+pub(super) fn created_layout(expected: &Table, now: &Fields<'_>, whole: bool) -> bool {
+    let expected = Fields::of(expected);
+    let target = holder(&expected);
     let built = target.is_none_or(|slot| slot.read(now).is_some());
     !(built || whole) || target == holder(now)
 }
 
-fn holder(table: &Table) -> Option<Slot<'_>> {
-    match &table.clustered {
+fn holder<'a>(table: &Fields<'a>) -> Option<Slot<'a>> {
+    match table.clustered {
         None if table.primary_key.is_some() => Some(Slot::PrimaryKey),
         Some(pbps_model::Clustered::Unique(n)) => Some(Slot::Unique(n)),
         Some(pbps_model::Clustered::Index(n)) => Some(Slot::Index(n)),
@@ -468,4 +472,50 @@ fn clustered(after: PartAfter<'_>) -> bool {
         )
         | PartAfter::Gone(_) => false,
     }
+}
+
+/// Whether a part read back is the one the plan adds it as, or `None` where
+/// the definition has nothing a read-back can be held to: a check is nothing
+/// but an expression and SQL Server rewrites it (167), so its name is all
+/// that is comparable (DECISIONS 183).
+///
+/// `None` as well where the part is not there at all: absent and wrong are
+/// two different findings, and the presence check answers for the first.
+fn part_as_planned(
+    planned: pbps_model::PartDefinition<'_>,
+    table: &Fields<'_>,
+    name: &str,
+) -> Option<bool> {
+    use pbps_model::PartDefinition;
+    // The layout is held with the rest: which index is clustered is read
+    // back as the table's selector, so a key the engine built nonclustered
+    // where the plan built it clustered is movement, not the plan's result
+    // (#1178).
+    Some(match planned {
+        PartDefinition::PrimaryKey(was, clustered) => {
+            primary_key_as_declared(was, table.primary_key.as_ref()?)
+                && (holder(table) == Some(Slot::PrimaryKey)) == clustered
+        }
+        // A unique constraint is nothing but its columns, its index's
+        // storage parameters (#1442) and its layout.
+        PartDefinition::Unique(was, clustered) => {
+            table.unique.get(name)? == was
+                && (holder(table) == Some(Slot::Unique(name))) == clustered
+        }
+        // And a foreign key nothing but structure — the columns, the parent
+        // and the two referential actions — so all of it is comparable (182).
+        PartDefinition::ForeignKey(was) => table.foreign_keys.get(name)? == was,
+        PartDefinition::Check(_) => return None,
+        PartDefinition::Index(was, clustered) => {
+            index_as_declared(was, table.indexes.get(name)?)
+                && (holder(table) == Some(Slot::Index(name))) == clustered
+        }
+        // Held to its persistence, which the catalog reads back as given.
+        // The expression is respelled (`([a]*(2))`), as a check's is, so it
+        // is not compared here (#1174).
+        PartDefinition::Computed(was) => {
+            let now = table.computed.get(name)?;
+            now.persisted == was.persisted && (!was.not_null || now.not_null)
+        }
+    })
 }

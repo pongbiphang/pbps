@@ -1328,6 +1328,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "indexmap",
  "insta",
  "jsonschema",
  "miette",

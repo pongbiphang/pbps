@@ -5,14 +5,17 @@ mod created;
 mod expect;
 mod parts;
 mod read;
+mod tables;
 
 pub(super) use check::{
-    columns, columns_after, created_place, declared_column, implied, own, system_time, table,
+    Fields, columns, columns_after, created_place, declared_column, implied, own, system_time,
+    table,
 };
 pub(super) use created::CreatedChanges;
 pub(super) use expect::{ColumnChanges, OwnNames, TableChanges};
 pub(super) use parts::PartChanges;
 pub(super) use read::{Read, Staged};
+pub(super) use tables::Tables;
 
 /// Kept readings compare exactly; only a field the plan changes can be
 /// unpromised between statements (SPEC 7.6). The two planned forms preserve
