@@ -20,6 +20,9 @@ async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbErro
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/plan_outputs.rs"]
+mod plan_outputs;
+
 #[path = "support/unexpressible.rs"]
 mod unexpressible;
 

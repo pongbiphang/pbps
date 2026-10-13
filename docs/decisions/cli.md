@@ -1046,3 +1046,42 @@ Pinned by the `erd.rs` tests for separate headers/attributes/FK endpoints,
 aliases; the issue's disposable real-parser and Chromium fixtures verify the
 emitted CLI output. No Mermaid dependency or script is added to the generated
 documentation (decision 18).
+
+<a id="dec-1800-1"></a>
+
+**DEC-1800.1. Plan artifacts must not alias each other or project inputs.**
+Both offline and connected planning compare output paths before any identity
+write or connection. The protected set is the config, the configured identity
+file (even before it exists), all declaration files, an explicit `--base`
+snapshot, every environment's configured fingerprint key file, and every
+configured resolver SQL baseline. Keys and baselines remain inputs even when
+this invocation does not select their environment or resolver. Existing ordinary
+artifact destinations retain their overwrite behavior; other output commands
+are outside #1800.
+
+The shared `paths::absolute` canonicalizes the deepest existing ancestor and
+appends the missing suffix, preserving the filesystem meaning of a symlink
+followed by `..`. Equal paths compare equal even before creation; existing
+Unix hardlinks also compare by device and inode. Inspection errors are explicit
+`plan.unwritable` failures, while alias refusals use `flags.conflicting` and
+locate the protected path. A missing output parent still fails when writing;
+this guard neither creates directories nor promises transactional publication.
+Declaration enumeration errors remain the loader's responsibility before any
+write or connection. Dispatch owns this guard so the connected operational-error
+wrapper cannot emit a second JSON envelope for its refusal.
+
+Known limits are case-only aliases between two nonexistent names on a
+case-insensitive filesystem, Windows hardlinks, dangling symlinks to an absent
+identity file, and check-then-write races. This bounded preflight is protection
+against accidental output selection, not a filesystem locking protocol.
+
+Pinned by `paths.rs` tests for missing and existing equivalent paths, distinct
+files with identical bytes, physical symlink-parent resolution, Unix hardlinks
+and inspection errors, and `tests/support/plan_outputs.rs` for both dialects:
+all protected inputs retain their bytes, an absent identity file stays absent,
+connected refusals precede target access, a JSON refusal is a single envelope,
+and distinct overwritten artifacts still pass `explain`. The live PostgreSQL
+`plan_outputs_preserve_the_fingerprint_key_its_apply_needs` test also seals and
+applies a plan with the retained key. On the unguarded path, writing SQL over
+that key made an otherwise valid plan fail; restoring only the key made the
+same plan apply successfully (review on #1944).

@@ -20,6 +20,7 @@ mod key;
 mod object_order;
 mod output;
 mod partitions;
+mod paths;
 mod pins;
 mod prompt;
 mod report;
@@ -85,7 +86,7 @@ impl Unexpressible {
 /// The exit code for [`Found`].
 const EXIT_FINDING: i32 = 2;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 use clap::{Args, CommandFactory as _, Parser, Subcommand};
@@ -902,6 +903,7 @@ fn run() -> anyhow::Result<()> {
                          environment; run them separately",
                     )?;
                 }
+                refuse_aliased_outputs(&project, out.as_deref(), sql.as_deref(), None, json)?;
                 let resolver_selection = match project
                     .config
                     .select_resolver(resolve_with.as_deref(), target.env.as_deref())
@@ -993,6 +995,13 @@ fn run() -> anyhow::Result<()> {
                     refuse("--check changes no files, so it cannot take --sql")?;
                 }
             }
+            refuse_aliased_outputs(
+                &project,
+                out.as_deref(),
+                sql.as_deref(),
+                base.as_deref(),
+                json,
+            )?;
             let source = match base {
                 Some(p) => baseline::Source::File(p),
                 None if since == "HEAD" => baseline::default_source(&project),
@@ -2764,6 +2773,74 @@ struct PlanOptions<'a> {
     /// question, or a pipeline hangs on one nobody can see.
     may_prompt: bool,
     format: OutputFormat,
+}
+
+/// Guard both planning paths in dispatch so refusals precede identity writes
+/// and connections, and are not wrapped in a second JSON envelope by the
+/// connected command's operational-error handler (DEC-1800.1).
+fn refuse_aliased_outputs(
+    project: &Project,
+    out: Option<&Path>,
+    sql: Option<&Path>,
+    base: Option<&Path>,
+    json: bool,
+) -> anyhow::Result<()> {
+    if out.is_none() && sql.is_none() {
+        return Ok(());
+    }
+    let distinct = |destination: &Path, protected: &Path| -> anyhow::Result<()> {
+        let aliases = output::or_unanswerable_at(
+            "plan",
+            json,
+            "plan.unwritable",
+            destination,
+            paths::same_file(destination, protected),
+        )?;
+        if aliases {
+            return output::or_unanswerable_at(
+                "plan",
+                json,
+                "flags.conflicting",
+                protected,
+                Err(anyhow::anyhow!(
+                    "output `{}` aliases `{}`; choose a distinct artifact destination",
+                    destination.display(),
+                    protected.display(),
+                )),
+            );
+        }
+        Ok(())
+    };
+    if let (Some(out), Some(sql)) = (out, sql) {
+        distinct(out, sql)?;
+    }
+    let mut inputs = vec![project.config_file(), project.ids_file()];
+    // The ordinary loader owns declaration-enumeration errors and runs before
+    // writes or connection. An unreadable directory must not become a clean plan.
+    if let Ok(files) = pbps_load::schema_files(&project.schema_dir()) {
+        inputs.extend(files);
+    }
+    inputs.extend(base.map(Path::to_owned));
+    // Replacing a key invalidates plans already sealed under it, including
+    // plans for environments this invocation does not select.
+    for environment in project.config.environments.values() {
+        if let Some(path) = &environment.fingerprint_key_file {
+            inputs.push(project.root.join(path));
+        }
+    }
+    for profile in project.config.resolvers.values() {
+        let (pbps_config::resolver::ResolverProfile::Docker { baseline, .. }
+        | pbps_config::resolver::ResolverProfile::Server { baseline, .. }) = profile;
+        if let Some(path) = baseline {
+            inputs.push(project.root.join(path));
+        }
+    }
+    for destination in [out, sql].into_iter().flatten() {
+        for input in &inputs {
+            distinct(destination, input)?;
+        }
+    }
+    Ok(())
 }
 
 fn cmd_plan(
