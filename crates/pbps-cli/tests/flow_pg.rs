@@ -185,6 +185,15 @@ fn blank_baseline_reasons_leave_the_live_ledger_unchanged() {
 #[path = "support/fmt_scalars.rs"]
 mod fmt_scalars;
 
+#[path = "support/fmt_failures.rs"]
+mod fmt_failures;
+
+#[test]
+fn formatting_stages_all_inputs_and_keeps_failures_visible() {
+    fmt_failures::before_writes("postgres");
+    fmt_failures::all_errors_and_warnings("postgres");
+}
+
 #[test]
 fn formatting_preserves_multiline_data_and_refuses_malformed_yaml() {
     fmt_scalars::check("postgres");

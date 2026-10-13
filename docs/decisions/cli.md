@@ -1085,3 +1085,29 @@ and distinct overwritten artifacts still pass `explain`. The live PostgreSQL
 applies a plan with the retained key. On the unguarded path, writing SQL over
 that key made an otherwise valid plan fail; restoring only the key made the
 same plan apply successfully (review on #1944).
+
+<a id="dec-1802-1"></a>
+
+**DEC-1802.1. Formatting stages all inputs and reports every completed rewrite.**
+Reading and writing one declaration at a time let a malformed later file hide
+an earlier rewrite. Reading once to gather names and again to render also let
+the two passes judge different contents. `fmt` now stages each path, original
+text and parsed declaration before the writer can run. All input errors are
+reported together with already-gathered identity warnings; any such error
+prevents every source write (SPEC §9.8). The project-wide rename-source names
+come from that same staged input. Other callers of `fmt_declared`, including
+`partitions extend`, keep their separate validation flow.
+
+This is not a filesystem transaction or a concurrent-writer protocol. A write
+can still fail after earlier writes succeeded. Only successful writes enter
+the completed-change list, whose rewrite and annotation-removal notes survive
+that failure in both JSON and human output, together with the failing path
+and existing warnings. The failing write is not reported as a completed rewrite.
+
+The offline CLI tests cover malformed and invalid-UTF-8 later inputs, multiple
+bad inputs, identity-warning retention, both output formats, read-only check
+mode, and successful formatting after repair for both dialects. The multi-file
+JSON control preserves the complete changed-file set. A non-root filesystem
+probe with a readable but read-only first or later file verifies actual write
+failures and retained progress; it does not substitute a read failure for a
+write failure or claim that Unix permission bits deny a root process.

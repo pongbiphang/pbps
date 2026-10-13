@@ -17,5 +17,5 @@ pbps::load::semantic
   help: the format is `schema.table(column)`; separate multiple columns with
         commas
 
-error: `./schema/dbo.t.yml` does not parse
+error: cannot format declarations with unreadable or invalid input
 --- end ---

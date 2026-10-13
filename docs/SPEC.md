@@ -2679,9 +2679,13 @@ Three exit codes, and the split is the point:
 | 2 | The command answered and found something to act on — invalid declarations, an unformatted file, a stale ids file, unresolved identity, drift, a plan that does not converge | whoever owns the change or the schema |
 | 1 | The command could not answer — an unreachable database, an unreadable file, contradictory flags | whoever runs CI |
 
-`fmt` on a file it cannot parse is the second case: the parse errors are the
-findings, but `fmt` never got to decide whether that file was canonical, so the
-result is `unanswerable`.
+`fmt` reads and parses every declaration before writing any. If an input
+cannot be read or parsed, it reports all input errors alongside gathered
+warnings, leaves every source file unchanged, and returns `unanswerable`
+(exit `1`). It never got to decide whether those files were canonical.
+`fmt --check` remains read-only. Formatting is not a multi-file filesystem
+transaction: if a later write fails, the failure report names that file and
+retains notes for every completed rewrite and annotation removal.
 
 A pipeline that cannot tell 1 from 2 sends half of every alert to the wrong
 person. `status` is the deliberate exception and always exits 0: it is a report
