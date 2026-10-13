@@ -60,9 +60,11 @@ fn refused(d: &Demo, args: &[&str], location: Option<&Path>) {
     assert_eq!(report["result"], "unanswerable", "{report}");
     assert_eq!(report["findings"][0]["id"], "flags.conflicting", "{report}");
     if let Some(path) = location {
+        // Directory enumeration uses native separators; CLI inputs may use
+        // either separator on Windows. Compare the path, not its spelling.
         assert_eq!(
-            report["findings"][0]["location"]["file"],
-            path.to_str().unwrap()
+            Path::new(report["findings"][0]["location"]["file"].as_str().unwrap()),
+            path
         );
     }
     assert_eq!(
