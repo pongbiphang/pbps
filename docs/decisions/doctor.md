@@ -1271,3 +1271,39 @@ Pinned by the arithmetic tests in `partition_runway.rs`, the query tests in
 `partition_runway_is_a_count_or_a_width_and_absent_by_default`, and the live
 `doctor_warns_when_a_partition_series_is_about_to_run_out` and
 `doctor_does_not_queue_behind_a_locked_partitioned_table` on 18 and 16.
+
+<a id="dec-1806-1"></a>
+
+**DEC-1806.1. A proven-absent declared SQL Server grant target asks for
+CONTROL on its creation schema.** Asking for object CONTROL before the object
+exists reports a false readiness failure even for sa and a non-sysadmin
+db_owner. Measured on SQL Server 17.0.4075.5: both can create a table or view
+and grant SELECT on it; schema CONTROL also authorizes those grants. CREATE
+TABLE/VIEW plus ALTER and VIEW DEFINITION on the schema allows creation but
+the grants fail with 15151. The new object's explicit owner is NULL and its
+effective owner is the schema owner, not the creator. Silencing the check as
+PostgreSQL does (428) would therefore miss a real SQL Server refusal.
+
+After identity resolution, the target must be unconfirmed, declared as a table
+or module, and absent from recorded tables, modules and role grant targets.
+Membership uses the database collation. Failed recorded-state reads cannot
+establish an unrecorded target. OBJECT_ID, without a table-only type filter,
+must be NULL: an existing unrecorded view, procedure or function still has
+object authority and may have an object DENY. Schema VIEW DEFINITION
+must be held, and effective object metadata denials must not hide this target;
+an unreadable denied object blocks the proof. The denial read is shared with
+the delete-count proof without adding delete diagnostics to grant-only
+projects. Existing, hidden, recorded, undeclared and unresolvable targets keep
+the object demand. A missing creation schema remains an absent-schema finding.
+
+`GrantedAt` carries either object rights or creation-schema rights, so a target
+cannot have both answers. Missing schema CONTROL is deduplicated across future
+targets and explicit schema grants. This is the securable-level CONTROL policy
+of 62 applied before creation, not a general demand for CONTROL on every managed
+schema: SPEC §9.5's cross-schema-transfer limitation remains. Narrower authority
+through grant options is outside this change, as it is for existing targets.
+
+Pinned by the unit test
+`future_grants_share_one_schema_gap_without_hiding_existing_or_unresolved_targets`,
+the SQL Server live `future_grants_tests` module, and the CLI reproduction
+`doctor_accepts_future_table_and_view_grants_before_a_db_owner_bootstrap`.
