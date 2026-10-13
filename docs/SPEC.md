@@ -1344,6 +1344,15 @@ reconciliation.
 
 What this catches is somebody having SSHed in and changed the schema by hand.
 
+`verify` distinguishes being unable to connect from being unable to read the
+recorded or live state. Connection failures use `environment.unreachable`;
+a missing ledger uses `state.uninitialized`, an empty ledger
+`state.no-entries`, and an unreadable ledger or snapshot `state.unreadable`.
+Failure to read the managed catalog or recorded reference rows uses
+`environment.unreadable`; other operational failures in the comparison use
+`verify.failed`. These are `unanswerable` (exit 1), with the target and original
+cause retained, not established drift (DEC-1804.1).
+
 **The scope of the comparison is the managed set**: the tables that appear in the
 declarations (with their columns, constraints and indexes) plus `__pbps_state`
 itself. Other objects in the same database are ignored by default — which is what
@@ -2678,6 +2687,12 @@ Three exit codes, and the split is the point:
 | 0 | The command answered and found nothing | nobody |
 | 2 | The command answered and found something to act on — invalid declarations, an unformatted file, a stale ids file, unresolved identity, drift, a plan that does not converge | whoever owns the change or the schema |
 | 1 | The command could not answer — an unreachable database, an unreadable file, contradictory flags | whoever runs CI |
+
+For `verify`, an exit-1 finding identifies the failing step with the IDs in
+§8.2. A successful connection followed by a state or object-read failure must
+not be labelled `environment.unreachable`. This classification does not parse
+engine error text or distinguish malformed from future-version snapshots;
+their detailed causes remain in the message (DEC-1804.1).
 
 `fmt` reads and parses every declaration before writing any. If an input
 cannot be read or parsed, it reports all input errors alongside gathered
