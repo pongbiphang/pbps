@@ -994,11 +994,12 @@ command that reads the date against one that does not.
   anything else would put a reformatting of the whole file into the diff beside the new
   entries, so the remedy is `pbps fmt` first. The new entries are added and the file
   re-rendered by the same function `fmt` uses, read back and compared with what was
-  generated, and the whole project is then run through the declaration checks `plan` and
-  `validate` share before a byte is written. The `policies:` rules are not among them, so
-  `validate` can still refuse a generated name a naming rule rejects (#1904). A tree that
-  already fails those checks is refused first, so that what they say afterwards is about
-  this change alone.
+  generated, and the whole project is then checked as `validate` checks it before a byte is
+  written: the declaration checks `plan` and `validate` share, and the project's `policies:`
+  rules through the one function `validate` calls (#1904). Of the rules, only an error the
+  tree did not already carry refuses, and it is named; a finding the tree had before, and a
+  rule set below `error`, do not stop the series. A tree that already fails the declaration
+  checks is refused first, so that what they say afterwards is about this change alone.
 - **What it leaves alone.** The ids file: `plan` gives the partitions identities as it does
   for any table added by hand (SPEC 6.2), and a flag that supplied them would be identity
   intent no human gave (SPEC 14.3). Every file but the parent's. The database: nothing is
@@ -1009,8 +1010,9 @@ command that reads the date against one that does not.
 Pinned by the unit tests in `partition_series.rs` (a year end, a leap February, daily,
 weekly, monthly, yearly, `timestamp`, `timestamptz` and `bigint` series, and each refusal
 above), by `tests/partitions_extend.rs` without a database (canonical output, a no-op rerun,
-other files untouched, a file not canonical, a taken name, a tree already invalid, SQL
-Server), and on 16 and 18 by `a_generated_series_is_planned_applied_and_verified_through_the_cli`.
+other files untouched, a file not canonical, a taken name, a tree already invalid, a
+naming rule at `error` that the generated names break or keep, one the tree already broke,
+the same rule at `warning`, SQL Server), and on 16 and 18 by `a_generated_series_is_planned_applied_and_verified_through_the_cli`.
 
 <a id="dec-1799-1"></a>
 

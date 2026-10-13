@@ -2167,18 +2167,9 @@ fn validate_inspected(
                 (_, Err(_)) => Some(Default::default()),
             },
         };
-        let mut ctx = policy_context(project, dialect, false);
-        ctx.only = only;
-        // Types in the dialect's own spelling, because the policy crate is
-        // dialect-agnostic on purpose and a rule that names a type sees
-        // whatever the declaration wrote. `national text` *is* `ntext` to SQL
-        // Server, and the default-on deprecated-type rule was bypassed by the
-        // alias. The boundary stays where it was: the dialect says what a
-        // type is, the policy says what to think of it (DECISIONS 187).
-        let spelled = types_as_the_dialect_spells_them(&l.schema, dialect);
-        for f in pbps_policy::declarations(&spelled, &policies, &ctx) {
-            findings.push(policy_finding(&f));
-        }
+        findings.extend(declaration_policy_findings(
+            project, dialect, &l.schema, only,
+        ));
     }
     if let Err(e) = &ids {
         findings.push(
@@ -2205,6 +2196,36 @@ fn validate_inspected(
         },
     };
     (findings, data)
+}
+
+/// The project's declaration rules over `schema` (ADR-0008): the half of
+/// `validate` that asks what the project's `policies:` think of the
+/// declarations. `only` narrows it to the named objects, as `--since` does.
+///
+/// One function for `validate` and for every command that writes declarations
+/// and must not hand the next `validate` a finding it could have named first
+/// (`partitions extend`, #1904). A second copy of this would drift in what it
+/// spells, which is how a rule is bypassed by an alias.
+pub(crate) fn declaration_policy_findings(
+    project: &Project,
+    dialect: &dyn Dialect,
+    schema: &Schema,
+    only: Option<std::collections::BTreeSet<String>>,
+) -> Vec<output::Finding> {
+    let policies = project.config.policies();
+    let mut ctx = policy_context(project, dialect, false);
+    ctx.only = only;
+    // Types in the dialect's own spelling, because the policy crate is
+    // dialect-agnostic on purpose and a rule that names a type sees
+    // whatever the declaration wrote. `national text` *is* `ntext` to SQL
+    // Server, and the default-on deprecated-type rule was bypassed by the
+    // alias. The boundary stays where it was: the dialect says what a
+    // type is, the policy says what to think of it (DECISIONS 187).
+    let spelled = types_as_the_dialect_spells_them(schema, dialect);
+    pbps_policy::declarations(&spelled, &policies, &ctx)
+        .iter()
+        .map(policy_finding)
+        .collect()
 }
 
 fn cmd_validate(

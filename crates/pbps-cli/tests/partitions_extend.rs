@@ -38,6 +38,18 @@ impl Project {
         assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     }
 
+    /// Sets the project's `naming.table` rule, in `pbps.yml`.
+    fn naming_table(&self, severity: &str, pattern: &str) {
+        std::fs::write(
+            self.dir.join("pbps.yml"),
+            format!(
+                "dialect: postgres\npolicies:\n  rules:\n    naming.table: \
+                 {{severity: {severity}, pattern: \"{pattern}\"}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         Command::new(BIN)
             .arg("--project")
@@ -431,6 +443,107 @@ fn a_tree_that_already_has_problems_is_not_extended() {
         stderr(&o)
     );
     assert_eq!(p.files(), before);
+}
+
+/// The names a table-naming rule accepts: the existing partitions (`ev_2026_11`
+/// and `ev_rest`) and the monthly ones the generator writes, but not a daily
+/// one.
+const MONTHLY: &str = "^ev(_[0-9]{4}_[0-9]{2}|_rest)?$";
+
+/// `validate` runs the project's `policies:`, and so must the command that
+/// writes declarations: a rule set to `error` that the generated names break
+/// is named before a byte is written, not by the `validate` after it
+/// (#1904).
+#[test]
+fn a_generated_name_an_error_rule_rejects_is_refused_and_nothing_is_written() {
+    let p = Project::new("policy-refused", "postgres");
+    p.declare("app.ev.yml", EVENTS);
+    p.naming_table("error", MONTHLY);
+    assert_eq!(code(&p.run(&["validate"])), 0, "the tree is clean to start");
+    let before = p.files();
+
+    // Daily names (`ev_2026_12_01`) are not the monthly scheme the rule asks.
+    let o = p.extend("app.ev", "1day", "2026-12-03");
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let said = stderr(&o);
+    assert!(
+        said.contains("naming.table")
+            && said.contains("ev_2026_12_01")
+            && said.contains("ev_2026_12_02")
+            && said.contains("nothing was written"),
+        "{said}"
+    );
+    assert_eq!(p.files(), before, "a file changed");
+}
+
+/// The positive twin: the same project and rule, a series whose names the rule
+/// accepts, is written, and the `validate` after it is clean.
+#[test]
+fn a_generated_name_an_error_rule_accepts_is_written() {
+    let p = Project::new("policy-accepted", "postgres");
+    p.declare("app.ev.yml", EVENTS);
+    p.naming_table("error", MONTHLY);
+    let before = p.read("app.ev.yml");
+
+    let o = p.extend("app.ev", "1month", "2027-02-01");
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_ne!(p.read("app.ev.yml"), before);
+    let v = p.run(&["validate"]);
+    assert_eq!(code(&v), 0, "{}{}", stdout(&v), stderr(&v));
+}
+
+/// A finding the tree already had is not this change's: it does not block the
+/// command, and it is not named as if the series had caused it. A finding the
+/// series does add still refuses, beside it.
+#[test]
+fn an_error_finding_the_tree_already_had_does_not_block_the_command() {
+    let p = Project::new("policy-existing", "postgres");
+    p.declare("app.ev.yml", EVENTS);
+    // `ev_rest` already breaks this one, and the monthly names do not.
+    p.naming_table("error", "^ev(_[0-9]{4}_[0-9]{2})?$");
+    let v = p.run(&["validate"]);
+    assert_ne!(code(&v), 0, "the tree already has the finding");
+    assert!(stderr(&v).contains("ev_rest"), "{}", stderr(&v));
+
+    // Daily names add findings of their own: refused, and `ev_rest` is not
+    // among those named.
+    let before = p.files();
+    let o = p.extend("app.ev", "1day", "2026-12-03");
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("ev_2026_12_01") && !stderr(&o).contains("ev_rest"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(p.files(), before);
+
+    // Monthly names add none: written, and `validate` still names only the
+    // finding it had.
+    let o = p.extend("app.ev", "1month", "2027-02-01");
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_ne!(p.files(), before);
+    let v = p.run(&["validate"]);
+    assert_ne!(code(&v), 0);
+    assert!(
+        stderr(&v).contains("ev_rest") && !stderr(&v).contains("ev_2026_12"),
+        "{}",
+        stderr(&v)
+    );
+}
+
+/// A rule below `error` is advice, as it is for `validate`, which prints it
+/// beside a valid project.
+#[test]
+fn a_rule_below_error_does_not_block_the_command() {
+    let p = Project::new("policy-warning", "postgres");
+    p.declare("app.ev.yml", EVENTS);
+    p.naming_table("warning", MONTHLY);
+
+    let o = p.extend("app.ev", "1day", "2026-12-03");
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let v = p.run(&["validate"]);
+    assert_eq!(code(&v), 0, "{}{}", stdout(&v), stderr(&v));
+    assert!(stderr(&v).contains("ev_2026_12_01"), "{}", stderr(&v));
 }
 
 /// SQL Server has no RANGE partitions: refused by name, nothing written.
