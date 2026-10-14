@@ -382,7 +382,22 @@ impl Cx<'_> {
                 let owner = self.table(&column.table)?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 let key = ColumnKey::Recorded(Recorded(uid.clone()));
-                self.removes(Resource::Column(ObjectKey::Column(key)));
+                self.removes(Resource::Column(ObjectKey::Column(key.clone())));
+                // What the column owns goes with it: its default, and its
+                // NOT NULL.
+                if let Some((_, was)) = self.base_of(&owner)
+                    && let Some(base) = was.columns.get(&column.name)
+                {
+                    if has_expression(&base.value_source) {
+                        self.removes(Resource::Object(
+                            ObjectKey::Default(key.clone()),
+                            Incarnation::Base,
+                        ));
+                    }
+                    if !base.nullable {
+                        self.removes(Resource::Object(Self::not_null(key), Incarnation::Base));
+                    }
+                }
                 self.requires_dependents_of_column_gone(&owner, &column.name);
             }
             Change::RenameColumn { uid, table, .. } => {

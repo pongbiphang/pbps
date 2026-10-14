@@ -5265,7 +5265,8 @@ index only when the target is usable in the baseline as it is and the plan
 leaves it as it is, which is the differ's own test for switching early. A row
 waits only for a foreign key that stands throughout, since one the plan adds
 is installed after the rows it checks, and names a parent row only through the
-referenced primary key.
+referenced primary key. A dropped column ends what it
+owns, its default and its NOT NULL.
 
 <a id="dec-1954-2"></a>
 

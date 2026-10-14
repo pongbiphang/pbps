@@ -1508,3 +1508,44 @@ fn a_report_that_cannot_be_written_is_an_error_and_not_an_empty_report() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nb\n");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_dropped_column_takes_its_default_with_it_so_a_later_insert_is_valid() {
+    use pbps_model::ValueSource;
+    let mut was = table_with(&["id"]);
+    let mut d = Column::new(int());
+    d.value_source = ValueSource::Default("1".into());
+    was.columns.insert("d".into(), d);
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), was);
+    after.tables.insert(t("t"), table_with(&["id"]));
+    let insert = p(Change::InsertRow {
+        table: t("t"),
+        key_column: "id".into(),
+        identity_key: false,
+        key: RowKey::from("1"),
+        row: [("id".to_owned(), Value::Int(1))]
+            .into_iter()
+            .collect::<Row>(),
+        defaults: Default::default(),
+        types: Default::default(),
+    });
+    let plan = Plan {
+        logical: vec![
+            p(Change::DropColumn {
+                uid: uid(UidKind::Column, "t.d"),
+                column: t("t").column("d"),
+            }),
+            insert,
+        ],
+        before,
+        after,
+        before_ids: Plan::ids(&["t"], &[("t", "id"), ("t", "d")]),
+        after_ids: Plan::ids(&["t"], &[("t", "id")]),
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    // Negative: the insert before the drop would take the column's default.
+    assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+}
