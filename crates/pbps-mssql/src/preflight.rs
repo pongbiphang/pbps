@@ -50,7 +50,25 @@ pub fn probes(plan_names: &PlanNames<'_>) -> Preflight {
     let facts = PlanFacts::of(plan_names);
     let mut report = Preflight::default();
     for (step, p) in plan_names.changes().iter().enumerate() {
-        let names = LazyCell::new(|| AsStored::of(facts.before(step)));
+        let names = LazyCell::new(|| {
+            let mut names = AsStored::of(facts.before(step));
+            // The current DELETE removes its target's earlier writes as well
+            // as its stored self-reference (DEC-1977.1).
+            if let Change::DeleteRow {
+                table,
+                key_column,
+                key,
+                ..
+            } = &p.change
+            {
+                names
+                    .moved
+                    .entry(table.clone())
+                    .or_default()
+                    .delete(key_column, key);
+            }
+            names
+        });
         match build(&p.change, &names, &mut report.unchecked) {
             Ok(probes) => report.probes.extend(probes),
             Err(error) => report
@@ -1107,16 +1125,6 @@ fn delete_probe(
     } else {
         format!("CASE {} ELSE N'' END", exclusions.join(" "))
     };
-    // The statement removes its target's self-reference at the same time.
-    // This is the current DELETE's effect, not a later plan mutation.
-    let exclusion = format!(
-        "{exclusion} + CASE WHEN fk.parent_object_id = fk.referenced_object_id THEN {} ELSE N'' END",
-        literal(&format!(
-            " AND ch.{} NOT IN ({})",
-            quote(&stored.name)?,
-            literal(key.as_str())
-        ))
-    );
     let arrival = if arrivals.is_empty() {
         "N''".to_owned()
     } else {
@@ -4117,7 +4125,7 @@ mod tests {
         // row pointing at itself is gone with the delete, not orphaned by it.
         assert!(
             sql.contains(
-                "WHEN fk.parent_object_id = fk.referenced_object_id THEN N' AND ch.[code] NOT IN (N''old'')'"
+                "WHEN s.name = N'dbo' AND t.name = N'status' THEN N' AND ch.[code] NOT IN (N''old'')'"
             ),
             "{sql}"
         );

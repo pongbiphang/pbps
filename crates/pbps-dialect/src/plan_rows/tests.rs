@@ -202,6 +202,37 @@ fn deleting_and_updating_one_key_excludes_it_once_and_keeps_unknowns_visible() {
 }
 
 #[test]
+fn a_deleted_row_cannot_arrive_again_from_its_earlier_writes() {
+    let mut rows = RowWrites::<&str>::default();
+    let gone = RowKey("gone".into());
+    let kept = RowKey("kept".into());
+    for row in [&gone, &kept] {
+        rows.insert(row, "known", Some("1"));
+        rows.update(row, "unknown", None);
+        rows.typed.insert(row.clone(), ["known".into()].into());
+        rows.held_null
+            .insert(row.clone(), ["sibling".into()].into());
+    }
+    rows.insert(&gone, "gone_only", None);
+    rows.delete("id", &gone);
+    assert_eq!(rows.key_column, "id");
+    assert_eq!(rows.deleted, [gone.clone()].into());
+    assert_eq!(rows.inserted.keys().collect::<Vec<_>>(), [&kept]);
+    assert_eq!(rows.updated.keys().collect::<Vec<_>>(), [&kept]);
+    assert_eq!(rows.typed.keys().collect::<Vec<_>>(), [&kept]);
+    assert_eq!(rows.held_null.keys().collect::<Vec<_>>(), [&kept]);
+    assert_eq!(
+        rows.unprobeable,
+        [("unknown".into(), [kept.clone()].into())].into()
+    );
+    assert!(rows.has_writes());
+    rows.delete("id", &kept);
+    assert!(!rows.has_writes());
+    assert!(rows.unprobeable.is_empty());
+    assert_eq!(rows.gone_keys(&[]), [&gone, &kept].into());
+}
+
+#[test]
 fn null_evidence_stays_with_its_row_and_uses_the_callers_interpretation() {
     let mut rows = RowWrites::<&str>::default();
     let first = RowKey("1".into());
@@ -323,4 +354,7 @@ fn row_projection_preserves_unknown_assignments_and_excludes_future_deletes() {
     let whole = facts.end().writes(render, null);
     assert_eq!(whole[&table("a")].deleted, [key.clone()].into());
     assert_eq!(whole[&table("a")].gone_keys(&["fk".into()]), [&key].into());
+    assert!(!whole[&table("a")].has_writes());
+    assert!(whole[&table("a")].unprobeable.is_empty());
+    assert!(whole[&table("a")].held_null.is_empty());
 }
