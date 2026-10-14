@@ -534,6 +534,19 @@ pub fn identity_seed_range(ty: &ColumnType, increment: i64) -> Option<RangeInclu
     })
 }
 
+/// The range a sequence's start must lie in (#1921, DEC-1921.1): the
+/// engine's default bounds for the type and direction
+/// ([`identity_seed_range`]), narrowed or widened by any bound the
+/// declaration sets.
+pub fn sequence_range(
+    ty: &ColumnType,
+    increment: i64,
+    options: &pbps_model::SequenceOptions,
+) -> Option<RangeInclusive<i64>> {
+    let default = identity_seed_range(ty, increment)?;
+    Some(options.min.unwrap_or(*default.start())..=options.max.unwrap_or(*default.end()))
+}
+
 // ---------------------------------------------------------------------------
 // Risk
 // ---------------------------------------------------------------------------

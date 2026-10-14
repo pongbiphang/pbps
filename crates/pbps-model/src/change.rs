@@ -138,7 +138,7 @@ impl RiskClass {
                 "access widens: a role can do more than before, which the merge request should have reviewed"
             }
             RiskClass::Numbering => {
-                "how the column is numbered changes: an insert that supplies its own value, calls the old sequence by name, or leaves the column to a source now gone fails"
+                "how the column is numbered changes: an insert that supplies its own value, calls the old sequence by name, or leaves the column to a source now gone fails, or one fails sooner because the numbers now end earlier"
             }
         }
     }
@@ -2608,7 +2608,27 @@ impl Change {
                     && !matches!(from, ValueSource::Identity(_));
                 let identity_loosened = matches!(from, ValueSource::Identity(_))
                     && matches!(to, ValueSource::Sequence(_));
-                if removed || identity_added || identity_loosened {
+                // A kept source retuned to end sooner: the bound it counts
+                // toward set or tightened, or its cycle turned off. A writer
+                // working today then fails when the numbers run out, where
+                // before it went on (#1921, DEC-1921.1).
+                let ends_sooner = match (from, to) {
+                    (ValueSource::Identity(was), ValueSource::Identity(now)) => now
+                        .options
+                        .ends_sooner_than(&was.options, now.increment),
+                    (ValueSource::Sequence(was), ValueSource::Sequence(now)) => now
+                        .options
+                        .ends_sooner_than(&was.options, now.increment),
+                    (
+                        ValueSource::None
+                        | ValueSource::Default(_)
+                        | ValueSource::Generated(_)
+                        | ValueSource::Identity(_)
+                        | ValueSource::Sequence(_),
+                        _,
+                    ) => false,
+                };
+                if removed || identity_added || identity_loosened || ends_sooner {
                     r.insert(RiskClass::Numbering);
                 }
                 // A sequence renamed is reached from its default by oid, but
@@ -3206,6 +3226,7 @@ mod tests {
                 crate::ValueSource::Identity(crate::schema::Identity {
                     seed: 1,
                     increment: 1,
+                    options: Default::default(),
                 })
             } else {
                 default.map_or(crate::ValueSource::None, |text| {

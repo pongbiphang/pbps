@@ -10562,6 +10562,7 @@ mod tests {
                 start,
                 increment: 1,
                 name: name.map(str::to_owned),
+                options: Default::default(),
             })
         };
         let numbering = |from, to| {
@@ -10579,6 +10580,7 @@ mod tests {
             pbps_model::ValueSource::Identity(pbps_model::Identity {
                 seed: 1,
                 increment: 1,
+                options: Default::default(),
             }),
         ] {
             refused(
@@ -12666,7 +12668,13 @@ mod tests {
     #[test]
     fn a_numbering_change_is_held_to_the_source_it_gives() {
         use pbps_model::{Identity, ValueSource};
-        let identity = |seed, increment| ValueSource::Identity(Identity { seed, increment });
+        let identity = |seed, increment| {
+            ValueSource::Identity(Identity {
+                seed,
+                increment,
+                options: Default::default(),
+            })
+        };
         let schema = |source: ValueSource| {
             let mut c = pbps_model::Column::new("integer".parse().unwrap()).not_null();
             c.value_source = source;
@@ -12717,6 +12725,7 @@ mod tests {
                 start,
                 increment: 1,
                 name: (!name.is_empty()).then(|| name.to_owned()),
+                options: Default::default(),
             })
         };
         let unnamed = changes(vec![pbps_model::Change::AlterColumnNumbering {
@@ -13408,6 +13417,7 @@ mod tests {
                 start,
                 increment: 1,
                 name: name.map(str::to_owned),
+                options: Default::default(),
             });
             c
         };
@@ -16495,6 +16505,7 @@ mod tests {
                 c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                     seed: 1,
                     increment: 1,
+                    options: Default::default(),
                 })
             },
             &|c: &mut pbps_model::Column| {
@@ -16934,6 +16945,7 @@ mod tests {
             .value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         let e = refuse_unplanned_movement(
             &pbps_mssql::Mssql,

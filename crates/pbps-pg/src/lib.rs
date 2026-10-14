@@ -257,7 +257,14 @@ fn identity_problems(
         dialect: "postgres",
         message,
     };
-    match types::identity_seed_range(&declared.ty, identity.increment) {
+    found.extend(options_problems(
+        column,
+        "its `identity:`",
+        &declared.ty,
+        identity.increment,
+        &identity.options,
+    ));
+    match types::sequence_range(&declared.ty, identity.increment, &identity.options) {
         None => found.push(invalid(format!(
             "column `{column}` has an `identity:` on `{}`. This engine says it in so many words: \
              identity column type must be smallint, integer, or bigint. A `numeric` is refused \
@@ -333,7 +340,14 @@ fn sequence_problems(
         message,
     };
     let mut found = Vec::new();
-    match types::identity_seed_range(&declared.ty, sequence.increment) {
+    found.extend(options_problems(
+        column,
+        "its sequence",
+        &declared.ty,
+        sequence.increment,
+        &sequence.options,
+    ));
+    match types::sequence_range(&declared.ty, sequence.increment, &sequence.options) {
         None => found.push(invalid(format!(
             "column `{column}` has an owned sequence on `{}`; a `serial` column is a smallint, \
              an integer or a bigint",
@@ -405,6 +419,108 @@ fn sequence_problems(
         }
     }
     found
+}
+
+/// What the engine refuses, or this model would not read back the same, in
+/// a sequence's bounds, cycle and cache (#1921, DEC-1921.1): a bound outside
+/// the type, a bound spelled as its own default (read back as none, so the
+/// next plan would differ), bounds that cross, and a cache below one.
+fn options_problems(
+    column: &str,
+    what: &str,
+    ty: &pbps_model::ColumnType,
+    increment: i64,
+    options: &pbps_model::SequenceOptions,
+) -> Vec<DialectError> {
+    let invalid = |message: String| DialectError::Invalid {
+        dialect: types::DIALECT,
+        message,
+    };
+    let mut found = Vec::new();
+    let (Some(held), Some(default)) = (
+        types::identity_range(ty),
+        types::identity_seed_range(ty, increment),
+    ) else {
+        // The type itself is refused by the caller.
+        return found;
+    };
+    for (name, value, own) in [
+        ("min", options.min, *default.start()),
+        ("max", options.max, *default.end()),
+    ] {
+        let Some(value) = value else { continue };
+        if !held.contains(&value) {
+            found.push(invalid(format!(
+                "column `{column}`: {what} has `{name}: {value}`, outside `{ty}`'s \
+                 {}..={}: the engine refuses it",
+                held.start(),
+                held.end()
+            )));
+        } else if value == own {
+            found.push(invalid(format!(
+                "column `{column}`: {what} has `{name}: {value}`, which is already the \
+                 engine's {name} for `{ty}` counting by {increment}; leave out `{name}:`"
+            )));
+        }
+    }
+    let low = options.min.unwrap_or(*default.start());
+    let high = options.max.unwrap_or(*default.end());
+    if low >= high {
+        found.push(invalid(format!(
+            "column `{column}`: {what} runs {low}..={high}, and its minimum must be below its \
+             maximum: the engine refuses MINVALUE ({low}) must be less than MAXVALUE ({high})"
+        )));
+    }
+    if let Some(cache) = options.cache {
+        if cache < 1 {
+            found.push(invalid(format!(
+                "column `{column}`: {what} has `cache: {cache}`, and a cache holds at least \
+                 one number: the engine refuses CACHE ({cache}) must be greater than zero"
+            )));
+        } else if cache == 1 {
+            found.push(invalid(format!(
+                "column `{column}`: {what} has `cache: 1`, which is already the engine's; \
+                 leave out `cache:`"
+            )));
+        }
+    }
+    found
+}
+
+/// A numbering column whose sequence cycles, under a primary key, a unique
+/// constraint or a unique index, refused by name (#1921, DEC-1921.1): once
+/// it wraps it hands out a number a row already holds, and the insert fails
+/// on that key.
+fn cycle_problems(table: &Table, column: &str) -> Vec<DialectError> {
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(pk) = &table.primary_key
+        && pk.columns.iter().any(|c| c == column)
+    {
+        keys.push(match &pk.name {
+            Some(name) => format!("primary key `{name}`"),
+            None => "the primary key".to_owned(),
+        });
+    }
+    for (name, unique) in &table.unique {
+        if unique.columns.iter().any(|c| c == column) {
+            keys.push(format!("unique constraint `{name}`"));
+        }
+    }
+    for (name, index) in &table.indexes {
+        if index.unique && index.columns.iter().any(|c| c.key.column() == Some(column)) {
+            keys.push(format!("unique index `{name}`"));
+        }
+    }
+    keys.into_iter()
+        .map(|key| DialectError::Invalid {
+            dialect: types::DIALECT,
+            message: format!(
+                "column `{column}` has `cycle: true` and is under {key}: once its sequence \
+                 wraps it hands out a number a row already holds, and the insert fails on that \
+                 key. Leave out `cycle:`, or take the column out of the key"
+            ),
+        })
+        .collect()
 }
 
 /// The PostgreSQL dialect.
@@ -1214,6 +1330,9 @@ impl Dialect for Postgres {
                     }
                     pbps_model::ValueSource::Identity(identity) => {
                         found.extend(identity_problems(column_name, column, identity));
+                        if identity.options.cycle {
+                            found.extend(cycle_problems(table, column_name));
+                        }
                         if has_default {
                             found.push(invalid(format!(
                                 "column `{column_name}` has an `identity:` and a `default:`. The engine refuses both on one column, and the identity is the one that supplies the value."
@@ -1230,6 +1349,9 @@ impl Dialect for Postgres {
                             column,
                             sequence,
                         ));
+                        if sequence.options.cycle {
+                            found.extend(cycle_problems(table, column_name));
+                        }
                         if has_default {
                             found.push(invalid(format!(
                                 "column `{column_name}` is a `serial` and has a `default:`; its default is its sequence's `nextval`"
@@ -1884,6 +2006,7 @@ mod tests {
         i.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         parent.columns.insert("i".into(), i);
         parent
@@ -2128,6 +2251,7 @@ mod tests {
             c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                 seed: 1,
                 increment: 1,
+                options: Default::default(),
             });
             t.columns.insert("id".into(), c);
             t
@@ -2344,6 +2468,7 @@ mod tests {
         id.value_source = pbps_model::ValueSource::Identity(Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         t.columns.insert("id".into(), id);
         t.primary_key = Some(PrimaryKey {
@@ -2649,6 +2774,7 @@ mod tests {
                 start: 1,
                 increment: 1,
                 name: sequence.map(str::to_owned),
+                options: Default::default(),
             });
             let mut t = Table::default();
             t.columns.insert("n".into(), serial);
@@ -2683,6 +2809,7 @@ mod tests {
             c.value_source = pbps_model::ValueSource::Identity(Identity {
                 seed: 1,
                 increment: 1,
+                options: Default::default(),
             });
             c
         };
@@ -2691,6 +2818,7 @@ mod tests {
             start: 1,
             increment: 1,
             name: Some("u_id_seq".into()),
+            options: Default::default(),
         });
         let mut t = Table::default();
         t.columns.insert("a".into(), serial);
@@ -2756,6 +2884,7 @@ mod tests {
                 id.value_source = pbps_model::ValueSource::Identity(Identity {
                     seed: 1,
                     increment: 1,
+                    options: Default::default(),
                 });
             }
             t.columns.insert("id".into(), id);
@@ -2880,6 +3009,7 @@ mod tests {
                 id.value_source = pbps_model::ValueSource::Identity(Identity {
                     seed: 1,
                     increment: 1,
+                    options: Default::default(),
                 });
             }
             t.columns.insert("id".into(), id);
@@ -3018,6 +3148,7 @@ mod tests {
                 start: 1,
                 increment: 1,
                 name: name.map(str::to_owned),
+                options: Default::default(),
             });
             c
         };
@@ -3127,6 +3258,7 @@ mod tests {
                 id.value_source = ValueSource::Identity(Identity {
                     seed: 1,
                     increment: 1,
+                    options: Default::default(),
                 });
             }
             table.columns.insert("id".into(), id);
@@ -3389,11 +3521,13 @@ mod tests {
                 start,
                 increment,
                 name: name.map(str::to_owned),
+                options: Default::default(),
             })
         };
         let identity = ValueSource::Identity(Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         let none = ValueSource::None;
         for (from, to, risks) in [
@@ -3417,6 +3551,7 @@ mod tests {
                 ValueSource::Identity(Identity {
                     seed: 9,
                     increment: 3,
+                    options: Default::default(),
                 }),
                 identity.clone(),
                 vec![],
@@ -3523,6 +3658,7 @@ mod tests {
                         ValueSource::Identity(Identity {
                             seed: -1,
                             increment: -1,
+                            options: Default::default(),
                         }),
                     ),
                     &plain,
@@ -3610,6 +3746,7 @@ mod tests {
                     start: 1,
                     increment: 1,
                     name: Some((*sequence).to_owned()),
+                    options: Default::default(),
                 });
                 let mut t = Table::default();
                 t.columns.insert("id".into(), c);
@@ -3712,6 +3849,7 @@ mod tests {
         let identity = ValueSource::Identity(Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         // One statement, so no checkpoint falls inside it.
         let [converted] = emit(serial.clone(), identity.clone()).try_into().unwrap();
@@ -3733,6 +3871,7 @@ mod tests {
             ValueSource::Identity(Identity {
                 seed: -1,
                 increment: -1,
+                options: Default::default(),
             }),
         )
         .concat();
@@ -3747,6 +3886,7 @@ mod tests {
                     start: 5,
                     increment: 2,
                     name: None,
+                    options: Default::default(),
                 }),
             ),
             emit(
@@ -3754,6 +3894,7 @@ mod tests {
                 ValueSource::Identity(Identity {
                     seed: 5,
                     increment: 2,
+                    options: Default::default(),
                 }),
             ),
         ] {
@@ -5090,6 +5231,7 @@ mod tests {
             column.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                 seed: 1,
                 increment: 1,
+                options: Default::default(),
             });
             table.columns.insert("id".to_owned(), column);
             let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
@@ -5160,6 +5302,7 @@ mod tests {
                 Some(pbps_model::ValueSource::Identity(pbps_model::Identity {
                     seed: 1,
                     increment: 1,
+                    options: Default::default(),
                 })),
                 "both an identity and a generated column",
             ),
@@ -5190,6 +5333,7 @@ mod tests {
         column.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 0,
+            options: Default::default(),
         });
         table.columns.insert("id".to_owned(), column.clone());
         // A second identity column, which this engine takes: it must not add a
@@ -5200,6 +5344,7 @@ mod tests {
             c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                 seed: 1,
                 increment: 1,
+                options: Default::default(),
             });
             c
         });
@@ -5238,6 +5383,7 @@ mod tests {
                 start: 1,
                 increment: 1,
                 name: name.map(str::to_owned),
+                options: Default::default(),
             });
             c
         };
@@ -5327,6 +5473,297 @@ mod tests {
         }
     }
 
+    /// A sequence's bounds, cycle and cache are held to what the engine takes
+    /// and reads back the same (#1921, DEC-1921.1): a bound inside the type,
+    /// not spelled as its own default, bounds that do not cross, a start
+    /// between them, and a cache of at least two. A bound the declaration
+    /// moves widens where a start may be, as the engine's own does. SQL
+    /// Server's refusal is pinned beside its own validation.
+    #[test]
+    fn sequence_options_the_engine_refuses_or_reads_back_otherwise_are_refused() {
+        use pbps_model::{Identity, OwnedSequence, SequenceOptions, ValueSource};
+        let t: TableName = "app.t".parse().unwrap();
+        let found = |source: ValueSource| {
+            let mut c = pbps_model::Column::new(ty("integer")).not_null();
+            c.value_source = source;
+            let mut table = Table::default();
+            table.columns.insert("id".to_owned(), c);
+            Postgres::new()
+                .validate_table(&t, &table)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        let identity = |seed, increment, options| {
+            ValueSource::Identity(Identity {
+                seed,
+                increment,
+                options,
+            })
+        };
+        let serial = |start, increment, options| {
+            ValueSource::Sequence(OwnedSequence {
+                start,
+                increment,
+                name: None,
+                options,
+            })
+        };
+        let o = |min, max, cycle, cache| SequenceOptions {
+            min,
+            max,
+            cycle,
+            cache,
+        };
+        // Negative: each option the engine takes, and a start a lowered
+        // minimum admits, are accepted on both kinds.
+        for options in [
+            o(Some(-5), Some(100), true, Some(20)),
+            o(None, Some(1000), false, None),
+            o(Some(0), None, false, Some(2)),
+        ] {
+            assert_eq!(
+                found(identity(0.max(options.min.unwrap_or(1)), 1, options)),
+                Vec::<String>::new()
+            );
+            assert_eq!(
+                found(serial(0.max(options.min.unwrap_or(1)), 1, options)),
+                Vec::<String>::new()
+            );
+        }
+        assert_eq!(
+            found(identity(0, 1, o(Some(-5), None, false, None))),
+            Vec::<String>::new()
+        );
+        // Counting down, the minimum is the bound it counts toward.
+        assert_eq!(
+            found(serial(-1, -1, o(Some(-100), None, false, None))),
+            Vec::<String>::new()
+        );
+        for (source, says) in [
+            (
+                identity(1, 1, o(None, Some(i64::MAX), false, None)),
+                "outside `integer`",
+            ),
+            (
+                serial(1, 1, o(Some(i64::MIN), None, false, None)),
+                "outside `integer`",
+            ),
+            (
+                identity(1, 1, o(None, Some(2147483647), false, None)),
+                "leave out `max:`",
+            ),
+            (
+                serial(1, 1, o(Some(1), None, false, None)),
+                "leave out `min:`",
+            ),
+            (
+                serial(-1, -1, o(None, Some(-1), false, None)),
+                "leave out `max:`",
+            ),
+            (
+                identity(5, 1, o(Some(5), Some(5), false, None)),
+                "must be below its maximum",
+            ),
+            (
+                serial(10, 1, o(Some(20), Some(10), false, None)),
+                "must be below its maximum",
+            ),
+            (identity(1, 1, o(None, None, false, Some(0))), "CACHE (0)"),
+            (
+                serial(1, 1, o(None, None, false, Some(1))),
+                "leave out `cache:`",
+            ),
+            // A start outside the bounds the declaration sets.
+            (identity(500, 1, o(None, Some(100), false, None)), "500"),
+            (serial(1, 1, o(Some(5), None, false, None)), "starts at 1"),
+        ] {
+            let refused = found(source.clone());
+            assert!(
+                refused.iter().any(|m| m.contains(says)),
+                "{source:?}: {refused:?}"
+            );
+        }
+    }
+
+    /// A sequence that cycles hands out, once it wraps, a number a row
+    /// already holds, so on a column under a primary key, a unique
+    /// constraint or a unique index it is refused, naming the key (#1921,
+    /// DEC-1921.1). The same sequence on a column under no key is accepted.
+    #[test]
+    fn a_cycling_sequence_under_a_key_is_refused_naming_the_key() {
+        let t: TableName = "app.t".parse().unwrap();
+        let cycling = |kind: &str| {
+            let mut c = pbps_model::Column::new(ty("integer")).not_null();
+            let options = pbps_model::SequenceOptions {
+                max: Some(100),
+                cycle: true,
+                ..Default::default()
+            };
+            c.value_source = if kind == "identity" {
+                pbps_model::ValueSource::Identity(pbps_model::Identity {
+                    seed: 1,
+                    increment: 1,
+                    options,
+                })
+            } else {
+                pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                    options,
+                    ..pbps_model::OwnedSequence::serial()
+                })
+            };
+            c
+        };
+        let found = |table: &Table| {
+            Postgres::new()
+                .validate_table(&t, table)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        for kind in ["identity", "serial"] {
+            let mut table = Table::default();
+            table.columns.insert("id".to_owned(), cycling(kind));
+            table
+                .columns
+                .insert("v".to_owned(), pbps_model::Column::new(ty("integer")));
+            assert_eq!(found(&table), Vec::<String>::new(), "{kind} under no key");
+
+            let mut keyed = table.clone();
+            keyed.primary_key = Some(pbps_model::PrimaryKey {
+                name: Some("t_pkey".into()),
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            });
+            let refused = found(&keyed);
+            assert!(
+                refused.iter().any(|m| m.contains("primary key `t_pkey`")),
+                "{kind}: {refused:?}"
+            );
+
+            let mut unique = table.clone();
+            unique.unique.insert(
+                "t_id_v".into(),
+                pbps_model::UniqueConstraint {
+                    columns: vec!["v".into(), "id".into()],
+                    storage_parameters: Default::default(),
+                },
+            );
+            let refused = found(&unique);
+            assert!(
+                refused
+                    .iter()
+                    .any(|m| m.contains("unique constraint `t_id_v`")),
+                "{kind}: {refused:?}"
+            );
+        }
+    }
+
+    /// A kept source retuned is gated as `numbering` only where its numbers
+    /// end sooner, making a writer fail where it went on before (#1921,
+    /// DEC-1921.1): the bound it counts toward set or lowered (raised,
+    /// counting down), or its cycle turned off. A bound raised or removed, a
+    /// cycle turned on, and a cache changed are not.
+    #[test]
+    fn a_retune_is_gated_only_where_its_numbers_end_sooner() {
+        use pbps_model::{
+            Change, Hints, Identity, IdsFile, OwnedSequence, RiskClass, Schema, SequenceOptions,
+            TableName, ValueSource,
+        };
+        let o = |min, max, cycle, cache| SequenceOptions {
+            min,
+            max,
+            cycle,
+            cache,
+        };
+        let schema = |source: ValueSource| {
+            let mut c = pbps_model::Column::new(ty("integer")).not_null();
+            c.value_source = source;
+            let mut table = Table::default();
+            table.columns.insert("id".into(), c);
+            let mut s = Schema::default();
+            s.tables.insert(TableName::new("app", "t"), table);
+            s
+        };
+        let context = pbps_diff::Context {
+            operator: "test".into(),
+            today: "2026-10-15".into(),
+        };
+        let gated = |from: ValueSource, to: ValueSource| {
+            let base = schema(from);
+            let declared = schema(to);
+            let ids = pbps_diff::resolve(&base, &IdsFile::default(), &[], &context)
+                .unwrap()
+                .ids;
+            let cs = pbps_diff::diff(
+                pbps_diff::Side {
+                    schema: &base,
+                    ids: &ids,
+                },
+                pbps_diff::Side {
+                    schema: &declared,
+                    ids: &ids,
+                },
+                &super::Postgres::new(),
+                &Hints::default(),
+            )
+            .unwrap();
+            assert_eq!(cs.changes.len(), 1, "{cs:?}");
+            assert!(matches!(
+                cs.changes[0].change,
+                Change::AlterColumnNumbering { .. }
+            ));
+            cs.changes[0].risks.contains(&RiskClass::Numbering)
+        };
+        let up = |options| {
+            ValueSource::Identity(Identity {
+                seed: 1,
+                increment: 1,
+                options,
+            })
+        };
+        let down = |options| {
+            ValueSource::Sequence(OwnedSequence {
+                start: -1,
+                increment: -1,
+                name: None,
+                options,
+            })
+        };
+        let none = o(None, None, false, None);
+        for (from, to, expected) in [
+            (up(none), up(o(None, Some(100), false, None)), true),
+            (
+                up(o(None, Some(100), false, None)),
+                up(o(None, Some(50), false, None)),
+                true,
+            ),
+            (
+                up(o(None, Some(100), true, None)),
+                up(o(None, Some(100), false, None)),
+                true,
+            ),
+            (down(none), down(o(Some(-100), None, false, None)), true),
+            // Negative: each change that ends no sooner.
+            (
+                up(o(None, Some(100), false, None)),
+                up(o(None, Some(500), false, None)),
+                false,
+            ),
+            (up(o(None, Some(100), false, None)), up(none), false),
+            (up(none), up(o(None, None, true, None)), false),
+            (up(none), up(o(None, None, false, Some(50))), false),
+            (up(none), up(o(Some(-10), None, false, None)), false),
+            (down(none), down(o(None, Some(-5), false, None)), false),
+        ] {
+            assert_eq!(
+                gated(from.clone(), to.clone()),
+                expected,
+                "{from:?} -> {to:?}"
+            );
+        }
+    }
+
     /// A `serial`'s sequence is `AS` the column's type with an identity's
     /// bounds, so its start and increment are held to the same ranges, and a
     /// type no serial stands for is refused (#1631).
@@ -5339,6 +5776,7 @@ mod tests {
                 start,
                 increment,
                 name: None,
+                options: Default::default(),
             });
             let mut table = Table::default();
             table.columns.insert("id".to_owned(), c);
@@ -5380,8 +5818,11 @@ mod tests {
             let mut table = Table::default();
             let mut column = pbps_model::Column::new(ty(declared));
             column.nullable = false;
-            column.value_source =
-                pbps_model::ValueSource::Identity(pbps_model::Identity { seed, increment });
+            column.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
+                seed,
+                increment,
+                options: Default::default(),
+            });
             table.columns.insert("id".to_owned(), column);
             let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
             assert_eq!(
@@ -5420,8 +5861,11 @@ mod tests {
             let mut table = Table::default();
             let mut column = pbps_model::Column::new(ty(declared));
             column.nullable = false;
-            column.value_source =
-                pbps_model::ValueSource::Identity(pbps_model::Identity { seed, increment });
+            column.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
+                seed,
+                increment,
+                options: Default::default(),
+            });
             table.columns.insert("id".into(), column);
             let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
             assert_eq!(

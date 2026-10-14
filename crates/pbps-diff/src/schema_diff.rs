@@ -6601,6 +6601,7 @@ mod tests {
                 c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                     seed: 1,
                     increment: 1,
+                    options: Default::default(),
                 });
             }
             t.columns.insert(name.to_owned(), c);
@@ -6657,6 +6658,7 @@ mod tests {
                 c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                     seed: 1,
                     increment: 1,
+                    options: Default::default(),
                 });
             }
             t.columns.insert(name.to_owned(), c);
@@ -9080,6 +9082,7 @@ mod tests {
                     c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                         seed: 1,
                         increment: 1,
+                        options: Default::default(),
                     });
                     p.columns.insert("seq".into(), c);
                 },
@@ -13107,6 +13110,7 @@ mod tests {
         seq.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         base_t.columns.insert("seq".to_owned(), seq);
         base_t
@@ -18839,6 +18843,7 @@ mod tests {
                 start,
                 increment: 1,
                 name: None,
+                options: Default::default(),
             });
             c
         };
@@ -18928,6 +18933,7 @@ mod tests {
         c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         let want = schema_of("dbo.t", table(&[("a", c)]));
 
@@ -19236,6 +19242,7 @@ mod tests {
         identity_changed.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         let mut not_null = Column::new(ty("int"));
         not_null.nullable = false;

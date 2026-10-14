@@ -2091,6 +2091,7 @@ mod tests {
             Some(pbps_model::Identity {
                 seed: 1,
                 increment: 1,
+                options: Default::default(),
             }),
         ] {
             let mut column = pbps_model::Column::new(ty("integer"));

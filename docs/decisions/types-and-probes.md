@@ -1791,9 +1791,9 @@ Measured on 16.15 and 18.6:
   partitioned (a partition
   carries its own copy of the parent's default, so the parent's sequence is
   called twice; #1893). Anything else,
-  a shared sequence, one the column does not own, a cache, bounds, a cycle or
-  another schema, stays the raw default it is, with the sequence named, as
-  before.
+  a shared sequence, one the column does not own, or another schema, stays
+  the raw default it is, with the sequence named, as before. A cache, bounds
+  and a cycle were named too, and are held since DEC-1921.1.
 - `ADD COLUMN` with a `nextval` default rewrites the table and numbers the
   stored rows from the sequence's start by its increment. The emitter creates
   the sequence by name with `START WITH` and `INCREMENT BY` first, then the
@@ -2093,8 +2093,9 @@ a sequence that outlives the statement: a `nextval` walks past any lock, an
 allocation cannot be recalled, an advance survives a rollback. Here the
 table is locked `ACCESS EXCLUSIVE` first, so every value read is in the
 table or rolled back, and the sequence moved is always one the block itself
-created, so a rollback takes the move with it. No `CYCLE` sequence is held
-(DEC-1631.1).
+created, so a rollback takes the move with it. A sequence that cycles is
+held since DEC-1921.1, but never under a key, so its wrap cannot reach a
+value the block continued past.
 
 **The plan text does not depend on the data.** The block computes the
 continuation at apply time, so an offline `plan` and `plan --db` give the
@@ -2177,11 +2178,86 @@ is (DEC-1631.1).
 **Refused, each by name:** a numbering change on a partitioned table or a
 partition, whose partitions each carry their parent's source (#1681, #1893);
 an owned sequence put on an `UNLOGGED` table, since it is created logged
-(DEC-1631.1); a nullable identity or `serial`, by validation; and a
-sequence's min, max, cycle or cache, which stay named limitations (#1921).
+(DEC-1631.1); and a nullable identity or `serial`, by validation. A
+sequence's min, max, cycle and cache, named limitations here, are held since
+DEC-1921.1.
 
 The live `numbering_sources_change_in_place_and_continue_past_the_rows`
 pins every kind on 16 and 18, the continuation from values, from a
 conversion's counter and counting down, the gate, and the cost report;
 `a_serial_added_to_another_roles_table_is_that_roles` pins the owner and
 the operators.
+
+<a id="dec-1921-1"></a>
+
+**DEC-1921.1. A PostgreSQL identity's or owned sequence's bounds, cycle and
+cache are declared, read back and changed in place, and only a change that
+ends the numbers sooner is gated (#1921).**
+
+Amends DEC-1631.1 and DEC-1889.1, which left them named limitations: a
+column whose sequence had any of them pulled as a raw default, or as an
+identity that read back with the engine's defaults, and could not be
+declared at all.
+
+**Declared.** `identity:` takes the `[seed, increment]` pair or a mapping
+`{seed, increment, min, max, cycle, cache}`; a `serial`'s `sequence:` takes
+`min`, `max`, `cycle` and `cache` beside `start`, `increment` and `name`.
+The pair stays the spelling of an identity with none of them, and the
+writer keeps it. Each option left out is the engine's own, so the model
+holds `None`, not a number: measured on 16 and 18, a retype moves a default
+bound with the type and keeps an explicit one, which `None` reproduces and a
+stored number would not. Spelling the default (`min: 1` counting up, a
+`cache: 1`) is refused with "leave out", so one sequence has one
+declaration and a pull of it plans to nothing.
+
+**Validated** against what the engine refuses or reads back otherwise: a
+bound outside the type, bounds that do not cross (`min < max`), a start
+outside the declared bounds (the engine's `START value … cannot be less than
+MINVALUE`, against the bounds the declaration sets rather than the type's),
+and a cache below 2. **A cycle under a key is refused,** naming the primary
+key, unique constraint or unique index: measured, once a cycling sequence
+wraps, the next insert fails as a duplicate key, so on a key a cycle only
+trades "reached maximum value" for a later and less clear failure. On a
+column under no key it is accepted. SQL Server's `IDENTITY` has only a seed
+and an increment, and refuses every option by name.
+
+**Changed in place.** A create, an added column and a source put on write
+the options into the `CREATE SEQUENCE` or the identity clause. A retune
+writes only the options that change, a returning one as `NO MINVALUE`, `NO
+MAXVALUE`, `NO CYCLE` or `CACHE 1`, which measured reset each to the
+engine's own; a retune of start or increment alone reads as before. No new
+change kind, rank or pass: options travel on `CreateTable`, `AddColumn` and
+`AlterColumnNumbering` (#1776).
+
+**Gated** (maintainer, 2026-10-14) as `numbering` only where a writer
+working today fails sooner: the bound the sequence counts toward set or
+lowered (raised, counting down), or its cycle turned off. A bound raised or
+removed, the other bound, a cycle turned on, and a cache changed are not:
+none can fail an insert that succeeds now.
+
+**Probed.** Measured, the engine refuses a bound the counter is already
+past (`RESTART value (10) cannot be greater than MAXVALUE (5)`), mid-apply.
+The pre-flight counts a kept source whose bounds move with its counter
+outside them. `pg_sequence_last_value` answers NULL for a counter this
+session cannot read as for one never called, so the privilege is asked
+first and an unreadable counter counts as in the way (DECISIONS 335); one
+never called is at its start. A source put on now continues up to its
+declared bound, not the type's, and the values probe counts against that.
+Both read the counter or the values before apply, which no earlier change
+in a plan moves: a column has one numbering change, and no statement a plan
+runs before it calls the sequence.
+
+Plan format 40, state 24 and schema set 45 carry the options; an older
+build would read them and drop them.
+
+Pinned by `sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted`
+(live, 16 and 18: read back, created, put on and retuned, the gate, the
+counter probe, an unreadable counter, the engine's refusal, the next plan
+empty), `what_the_model_cannot_hold_is_named_and_never_silently_dropped`,
+`sequence_options_the_engine_refuses_or_reads_back_otherwise_are_refused`,
+`a_cycling_sequence_under_a_key_is_refused_naming_the_key`,
+`a_retune_is_gated_only_where_its_numbers_end_sooner`,
+`sequence_options_are_created_and_retuned_only_where_they_change`,
+`sequence_options_round_trip_and_an_identity_keeps_its_pair_without_them`,
+`an_identity_holds_its_sequences_bounds_cycle_and_cache` and
+`an_identity_with_sequence_options_is_refused_on_sql_server`.

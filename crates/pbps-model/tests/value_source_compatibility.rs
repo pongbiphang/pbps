@@ -36,6 +36,7 @@ fn artifacts() -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
                 column.value_source = pbps_model::ValueSource::Identity(Identity {
                     seed: -7,
                     increment: 3,
+                    options: Default::default(),
                 })
             }
             "generated" => {
@@ -236,6 +237,7 @@ fn a_serial_source_round_trips_in_its_own_field() {
         start: 100,
         increment: 5,
         name: None,
+        options: Default::default(),
     });
     let text = serde_json::to_string(&column).unwrap();
     assert_eq!(

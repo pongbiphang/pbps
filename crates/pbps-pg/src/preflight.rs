@@ -2931,6 +2931,32 @@ fn reads_recomputed<'v, 'p: 'v>(
     }
 }
 
+/// The increment and options of a kept numbering source whose bounds the
+/// change moves (#1921): an identity still an identity, or a sequence still
+/// a sequence, with another `min` or `max`. `None` for anything else.
+fn moved_bounds(
+    from: &ValueSource,
+    to: &ValueSource,
+) -> Option<(i64, pbps_model::SequenceOptions)> {
+    let (was, now, increment) = match (from, to) {
+        (ValueSource::Identity(was), ValueSource::Identity(now)) => {
+            (was.options, now.options, now.increment)
+        }
+        (ValueSource::Sequence(was), ValueSource::Sequence(now)) => {
+            (was.options, now.options, now.increment)
+        }
+        (
+            ValueSource::None
+            | ValueSource::Default(_)
+            | ValueSource::Generated(_)
+            | ValueSource::Identity(_)
+            | ValueSource::Sequence(_),
+            _,
+        ) => return None,
+    };
+    ((was.min, was.max) != (now.min, now.max)).then_some((increment, now))
+}
+
 /// The probes one change implies, using facts before that statement.
 fn build<'v, 'p: 'v>(
     change: &Change,
@@ -3291,6 +3317,52 @@ fn build<'v, 'p: 'v>(
             unchecked,
         )),
 
+        // A kept source whose bounds this plan moves (#1921, DEC-1921.1):
+        // measured on 16 and 18, the engine refuses a bound the counter is
+        // already past ("RESTART value (10) cannot be greater than MAXVALUE
+        // (5)"), mid-apply. Counted here: the sequence's counter outside the
+        // bounds the change gives it, or a counter this session cannot read.
+        // `pg_sequence_last_value` reads an unreadable counter as NULL, as it
+        // does one never called, so the privilege is asked first and a hidden
+        // counter is counted as in the way (DECISIONS 335). Never called, the
+        // counter the engine checks is the sequence's start.
+        Change::AlterColumnNumbering {
+            column, ty, from, to, ..
+        } if moved_bounds(from, to).is_some() => {
+            let Some((increment, options)) = moved_bounds(from, to) else {
+                return Ok(Vec::new());
+            };
+            let Some(bounds) = crate::types::sequence_range(ty, increment, &options) else {
+                return Ok(Vec::new());
+            };
+            let Some(stored) = names.column(column) else {
+                return Ok(skip(change, "the column does not exist before apply", unchecked));
+            };
+            let counter =
+                "COALESCE(pg_catalog.pg_sequence_last_value(q.seqrelid), q.seqstart)";
+            Ok(vec![Probe::new(
+                format!(
+                    "the counter of {column}'s sequence outside the bounds {}..={} this plan \
+                     gives it, or not readable",
+                    bounds.start(),
+                    bounds.end()
+                ),
+                format!(
+                    "SELECT {} AS n FROM pg_catalog.pg_sequence q \
+                     WHERE q.seqrelid OPERATOR(pg_catalog.=) \
+                     pg_catalog.pg_get_serial_sequence({}, {})::pg_catalog.regclass \
+                     AND (NOT pg_catalog.has_sequence_privilege(q.seqrelid, 'SELECT, USAGE') \
+                     OR NOT ({counter} OPERATOR(pg_catalog.>=) {} \
+                     AND {counter} OPERATOR(pg_catalog.<=) {}));",
+                    saturated_count("count(*)"),
+                    value_literal(&qualified(&stored.table)?),
+                    value_literal(&stored.name),
+                    bounds.start(),
+                    bounds.end()
+                ),
+            )])
+        }
+
         // A source put on a column that holds values continues past them
         // (DEC-1889.1), and a value too near the type's bound leaves no
         // number to continue at: the block's `setval` is then refused
@@ -3305,9 +3377,19 @@ fn build<'v, 'p: 'v>(
                     return Ok(Vec::new());
                 }
             };
-            let Some(bounds) = crate::types::identity_range(ty) else {
+            // Up to the bound the new source declares, where it sets one
+            // (#1921), else the type's.
+            let options = match to {
+                ValueSource::Identity(id) => id.options,
+                ValueSource::Sequence(sequence) => sequence.options,
+                ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => {
+                    return Ok(Vec::new());
+                }
+            };
+            let Some(held) = crate::types::identity_range(ty) else {
                 return Ok(Vec::new());
             };
+            let bounds = options.min.unwrap_or(*held.start())..=options.max.unwrap_or(*held.end());
             let Some(stored) = names.column(column) else {
                 return Ok(skip(change, "the column does not exist before apply", unchecked));
             };
@@ -3337,8 +3419,8 @@ fn build<'v, 'p: 'v>(
             };
             Ok(vec![Probe::new(
                 format!(
-                    "values in {column} too near its type's bound for numbering to continue \
-                     past them"
+                    "values in {column} too near its sequence's bound for numbering to \
+                     continue past them"
                 ),
                 format!(
                     "SELECT {} AS n FROM {} WHERE {} OPERATOR(pg_catalog.{operator}) \

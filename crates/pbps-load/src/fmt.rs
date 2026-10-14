@@ -112,8 +112,17 @@ pub fn render_partitioned(
             pbps_model::ValueSource::Default(d) => {
                 let _ = writeln!(s, "    default: {}", scalar(d));
             }
-            pbps_model::ValueSource::Identity(id) => {
+            // The pair, unless the sequence has options to say (#1921).
+            pbps_model::ValueSource::Identity(id) if id.options.is_default() => {
                 let _ = writeln!(s, "    identity: [{}, {}]", id.seed, id.increment);
+            }
+            pbps_model::ValueSource::Identity(id) => {
+                let mut fields = vec![
+                    format!("seed: {}", id.seed),
+                    format!("increment: {}", id.increment),
+                ];
+                fields.extend(option_fields(&id.options));
+                let _ = writeln!(s, "    identity: {{{}}}", fields.join(", "));
             }
             // Only what `serial` does not say (DEC-1631.1).
             pbps_model::ValueSource::Sequence(seq) => {
@@ -127,6 +136,7 @@ pub fn render_partitioned(
                 if let Some(n) = &seq.name {
                     fields.push(format!("name: {}", scalar(n)));
                 }
+                fields.extend(option_fields(&seq.options));
                 if !fields.is_empty() {
                     let _ = writeln!(s, "    sequence: {{{}}}", fields.join(", "));
                 }
@@ -717,6 +727,24 @@ fn render_checks_and_indexes(s: &mut String, table: &Table, pad: &str, lead: &st
             }
         }
     }
+}
+
+/// A sequence's options as declaration fields, only those it sets (#1921).
+fn option_fields(options: &pbps_model::SequenceOptions) -> Vec<String> {
+    let mut fields = Vec::new();
+    if let Some(min) = options.min {
+        fields.push(format!("min: {min}"));
+    }
+    if let Some(max) = options.max {
+        fields.push(format!("max: {max}"));
+    }
+    if options.cycle {
+        fields.push("cycle: true".to_owned());
+    }
+    if let Some(cache) = options.cache {
+        fields.push(format!("cache: {cache}"));
+    }
+    fields
 }
 
 /// The `serial` spelling of an owned sequence's integer type, or `None` for a
@@ -1438,6 +1466,7 @@ indexes:
                 start: 100,
                 increment: 5,
                 name: Some("legacy_seq".into()),
+                options: Default::default(),
             })
         );
         // Said, the nullability is kept, for validation to refuse.
@@ -1455,6 +1484,72 @@ indexes:
             "{out}"
         );
         assert!(!out.contains("nullable: false"), "{out}");
+    }
+
+    /// A sequence's bounds, cycle and cache load from a `sequence:` beside a
+    /// `serial` and from an `identity:` written as a mapping, and render back
+    /// only where they are set: an identity without them keeps its
+    /// `[seed, increment]` pair (#1921, DEC-1921.1). A misspelt option is
+    /// refused by its own name, not as "matches no variant".
+    #[test]
+    fn sequence_options_round_trip_and_an_identity_keeps_its_pair_without_them() {
+        let yaml = "table: app.t\ncolumns:\n  id:\n    type: integer\n    nullable: false\n    identity: {seed: 5, increment: 1, min: 5, max: 1000, cycle: true, cache: 20}\n  n:\n    type: bigserial\n    sequence: {start: 10, max: 99999, cache: 50}\n  plain:\n    type: integer\n    nullable: false\n    identity: [1, 1]\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        let options = |c: &str| match &t.table.columns[c].value_source {
+            pbps_model::ValueSource::Identity(id) => (id.seed, id.options),
+            pbps_model::ValueSource::Sequence(s) => (s.start, s.options),
+            other @ (pbps_model::ValueSource::None
+            | pbps_model::ValueSource::Default(_)
+            | pbps_model::ValueSource::Generated(_)) => panic!("{c}: {other:?}"),
+        };
+        assert_eq!(
+            options("id"),
+            (
+                5,
+                pbps_model::SequenceOptions {
+                    min: Some(5),
+                    max: Some(1000),
+                    cycle: true,
+                    cache: Some(20),
+                }
+            )
+        );
+        assert_eq!(
+            options("n"),
+            (
+                10,
+                pbps_model::SequenceOptions {
+                    max: Some(99999),
+                    cache: Some(50),
+                    ..Default::default()
+                }
+            )
+        );
+        assert_eq!(
+            options("plain"),
+            (1, pbps_model::SequenceOptions::default())
+        );
+        let out = render(&t.name, &t.table, &t.intents, None);
+        assert!(
+            out.contains(
+                "identity: {seed: 5, increment: 1, min: 5, max: 1000, cycle: true, cache: 20}"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("sequence: {start: 10, max: 99999, cache: 50}"),
+            "{out}"
+        );
+        assert!(out.contains("identity: [1, 1]"), "{out}");
+
+        let misspelt = "table: app.t\ncolumns:\n  id:\n    type: integer\n    nullable: false\n    identity: {seed: 1, maximum: 5}\n";
+        let err = format!(
+            "{:?}",
+            crate::load_table_str(Path::new("t.yml"), misspelt).unwrap_err()
+        );
+        assert!(err.contains("maximum"), "{err}");
+        assert!(!err.contains("variant"), "{err}");
     }
 
     /// A computed column reads back with its expression and persisted state

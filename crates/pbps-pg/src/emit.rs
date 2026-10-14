@@ -762,11 +762,12 @@ fn owned_sequence_statements(
     let q = qualified(&name)?;
     Ok(Some((
         format!(
-            "CREATE {}SEQUENCE {q} AS {} START WITH {} INCREMENT BY {};",
+            "CREATE {}SEQUENCE {q} AS {} START WITH {} INCREMENT BY {}{};",
             if unlogged { "UNLOGGED " } else { "" },
             types::normalize(&declared.ty)?,
             sequence.start,
-            sequence.increment
+            sequence.increment,
+            created_options(&sequence.options)
         ),
         format!(
             "ALTER SEQUENCE {q} OWNED BY {}.{};",
@@ -775,6 +776,53 @@ fn owned_sequence_statements(
         ),
         name,
     )))
+}
+
+/// The options a sequence is created with (#1921, DEC-1921.1): each one the
+/// declaration sets, and nothing for the engine's defaults, so a plain
+/// sequence's statement reads as it did before options were held.
+fn created_options(options: &pbps_model::SequenceOptions) -> String {
+    let mut out = String::new();
+    if let Some(min) = options.min {
+        out.push_str(&format!(" MINVALUE {min}"));
+    }
+    if let Some(max) = options.max {
+        out.push_str(&format!(" MAXVALUE {max}"));
+    }
+    if options.cycle {
+        out.push_str(" CYCLE");
+    }
+    if let Some(cache) = options.cache {
+        out.push_str(&format!(" CACHE {cache}"));
+    }
+    out
+}
+
+/// The options a retune moves (#1921, DEC-1921.1), each prefixed by `set`
+/// (`" SET"` for an identity's `ALTER COLUMN`, `""` for `ALTER SEQUENCE`):
+/// nothing where they are unchanged, so a start or increment retuned reads as
+/// before. An option returning to the default is spelled `NO …` or `CACHE 1`,
+/// which, measured on 16 and 18, gives the type's bound in the direction
+/// counted, as `None` stands for.
+fn retuned_options(
+    was: &pbps_model::SequenceOptions,
+    now: &pbps_model::SequenceOptions,
+    set: &str,
+) -> String {
+    if was == now {
+        return String::new();
+    }
+    let bound = |name: &str, value: Option<i64>| match value {
+        Some(v) => format!("{set} {name} {v}"),
+        None => format!("{set} NO {name}"),
+    };
+    format!(
+        "{}{}{set} {}{set} CACHE {}",
+        bound("MINVALUE", now.min),
+        bound("MAXVALUE", now.max),
+        if now.cycle { "CYCLE" } else { "NO CYCLE" },
+        now.cache.unwrap_or(1)
+    )
 }
 
 /// `CREATE SEQUENCE` gives the sequence to the role that runs it, and `OWNED
@@ -877,13 +925,15 @@ fn numbering(
     // Kept: the same source, retuned. Neither moves a number already issued,
     // since neither restarts (DEC-1889.1).
     match (from, to) {
-        (ValueSource::Identity(_), ValueSource::Identity(id)) => {
+        (ValueSource::Identity(was), ValueSource::Identity(id)) => {
             return one(
                 pg,
                 table,
                 format!(
-                    "{alter} SET START WITH {} SET INCREMENT BY {};",
-                    id.seed, id.increment
+                    "{alter} SET START WITH {} SET INCREMENT BY {}{};",
+                    id.seed,
+                    id.increment,
+                    retuned_options(&was.options, &id.options, " SET")
                 ),
             );
         }
@@ -891,10 +941,11 @@ fn numbering(
             let mut steps = format!(
                 "{found}\n\
                  EXECUTE pg_catalog.format('ALTER SEQUENCE %s AS {} START WITH {} INCREMENT BY \
-                 {}', pbps.pbps_seq);",
+                 {}{}', pbps.pbps_seq);",
                 types::normalize(ty)?,
                 sequence.start,
-                sequence.increment
+                sequence.increment,
+                retuned_options(&was.options, &sequence.options, "")
             );
             // A name compared on both sides (`OwnedSequence::declares`), and
             // changed: the new one, in the table's schema. Not where the base
@@ -975,10 +1026,11 @@ fn numbering(
         ValueSource::Sequence(sequence) => {
             let q = qualified(&owned_sequence(table, &column.name, sequence))?;
             body.push(format!(
-                "CREATE SEQUENCE {q} AS {} START WITH {} INCREMENT BY {};",
+                "CREATE SEQUENCE {q} AS {} START WITH {} INCREMENT BY {}{};",
                 types::normalize(ty)?,
                 sequence.start,
-                sequence.increment
+                sequence.increment,
+                created_options(&sequence.options)
             ));
             body.push(on_catalog_path(&give_to_table_owner(&literal(&q), table)?));
             body.push(format!("ALTER SEQUENCE {q} OWNED BY {t}.{c};"));
@@ -990,8 +1042,10 @@ fn numbering(
         }
         ValueSource::Identity(id) => {
             body.push(format!(
-                "{alter} ADD GENERATED ALWAYS AS IDENTITY (START WITH {} INCREMENT BY {});",
-                id.seed, id.increment
+                "{alter} ADD GENERATED ALWAYS AS IDENTITY (START WITH {} INCREMENT BY {}{});",
+                id.seed,
+                id.increment,
+                created_options(&id.options)
             ));
             (id.seed, id.increment)
         }
@@ -1035,11 +1089,12 @@ fn column_definition(
     let default = match &column.value_source {
         pbps_model::ValueSource::None => None,
         pbps_model::ValueSource::Identity(id) => {
-            // ALWAYS and default sequence bounds/cache are the only identity
-            // semantics the model records and the reader can reproduce.
+            // ALWAYS, with the options the declaration sets (#1921).
             s.push_str(&format!(
-                " GENERATED ALWAYS AS IDENTITY (START WITH {} INCREMENT BY {})",
-                id.seed, id.increment
+                " GENERATED ALWAYS AS IDENTITY (START WITH {} INCREMENT BY {}{})",
+                id.seed,
+                id.increment,
+                created_options(&id.options)
             ));
             None
         }
@@ -5557,6 +5612,7 @@ mod tests {
                 start,
                 increment,
                 name: name.map(str::to_owned),
+                options: Default::default(),
             });
             c
         };
@@ -7785,6 +7841,7 @@ mod tests {
         id.value_source = pbps_model::ValueSource::Identity(Identity {
             seed: 7,
             increment: 3,
+            options: Default::default(),
         });
         table.columns.insert("id".into(), id);
         let sql = sql_of(
@@ -7806,6 +7863,116 @@ mod tests {
             !sql[0].contains("MINVALUE") && !sql[0].contains("CACHE"),
             "{}",
             sql[0]
+        );
+    }
+
+    /// A sequence's options are written where the declaration sets them, on
+    /// an identity, a `serial` and a source put on (#1921, DEC-1921.1); a
+    /// retune moves them only where they change, and an option returning to
+    /// the engine's own is spelled `NO …` or `CACHE 1`. A retune of start
+    /// alone reads as it did before options were held.
+    #[test]
+    fn sequence_options_are_created_and_retuned_only_where_they_change() {
+        let options = pbps_model::SequenceOptions {
+            min: Some(5),
+            max: Some(1000),
+            cycle: true,
+            cache: Some(20),
+        };
+        let mut table = Table::default();
+        let mut id = Column::new(ty("integer")).not_null();
+        id.value_source = pbps_model::ValueSource::Identity(Identity {
+            seed: 7,
+            increment: 1,
+            options,
+        });
+        table.columns.insert("id".into(), id);
+        let mut n = Column::new(ty("integer")).not_null();
+        n.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+            start: 5,
+            options,
+            ..pbps_model::OwnedSequence::serial()
+        });
+        table.columns.insert("n".into(), n);
+        let sql = sql_of(
+            &Postgres::new(),
+            &Change::CreateTable {
+                uid: Uid::generate(UidKind::Table),
+                name: name("app", "t"),
+                table: Box::new(table),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        )
+        .join("\n");
+        assert!(
+            sql.contains(
+                "GENERATED ALWAYS AS IDENTITY (START WITH 7 INCREMENT BY 1 MINVALUE 5 MAXVALUE \
+                 1000 CYCLE CACHE 20)"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("START WITH 5 INCREMENT BY 1 MINVALUE 5 MAXVALUE 1000 CYCLE CACHE 20;"),
+            "{sql}"
+        );
+
+        let retune = |from, to| {
+            sql_of(
+                &Postgres::new(),
+                &Change::AlterColumnNumbering {
+                    uid: Uid::generate(UidKind::Column),
+                    column: name("app", "t").column("id"),
+                    ty: ty("integer"),
+                    from,
+                    to,
+                },
+            )
+            .join("\n")
+        };
+        let identity = |seed, options| {
+            pbps_model::ValueSource::Identity(Identity {
+                seed,
+                increment: 1,
+                options,
+            })
+        };
+        let plain = pbps_model::SequenceOptions::default();
+        let moved = retune(identity(7, options), identity(7, plain));
+        assert!(
+            moved.contains(
+                "SET START WITH 7 SET INCREMENT BY 1 SET NO MINVALUE SET NO MAXVALUE SET NO \
+                 CYCLE SET CACHE 1;"
+            ),
+            "{moved}"
+        );
+        let set = retune(identity(7, plain), identity(7, options));
+        assert!(
+            set.contains("SET MINVALUE 5 SET MAXVALUE 1000 SET CYCLE SET CACHE 20;"),
+            "{set}"
+        );
+        // Negative: start alone, with the options unchanged, says nothing of
+        // them.
+        let started = retune(identity(7, options), identity(9, options));
+        assert!(
+            started.contains("SET START WITH 9 SET INCREMENT BY 1;"),
+            "{started}"
+        );
+        let serial = |options| {
+            pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                options,
+                ..pbps_model::OwnedSequence::serial()
+            })
+        };
+        let kept = retune(serial(plain), serial(options));
+        assert!(
+            kept.contains("START WITH 1 INCREMENT BY 1 MINVALUE 5 MAXVALUE 1000 CYCLE CACHE 20'"),
+            "{kept}"
+        );
+        let put_on = retune(pbps_model::ValueSource::None, serial(options));
+        assert!(
+            put_on.contains("START WITH 1 INCREMENT BY 1 MINVALUE 5 MAXVALUE 1000 CYCLE CACHE 20;"),
+            "{put_on}"
         );
     }
 

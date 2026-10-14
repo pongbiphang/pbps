@@ -194,11 +194,13 @@ mod tests {
             ValueSource::Identity(Identity {
                 seed: 5,
                 increment: -1,
+                options: Default::default(),
             }),
             ValueSource::Sequence(OwnedSequence {
                 start: 9,
                 increment: 3,
                 name: Some("numbers".into()),
+                options: Default::default(),
             }),
             ValueSource::Generated(crate::Generated {
                 expression: "n * 2".into(),

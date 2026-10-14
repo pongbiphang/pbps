@@ -866,10 +866,12 @@ fn a_rename_keeps_every_observed_column_field_across_the_move_and_at_close() {
             ValueSource::Identity(Identity {
                 seed: 1,
                 increment: 1,
+                options: Default::default(),
             }),
             ValueSource::Identity(Identity {
                 seed: 2,
                 increment: 1,
+                options: Default::default(),
             }),
         ),
         (
@@ -878,11 +880,13 @@ fn a_rename_keeps_every_observed_column_field_across_the_move_and_at_close() {
                 start: 1,
                 increment: 1,
                 name: Some("kept_seq".into()),
+                options: Default::default(),
             }),
             ValueSource::Sequence(OwnedSequence {
                 start: 1,
                 increment: 2,
                 name: Some("kept_seq".into()),
+                options: Default::default(),
             }),
         ),
     ] {

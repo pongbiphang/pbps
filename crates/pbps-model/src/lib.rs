@@ -83,8 +83,8 @@ pub use schema::{
     BoundDatum, CheckConstraint, Clustered, Collation, Column, ComputedColumn, ForeignKey,
     Generated, Identity, Index, IndexColumn, IndexKey, IndexMethod, OwnedSequence, PartitionBound,
     PartitionBy, PartitionColumn, PartitionOf, PrimaryKey, ReferentialAction, ReplicaIdentity,
-    Retention, RetentionUnit, Schema, SystemTime, SystemVersioning, Table, UniqueConstraint,
-    ValueSource,
+    Retention, RetentionUnit, Schema, SequenceOptions, SystemTime, SystemVersioning, Table,
+    UniqueConstraint, ValueSource,
 };
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};

@@ -4135,6 +4135,7 @@ mod tests {
             .value_source = pbps_model::ValueSource::Identity(pbps_model::schema::Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         let mut held = everything_but_the_dml(&["app"]);
         held.data_tables.insert(

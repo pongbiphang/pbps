@@ -1208,9 +1208,11 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let mut column = Column::new(ty);
         column.collation = collation;
         column.nullable = c.is_nullable;
-        let identity = c
-            .identity
-            .map(|(seed, increment)| Identity { seed, increment });
+        let identity = c.identity.map(|(seed, increment)| Identity {
+            seed,
+            increment,
+            options: Default::default(),
+        });
         let unavailable_default =
             c.default_constraint
                 .as_ref()
@@ -3098,7 +3100,8 @@ mod tests {
             t.columns["id"].value_source,
             pbps_model::ValueSource::Identity(Identity {
                 seed: 1,
-                increment: 1
+                increment: 1,
+                options: Default::default(),
             })
         );
         assert_eq!(t.columns["email"].ty.to_string(), "nvarchar(255)");
