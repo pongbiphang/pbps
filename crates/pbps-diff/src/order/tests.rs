@@ -1495,3 +1495,16 @@ fn a_primary_key_over_a_column_the_plan_tightens_follows_the_tightening() {
     assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
     assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
 }
+
+#[test]
+fn a_report_that_cannot_be_written_is_an_error_and_not_an_empty_report() {
+    let dir = std::env::temp_dir().join(format!("pbps-shadow-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A directory is not a file the report can be appended to.
+    assert!(super::shadow::write_report(&dir, "line\n").is_err());
+    let file = dir.join("report.log");
+    super::shadow::write_report(&file, "a\n").unwrap();
+    super::shadow::write_report(&file, "b\n").unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nb\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

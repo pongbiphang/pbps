@@ -5352,7 +5352,10 @@ nothing about the order. A function a computed column calls that the differ's or
 ahead of the column's own removal is recorded as `connected`: the connected
 pass moves it afterwards from the catalog's edges (DEC-1431.1), so the order
 the differ made is not the one that runs. It is not failed until the verifier
-runs on the order that runs; a column change in the same position still fails. They run where an order is made: the differ's, and the
+runs on the order that runs; a column change in the same position still fails.
+A foreign key the plan drops and adds again is read as absent by the rows
+written in between; a report file that cannot be written fails the run that was
+measuring, with the I/O error on stderr, rather than reading as an empty report. They run where an order is made: the differ's, and the
 resolver's. The resolver's intermediate ordinary plan is not observed, because
 it is not an order anything runs. With `PBPS_ORDER_SHADOW` set to a file they
 write their findings and never fail, which is how the go/no-go report is

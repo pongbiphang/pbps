@@ -106,3 +106,99 @@ fn altering_a_function_while_a_computed_column_calling_it_stands_is_refused_by_n
     let late = violations(plan(), &[0, 2, 1]);
     assert!(!late.is_empty(), "{late:?}");
 }
+
+#[test]
+fn rows_written_while_a_foreign_key_is_rebuilt_do_not_wait_for_it() {
+    use pbps_model::{
+        ForeignKey, PlannedChange as P, PrimaryKey, ReferentialAction, Row, RowKey, Value,
+    };
+    let table = |with_key: bool| {
+        let mut table = Table {
+            columns: IndexMap::from([
+                ("id".to_owned(), Column::new("int".parse().unwrap())),
+                ("pid".to_owned(), Column::new("int".parse().unwrap())),
+            ]),
+            primary_key: Some(PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            }),
+            ..Table::default()
+        };
+        if with_key {
+            table.foreign_keys.insert(
+                "fk".into(),
+                ForeignKey {
+                    columns: vec!["pid".into()],
+                    references_table: t(),
+                    references_columns: vec!["id".into()],
+                    on_delete: ReferentialAction::default(),
+                    on_update: ReferentialAction::default(),
+                },
+            );
+        }
+        table
+    };
+    let (mut schema, mut ids) = (Schema::default(), IdsFile::default());
+    schema.tables.insert(t(), table(true));
+    ids.tables.insert(Uid::derived(UidKind::Table, "t", 0), t());
+    for c in ["id", "pid"] {
+        ids.columns.insert(
+            Uid::derived(UidKind::Column, &format!("t.{c}"), 0),
+            t().column(c),
+        );
+    }
+    let insert = |id: i64, parent: Option<i64>| {
+        P::new(Change::InsertRow {
+            table: t(),
+            key_column: "id".into(),
+            identity_key: false,
+            key: RowKey::from(id.to_string().as_str()),
+            row: [
+                ("id".to_owned(), Value::Int(id)),
+                ("pid".to_owned(), parent.map_or(Value::Null, Value::Int)),
+            ]
+            .into_iter()
+            .collect::<Row>(),
+            defaults: Default::default(),
+            types: Default::default(),
+        })
+    };
+    let key = table(true).foreign_keys["fk"].clone();
+    let verdict = |rebuilt: bool| {
+        let mut logical = vec![insert(1, Some(2)), insert(2, None)];
+        if rebuilt {
+            logical.insert(
+                0,
+                P::new(Change::DropForeignKey {
+                    table: t(),
+                    name: "fk".into(),
+                }),
+            );
+            logical.push(P::new(Change::AddForeignKey {
+                table: t(),
+                name: "fk".into(),
+                constraint: Box::new(key.clone()),
+            }));
+        }
+        let ops = Operations::of_plan(&logical, ModuleEdits::InPlace);
+        let names = PlanNames::of(&logical, &ids).unwrap();
+        let owners = PlanOwners::new(names, &ids, &ids);
+        let snapshot = Snapshot {
+            schema: &schema,
+            ids: &ids,
+        };
+        let baseline = Baseline::of(snapshot, &owners);
+        let shadowed = analyse(&ops, &owners, snapshot, snapshot, &Mssql);
+        pbps_diff::order::verify(
+            ops.as_slice(),
+            &shadowed.effects,
+            &baseline,
+            &Default::default(),
+        )
+    };
+    // Rebuilt around the rows: 1 -> 2 is written before 2 exists, and fine.
+    assert_eq!(verdict(true), []);
+    // Negative: a key that stands throughout wants its parent row first.
+    assert!(!verdict(false).is_empty());
+}
