@@ -4,8 +4,8 @@
 //! value, and a surface's verdict is what its sealed bindings say.
 
 use pbps_model::resolver::{
-    ObjectIdentity, OrderReason, OutsideWrites, ResolverEvidence, ResolverRuntime, ScratchLayout,
-    ScratchSource, Surface, SurfaceResolution,
+    ObjectIdentity, OrderReason, OutsideWrites, Prerequisite, ResolverEvidence, ResolverRuntime,
+    ScratchLayout, ScratchSource, Surface, SurfaceResolution,
 };
 
 /// What `explain` shows of a resolved plan's evidence.
@@ -38,7 +38,8 @@ pub struct ResolverDetail {
     pub surfaces: Vec<SurfaceVerdict>,
     /// The order the evidence proves, edge by edge.
     pub order: Vec<OrderStep>,
-    /// The external inputs the bindings read, by identity.
+    /// The catalog records the bindings read, by identity: the target's,
+    /// and those the plan itself installs.
     pub prerequisites: Vec<PrerequisiteDetail>,
 }
 
@@ -70,11 +71,35 @@ pub struct OrderStep {
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct PrerequisiteDetail {
-    /// The catalog class and name, such as `pg_proc app.f(numeric)`.
-    pub object: String,
-    /// Whether a keyed fingerprint of its properties is sealed. One the plan
-    /// itself installs has none.
+    /// The record's logical address, as the evidence holds it.
+    pub object: ObjectDetail,
+    /// Whether a keyed fingerprint of its properties is sealed: true for the
+    /// target's records, false for one the plan itself installs, whose
+    /// properties the managed revalidation checks instead.
     pub fingerprinted: bool,
+}
+
+/// A catalog record's logical address, component by component. Structured,
+/// not a string: a signature component has its own class and signature (a
+/// dependency's endpoint is an overloaded routine, a default's is a column
+/// of a table), and a dot inside a name is not qualification, so no
+/// flattening is unambiguous.
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct ObjectDetail {
+    /// The catalog, such as `pg_proc`.
+    pub class: String,
+    pub name: Vec<String>,
+    pub signature: Vec<ObjectDetail>,
+}
+
+impl From<&ObjectIdentity> for ObjectDetail {
+    fn from(object: &ObjectIdentity) -> Self {
+        Self {
+            class: object.class.clone(),
+            name: object.name.clone(),
+            signature: object.signature.iter().map(Self::from).collect(),
+        }
+    }
 }
 
 pub fn detail(evidence: &ResolverEvidence) -> ResolverDetail {
@@ -133,16 +158,29 @@ pub fn detail(evidence: &ResolverEvidence) -> ResolverDetail {
                 reason: reason(edge.reason),
             })
             .collect(),
-        prerequisites: evidence
-            .before()
-            .prerequisites()
-            .iter()
-            .map(|p| PrerequisiteDetail {
-                object: identity(&p.object),
-                fingerprinted: p.fingerprinted(),
-            })
-            .collect(),
+        prerequisites: prerequisites(
+            evidence.before().prerequisites(),
+            evidence.after().prerequisites(),
+        ),
     }
+}
+
+/// The opening manifest holds the target's records, each fingerprinted. A
+/// record the plan itself installs is only in the closing manifest, as a
+/// placeholder without one (DEC-1274.1); the closing manifest's other
+/// records repeat the target's. A record the plan replaces is listed twice,
+/// the target's and the plan's, since both are sealed.
+fn prerequisites(opening: &[Prerequisite], closing: &[Prerequisite]) -> Vec<PrerequisiteDetail> {
+    let mut seen = std::collections::BTreeSet::new();
+    opening
+        .iter()
+        .chain(closing.iter().filter(|p| p.is_managed_closing()))
+        .filter(|p| seen.insert((&p.object, p.fingerprinted())))
+        .map(|p| PrerequisiteDetail {
+            object: ObjectDetail::from(&p.object),
+            fingerprinted: p.fingerprinted(),
+        })
+        .collect()
 }
 
 /// The verdict the sealed sides say: a surface only the desired side holds
@@ -185,19 +223,6 @@ fn reason(reason: OrderReason) -> &'static str {
         OrderReason::Authorization => "authorization",
         OrderReason::Restoration => "restoration",
     }
-}
-
-fn identity(object: &ObjectIdentity) -> String {
-    let mut out = format!("{} {}", object.class, object.name.join("."));
-    if !object.signature.is_empty() {
-        let arguments: Vec<String> = object
-            .signature
-            .iter()
-            .map(|argument| argument.name.join("."))
-            .collect();
-        out.push_str(&format!("({})", arguments.join(", ")));
-    }
-    out
 }
 
 /// The one line `explain` prints for the resolver: `<entry> (<kind>
@@ -279,7 +304,7 @@ pub fn render(detail: &ResolverDetail, changes: &pbps_model::ChangeSet) -> Strin
     if !detail.prerequisites.is_empty() {
         let mut classes: std::collections::BTreeMap<&str, usize> = Default::default();
         for prerequisite in &detail.prerequisites {
-            let class = prerequisite.object.split(' ').next().unwrap_or_default();
+            let class = prerequisite.object.class.as_str();
             *classes.entry(class).or_default() += 1;
         }
         let installed = detail
@@ -323,6 +348,84 @@ mod tests {
             order: Vec::new(),
             prerequisites: Vec::new(),
         }
+    }
+
+    fn record(object: ObjectIdentity) -> Prerequisite {
+        Prerequisite {
+            object,
+            ownership: pbps_model::resolver::ObjectOwnership::Unqualified,
+            canonicalization: "postgres-catalog-inputs-v2".into(),
+            properties: "11".repeat(32),
+            bindings: Vec::new(),
+        }
+    }
+
+    fn id(class: &str, name: &[&str], signature: Vec<ObjectIdentity>) -> ObjectIdentity {
+        ObjectIdentity {
+            class: class.into(),
+            name: name.iter().map(|n| (*n).to_owned()).collect(),
+            signature,
+        }
+    }
+
+    /// The prerequisites are the target's records and those the plan
+    /// installs, each once, by their whole logical address (#1517 review).
+    #[test]
+    fn prerequisites_list_the_plans_own_records_by_their_whole_address() {
+        let default_of = |table: &str| {
+            id(
+                "pg_attrdef",
+                &[],
+                vec![id(
+                    "column",
+                    &["a"],
+                    vec![id("pg_class", &["app", table], vec![])],
+                )],
+            )
+        };
+        let installed = record(id(
+            "pg_proc",
+            &["app", "g"],
+            vec![id("pg_type", &["pg_catalog", "int4"], vec![])],
+        ))
+        .managed_closing();
+        let opening = [record(default_of("t")), record(default_of("u"))];
+        // The closing manifest repeats the target's records; the plan's own
+        // is a placeholder, here twice.
+        let closing = [
+            record(default_of("t")),
+            installed.clone(),
+            installed.clone(),
+        ];
+        let listed = serde_json::to_value(prerequisites(&opening, &closing)).unwrap();
+        let column = |table: &str| {
+            serde_json::json!({"class": "pg_attrdef", "name": [], "signature": [{
+                "class": "column", "name": ["a"], "signature": [
+                    {"class": "pg_class", "name": ["app", table], "signature": []}
+                ]
+            }]})
+        };
+        assert_eq!(
+            listed,
+            serde_json::json!([
+                {"object": column("t"), "fingerprinted": true},
+                {"object": column("u"), "fingerprinted": true},
+                {"object": {"class": "pg_proc", "name": ["app", "g"], "signature": [
+                    {"class": "pg_type", "name": ["pg_catalog", "int4"], "signature": []}
+                ]}, "fingerprinted": false},
+            ])
+        );
+        let mut shown = detail("server", None, "refused");
+        shown.prerequisites = prerequisites(&opening, &closing);
+        let text = render(&shown, &pbps_model::ChangeSet::default());
+        assert!(
+            text.contains("  prerequisites 3 catalog records, by class: pg_attrdef 2, pg_proc 1\n")
+                && text.contains("2 fingerprinted; 1 installed by this plan\n"),
+            "{text}"
+        );
+        // Negative: without the plan's own records none is installed.
+        let alone = serde_json::to_value(prerequisites(&opening, &[])).unwrap();
+        assert_eq!(alone.as_array().unwrap().len(), 2, "{alone}");
     }
 
     /// A reviewer reads which entry ran, its kind of scratch and its

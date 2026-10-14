@@ -299,7 +299,12 @@ fn assert_explained(d: &Demo, artifact: &std::path::Path) {
         .map(|(v, s)| (v.to_owned(), s.to_owned()))
     );
     let prerequisites = resolver["prerequisites"].as_array().unwrap();
-    for named in ["pg_namespace app", "pg_class app.t", "pg_class app.v"] {
+    let object = |class: &str, name: &[&str]| serde_json::json!({"class": class, "name": name, "signature": []});
+    for named in [
+        object("pg_namespace", &["app"]),
+        object("pg_class", &["app", "t"]),
+        object("pg_class", &["app", "v"]),
+    ] {
         assert!(
             prerequisites
                 .iter()
@@ -307,6 +312,24 @@ fn assert_explained(d: &Demo, artifact: &std::path::Path) {
             "{named}"
         );
     }
+    // The overload the plan creates is sealed only as the closing
+    // manifest's placeholder: listed, without a fingerprint (#1517 review).
+    let created = serde_json::json!({"class": "pg_proc", "name": ["app", "f"], "signature": [
+        {"class": "pg_type", "name": ["pg_catalog", "int4"], "signature": []}
+    ]});
+    assert!(
+        prerequisites
+            .iter()
+            .any(|p| p["object"] == created && p["fingerprinted"] == false),
+        "{created}"
+    );
+    // Negative: the target held no such overload to fingerprint.
+    assert!(
+        !prerequisites
+            .iter()
+            .any(|p| p["object"] == created && p["fingerprinted"] == true),
+        "{created}"
+    );
     let text = stdout(&successful(run(d, &["explain", "--plan", plan], None)));
     assert!(
         text.contains("  resolver    scratch (server scratch, supplied)\n"),

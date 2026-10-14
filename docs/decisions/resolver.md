@@ -2598,9 +2598,13 @@ the evidence came from or what it sealed.
   refuses before sealing.
 - **No fingerprint value is shown.** The qualification's digests are
   named, not printed; a prerequisite shows its identity and whether it
-  carries a fingerprint. The JSON lists every prerequisite. The human output
-  counts them by catalog class: the capture's scope includes the system
-  catalog, thousands of records a reviewer would scroll past.
+  carries a fingerprint. The prerequisites are the target's records, from
+  the opening manifest, and the records the plan itself installs, which only
+  the closing manifest holds, without a fingerprint. The JSON lists each
+  one by its structured identity: a signature component has a class and
+  signature of its own, so no flattened string is unambiguous. The human
+  output counts them by catalog class: the capture's scope includes the
+  system catalog, thousands of records a reviewer would scroll past.
 - **The gates are `resolver.unresolved` findings that name themselves**,
   SPEC §9.8's known unsupported cases, refused before any deployable output:
   - SQL Server resolution, until #619 and #620; the remedy is to select no
@@ -2612,7 +2616,8 @@ the evidence came from or what it sealed.
     routine was named, and only when the entry had a baseline. Now an object
     of any candidate class is named, with or without a baseline, together
     with the declaration that could bind it and the remedy, add it to the
-    baseline. The resolver transfers no target source, so only the operator
+    baseline. A routine is named with its argument types, and only an
+    overload the declaration's call could reach is named. The resolver transfers no target source, so only the operator
     can stage it.
 
 **Pinned by** `a_resolved_plan_explains_its_provenance_and_sealed_qualification`

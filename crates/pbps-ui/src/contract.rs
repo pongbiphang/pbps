@@ -172,8 +172,16 @@ pub struct ResolverOrder {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolverPrerequisite {
-    pub object: String,
+    pub object: ResolverObject,
     pub fingerprinted: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverObject {
+    pub class: String,
+    pub name: Vec<String>,
+    pub signature: Vec<ResolverObject>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

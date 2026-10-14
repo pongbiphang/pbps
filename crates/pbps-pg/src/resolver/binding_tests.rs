@@ -2708,7 +2708,20 @@ async fn an_unstaged_external_object_of_any_class_is_refused_by_name() {
                 "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
                  CREATE FUNCTION util.f(integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;",
                 numeric_f().view("app.v", "SELECT f(1) AS x"),
-                Some("routine util.f"),
+                Some("routine util.f(pg_catalog.int4)"),
+            ),
+            // A one-argument call cannot reach `app.int4(integer, integer)`,
+            // so it is not what the set is unfaithful for: the overload a
+            // function-style cast could reach is the one named, though the
+            // other sorts first.
+            (
+                "reachable",
+                "SET search_path = app;
+                 CREATE VIEW app.v AS SELECT int4('1'::text) AS x;
+                 CREATE FUNCTION app.int4(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 0;
+                 CREATE FUNCTION app.int4(text) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 0;",
+                Declared::default().view("app.v", "SELECT int4('1'::text) AS x"),
+                Some("routine app.int4(pg_catalog.text)"),
             ),
             (
                 "relation",
@@ -2731,6 +2744,7 @@ async fn an_unstaged_external_object_of_any_class_is_refused_by_name() {
         ] {
             let base = match tag {
                 "routine" | "faithful" => numeric_f(),
+                "reachable" => Declared::default().view("app.v", "SELECT int4('1'::text) AS x"),
                 _ => Declared::default()
                     .table("util.t", column())
                     .table("app.owner", column()),

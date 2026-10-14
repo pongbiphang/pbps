@@ -1260,7 +1260,7 @@
           }
         },
         "prerequisites": {
-          "description": "The external inputs the bindings read, by identity.",
+          "description": "The catalog records the bindings read, by identity: the target's,\nand those the plan itself installs.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/PrerequisiteDetail"
@@ -1343,17 +1343,44 @@
       "type": "object",
       "properties": {
         "object": {
-          "description": "The catalog class and name, such as `pg_proc app.f(numeric)`.",
-          "type": "string"
+          "description": "The record's logical address, as the evidence holds it.",
+          "$ref": "#/$defs/ObjectDetail"
         },
         "fingerprinted": {
-          "description": "Whether a keyed fingerprint of its properties is sealed. One the plan\nitself installs has none.",
+          "description": "Whether a keyed fingerprint of its properties is sealed: true for the\ntarget's records, false for one the plan itself installs, whose\nproperties the managed revalidation checks instead.",
           "type": "boolean"
         }
       },
       "required": [
         "object",
         "fingerprinted"
+      ]
+    },
+    "ObjectDetail": {
+      "description": "A catalog record's logical address, component by component. Structured,\nnot a string: a signature component has its own class and signature (a\ndependency's endpoint is an overloaded routine, a default's is a column\nof a table), and a dot inside a name is not qualification, so no\nflattening is unambiguous.",
+      "type": "object",
+      "properties": {
+        "class": {
+          "description": "The catalog, such as `pg_proc`.",
+          "type": "string"
+        },
+        "name": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "signature": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ObjectDetail"
+          }
+        }
+      },
+      "required": [
+        "class",
+        "name",
+        "signature"
       ]
     },
     "envelope.explain": {

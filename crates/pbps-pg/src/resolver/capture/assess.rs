@@ -486,63 +486,72 @@ pub(super) fn assess_with(
     // could win: the engine's own objects identically, the managed ones as
     // declared. Missing from either capture is not faithful: an uncaptured
     // set is not an empty one.
+    let reproduced = |set: &CandidateSet,
+                      one_argument: bool,
+                      on_target: &BTreeSet<ObjectIdentity>,
+                      on_scratch: &BTreeSet<ObjectIdentity>,
+                      member: &ObjectIdentity|
+     -> bool {
+        // A routine a one-argument call cannot reach cannot take a cast.
+        let holder = if target.inputs.contains_key(member) {
+            &target.inputs
+        } else {
+            &desired.inputs
+        };
+        if one_argument && !callable_with_one(holder, member) {
+            return true;
+        }
+        let system = set.class == CandidateClass::Cast
+            || member.name.first().is_some_and(|schema| is_system(schema));
+        if system {
+            // A system schema may also hold what a superuser created
+            // there. The baseline's comparison already accepted such a
+            // root by its header, without the body (SPEC §9.3.2). Only
+            // the root itself: an extension's member there was compared
+            // through its extension's version alone, so it is compared
+            // in full here, like an initdb member.
+            let staged = staged.is_some_and(|staged| staged.holds(member));
+            return match (target.inputs.get(member), desired.inputs.get(member)) {
+                (Some(left), Some(right)) => {
+                    on_target.contains(member)
+                        && on_scratch.contains(member)
+                        && (staged || properties_equal(&left.properties, &right.properties))
+                }
+                _ => false,
+            };
+        }
+        // Scratch's user schemas hold only the declarations, what
+        // creating them made, and what the baseline staged, so a member
+        // only scratch has was reproduced. A target member, whether
+        // scratch has the same identity or the plan drops it, must be
+        // the project's own, or staged and compared.
+        !on_target.contains(member)
+            || own(set.class, member)
+            || on_scratch.contains(member)
+                && staged.is_some_and(|staged| carries(&target.inputs, staged, member))
+    };
     let faithful = |(set, one_argument): (&CandidateSet, &bool)| -> bool {
         let (Some(on_target), Some(on_scratch)) =
             (target.candidates.get(set), desired.candidates.get(set))
         else {
             return false;
         };
-        on_target.union(on_scratch).all(|member| {
-            // A routine a one-argument call cannot reach cannot take a cast.
-            let holder = if target.inputs.contains_key(member) {
-                &target.inputs
-            } else {
-                &desired.inputs
-            };
-            if *one_argument && !callable_with_one(holder, member) {
-                return true;
-            }
-            let system = set.class == CandidateClass::Cast
-                || member.name.first().is_some_and(|schema| is_system(schema));
-            if system {
-                // A system schema may also hold what a superuser created
-                // there. The baseline's comparison already accepted such a
-                // root by its header, without the body (SPEC §9.3.2). Only
-                // the root itself: an extension's member there was compared
-                // through its extension's version alone, so it is compared
-                // in full here, like an initdb member.
-                let staged = staged.is_some_and(|staged| staged.holds(member));
-                return match (target.inputs.get(member), desired.inputs.get(member)) {
-                    (Some(left), Some(right)) => {
-                        on_target.contains(member)
-                            && on_scratch.contains(member)
-                            && (staged || properties_equal(&left.properties, &right.properties))
-                    }
-                    _ => false,
-                };
-            }
-            // Scratch's user schemas hold only the declarations, what
-            // creating them made, and what the baseline staged, so a member
-            // only scratch has was reproduced. A target member, whether
-            // scratch has the same identity or the plan drops it, must be
-            // the project's own, or staged and compared.
-            !on_target.contains(member)
-                || own(set.class, member)
-                || on_scratch.contains(member)
-                    && staged.is_some_and(|staged| carries(&target.inputs, staged, member))
-        })
+        on_target
+            .union(on_scratch)
+            .all(|member| reproduced(set, *one_argument, on_target, on_scratch, member))
     };
     // Unfaithful because the target retains an object, of any candidate
     // class, that is neither managed nor on scratch: only the operator can
     // stage it, since pbps sends no target source of its own (SPEC §9.3.2).
-    // The first such member names the refusal (#1517).
-    let unstaged = |(set, _): (&CandidateSet, &bool)| {
-        target.candidates.get(set)?.iter().find(|member| {
-            !own(set.class, member)
-                && !desired
-                    .candidates
-                    .get(set)
-                    .is_some_and(|scratch| scratch.contains(member))
+    // The first such member that `faithful` itself fails names the refusal,
+    // so a member the call cannot reach is never named (#1517).
+    let unstaged = |(set, one_argument): (&CandidateSet, &bool)| {
+        let on_target = target.candidates.get(set)?;
+        let on_scratch = desired.candidates.get(set)?;
+        on_target.iter().find(|member| {
+            !on_scratch.contains(*member)
+                && !own(set.class, member)
+                && !reproduced(set, *one_argument, on_target, on_scratch, member)
         })
     };
     let mut assessment = Assessment::default();
@@ -576,7 +585,7 @@ pub(super) fn assess_with(
                         "{} on the target is not in the resolver's baseline, and {} could \
                          bind it; add it to the baseline, or select no resolver and keep \
                          ADR-0013's conservative rebuild",
-                        super::staged::named(member),
+                        overload(member),
                         // The declaration, not its part: a view's rule, a
                         // default's record.
                         super::staged::named(owner(object))
@@ -782,6 +791,22 @@ fn compiled_early(
                     )
             })
         })
+}
+
+/// An object as a refusal names it, a routine with its argument types: the
+/// set holds every overload of the name, so the name alone would not say
+/// which one the operator has to stage (#1517).
+fn overload(member: &ObjectIdentity) -> String {
+    let name = super::staged::named(member);
+    if member.class != "pg_proc" {
+        return name;
+    }
+    let arguments: Vec<String> = member
+        .signature
+        .iter()
+        .map(|argument| argument.name.join("."))
+        .collect();
+    format!("{name}({})", arguments.join(", "))
 }
 
 #[cfg(test)]
