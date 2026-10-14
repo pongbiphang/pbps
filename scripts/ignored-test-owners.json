@@ -381,6 +381,7 @@
         "renames_only_the_catalog_can_order_apply_or_are_refused_at_plan",
         "resolver_selection_is_lazy_and_obeys_cli_environment_project_precedence",
         "retyped_defaults_and_referenced_keys_apply_through_the_saved_plan_gate",
+        "role_name_reuse_compares_the_grants_of_the_final_principal",
         "roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan",
         "snapshot_and_baseline_refuse_a_held_deployment_lock",
         "source_default_collation_notice_is_only_printed_once_during_onboarding",

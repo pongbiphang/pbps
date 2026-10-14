@@ -1016,3 +1016,30 @@ an entry here.
      statement would therefore have the pull promise per privilege what the
      emitted statement settles per grantor, so the width is what goes rather
      than the promise (#251).
+
+<a id="dec-1988-1"></a>
+
+**DEC-1988.1. The grant comparison carries a role's identity, not its old
+spelling.** The apply guard already has `PlanNames`, so its remaining
+independent role rename map is removed. Baseline roles are paired with
+the final name of their surviving UID once; the carried-name set and
+grant comparison consume those same pairs. A retired holder does not
+supply grants to a different final holder of its name. After-only roles
+start with no grants and their names are not translated again.
+
+Measured on SQL Server 17.0.4075.5: commit a drop of `a`, then commit a
+rename of `b` to `a`, and deploy both revisions together. The connected
+plan emits DROP ROLE followed by ALTER ROLE; the engine preserves b's
+SELECT grant. The old guard compared the retired a's INSERT grant with
+it and rolled the valid transaction back. Identity pairing removes that
+false comparison without changing permission additions, removals,
+target normalization, or the SoFar/Whole/Closing policy.
+
+Planned identity does not replace observed progress. A staged closing
+baseline may already spell the final name; its grants remain the
+baseline. A staged DROP ROLE can first remove memberships while leaving
+the role and grants present. A retired UID whose name has no replacement
+therefore keeps its same-name comparison while observed. Pairs are kept
+as a vector rather than a destination-keyed map: ambiguous observations
+must not silently overwrite one another. Staged admission still permits
+exactly one logical change (DEC-1950.1).
