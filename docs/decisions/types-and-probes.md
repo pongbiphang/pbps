@@ -1856,3 +1856,49 @@ not see, is #1890.
 The live `a_serial_round_trips_and_numbers_the_rows_it_is_added_to` pins the
 round trip on both versions, the numbering of an added column, and the
 shared and unowned sequences as negative cases.
+
+<a id="dec-1775-1"></a>
+
+**DEC-1775.1. Preflight projects the prefix before each statement; the shared
+walk records facts and the dialect interprets them.** The checksum-pinned
+change list supplies the boundary, rather than a second copy of the planner's
+sort classes. `PlanFacts` in `pbps-dialect` borrows `PlanNames` and classifies
+every `Change` exhaustively once. `before(k)` contains steps `[0, k)`;
+`before(len)` is the whole-plan endpoint, including for an empty plan. A
+removal keeps the stored identity resolved at its own step (DEC-1770.1).
+Column additions and retypes remain separate events: retaining only the latest
+one would lose a backfill followed by a conversion.
+
+Row writes share tuple bookkeeping, unknown assignments, gone-key unions and
+omission classification. SQL literal readers, assignment conversion,
+collation, added-column backfill and PostgreSQL partition reach remain in the
+dialects. In particular, PostgreSQL backfills a nullable added column's default;
+SQL Server does not (decision 171). Each probe materializes its prefix only
+when it needs engine state, so changes with no probe do not repeatedly build
+row projections and no plan-sized snapshots are retained at every boundary.
+
+Measured on SQL Server and PostgreSQL 18/16: a NOT NULL statement before the
+update that fills a NULL must count that NULL; the reverse order counts zero
+and succeeds. A PostgreSQL parent tightening before an attach must not count
+the unattached child's NULL, while a tightening after it must. The old
+whole-plan projection gave the opposite answers in these cases. The live
+`tightening_reads_prior_writes_and_never_future_writes` and
+`tightening_sees_an_attached_child_only_after_the_attach` fail with the
+whole-plan projection restored and pass with positional reads.
+`an_attach_cannot_borrow_a_later_detachs_empty_range` also measures that a
+DEFAULT partition's rows remain range blockers until its detach has run.
+
+The current statement still owns its simultaneous effects: a DELETE removes
+its target's self-reference, and a CREATE's inline foreign keys see the
+columns it defines. Neither requires making later statements visible.
+A foreign key added after a row deletion validates that deletion at the key's
+own step. Its current definition is explicit input to the dialect's planned-key
+checks; it is not inserted into the prefix as if already installed. This keeps
+the existing converted-value, backfill, survivor and unreadable-child guards
+without making a future key visible to an earlier DELETE. Measured on
+PostgreSQL 18/16, repairing the child between DELETE and ADD FOREIGN KEY makes
+the key succeed, while the same repair after ADD does not:
+`a_new_key_validates_writes_before_its_own_step_and_never_after_it`.
+
+The extraction was first checked against 192 existing preflight reports with
+byte-identical SQL and diagnostics before changing the read boundaries.

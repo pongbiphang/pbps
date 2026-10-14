@@ -40,6 +40,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod estimate;
+pub mod plan_rows;
 
 #[cfg(test)]
 use pbps_model::ChangeSet;

@@ -41,6 +41,9 @@ mod estimate_tests;
 #[path = "support/resolver.rs"]
 mod resolver_tests;
 
+#[path = "support/positional_preflight.rs"]
+mod positional_preflight_tests;
+
 #[path = "support/removal_names.rs"]
 mod removal_names_tests;
 

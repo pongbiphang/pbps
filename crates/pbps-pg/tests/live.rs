@@ -37,6 +37,9 @@ mod physical_sources;
 #[path = "support/resolver.rs"]
 mod resolver_tests;
 
+#[path = "support/positional_preflight.rs"]
+mod positional_preflight_tests;
+
 #[path = "support/removal_names.rs"]
 mod removal_names_tests;
 
@@ -23012,9 +23015,14 @@ async fn a_row_arriving_against_an_unprobeable_parent_backfill_is_refused() {
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
     let probes = pg.fixture_preflight(&cs).probes;
+    // The preceding DELETE has its own catalog-key refusal. Select the
+    // new key's later backfill check, which sees writes before its ADD.
     let refusal = probes
         .iter()
-        .find(|p| p.description.contains("cannot evaluate"))
+        .find(|p| {
+            p.description.contains("cannot evaluate")
+                && p.description.contains("foreign key this plan adds")
+        })
         .expect("the identity backfill is refused");
     assert!(
         refusal
@@ -23040,7 +23048,10 @@ async fn a_row_arriving_against_an_unprobeable_parent_backfill_is_refused() {
     let probes = pg.fixture_preflight(&cs).probes;
     let refusal = probes
         .iter()
-        .find(|p| p.description.contains("cannot evaluate"))
+        .find(|p| {
+            p.description.contains("cannot evaluate")
+                && p.description.contains("foreign key this plan adds")
+        })
         .expect("the refusal is still offered");
     assert_eq!(
         counted(&mut conn, &refusal.sql).await,
@@ -23254,9 +23265,14 @@ async fn a_row_spelling_a_value_over_a_null_backfill_is_refused_on_its_own_tuple
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
     let probes = pg.fixture_preflight(&cs).probes;
+    // The preceding DELETE has its own catalog-key refusal. Select the
+    // new key's later backfill check, which sees writes before its ADD.
     let refusal = probes
         .iter()
-        .find(|p| p.description.contains("cannot evaluate"))
+        .find(|p| {
+            p.description.contains("cannot evaluate")
+                && p.description.contains("foreign key this plan adds")
+        })
         .expect("the arriving row is refused on its own tuple");
     assert!(
         refusal.description.contains("`c1`") && !refusal.description.contains("`c0`"),

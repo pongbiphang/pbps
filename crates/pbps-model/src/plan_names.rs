@@ -569,13 +569,22 @@ impl<'p> PlanNames<'p> {
     /// Surviving columns whose own spelling changed, under their final table.
     /// Table renames alone do not change a column's own name.
     pub fn renamed_columns(&self, table: &TableName) -> impl Iterator<Item = (&Uid, &str, &str)> {
-        let owner = match self.holder(table, At::End) {
+        self.renamed_columns_at(table, At::End)
+    }
+
+    /// Column spellings changed by this prefix, without reading later names.
+    pub fn renamed_columns_at<'a>(
+        &'a self,
+        table: &TableName,
+        at: At,
+    ) -> impl Iterator<Item = (&'a Uid, &'a str, &'a str)> + use<'a> {
+        let owner = match self.holder(table, at) {
             Holder::Tracked(uid) => Some(uid),
             Holder::Unmanaged | Holder::Vacant => None,
         };
         self.columns.names.keys().filter_map(move |uid| {
             let (_, from) = self.column_at(uid, At::Start)?;
-            let (held, to) = self.column_at(uid, At::End)?;
+            let (held, to) = self.column_at(uid, at)?;
             (Some(held) == owner && from != to).then_some((uid, from, to))
         })
     }
