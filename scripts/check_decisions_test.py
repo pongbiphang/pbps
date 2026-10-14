@@ -96,6 +96,7 @@ class TheRecord(unittest.TestCase):
             "| DEC-9.1 | [ledger](decisions/ledger.md#dec-9-1) | Nine |",
             "|  DEC-9.1 | [ledger](decisions/ledger.md#dec-9-1) | Nine |",
             "|DEC-9.1|[ledger](decisions/ledger.md#dec-9-1)|Nine|",
+            "DEC-9.1 | [ledger](decisions/ledger.md#dec-9-1) | Nine |",
         ):
             with self.subTest(row=row):
                 errors = run(index=INDEX + row + "\n")

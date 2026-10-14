@@ -39,8 +39,9 @@ NOT_CITATIONS = {INDEX, "scripts/check-decisions.py", "scripts/check_decisions_t
 LEGACY_ENTRY = re.compile(r"^(\d+)\. \*\*")
 NEW_ENTRY = re.compile(r"^\*\*DEC-(\d+)\.(\d+)\. ")
 ANCHOR = re.compile(r'^<a id="(decision-(\d+)|dec-(\d+)-(\d+))"></a>$')
-# Any spacing Markdown accepts around the first cell: `|DEC-9.1|` is the same row.
-DEC_INDEX_ROW = re.compile(r"^\|\s*(DEC-\d+\.\d+)\s*\|")
+# Any spelling of the first cell GitHub's tables accept: spacing around it, and
+# the leading pipe itself, are optional (`DEC-9.1 | ... |` is the same row).
+DEC_INDEX_ROW = re.compile(r"^\s*\|?\s*(DEC-\d+\.\d+)\s*\|")
 INDEX_ROW = re.compile(r"^\| (\d+) \| \[[^\]]+\]\(decisions/([^)#]+)#decision-(\d+)\) \|")
 # The last number of the closed sequence. Fixed here rather than read from the
 # index, which is an ordinary file a branch could extend along with its entry.
