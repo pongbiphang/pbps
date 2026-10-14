@@ -10,11 +10,14 @@ fn the_equivalence_corpus_covers_every_change_kind() {
     let expected: BTreeSet<_> = file
         .items
         .iter()
-        .find_map(|item| match item {
-            syn::Item::Enum(item) if item.ident == "Change" => {
+        .find_map(|item| {
+            if let syn::Item::Enum(item) = item
+                && item.ident == "Change"
+            {
                 Some(item.variants.iter().map(|v| v.ident.to_string()).collect())
+            } else {
+                None
             }
-            _ => None,
         })
         .unwrap();
     let cases = corpus::cases();

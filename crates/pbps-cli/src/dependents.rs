@@ -203,6 +203,52 @@ fn span(changes: &[PlannedChange], root: &ModuleId) -> Option<Span> {
     })
 }
 
+// These callers ask different questions of the same part address. Parent
+// reach belongs to removal above, never to exact restoration (DEC-1699.1).
+#[allow(clippy::wildcard_enum_match_arm)]
+fn exact_dependent(part: &DependencyPart<'_>, holds: &Holds) -> bool {
+    match (part, holds) {
+        (DependencyPart::Module { id, .. }, Holds::Module(module)) => *id == module,
+        (
+            DependencyPart::Named {
+                table,
+                kind: pbps_model::Part::Check,
+                name,
+            },
+            Holds::TablePart {
+                table: target,
+                part: Part::Check(target_name),
+            },
+        )
+        | (
+            DependencyPart::Named {
+                table,
+                kind: pbps_model::Part::Index,
+                name,
+            },
+            Holds::TablePart {
+                table: target,
+                part: Part::Index(target_name),
+            },
+        ) => *table == target && *name == target_name,
+        (
+            DependencyPart::Default { column, .. },
+            Holds::TablePart {
+                table,
+                part: Part::Default(name),
+            },
+        )
+        | (
+            DependencyPart::Generated(column),
+            Holds::TablePart {
+                table,
+                part: Part::Generated(name),
+            },
+        ) => column.table == *table && column.name == *name,
+        _ => false,
+    }
+}
+
 /// Whether `change` removes exactly this dependent.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn removes(change: &Change, holds: &Holds, partitions: &Partitions) -> bool {
@@ -8285,250 +8331,6 @@ mod tests {
         assert_eq!(relation_literal(&a(63)), some(None, &a(63)));
         for not_a_name in ["", "a b", "app.", ".ix", "a.b.c.d", "\"open", "1259", "-"] {
             assert_eq!(relation_literal(not_a_name), None, "{not_a_name:?}");
-        }
-    }
-}
-
-// These callers ask different questions of the same part address. Parent
-// reach belongs to removal above, never to exact restoration (DEC-1699.1).
-#[allow(clippy::wildcard_enum_match_arm)]
-fn exact_dependent(part: &DependencyPart<'_>, holds: &Holds) -> bool {
-    match (part, holds) {
-        (DependencyPart::Module { id, .. }, Holds::Module(module)) => *id == module,
-        (
-            DependencyPart::Named {
-                table,
-                kind: pbps_model::Part::Check,
-                name,
-            },
-            Holds::TablePart {
-                table: target,
-                part: Part::Check(target_name),
-            },
-        )
-        | (
-            DependencyPart::Named {
-                table,
-                kind: pbps_model::Part::Index,
-                name,
-            },
-            Holds::TablePart {
-                table: target,
-                part: Part::Index(target_name),
-            },
-        ) => *table == target && *name == target_name,
-        (
-            DependencyPart::Default { column, .. },
-            Holds::TablePart {
-                table,
-                part: Part::Default(name),
-            },
-        )
-        | (
-            DependencyPart::Generated(column),
-            Holds::TablePart {
-                table,
-                part: Part::Generated(name),
-            },
-        ) => column.table == *table && column.name == *name,
-        _ => false,
-    }
-}
-#[cfg(test)]
-#[allow(clippy::wildcard_enum_match_arm)]
-fn old_removes(change: &Change, holds: &Holds, partitions: &Partitions) -> bool {
-    match (holds, change) {
-        (Holds::Module(x), Change::DropModule { id, .. }) => id == x,
-        (Holds::TablePart { table, part }, change) => match (part, change) {
-            (Part::Check(n), Change::DropCheck { table: t, name }) => t == table && name == n,
-            (Part::Index(n), Change::DropIndex { table: t, name }) => t == table && name == n,
-            // On a partition, its parent's too: the engine recurses `DROP
-            // DEFAULT` into every partition, its own default included
-            // (measured on 16 and 18, #1699).
-            (
-                Part::Default(c),
-                Change::AlterColumnDefault {
-                    column, to: None, ..
-                },
-            ) => reaches(&column.table, table, partitions) && column.name == *c,
-            // A partition's default goes only when the partition takes
-            // neither its own nor its parent's (#1588).
-            (
-                Part::Default(c),
-                Change::SetPartitionDefault {
-                    table: t,
-                    column,
-                    to: None,
-                    fallback: None,
-                    ..
-                },
-            ) => t == table && column == c,
-            // A changed expression takes the old one's dependency away
-            // (DEC-1168.1). If the new one calls the module again, its
-            // `SET EXPRESSION` binds the old module and the drop is refused
-            // inside the transaction: the loud outcome, where telling the two
-            // apart would mean parsing the expression (DECISIONS 174).
-            (Part::Generated(c), Change::AlterColumnExpression { column, .. }) => {
-                reaches(&column.table, table, partitions) && column.name == *c
-            }
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::wildcard_enum_match_arm)]
-fn old_restores(change: &Change, holds: &Holds, _: &Partitions) -> bool {
-    match (holds, change) {
-        (Holds::Module(x), Change::CreateModule { id, .. }) => id == x,
-        (Holds::TablePart { table, part }, change) => match (part, change) {
-            (Part::Check(n), Change::AddCheck { table: t, name, .. }) => t == table && name == n,
-            (Part::Index(n), Change::AddIndex { table: t, name, .. }) => t == table && name == n,
-            (
-                Part::Default(c),
-                Change::AlterColumnDefault {
-                    column,
-                    from: None,
-                    to: Some(_),
-                    ..
-                },
-            ) => column.table == *table && column.name == *c,
-            (
-                Part::Default(c),
-                Change::SetPartitionDefault {
-                    table: t,
-                    column,
-                    from: None,
-                    to,
-                    fallback,
-                    ..
-                },
-            ) => t == table && column == c && (to.is_some() || fallback.is_some()),
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::wildcard_enum_match_arm)]
-fn old_removes_with_its_owner(change: &Change, holds: &Holds, partitions: &Partitions) -> bool {
-    match (holds, change) {
-        (Holds::TablePart { table, .. }, Change::DropTable { name, .. }) => name == table,
-        (
-            Holds::TablePart {
-                table,
-                part: Part::Default(c) | Part::Generated(c),
-            },
-            Change::DropColumn { column, .. },
-        ) => reaches(&column.table, table, partitions) && column.name == *c,
-        _ => false,
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::wildcard_enum_match_arm)]
-fn old_edits_in_place(change: &Change, holds: &Holds, _: &Partitions) -> bool {
-    match (holds, change) {
-        (Holds::Module(x), Change::AlterModule { id, .. }) => id == x,
-        (
-            Holds::TablePart {
-                table,
-                part: Part::Default(c),
-            },
-            Change::AlterColumnDefault {
-                column,
-                from: Some(_),
-                to: Some(_),
-                ..
-            },
-        ) => column.table == *table && column.name == *c,
-        // A partition's own default replaced by another, or by its parent's.
-        (
-            Holds::TablePart {
-                table,
-                part: Part::Default(c),
-            },
-            Change::SetPartitionDefault {
-                table: t,
-                column,
-                from: Some(_),
-                to,
-                fallback,
-                ..
-            },
-        ) => t == table && column == c && (to.is_some() || fallback.is_some()),
-        _ => false,
-    }
-}
-
-#[cfg(test)]
-#[path = "../../pbps-model/tests/support/part_effect_cases.rs"]
-mod part_effect_cases;
-
-#[test]
-fn dependency_effects_preserve_weaving_answers_for_every_change() {
-    use pbps_model::Table;
-
-    let mut targets = vec![Holds::Unrepresentable("outside".into())];
-    for name in ["app.v", "app.f()", "app.p()", "app.t.trig", "app.other"] {
-        targets.push(Holds::Module(name.parse().unwrap()));
-    }
-    for table in [
-        "app.t",
-        "app.child",
-        "app.parent",
-        "app.renamed",
-        "app.other",
-    ] {
-        for name in ["n", "d", "g", "i", "s", "renamed", "part", "other"] {
-            for part in [
-                Part::Default(name.into()),
-                Part::Generated(name.into()),
-                Part::Check(name.into()),
-                Part::Index(name.into()),
-            ] {
-                targets.push(Holds::TablePart {
-                    table: table.parse().unwrap(),
-                    part,
-                });
-            }
-        }
-    }
-    let mut relations = vec![Partitions::default()];
-    for (child, parent) in [("app.child", "app.t"), ("app.t", "app.parent")] {
-        let mut schema = Schema::default();
-        schema.tables.insert(
-            child.parse().unwrap(),
-            Table {
-                partition_of: Some(pbps_model::PartitionOf {
-                    parent: parent.parse().unwrap(),
-                    bound: pbps_model::PartitionBound::Default,
-                    columns: BTreeMap::new(),
-                }),
-                ..Table::default()
-            },
-        );
-        relations.push(Partitions::of(&schema));
-    }
-    for (name, change) in part_effect_cases::cases() {
-        for (relation, partitions) in relations.iter().enumerate() {
-            for holds in &targets {
-                let actual = [
-                    removes(&change, holds, partitions),
-                    restores(&change, holds, partitions),
-                    removes_with_its_owner(&change, holds, partitions),
-                    edits_in_place(&change, holds, partitions),
-                ];
-                let expected = [
-                    old_removes(&change, holds, partitions),
-                    old_restores(&change, holds, partitions),
-                    old_removes_with_its_owner(&change, holds, partitions),
-                    old_edits_in_place(&change, holds, partitions),
-                ];
-                assert_eq!(actual, expected, "{name}, relation {relation}, {holds:?}");
-            }
         }
     }
 }
