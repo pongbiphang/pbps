@@ -329,6 +329,25 @@ how to add an entry here.
      so a reopened session cannot inherit it, and requalified on every check so
      an in-place change invalidates the run. SQL Server is the twin step, 521.
 
+     *Amended (#1997) by [DEC-1634.1](types-and-probes.md#dec-1634-1):
+     `xmloption` left the compared settings when it became a pin, which the
+     rule's own definition already required ("the effective settings the
+     dialect does not pin") and the list did not follow. Measured on 16.15 and
+     18.6 with a target whose `xmloption` was `document`, as a database
+     default and as a server-level value, a valid plan was refused twice
+     over. A server-level value was a `setting:xmloption` mismatch against a
+     scratch on `content`, the scratch being given copies of the database and
+     role defaults but not that. And a database default, which the scratch is
+     given, was refused at the capture: the capture sets `xmloption` for its
+     own transaction (`catalog::capture_path`), so the setting read as
+     `content` inside the read and as the database's value after it, which the
+     capture takes for a session input that changed. Nothing the resolver
+     reproduces runs under the target's value — the compile runs under
+     `session_pins` and the captures under `capture_path`, both `content` —
+     so it is neither compared nor replayed, and the pin is not repeated in
+     the capture session. The list is checked against the dialect's pins and
+     the capture's, so a setting pinned later cannot stay in it.*
+
 <a id="decision-521"></a>
 
 521. **SQL Server's analysis scope is qualified by the engine's own answers:

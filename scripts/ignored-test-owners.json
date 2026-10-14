@@ -1533,6 +1533,7 @@
         "resolver::server::scratch::live_tests::resolver_seals_an_accepted_build_limitation_and_rechecks_it",
         "resolver::server::scratch::live_tests::resolver_cleanup_runs_only_on_the_backend_the_run_checked",
         "resolver::server::scratch::live_tests::resolver_compiles_as_the_login_whatever_its_session_defaults",
+        "resolver::server::scratch::live_tests::resolver_answers_xml_fragments_for_a_target_whose_xmloption_is_document",
         "resolver::server::scratch::live_tests::resolver_provisions_as_the_superuser_login_whatever_its_default_role",
         "resolver::server::scratch::live_tests::resolver_compiles_as_a_non_superuser_provisioner_in_its_own_database",
         "resolver::server::scratch::live_tests::resolver_empties_the_supplied_database_when_the_run_refuses",

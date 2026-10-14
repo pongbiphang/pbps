@@ -946,6 +946,92 @@ async fn resolver_compiles_as_the_login_whatever_its_session_defaults() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_answers_xml_fragments_for_a_target_whose_xmloption_is_document() {
+    // `xmloption` is a pin of the dialect (DEC-1634.1): the compile, the
+    // captures and every deployment run under `content`, so what the
+    // target's ambient value is decides nothing the resolver reproduces
+    // (#1997, DEC-520). Two ways a target reads `document`: a database
+    // default, which the scratch is given a copy of, and a startup option,
+    // which stands in for a server-level value (`postgresql.conf`,
+    // `ALTER SYSTEM`) and is replayed nowhere. The first was refused at the
+    // capture ("session inputs changed"), the second as a mismatch.
+    let mut refused = Vec::new();
+    for server in SERVERS {
+        for how in ["a database default", "a startup option"] {
+            let mut fixture = Fixture::new(server);
+            let target_db = fixture.target().await;
+            let target = if how == "a database default" {
+                fixture
+                    .admin()
+                    .await
+                    .execute(&format!(
+                        "ALTER DATABASE {target_db} SET xmloption = document"
+                    ))
+                    .await
+                    .unwrap();
+                fixture.on(&target_db)
+            } else {
+                format!("{} options='-c xmloption=document'", fixture.on(&target_db))
+            };
+            // The premise: the planning session reads documents, so the
+            // fragments the plan declares are invalid in it.
+            let mut planning = Conn::connect(Driver::Postgres, &target).await.unwrap();
+            let read = planning.query("SHOW xmloption").await.unwrap();
+            let ambient = read[0]
+                .try_get::<&str>("xmloption")
+                .unwrap()
+                .map(str::to_owned);
+            let fragment = planning.query("SELECT '<a/><b/>'::pg_catalog.xml").await;
+            drop(planning);
+            let (login, scratch_db) = fixture.confined().await;
+            let inputs = Inputs::from_pair(cases::pair_with_xml_fragments());
+            let key = ProjectKey::new(true);
+            let result = produce(
+                &fixture.as_login(&scratch_db, &login),
+                &target,
+                &inputs,
+                &key,
+            )
+            .await;
+            let left = fixture.foreign_objects(&scratch_db).await;
+            fixture.drop().await;
+            assert_eq!(
+                ambient.as_deref(),
+                Some("document"),
+                "{server} {how}: the target's session reads documents"
+            );
+            assert!(
+                fragment.is_err(),
+                "{server} {how}: a fragment is refused in that session"
+            );
+            assert_eq!(
+                left.1, 0,
+                "{server} {how}: the run empties its database: {left:?}"
+            );
+            let plan = match result {
+                Ok(plan) => plan,
+                Err(error) => {
+                    refused.push(format!("{server} {how}: {error}"));
+                    continue;
+                }
+            };
+            plan.evidence.validate(&plan.changes).unwrap();
+            for name in ["xv", "xf"] {
+                assert!(
+                    plan.changes.changes.iter().any(|step| matches!(
+                        &step.change,
+                        Change::CreateModule { id, .. } if id.name().starts_with(name)
+                    )),
+                    "{server} {how}: the plan creates {name}"
+                );
+            }
+        }
+    }
+    assert!(refused.is_empty(), "a valid plan was refused: {refused:#?}");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
 async fn resolver_provisions_as_the_superuser_login_whatever_its_default_role() {
     // A superuser login whose default role cannot create roles: every
     // connection the run opens as it must act as the login itself, and so
