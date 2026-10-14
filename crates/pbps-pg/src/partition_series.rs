@@ -37,7 +37,8 @@
 //! calendar from the start, never stepped one after another.
 //!
 //! A refusal names the nearest values that would tile, because "your end is
-//! wrong" without the right one is a second round trip.
+//! wrong" without the right one is a second round trip. An integer key's
+//! nearest value above its type's maximum is left out and said so (#1905).
 //!
 //! # Limits, each a refusal rather than a guess
 //!
@@ -802,12 +803,24 @@ fn integers(
     }
     let diff = until - start;
     if diff % step != 0 {
+        // `until > start`, so `diff` is positive and `lower` lies in
+        // `[start, until)`, inside the key type whatever the step is. Only
+        // the value above can leave it, and a value the column cannot hold
+        // is no value to propose: it is left out and the refusal says so
+        // (#1905).
         let lower = start + diff / step * step;
+        let upper = lower + step;
+        let nearest = if upper <= int.max {
+            format!("The nearest that tile are `{lower}` and `{upper}`")
+        } else {
+            format!(
+                "The nearest that tiles is `{lower}`; no larger value fits a {}",
+                int.name
+            )
+        };
         return Err(invalid(format!(
             "--until `{until}` is not a whole number of steps of {step} after `{start}`, so the \
-             last partition would end short of it or past it. The nearest that tile are `{lower}` \
-             and `{}`",
-            lower + step
+             last partition would end short of it or past it. {nearest}"
         )));
     }
     let count = diff / step;
@@ -1310,6 +1323,92 @@ mod tests {
         let s = schema("bigint", &[("ev_0", "0", "1000")]);
         let said = refusal(ask(&s, "1000", "2500", None));
         assert!(said.contains("`2000` and `3000`"), "{said}");
+    }
+
+    /// Every number in `text`.
+    fn numbers(text: &str) -> Vec<u128> {
+        text.split(|c: char| !c.is_ascii_digit())
+            .filter(|run| !run.is_empty())
+            .map(|run| run.parse().unwrap())
+            .collect()
+    }
+
+    /// The part of an integer refusal that proposes values: what follows
+    /// "The nearest".
+    fn proposed(said: &str) -> &str {
+        said.split_once("The nearest")
+            .unwrap_or_else(|| panic!("no proposal in {said}"))
+            .1
+    }
+
+    /// The value above is left out when the key cannot hold it (#1905), for
+    /// every integer type by its own maximum. A 20-digit step is the widest
+    /// `--every` accepts, so it is the one that reaches past a `bigint`.
+    #[test]
+    fn a_nearest_value_beyond_the_key_type_is_left_out() {
+        for (ty, max, step, until) in [
+            (
+                "bigint",
+                i128::from(i64::MAX),
+                "99999999999999999999",
+                "9223372036854775807",
+            ),
+            (
+                "bigint",
+                i128::from(i64::MAX),
+                "9223372036854774808",
+                "2000",
+            ),
+            ("integer", i128::from(i32::MAX), "3000000000", "2000"),
+            ("integer", i128::from(i32::MAX), "2147482648", "2000"),
+            ("smallint", i128::from(i16::MAX), "40000", "2000"),
+            ("smallint", i128::from(i16::MAX), "31768", "2000"),
+        ] {
+            let s = schema(ty, &[("ev_0", "0", "1000")]);
+            let said = refusal(ask(&s, step, until, None));
+            assert!(
+                said.contains(&format!(
+                    "The nearest that tiles is `1000`; no larger value fits a {ty}"
+                )),
+                "{ty} {step}: {said}"
+            );
+            assert!(
+                numbers(proposed(&said))
+                    .iter()
+                    .all(|n| *n <= max.unsigned_abs()),
+                "{ty} {step}: {said}"
+            );
+        }
+    }
+
+    /// A value exactly at the type's maximum fits, so it is still named, and
+    /// an in-range pair reads as it always did.
+    #[test]
+    fn a_nearest_value_at_the_key_types_maximum_is_still_named() {
+        for (ty, step, top) in [
+            ("bigint", "9223372036854774807", "9223372036854775807"),
+            ("integer", "2147482647", "2147483647"),
+            ("smallint", "31767", "32767"),
+        ] {
+            let s = schema(ty, &[("ev_0", "0", "1000")]);
+            let said = refusal(ask(&s, step, "2000", None));
+            assert!(
+                said.ends_with(&format!("The nearest that tile are `1000` and `{top}`")),
+                "{ty}: {said}"
+            );
+        }
+    }
+
+    /// The value below cannot leave the type: it lies between the frontier
+    /// and `--until`, both of which were read as the type's own values.
+    #[test]
+    fn a_nearest_value_below_is_always_inside_the_key_type() {
+        let s = schema("smallint", &[("ev_x", "-40", "-32768")]);
+        let said = refusal(ask(&s, "70000", "-1", None));
+        assert!(
+            said.ends_with("The nearest that tiles is `-32768`; no larger value fits a smallint"),
+            "{said}"
+        );
     }
 
     #[test]
