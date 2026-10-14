@@ -3,6 +3,7 @@
 //! alone where that is sound. No SQL is read and no catalog is asked.
 
 use super::prepare::{forward, invalidates, surfaces};
+use pbps_model::part_effects::PartEffect;
 use pbps_model::resolver::Surface;
 use pbps_model::{Change, ChangeSet, GrantTarget, IdsIndex};
 use std::collections::BTreeMap;
@@ -93,6 +94,11 @@ fn assessed_with(
     engine: &Engine<'_>,
 ) -> Assessment {
     let after = surfaces(desired.schema);
+    let parts: Vec<_> = ordinary
+        .changes
+        .iter()
+        .map(|p| super::part_effects(&p.change))
+        .collect();
     let moved = ordinary
         .changes
         .iter()
@@ -107,11 +113,9 @@ fn assessed_with(
             continue;
         }
         let answer = if replaced(&surface, &kept, &base_names, &desired_names)
-            || ordinary
-                .changes
-                .iter()
-                .any(|p| recreates(&p.change, &surface, &kept, base, desired, engine))
-        {
+            || ordinary.changes.iter().zip(&parts).any(|(p, facts)| {
+                recreates(&p.change, facts, &surface, &kept, base, desired, engine)
+            }) {
             Answer::Rebuild
         } else if moved {
             Answer::Resolve
@@ -148,6 +152,7 @@ fn replaced(surface: &Surface, kept: &Surface, from: &IdsIndex<'_>, to: &IdsInde
 /// rebuild, which is the question itself, not its answer.
 fn recreates(
     change: &Change,
+    parts: &[PartEffect<'_>],
     surface: &Surface,
     kept: &Surface,
     base: crate::Side<'_>,
@@ -159,7 +164,7 @@ fn recreates(
     }
     // A change names a surface by whichever spelling it acts under; a kept
     // surface has one of each only across a rename.
-    invalidates(change, surface) || invalidates(change, kept)
+    invalidates(parts, surface) || invalidates(parts, kept)
 }
 
 /// Whether the declaration of a module differs, as the differ decides it:

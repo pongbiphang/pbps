@@ -22,7 +22,7 @@
 //! an engine; the reads are `engine::module_dependents`'.
 
 use pbps_model::ValueSource;
-use pbps_model::part_effects::{DefaultChange, Effect, Origin, Part as DependencyPart};
+use pbps_model::part_effects::{DefaultChange, Effect, Origin, Part as DependencyPart, PartEffect};
 use pbps_model::physical_sources::{ColumnAt, Located, Owner, PhysicalSources};
 use pbps_model::plan_names::{At, PlanNames};
 
@@ -42,6 +42,21 @@ impl Sources<'_> {
         let names = PlanNames::of(changes, self.after).map_err(|e| e.to_string())?;
         PhysicalSources::of(names, self.before.schema, self.before.ids).map_err(|e| e.to_string())
     }
+}
+
+// The regression counts actual classifier calls through the dependent walk.
+// A cache constructed but then ignored must not appear to save work.
+#[inline]
+fn part_effects(change: &Change) -> Vec<PartEffect<'_>> {
+    #[cfg(test)]
+    part_effect_tests::record_projection();
+    change.part_effects()
+}
+
+// A cache borrows the same immutable slice as the physical-source view.
+// Every splice releases both; the next view projects the new steps (DEC-1981.1).
+fn projected_parts(changes: &[PlannedChange]) -> Vec<Vec<PartEffect<'_>>> {
+    changes.iter().map(|p| part_effects(&p.change)).collect()
 }
 
 fn boundary(changes: &[PlannedChange], i: usize) -> At {
@@ -251,8 +266,8 @@ fn exact_dependent(part: &DependencyPart<'_>, holds: &Holds) -> bool {
 
 /// Whether `change` removes exactly this dependent.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn removes(change: &Change, holds: &Holds, partitions: &Partitions) -> bool {
-    change.part_effects().into_iter().any(|fact| {
+fn removes(parts: &[PartEffect<'_>], holds: &Holds, partitions: &Partitions) -> bool {
+    parts.iter().any(|fact| {
         if fact.effect != Effect::Removed
             && !matches!(
                 (&fact.part, fact.effect),
@@ -295,8 +310,8 @@ fn removes(change: &Change, holds: &Holds, partitions: &Partitions) -> bool {
 /// the parent's default, and a partition's own comes back only through its
 /// own change, which has to be the one placed after the module (#1699).
 #[allow(clippy::wildcard_enum_match_arm)]
-fn restores(change: &Change, holds: &Holds, _: &Partitions) -> bool {
-    change.part_effects().iter().any(|fact| {
+fn restores(parts: &[PartEffect<'_>], holds: &Holds, _: &Partitions) -> bool {
+    parts.iter().any(|fact| {
         fact.origin == Origin::Direct
             && fact.effect == Effect::Created
             && !matches!(fact.part, DependencyPart::Generated(_))
@@ -309,9 +324,12 @@ fn restores(change: &Change, holds: &Holds, _: &Partitions) -> bool {
 /// removal before the module's drop, but a dependent it takes away this way
 /// is one the declarations let go of, not one they fail to hold.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn removes_with_its_owner(change: &Change, holds: &Holds, partitions: &Partitions) -> bool {
-    change
-        .part_effects()
+fn removes_with_its_owner(
+    parts: &[PartEffect<'_>],
+    holds: &Holds,
+    partitions: &Partitions,
+) -> bool {
+    parts
         .iter()
         .any(|fact| match (&fact.part, fact.effect, holds) {
             (DependencyPart::Table(name), Effect::Removed, Holds::TablePart { table, .. }) => {
@@ -366,8 +384,8 @@ fn reaches(changed: &TableName, table: &TableName, partitions: &Partitions) -> b
 /// it: a view's `AlterModule`, or a default changed from one expression to
 /// another.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn edits_in_place(change: &Change, holds: &Holds, _: &Partitions) -> bool {
-    change.part_effects().iter().any(|fact| {
+fn edits_in_place(parts: &[PartEffect<'_>], holds: &Holds, _: &Partitions) -> bool {
+    parts.iter().any(|fact| {
         fact.effect == Effect::Rewritten
             && matches!(
                 fact.part,
@@ -390,7 +408,8 @@ fn split_in_place_edit(
     sources: &Sources<'_>,
 ) -> Result<(), String> {
     let view = sources.project(changes)?;
-    let Some(i) = find(&view, holds, partitions, edits_in_place) else {
+    let parts = projected_parts(changes);
+    let Some(i) = find(&view, &parts, holds, partitions, edits_in_place) else {
         return Ok(());
     };
     let (removal, restoration) = match changes[i].change.clone() {
@@ -625,19 +644,20 @@ fn default_change(
 /// change's own position.
 fn find(
     sources: &PhysicalSources<'_>,
+    parts: &[Vec<PartEffect<'_>>],
     holds: &Holds,
     partitions: &Partitions,
-    test: fn(&Change, &Holds, &Partitions) -> bool,
+    test: fn(&[PartEffect<'_>], &Holds, &Partitions) -> bool,
 ) -> Option<usize> {
     sources
         .names()
         .changes()
         .iter()
         .enumerate()
-        .find_map(|(i, p)| {
+        .find_map(|(i, _)| {
             let partitions = partitions.at(sources.names(), At::End, At::Before(i));
             named_at(sources, At::Before(i), holds)
-                .filter(|here| test(&p.change, here, &partitions))
+                .filter(|here| test(&parts[i], here, &partitions))
                 .map(|_| i)
         })
 }
@@ -904,6 +924,7 @@ pub(crate) fn weave(
     let mut refused: Vec<String> = Vec::new();
     let partitions = standing_partitions(declared, cs);
     let view = sources.project(&cs.changes)?;
+    let parts = projected_parts(&cs.changes);
     for (root, _) in &roots {
         let Some(deps) = found.get(root) else {
             continue;
@@ -911,8 +932,8 @@ pub(crate) fn weave(
         let blocked: Vec<Dependent> = deps
             .iter()
             .filter(|d| {
-                let accounted = find(&view, &d.holds, &partitions, removes).is_some()
-                    || find(&view, &d.holds, &partitions, removes_with_its_owner).is_some();
+                let accounted = find(&view, &parts, &d.holds, &partitions, removes).is_some()
+                    || find(&view, &parts, &d.holds, &partitions, removes_with_its_owner).is_some();
                 matches!(d.holds, Holds::Unrepresentable(_))
                     || (!as_declared(&view, d).is_some_and(|d| d.managed(declared))
                         && !accounted
@@ -1000,6 +1021,7 @@ pub(crate) fn weave(
             }
             split_in_place_edit(&mut cs.changes, &d.holds, &partitions, dialect, &sources)?;
             let view = sources.project(&cs.changes)?;
+            let parts = projected_parts(&cs.changes);
             let Some(at) = span(&cs.changes, root) else {
                 continue;
             };
@@ -1012,12 +1034,12 @@ pub(crate) fn weave(
             // already removed, and nothing to put back, since the
             // declarations no longer have its owner. A removal synthesized
             // here would name an object that is gone by then.
-            if find(&view, &d.holds, &partitions, removes_with_its_owner)
+            if find(&view, &parts, &d.holds, &partitions, removes_with_its_owner)
                 .is_some_and(|i| i < at.drop_at)
             {
                 continue;
             }
-            let removal = find(&view, &d.holds, &partitions, removes);
+            let removal = find(&view, &parts, &d.holds, &partitions, removes);
             let removed_at = match removal {
                 Some(i) if i < at.drop_at => i,
                 Some(i) => {
@@ -1054,7 +1076,8 @@ pub(crate) fn weave(
             // kept. The old one is removed before the drop above; the new one
             // is its own creation's business.
             let view = sources.project(&cs.changes)?;
-            if find(&view, &d.holds, &partitions, removes_with_its_owner).is_some() {
+            let parts = projected_parts(&cs.changes);
+            if find(&view, &parts, &d.holds, &partitions, removes_with_its_owner).is_some() {
                 continue;
             }
             let Some(kept) = as_declared(&view, d) else {
@@ -1069,7 +1092,7 @@ pub(crate) fn weave(
                 continue;
             };
             let after = at.create_at.unwrap_or(removed_at);
-            let restoration = find(&view, &d.holds, &partitions, restores);
+            let restoration = find(&view, &parts, &d.holds, &partitions, restores);
             match restoration {
                 Some(j) if j > after => {}
                 Some(j) => {
@@ -1166,6 +1189,7 @@ fn after_its_release(
     sources: &Sources<'_>,
 ) -> Result<bool, String> {
     let view = sources.project(&cs.changes)?;
+    let parts = projected_parts(&cs.changes);
     let Some(at) = span(&cs.changes, root) else {
         return Ok(false);
     };
@@ -1175,9 +1199,9 @@ fn after_its_release(
             Holds::TablePart {
                 part: Part::Generated(_),
                 ..
-            } => find(&view, &d.holds, partitions, removes)
-                .or_else(|| find(&view, &d.holds, partitions, removes_with_its_owner)),
-            Holds::Module(_) => find(&view, &d.holds, partitions, removes),
+            } => find(&view, &parts, &d.holds, partitions, removes)
+                .or_else(|| find(&view, &parts, &d.holds, partitions, removes_with_its_owner)),
+            Holds::Module(_) => find(&view, &parts, &d.holds, partitions, removes),
             Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
         })
         .filter(|i| *i > at.drop_at)
@@ -3590,6 +3614,7 @@ pub(crate) fn released(
     partitions: &Partitions,
     view: &PhysicalSources<'_>,
 ) -> BTreeSet<ColumnRef> {
+    let parts = projected_parts(view.names().changes());
     let mut out = BTreeSet::new();
     for (root, _) in dropped_modules(cs) {
         for d in found.get(&root).into_iter().flatten() {
@@ -3602,7 +3627,7 @@ pub(crate) fn released(
             ) {
                 continue;
             }
-            if let Some(i) = find(view, &d.holds, partitions, removes)
+            if let Some(i) = find(view, &parts, &d.holds, partitions, removes)
                 && let Change::AlterColumnExpression { column, .. } = &cs.changes[i].change
             {
                 out.insert(column.clone());
@@ -3621,14 +3646,15 @@ pub(crate) fn unaccounted(
     partitions: &Partitions,
     view: &PhysicalSources<'_>,
 ) -> Vec<String> {
+    let parts = projected_parts(view.names().changes());
     let mut out = Vec::new();
     for (root, _) in dropped_modules(cs) {
         let (Some(deps), Some(at)) = (found.get(&root), span(&cs.changes, &root)) else {
             continue;
         };
         for d in deps {
-            let removed_first = find(view, &d.holds, partitions, removes)
-                .or_else(|| find(view, &d.holds, partitions, removes_with_its_owner))
+            let removed_first = find(view, &parts, &d.holds, partitions, removes)
+                .or_else(|| find(view, &parts, &d.holds, partitions, removes_with_its_owner))
                 .is_some_and(|i| i < at.drop_at)
                 || taken_by_its_parent(&cs.changes, &d.holds, at.drop_at);
             if !removed_first {
@@ -3641,6 +3667,8 @@ pub(crate) fn unaccounted(
 
 #[cfg(test)]
 mod fixture;
+#[cfg(test)]
+mod part_effect_tests;
 #[cfg(test)]
 mod physical_tests;
 

@@ -1,4 +1,4 @@
-use pbps_model::part_effects::{DefaultChange, Effect, Part as DependencyPart};
+use pbps_model::part_effects::{DefaultChange, Effect, Part as DependencyPart, PartEffect};
 use pbps_model::resolver::{OrderEdge, OrderReason, Surface, SurfaceResolution};
 use pbps_model::{Change, ChangeSet, GrantTarget, TableName, ValueSource};
 use std::collections::BTreeSet;
@@ -6,18 +6,22 @@ use std::collections::BTreeSet;
 // Model facts classify every Change kind. This consumer selects the binding
 // surfaces it provides; scheduling and containment remain graph policy.
 #[allow(clippy::wildcard_enum_match_arm)]
-pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
-    c.part_effects()
-        .into_iter()
-        .filter_map(|fact| match (fact.part, fact.effect) {
-            (DependencyPart::Table(table), Effect::Created) => Some(Surface::Table(table.clone())),
-            (DependencyPart::Column(column), Effect::Created) => Some(Surface::Column(column)),
+fn provides(parts: &[PartEffect<'_>]) -> BTreeSet<Surface> {
+    parts
+        .iter()
+        .filter_map(|fact| match (&fact.part, fact.effect) {
+            (DependencyPart::Table(table), Effect::Created) => {
+                Some(Surface::Table((*table).clone()))
+            }
+            (DependencyPart::Column(column), Effect::Created) => {
+                Some(Surface::Column(column.clone()))
+            }
             (
                 DependencyPart::Default { column, .. } | DependencyPart::Generated(column),
                 Effect::Created | Effect::Rewritten,
-            ) => Some(Surface::Default(column)),
+            ) => Some(Surface::Default(column.clone())),
             (DependencyPart::Module { id, .. }, Effect::Created | Effect::Rewritten) => {
-                Some(Surface::Module(id.clone()))
+                Some(Surface::Module((*id).clone()))
             }
             (
                 DependencyPart::Named {
@@ -27,8 +31,8 @@ pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
                 },
                 Effect::Created,
             ) => Some(Surface::Check {
-                table: table.clone(),
-                name: name.to_owned(),
+                table: (*table).clone(),
+                name: (*name).to_owned(),
             }),
             (
                 DependencyPart::Named {
@@ -38,8 +42,8 @@ pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
                 },
                 Effect::Created,
             ) => Some(Surface::Index {
-                table: table.clone(),
-                name: name.to_owned(),
+                table: (*table).clone(),
+                name: (*name).to_owned(),
             }),
             _ => None,
         })
@@ -50,8 +54,8 @@ pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
 // can release its own binding while retaining an inherited default; neither
 // question is simply whether the effective expression disappears (DEC-1773.1).
 #[allow(clippy::wildcard_enum_match_arm)]
-fn release(c: &Change, surface: &Surface) -> bool {
-    c.part_effects()
+fn release(parts: &[PartEffect<'_>], surface: &Surface) -> bool {
+    parts
         .iter()
         .any(|fact| match (&fact.part, fact.effect, surface) {
             (DependencyPart::Module { id, .. }, Effect::Removed, Surface::Module(module)) => {
@@ -174,10 +178,14 @@ pub(super) fn constraints(
     let base_names = base.ids.index();
     let desired_names = desired.ids.index();
     let steps: Vec<_> = changes.changes.iter().map(|p| &p.change).collect();
+    // These are the prepared steps, after splitting and expansion. Borrow
+    // this slice locally so facts cannot outlive a change of its order.
+    let parts: Vec<_> = steps.iter().map(|c| super::part_effects(c)).collect();
     let made: Vec<_> = steps
         .iter()
-        .map(|c| {
-            let mut surfaces = provides(c);
+        .zip(&parts)
+        .map(|(c, facts)| {
+            let mut surfaces = provides(facts);
             match c {
                 Change::RenameTable { to, .. } => {
                     surfaces.insert(Surface::Table(to.clone()));
@@ -606,13 +614,13 @@ pub(super) fn constraints(
         let removes: Vec<_> = steps
             .iter()
             .enumerate()
-            .filter(|&(i, c)| {
+            .filter(|&(i, _)| {
                 owned(i, base_owner)
-                    && (release(c, surface)
+                    && (release(&parts[i], surface)
                         || (&final_spelling != surface
                             && owners[i].is_some()
                             && base_owner.is_some()
-                            && release(c, &final_spelling)))
+                            && release(&parts[i], &final_spelling)))
             })
             .map(|(i, _)| i)
             .collect();
@@ -632,8 +640,8 @@ pub(super) fn constraints(
         }
         if let Some(current) = &observation.current {
             for input in &current.managed_inputs {
-                for (i, change) in steps.iter().enumerate() {
-                    if super::prepare::invalidates(change, input) {
+                for (i, facts) in parts.iter().enumerate() {
+                    if super::prepare::invalidates(facts, input) {
                         for &drop in &removes {
                             if drop != i {
                                 edge(drop, i, OrderReason::Binding);
@@ -720,14 +728,14 @@ fn a_prepared_default_rewrite_releases_then_provides_its_binding() {
     let target = Surface::Default(column.clone());
     let rewrite = change(Some("app.old()"), Some("app.new()"));
     assert!(
-        !release(&rewrite, &target),
+        !release(&rewrite.part_effects(), &target),
         "release consumes the prepared split, not the unsplit edit"
     );
-    assert!(provides(&rewrite).contains(&target));
+    assert!(provides(&rewrite.part_effects()).contains(&target));
     let drop = change(Some("app.old()"), None);
     let create = change(None, Some("app.new()"));
-    assert!(release(&drop, &target));
-    assert!(!provides(&drop).contains(&target));
-    assert!(provides(&create).contains(&target));
-    assert!(!release(&create, &target));
+    assert!(release(&drop.part_effects(), &target));
+    assert!(!provides(&drop.part_effects()).contains(&target));
+    assert!(provides(&create.part_effects()).contains(&target));
+    assert!(!release(&create.part_effects(), &target));
 }
