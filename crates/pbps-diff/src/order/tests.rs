@@ -655,3 +655,98 @@ fn a_renamed_column_keeps_its_default_so_a_row_insert_waits_for_nothing() {
     // row wait for the drop.
     assert!(default_must_go(&renamed_default(None)));
 }
+
+/// `par` with a partition `pt` attached in the plan, whose own default and
+/// NOT NULL on `note` are then set: ops 0 (attach), 1 (default), 2 (NOT NULL).
+fn attached_partition() -> Plan {
+    use pbps_model::{PartitionBound, PartitionColumn, PartitionOf};
+    let mut before = Schema::default();
+    before.tables.insert(t("par"), table_with(&["id", "note"]));
+    before.tables.insert(t("pt"), table_with(&["id", "note"]));
+    let mut member = table_with(&[]);
+    member.partition_of = Some(PartitionOf {
+        parent: t("par"),
+        bound: PartitionBound::Default,
+        columns: [(
+            "note".to_owned(),
+            PartitionColumn {
+                default: Some("5".into()),
+                not_null: true,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    });
+    let mut after = Schema::default();
+    after.tables.insert(t("par"), table_with(&["id", "note"]));
+    after.tables.insert(t("pt"), member.clone());
+    let pt = uid(UidKind::Table, "pt");
+    Plan {
+        logical: vec![
+            p(Change::AttachPartition {
+                uid: pt.clone(),
+                table: t("pt"),
+                parent: t("par"),
+                bound: PartitionBound::Default,
+                shape: Box::new(member),
+            }),
+            p(Change::SetPartitionDefault {
+                uid: pt.clone(),
+                table: t("pt"),
+                parent: t("par"),
+                column: "note".into(),
+                from: None,
+                to: Some("5".into()),
+                fallback: None,
+            }),
+            p(Change::SetPartitionNotNull {
+                uid: pt,
+                table: t("pt"),
+                column: "note".into(),
+                not_null: true,
+            }),
+        ],
+        before,
+        after,
+        before_ids: Plan::ids(
+            &["par", "pt"],
+            &[("par", "id"), ("par", "note"), ("pt", "id"), ("pt", "note")],
+        ),
+        after_ids: Plan::ids(&["par", "pt"], &[("par", "id"), ("par", "note")]),
+    }
+}
+
+#[test]
+fn a_partitions_default_and_not_null_on_one_column_do_not_order_each_other() {
+    let plan = attached_partition();
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    let g = graph(ops.as_slice(), &fx, &baseline, &none, Checks::ALL);
+    assert!(
+        !g.edges
+            .iter()
+            .any(|e| (e.before, e.after) == (1, 2) || (e.before, e.after) == (2, 1)),
+        "{:?}",
+        g.edges
+    );
+    for order in [[0, 1, 2], [0, 2, 1]] {
+        assert_eq!(
+            run(&ops, &fx, &baseline, &order, &none, Checks::ALL),
+            [],
+            "{order:?}"
+        );
+    }
+    // Negative: the entry they both address is the attach's, and a step that
+    // runs before it is still refused.
+    let early = run(&ops, &fx, &baseline, &[2, 0, 1], &none, Checks::ALL);
+    assert!(
+        early.iter().any(|v| matches!(
+            v,
+            Violation::Edge { before, after, edge }
+                if before.source() == 0
+                    && after.source() == 2
+                    && matches!(edge.because, Because::Creates(ObjectKey::Column(_)))
+        )),
+        "{early:?}"
+    );
+}
