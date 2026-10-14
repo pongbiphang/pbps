@@ -181,19 +181,15 @@ pub fn cmd_extend(
     // refuses: a finding it had before is not this change's, and a rule left
     // at `warning` or `note` is advice that `validate` prints beside a valid
     // project. A rule whose pattern the existing partitions break must not
-    // make the series impossible to extend.
-    let had: std::collections::BTreeSet<(String, String)> =
-        crate::declaration_policy_findings(project, dialect.as_ref(), &loaded.schema, None)
-            .into_iter()
-            .filter(|f| f.severity == crate::output::Severity::Error)
-            .map(|f| (f.id, f.message))
-            .collect();
-    let broken: Vec<_> =
-        crate::declaration_policy_findings(project, dialect.as_ref(), &after.schema, None)
-            .into_iter()
-            .filter(|f| f.severity == crate::output::Severity::Error)
-            .filter(|f| !had.contains(&(f.id.clone(), f.message.clone())))
-            .collect();
+    // make the series impossible to extend. The clock is read here, once, for
+    // both trees (DEC-1943.1).
+    let broken = errors_the_series_adds(
+        project,
+        dialect.as_ref(),
+        &loaded.schema,
+        &after.schema,
+        crate::unix_seconds(),
+    );
     if !broken.is_empty() {
         let lines: Vec<String> = broken
             .iter()
@@ -243,6 +239,33 @@ pub fn cmd_extend(
     Ok(())
 }
 
+/// The error-severity policy findings `after` has and `before` did not, with
+/// both trees asked at the one instant `now`.
+///
+/// A finding is compared by rule and message, so two evaluations are
+/// comparable only if nothing but the tree differs between them. A suppression
+/// carries an `until` date, and a clock read once per tree can straddle the
+/// instant it expires: the finding is suppressed in `before`, live in `after`,
+/// and the series is refused for an error it did not add (#1943, DEC-1943.1).
+fn errors_the_series_adds(
+    project: &Project,
+    dialect: &dyn pbps_dialect::Dialect,
+    before: &pbps_model::Schema,
+    after: &pbps_model::Schema,
+    now: i64,
+) -> Vec<crate::output::Finding> {
+    let errors = |schema| {
+        crate::declaration_policy_findings(project, dialect, schema, None, now)
+            .into_iter()
+            .filter(|f| f.severity == crate::output::Severity::Error)
+    };
+    let had: std::collections::BTreeSet<(String, String)> =
+        errors(before).map(|f| (f.id, f.message)).collect();
+    errors(after)
+        .filter(|f| !had.contains(&(f.id.clone(), f.message.clone())))
+        .collect()
+}
+
 /// The file that declares `parent`, as written, and what it loaded as.
 fn parents_file(
     project: &Project,
@@ -274,4 +297,93 @@ fn list<'a>(lines: impl Iterator<Item = &'a str>) -> String {
         .map(|line| format!("  - {line}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One second before the suppression below expires, and the second it does:
+    /// `until: 2026-12-31` stops applying at 2026-12-31T00:00:00Z.
+    const BEFORE_EXPIRY: i64 = 1_798_675_199;
+    const AT_EXPIRY: i64 = BEFORE_EXPIRY + 1;
+    /// Well clear of the date, either way.
+    const LONG_BEFORE: i64 = BEFORE_EXPIRY - 30 * 86_400;
+    const LONG_AFTER: i64 = AT_EXPIRY + 30 * 86_400;
+
+    fn project() -> Project {
+        let yaml = "dialect: postgres\n\
+                    policies:\n  rules:\n    naming.table: {severity: error, pattern: \"^[a-z][a-z0-9_]*$\"}\n  \
+                    suppress:\n    - {rule: naming.table, on: app.Legacy, reason: inherited, until: 2026-12-31}\n";
+        Project {
+            root: PathBuf::new(),
+            config: pbps_config::Config::parse(yaml, Path::new("pbps.yml")).unwrap(),
+        }
+    }
+
+    fn schema(names: &[&str]) -> pbps_model::Schema {
+        let mut schema = pbps_model::Schema::default();
+        for name in names {
+            schema
+                .tables
+                .insert(TableName::new("app", *name), Table::default());
+        }
+        schema
+    }
+
+    fn adds(before: &[&str], after: &[&str], now: i64) -> Vec<String> {
+        let dialect = pbps_pg::Postgres::new();
+        errors_the_series_adds(&project(), &dialect, &schema(before), &schema(after), now)
+            .into_iter()
+            .map(|f| f.message)
+            .collect()
+    }
+
+    /// The window of #1943, closed: the tree already carries `app.Legacy`,
+    /// which a suppression excuses until 2026-12-31, and the series adds a
+    /// well-named partition. Asked at the one instant, the same set comes back
+    /// for both trees on either side of the expiry, so the delta is empty
+    /// whenever that instant falls.
+    #[test]
+    fn a_suppression_expiring_between_two_reads_does_not_count_as_added() {
+        let (before, after) = (["Legacy"], ["Legacy", "ev_2027_01"]);
+        for now in [LONG_BEFORE, BEFORE_EXPIRY, AT_EXPIRY, LONG_AFTER] {
+            assert_eq!(adds(&before, &after, now), Vec::<String>::new(), "{now}");
+        }
+    }
+
+    /// The hazard exists and the instant is honoured: the shared function
+    /// excuses `app.Legacy` before the date and names it from the date on, so
+    /// two reads that straddle it are not two answers about the same tree.
+    /// The negative cases are the instants clear of the date, which agree.
+    #[test]
+    fn the_policy_findings_depend_on_the_instant_they_are_asked_at() {
+        let dialect = pbps_pg::Postgres::new();
+        let at = |now| {
+            crate::declaration_policy_findings(
+                &project(),
+                &dialect,
+                &schema(&["Legacy"]),
+                None,
+                now,
+            )
+            .len()
+        };
+        assert_eq!(at(LONG_BEFORE), 0);
+        assert_eq!(at(BEFORE_EXPIRY), 0);
+        assert_eq!(at(AT_EXPIRY), 1);
+        assert_eq!(at(LONG_AFTER), 1);
+    }
+
+    /// The control that keeps the test above honest: a partition that breaks
+    /// the rule is still named, with the suppression live and with it expired.
+    #[test]
+    fn an_error_the_series_does_add_is_named_at_any_instant() {
+        let (before, after) = (["Legacy"], ["Legacy", "Ev_2027_01"]);
+        for now in [LONG_BEFORE, BEFORE_EXPIRY, AT_EXPIRY, LONG_AFTER] {
+            let added = adds(&before, &after, now);
+            assert_eq!(added.len(), 1, "{now}: {added:?}");
+            assert!(added[0].contains("Ev_2027_01"), "{now}: {added:?}");
+        }
+    }
 }

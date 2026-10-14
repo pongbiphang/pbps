@@ -1567,14 +1567,32 @@ fn cmd_pull(
 
 /// What the policy rules need besides the block (ADR-0008), including the
 /// dialect's deprecated types, which the policy crate cannot know itself
-/// (DEC-1869.1).
+/// (DEC-1869.1). The clock is read here, once, for a command that evaluates
+/// the rules once; a command that compares two evaluations reads it itself and
+/// calls [`policy_context_at`] (DEC-1943.1).
 fn policy_context(
     project: &Project,
     dialect: &dyn Dialect,
     connected: bool,
 ) -> pbps_policy::Context {
+    policy_context_at(project, dialect, connected, unix_seconds())
+}
+
+/// [`policy_context`] at an instant the caller chose.
+///
+/// A suppression's `until` is compared with today's date, so two evaluations
+/// that each read the clock can straddle the instant one expires: a finding
+/// suppressed in the first set is live in the second, and a command that
+/// subtracts one set from the other counts it as new. Sharing the instant is
+/// what makes two evaluations comparable (DEC-1943.1).
+fn policy_context_at(
+    project: &Project,
+    dialect: &dyn Dialect,
+    connected: bool,
+    now: i64,
+) -> pbps_policy::Context {
     pbps_policy::Context {
-        now: unix_seconds(),
+        now,
         max_rows: project
             .config
             .max_data_rows
@@ -2180,7 +2198,11 @@ fn validate_inspected(
             },
         };
         findings.extend(declaration_policy_findings(
-            project, dialect, &l.schema, only,
+            project,
+            dialect,
+            &l.schema,
+            only,
+            unix_seconds(),
         ));
     }
     if let Err(e) = &ids {
@@ -2214,6 +2236,11 @@ fn validate_inspected(
 /// `validate` that asks what the project's `policies:` think of the
 /// declarations. `only` narrows it to the named objects, as `--since` does.
 ///
+/// `now` is the instant the rules are asked at, in Unix seconds. It is an
+/// argument, not read here, so that a command which compares two trees asks
+/// both at the same instant: a suppression expiring between two reads would
+/// otherwise show up as a finding the change added (DEC-1943.1).
+///
 /// One function for `validate` and for every command that writes declarations
 /// and must not hand the next `validate` a finding it could have named first
 /// (`partitions extend`, #1904). A second copy of this would drift in what it
@@ -2223,9 +2250,10 @@ pub(crate) fn declaration_policy_findings(
     dialect: &dyn Dialect,
     schema: &Schema,
     only: Option<std::collections::BTreeSet<String>>,
+    now: i64,
 ) -> Vec<output::Finding> {
     let policies = project.config.policies();
-    let mut ctx = policy_context(project, dialect, false);
+    let mut ctx = policy_context_at(project, dialect, false, now);
     ctx.only = only;
     // Types in the dialect's own spelling, because the policy crate is
     // dialect-agnostic on purpose and a rule that names a type sees
@@ -3800,7 +3828,7 @@ fn now() -> String {
     )
 }
 
-fn unix_seconds() -> i64 {
+pub(crate) fn unix_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
