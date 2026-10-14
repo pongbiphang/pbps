@@ -1,5 +1,6 @@
 use super::Error;
 use pbps_dialect::Dialect;
+use pbps_model::operation::{Origin, Source};
 use pbps_model::resolver::{Surface, SurfaceResolution};
 use pbps_model::{Change, ChangeSet, IdsFile, IdsIndex, PlannedChange, Schema, ValueSource};
 use std::collections::BTreeSet;
@@ -193,6 +194,18 @@ pub(super) fn invalidates(change: &Change, surface: &Surface) -> bool {
     }
 }
 
+/// The resolver's input before it is ordered: the ordinary plan with its
+/// splits, then the rebuilds its evidence appends.
+pub(super) struct Prepared {
+    pub changes: ChangeSet,
+    /// How many of `changes` are the ordinary plan's, which come first.
+    pub ordinary: usize,
+    /// Where each of `changes` came from, by position: which change of the
+    /// ordinary plan, or which rebinding, and its role in it (#1961). Never
+    /// part of the plan: the operations are built from it and dropped.
+    pub origins: Vec<Origin>,
+}
+
 #[allow(clippy::wildcard_enum_match_arm, clippy::too_many_arguments)]
 pub(super) fn changes(
     ordinary: &ChangeSet,
@@ -203,10 +216,10 @@ pub(super) fn changes(
     rebuilds: &BTreeSet<Surface>,
     hints: &pbps_model::Hints,
     dialect: &dyn Dialect,
-) -> Result<(ChangeSet, usize), Error> {
+) -> Result<Prepared, Error> {
     let names = ids.index();
-    let mut changes = Vec::new();
-    for planned in &ordinary.changes {
+    let mut changes: Vec<(Origin, PlannedChange)> = Vec::new();
+    for (position, planned) in ordinary.changes.iter().enumerate() {
         let expanded = match &planned.change {
             Change::CreateTable {
                 uid,
@@ -316,6 +329,12 @@ pub(super) fn changes(
             ],
             _ => vec![planned.change.clone()],
         };
+        // A create with nothing to split off comes back as it was: whole.
+        let origin = if expanded.len() == 1 && expanded[0] == planned.change {
+            Origin::Whole(position)
+        } else {
+            Origin::SplitPart(position)
+        };
         for change in expanded {
             let mut p = planned.clone();
             if matches!(planned.change, Change::CreateTable { .. })
@@ -328,14 +347,21 @@ pub(super) fn changes(
             }
             p.risks = dialect.change_risks(&change);
             p.change = change;
-            changes.push(p);
+            changes.push((origin.clone(), p));
         }
     }
     // The rebuilds follow the ordinary plan. They spell a teardown by its
     // base name and a restoration by its final one, wherever they sit, so
     // the graph reads their tables by kind, not by position (DEC-1498.1).
-    let mut added: Vec<PlannedChange> = Vec::new();
+    let mut added: Vec<(Origin, PlannedChange)> = Vec::new();
+    let present =
+        |all: &[(Origin, PlannedChange)], more: &[(Origin, PlannedChange)], c: &Change| {
+            all.iter().chain(more).any(|(_, p)| p.change == *c)
+        };
     for surface in rebuilds {
+        // A rebinding is a logical change of its own: no change of the
+        // ordinary plan asks for it, the evidence does (DEC-1498.1).
+        let rebinding = || Source::Rebinding(surface.clone());
         let previous = forward(surface, &names, before_ids);
         let pair = match surface {
             Surface::Default(column)
@@ -387,7 +413,7 @@ pub(super) fn changes(
                         from: old.expression,
                         to: new.expression,
                     };
-                    if !changes.iter().chain(&added).any(|p| p.change == rewrite) {
+                    if !present(&changes, &added, &rewrite) {
                         let mut planned = PlannedChange::new(rewrite);
                         planned.risks = dialect.change_risks(&planned.change);
                         planned.strategy = hints
@@ -395,7 +421,10 @@ pub(super) fn changes(
                             .get(&column.table)
                             .copied()
                             .unwrap_or_default();
-                        added.push(planned);
+                        // One step that ends the old expression and produces
+                        // the new one, spelled at its final column, as a
+                        // restoration is.
+                        added.push((Origin::Restoration(rebinding()), planned));
                     }
                     continue;
                 }
@@ -502,10 +531,11 @@ pub(super) fn changes(
             // The ordinary differ names a changed expression after the rename.
             // A binding rebuild needs its old input gone before that rename;
             // replace that teardown instead of retaining both spellings.
-            changes.retain(|p| !tears_down(&p.change, surface));
+            changes.retain(|(_, p)| !tears_down(&p.change, surface));
         }
-        for change in pair {
-            if !changes.iter().chain(&added).any(|p| p.change == change) {
+        // Every pair is the removal, then the putting back.
+        for (half, change) in pair.into_iter().enumerate() {
+            if !present(&changes, &added, &change) {
                 let mut planned = PlannedChange::new(change);
                 planned.risks = dialect.change_risks(&planned.change);
                 if let Some(table) = planned.change.table() {
@@ -518,7 +548,12 @@ pub(super) fn changes(
                     };
                     planned.strategy = hints.strategies.get(owner).copied().unwrap_or_default();
                 }
-                added.push(planned);
+                let origin = if half == 0 {
+                    Origin::Teardown(rebinding())
+                } else {
+                    Origin::Restoration(rebinding())
+                };
+                added.push((origin, planned));
             }
         }
     }
@@ -529,7 +564,7 @@ pub(super) fn changes(
     // else in the plan sets is set again here, after the parent's (#1610
     // review).
     let mut again = Vec::new();
-    for planned in &added {
+    for (origin, planned) in &added {
         let Change::AlterColumnDefault {
             column,
             to: Some(fallback),
@@ -552,7 +587,7 @@ pub(super) fn changes(
                 matches!(c, Change::SetPartitionDefault { table, column: name, to: Some(_), .. }
                     if table == partition && *name == column.name)
             };
-            if changes.iter().chain(&added).any(|p| set(&p.change)) {
+            if changes.iter().chain(&added).any(|(_, p)| set(&p.change)) {
                 continue;
             }
             let uid = ids
@@ -570,7 +605,8 @@ pub(super) fn changes(
             });
             planned.risks = dialect.change_risks(&planned.change);
             planned.strategy = hints.strategies.get(partition).copied().unwrap_or_default();
-            again.push(planned);
+            // Part of the parent's restoration, after it.
+            again.push((Origin::Restoration(origin.source()), planned));
         }
     }
     added.extend(again);
@@ -579,15 +615,19 @@ pub(super) fn changes(
     // dropped: the same normalization the differ's and the dependents
     // pass's rebuilds get (#1516 review). Only ordinary changes go, so the
     // ordinary ones still come first.
-    let mut all: Vec<(bool, PlannedChange)> = changes
+    let mut all: Vec<(bool, Origin, PlannedChange)> = changes
         .into_iter()
-        .map(|p| (false, p))
-        .chain(added.into_iter().map(|p| (true, p)))
+        .map(|(o, p)| (false, o, p))
+        .chain(added.into_iter().map(|(o, p)| (true, o, p)))
         .collect();
-    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut all, |(_, p)| &p.change);
-    let ordinary = all.iter().filter(|(added, _)| !added).count();
-    let changes = all.into_iter().map(|(_, p)| p).collect();
-    Ok((ChangeSet { changes }, ordinary))
+    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut all, |(_, _, p)| &p.change);
+    let ordinary = all.iter().filter(|(added, _, _)| !added).count();
+    let (origins, changes) = all.into_iter().map(|(_, o, p)| (o, p)).unzip();
+    Ok(Prepared {
+        changes: ChangeSet { changes },
+        ordinary,
+        origins,
+    })
 }
 
 /// A column's default, where its value comes from one: not an identity's,

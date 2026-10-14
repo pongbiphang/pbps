@@ -1808,8 +1808,10 @@ mod generated_surface_coverage {
     /// by where it sits. In a rename chain, app.b to app.c and then app.a to
     /// app.b, the old app.b's check is dropped before its rename, never
     /// after it, which would hit the table that took the name (DEC-1498.1).
-    #[test]
-    fn an_appended_teardown_belongs_to_its_base_table_in_a_rename_chain() {
+    /// Rename chain app.b to app.c, then app.a to app.b; the moved table's
+    /// check calls a routine whose binding moves, so the resolver appends its
+    /// rebuild: (base, desired, base ids, final ids, evidence).
+    fn chained_check() -> (Schema, Schema, IdsFile, IdsFile, Vec<SurfaceResolution>) {
         let (id, module) = routine();
         let names =
             ["app.a", "app.b", "app.c"].map(|n| n.parse::<pbps_model::TableName>().unwrap());
@@ -1848,6 +1850,30 @@ mod generated_surface_coverage {
                 binds,
             ))
         };
+        let observations = vec![
+            SurfaceResolution {
+                surface: check(&b),
+                current: constraint("f"),
+                desired: None,
+            },
+            SurfaceResolution {
+                surface: check(&c),
+                current: None,
+                desired: constraint("f_exact"),
+            },
+            SurfaceResolution {
+                surface: function.clone(),
+                current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                desired: Some(bound("pg_proc", "app.f", &[], "int4in")),
+            },
+        ];
+        (base, desired, before_ids, after_ids, observations)
+    }
+
+    #[test]
+    fn an_appended_teardown_belongs_to_its_base_table_in_a_rename_chain() {
+        let [b, c] = ["app.b", "app.c"].map(|n| n.parse::<pbps_model::TableName>().unwrap());
+        let (base, desired, before_ids, after_ids, observations) = chained_check();
         let ordered = super::plan(
             crate::Side {
                 schema: &base,
@@ -1858,23 +1884,7 @@ mod generated_surface_coverage {
                 ids: &after_ids,
             },
             &Hints::default(),
-            &[
-                SurfaceResolution {
-                    surface: check(&b),
-                    current: constraint("f"),
-                    desired: None,
-                },
-                SurfaceResolution {
-                    surface: check(&c),
-                    current: None,
-                    desired: constraint("f_exact"),
-                },
-                SurfaceResolution {
-                    surface: function.clone(),
-                    current: Some(bound("pg_proc", "app.f", &[], "int4in")),
-                    desired: Some(bound("pg_proc", "app.f", &[], "int4in")),
-                },
-            ],
+            &observations,
             &pbps_dialect::MinimalDialect,
         )
         .unwrap();
@@ -1893,6 +1903,94 @@ mod generated_surface_coverage {
         assert!(away < into, "{steps:?}");
         assert!(away < restore, "{steps:?}");
         ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// The rebuild appended in that chain spells its teardown by the base
+    /// name and its restoration by the final one: two names for one check.
+    /// Keyed by the table recorded under each, they are one key, whose
+    /// teardown ends the baseline's instance and whose restoration produces
+    /// the plan's; the table that took the old name is another key (#1961).
+    #[test]
+    fn a_rebuilds_teardown_ends_the_base_and_its_restoration_produces_the_final() {
+        use pbps_model::operation::{
+            InForce, Incarnations, ObjectKey, PlanOwners, ReplayError, Role, Source, Spelling,
+            Transition,
+        };
+        let [b, c] = ["app.b", "app.c"].map(|n| n.parse::<pbps_model::TableName>().unwrap());
+        let (base, desired, before_ids, after_ids, observations) = chained_check();
+        let planned = super::plan_operations(
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+            &Hints::default(),
+            &observations,
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let owners = PlanOwners::new(
+            pbps_model::plan_names::PlanNames::of(&planned.logical.changes, &after_ids).unwrap(),
+            &before_ids,
+            &after_ids,
+        );
+        let ops = planned.operations.as_slice();
+        let position = |f: &dyn Fn(&Change) -> bool| {
+            ops.iter()
+                .position(|op| f(op.change()))
+                .unwrap_or_else(|| panic!("missing from {ops:?}"))
+        };
+        let down = position(&|ch| matches!(ch, Change::DropCheck { table, .. } if table == &b));
+        let up = position(&|ch| matches!(ch, Change::AddCheck { table, .. } if table == &c));
+        let (teardown, restoration) = (&ops[down], &ops[up]);
+        assert_eq!(teardown.role(), Role::Teardown);
+        assert_eq!(restoration.role(), Role::Restoration);
+        assert_eq!(teardown.source(), restoration.source());
+        assert!(matches!(
+            teardown.source(),
+            Source::Rebinding(Surface::Check { .. })
+        ));
+        assert_eq!(teardown.origin().spelling(), Spelling::Base);
+        assert_eq!(restoration.origin().spelling(), Spelling::Final);
+        let key = teardown.key(&owners).unwrap();
+        assert_eq!(restoration.key(&owners).unwrap(), key);
+        let ObjectKey::Part { table, .. } = &key else {
+            panic!("{key:?}")
+        };
+        assert_eq!(Some(table.uid()), before_ids.table_uid(&b));
+        // Negative: not the table that holds app.b once the plan has run.
+        assert_ne!(Some(table.uid()), after_ids.table_uid(&b));
+        let transitions = |op: &pbps_model::operation::Operation| {
+            op.defines(&owners)
+                .unwrap()
+                .into_iter()
+                .map(|d| (d.key, d.transition))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(transitions(teardown), [(key.clone(), Transition::Ends)]);
+        assert_eq!(
+            transitions(restoration),
+            [(key.clone(), Transition::Produces)]
+        );
+        let replay = Incarnations::replay(ops, &owners).unwrap();
+        assert_eq!(replay.in_force(&key, down), InForce::Base);
+        assert_eq!(replay.in_force(&key, down + 1), InForce::Absent);
+        assert_eq!(replay.in_force(&key, up), InForce::Absent);
+        // Whatever follows the restoration reads the plan's check.
+        for after in up + 1..=ops.len() {
+            assert_eq!(replay.in_force(&key, after), InForce::Final);
+        }
+        // Negative: restored ahead of its teardown, the teardown would end the
+        // plan's own check, which the replay refuses as a third instance.
+        let mut order: Vec<usize> = (0..ops.len()).collect();
+        order.swap(down, up);
+        match Incarnations::replay(planned.operations.reordered(&order).as_slice(), &owners) {
+            Err(ReplayError::Third { key: third, .. }) => assert_eq!(*third, key),
+            other => panic!("replayed: {other:?}"),
+        }
     }
 
     /// Releases are read through the table that owns them, not the spelling
@@ -3413,7 +3511,7 @@ mod generated_surface_coverage {
             assert!(
                 matches!(&result, Err(super::super::Error::Definition(s)) if *s == surface),
                 "{table}: {:?}",
-                result.map(|(changes, _)| changes)
+                result.map(|prepared| prepared.changes)
             );
         }
         // Negative: the same surface with a default is rebuilt, not refused:
@@ -3424,7 +3522,7 @@ mod generated_surface_coverage {
         let after_ids = ids(&schema, &before_ids);
         for (table, expected) in [("app.t", 3), ("app.p", 2)] {
             let name: pbps_model::TableName = table.parse().unwrap();
-            let (changes, _) = super::super::prepare::changes(
+            let changes = super::super::prepare::changes(
                 &ChangeSet::default(),
                 &schema,
                 &schema,
@@ -3434,7 +3532,8 @@ mod generated_surface_coverage {
                 &Hints::default(),
                 &pbps_dialect::MinimalDialect,
             )
-            .unwrap_or_else(|error| panic!("{table}: {error:?}"));
+            .unwrap_or_else(|error| panic!("{table}: {error:?}"))
+            .changes;
             assert_eq!(
                 changes.changes.len(),
                 expected,
@@ -3803,4 +3902,352 @@ fn a_resolver_plan_keeps_the_move_a_human_allowed() {
     );
     // Negative: nothing allowed.
     assert_eq!(bound(&[]), None);
+}
+
+/// The operations the resolver orders beside its plan (#1961). Each reads
+/// its own payload: the models supply who owns a name and nothing about what
+/// a step does.
+mod operations {
+    use super::*;
+    use pbps_model::operation::{
+        InForce, Incarnations, ObjectKey, Operation, Origin, PartKey, PlanOwners, ReplayError,
+        Role, Source, Transition,
+    };
+    use pbps_model::plan_names::PlanNames;
+    use pbps_model::{
+        CheckConstraint, Hints, IdsFile, Index, IndexColumn, Module, ModuleKind, Schema,
+        ValueSource,
+    };
+
+    /// `app.a` with a default, a check and an index, which the resolver
+    /// takes out of its `CREATE`, and `app.z` with nothing to take out.
+    fn created() -> (Schema, Schema) {
+        let mut desired = tables();
+        let a = desired.tables.get_mut(&"app.a".parse().unwrap()).unwrap();
+        a.columns.get_mut("id").unwrap().value_source = ValueSource::Default("0".into());
+        a.checks.insert(
+            "k".into(),
+            CheckConstraint {
+                expression: "id >= 0".into(),
+            },
+        );
+        a.indexes.insert(
+            "ix".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    key: pbps_model::IndexKey::Column("id".into()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: vec![],
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            },
+        );
+        (Schema::default(), desired)
+    }
+
+    /// Every surface of a schema the plan creates whole, observed.
+    fn observed(desired: &Schema) -> Vec<SurfaceResolution> {
+        super::super::prepare::surfaces(desired)
+            .into_iter()
+            .map(|surface| observation(surface, BTreeSet::new()))
+            .collect()
+    }
+
+    fn planned(
+        base: &Schema,
+        desired: &Schema,
+        observations: &[SurfaceResolution],
+        dialect: &dyn pbps_dialect::Dialect,
+    ) -> (Planned, IdsFile, IdsFile) {
+        let old_ids = ids(base, &IdsFile::default());
+        let new_ids = ids(desired, &old_ids);
+        let planned = plan_operations(
+            crate::Side {
+                schema: base,
+                ids: &old_ids,
+            },
+            crate::Side {
+                schema: desired,
+                ids: &new_ids,
+            },
+            &Hints::default(),
+            observations,
+            dialect,
+        )
+        .unwrap();
+        (planned, old_ids, new_ids)
+    }
+
+    fn owners<'p>(planned: &'p Planned, old: &'p IdsFile, new: &'p IdsFile) -> PlanOwners<'p> {
+        PlanOwners::new(
+            PlanNames::of(&planned.logical.changes, new).unwrap(),
+            old,
+            new,
+        )
+    }
+
+    fn find<'o>(planned: &'o Planned, f: &dyn Fn(&Change) -> bool) -> (usize, &'o Operation) {
+        planned
+            .operations
+            .iter()
+            .enumerate()
+            .find(|(_, op)| f(op.change()))
+            .unwrap_or_else(|| panic!("missing from {:?}", planned.operations))
+    }
+
+    /// The bare table the resolver splits off a `CREATE TABLE` creates the
+    /// table and its columns and nothing else: its default, check and index
+    /// are the later operations', which produce them. Read from the desired
+    /// table instead, the bare table would claim all three.
+    #[test]
+    fn a_bare_table_operation_defines_no_index_check_or_default_and_the_later_ones_do() {
+        let (base, desired) = created();
+        let (planned, old, new) = planned(
+            &base,
+            &desired,
+            &observed(&desired),
+            &pbps_dialect::MinimalDialect,
+        );
+        let owners = owners(&planned, &old, &new);
+        let a: pbps_model::TableName = "app.a".parse().unwrap();
+        let z: pbps_model::TableName = "app.z".parse().unwrap();
+        let (bare_at, bare) = find(
+            &planned,
+            &|c| matches!(c, Change::CreateTable { name, .. } if name == &a),
+        );
+        let defined = |op: &Operation| -> Vec<ObjectKey> {
+            op.defines(&owners)
+                .unwrap()
+                .into_iter()
+                .map(|d| {
+                    assert_eq!(d.transition, Transition::Produces, "{op:?}");
+                    d.key
+                })
+                .collect()
+        };
+        let bare_keys = defined(bare);
+        assert_eq!(bare.role(), Role::SplitPart);
+        assert!(
+            bare_keys
+                .iter()
+                .all(|k| matches!(k, ObjectKey::Table(_) | ObjectKey::Column(_))),
+            "{bare_keys:?}"
+        );
+        assert_eq!(bare_keys.len(), 2, "the table and its one column");
+        let replay = Incarnations::replay(planned.operations.as_slice(), &owners).unwrap();
+        let later = [
+            find(&planned, &|c| {
+                matches!(c, Change::AlterColumnDefault { .. })
+            }),
+            find(&planned, &|c| matches!(c, Change::AddCheck { .. })),
+            find(&planned, &|c| matches!(c, Change::AddIndex { .. })),
+        ];
+        for (at, op) in later {
+            assert!(at > bare_at, "{:?}", planned.operations);
+            // One logical change: the same source, another part of it.
+            assert_eq!(op.source(), bare.source());
+            assert_eq!(op.role(), Role::SplitPart);
+            let keys = defined(op);
+            assert_eq!(keys.len(), 1, "{op:?}: {keys:?}");
+            let key = &keys[0];
+            assert!(
+                matches!(
+                    key,
+                    ObjectKey::Default(_)
+                        | ObjectKey::Part {
+                            part: PartKey::Check(_) | PartKey::Index(_),
+                            ..
+                        }
+                ),
+                "{key:?}"
+            );
+            assert!(!bare_keys.contains(key), "{key:?} claimed by {bare:?}");
+            // Nothing of it stands after the bare table; it does after its
+            // own operation.
+            assert_eq!(replay.in_force(key, bare_at + 1), InForce::Absent);
+            assert_eq!(replay.in_force(key, at), InForce::Absent);
+            assert_eq!(replay.in_force(key, at + 1), InForce::Final);
+        }
+        // A create with nothing to take out is one whole operation.
+        let (_, whole) = find(
+            &planned,
+            &|c| matches!(c, Change::CreateTable { name, .. } if name == &z),
+        );
+        assert_eq!(whole.role(), Role::Whole);
+        assert_ne!(whole.source(), bare.source());
+        assert!(
+            planned
+                .operations
+                .iter()
+                .filter(|op| op.source() == whole.source())
+                .count()
+                == 1
+        );
+    }
+
+    /// The operations are a layer beside the plan, not in it: the ordered
+    /// plan and its proof are `plan`'s, and so the saved plan's bytes and
+    /// checksum. The ids follow from the plan alone, so two runs give the
+    /// same ones.
+    #[test]
+    fn operation_ids_repeat_across_runs_and_the_ordered_plan_is_unchanged() {
+        let (base, desired) = created();
+        let observations = observed(&desired);
+        let old = super::ids(&base, &IdsFile::default());
+        let new = super::ids(&desired, &old);
+        let base = crate::Side {
+            schema: &base,
+            ids: &old,
+        };
+        let desired = crate::Side {
+            schema: &desired,
+            ids: &new,
+        };
+        let dialect = &pbps_dialect::MinimalDialect;
+        let run =
+            || plan_operations(base, desired, &Hints::default(), &observations, dialect).unwrap();
+        let first = run();
+        let second = run();
+        let ids = |p: &Planned| {
+            p.operations
+                .iter()
+                .map(|op| op.id().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&first), ids(&second));
+        assert_eq!(ids(&first), ["0.0", "0.1", "0.2", "0.3", "1.0"]);
+        let ordered = plan(base, desired, &Hints::default(), &observations, dialect).unwrap();
+        assert_eq!(first.ordered.changes, ordered.changes);
+        assert_eq!(first.ordered.proof, ordered.proof);
+        // One operation per sealed step, carrying that step's change.
+        let steps: Vec<&PlannedChange> = first.operations.iter().map(|op| op.planned()).collect();
+        let sealed: Vec<&PlannedChange> = ordered.changes.changes.iter().collect();
+        assert_eq!(steps, sealed);
+        // Negative: an id is not a position. The second table's names its
+        // logical change, the plan's second, while it runs fifth.
+        let (at, whole) = find(
+            &first,
+            &|c| matches!(c, Change::CreateTable { name, .. } if name.name == "z"),
+        );
+        assert_eq!(at, 4);
+        assert_eq!(whole.source(), Source::Change(1));
+        assert!(matches!(whole.origin(), Origin::Whole(1)));
+    }
+
+    /// A view the evidence rebuilds on an engine that rebuilds modules is
+    /// one logical change in two parts: its drop ends the instance the
+    /// baseline holds and its create produces the one the plan leaves, under
+    /// one key. The create is made over the plan's function, and everything
+    /// after it reads the plan's view. Created before its drop, the view
+    /// would be read as a third instance, which the replay refuses.
+    #[test]
+    fn a_rebuilt_views_drop_ends_the_base_and_its_create_produces_the_final() {
+        use pbps_model::resolver::{Binding, BoundSurface};
+        let view: pbps_model::ModuleId = "app.v".parse().unwrap();
+        let function: pbps_model::ModuleId = "app.f()".parse().unwrap();
+        let mut base = Schema::default();
+        base.modules.insert(
+            view.clone(),
+            Module {
+                kind: ModuleKind::View,
+                description: None,
+                definition: "SELECT f() AS x".into(),
+            },
+        );
+        let mut desired = base.clone();
+        desired.modules.insert(
+            function.clone(),
+            Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: "RETURNS int LANGUAGE sql RETURN 1".into(),
+            },
+        );
+        let bound = |target: &str| BoundSurface {
+            object: identity("v"),
+            bindings: vec![Binding {
+                node: "FuncExpr".into(),
+                path: vec!["x".into()],
+                target: identity(target),
+            }],
+            managed_inputs: BTreeSet::new(),
+        };
+        let observations = [
+            SurfaceResolution {
+                surface: Surface::Module(function.clone()),
+                current: None,
+                desired: Some(BoundSurface {
+                    object: identity("f"),
+                    bindings: vec![],
+                    managed_inputs: BTreeSet::new(),
+                }),
+            },
+            SurfaceResolution {
+                surface: Surface::Module(view.clone()),
+                current: Some(bound("ext.f")),
+                desired: Some(bound("app.f")),
+            },
+        ];
+        let (planned, old, new) = planned(&base, &desired, &observations, &Candidates);
+        let owners = owners(&planned, &old, &new);
+        let (down, teardown) = find(
+            &planned,
+            &|c| matches!(c, Change::DropModule { id, .. } if id == &view),
+        );
+        let (up, restoration) = find(
+            &planned,
+            &|c| matches!(c, Change::CreateModule { id, .. } if id == &view),
+        );
+        let (made, _) = find(
+            &planned,
+            &|c| matches!(c, Change::CreateModule { id, .. } if id == &function),
+        );
+        assert_eq!(teardown.role(), Role::SplitPart);
+        assert_eq!(restoration.role(), Role::SplitPart);
+        assert_eq!(teardown.source(), restoration.source());
+        let Source::Change(logical) = teardown.source() else {
+            panic!("{teardown:?}")
+        };
+        assert!(matches!(
+            &planned.logical.changes[logical].change,
+            Change::AlterModule { id, .. } if id == &view
+        ));
+        let key = teardown.key(&owners).unwrap();
+        assert_eq!(restoration.key(&owners).unwrap(), key);
+        assert_eq!(
+            teardown.defines(&owners).unwrap()[0].transition,
+            Transition::Ends
+        );
+        assert_eq!(
+            restoration.defines(&owners).unwrap()[0].transition,
+            Transition::Produces
+        );
+        let replay = Incarnations::replay(planned.operations.as_slice(), &owners).unwrap();
+        assert!(down < up, "{:?}", planned.operations);
+        assert_eq!(replay.in_force(&key, down), InForce::Base);
+        assert_eq!(replay.in_force(&key, down + 1), InForce::Absent);
+        assert_eq!(replay.in_force(&key, up), InForce::Absent);
+        // Everything after the restoration reads the plan's view.
+        for after in up + 1..=planned.operations.len() {
+            assert_eq!(replay.in_force(&key, after), InForce::Final);
+        }
+        // And the restoration reads the plan's function, never a missing one.
+        assert!(made < up, "{:?}", planned.operations);
+        assert_eq!(
+            replay.in_force(&ObjectKey::Module(function.clone()), up),
+            InForce::Final
+        );
+        // Negative: the restoration moved ahead of its teardown reads one
+        // view as both instances, and is refused.
+        let mut order: Vec<usize> = (0..planned.operations.len()).collect();
+        order.swap(down, up);
+        match Incarnations::replay(planned.operations.reordered(&order).as_slice(), &owners) {
+            Err(ReplayError::Third { key: third, .. }) => assert_eq!(*third, key),
+            other => panic!("replayed: {other:?}"),
+        }
+    }
 }

@@ -8,6 +8,7 @@ mod prepare;
 pub use assess::{Answer, Assessment, assess};
 
 use pbps_dialect::Dialect;
+use pbps_model::operation::{ModuleEdits, Operations};
 use pbps_model::resolver::{OrderEdge, OrderingProof, Surface, SurfaceResolution};
 use pbps_model::{ChangeSet, IdsFile};
 use std::collections::BTreeSet;
@@ -86,7 +87,6 @@ pub fn ordinary(
 /// A module ADR-0013's candidate test would rebuild is rebuilt here only
 /// when the evidence says its binding changes or one of its managed inputs
 /// is replaced (DEC-1515.1).
-#[allow(clippy::wildcard_enum_match_arm)]
 pub fn plan(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
@@ -94,6 +94,71 @@ pub fn plan(
     resolution: &[SurfaceResolution],
     dialect: &dyn Dialect,
 ) -> Result<Ordered, Error> {
+    plan_operations(base, desired, hints, resolution, dialect).map(|planned| planned.ordered)
+}
+
+/// [`plan`], with the operations its steps are (#1961) and the logical plan
+/// they came from.
+pub struct Planned {
+    pub ordered: Ordered,
+    /// One per step of `ordered`, in its order.
+    pub operations: Operations,
+    /// The ordinary plan the resolver started from: what an operation's
+    /// [`pbps_model::operation::Source::Change`] counts positions in, and the
+    /// order a step's names are in force in.
+    pub logical: ChangeSet,
+}
+
+/// [`plan`] and the operations it orders. [`plan`] is this, so the order and
+/// the changes are the same: the operations are built beside them from where
+/// each step came from, and are never part of the sealed plan.
+pub fn plan_operations(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    hints: &pbps_model::Hints,
+    resolution: &[SurfaceResolution],
+    dialect: &dyn Dialect,
+) -> Result<Planned, Error> {
+    let (logical, prepared) = prepare(base, desired, hints, resolution, dialect)?;
+    let operations = Operations::expanded(
+        logical.changes.len(),
+        prepared
+            .origins
+            .iter()
+            .cloned()
+            .zip(prepared.changes.changes.iter().cloned()),
+        if dialect.rebuilds_modules() {
+            ModuleEdits::Rebuilt
+        } else {
+            ModuleEdits::InPlace
+        },
+    );
+    let edges = graph::constraints(
+        &prepared.changes,
+        prepared.ordinary,
+        resolution,
+        &hints.module_deps,
+        base,
+        desired,
+    );
+    let (ordered, sequence) = ordered(prepared.changes, edges)?;
+    Ok(Planned {
+        ordered,
+        operations: operations.reordered(&sequence),
+        logical,
+    })
+}
+
+/// The ordinary plan and the resolver's input built from it: its splits,
+/// and the rebuilds the evidence appends.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn prepare(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    hints: &pbps_model::Hints,
+    resolution: &[SurfaceResolution],
+    dialect: &dyn Dialect,
+) -> Result<(ChangeSet, prepare::Prepared), Error> {
     prepare::coverage(base, desired, resolution)?;
     let ordinary = ordinary(base, desired, dialect, hints)
         .map_err(|e| Error::Diff(e.into_iter().map(|e| e.to_string()).collect()))?;
@@ -122,7 +187,7 @@ pub fn plan(
         None,
     )
     .map_err(|e| Error::Diff(e.into_iter().map(|e| e.to_string()).collect()))?;
-    let (changes, ordinary) = prepare::changes(
+    let prepared = prepare::changes(
         &ordinary,
         base.schema,
         desired.schema,
@@ -132,45 +197,18 @@ pub fn plan(
         hints,
         dialect,
     )?;
-    let edges = graph::constraints(
-        &changes,
-        ordinary,
-        resolution,
-        &hints.module_deps,
-        base,
-        desired,
-    );
-    order(changes, edges)
+    Ok((ordinary, prepared))
 }
 
+#[cfg(test)]
 fn order(changes: ChangeSet, edges: BTreeSet<OrderEdge>) -> Result<Ordered, Error> {
+    ordered(changes, edges).map(|(ordered, _)| ordered)
+}
+
+/// The ordered plan and the positions it took its steps from.
+fn ordered(changes: ChangeSet, edges: BTreeSet<OrderEdge>) -> Result<(Ordered, Vec<usize>), Error> {
     let n = changes.changes.len();
-    let mut incoming = vec![0usize; n];
-    let mut outgoing = vec![BTreeSet::new(); n];
-    for edge in &edges {
-        if edge.before >= n || edge.after >= n {
-            return Err(Error::Edge);
-        }
-        if outgoing[edge.before].insert(edge.after) {
-            incoming[edge.after] += 1;
-        }
-    }
-    // Original position is the deterministic tie-break. It preserves the
-    // differ's identity/data order wherever no dependency requires movement.
-    let mut ready: BTreeSet<_> = (0..n).filter(|&i| incoming[i] == 0).collect();
-    let mut sequence = Vec::with_capacity(n);
-    while let Some(i) = ready.pop_first() {
-        sequence.push(i);
-        for &after in &outgoing[i] {
-            incoming[after] -= 1;
-            if incoming[after] == 0 {
-                ready.insert(after);
-            }
-        }
-    }
-    if sequence.len() != n {
-        return Err(Error::Cycle);
-    }
+    let sequence = sequence(n, &edges)?;
     let mut positions = vec![0; n];
     let ordered = ChangeSet {
         changes: sequence
@@ -194,10 +232,44 @@ fn order(changes: ChangeSet, edges: BTreeSet<OrderEdge>) -> Result<Ordered, Erro
             .collect(),
     )
     .map_err(|_| Error::Edge)?;
-    Ok(Ordered {
-        changes: ordered,
-        proof,
-    })
+    Ok((
+        Ordered {
+            changes: ordered,
+            proof,
+        },
+        sequence,
+    ))
+}
+
+/// The order of `n` steps under `edges`, as positions into them.
+fn sequence(n: usize, edges: &BTreeSet<OrderEdge>) -> Result<Vec<usize>, Error> {
+    let mut incoming = vec![0usize; n];
+    let mut outgoing = vec![BTreeSet::new(); n];
+    for edge in edges {
+        if edge.before >= n || edge.after >= n {
+            return Err(Error::Edge);
+        }
+        if outgoing[edge.before].insert(edge.after) {
+            incoming[edge.after] += 1;
+        }
+    }
+    // Original position is the deterministic tie-break. It preserves the
+    // differ's identity/data order wherever no dependency requires movement.
+    let mut ready: BTreeSet<_> = (0..n).filter(|&i| incoming[i] == 0).collect();
+    let mut sequence = Vec::with_capacity(n);
+    while let Some(i) = ready.pop_first() {
+        sequence.push(i);
+        for &after in &outgoing[i] {
+            incoming[after] -= 1;
+            if incoming[after] == 0 {
+                ready.insert(after);
+            }
+        }
+    }
+    if sequence.len() != n {
+        return Err(Error::Cycle);
+    }
+    Ok(sequence)
 }
 
 #[cfg(test)]

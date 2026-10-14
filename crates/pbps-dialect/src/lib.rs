@@ -40,6 +40,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod estimate;
+pub mod lower;
 pub mod plan_rows;
 
 #[cfg(test)]
@@ -224,6 +225,17 @@ pub struct Statement {
     /// the live identities, under the uid the plan gave it, the moment the
     /// statement commits (DECISIONS 100).
     pub creates: Vec<Created>,
+
+    /// The objects this statement drops, freeing their names.
+    ///
+    /// For the reason [`Statement::renames`] exists: one change can need
+    /// more than one statement, and what holds a name *between* them is in
+    /// neither the baseline nor the plan. A PostgreSQL module edit is a
+    /// `DROP` and then a `CREATE` (ADR-0009 §3), and between the two the
+    /// module's name is free. Only the emitter knows which of its statements
+    /// lets go of it, so it says so here, and nothing derives it elsewhere
+    /// (#1961).
+    pub releases: Vec<Released>,
 }
 
 /// The reference-data operation performed by a guarded statement.
@@ -257,6 +269,12 @@ pub enum Created {
     Role(String),
 }
 
+/// An object a statement drops, freeing its name ([`Statement::releases`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Released {
+    Module(ModuleId),
+}
+
 impl Statement {
     pub fn new(sql: impl Into<String>) -> Self {
         Self {
@@ -268,6 +286,7 @@ impl Statement {
             renames: Vec::new(),
             role_renames: Vec::new(),
             creates: Vec::new(),
+            releases: Vec::new(),
         }
     }
 
@@ -299,6 +318,12 @@ impl Statement {
     /// Records that this statement creates `what`.
     pub fn creating(mut self, what: Created) -> Self {
         self.creates.push(what);
+        self
+    }
+
+    /// Records that this statement drops `what`.
+    pub fn releasing(mut self, what: Released) -> Self {
+        self.releases.push(what);
         self
     }
 

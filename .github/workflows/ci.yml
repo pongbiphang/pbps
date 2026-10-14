@@ -184,6 +184,9 @@ jobs:
       - run: cargo test -p pbps-pg --doc
       # And that a resolver plan is sealed only by its own recheck (#1516).
       - run: cargo test -p pbps-cli --doc
+      # And that no operation key holds a uid a caller made up, and no
+      # operation or its id can be serialized into a saved plan (#1961).
+      - run: cargo test -p pbps-model --doc
 
   # Development happens on Linux, so Windows coverage rests entirely on this
   # job: line endings, path separators and terminal detection are the kinds of

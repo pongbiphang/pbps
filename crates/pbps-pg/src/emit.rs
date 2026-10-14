@@ -1657,7 +1657,9 @@ fn drop_module(pg: &Postgres, id: &ModuleId, kind: ModuleKind) -> Result<Stateme
             qualified(attached_to(id)?)?
         ),
     };
-    scoped(pg, id.schema(), &sql)
+    // The name is free from here until a create takes it again: between the
+    // two statements of an `AlterModule`, too (#1961).
+    Ok(scoped(pg, id.schema(), &sql)?.releasing(pbps_dialect::Released::Module(id.clone())))
 }
 
 /// The argument types of a routine's identity, as the engine spells them.

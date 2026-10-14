@@ -4931,3 +4931,60 @@ decides it there (DEC-981.3, DEC-1366.3). A chain is ordered as before.
 The resolver never receives a swap now. DEC-1498.1's pairing through recorded
 UIDs, which one spelling naming two tables in turn needs, is pinned on a chain
 instead (`chained_table_names_pair_bindings_through_recorded_uids`).
+
+<a id="dec-1961-1"></a>
+
+**DEC-1961.1. A plan's steps are operations held beside it in memory, each
+keyed by recorded identity and lowered by `emit`, and never serialized.** A
+logical change is not always one step: the resolver splits a `CreateTable`
+into the bare table and the defaults, checks and indexes set after it,
+appends a teardown and a restoration for each surface its evidence rebinds,
+and splits a rebuilt module into its drop and its create. What reads a plan's
+effects (#1954) or who owns a name at each step (#1871) has to read it per
+step, from that step's own payload; read from the desired model, the bare
+table claims the indexes a later step adds. An `Operation`
+(`pbps_model::operation`) is that step: its payload, the logical change or
+rebinding it came from, and its role (whole, split part, teardown,
+restoration). Its id is the source's number and its place among that
+source's parts, so it is the same on every run and is not a position.
+Three obvious alternatives are wrong. Adding the operation to the saved plan
+changes every saved plan's bytes and checksum for a layer nothing on disk
+reads, so no type in the module derives `Serialize`, and `plan` is
+`plan_operations` with the operations dropped. Keying an object by its
+spelled name gives one check two keys, because DEC-1498.1 spells a teardown
+by its base name and its restoration by its final one, and gives a dropped
+table's check and the check of the table renamed into its name one key
+(DEC-1851.1); an `ObjectKey` therefore holds the uid its object or owning
+table was recorded under, through a `Recorded` that has no public
+constructor, so no caller makes one up for a check, index or row the model
+gives no uid. And lowering by its own rules is a second copy of the
+emitter's: whether an index is built concurrently depends on the strategy,
+and the rule lives in `emit`. `lower` is `emit` on the operation's change
+under a strategy, regrouped as one indivisible group, with whether each
+statement runs inside the transaction and whether it needs its own batch kept
+apart, because SQL Server's `CREATE VIEW` needs a batch of its own inside the
+transaction. The one fact the emitter knew and did not say, which module a
+`DROP` releases, is now on the statement (`Statement::releases`). The
+connected PostgreSQL plan's weave of module teardowns and restorations is not
+expressed as operations yet: the passes after it reorder and split by
+position, so a provenance attached there would not survive them; it waits for
+the expansion mechanism of #1958.
+
+<a id="dec-1961-2"></a>
+
+**DEC-1961.2. An incarnation is an instance of an object, base or final, and
+an alteration in place is not one.** Within one plan an object is at most
+two instances: the one the baseline holds and the one the plan leaves. A
+drop or teardown ends the first; a create, re-add or restoration produces the
+second, and a replay refuses a plan that needs a third, which is a plan
+reading one instance as another. The obvious alternative numbers every
+rewrite of an object as a new incarnation, so that two `ALTER`s of one column
+are told apart. That conflates two problems: two writes of one attribute are
+ordered by the rule for two writes, whatever their count, and a numbered
+rewrite would make every ordinary alteration a lifetime event that a
+dependent then has to name. A module edit is a new instance only where the
+engine rebuilds it (`Dialect::rebuilds_modules`): PostgreSQL drops and
+creates it, SQL Server's `CREATE OR ALTER` keeps it. What a step ends or
+produces is read from its own payload alone; whether a dropped table's parts
+went with it, or a partition held its parent's default, is the baseline's to
+say (#1954).
