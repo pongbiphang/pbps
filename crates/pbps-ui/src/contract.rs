@@ -124,6 +124,64 @@ pub struct Explanation {
     pub unchecked: Vec<Unchecked>,
     pub statement_count: usize,
     pub target: Option<Target>,
+    /// A resolved plan's sealed evidence (#1517); absent for any other plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolver: Option<Resolver>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Resolver {
+    pub entry: String,
+    pub scratch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    pub layout: String,
+    pub outside_writes: String,
+    pub rule: String,
+    pub key_id: String,
+    pub sealed: Vec<String>,
+    pub limitations: Vec<ResolverLimitation>,
+    pub surfaces: Vec<ResolverSurface>,
+    pub order: Vec<ResolverOrder>,
+    pub prerequisites: Vec<ResolverPrerequisite>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverLimitation {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverSurface {
+    pub surface: String,
+    pub verdict: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverOrder {
+    pub before: usize,
+    pub after: usize,
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverPrerequisite {
+    pub object: ResolverObject,
+    pub fingerprinted: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverObject {
+    pub class: String,
+    pub name: Vec<String>,
+    pub signature: Vec<ResolverObject>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

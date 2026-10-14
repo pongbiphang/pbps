@@ -36,11 +36,26 @@ pub enum ResolverRuntime {
     /// build (DEC-1528.1). The measured runtimes that once stood beside it
     /// are gone (#1636), so a plan naming one no longer reads.
     Scratch {
+        /// The `pbps.yml` resolver entry that ran, so a reviewer of the plan
+        /// alone can tell which configuration produced it (#1517).
+        entry: String,
         scratch: ScratchSource,
+        /// Whether the run made its scratch database or used one supplied.
+        layout: ScratchLayout,
         /// Whether the baseline's writes outside the scratch database were
         /// refused or allowed (#1674).
         outside_writes: OutsideWrites,
     },
+}
+
+/// How the run held its scratch database (#1517).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScratchLayout {
+    /// A login and database the run created, and dropped after it.
+    RunOwned,
+    /// The database the entry's connection names, emptied after the run.
+    Supplied,
 }
 
 /// Where the resolver's scratch came from.
@@ -113,8 +128,9 @@ pub enum BindingCoverage {
 
 /// The evidence format this build writes and reads. 3 adds the target's
 /// cluster identity and the accepted limitations to the qualification
-/// (#1516, #1700).
-pub const EVIDENCE_VERSION: u32 = 3;
+/// (#1516, #1700); 4, the resolver entry and scratch layout to the runtime
+/// (#1517).
+pub const EVIDENCE_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -229,11 +245,12 @@ impl ResolverEvidence {
         {
             return Err(EvidenceError::Incomplete);
         }
-        let ResolverRuntime::Scratch { scratch, .. } = &q.runtime;
-        let qualified = match scratch {
-            ScratchSource::Server {} => true,
-            ScratchSource::Docker { image } => !image.is_empty(),
-        };
+        let ResolverRuntime::Scratch { entry, scratch, .. } = &q.runtime;
+        let qualified = !entry.is_empty()
+            && match scratch {
+                ScratchSource::Server {} => true,
+                ScratchSource::Docker { image } => !image.is_empty(),
+            };
         if !qualified {
             return Err(EvidenceError::Incomplete);
         }
@@ -603,7 +620,9 @@ mod tests {
                 target_cluster: "06".repeat(32),
                 limitations: Default::default(),
                 runtime: ResolverRuntime::Scratch {
+                    entry: "scratch".into(),
                     scratch: ScratchSource::Server {},
+                    layout: ScratchLayout::Supplied,
                     outside_writes: OutsideWrites::Refused,
                 },
             },
@@ -960,14 +979,18 @@ mod tests {
         assert!(predicted.validate(&plan.changes).is_err());
     }
 
+    /// The runtime records the entry that ran, its scratch by its
+    /// configured image, and the layout the run used (#1674, #1517).
     #[test]
-    fn a_docker_scratch_is_recorded_by_its_configured_image() {
+    fn a_docker_scratch_is_recorded_by_its_entry_image_and_layout() {
         let plan = plan();
         let mut evidence = resolved(&plan);
         evidence.qualification.runtime = ResolverRuntime::Scratch {
+            entry: "ci".into(),
             scratch: ScratchSource::Docker {
                 image: "postgres:18".into(),
             },
+            layout: ScratchLayout::RunOwned,
             outside_writes: OutsideWrites::Allowed,
         };
         evidence.validate(&plan.changes).unwrap();
@@ -975,25 +998,37 @@ mod tests {
             serde_json::to_value(&evidence.qualification.runtime).unwrap(),
             json!({
                 "kind": "scratch",
+                "entry": "ci",
                 "scratch": {"kind": "docker", "image": "postgres:18"},
+                "layout": "run-owned",
                 "outside_writes": "allowed",
             })
         );
-        // Negative: a Docker scratch with no image names nothing.
-        evidence.qualification.runtime = ResolverRuntime::Scratch {
-            scratch: ScratchSource::Docker { image: "".into() },
-            outside_writes: OutsideWrites::Refused,
-        };
-        assert_eq!(
-            evidence.validate(&plan.changes),
-            Err(EvidenceError::Incomplete)
-        );
+        // Negative: a Docker scratch with no image names nothing, and an
+        // entry with no name says nothing of which configuration ran.
+        for (entry, image) in [("ci", ""), ("", "postgres:18")] {
+            evidence.qualification.runtime = ResolverRuntime::Scratch {
+                entry: entry.into(),
+                scratch: ScratchSource::Docker {
+                    image: image.into(),
+                },
+                layout: ScratchLayout::RunOwned,
+                outside_writes: OutsideWrites::Refused,
+            };
+            assert_eq!(
+                evidence.validate(&plan.changes),
+                Err(EvidenceError::Incomplete),
+                "{entry:?} {image:?}"
+            );
+        }
         // Negative: a form that names neither the scratch nor the
         // outside-write choice is not read as either, nor is a runtime that
         // no longer exists: the pre-#1636 operator-vouched tag, or a removed
         // measured one (#1636).
         for gone in [
             json!({"kind": "scratch"}),
+            // The pre-#1517 form, without the entry and layout.
+            json!({"kind": "scratch", "scratch": {"kind": "server"}, "outside_writes": "refused"}),
             json!({"kind": "vouched", "scratch": {"kind": "server"}, "outside_writes": "refused"}),
             json!({"kind": "container", "image_digest": format!("sha256:{}", "06".repeat(32)),
                    "platform": "linux/amd64", "profile": "linux-amd64-v1"}),

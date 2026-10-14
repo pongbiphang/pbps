@@ -202,8 +202,8 @@ say whether what the emitter sent is what comes back.
 
 ### Engine-assisted planning and resolver environments
 
-**Doctor discovery, resolver selection and the resolver's scratch runs implemented; publication remains planned.**
-[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
+**PostgreSQL resolver planning delivered (#615); applying a resolved plan (#616) and SQL Server resolution (#619–#621) remain.**
+[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-postgresql-planning-delivered)
 and [ADR-0016](ADR-0016-engine-assisted-planning.md) retain offline previews and
 the existing SQL Server `--dev` rehearsal. Target planning accepts
 `--resolve-with <profile>` (#606), with CLI > environment > project precedence.
@@ -217,8 +217,9 @@ checks remain in force.
 Connected `doctor` reports an advisory target
 environment inventory and known official image-family suggestions for both
 engines, without acquisition. It names unknown qualification requirements;
-session observations do not establish the deployment context. No environment
-has been verified and no binding evidence is produced. See
+session observations do not establish the deployment context. A resolved
+plan carries its sealed binding evidence (#1516), which `explain` shows from
+the file (#1517); apply refuses it until #616. See
 [the staged delivery plan](RESOLVER-DELIVERY.md) for #595, completed discovery
 #597, and ordered implementation steps #606–#621.
 
@@ -239,12 +240,13 @@ unimplemented (#619, #620).
 The PostgreSQL target-input library (#612) captures actual historical bindings,
 recorded baseline, complete requested candidate sets and prerequisite properties
 on one owned snapshot. Fresh recapture compares private versioned fingerprints,
-keyed under a per-process key (DEC-952.1). Unknown required coverage refuses. This is a library boundary,
-not enabled CLI resolution or a saved-plan/apply path. Desired-namespace
+keyed under a per-process key (DEC-952.1). Unknown required coverage refuses. Connected
+planning uses it through the CLI (#1515–#1517); the apply path does not yet
+(#616). Desired-namespace
 reconstruction and the managed-only binding comparison (#613) compile the
 declarations on the resolver's scratch database and return, per surface,
 unaffected, rebuild or unresolved; sealing (#614) and planning integration
-(#615) remain required. See [the capture contract and fixtures](RESOLVER-CAPTURE.md)
+(#615) are delivered. See [the capture contract and fixtures](RESOLVER-CAPTURE.md)
 and [delivery tracking](RESOLVER-DELIVERY.md).
 
 **Re-planned by #1528 and #1636 (DEC-1528.1, DEC-1636.1).** Selecting a
@@ -258,8 +260,13 @@ proves its scratch is not the target and, on the target's cluster, that its
 account is confined; then it runs the shared compatibility qualification. Its
 plan is published after the ordinary connected checks and a fresh recheck of
 the target, with the target's cluster identity and the accepted limitations
-sealed in its evidence (#1516, DEC-1516.1).
-[Delivery tracking](RESOLVER-DELIVERY.md) has the remaining order: #1517,
+sealed in its evidence (#1516, DEC-1516.1). `explain` shows that evidence
+from the plan alone, in human and JSON output: the entry that ran, its
+scratch kind and layout, the qualification, each surface's verdict, the
+order and the prerequisites. SQL Server resolution, `--staged` and a
+retained external object the baseline does not stage refuse by name (#1517,
+DEC-1517.1). PostgreSQL planning is delivered; applying a resolved plan is
+#616. [Delivery tracking](RESOLVER-DELIVERY.md) has the remaining order:
 #1778 and #616, then SQL Server's #619, #620 and #621.
 
 Delivery is split into three stages:

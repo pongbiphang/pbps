@@ -29,7 +29,7 @@ use pbps_db::resolver::ScratchNames;
 use pbps_db::resolver::environment::{CatalogFacts, Verdict};
 use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
-use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchSource};
+use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchLayout, ScratchSource};
 use pbps_pg::resolver::baseline;
 use pbps_pg::resolver::capture::{StageError, Staged};
 use pbps_pg::resolver::scratch::{self as sql, Placement};
@@ -199,17 +199,21 @@ pub async fn produce_unsealed(
     }
 }
 
-/// What the evidence records of the scratch a run used (#1674).
+/// What the evidence records of the scratch a run used (#1674): the entry
+/// that configured it too (#1517). Its layout is the run's own finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provenance {
+    pub entry: String,
     pub scratch: ScratchSource,
     pub outside_writes: OutsideWrites,
 }
 
 impl Provenance {
-    /// A supplied server, its baseline's outside writes refused.
+    /// A server entry named `scratch`, its baseline's outside writes refused.
+    #[cfg(test)]
     pub fn server() -> Self {
         Self {
+            entry: "scratch".into(),
             scratch: ScratchSource::Server {},
             outside_writes: OutsideWrites::Refused,
         }
@@ -654,7 +658,12 @@ impl Run<'_> {
             resolver_build: reported_build(self.key, &prepared.scratch_catalog)?,
             channels: format!("scratch|{}|{}", self.tokens.target, self.tokens.scratch),
             runtime: ResolverRuntime::Scratch {
+                entry: self.provenance.entry.clone(),
                 scratch: self.provenance.scratch.clone(),
+                layout: match provisioning {
+                    Provisioning::RunOwned => ScratchLayout::RunOwned,
+                    Provisioning::Supplied => ScratchLayout::Supplied,
+                },
                 outside_writes: self.provenance.outside_writes,
             },
             target_cluster: self.planned_identity.to_owned(),

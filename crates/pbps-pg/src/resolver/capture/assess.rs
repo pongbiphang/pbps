@@ -486,66 +486,73 @@ pub(super) fn assess_with(
     // could win: the engine's own objects identically, the managed ones as
     // declared. Missing from either capture is not faithful: an uncaptured
     // set is not an empty one.
+    let reproduced = |set: &CandidateSet,
+                      one_argument: bool,
+                      on_target: &BTreeSet<ObjectIdentity>,
+                      on_scratch: &BTreeSet<ObjectIdentity>,
+                      member: &ObjectIdentity|
+     -> bool {
+        // A routine a one-argument call cannot reach cannot take a cast.
+        let holder = if target.inputs.contains_key(member) {
+            &target.inputs
+        } else {
+            &desired.inputs
+        };
+        if one_argument && !callable_with_one(holder, member) {
+            return true;
+        }
+        let system = set.class == CandidateClass::Cast
+            || member.name.first().is_some_and(|schema| is_system(schema));
+        if system {
+            // A system schema may also hold what a superuser created
+            // there. The baseline's comparison already accepted such a
+            // root by its header, without the body (SPEC §9.3.2). Only
+            // the root itself: an extension's member there was compared
+            // through its extension's version alone, so it is compared
+            // in full here, like an initdb member.
+            let staged = staged.is_some_and(|staged| staged.holds(member));
+            return match (target.inputs.get(member), desired.inputs.get(member)) {
+                (Some(left), Some(right)) => {
+                    on_target.contains(member)
+                        && on_scratch.contains(member)
+                        && (staged || properties_equal(&left.properties, &right.properties))
+                }
+                _ => false,
+            };
+        }
+        // Scratch's user schemas hold only the declarations, what
+        // creating them made, and what the baseline staged, so a member
+        // only scratch has was reproduced. A target member, whether
+        // scratch has the same identity or the plan drops it, must be
+        // the project's own, or staged and compared.
+        !on_target.contains(member)
+            || own(set.class, member)
+            || on_scratch.contains(member)
+                && staged.is_some_and(|staged| carries(&target.inputs, staged, member))
+    };
     let faithful = |(set, one_argument): (&CandidateSet, &bool)| -> bool {
         let (Some(on_target), Some(on_scratch)) =
             (target.candidates.get(set), desired.candidates.get(set))
         else {
             return false;
         };
-        on_target.union(on_scratch).all(|member| {
-            // A routine a one-argument call cannot reach cannot take a cast.
-            let holder = if target.inputs.contains_key(member) {
-                &target.inputs
-            } else {
-                &desired.inputs
-            };
-            if *one_argument && !callable_with_one(holder, member) {
-                return true;
-            }
-            let system = set.class == CandidateClass::Cast
-                || member.name.first().is_some_and(|schema| is_system(schema));
-            if system {
-                // A system schema may also hold what a superuser created
-                // there. The baseline's comparison already accepted such a
-                // root by its header, without the body (SPEC §9.3.2). Only
-                // the root itself: an extension's member there was compared
-                // through its extension's version alone, so it is compared
-                // in full here, like an initdb member.
-                let staged = staged.is_some_and(|staged| staged.holds(member));
-                return match (target.inputs.get(member), desired.inputs.get(member)) {
-                    (Some(left), Some(right)) => {
-                        on_target.contains(member)
-                            && on_scratch.contains(member)
-                            && (staged || properties_equal(&left.properties, &right.properties))
-                    }
-                    _ => false,
-                };
-            }
-            // Scratch's user schemas hold only the declarations, what
-            // creating them made, and what the baseline staged, so a member
-            // only scratch has was reproduced. A target member, whether
-            // scratch has the same identity or the plan drops it, must be
-            // the project's own, or staged and compared.
-            !on_target.contains(member)
-                || own(set.class, member)
-                || on_scratch.contains(member)
-                    && staged.is_some_and(|staged| carries(&target.inputs, staged, member))
-        })
+        on_target
+            .union(on_scratch)
+            .all(|member| reproduced(set, *one_argument, on_target, on_scratch, member))
     };
-    // Unfaithful because the target has a routine that is neither managed
-    // nor staged: only the operator can stage it, since pbps sends no
-    // routine source of its own (SPEC §9.3.2).
-    let unstaged_routine = |(set, _): (&CandidateSet, &bool)| {
-        set.class == CandidateClass::Routine
-            && target.candidates.get(set).is_some_and(|members| {
-                members.iter().any(|member| {
-                    !own(set.class, member)
-                        && !desired
-                            .candidates
-                            .get(set)
-                            .is_some_and(|scratch| scratch.contains(member))
-                })
-            })
+    // Unfaithful because the target retains an object, of any candidate
+    // class, that is neither managed nor on scratch: only the operator can
+    // stage it, since pbps sends no target source of its own (SPEC §9.3.2).
+    // The first such member that `faithful` itself fails names the refusal,
+    // so a member the call cannot reach is never named (#1517).
+    let unstaged = |(set, one_argument): (&CandidateSet, &bool)| {
+        let on_target = target.candidates.get(set)?;
+        let on_scratch = desired.candidates.get(set)?;
+        on_target.iter().find(|member| {
+            !on_scratch.contains(*member)
+                && !own(set.class, member)
+                && !reproduced(set, *one_argument, on_target, on_scratch, member)
+        })
     };
     let mut assessment = Assessment::default();
     for (object, input) in surfaces(desired) {
@@ -561,26 +568,38 @@ pub(super) fn assess_with(
             .any(|binding| binding.target.class == "pg_authid")
         {
             Verdict::Unresolved {
-                condition: "a binding names a role, which scratch reproduces under another name",
+                condition: "a binding names a role, which scratch reproduces under another name"
+                    .into(),
             }
-        } else if let Some(unfaithful) = derived(object, input, paths, &desired.inputs)
+        } else if let Some(unstaged) = derived(object, input, paths, &desired.inputs)
             .iter()
             .filter(|set| !faithful(*set))
-            .map(&unstaged_routine)
-            .reduce(|any, routine| any || routine)
+            .map(&unstaged)
+            .reduce(Option::or)
         {
             Verdict::Unresolved {
-                condition: if unfaithful && staged.is_some() {
-                    "a same-named routine on the target is not in the resolver's baseline; \
-                     add it to the baseline, or select no resolver and keep ADR-0013's \
-                     conservative rebuild"
-                } else {
-                    "a same-named candidate on the target was not reconstructed on scratch"
+                condition: match unstaged {
+                    // A retained external object, whatever its class and
+                    // whether or not the entry has a baseline (#1517).
+                    Some(member) => format!(
+                        "{} on the target is not in the resolver's baseline, and {} could \
+                         bind it; add it to the baseline, or select no resolver and keep \
+                         ADR-0013's conservative rebuild",
+                        overload(member),
+                        // The declaration, not its part: a view's rule, a
+                        // default's record. With its signature, as the
+                        // candidate is: a declared routine has overloads.
+                        overload(owner(object))
+                    ),
+                    None => "a same-named candidate on the target was not reconstructed on \
+                             scratch"
+                        .into(),
                 },
             }
         } else if compiled_early(object, input, order, &desired.inputs, paths) {
             Verdict::Unresolved {
-                condition: "the declaration was compiled before an object sharing a name it bound",
+                condition: "the declaration was compiled before an object sharing a name it bound"
+                    .into(),
             }
         } else if let Some(current) = current {
             if input.bindings == current.bindings {
@@ -773,6 +792,27 @@ fn compiled_early(
                     )
             })
         })
+}
+
+/// A candidate as a refusal names it, with its signature, whatever its
+/// class: a set holds every member of a name (a routine's or an operator's
+/// overloads, an operator class per access method), and a cast has no name
+/// at all, its two types are its identity. The name alone would not say
+/// which one the operator has to stage (#1517, #1945 review).
+fn overload(member: &ObjectIdentity) -> String {
+    let arguments: Vec<String> = member
+        .signature
+        .iter()
+        .map(|argument| argument.name.join("."))
+        .collect();
+    if let ("pg_cast", [source, target]) = (member.class.as_str(), arguments.as_slice()) {
+        return format!("cast ({source} AS {target})");
+    }
+    let name = super::staged::named(member);
+    if arguments.is_empty() {
+        return name;
+    }
+    format!("{name}({})", arguments.join(", "))
 }
 
 #[cfg(test)]

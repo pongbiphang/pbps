@@ -83,7 +83,65 @@ pub fn published(server: &str) {
     );
     assert_prior(&artifact, &sql);
 
-    // Without it, the plan is published.
+    // `--staged` is a gate: its evidence describes one transaction, so it is
+    // refused by name before the resolver runs, and nothing is written
+    // (#1517).
+    let mut args = plan_args(&artifact, &sql);
+    args.push("--staged");
+    let staged = run(&d, &args, Some(&targets));
+    assert_eq!(code(&staged), 2, "{}{}", stdout(&staged), stderr(&staged));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&staged)).unwrap();
+    let finding = &value["findings"][0];
+    assert_eq!(finding["id"], "resolver.unresolved", "{value}");
+    assert!(
+        finding["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("--staged cannot carry its answer")),
+        "{value}"
+    );
+    assert_prior(&artifact, &sql);
+
+    // A deployment role that may not read the cluster's identity meets the
+    // same gate by name: `--staged` refuses before that read (#1945 review).
+    let reader = format!("pbps_cli_r1517_{}", std::process::id());
+    let _roles = ClusterRoles {
+        server: connection.to_owned(),
+        names: vec![reader.clone()],
+    };
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {reader} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+             GRANT pg_read_all_data TO {reader}; \
+             REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC"
+        ),
+    );
+    let limited = as_role(connection, &reader);
+    let as_reader = Targets {
+        target: &limited,
+        scratch: &scratch.connection,
+    };
+    let mut args = plan_args(&artifact, &sql);
+    args.push("--staged");
+    let gated = run(&d, &args, Some(&as_reader));
+    // Negative: without `--staged` the same role stops at the identity read,
+    // so the gate above was reached before it.
+    let unread = run(&d, &plan_args(&artifact, &sql), Some(&as_reader));
+    on_server(
+        connection,
+        "GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO PUBLIC",
+    );
+    for (output, id) in [
+        (&gated, "resolver.unresolved"),
+        (&unread, "resolver.identity"),
+    ] {
+        assert_eq!(code(output), 2, "{}{}", stdout(output), stderr(output));
+        let value: serde_json::Value = serde_json::from_str(&stdout(output)).unwrap();
+        assert_eq!(value["findings"][0]["id"], id, "{value}");
+    }
+    assert_prior(&artifact, &sql);
+
+    // Without either, the plan is published.
     let output = successful(run(&d, &plan_args(&artifact, &sql), Some(&targets)));
     let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
     assert_eq!(
@@ -123,6 +181,7 @@ pub fn published(server: &str) {
         "keyed, never the identifier in clear: {cluster}"
     );
     assert_exact_order(&std::fs::read_to_string(&sql).unwrap());
+    assert_explained(&d, &artifact);
 
     // A hand-edited cluster identity is a plan other than the one whose
     // checksum was approved.
@@ -225,6 +284,157 @@ pub fn ordinary_checks(server: &str, refused: bool) {
             "the expression change is published with the resolver's answer"
         );
     }
+}
+
+/// `explain` of the published plan, from the file alone (#1517): the
+/// entry, its scratch kind and layout, each surface's verdict and every
+/// edge with its reason, in the JSON and the human form alike. The
+/// prerequisites are the whole captured scope, which depends on the
+/// cluster, so only their shape is pinned: identities, never a fingerprint.
+fn assert_explained(d: &Demo, artifact: &std::path::Path) {
+    let plan = artifact.to_str().unwrap();
+    let json = successful(run(
+        d,
+        &["explain", "--plan", plan, "--format", "json"],
+        None,
+    ));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+    let resolver = &value["data"]["resolver"];
+    assert_eq!(
+        (
+            &resolver["entry"],
+            &resolver["scratch"],
+            &resolver["layout"]
+        ),
+        (
+            &serde_json::json!("scratch"),
+            &serde_json::json!("server"),
+            &serde_json::json!("supplied")
+        ),
+        "{resolver}"
+    );
+    let surfaces: Vec<(String, String)> = resolver["surfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["verdict"].as_str().unwrap().to_owned(),
+                s["surface"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        surfaces,
+        [
+            ("rebuilt", "default app.t.c"),
+            ("rebuilt", "check app.t.ck"),
+            ("rebuilt", "index app.t.ix"),
+            ("rebuilt", "module app.v"),
+            ("unaffected", "module app.w"),
+            ("created", "module app.f(integer)"),
+            ("unaffected", "module app.f(numeric)"),
+            ("rebuilt", "module app.h(numeric)"),
+        ]
+        .map(|(v, s)| (v.to_owned(), s.to_owned()))
+    );
+    let prerequisites = resolver["prerequisites"].as_array().unwrap();
+    let object = |class: &str, name: &[&str]| serde_json::json!({"class": class, "name": name, "signature": []});
+    for named in [
+        object("pg_namespace", &["app"]),
+        object("pg_class", &["app", "t"]),
+        object("pg_class", &["app", "v"]),
+    ] {
+        assert!(
+            prerequisites
+                .iter()
+                .any(|p| p["object"] == named && p["fingerprinted"] == true),
+            "{named}"
+        );
+    }
+    // The overload the plan creates is sealed only as the closing
+    // manifest's placeholder: listed, without a fingerprint (#1517 review).
+    let created = serde_json::json!({"class": "pg_proc", "name": ["app", "f"], "signature": [
+        {"class": "pg_type", "name": ["pg_catalog", "int4"], "signature": []}
+    ]});
+    assert!(
+        prerequisites
+            .iter()
+            .any(|p| p["object"] == created && p["fingerprinted"] == false),
+        "{created}"
+    );
+    // Negative: the target held no such overload to fingerprint.
+    assert!(
+        !prerequisites
+            .iter()
+            .any(|p| p["object"] == created && p["fingerprinted"] == true),
+        "{created}"
+    );
+    let text = stdout(&successful(run(d, &["explain", "--plan", plan], None)));
+    assert!(
+        text.contains("  resolver    scratch (server scratch, supplied)\n"),
+        "{text}"
+    );
+    let block = text
+        .split_once("\n  surfaces\n")
+        .and_then(|(_, rest)| rest.split_once("\n  prerequisites "))
+        .map(|(block, _)| block)
+        .unwrap_or_else(|| panic!("{text}"));
+    let expected = [
+        "  surfaces",
+        "    rebuilt     default app.t.c",
+        "    rebuilt     check app.t.ck",
+        "    rebuilt     index app.t.ix",
+        "    rebuilt     module app.v",
+        "    unaffected  module app.w",
+        "    created     module app.f(integer)",
+        "    unaffected  module app.f(numeric)",
+        "    rebuilt     module app.h(numeric)",
+        "  order",
+        "    #1 create_module app.f(integer) before #2 public_execution app.f(integer) (restoration)",
+        "    #1 create_module app.f(integer) before #4 create_module app.v (binding)",
+        "    #1 create_module app.f(integer) before #7 create_module app.h(numeric) (binding)",
+        "    #1 create_module app.f(integer) before #13 alter_column_default app.t (binding)",
+        "    #1 create_module app.f(integer) before #14 add_check app.t (binding)",
+        "    #1 create_module app.f(integer) before #15 add_index app.t (binding)",
+        "    #2 public_execution app.f(integer) before #13 alter_column_default app.t (authorization)",
+        "    #2 public_execution app.f(integer) before #14 add_check app.t (authorization)",
+        "    #2 public_execution app.f(integer) before #15 add_index app.t (authorization)",
+        "    #3 drop_module app.v before #4 create_module app.v (identity)",
+        "    #3 drop_module app.v before #4 create_module app.v (restoration)",
+        "    #5 drop_module app.w before #6 drop_module app.h(numeric) (binding)",
+        "    #5 drop_module app.w before #9 create_module app.w (identity)",
+        "    #5 drop_module app.w before #9 create_module app.w (restoration)",
+        "    #6 drop_module app.h(numeric) before #7 create_module app.h(numeric) (identity)",
+        "    #6 drop_module app.h(numeric) before #7 create_module app.h(numeric) (restoration)",
+        "    #7 create_module app.h(numeric) before #8 public_execution app.h(numeric) (restoration)",
+        "    #7 create_module app.h(numeric) before #9 create_module app.w (binding)",
+        "    #10 drop_check app.t before #12 alter_column_default app.t (binding)",
+        "    #10 drop_check app.t before #13 alter_column_default app.t (binding)",
+        "    #10 drop_check app.t before #13 alter_column_default app.t (restoration)",
+        "    #10 drop_check app.t before #14 add_check app.t (restoration)",
+        "    #10 drop_check app.t before #15 add_index app.t (restoration)",
+        "    #11 drop_index app.t before #12 alter_column_default app.t (binding)",
+        "    #11 drop_index app.t before #13 alter_column_default app.t (binding)",
+        "    #11 drop_index app.t before #13 alter_column_default app.t (restoration)",
+        "    #11 drop_index app.t before #14 add_check app.t (restoration)",
+        "    #11 drop_index app.t before #15 add_index app.t (restoration)",
+        "    #12 alter_column_default app.t before #13 alter_column_default app.t (restoration)",
+        "    #12 alter_column_default app.t before #14 add_check app.t (restoration)",
+        "    #12 alter_column_default app.t before #15 add_index app.t (restoration)",
+    ];
+    assert_eq!(
+        format!("  surfaces\n{block}"),
+        expected.join("\n"),
+        "{text}"
+    );
+    // No fingerprint is shown: the sealed values are 64 hex digits.
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(artifact).unwrap()).unwrap();
+    let cluster = saved["analysis"]["evidence"]["qualification"]["target_cluster"]
+        .as_str()
+        .unwrap();
+    assert!(!text.contains(cluster) && !stdout(&json).contains(cluster));
 }
 
 /// The declarations every case starts from: `app.f(numeric)`, the

@@ -1101,6 +1101,7 @@
         "resolver::binding_tests::an_sql_value_functions_type_is_no_named_candidate",
         "resolver::binding_tests::an_unreadable_dropped_signature_is_refused_not_absent",
         "resolver::binding_tests::an_unrelated_arriving_routine_leaves_a_view_and_a_capturing_one_rebuilds_it",
+        "resolver::binding_tests::an_unstaged_external_object_of_any_class_is_refused_by_name",
         "resolver::binding_tests::a_scratch_backend_terminated_mid_statement_is_no_compile_verdict",
         "resolver::binding_tests::bindings_compare_logical_names_never_object_numbers",
         "resolver::binding_tests::the_scratch_compiles_in_the_targets_zone_or_not_at_all",

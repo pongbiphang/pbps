@@ -523,7 +523,7 @@ fn differences(
 }
 
 /// A readable name for an identity the engine did not describe.
-fn named(object: &ObjectIdentity) -> String {
+pub(super) fn named(object: &ObjectIdentity) -> String {
     let path = object.name.join(".");
     let of = |at: usize| object.signature.get(at).map(named).unwrap_or_default();
     match object.class.as_str() {

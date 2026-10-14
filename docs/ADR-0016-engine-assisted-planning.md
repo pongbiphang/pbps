@@ -692,7 +692,7 @@ file-based and the final emitter remains the only source of deployment SQL.
 
 ## Amendment: the resolver (#1528, #1636)
 
-This amends decisions 4 and 5. [SPEC §9.3.2](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
+This amends decisions 4 and 5. [SPEC §9.3.2](SPEC.md#932-engine-assisted-planning-postgresql-planning-delivered)
 carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
 
 - **One resolver.** The resolver environments designed above are the
@@ -796,6 +796,12 @@ carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
     prerequisite, an in-place mutation, a compared setting, an extension and
     the deployer's authorization, each written from a second connection)
   - `resolver_seals_an_accepted_build_limitation_and_rechecks_it`
+  - `an_unstaged_external_object_of_any_class_is_refused_by_name` (a routine
+    and a relation, with no baseline: the object, the declaration and the
+    remedy, #1517)
+  - `resolver_publishes_its_rechecked_plan_in_the_exact_order` (`flow_pg`):
+    `explain` of the published plan from the file alone, and `--staged`
+    refused by name (#1517)
 
 ## Architectural placement
 

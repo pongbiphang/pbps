@@ -242,6 +242,8 @@ for the run and removes it afterwards. A `kind: server` entry, a scratch
 server you supply, is for targets no community image matches and for CI
 without a container runtime. A resolver runs only when a plan needs it; its
 plan is published after a fresh recheck of the target, and existing planning
-checks apply to it as to any other. See
-[SPEC §9.3.2](docs/SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
+checks apply to it as to any other. `pbps explain --plan` shows its evidence
+from the file alone: which entry ran, on what scratch, and what it sealed.
+Applying a resolver's plan is not built yet (#616). See
+[SPEC §9.3.2](docs/SPEC.md#932-engine-assisted-planning-postgresql-planning-delivered)
 for configuration and [the delivery steps](docs/RESOLVER-DELIVERY.md).
