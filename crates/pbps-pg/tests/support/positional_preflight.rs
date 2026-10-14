@@ -310,28 +310,86 @@ async fn a_new_key_validates_writes_before_its_own_step_and_never_after_it() {
         .into(),
         ..Default::default()
     };
+    let drop_key = Change::DropForeignKey {
+        table: child.clone(),
+        name: "child_parent_fkey".into(),
+    };
+    let mut other_key = add.clone();
+    if let Change::AddForeignKey { name, .. } = &mut other_key {
+        *name = "other_parent_fkey".into();
+    }
     let dialect = Postgres::new();
     let mut observations = Vec::new();
     for (label, changes, expected) in [
-        ("no repair", vec![delete.clone(), add.clone()], 1),
+        ("no repair", vec![delete.clone(), add.clone()], Some(1)),
         (
             "repair between delete and key",
             vec![delete.clone(), update.clone(), add.clone()],
-            0,
+            Some(0),
         ),
-        ("repair after key", vec![delete, add, update], 1),
+        (
+            "repair after key",
+            vec![delete.clone(), add.clone(), update.clone()],
+            Some(1),
+        ),
+        (
+            "key before delete",
+            vec![add.clone(), delete.clone()],
+            Some(1),
+        ),
+        (
+            "repair before delete",
+            vec![add.clone(), update.clone(), delete.clone()],
+            Some(0),
+        ),
+        (
+            "repair after delete",
+            vec![add.clone(), delete.clone(), update],
+            Some(1),
+        ),
+        (
+            "key already dropped",
+            vec![add.clone(), drop_key.clone(), delete.clone()],
+            None,
+        ),
+        (
+            "future drop",
+            vec![add.clone(), delete.clone(), drop_key.clone()],
+            Some(1),
+        ),
+        (
+            "key rebuilt",
+            vec![add.clone(), drop_key, add.clone(), delete.clone()],
+            Some(1),
+        ),
+        (
+            "another key dropped",
+            vec![
+                add,
+                other_key,
+                Change::DropForeignKey {
+                    table: child.clone(),
+                    name: "other_parent_fkey".into(),
+                },
+                delete,
+            ],
+            Some(1),
+        ),
     ] {
         let plan = ChangeSet {
             changes: changes.into_iter().map(PlannedChange::new).collect(),
         };
         let names = PlanNames::of(&plan.changes, &ids).unwrap();
         let report = dialect.preflight(&names);
-        let probe = report
+        let probes: Vec<_> = report
             .probes
             .iter()
-            .find(|p| p.description.contains("on a column it also adds"))
-            .expect("the key checks the effects of preceding deletes at its own step");
-        let count = counted(&mut db.conn, &probe.sql).await;
+            .filter(|p| p.description.contains("on a column it also adds"))
+            .collect();
+        let count = match probes.first() {
+            Some(probe) => Some(counted(&mut db.conn, &probe.sql).await),
+            None => None,
+        };
         let frame = dialect.transaction_framing(&pbps_model::SessionZone::utc());
         db.conn.begin(&frame).await.unwrap();
         let mut accepted = true;
@@ -344,11 +402,29 @@ async fn a_new_key_validates_writes_before_its_own_step_and_never_after_it() {
             }
         }
         db.conn.rollback(&frame).await.unwrap();
-        observations.push((label, expected, count, accepted));
+        observations.push((label, expected, count, accepted, probes.len()));
     }
     db.drop().await;
-    for (label, expected, count, accepted) in observations {
-        assert_eq!(count, expected, "{label}: the key owns its row projection");
-        assert_eq!(accepted, expected == 0, "{label}: the engine agrees");
+    for (label, expected, count, accepted, _) in &observations {
+        eprintln!("{label}: expected={expected:?}, count={count:?}, engine_accepts={accepted}");
     }
+    for (label, expected, count, accepted, probe_count) in observations {
+        assert_eq!(
+            probe_count,
+            usize::from(expected.is_some()),
+            "{label}: only the active key contributes"
+        );
+        assert_eq!(count, expected, "{label}: the key owns its row projection");
+        assert_eq!(
+            accepted,
+            expected.unwrap_or(0) == 0,
+            "{label}: the engine agrees"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn a_planned_key_counts_only_references_that_survive_the_current_delete() {
+    check_deleted_self_reference(false).await;
 }

@@ -1902,3 +1902,38 @@ the key succeed, while the same repair after ADD does not:
 
 The extraction was first checked against 192 existing preflight reports with
 byte-identical SQL and diagnostics before changing the read boundaries.
+
+
+<a id="dec-1977-1"></a>
+
+**DEC-1977.1. A delete owns its row's removal at its probe boundary.**
+
+`PlanFacts::before(step)` excludes the current statement. Keep that boundary
+for names, columns, defaults and preceding writes; overlay the current DELETE
+on the row projection used by its probes. The target cannot remain a surviving
+parent or a referencing child, including a reference introduced by an earlier
+update to that same row. `RowWrites::delete` records the removal and discards
+that row's earlier assignments and unknown-value evidence. Both dialects use
+the same operation for preceding deletes and for the current delete, replacing
+the separate SQL fragments that excluded only the stored self-reference.
+Other rows' assignments and unknowns remain visible.
+
+Measured on PostgreSQL 18/16, adding a NO ACTION key and then deleting its
+referenced parent counted zero while the engine refused: the target was still
+its own surviving parent. A preceding repair permits the delete; the same
+repair after it does not. Planned keys are also retired when their own DROP
+runs. Keeping an already dropped key after fixing the survivor projection
+would refuse a valid delete; a later key with the same name must participate
+again. Constraint names therefore remain raw facts on `Event::AddForeignKey`.
+
+Measured on SQL Server and PostgreSQL 18/16, updating a row from a reference to
+another row into a self-reference and then deleting it counted one while the
+engine accepted. A second referencing row counted two instead of one. Clearing
+the deleted row's earlier writes makes these counts zero and one respectively.
+`a_catalog_key_counts_only_references_that_survive_the_current_delete` runs the
+same cases against both dialects; PostgreSQL also checks planned keys in
+`a_planned_key_counts_only_references_that_survive_the_current_delete`.
+`a_new_key_validates_writes_before_its_own_step_and_never_after_it` retains the
+before/after key controls and checks the DELETE boundary and retired keys.
+Name reads never move past the current statement, and later repairs remain
+invisible. Conversion, collation, backfill and key comparison stay engine-owned.

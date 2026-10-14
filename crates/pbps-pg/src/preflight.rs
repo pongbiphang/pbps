@@ -464,15 +464,17 @@ struct AddedColumn {
 #[derive(Debug)]
 struct Added {
     child: TableName,
+    name: String,
     columns: Vec<String>,
     parent: TableName,
     referenced: Vec<String>,
 }
 
 impl Added {
-    fn of(table: &TableName, constraint: &pbps_model::ForeignKey) -> Self {
+    fn of(table: &TableName, name: &str, constraint: &pbps_model::ForeignKey) -> Self {
         Self {
             child: table.clone(),
+            name: name.to_owned(),
             columns: constraint.columns.clone(),
             parent: constraint.references_table.clone(),
             referenced: constraint.references_columns.clone(),
@@ -589,9 +591,15 @@ impl<'v, 'p> AsStored<'v, 'p> {
                 // A preceding key addition must participate in the delete's
                 // count even though the catalog does not hold it yet.
                 Event::AddForeignKey {
-                    table, constraint, ..
+                    table,
+                    name,
+                    constraint,
                 } => {
-                    this.added.push(Added::of(table, constraint));
+                    this.added.push(Added::of(table, name, constraint));
+                }
+                Event::DropForeignKey { table, name } => {
+                    this.added
+                        .retain(|key| key.child != *table || key.name != *name);
                 }
                 Event::UpdateRow {
                     table,
@@ -649,7 +657,6 @@ impl<'v, 'p> AsStored<'v, 'p> {
                 }
                 Event::AddComputedColumn { .. }
                 | Event::DropComputedColumn { .. }
-                | Event::DropForeignKey { .. }
                 | Event::DropTable { .. } => {}
                 Event::AttachPartition { table, parent, .. } => {
                     this.attached
@@ -1023,9 +1030,6 @@ fn delete_probe(
     } else {
         format!("CASE {} ELSE '' END", exclusions.join(" "))
     };
-    // The statement removes its target's self-reference at the same time.
-    // This is the current DELETE's effect, not a later plan mutation.
-    let exclusion = format!("{exclusion} || {}", self_reference(&stored.name, key)?);
     let arrival = if arrivals.is_empty() {
         "''".to_owned()
     } else {
@@ -3526,6 +3530,22 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
         let names = LazyCell::new(|| {
             let mut names = AsStored::of(facts.before(step), partitions);
             names.reach_partitions(partitions);
+            // Names and column facts belong to the preceding prefix. The
+            // current DELETE also removes its own reference and cannot leave
+            // its target as a surviving parent (DEC-1977.1).
+            if let Change::DeleteRow {
+                table,
+                key_column,
+                key,
+                ..
+            } = &p.change
+            {
+                names
+                    .moved
+                    .entry(table.clone())
+                    .or_default()
+                    .delete(key_column, key);
+            }
             names
         });
         match build(&p.change, &names, &mut unchecked) {
@@ -3630,13 +3650,15 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             }
         }
         if let Change::AddForeignKey {
-            table, constraint, ..
+            table,
+            name,
+            constraint,
         } = &p.change
         {
             // Validation belongs to this key's statement. A preceding delete
             // cannot see the future key, while its earlier row/column changes
             // must still inform the key's backfill and survivor checks.
-            let added = Added::of(table, constraint);
+            let added = Added::of(table, name, constraint);
             let keys = std::slice::from_ref(&added);
             for (_, event) in facts.before(step).events() {
                 let Event::DeleteRow {

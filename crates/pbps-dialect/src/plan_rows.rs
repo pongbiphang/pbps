@@ -53,6 +53,7 @@ pub enum Event<'p> {
     },
     AddForeignKey {
         table: &'p TableName,
+        name: &'p String,
         constraint: &'p ForeignKey,
     },
     DropForeignKey {
@@ -140,8 +141,14 @@ impl<'p> PlanFacts<'p> {
                 }
                 Change::DropComputedColumn { table, .. } => Event::DropComputedColumn { table },
                 Change::AddForeignKey {
-                    table, constraint, ..
-                } => Event::AddForeignKey { table, constraint },
+                    table,
+                    name,
+                    constraint,
+                } => Event::AddForeignKey {
+                    table,
+                    name,
+                    constraint,
+                },
                 Change::DropForeignKey { table, name } => Event::DropForeignKey { table, name },
                 Change::AttachPartition { table, parent, .. } => {
                     Event::AttachPartition { table, parent }
@@ -482,8 +489,7 @@ impl<'p> View<'_, 'p> {
                     ..
                 } => {
                     let moved = tables.entry(table.clone()).or_default();
-                    moved.key_column = key_column.clone();
-                    moved.deleted.insert(key.clone());
+                    moved.delete(key_column, key);
                 }
                 Event::CreateTable { .. }
                 | Event::DropTable { .. }
@@ -597,6 +603,21 @@ impl<V, M: Default> Default for RowWrites<V, M> {
 }
 
 impl<V, M> RowWrites<V, M> {
+    /// A deleted row contributes neither a surviving reference nor an arrival
+    /// from its earlier writes. Keep other rows' unknown assignments visible.
+    pub fn delete(&mut self, key_column: &str, row: &RowKey) {
+        self.key_column = key_column.to_owned();
+        self.deleted.insert(row.clone());
+        self.updated.remove(row);
+        self.inserted.remove(row);
+        self.typed.remove(row);
+        self.held_null.remove(row);
+        self.unprobeable.retain(|_, rows| {
+            rows.remove(row);
+            !rows.is_empty()
+        });
+    }
+
     /// Keep an unknown assignment visible: treating it as an untouched cell
     /// would compare the stored reference instead (DECISIONS 124, 165).
     pub fn update(&mut self, row: &RowKey, column: &str, value: Option<V>) {
