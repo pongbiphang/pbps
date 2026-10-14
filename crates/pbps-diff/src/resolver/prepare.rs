@@ -1,6 +1,7 @@
 use super::Error;
 use pbps_dialect::Dialect;
 use pbps_model::operation::{Origin, Source};
+use pbps_model::part_effects::{DefaultChange, Effect, Part as DependencyPart};
 use pbps_model::resolver::{Surface, SurfaceResolution};
 use pbps_model::{Change, ChangeSet, IdsFile, IdsIndex, PlannedChange, Schema, ValueSource};
 use std::collections::BTreeSet;
@@ -159,39 +160,18 @@ pub(super) fn forward(surface: &Surface, from: &IdsIndex<'_>, to: &IdsFile) -> S
     }
 }
 
+#[allow(clippy::wildcard_enum_match_arm)]
 pub(super) fn invalidates(change: &Change, surface: &Surface) -> bool {
-    match surface {
-        Surface::Namespace(_) => false,
-        Surface::Module(id) => matches!(change, Change::DropModule { id: gone, .. } if gone == id),
-        Surface::Table(table) => {
-            matches!(change, Change::DropTable { name, .. } if name == table)
-                || matches!(change, Change::RenameTable { from, .. } if from == table)
-        }
-        // Definition comparisons also name declaration-only metadata. It emits
-        // no DDL, so dropping a bound view/routine would invent a dependency
-        // failure on a plan that needs no catalog change (SPEC §7.6).
-        Surface::Column(column) => change
-            .columns_redefined()
-            .iter()
-            .any(|(r, field)| r == column && *field != pbps_model::ColumnField::Deprecated),
-        // A rewritten generation expression replaces its `pg_attrdef` as a
-        // changed default does (DEC-1168.1).
-        Surface::Default(column) => {
-            matches!(change, Change::AlterColumnDefault { column: r, from: Some(_), .. } if r == column)
-                || matches!(change, Change::AlterColumnExpression { column: r, .. } if r == column)
-                // A partition's: every one of these sets, replaces or drops
-                // the partition's own `pg_attrdef`, an inherited copy of its
-                // parent's included (#1607 review).
-                || matches!(change, Change::SetPartitionDefault { table, column: c, .. }
-                    if *table == column.table && *c == column.name)
-        }
-        Surface::Check { table, name } => {
-            matches!(change, Change::DropCheck { table: t, name: n } if t == table && n == name)
-        }
-        Surface::Index { table, name } => {
-            matches!(change, Change::DropIndex { table: t, name: n } if t == table && n == name)
-        }
-    }
+    change.part_effects().iter().any(|fact| match (&fact.part, fact.effect, surface) {
+        (DependencyPart::Module { id, .. }, Effect::Removed, Surface::Module(module)) => *id == module,
+        (DependencyPart::Table(table), Effect::Removed | Effect::Renamed, Surface::Table(target)) => *table == target,
+        (DependencyPart::Column(column), Effect::Redefined(field), Surface::Column(target)) => column == target && field != pbps_model::ColumnField::Deprecated,
+        (DependencyPart::Default { column, change: DefaultChange::Column { from: Some(_), .. } | DefaultChange::Partition { .. } }, _, Surface::Default(target))
+        | (DependencyPart::Generated(column), Effect::Rewritten, Surface::Default(target)) => column == target,
+        (DependencyPart::Named { table, kind: pbps_model::Part::Check, name }, Effect::Removed, Surface::Check { table: target, name: target_name })
+        | (DependencyPart::Named { table, kind: pbps_model::Part::Index, name }, Effect::Removed, Surface::Index { table: target, name: target_name }) => *table == target && *name == target_name,
+        _ => false,
+    })
 }
 
 /// The resolver's input before it is ordered: the ordinary plan with its
@@ -788,4 +768,58 @@ fn tears_down(change: &Change, surface: &Surface) -> bool {
         || matches!((change, surface),
         (Change::DropCheck { table: a, name: n }, Surface::Check { table: b, name: m })
         | (Change::DropIndex { table: a, name: n }, Surface::Index { table: b, name: m }) if a == b && n == m)
+}
+
+#[cfg(test)]
+#[allow(clippy::wildcard_enum_match_arm)]
+fn old_invalidates(change: &Change, surface: &Surface) -> bool {
+    match surface {
+        Surface::Namespace(_) => false,
+        Surface::Module(id) => matches!(change, Change::DropModule { id: gone, .. } if gone == id),
+        Surface::Table(table) => {
+            matches!(change, Change::DropTable { name, .. } if name == table)
+                || matches!(change, Change::RenameTable { from, .. } if from == table)
+        }
+        // Definition comparisons also name declaration-only metadata. It emits
+        // no DDL, so dropping a bound view/routine would invent a dependency
+        // failure on a plan that needs no catalog change (SPEC §7.6).
+        Surface::Column(column) => change
+            .columns_redefined()
+            .iter()
+            .any(|(r, field)| r == column && *field != pbps_model::ColumnField::Deprecated),
+        // A rewritten generation expression replaces its `pg_attrdef` as a
+        // changed default does (DEC-1168.1).
+        Surface::Default(column) => {
+            matches!(change, Change::AlterColumnDefault { column: r, from: Some(_), .. } if r == column)
+                || matches!(change, Change::AlterColumnExpression { column: r, .. } if r == column)
+                // A partition's: every one of these sets, replaces or drops
+                // the partition's own `pg_attrdef`, an inherited copy of its
+                // parent's included (#1607 review).
+                || matches!(change, Change::SetPartitionDefault { table, column: c, .. }
+                    if *table == column.table && *c == column.name)
+        }
+        Surface::Check { table, name } => {
+            matches!(change, Change::DropCheck { table: t, name: n } if t == table && n == name)
+        }
+        Surface::Index { table, name } => {
+            matches!(change, Change::DropIndex { table: t, name: n } if t == table && n == name)
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../pbps-model/tests/support/part_effect_cases.rs"]
+mod part_effect_cases;
+
+#[test]
+fn dependency_effects_preserve_invalidation_for_every_change() {
+    for (name, change) in part_effect_cases::cases() {
+        for surface in super::graph::effect_surfaces() {
+            assert_eq!(
+                invalidates(&change, &surface),
+                old_invalidates(&change, &surface),
+                "{name}: {surface:?}"
+            );
+        }
+    }
 }

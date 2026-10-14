@@ -4988,3 +4988,32 @@ creates it, SQL Server's `CREATE OR ALTER` keeps it. What a step ends or
 produces is read from its own payload alone; whether a dropped table's parts
 went with it, or a partition held its parent's default, is the baseline's to
 say (#1954).
+
+<a id="dec-1773-1"></a>
+
+**DEC-1773.1. Dependency consumers filter one exhaustive classification of
+parts, while retaining their own removal and rebinding questions.** The
+eight-consumer matrix on #1773 records every Change variant before this
+refactor. `Change::part_effects` classifies dependency-bearing declarations
+in the model and reuses `columns_redefined` for column-field facts. A new
+Change kind must be classified there; there is no wildcard or defaulted
+per-consumer boolean. This is not the operation-level ordering effects or
+scheduler of #1954/#1968.
+
+A default transition retains its own `from` and `to` and a partition's
+`fallback`: no own default does not mean no inherited catalog expression.
+Replacing an own default with an inherited one releases its old binding
+while retaining an effective default. An unsplit normal default rewrite is
+an in-place edit to weaving, but the resolver's release filter consumes
+prepared changes whose rewrite was already split. Neither question changes
+to match the other's answer (DECISIONS 170). An inline expression created
+with a table or column is a provided surface, not a separate restoration
+step that weaving can move.
+
+Parent reach and standing-partition selection remain in weaving
+(DEC-1699.1); catalog class selection, physical-source lookup and
+absent-versus-unreadable handling remain in PostgreSQL. No effect facts
+are serialized in a schema or plan, and the classifier does not choose
+ordering edges. The old and new predicates are compared over every kind
+and the matrix's field-dependent cases before the old predicates are
+deleted.

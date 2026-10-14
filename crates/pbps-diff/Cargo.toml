@@ -13,6 +13,7 @@ pbps-dialect.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 indexmap.workspace = true
 
 [lints]

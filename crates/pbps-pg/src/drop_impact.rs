@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::impact::{DropReport, ImpactError};
 use pbps_db::{Conn, DbError, Param, Row};
+use pbps_model::part_effects::{DefaultChange, Effect, Part as DependencyPart};
 use pbps_model::physical_sources::{PhysicalSources, Source};
 use pbps_model::plan_names::At;
 use pbps_model::{Change, ModuleId, ModuleKind, TableName};
@@ -419,15 +420,40 @@ async fn detached_clones(
         .collect()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Removal<'a> {
+    Table(&'a TableName),
+    Column(pbps_model::ColumnRef),
+    Module(&'a ModuleId, ModuleKind),
+    Part(&'a TableName, Part<'a>),
+    Default(pbps_model::ColumnRef),
+}
+
+// Catalog classes and absent/unreadable policy stay here. The model supplies
+// declaration effects, not a claim that a catalog address exists (DEC-1316.1).
+#[allow(clippy::wildcard_enum_match_arm)]
+fn removal_part(change: &Change) -> Option<Removal<'_>> {
+    change.part_effects().into_iter().find_map(|fact| match (fact.part, fact.effect) {
+        (DependencyPart::Table(table), Effect::Removed) => Some(Removal::Table(table)),
+        (DependencyPart::Column(column), Effect::Removed) => Some(Removal::Column(column)),
+        (DependencyPart::Module { id, kind }, Effect::Removed | Effect::Rewritten) => Some(Removal::Module(id, kind)),
+        (DependencyPart::Named { table, kind: pbps_model::Part::Check | pbps_model::Part::Unique | pbps_model::Part::ForeignKey, name }, Effect::Removed) => Some(Removal::Part(table, Part::Constraint(name))),
+        (DependencyPart::Named { table, kind: pbps_model::Part::Index, name }, Effect::Removed) => Some(Removal::Part(table, Part::Index(name))),
+        (DependencyPart::PrimaryKey(table), Effect::Removed | Effect::Rewritten) => Some(Removal::Part(table, Part::PrimaryKey)),
+        (DependencyPart::Default { column, change: DefaultChange::Column { from: Some(_), .. } | DefaultChange::Partition { .. } }, _)
+        | (DependencyPart::Generated(column), Effect::Rewritten) => Some(Removal::Default(column)),
+        _ => None,
+    })
+}
+
 async fn removal(
     conn: &mut Conn,
     classes: &Classes,
     sources: &PhysicalSources<'_>,
     index: usize,
 ) -> Result<Option<Address>, ImpactError> {
-    let p = &sources.names().changes()[index];
-    match &p.change {
-        Change::DropTable { name, .. } => {
+    match removal_part(&sources.names().changes()[index].change) {
+        Some(Removal::Table(name)) => {
             let Some((table, _)) = stored(sources, index, name, None)? else {
                 return Ok(None);
             };
@@ -441,7 +467,7 @@ async fn removal(
                     .into()
                 })
         }
-        Change::DropColumn { column, .. } => {
+        Some(Removal::Column(column)) => {
             let Some((table, name)) = stored(sources, index, &column.table, Some(&column.name))?
             else {
                 return Ok(None);
@@ -456,71 +482,14 @@ async fn removal(
                     .into()
                 })
         }
-        Change::DropModule { id, kind } => module_address(conn, classes, id, *kind).await,
-        Change::AlterModule { id, module } => module_address(conn, classes, id, module.kind).await,
-        Change::DropCheck { table, name }
-        | Change::DropUnique { table, name }
-        | Change::DropForeignKey { table, name } => {
-            table_part(conn, classes, sources, index, table, Part::Constraint(name)).await
+        Some(Removal::Module(id, kind)) => module_address(conn, classes, id, kind).await,
+        Some(Removal::Part(table, part)) => {
+            table_part(conn, classes, sources, index, table, part).await
         }
-        Change::DropIndex { table, name } => {
-            table_part(conn, classes, sources, index, table, Part::Index(name)).await
-        }
-        Change::SetPrimaryKey {
-            table,
-            from: Some(_),
-            ..
-        } => table_part(conn, classes, sources, index, table, Part::PrimaryKey).await,
-        // `SET EXPRESSION` replaces the column's `pg_attrdef` row as a default
-        // change does, and its old edges go with the old row: an input the
-        // old expression read is no longer blocked by it (DEC-1316.1).
-        Change::AlterColumnDefault {
-            column,
-            from: Some(_),
-            ..
-        }
-        | Change::AlterColumnExpression { column, .. } => {
+        Some(Removal::Default(column)) => {
             default_row(conn, classes, sources, index, &column.table, &column.name).await
         }
-        // A partition's row, its own default or its copy of its parent's,
-        // goes as a column's does (#1581).
-        Change::SetPartitionDefault { table, column, .. } => {
-            default_row(conn, classes, sources, index, table, column).await
-        }
-        Change::CreateTable { .. }
-        | Change::DetachPartition { .. }
-        | Change::AttachPartition { .. }
-        | Change::RenameTable { .. }
-        | Change::AddColumn { .. }
-        | Change::RenameColumn { .. }
-        | Change::AlterColumnType { .. }
-        | Change::AlterColumnNullability { .. }
-        | Change::AlterColumnDefault { .. }
-        | Change::SetColumnDeprecated { .. }
-        | Change::SetPrimaryKey { .. }
-        | Change::SetIndexStorageParameters { .. }
-        | Change::SetTablePersistence { .. }
-        | Change::SetPartitionNotNull { .. }
-        | Change::SetStorageParameters { .. }
-        | Change::SetReplicaIdentity { .. }
-        | Change::AddUnique { .. }
-        | Change::AddForeignKey { .. }
-        | Change::AddCheck { .. }
-        | Change::AddIndex { .. }
-        | Change::AddComputedColumn { .. }
-        | Change::DropComputedColumn { .. }
-        | Change::InsertRow { .. }
-        | Change::UpdateRow { .. }
-        | Change::DeleteRow { .. }
-        | Change::SetDataMode { .. }
-        | Change::SetEnsureKeys { .. }
-        | Change::CreateModule { .. }
-        | Change::CreateRole { .. }
-        | Change::DropRole { .. }
-        | Change::RenameRole { .. }
-        | Change::Grant { .. }
-        | Change::Revoke { .. }
-        | Change::PublicExecution { .. } => Ok(None),
+        None => Ok(None),
     }
 }
 
@@ -578,6 +547,7 @@ async fn module_address(
         }))
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Part<'a> {
     Constraint(&'a str),
     Index(&'a str),
@@ -878,5 +848,156 @@ mod tests {
             sources.source(&u.column("other"), At::End),
             Source::Stored(t.column("other"))
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::wildcard_enum_match_arm)]
+fn old_removal_part(change: &Change) -> Option<Removal<'_>> {
+    match change {
+        Change::DropTable { name, .. } => Some(Removal::Table(name)),
+        Change::DropColumn { column, .. } => Some(Removal::Column(column.clone())),
+        Change::DropModule { id, kind } => Some(Removal::Module(id, *kind)),
+        Change::AlterModule { id, module } => Some(Removal::Module(id, module.kind)),
+        Change::DropCheck { table, name }
+        | Change::DropUnique { table, name }
+        | Change::DropForeignKey { table, name } => {
+            Some(Removal::Part(table, Part::Constraint(name)))
+        }
+        Change::DropIndex { table, name } => Some(Removal::Part(table, Part::Index(name))),
+        Change::SetPrimaryKey {
+            table,
+            from: Some(_),
+            ..
+        } => Some(Removal::Part(table, Part::PrimaryKey)),
+        Change::AlterColumnDefault {
+            column,
+            from: Some(_),
+            ..
+        }
+        | Change::AlterColumnExpression { column, .. } => Some(Removal::Default(column.clone())),
+        Change::SetPartitionDefault { table, column, .. } => {
+            Some(Removal::Default(table.column(column)))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[path = "../../pbps-model/tests/support/part_effect_cases.rs"]
+mod part_effect_cases;
+
+#[test]
+fn dependency_effects_preserve_catalog_selection_for_every_change() {
+    for (name, change) in part_effect_cases::cases() {
+        assert_eq!(removal_part(&change), old_removal_part(&change), "{name}");
+    }
+}
+
+// WIP equivalence reference; removed before the final refactor.
+#[cfg(test)]
+#[allow(dead_code)]
+async fn old_removal(
+    conn: &mut Conn,
+    classes: &Classes,
+    sources: &PhysicalSources<'_>,
+    index: usize,
+) -> Result<Option<Address>, ImpactError> {
+    let p = &sources.names().changes()[index];
+    match &p.change {
+        Change::DropTable { name, .. } => {
+            let Some((table, _)) = stored(sources, index, name, None)? else {
+                return Ok(None);
+            };
+            relation(conn, classes, &table, None)
+                .await?
+                .map(Some)
+                .ok_or_else(|| {
+                    error(format!(
+                        "drop_blockers: table {table} is absent from the catalog"
+                    ))
+                    .into()
+                })
+        }
+        Change::DropColumn { column, .. } => {
+            let Some((table, name)) = stored(sources, index, &column.table, Some(&column.name))?
+            else {
+                return Ok(None);
+            };
+            relation(conn, classes, &table, name.as_deref())
+                .await?
+                .map(Some)
+                .ok_or_else(|| {
+                    error(format!(
+                        "drop_blockers: column {column} is absent from the catalog"
+                    ))
+                    .into()
+                })
+        }
+        Change::DropModule { id, kind } => module_address(conn, classes, id, *kind).await,
+        Change::AlterModule { id, module } => module_address(conn, classes, id, module.kind).await,
+        Change::DropCheck { table, name }
+        | Change::DropUnique { table, name }
+        | Change::DropForeignKey { table, name } => {
+            table_part(conn, classes, sources, index, table, Part::Constraint(name)).await
+        }
+        Change::DropIndex { table, name } => {
+            table_part(conn, classes, sources, index, table, Part::Index(name)).await
+        }
+        Change::SetPrimaryKey {
+            table,
+            from: Some(_),
+            ..
+        } => table_part(conn, classes, sources, index, table, Part::PrimaryKey).await,
+        // `SET EXPRESSION` replaces the column's `pg_attrdef` row as a default
+        // change does, and its old edges go with the old row: an input the
+        // old expression read is no longer blocked by it (DEC-1316.1).
+        Change::AlterColumnDefault {
+            column,
+            from: Some(_),
+            ..
+        }
+        | Change::AlterColumnExpression { column, .. } => {
+            default_row(conn, classes, sources, index, &column.table, &column.name).await
+        }
+        // A partition's row, its own default or its copy of its parent's,
+        // goes as a column's does (#1581).
+        Change::SetPartitionDefault { table, column, .. } => {
+            default_row(conn, classes, sources, index, table, column).await
+        }
+        Change::CreateTable { .. }
+        | Change::DetachPartition { .. }
+        | Change::AttachPartition { .. }
+        | Change::RenameTable { .. }
+        | Change::AddColumn { .. }
+        | Change::RenameColumn { .. }
+        | Change::AlterColumnType { .. }
+        | Change::AlterColumnNullability { .. }
+        | Change::AlterColumnDefault { .. }
+        | Change::SetColumnDeprecated { .. }
+        | Change::SetPrimaryKey { .. }
+        | Change::SetIndexStorageParameters { .. }
+        | Change::SetTablePersistence { .. }
+        | Change::SetPartitionNotNull { .. }
+        | Change::SetStorageParameters { .. }
+        | Change::SetReplicaIdentity { .. }
+        | Change::AddUnique { .. }
+        | Change::AddForeignKey { .. }
+        | Change::AddCheck { .. }
+        | Change::AddIndex { .. }
+        | Change::AddComputedColumn { .. }
+        | Change::DropComputedColumn { .. }
+        | Change::InsertRow { .. }
+        | Change::UpdateRow { .. }
+        | Change::DeleteRow { .. }
+        | Change::SetDataMode { .. }
+        | Change::SetEnsureKeys { .. }
+        | Change::CreateModule { .. }
+        | Change::CreateRole { .. }
+        | Change::DropRole { .. }
+        | Change::RenameRole { .. }
+        | Change::Grant { .. }
+        | Change::Revoke { .. }
+        | Change::PublicExecution { .. } => Ok(None),
     }
 }
