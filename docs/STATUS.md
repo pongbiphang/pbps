@@ -253,7 +253,7 @@ and [delivery tracking](RESOLVER-DELIVERY.md).
 resolver gives the one resolver, on every platform pbps supports. A server
 entry runs it on a scratch server the operator supplies (#1672, DEC-1672.1); a
 Docker entry on a container pbps starts from the entry's image and removes
-after the run (#1674, DEC-1674.1). Either kind's `baseline` stages external
+after the run (#1674, DEC-1674.1). Either kind's `externals` stages external
 objects, compared with the target (#1673, DEC-1673.1), and may be allowed to
 write outside the scratch database. Before any scratch write the resolver
 proves its scratch is not the target and, on the target's cluster, that its
@@ -264,7 +264,7 @@ sealed in its evidence (#1516, DEC-1516.1). `explain` shows that evidence
 from the plan alone, in human and JSON output: the entry that ran, its
 scratch kind and layout, the qualification, each surface's verdict, the
 order and the prerequisites. SQL Server resolution, `--staged` and a
-retained external object the baseline does not stage refuse by name (#1517,
+retained external object the externals file does not stage refuse by name (#1517,
 DEC-1517.1). PostgreSQL planning is delivered; applying a resolved plan is
 #616. [Delivery tracking](RESOLVER-DELIVERY.md) has the remaining order:
 #1778 and #616, then SQL Server's #619, #620 and #621.

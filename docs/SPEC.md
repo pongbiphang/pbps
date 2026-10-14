@@ -1719,7 +1719,7 @@ DEC-1674.1).**
       initdb did not create: no object at or above `FirstNormalObjectId`,
       subscriptions included, and no large object, whose OID may be
       chosen. This is checked before the run's first write there, the
-      baseline's included. In the supplied layout every write,
+      externals file's included. In the supplied layout every write,
       the cleanup included, goes through the connection the checks were
       made on. The database itself is read, not a template, so an object a
       template added is found whichever template it was cloned from. A
@@ -1809,7 +1809,7 @@ first, then runs it, and publishes its answer (DEC-1516.1):
 3. **The target is rechecked** on a new session. It must report the cluster
    identity the planning read recorded (DEC-1685.1). Its reported facts and
    its deployer's authorization are read again and must equal the run's
-   opening read. The run's capture, including the objects the baseline
+   opening read. The run's capture, including the objects the externals file
    staged, is taken again and must equal it. A difference refuses as
    `resolver.recheck`, naming what changed; an unreadable read is
    `unanswerable`.
@@ -1834,8 +1834,9 @@ is required: nothing selects one for the user.
   runtime; an engine with no Linux image to run (#620).
 - An entry has no `profile` field (#1654). One that names a profile is
   refused, naming the resolver (#1636).
-- An entry's optional `baseline` names the baseline file (below; #1673).
-- An entry's optional `outside_writes` decides what a baseline may change
+- An entry's optional `externals` names the externals file (below; #1673;
+  `baseline` until #2007, a word the ledger's `pbps baseline` also uses).
+- An entry's optional `outside_writes` decides what an externals file may change
   outside the scratch database (below): `refuse`, the default, or `allow`.
 
 ```yaml
@@ -1845,7 +1846,7 @@ resolvers:
     kind: docker
     image: postgres:18
     pull: never
-    baseline: db/baseline.sql       # optional; relative to the project root
+    externals: db/externals.sql       # optional; relative to the project root
   internal:
     kind: docker
     image: registry.example:5000/team/pg:approved
@@ -1853,7 +1854,7 @@ resolvers:
   scratch:
     kind: server
     url_env: PBPS_SCRATCH_DB
-    baseline: db/baseline.sql       # optional; relative to the project root
+    externals: db/externals.sql       # optional; relative to the project root
     standard:                       # optional; omitted = template0's state
       settings:                     # ALTER DATABASE <scratch> SET ...
         statement_timeout: 5min
@@ -1909,18 +1910,18 @@ metadata or an environment that cannot be reproduced remain unresolved;
 fabricated stubs never constitute binding evidence.
 
 **The resolver stages objects outside the managed set from a
-reviewed baseline, compared with the target (#1528).** A managed view or routine
+reviewed externals file, compared with the target (#1528).** A managed view or routine
 that references anything outside the managed set otherwise fails the whole
 scratch compile (#1616).
 
-- **The baseline is a SQL file in the repository**, named by the resolver
-  entry's `baseline`. It is reviewed history like the declarations. An
+- **The externals file is a SQL file in the repository**, named by the resolver
+  entry's `externals`. It is reviewed history like the declarations. An
   absolute path is refused, and so is a relative one that resolves outside
   the project root through `..` or a symlink. It runs on scratch only, never on the target.
 - **It runs whole, before any managed object** (#1664, DEC-1673.1), in
   both layouts. It runs after the separation and emptiness checks and after
   the deployer's authorization is reproduced, which recreates each in-scope
-  schema; a baseline that writes into one writes `CREATE SCHEMA IF NOT
+  schema; an externals file that writes into one writes `CREATE SCHEMA IF NOT
   EXISTS`. It runs as the setup role: in the run-owned layout in a session
   of its own, in the supplied one on the checked connection, which `DISCARD
   ALL` then resets. It runs inside one `REPEATABLE READ` transaction pbps
@@ -1940,10 +1941,10 @@ scratch compile (#1616).
   - What it created is the difference between the database's objects
     before and after it. The target deployer's USAGE on a schema it
     created, an extension's own schema included, is reproduced as an
-    in-scope schema's is, not left to the baseline to grant.
+    in-scope schema's is, not left to the externals file to grant.
   - No privilege rule is needed, so any SQL may be written: an extension, a
     cast, an operator, a `DO` block.
-  - **So a baseline's statements name nothing managed.** A legacy view over
+  - **So an externals file's statements name nothing managed.** A legacy view over
     a managed table is written as a shape view (below), which names nothing.
     An object whose own shape uses a managed type, such as a column or an
     argument of a managed domain, cannot be written that early, and scratch
@@ -1955,14 +1956,14 @@ scratch compile (#1616).
 - **Everything it leaves behind must be accounted for.**
   - Each object it creates is compared with the target before any binding
     question is answered. A mismatch, an object the target does not have,
-    or a baseline object in the managed set refuses, and the finding names
+    or an object it creates in the managed set refuses, and the finding names
     the object. So does an object the comparison cannot read, such as a
     conversion or a foreign table. Text search parsers, templates,
     dictionaries and configurations, with a configuration's mapping, are
     read like any other object (#1786).
   - An extension's members are each compared like an object it creates:
     an extension's version says nothing of a member altered in place, or
-    one the baseline adds to an extension (#1783). A member the comparison
+    one the externals file adds to an extension (#1783). A member the comparison
     cannot read refuses, naming it, as a root would.
   - It changes nothing outside the scratch database, unless the entry sets
     `outside_writes: allow`. Roles, role memberships, role and other
@@ -1976,25 +1977,25 @@ scratch compile (#1616).
     `COPY ... TO PROGRAM`) is not seen and outlives the rollback. It is the
     operator's, under the vouching for the scratch (#1824).
   - **`outside_writes: allow`** skips that comparison, on either kind
-    (DEC-1674.1). What the baseline changed outside the database, a role
+    (DEC-1674.1). What the externals file changed outside the database, a role
     for instance, is kept, and pbps does not clean it up: a Docker scratch
     drops it with the container, and on a server scratch it is the
     operator's. In the supplied layout the login's own defaults the
-    baseline changed stay too: the release checks the compile's changes to
-    them against what the baseline left. The release's `DROP OWNED` still
+    externals file changed stay too: the release checks the compile's changes to
+    them against what the externals file left. The release's `DROP OWNED` still
     revokes what reaches the login, a membership it granted included
     (measured on 18), while a role it created stays. The choice is the user's, never inferred from the kind. The
     evidence records it, and `explain` shows it, so a reviewer sees a plan
-    whose baseline ran with `allow`. A role the target lacks is not this
+    whose externals file ran with `allow`. A role the target lacks is not this
     check's to find: the target-side checks catch it (#1516).
   - **Writing one.** `pg_dump --schema-only --no-owner --no-privileges`
-    of the objects the managed set reads writes a baseline that names no
-    role the scratch lacks. A baseline that creates an extension only a
+    of the objects the managed set reads writes an externals file that names no
+    role the scratch lacks. An externals file that creates an extension only a
     superuser may create needs the run-owned layout, where it runs as the
     superuser: a Docker scratch, or a server scratch whose account is a
     superuser on another cluster.
   - The shared compatibility qualification reads scratch after the
-    baseline, so a setting the baseline changed must match the target too:
+    externals file, so a setting it changed must match the target too:
     the scratch database's own settings are its to change.
 - **Everything is compared except what is listed as not compared** (#1783):
   each object's own class-specific properties, as the evidence manifest
@@ -2027,7 +2028,7 @@ scratch compile (#1616).
     view's query.
 
   A binding reads the object's shape, not how it computes or guards it, so
-  a baseline may omit all of these. The recheck before publication and at
+  an externals file may omit all of these. The recheck before publication and at
   apply still compares the target's complete fingerprints.
 - **A view may be staged as a shape view:** a view of the same output columns
   over typed NULLs that returns no row, for example
@@ -2057,18 +2058,18 @@ scratch compile (#1616).
     neither is compared. Random half-splits did, through columns typed with
     a shared managed domain.
 - **pbps itself never sends routine source to scratch.** A routine is there
-  only if the operator put it in the baseline. A binding question that needs
-  routine source the baseline lacks refuses with a finding naming the
-  surface, and two remedies: add the routine to the baseline, or select no
+  only if the operator put it in the externals file. A binding question that needs
+  routine source the externals file lacks refuses with a finding naming the
+  surface, and two remedies: add the routine to the externals file, or select no
   resolver and keep ADR-0013's conservative rebuild.
 
-A baseline object compared with the target is not a fabricated stub; an
-uncompared one never reaches binding evidence. Two later steps are planned:
-1. a command that drafts a baseline from the target's external shapes, for
+An object the externals file stages, compared with the target, is not a
+fabricated stub; an uncompared one never reaches binding evidence. Two later steps are planned:
+1. a command that drafts an externals file from the target's external shapes, for
    review (a view is drafted as a shape view of its output columns, and a
    routine is listed but never written);
-2. filling, at plan time, the shapes a baseline lacks, by the same rules;
-   the baseline wins on overlap. pbps generates each object itself, so it
+2. filling, at plan time, the shapes an externals file lacks, by the same rules;
+   the externals file wins on overlap. pbps generates each object itself, so it
    can order them one by one from the target's recorded dependencies
    (`pg_depend`), between managed objects, without parsing SQL. That lifts
    the chain refusal for filled objects.
@@ -2135,7 +2136,7 @@ typed changes, so planned candidate/grant changes are distinguished from drift.
 An unprovable transition refuses at planning, never becomes an apply-time choice.
 
 The resolver transfers no target source. What lies outside the managed set
-comes from the baseline, reviewed repository content the operator chose to
+comes from the externals file, reviewed repository content the operator chose to
 send (#1673); a measured transfer of the target's own definitions is not
 planned (#617 is closed, DEC-1636.1). Saved evidence records the logical
 identities and keyed fingerprints of the external inputs a binding read,
@@ -2187,7 +2188,7 @@ measured Docker and dedicated-server runtime profiles (#608, #609) were
 removed (#1636, DEC-1636.1). Saved binding evidence and the remaining steps
 stay planned under #595; the requirements below still govern their delivery,
 and the resolver follows §9.3.2: its separation checks, the shared
-compatibility and authorization qualification, and its baseline. See
+compatibility and authorization qualification, and its externals file. See
 [delivery tracking](RESOLVER-DELIVERY.md).
 
 `pbps doctor --env prod` (or `--db`, with optional `--format json`) now reports
@@ -2632,7 +2633,7 @@ reason in both offline and connected JSON, remaining `unanswerable` with exit `1
 For a selected resolver (§9.3.2), a required question it leaves unresolved,
 an observed incompatibility or a known unsupported resolution case
 (`resolver.unresolved`; each gate names itself: SQL Server resolution,
-`--staged`, and a retained external object the baseline does not stage,
+`--staged`, and a retained external object the externals file does not stage,
 named with the declaration that could bind it, #1517), a missing fingerprint key (`resolver.key`) and a
 target the publication recheck found changed after the run
 (`resolver.recheck`) are finding refusals (exit `2`).
